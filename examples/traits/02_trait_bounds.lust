@@ -1,0 +1,38 @@
+-- Trait bounds on generic functions
+
+trait Drawable
+    function draw(self)
+end
+
+struct Circle
+    radius: float
+end
+
+impl Drawable for Circle
+    function draw(self)
+        println("Circle with radius: " .. tostring(self.radius))
+    end
+end
+
+struct Square
+    side: float
+end
+
+impl Drawable for Square
+    function draw(self)
+        println("Square with side: " .. tostring(self.side))
+    end
+end
+
+-- Generic function with trait bound: T must implement Drawable
+function render<T: Drawable>(shape: T)
+    shape:draw()
+end
+
+local c: Circle = Circle { radius = 5.0 }
+local s: Square = Square { side = 10.0 }
+
+render(c)
+render(s)
+
+

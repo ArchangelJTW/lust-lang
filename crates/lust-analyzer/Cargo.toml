@@ -1,0 +1,21 @@
+[package]
+name = "lust-analyzer"
+version = "0.1.5"
+edition = "2021"
+include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
+license-file = "LICENSE"
+readme = "README.md"
+keywords = ["lust", "language-server", "lsp"]
+categories = ["development-tools", "text-editors"]
+description = "A WIP implementation of the language server protocol (LSP) for the Lust programming language"
+homepage = "https://lust-lang.dev/"
+
+[dependencies]
+tokio = { version = "1.48.0", features = [
+  "macros",
+  "rt-multi-thread",
+  "io-std",
+] }
+tower-lsp = "0.20.0"
+url = "2.5.7"
+lust = { path = "../..", version = "1.3.7", package = "lust-rs" }

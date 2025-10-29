@@ -1,0 +1,41 @@
+-- Structs and impl blocks
+
+struct Point
+    x: int
+    y: int
+end
+
+impl Point
+    function new(x: int, y: int): Point
+        return Point { x = x, y = y }
+    end
+
+    function distance_squared(self): int
+        local dx: int = self.x
+        local dy: int = self.y
+        return (dx * dx + dy * dy)
+    end
+
+    function translate(self, dx: int, dy: int): Point
+        return Point { x = self.x + dx, y = self.y + dy }
+    end
+end
+
+-- Constructor syntax
+local p1: Point = Point { x = 3, y = 4 }
+
+-- Using impl methods
+local p2 = Point.new(10, 20)
+
+-- Field access
+println(p1.x)
+println(p1.y)
+
+-- Method calls
+println(p1:distance_squared())
+
+local p3 = p1:translate(5, 5)
+println(p3.x)  -- Outputs: 8
+println(p3.y)  -- Outputs: 9
+
+

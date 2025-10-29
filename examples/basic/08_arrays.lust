@@ -1,0 +1,41 @@
+-- Arrays with methods
+
+-- Array literal with type inference
+local numbers: Array<int> = [1, 2, 3, 4, 5]
+local names = ["Alice", "Bob", "Charlie"]
+
+-- Basic methods
+println(numbers:len())        -- Outputs: 5
+println(numbers:is_empty())   -- Outputs: false
+
+-- Accessing elements
+local first = numbers:first()
+if first:is_some() then
+    println(first:unwrap())   -- Outputs: 1
+end
+
+local last = numbers:last()
+if last:is_some() then
+    println(last:unwrap())    -- Outputs: 5
+end
+
+-- Get by index
+local third = numbers:get(2)
+if third:is_some() then
+    println(third:unwrap())   -- Outputs: 3
+end
+
+-- Mutable operations
+numbers:push(6)
+println(numbers:len())        -- Outputs: 6
+
+local popped = numbers:pop()
+if popped:is_some() then
+    println(popped:unwrap())  -- Outputs: 6
+end
+
+-- Slicing (creates new array)
+local sliced = numbers:slice(1, 3)
+println(sliced:len())         -- Outputs: 2
+ 
+

@@ -1,0 +1,118 @@
+-- Type Narrowing Demo
+-- Demonstrates how type narrowing works with 'is' operator in control flow
+
+-- Process a value that could be string, int, or float
+function process_value(value: string | int | float): int
+    println("Processing value...")
+
+    -- Type narrowing with if-elseif chain
+    if value is string then
+        -- Compiler knows 'value' is string here
+        println("  String value: " .. value)
+        println("  Length: " .. tostring(value:len()))
+        return value:len()
+    elseif value is int then
+        -- Compiler knows 'value' is int here
+        println("  Int value: " .. tostring(value))
+        println("  Doubled: " .. tostring(value * 2))
+        return value
+    elseif value is float then
+        -- Compiler knows 'value' is float here
+        println("  Float value: " .. tostring(value))
+        local rounded: int = 0  -- Manual conversion
+        return rounded
+    end
+
+    return 0
+end
+ 
+
+-- Handle unknown type from Table
+function handle_unknown(val: unknown): string
+    -- Must narrow unknown before using type-specific operations
+
+    -- Try int first
+    local as_int = val:as<int>()
+    if as_int:is_some() then
+        return "Integer: " .. tostring(as_int:unwrap())
+    end
+
+    -- Try string
+    local as_str = val:as<string>()
+    if as_str:is_some() then
+        return "String: " .. as_str:unwrap()
+    end
+
+    -- Try bool
+    local as_bool = val:as<bool>()
+    if as_bool:is_some() then
+        if as_bool:unwrap() then
+            return "Boolean: true"
+        end
+        return "Boolean: false"
+    end
+
+    return "Unknown type"
+end
+
+println("=== Type Narrowing Demo ===")
+println("")
+
+-- Test 1: Union type narrowing
+println("Test 1: Union type narrowing")
+local result1 = process_value("hello")
+println("  Result: " .. tostring(result1))
+
+println("")
+local result2 = process_value(42)
+println("  Result: " .. tostring(result2))
+
+println("")
+local result3 = process_value(3.14)
+println("  Result: " .. tostring(result3))
+
+-- Test 2: Unknown type narrowing with Table
+println("")
+println("Test 2: Unknown type narrowing")
+local data: Table = {}
+data:set("id", 100)
+data:set("name", "Bob")
+data:set("verified", true)
+
+local id_opt = data:get("id")
+if id_opt:is_some() then
+    println(handle_unknown(id_opt:unwrap()))
+end
+
+local name_opt = data:get("name")
+if name_opt:is_some() then
+    println(handle_unknown(name_opt:unwrap()))
+end
+
+local verified_opt = data:get("verified")
+if verified_opt:is_some() then
+    println(handle_unknown(verified_opt:unwrap()))
+end
+
+-- Test 3: Type guard in while loop
+println("")
+println("Test 3: Type guards in loops")
+local values: Array<string | int> = ["first", 1, "second", 2, "third", 3]
+local i: int = 0
+while i < values:len() do
+    local val = values:get(i):unwrap()
+
+    if val is string then
+        println("  String: " .. val)
+    elseif val is int then
+        println("  Number: " .. tostring(val))
+    end
+
+    i = i + 1
+end
+
+println("")
+println("=== All narrowing tests passed! ===")
+
+
+

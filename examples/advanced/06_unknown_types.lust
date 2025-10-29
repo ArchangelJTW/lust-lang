@@ -1,0 +1,78 @@
+-- Unknown Types Demo
+-- Demonstrates working with the 'unknown' type and safe type casting
+
+println("=== Unknown Types Demo ===")
+println("")
+
+-- Table stores values with unknown type
+println("Test 1: Table with mixed types")
+local data: Table = {}
+data:set("name", "Alice")
+data:set("age", 30)
+data:set("score", 95.5)
+data:set("active", true)
+
+println("Table length: " .. tostring(data:len()))
+
+-- Getting values returns Option<unknown>
+println("")
+println("Test 2: Type casting from unknown")
+local age_opt = data:get("age")
+if age_opt:is_some() then
+    local unknown_val = age_opt:unwrap()  -- unknown type
+
+    -- Safe type casting with :as<T>()
+    local int_val = unknown_val:as<int>()
+    if int_val:is_some() then
+        println("Age (as int): " .. tostring(int_val:unwrap()))
+    end
+
+    -- Try casting to wrong type - returns None
+    local str_val = unknown_val:as<string>()
+    if str_val:is_none() then
+        println("Age is not a string (correct)")
+    end
+end
+
+-- Type cast score to float
+println("")
+println("Test 3: Casting to float")
+local score_opt = data:get("score")
+if score_opt:is_some() then
+    local unknown_score = score_opt:unwrap()
+    local float_score = unknown_score:as<float>()
+    if float_score:is_some() then
+        println("Score (as float): " .. tostring(float_score:unwrap()))
+    end
+end
+
+-- Type cast bool
+println("")
+println("Test 4: Casting to bool")
+local active_opt = data:get("active")
+if active_opt:is_some() then
+    local unknown_active = active_opt:unwrap()
+    local bool_active = unknown_active:as<bool>()
+    if bool_active:is_some() then
+        if bool_active:unwrap() then
+            println("User is active")
+        end
+    end
+end
+
+-- Direct casting to string
+println("")
+println("Test 5: Casting to string")
+local name_opt = data:get("name")
+if name_opt:is_some() then
+    local unknown_name = name_opt:unwrap()
+    local str_name = unknown_name:as<string>()
+    if str_name:is_some() then
+        println("Name: " .. str_name:unwrap())
+    end
+end
+
+println("")
+println("=== All tests passed! ===")
+ 
+

@@ -1,0 +1,68 @@
+-- Trait casting with :as<T>() method
+
+trait Drawable
+    function draw(self)
+end
+
+trait Printable
+    function print(self)
+end
+
+struct Circle
+    radius: float
+end
+
+impl Drawable for Circle
+    function draw(self)
+        println("Drawing circle")
+    end
+end
+
+impl Printable for Circle
+    function print(self)
+        println("Circle with radius: " .. tostring(self.radius))
+    end
+end
+
+struct Square
+    side: float
+end
+
+impl Drawable for Square
+    function draw(self)
+        println("Drawing square")
+    end
+end
+
+function process_object(obj: unknown)
+    println("Processing object...")
+    
+    -- Try to cast to Drawable trait
+    local drawable = obj:as<Drawable>()
+    if drawable:is_some() then
+        println("Object is drawable!")
+        drawable:unwrap():draw()
+    else
+        println("Object is not drawable")
+    end
+    
+    -- Try to cast to Printable trait
+    local printable = obj:as<Printable>()
+    if printable:is_some() then
+        println("Object is printable!")
+        printable:unwrap():print()
+    else
+        println("Object is not printable")
+    end
+end
+
+local c: Circle = Circle { radius = 5.0 }
+local s: Square = Square { side = 3.0 }
+
+println("=== Testing Circle ===")
+process_object(c)
+
+println("\n=== Testing Square ===")
+process_object(s)
+
+

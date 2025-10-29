@@ -1,0 +1,36 @@
+-- Destructuring and Multiple Return Demo
+
+-- Return multiple values with explicit tuple type annotation
+function split_stats(label: string, score: int): (string, bool, int)
+    local is_positive: bool = score > 0
+    return label, is_positive, score
+end
+
+-- Function that returns two values without explicit annotation
+function min_max(a: int, b: int): (int, int)
+    if a < b then
+        return a, b
+    end
+    return b, a
+end
+
+println("=== Destructuring Demo ===")
+
+-- Basic destructuring with annotation
+local label: string, positive: bool, score: int = split_stats("tasks completed", 7)
+println("Label: " .. label)
+println("Positive: " .. tostring(positive))
+println("Score: " .. tostring(score))
+
+-- Destructuring without annotation (type inferred)
+local low, high = min_max(42, 5)
+println("Low: " .. tostring(low))
+println("High: " .. tostring(high))
+
+-- Destructuring combined with additional locals
+local name, healthy, total = split_stats("quests", -4)
+println("Name: " .. name)
+println("Healthy: " .. tostring(healthy))
+println("Total: " .. tostring(total))
+
+

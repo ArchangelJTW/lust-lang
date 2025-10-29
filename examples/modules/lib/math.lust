@@ -1,0 +1,13 @@
+println("[lib.math] init")
+local test_capture = 12
+
+pub struct Point
+    x: int
+    y: int
+end
+
+pub function add(a: int, b: int): int
+    println(test_capture)
+    return a + b
+end
+

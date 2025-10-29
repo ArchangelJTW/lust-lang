@@ -1,0 +1,41 @@
+-- Result<T, E> type for error handling
+
+function divide(a: int, b: int): Result<int, string>
+    if b == 0 then
+        return Result.Err("division by zero")
+    end
+    return Result.Ok(a / b)
+end
+ 
+
+
+local result1 = divide(10, 2)
+local result2 = divide(10, 0)
+
+-- Pattern matching on Result
+if result1 is Ok(value) then
+    print("Success: ")
+    println(value)
+elseif result1 is Err(msg) then
+    print("Error: ")
+    println(msg)
+end
+
+if result2 is Ok(value) then
+    print("Success: ")
+    println(value)
+elseif result2 is Err(msg) then
+    print("Error: ")
+    println(msg)
+end
+
+-- Using Result methods
+if result1:is_ok() then
+    println(result1:unwrap())
+end
+
+if result2:is_err() then
+    println("Division failed as expected")
+end
+
+

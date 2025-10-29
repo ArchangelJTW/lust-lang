@@ -1,0 +1,12 @@
+[package]
+name = "lust-triple"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+lust-lang = { path = "../../../../", features = ["packages"] }
+
+[workspace]

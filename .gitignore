@@ -1,0 +1,6 @@
+/target
+vs-extension/lust-analyzer/dist
+vs-extension/lust-analyzer/node_modules
+/web
+examples/rust-extension/extensions/double/target
+examples/rust-extension/extensions/triple/target

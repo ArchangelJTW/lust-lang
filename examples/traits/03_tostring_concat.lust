@@ -1,0 +1,29 @@
+-- ToString trait with automatic concat conversion
+
+struct Point
+    x: int
+    y: int
+end
+
+impl ToString for Point
+    function to_string(self): string
+        return "(" .. self.x .. "," .. self.y .. ")"
+    end
+end
+
+local p: Point = Point { x = 10, y = 20 }
+
+-- Test calling to_string directly first
+local str: string = p:to_string()
+println("Direct call: " .. str)
+
+-- Point implements ToString, so concat should work automatically
+local msg: string = "Point at: " .. p
+println(msg)
+
+-- Also test with primitives (already implement ToString)
+local num: int = 42
+local result: string = "The answer is " .. num
+println(result)
+
+

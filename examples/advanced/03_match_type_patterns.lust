@@ -1,0 +1,112 @@
+-- Match Type Patterns Demo
+-- Demonstrates type pattern matching in match statements
+
+-- Process different types with match statement
+function process_with_match(value: string | int | bool): string
+    if value is string then
+        return "String: " .. value .. " (len: " .. tostring(value:len()) .. ")"
+    elseif value is int then
+        return "Integer: " .. tostring(value) .. " (doubled: " .. tostring(value * 2) .. ")"
+    elseif value is bool then
+        if value then
+            return "Boolean: true"
+        end
+        return "Boolean: false"
+    end
+    return "No match"
+end
+
+-- Handle unknown with match patterns
+function describe_unknown(val: unknown): string
+    -- Match on specific types to narrow from unknown
+    -- Note: We use :as<T>() to get Option<T>, then match on the Option
+    local as_int = val:as<int>()
+    if as_int:is_some() then
+        local i = as_int:unwrap()
+        return "Found int: " .. tostring(i)
+    end
+
+    local as_str = val:as<string>()
+    if as_str:is_some() then
+        local s = as_str:unwrap()
+        return "Found string: " .. s
+    end
+
+    local as_bool = val:as<bool>()
+    if as_bool:is_some() then
+        return "Found bool"
+    end
+
+    return "Unknown type"
+end
+
+-- Example showing combined use
+function format_for_display(data: string | int | float): string
+    if data is string then
+        return "[STR] " .. data
+    elseif data is int then
+        return "[INT] " .. tostring(data)
+    elseif data is float then
+        return "[FLT] " .. tostring(data)
+    end
+    return "FAIL"
+end
+
+println("=== Match Type Patterns Demo ===")
+println("")
+
+-- Test 1: Match on string
+println("Test 1: Match string | int | bool")
+println(process_with_match("hello world"))
+println(process_with_match(42))
+println(process_with_match(true))
+println(process_with_match(false))
+
+-- Test 2: Match with unknown from Table
+println("")
+println("Test 2: Unknown narrowing")
+local config: Table = {}
+config:set("port", 8080)
+config:set("host", "localhost")
+config:set("debug", true)
+
+local port_opt = config:get("port")
+if port_opt:is_some() then
+    println(describe_unknown(port_opt:unwrap()))
+end
+
+local host_opt = config:get("host")
+if host_opt:is_some() then
+    println(describe_unknown(host_opt:unwrap()))
+end
+
+local debug_opt = config:get("debug")
+if debug_opt:is_some() then
+    println(describe_unknown(debug_opt:unwrap()))
+end
+
+-- Test 3: Display formatting
+println("")
+println("Test 3: Format for display")
+println(format_for_display("Alice"))
+println(format_for_display(100))
+println(format_for_display(3.14159))
+
+-- Test 4: Array of union types
+println("")
+println("Test 4: Array of union types")
+-- Split into separate arrays with explicit types to work around union type inference
+local str_items: Array<string> = ["a", "b", "c"]
+local int_items: Array<int> = [1, 2, 3]
+
+println(process_with_match(str_items:get(0):unwrap()))
+println(process_with_match(int_items:get(0):unwrap()))
+println(process_with_match(str_items:get(1):unwrap()))
+println(process_with_match(int_items:get(1):unwrap()))
+println(process_with_match(str_items:get(2):unwrap()))
+println(process_with_match(int_items:get(2):unwrap()))
+
+println("")
+println("=== All match pattern tests passed! ===")
+
+

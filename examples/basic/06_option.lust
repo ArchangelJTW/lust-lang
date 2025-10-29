@@ -1,0 +1,35 @@
+
+function find_even(n: int): Option<int>
+    if n % 2 == 0 then
+        return Option.Some(n)
+    end
+    return Option.None
+end
+
+
+local result1 = find_even(42)
+local result2 = find_even(7)
+
+-- Using Option methods
+if result1:is_some() then
+    println("Found even number:")
+    println(result1:unwrap())
+end
+
+if result2:is_none() then
+    println("No even number found")
+end
+
+-- Using unwrap_or for default values
+println(result1:unwrap_or(0))
+println(result2:unwrap_or(-1))
+
+-- Using type matching
+if result1 is Some(x) then
+    println("Found even number:")
+    println(x)
+end
+
+
+
+

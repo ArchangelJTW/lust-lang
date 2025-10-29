@@ -1,0 +1,39 @@
+-- String methods
+
+local text = "Hello, World!"
+
+-- Basic methods
+println(text:len())                    -- Outputs: 13
+println(text:is_empty())               -- Outputs: false
+
+-- Searching
+local pos = text:find("World")
+if pos:is_some() then
+    println(pos:unwrap())              -- Outputs: 7
+end
+
+println(text:starts_with("Hello"))    -- Outputs: true
+println(text:ends_with("!"))          -- Outputs: true
+println(text:contains("World"))       -- Outputs: true
+
+-- Substring
+println(text:substring(0, 5))         -- Outputs: Hello
+
+-- Case conversion
+println(text:to_upper())              -- Outputs: HELLO, WORLD!
+println(text:to_lower())              -- Outputs: hello, world!
+
+-- Trimming
+local padded = "  spaces  "
+println(padded:trim())                -- Outputs: spaces
+println(padded:trim_start())          -- Outputs: spaces
+println(padded:trim_end())            -- Outputs:   spaces
+
+-- Replace
+println(text:replace("World", "Lust"))  -- Outputs: Hello, Lust!
+
+-- Split
+local words = text:split(", ")
+println(words:len())                  -- Outputs: 2
+ 
+

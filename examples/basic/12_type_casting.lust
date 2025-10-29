@@ -1,0 +1,41 @@
+-- Type casting with :as<T>() method
+
+-- Type casting returns Option<T>
+
+-- Cast from Unknown (from Table)
+local data: Table = {}
+data:set("age", 30)
+data:set("name", "Alice")
+
+local age_opt = data:get("age")
+if age_opt:is_some() then
+    local unknown_val = age_opt:unwrap()  -- Unknown type
+
+    -- Try to cast to int (succeeds)
+    local int_val = unknown_val:as<int>()
+    if int_val:is_some() then
+        println(int_val:unwrap())         -- Outputs: 30
+    end
+
+    -- Try to cast to string (fails)
+    local str_val = unknown_val:as<string>()
+    if str_val:is_none() then
+        println("Not a string")           -- This prints
+    end
+end
+
+-- Cast name to string (succeeds)
+local name_opt = data:get("name")
+if name_opt:is_some() then
+    local unknown_name = name_opt:unwrap()
+    local str_name = unknown_name:as<string>()
+    if str_name:is_some() then
+        println(str_name:unwrap())        -- Outputs: Alice
+    end
+end
+
+-- Direct casts on primitives
+println(42:as<int>():is_some())           -- Outputs: true
+println(42:as<string>():is_none())        -- Outputs: true
+ 
+

@@ -1,0 +1,18 @@
+println("[lib.math.vector] init")
+
+pub struct IntVector
+    x: int
+    y: int
+end
+
+pub function make(x: int, y: int): IntVector
+    return IntVector { x = x, y = y }
+end
+
+pub function zero(): IntVector
+    return IntVector { x = 0, y = 0 }
+end
+
+pub function length_squared(vec: IntVector): int
+    return (vec.x * vec.x) + (vec.y * vec.y)
+end

@@ -1,0 +1,54 @@
+-- Loops: while and for (with JIT compilation demo)
+
+println("=== While Loop ===")
+local i = 1
+while i <= 5 do
+    println(i)
+    i = i + 1
+end
+
+println("=== For Loop (basic) ===")
+for j = 1, 5 do
+    println(j)
+end
+
+println("=== For Loop (with step) ===")
+for k = 0, 10, 2 do
+    println(k)  -- Outputs: 0, 2, 4, 6, 8, 10
+end
+
+println("=== For-In Loop (array iteration) ===")
+local fruits: Array<string> = ["apple", "banana", "cherry"]
+for fruit in fruits do
+    println(fruit)
+end
+
+println("=== Generic For-In Loop (map iteration) ===")
+local fruits_map: Map<string, int> = {["apple"] = 3, ["banana"] = 5, ["cherry"] = 2}
+for fruit, amount in fruits_map:iter() do
+    println("Fruit: " ..fruit.. " Amount: " ..tostring(amount))
+end
+
+println("=== Generic For-In Loop on Complex Array ===")
+local complex_mixed_types: Array<Option<unknown>> = [Option.Some("Hello"), Option.None, Option.Some(5), Option.Some("world")]
+
+for x in complex_mixed_types do
+     if x is Some(str) and str is string then
+     println("Got a String: "..str)
+     elseif x is Some(n) and n is int then
+     println("Got an Int: "..tostring(n))
+     elseif x is None then
+     println("Got None")
+     else
+     println("Catch All")
+     end
+end
+
+println("=== JIT Compilation Demo ===")
+-- Large loop triggers JIT compilation; subsequent iterations run as native x64
+local sum = 0
+for n = 1, 10000 do
+    sum = sum + n
+end
+println(sum)  -- Outputs: 50005000
+ 

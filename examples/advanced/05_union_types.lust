@@ -1,0 +1,78 @@
+-- Union Types Demo
+-- Demonstrates union types and type narrowing with the 'is' operator
+
+-- Function that accepts either string or int ID
+function print_id(id: string | int)
+    println("=== Type narrowing with 'is' operator ===")
+
+    -- Use 'is' operator for type checking and narrowing
+    if id is string then
+        -- Compiler knows 'id' is string in this branch
+        println("String ID: " .. id)
+    elseif id is int then
+        -- Compiler knows 'id' is int in this branch
+        println("Numeric ID: " .. tostring(id))
+    end
+end
+
+-- Function that returns different types based on input
+function get_response(success: bool): string | int | bool
+    if success then
+        return "Success!"
+    elseif not success then
+        return 404
+    end
+    return false
+end
+
+println("=== Union Types Demo ===")
+println("")
+
+-- Test 1: String | Int union
+println("Test 1: String | Int")
+local id1: string | int = "user_123"
+print_id(id1)
+
+println("")
+local id2: string | int = 42
+print_id(id2)
+
+-- Test 2: Complex union with three types
+println("")
+println("Test 2: String | Int | Bool")
+local response1 = get_response(true)
+if response1 is string then
+    println("Got string response: " .. response1)
+end
+
+local response2 = get_response(false)
+if response2 is int then
+    println("Got int response: " .. tostring(response2))
+end
+
+-- Test 3: Type narrowing in sequence
+println("")
+println("Test 3: Sequential type checks")
+local value: string | int | bool = true
+
+if value is bool then
+    if value then
+        println("Value is true")
+    end
+end
+
+-- Reassign to different type in union
+value = "hello"
+if value is string then
+    println("Value is now string: " .. value)
+end
+
+value = 999
+if value is int then
+    println("Value is now int: " .. tostring(value))
+end
+
+println("")
+println("=== All union tests passed! ===")
+ 
+

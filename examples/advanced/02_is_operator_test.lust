@@ -1,0 +1,43 @@
+-- Simple test for the 'is' operator
+
+println("=== Testing 'is' Operator ===")
+println("")
+
+-- Test with concrete types
+local x: int = 42
+local s: string = "hello"
+local f: float = 3.14
+local b: bool = true
+
+println("Test 1: Type checking concrete values")
+if x is int then
+    println("  x is int: true")
+end
+
+if s is string then
+    println("  s is string: true")
+end
+
+if f is float then
+    println("  f is float: true")
+end
+
+if b is bool then
+    println("  b is bool: true")
+end
+
+-- Negative tests
+println("")
+println("Test 2: Negative type checks")
+if not (x is string) then
+    println("  x is not string: correct")
+end
+
+if not (s is int) then
+    println("  s is not int: correct")
+end
+
+println("")
+println("=== 'is' operator test passed! ===")
+ 
+

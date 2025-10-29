@@ -1,0 +1,38 @@
+-- Break and continue in loops
+
+println("=== Break Example ===")
+local i = 1
+while true do
+    if i > 5 then
+        break
+    end
+    println(i)
+    i = i + 1
+end
+
+println("=== Continue Example ===")
+for j = 1, 10 do
+    if j % 2 == 0 then
+        continue  -- Skip even numbers
+    end
+    println(j)  -- Only prints odd numbers
+end
+
+println("=== FizzBuzz with continue ===")
+for n = 1, 15 do
+    if n % 15 == 0 then
+        println("FizzBuzz")
+        continue
+    end
+    if n % 3 == 0 then
+        println("Fizz")
+        continue
+    end
+    if n % 5 == 0 then
+        println("Buzz")
+        continue
+    end
+    println(n)
+end
+ 
+

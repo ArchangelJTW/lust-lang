@@ -1,0 +1,41 @@
+-- Demonstrates Lust's `os` module for simple filesystem tasks.
+-- Requires lust-config.toml enabling the `os` (and optionally `io`) module.
+
+local dir = "os_example_tmp"
+local original = dir .. "/note.txt"
+local renamed = dir .. "/note-renamed.txt"
+
+local create_dir_result = os.create_dir(dir)
+if create_dir_result is Ok(_) then
+    println("Created directory: " .. dir)
+elseif create_dir_result is Err(message) then
+    println("Failed to create directory: " .. message)
+end
+
+local create_file_result = os.create_file(original)
+if create_file_result is Ok(_) then
+    println("Created empty file: " .. original)
+elseif create_file_result is Err(message) then
+    println("Failed to create file: " .. message)
+end
+
+local rename_result = os.rename(original, renamed)
+if rename_result is Ok(_) then
+    println("Renamed file to: " .. renamed)
+elseif rename_result is Err(message) then
+    println("Failed to rename file: " .. message)
+end
+
+local remove_file_result = os.remove_file(renamed)
+if remove_file_result is Ok(_) then
+    println("Removed file: " .. renamed)
+elseif remove_file_result is Err(message) then
+    println("Failed to remove file: " .. message)
+end
+
+local remove_dir_result = os.remove_dir(dir)
+if remove_dir_result is Ok(_) then
+    println("Removed directory: " .. dir)
+elseif remove_dir_result is Err(message) then
+    println("Failed to remove directory: " .. message)
+end

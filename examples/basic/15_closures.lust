@@ -1,0 +1,34 @@
+-- Closures and lambdas with upvalue capture
+
+println("=== Simple Lambda ===")
+local add = function(x: int, y: int): int
+    return x + y
+end
+println(add(5, 3))  -- Outputs: 8
+
+println("=== Closure (single capture) ===")
+local multiplier: int = 10
+local multiply = function(x: int): int
+    return x * multiplier  -- Captures 'multiplier'
+end
+println(multiply(5))  -- Outputs: 50
+
+println("=== Closure (multiple captures) ===")
+local base: int = 100
+local offset: int = 20
+local compute = function(x: int): int
+    return x + base - offset
+end
+println(compute(10))  -- Outputs: 90
+
+println("=== Nested Closures ===")
+local outer: int = 5
+local make_adder = function(x: int): int
+    local inner = function(y: int): int
+        return x + y + outer  -- Captures both 'x' and 'outer'
+    end
+    return inner(10)
+end
+println(make_adder(3))  -- Outputs: 18
+ 
+

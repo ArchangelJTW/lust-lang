@@ -1,0 +1,4 @@
+println("Hello from Lust!")
+println("A Lua-inspired language with strict typing and JIT compilation")
+ 
+

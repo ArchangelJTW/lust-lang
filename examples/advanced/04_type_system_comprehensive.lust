@@ -1,0 +1,192 @@
+-- Comprehensive Type System Demo
+-- Combines unknown types, union types, type narrowing, and match patterns
+-- in a realistic JSON-like data processing scenario
+
+-- Simulates processing API responses with mixed types
+function process_api_field(key: string, value: unknown): string
+    println("  Processing field '" .. key .. "':")
+
+    -- Use type narrowing to handle different value types
+    local as_string = value:as<string>()
+    if as_string:is_some() then
+        local s = as_string:unwrap()
+        return "    String value: '" .. s .. "' (length: " .. tostring(s:len()) .. ")"
+    end
+
+    local as_int = value:as<int>()
+    if as_int:is_some() then
+        local i = as_int:unwrap()
+        return "    Integer value: " .. tostring(i)
+    end
+
+    local as_bool = value:as<bool>()
+    if as_bool:is_some() then
+        local b = as_bool:unwrap()
+        if b then
+            return "    Boolean value: true"
+        end
+        return "    Boolean value: false"
+    end
+
+    return "    Unknown type"
+end
+
+
+-- Validate a user ID (can be string or numeric)
+-- Note: Type narrowing in control flow is not yet fully implemented in type checker
+-- For now, we work around by casting to concrete types
+function validate_id_string(id: string): bool
+    println("Validating string ID...")
+    if id:len() > 0 then
+        println("  Valid string ID: " .. id)
+        return true
+    end
+    println("  Invalid: empty string ID")
+    return false
+end
+
+function validate_id_int(id: int): bool
+    println("Validating int ID...")
+    if id > 0 then
+        println("  Valid numeric ID: " .. tostring(id))
+        return true
+    end
+    println("  Invalid: non-positive ID")
+    return false
+end
+
+-- Note: Match type patterns with narrowing not yet implemented in type checker
+-- The runtime support is there, but compile-time checking needs work
+-- For now, we test the 'is' operator in if statements
+
+-- Complex example: parse and validate configuration
+function parse_config(config: Table): bool
+    println("Parsing configuration...")
+    local all_valid: bool = true
+
+    -- Validate port (should be int)
+    local port_opt = config:get("port")
+    if port_opt:is_some() then
+        local port_unknown = port_opt:unwrap()
+        local port_int = port_unknown:as<int>()
+
+        if port_int:is_some() then
+            local port = port_int:unwrap()
+            if port > 0 and port < 65536 then
+                println("  Valid port: " .. tostring(port))
+            else
+                println("  Invalid port number")
+                all_valid = false
+            end
+        else
+            println("  Port must be an integer")
+            all_valid = false
+        end
+    end
+
+    -- Validate host (should be string)
+    local host_opt = config:get("host")
+    if host_opt:is_some() then
+        local host_unknown = host_opt:unwrap()
+        local host_str = host_unknown:as<string>()
+
+        if host_str:is_some() then
+            local host = host_str:unwrap()
+            if host:len() > 0 then
+                println("  Valid host: " .. host)
+            else
+                println("  Host cannot be empty")
+                all_valid = false
+            end
+        else
+            println("  Host must be a string")
+            all_valid = false
+        end
+    end
+
+    -- Validate debug flag (should be bool)
+    local debug_opt = config:get("debug")
+    if debug_opt:is_some() then
+        local debug_unknown = debug_opt:unwrap()
+        local debug_bool = debug_unknown:as<bool>()
+
+        if debug_bool:is_some() then
+            if debug_bool:unwrap() then
+                println("  Debug mode: enabled")
+            else
+                println("  Debug mode: disabled")
+            end
+        else
+            println("  Debug flag must be a boolean")
+            all_valid = false
+        end
+    end
+
+    return all_valid
+end
+
+println("=== Comprehensive Type System Demo ===")
+println("")
+
+-- Test 1: API field processing
+println("Test 1: API Response Processing")
+local api_response: Table = {}
+api_response:set("status", 200)
+api_response:set("message", "Success")
+api_response:set("authenticated", true)
+
+local status_opt = api_response:get("status")
+if status_opt:is_some() then
+    println(process_api_field("status", status_opt:unwrap()))
+end
+
+local msg_opt = api_response:get("message")
+if msg_opt:is_some() then
+    println(process_api_field("message", msg_opt:unwrap()))
+end
+
+local auth_opt = api_response:get("authenticated")
+if auth_opt:is_some() then
+    println(process_api_field("authenticated", auth_opt:unwrap()))
+end
+
+-- Test 2: ID validation
+println("")
+println("Test 2: ID Validation")
+validate_id_string("user_abc123")
+validate_id_int(42)
+validate_id_string("")
+validate_id_int(-5)
+
+-- Test 3: Runtime type checking with 'is' operator
+println("")
+println("Test 3: Runtime type checking")
+local mixed_val1: string | int = "text"
+if mixed_val1 is string then
+    println("  mixed_val1 is string at runtime: true")
+end
+
+local mixed_val2: string | int = 100
+if mixed_val2 is int then
+    println("  mixed_val2 is int at runtime: true")
+end
+
+-- Test 4: Configuration parsing
+println("")
+println("Test 4: Configuration Validation")
+local config: Table = {}
+config:set("port", 8080)
+config:set("host", "localhost")
+config:set("debug", true)
+
+if parse_config(config) then
+    println("Configuration is valid!")
+else
+    println("Configuration has errors!")
+end
+
+println("")
+println("=== All comprehensive tests passed! ===")
+
+
+

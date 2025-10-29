@@ -1,0 +1,3 @@
+[settings]
+stdlib_modules = ["io", "os"]
+jit = true

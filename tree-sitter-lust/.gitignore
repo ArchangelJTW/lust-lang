@@ -1,0 +1,16 @@
+# Generated files
+src/
+node_modules/
+build/
+*.node
+
+# NPM
+package-lock.json
+
+# Tree-sitter
+*.so
+*.dylib
+*.dll
+
+# Bindings
+bindings/

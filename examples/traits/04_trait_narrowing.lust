@@ -1,0 +1,32 @@
+-- Trait type narrowing with is operator
+
+trait Drawable
+    function draw(self)
+end
+
+struct Circle
+    radius: float
+end
+
+impl Drawable for Circle
+    function draw(self)
+        println("Drawing circle")
+    end
+end
+
+function process(obj: unknown)
+    println("Processing...")
+    -- Narrow unknown to Drawable trait
+    if obj is Drawable then
+        println("Object is Drawable!")
+        obj:draw()  -- Should work after narrowing
+    else
+        println("Object is NOT Drawable")
+    end
+end
+
+local c: Circle = Circle { radius = 5.0 }
+process(c)
+
+
+

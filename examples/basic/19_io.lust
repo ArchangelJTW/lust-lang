@@ -1,0 +1,29 @@
+-- Demonstrates Lust's `io` module.
+-- Make sure the example directory has a lust-config.toml with:
+--   "enabled modules" = ["io", "os"]
+
+local path = "io_example_output.txt"
+
+local write_result = io.write_file(path, "Hello from Lust's IO module!\n")
+if write_result is Err(message) then
+    println("Failed to write file: " .. message)
+    return
+end
+
+local read_result = io.read_file(path)
+if read_result is Ok(contents) then
+    println("Read back: " .. contents)
+elseif read_result is Err(message) then
+    println("Failed to read file: " .. message)
+end
+
+local stdout_result = io.write_stdout("io.write_stdout() writes directly to stdout.\n")
+if stdout_result is Err(message) then
+    println("Failed to write to stdout: " .. message)
+end
+
+-- Clean up
+local cleanup_result = os.remove_file(path)
+if cleanup_result is Err(message) then
+    println("Failed to remove file: " .. message)
+end

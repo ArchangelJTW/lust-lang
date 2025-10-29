@@ -1,0 +1,129 @@
+-- Mini interactive CLI that uses the `io` and `os` modules.
+-- Offers interactive prompts (press Enter to keep defaults).
+
+local STORAGE_DIR = "profiles"
+local STORAGE_FILE = STORAGE_DIR .. "/profile.txt"
+
+local DEFAULT_NAME = "Friend"
+local DEFAULT_AGE = "25"
+local DEFAULT_COLOR = "Blue"
+
+function get_profile_field(profile: Table, key: string, fallback: string): string
+    local value_opt = profile:get(key)
+    if value_opt is Some(value) and value is string then
+        return value
+    end
+    return fallback
+end
+
+function new_profile(name: string, age: string, color: string): Table
+    local profile: Table = {}
+    profile:set("name", name)
+    profile:set("age", age)
+    profile:set("color", color)
+    return profile
+end
+
+function clone_profile(profile: Table): Table
+    return new_profile(
+        get_profile_field(profile, "name", DEFAULT_NAME),
+        get_profile_field(profile, "age", DEFAULT_AGE),
+        get_profile_field(profile, "color", DEFAULT_COLOR)
+    )
+end
+
+function parse_profile(text: string, defaults: Table): Table
+    local profile = clone_profile(defaults)
+    local lines = text:split("\n")
+    local i: int = 0
+    while i < lines:len() do
+        if lines:get(i) is Some(line) and line:len() > 0 then
+            local parts = line:split("=")
+            if parts:len() >= 2 then
+                if parts:get(0) is Some(key) and (key == "name" or key == "age" or key == "color") 
+                and parts:get(1) is Some(value) then
+                    profile:set(key, value)
+                end
+            end
+        end
+        i += 1
+    end
+    return profile
+end
+
+function load_profile(path: string): Table
+    local defaults = new_profile(DEFAULT_NAME, DEFAULT_AGE, DEFAULT_COLOR)
+    local read_result = io.read_file(path)
+    if read_result is Ok(contents) then
+        return parse_profile(contents, defaults)
+    end
+    return defaults
+end
+
+function save_profile(path: string, profile: Table): Result<(), string>
+    local name = get_profile_field(profile, "name", DEFAULT_NAME)
+    local age = get_profile_field(profile, "age", DEFAULT_AGE)
+    local color = get_profile_field(profile, "color", DEFAULT_COLOR)
+
+    local contents = "name=" .. name .. "\nage=" .. age .. "\ncolor=" .. color .. "\n"
+    return io.write_file(path, contents)
+end
+
+function prompt_field(label: string, current: string): string
+    local prompt_text = label
+    if current:len() > 0 then
+        prompt_text = prompt_text .. " [" .. current .. "]: "
+    else
+        prompt_text = prompt_text .. ": "
+    end
+
+    local prompt_result = io.write_stdout(prompt_text)
+    if prompt_result is Err(message) then
+        println("Warning: unable to write prompt: " .. message)
+    end
+
+    local line_result = io.read_line()
+    if line_result is Ok(raw_input) then
+        local input = raw_input:trim()
+        if input:len() == 0 then
+            return current
+        end
+        return input
+    elseif line_result is Err(message) then
+        println("Warning: unable to read input: " .. message)
+    end
+    return current
+end
+
+println("=== Basic Profile CLI ===")
+println("Enter answers for each prompt (press Enter to keep the default).")
+println("")
+
+local dir_result = os.create_dir(STORAGE_DIR)
+if dir_result is Err(message) then
+    println("Warning: could not prepare storage directory: " .. message)
+end
+
+local existing_profile = load_profile(STORAGE_FILE)
+
+local current_name = get_profile_field(existing_profile, "name", DEFAULT_NAME)
+local current_age = get_profile_field(existing_profile, "age", DEFAULT_AGE)
+local current_color = get_profile_field(existing_profile, "color", DEFAULT_COLOR)
+
+local name = prompt_field("Name", current_name)
+local age = prompt_field("Age", current_age)
+local color = prompt_field("Favorite color", current_color)
+
+local updated_profile = new_profile(name, age, color)
+local save_result = save_profile(STORAGE_FILE, updated_profile)
+if save_result is Ok(_) then
+    println("\nSaved your preferences to " .. STORAGE_FILE)
+elseif save_result is Err(message) then
+    println("\nUnable to save profile: " .. message)
+end
+
+println("")
+println("Summary:")
+println("  Name: " .. tostring(name))
+println("  Age: " .. tostring(age))
+println("  Favorite color: " .. tostring(color))

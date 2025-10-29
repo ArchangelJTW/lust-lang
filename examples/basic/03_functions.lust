@@ -1,0 +1,22 @@
+
+function add(a: int, b: int): int
+    return a + b
+end
+
+function greet(name: string): string
+    return "Hello, " .. name .. "!"
+end
+
+
+function factorial(n: int): int
+    if n <= 1 then
+        return 1
+    end
+    return n * factorial(n - 1)
+end
+
+println(add(5, 3))
+println(greet("World"))
+println(factorial(5))  -- Outputs: 120
+
+

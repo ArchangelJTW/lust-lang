@@ -1,0 +1,20 @@
+-- Simple benchmark: sum numbers from 1 to N
+
+
+function main(): int
+    local sum: int = 0
+    local i: int = 1
+    local n: int = 10000000  -- 10 million iterations
+
+    while i <= n do
+        sum = sum + i
+        i = i + 1
+    end
+
+    print("Sum: ")
+    println(sum)
+    return 0
+end
+
+
+main()

@@ -1,0 +1,22 @@
+-- Simple trait test without self parameter
+
+trait Printable
+    function to_string(self): string
+end
+
+struct Point
+    x: int
+    y: int
+end
+
+impl Printable for Point
+    function to_string(self): string
+        return "Point(" .. tostring(self.x) .. ", " .. tostring(self.y) .. ")"
+    end
+end
+
+local p: Point = Point { x = 10, y = 20 }
+local s: string = p:to_string()
+println(s)
+
+

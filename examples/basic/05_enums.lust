@@ -1,0 +1,33 @@
+
+enum Status
+    Pending,
+    Running,
+    Complete(int)
+end
+
+
+function check_status(s: Status): string
+    if s is Pending then
+        return "Waiting to start..."
+    elseif s is Running then
+        return "In progress..."
+    elseif s is Complete(code) then
+        if code == 0 then
+            return "Success!"
+        end
+        return "Failed with code"
+    end
+    return "Unknown"
+end
+
+local s1 = Status.Pending
+local s2 = Status.Running
+local s3 = Status.Complete(0)
+local s4 = Status.Complete(1)
+
+println(check_status(s1))
+println(check_status(s2))
+println(check_status(s3))
+println(check_status(s4))
+
+

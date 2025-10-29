@@ -1,0 +1,36 @@
+-- Basic trait definition and implementation
+
+trait Drawable
+    function draw(self)
+end
+
+
+struct Circle
+    radius: float
+end
+
+impl Drawable for Circle
+    function draw(self)
+        println("Drawing circle with radius: " .. tostring(self.radius))
+    end
+end
+
+struct Rectangle
+    width: float
+    height: float
+end
+
+impl Drawable for Rectangle
+    function draw(self)
+        println("Drawing rectangle: " .. tostring(self.width) .. "x" .. tostring(self.height))
+    end
+end
+
+local c: Circle = Circle { radius = 5.0 }
+c:draw()
+
+local r: Rectangle = Rectangle { width = 10.0, height = 20.0 }
+r:draw()
+
+
+

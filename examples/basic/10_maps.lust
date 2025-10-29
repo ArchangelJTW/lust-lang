@@ -1,0 +1,42 @@
+-- Map<K, V> - typed homogeneous key-value collections
+
+-- Create a map with type annotations
+local scores: Map<string, int> = {
+    Alice = 100,
+    Bob = 85,
+    Charlie = 92
+}
+
+-- Get returns Option<V>
+local alice_score = scores:get("Alice")
+if alice_score:is_some() then
+    println(alice_score:unwrap())     -- Outputs: 100
+end
+
+-- Set adds or updates
+scores:set("David", 88)
+
+-- Check if key exists
+println(scores:has("Alice"))          -- Outputs: true
+println(scores:has("Eve"))            -- Outputs: false
+
+-- Length
+println(scores:len())                 -- Outputs: 4
+
+-- Get all keys (returns Array<K>)
+local all_names = scores:keys()
+println(all_names:len())              -- Outputs: 4
+
+-- Get all values (returns Array<V>)
+local all_scores = scores:values()
+println(all_scores:len())             -- Outputs: 4
+
+-- Delete returns Option<V>
+local removed = scores:delete("Bob")
+if removed:is_some() then
+    println(removed:unwrap())         -- Outputs: 85
+end
+
+println(scores:len())                 -- Outputs: 3
+ 
+

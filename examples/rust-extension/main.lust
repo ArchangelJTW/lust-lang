@@ -1,0 +1,24 @@
+use externs.lust_double.*
+use externs.lust_double.nested.host_quadruple
+use externs.lust_triple.*
+
+pub function main()
+    local data: Array<int> = []
+
+    for i = 1, 50 do
+        data:push(i)
+    end
+
+    local sum = 0
+    for value in data do
+        sum = sum + host_double(value)
+        println("Test print")
+        println("host_double(" .. tostring(value) .. ") = " .. tostring(host_double(value)))
+        println("host_triple(" .. tostring(value) .. ") = " .. tostring(host_triple(value)))
+        println("host_quadruple(" .. tostring(value) .. ") = " .. tostring(host_quadruple(value)))
+    end
+
+    println(sum)
+end
+
+main()

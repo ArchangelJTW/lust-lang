@@ -1,0 +1,69 @@
+-- Cooperative task scheduling demo
+-- Drives two tasks in a round-robin loop until both complete.
+
+function ticker(name: string, count: int): string
+    for step = 1, count do
+        println(name .. " tick " .. tostring(step))
+        task.yield(name .. " checkpoint " .. tostring(step))
+    end
+    return name .. " done"
+end
+
+function describe_unknown(opt: Option<unknown>): string
+    if opt:is_some() then
+        return tostring(opt:unwrap())
+    end
+    return "None"
+end
+
+function describe_error(opt: Option<string>): string
+    return opt:unwrap_or("None")
+end
+
+function log_completion(label: string, info: TaskInfo)
+    println(label .. " state=" .. tostring(info.state))
+    println(label .. " result=" .. describe_unknown(info.last_result))
+    println(label .. " error=" .. describe_error(info.error))
+end
+
+function step_task(label: string, handle: Task): bool
+    local status = task.status(handle)
+    if status == TaskStatus.Completed or status == TaskStatus.Stopped or status == TaskStatus.Failed then
+        local info = task.info(handle)
+        log_completion(label, info)
+        return true
+    end
+
+    local resume_info = task.resume(handle)
+    println(label .. " yield=" .. describe_unknown(resume_info.last_yield))
+    return false
+end
+
+function run_loop(alpha_label: string, alpha_handle: Task, beta_label: string, beta_handle: Task)
+    local alpha_done = false
+    local beta_done = false
+    while not (alpha_done and beta_done) do
+        if not alpha_done then
+            alpha_done = step_task(alpha_label, alpha_handle)
+        end
+        if not beta_done then
+            beta_done = step_task(beta_label, beta_handle)
+        end
+    end
+end
+
+println("=== Cooperative Tasks Demo ===")
+
+local alpha = task.create(function(): string
+    return ticker("alpha", 2)
+end)
+
+local beta = task.create(function(): string
+    return ticker("beta", 3)
+end)
+
+run_loop("alpha", alpha, "beta", beta)
+
+println("All tasks complete")
+
+

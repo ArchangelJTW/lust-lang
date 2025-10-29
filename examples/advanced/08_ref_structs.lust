@@ -1,0 +1,60 @@
+-- Weak parent links with `ref` fields ensure trees don't leak.
+
+struct Node
+    name: string,
+    parent: ref Node,
+    children: Array<Node>
+end
+
+impl Node
+    function new(name: string): Node
+        return Node {
+            name = name,
+            parent = Option.None,
+            children = []
+        }
+    end
+
+end
+
+function attach_child(parent: Node, child: Node): Node
+    -- Assigning to a `ref` field accepts either an Option<Node> or a Node.
+    child.parent = parent
+    parent.children:push(child)
+    return child
+end
+
+function print_ancestors(node: Node)
+    println("Ancestors of " .. node.name .. ":")
+    local cursor = node.parent
+    while true do
+        if cursor is Some(parent) then
+            println("  -> " .. parent.name)
+            cursor = parent.parent
+        else
+            break
+        end
+    end
+end
+
+local root = Node.new("root")
+local child = attach_child(root, Node.new("child"))
+local grandchild = attach_child(child, Node.new("grandchild"))
+
+print_ancestors(grandchild)
+
+local direct_parent = grandchild.parent
+if direct_parent is Some(parent) then
+    println("Direct parent of " .. grandchild.name .. " is " .. parent.name)
+end
+
+-- Removing the grandchild severs the only strong edge; the weak parent becomes None.
+local removed = child.children:pop()
+if removed is Some(orphan) then
+    orphan.parent = Option.None
+    if orphan.parent is None then
+        println(orphan.name .. " is now detached from the tree.")
+    end
+end
+
+

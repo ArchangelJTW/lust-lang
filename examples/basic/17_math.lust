@@ -1,0 +1,27 @@
+-- Math helper methods for floats and ints
+
+-- Float methods
+local x: float = 3.7
+println(x:floor())           -- Outputs: 3
+println(x:ceil())            -- Outputs: 4
+println(x:round())           -- Outputs: 4
+
+local y: float = 16.0
+println(y:sqrt())            -- Outputs: 4
+
+local z: float = -5.5
+println(z:abs())             -- Outputs: 5.5
+
+local w: float = 7.5
+println(w:clamp(0.0, 10.0))  -- Outputs: 7.5
+println(w:clamp(0.0, 5.0))   -- Outputs: 5
+
+-- Int methods
+local a: int = -42
+println(a:abs())             -- Outputs: 42
+
+local b: int = 75
+println(b:clamp(0, 100))     -- Outputs: 75
+println(b:clamp(0, 50))      -- Outputs: 50
+ 
+

@@ -1,0 +1,26 @@
+use lib.math as math
+use lib.math.{Point, vector}
+use lib.math.{add, vector.length_squared, vector.make as make_vector}
+
+println("[main] starting module showcase")
+
+function describe_vector(label: string, vec: vector.IntVector)
+    println("[main] " .. label .. ": (" .. tostring(vec.x) .. ", " .. tostring(vec.y) .. ")")
+end
+
+println("[main] math.add via grouped import: " .. tostring(add(1, 2)))
+println("[main] math.add via module alias: " .. tostring(math.add(3, 4)))
+
+local p: Point = Point { x = 10, y = 20 }
+println("[main] constructed Point: (" .. tostring(p.x) .. ", " .. tostring(p.y) .. ")")
+
+local velocity: vector.IntVector = make_vector(3, 4)
+describe_vector("velocity", velocity)
+
+local energy: int = length_squared(velocity)
+println("[main] velocity length squared: " .. tostring(energy))
+
+local origin: vector.IntVector = vector.zero()
+describe_vector("origin", origin)
+
+

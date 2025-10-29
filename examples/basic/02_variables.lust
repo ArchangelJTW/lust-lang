@@ -1,0 +1,22 @@
+
+-- Explicit type annotations
+local x: int = 42
+local name: string = "Alice"
+local pi: float = 3.14159
+local active: bool = true
+
+-- Type inference
+local inferred = 100  -- inferred as int
+
+-- Variables are mutable
+local counter = 0
+counter = counter + 1
+
+println(x)
+println(name)
+println(pi)
+println(active)
+println(inferred)
+println(counter)
+ 
+

@@ -6,7 +6,7 @@ include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
 license-file = "LICENSE"
 readme = "README.md"
 keywords = ["lust", "language-server", "lsp"]
-categories = ["development-tools", "text-editors"]
+categories = ["development-tools", "development-tools::debugging"]
 description = "A WIP implementation of the language server protocol (LSP) for the Lust programming language"
 homepage = "https://lust-lang.dev/"
 

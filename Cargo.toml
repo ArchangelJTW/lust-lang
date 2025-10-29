@@ -20,8 +20,7 @@ categories = [
   "parser-implementations",
   "compilers",
   "development-tools",
-  "embedded-development",
-  "webassembly",
+  "wasm",
 ]
 description = "A WIP Lua-like scripting language implemented in Rust, designed for embedding and rapid scripting with a strong type system, with trace-based JIT."
 homepage = "https://lust-lang.dev/"

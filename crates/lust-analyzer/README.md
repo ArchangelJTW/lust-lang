@@ -8,10 +8,9 @@ Heavily WIP language server for the Lust scripting language. It targets editor i
 - Basic parsing + type checking go through, but large areas (completions, refactors, multi-file project awareness) are experimental or missing.
 - Expect frequent breaking changes while the protocol surface settles.
 
-## Trying It
+## Install
 ```bash
-git clone https://github.com/<your-org>/lust-lang
-cargo run -p lust-analyzer
+cargo install lust-analyzer
 ```
 
 Point your editor’s LSP client at the spawned process to explore the current feature set. Contributions and bug reports are welcome!

@@ -16,13 +16,13 @@ Lust is a strongly typed, Lua-inspired scripting language implemented in Rust. I
 Add the crate (renamed for ergonomic imports):
 
 ```bash
-cargo add lust-lang --rename lust
+cargo add lust-rs --rename lust
 ```
 
 Install the CLI:
 
 ```bash
-cargo install lust-lang
+cargo install lust-rs
 lust --help
 ```
 

@@ -253,6 +253,10 @@ impl ModuleLoader {
                                     self.simple_name(&new_name).to_string(),
                                     new_name.clone(),
                                 );
+                                imports.function_aliases.insert(
+                                    self.simple_name(&new_name).to_string(),
+                                    new_name.clone(),
+                                );
 
                                 rewritten.push(crate::ast::ExternItem::Function {
                                     name: new_name,

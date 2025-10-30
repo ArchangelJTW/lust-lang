@@ -1,12 +1,143 @@
 use crate::ast::{EnumDef, FieldOwnership, Item, ItemKind, Span, StructDef, Type, TypeKind};
-use crate::bytecode::{Compiler, NativeCallResult, Value};
+use crate::bytecode::{Compiler, NativeCallResult, TaskHandle, Value};
 use crate::modules::{ModuleImports, ModuleLoader};
 use crate::typechecker::{FunctionSignature, TypeChecker};
 use crate::vm::VM;
 use crate::{LustConfig, LustError, Result};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+type AsyncValueFuture = Pin<Box<dyn Future<Output = std::result::Result<Value, String>>>>;
+
+struct AsyncRegistry {
+    pending: HashMap<u64, AsyncTaskEntry>,
+}
+
+impl AsyncRegistry {
+    fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+        }
+    }
+
+    fn register(
+        &mut self,
+        handle: TaskHandle,
+        future: AsyncValueFuture,
+    ) -> std::result::Result<(), String> {
+        let key = handle.id();
+        if self.pending.contains_key(&key) {
+            return Err(format!(
+                "Task {} already has a pending async native call",
+                key
+            ));
+        }
+
+        self.pending
+            .insert(key, AsyncTaskEntry::new(handle, future));
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+struct AsyncTaskEntry {
+    handle: TaskHandle,
+    future: AsyncValueFuture,
+    wake_flag: Arc<WakeFlag>,
+    immediate_poll: bool,
+}
+
+impl AsyncTaskEntry {
+    fn new(handle: TaskHandle, future: AsyncValueFuture) -> Self {
+        Self {
+            handle,
+            future,
+            wake_flag: Arc::new(WakeFlag::new()),
+            immediate_poll: true,
+        }
+    }
+
+    fn take_should_poll(&mut self) -> bool {
+        if self.immediate_poll {
+            self.immediate_poll = false;
+            true
+        } else {
+            self.wake_flag.take()
+        }
+    }
+
+    fn make_waker(&self) -> Waker {
+        make_async_waker(&self.wake_flag)
+    }
+}
+
+struct WakeFlag {
+    pending: AtomicBool,
+}
+
+impl WakeFlag {
+    fn new() -> Self {
+        Self {
+            pending: AtomicBool::new(true),
+        }
+    }
+
+    fn take(&self) -> bool {
+        self.pending.swap(false, Ordering::SeqCst)
+    }
+
+    fn wake(&self) {
+        self.pending.store(true, Ordering::SeqCst);
+    }
+}
+
+fn make_async_waker(flag: &Arc<WakeFlag>) -> Waker {
+    unsafe {
+        Waker::from_raw(RawWaker::new(
+            Arc::into_raw(flag.clone()) as *const (),
+            &ASYNC_WAKER_VTABLE,
+        ))
+    }
+}
+
+unsafe fn async_waker_clone(ptr: *const ()) -> RawWaker {
+    let arc = Arc::<WakeFlag>::from_raw(ptr as *const WakeFlag);
+    let cloned = arc.clone();
+    std::mem::forget(arc);
+    RawWaker::new(Arc::into_raw(cloned) as *const (), &ASYNC_WAKER_VTABLE)
+}
+
+unsafe fn async_waker_wake(ptr: *const ()) {
+    let arc = Arc::<WakeFlag>::from_raw(ptr as *const WakeFlag);
+    arc.wake();
+}
+
+unsafe fn async_waker_wake_by_ref(ptr: *const ()) {
+    let arc = Arc::<WakeFlag>::from_raw(ptr as *const WakeFlag);
+    arc.wake();
+    std::mem::forget(arc);
+}
+
+unsafe fn async_waker_drop(ptr: *const ()) {
+    let _ = Arc::<WakeFlag>::from_raw(ptr as *const WakeFlag);
+}
+
+static ASYNC_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    async_waker_clone,
+    async_waker_wake,
+    async_waker_wake_by_ref,
+    async_waker_drop,
+);
 pub struct EmbeddedBuilder {
     base_dir: PathBuf,
     modules: HashMap<String, String>,
@@ -110,6 +241,8 @@ pub struct EmbeddedProgram {
     struct_defs: HashMap<String, StructDef>,
     enum_defs: HashMap<String, EnumDef>,
     entry_script: Option<String>,
+    entry_module: String,
+    async_registry: Rc<RefCell<AsyncRegistry>>,
 }
 
 impl EmbeddedProgram {
@@ -122,7 +255,7 @@ impl EmbeddedProgram {
     }
 
     pub fn signature(&self, function_name: &str) -> Option<&FunctionSignature> {
-        self.signatures.get(function_name)
+        self.find_signature(function_name).map(|(_, sig)| sig)
     }
 
     pub fn typed_functions(&self) -> impl Iterator<Item = (&String, &FunctionSignature)> {
@@ -135,6 +268,119 @@ impl EmbeddedProgram {
 
     pub fn enum_definition(&self, type_name: &str) -> Option<&EnumDef> {
         self.enum_defs.get(type_name)
+    }
+
+    fn find_signature(&self, name: &str) -> Option<(String, &FunctionSignature)> {
+        if let Some(sig) = self.signatures.get(name) {
+            return Some((name.to_string(), sig));
+        }
+
+        for candidate in self.signature_lookup_candidates(name) {
+            if let Some(sig) = self.signatures.get(&candidate) {
+                return Some((candidate, sig));
+            }
+        }
+
+        let matches = self
+            .signatures
+            .iter()
+            .filter_map(|(key, sig)| {
+                if Self::simple_name(key) == name {
+                    Some((key, sig))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            let (key, sig) = matches[0];
+            return Some((key.clone(), sig));
+        }
+
+        None
+    }
+
+    fn resolve_signature(&self, name: &str) -> Result<(String, &FunctionSignature)> {
+        if let Some(found) = self.find_signature(name) {
+            return Ok(found);
+        }
+
+        let matches = self
+            .signatures
+            .keys()
+            .filter(|key| Self::simple_name(key) == name)
+            .count();
+        if matches > 1 {
+            return Err(LustError::TypeError {
+                message: format!(
+                    "Cannot register native '{}': multiple matching functions found; specify a fully qualified name",
+                    name
+                ),
+            });
+        }
+
+        Err(LustError::TypeError {
+            message: format!(
+                "Cannot register native '{}': function not declared in Lust source",
+                name
+            ),
+        })
+    }
+
+    fn signature_lookup_candidates(&self, name: &str) -> Vec<String> {
+        let mut candidates: Vec<String> = Vec::new();
+        if name.contains("::") {
+            candidates.push(name.replace("::", "."));
+        }
+
+        if name.contains('.') {
+            candidates.push(name.replace('.', "::"));
+        }
+
+        if !name.contains('.') && !name.contains("::") {
+            let module = &self.entry_module;
+            candidates.push(format!("{}.{}", module, name));
+            candidates.push(format!("{}::{}", module, name));
+        }
+
+        candidates
+    }
+
+    fn simple_name(name: &str) -> &str {
+        name.rsplit(|c| c == '.' || c == ':').next().unwrap_or(name)
+    }
+
+    fn register_native_with_aliases<F>(
+        &mut self,
+        requested_name: &str,
+        canonical: String,
+        func: F,
+    ) where
+        F: Fn(&[Value]) -> std::result::Result<NativeCallResult, String> + 'static,
+    {
+        let native_fn: Rc<dyn Fn(&[Value]) -> std::result::Result<NativeCallResult, String>> =
+            Rc::new(func);
+        let value = Value::NativeFunction(native_fn);
+        let mut aliases: Vec<String> = Vec::new();
+        aliases.push(canonical.clone());
+        let canonical_normalized = normalize_global_name(&canonical);
+        if canonical_normalized != canonical {
+            aliases.push(canonical_normalized);
+        }
+
+        if requested_name != canonical {
+            aliases.push(requested_name.to_string());
+            let normalized = normalize_global_name(requested_name);
+            if normalized != requested_name {
+                aliases.push(normalized);
+            }
+        }
+
+        aliases.sort();
+        aliases.dedup();
+        for key in aliases {
+            self.vm.register_native(key, value.clone());
+        }
     }
 
     pub fn get_global_value(&self, name: &str) -> Option<Value> {
@@ -331,21 +577,39 @@ impl EmbeddedProgram {
         self.vm.register_native(name, native);
     }
 
+    pub fn register_async_native<F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        func: F,
+    ) -> Result<()>
+    where
+        F: Fn(Vec<Value>) -> Fut + 'static,
+        Fut: Future<Output = std::result::Result<Value, String>> + 'static,
+    {
+        let registry = self.async_registry.clone();
+        let name_string = name.into();
+        let handler = move |values: &[Value]| -> std::result::Result<NativeCallResult, String> {
+            let args: Vec<Value> = values.iter().cloned().collect();
+            let future: AsyncValueFuture = Box::pin(func(args));
+            VM::with_current(|vm| {
+                let handle = vm
+                    .current_task_handle()
+                    .ok_or_else(|| "Async native functions require a running task".to_string())?;
+                registry.borrow_mut().register(handle, future)?;
+                Ok(NativeCallResult::Yield(Value::Nil))
+            })
+        };
+        self.register_native_fn(name_string, handler);
+        Ok(())
+    }
+
     pub fn register_typed_native<Args, R, F>(&mut self, name: &str, func: F) -> Result<()>
     where
         Args: FromLustArgs,
         R: IntoLustValue + FromLustValue,
         F: Fn(Args) -> std::result::Result<R, String> + 'static,
     {
-        let signature = self
-            .signatures
-            .get(name)
-            .ok_or_else(|| LustError::TypeError {
-                message: format!(
-                    "Cannot register native '{}': function not declared in Lust source",
-                    name
-                ),
-            })?;
+        let (canonical, signature) = self.resolve_signature(name)?;
         if !Args::matches_signature(&signature.params) {
             return Err(LustError::TypeError {
                 message: format!(
@@ -361,7 +625,53 @@ impl EmbeddedProgram {
             let result = func(args)?;
             Ok(NativeCallResult::Return(result.into_value()))
         };
-        self.register_native_fn(name.to_string(), handler);
+        self.register_native_with_aliases(name, canonical, handler);
+        Ok(())
+    }
+
+    pub fn register_async_typed_native<Args, R, F, Fut>(
+        &mut self,
+        name: &str,
+        func: F,
+    ) -> Result<()>
+    where
+        Args: FromLustArgs,
+        R: IntoLustValue + FromLustValue,
+        F: Fn(Args) -> Fut + 'static,
+        Fut: Future<Output = std::result::Result<R, String>> + 'static,
+    {
+        let (canonical, signature) = self.resolve_signature(name)?;
+        let signature = signature.clone();
+        if !Args::matches_signature(&signature.params) {
+            return Err(LustError::TypeError {
+                message: format!(
+                    "Native '{}' argument types do not match Lust signature",
+                    name
+                ),
+            });
+        }
+
+        ensure_return_type::<R>(name, &signature.return_type)?;
+        let registry = self.async_registry.clone();
+        let handler = move |values: &[Value]| -> std::result::Result<NativeCallResult, String> {
+            let args = Args::from_values(values)?;
+            let future = func(args);
+            let mapped = async move {
+                match future.await {
+                    Ok(result) => Ok(result.into_value()),
+                    Err(err) => Err(err),
+                }
+            };
+            let future: AsyncValueFuture = Box::pin(mapped);
+            VM::with_current(|vm| {
+                let handle = vm
+                    .current_task_handle()
+                    .ok_or_else(|| "Async native functions require a running task".to_string())?;
+                registry.borrow_mut().register(handle, future)?;
+                Ok(NativeCallResult::Yield(Value::Nil))
+            })
+        };
+        self.register_native_with_aliases(name, canonical, handler);
         Ok(())
     }
 
@@ -407,6 +717,71 @@ impl EmbeddedProgram {
                 ),
             }),
         }
+    }
+
+    pub fn poll_async_tasks(&mut self) -> Result<()> {
+        let pending_ids: Vec<u64> = {
+            let registry = self.async_registry.borrow();
+            registry.pending.keys().copied().collect()
+        };
+
+        let mut completions: Vec<(TaskHandle, std::result::Result<Value, String>)> = Vec::new();
+        for id in pending_ids {
+            let handle = TaskHandle(id);
+            if self.vm.get_task_instance(handle).is_err() {
+                self.async_registry.borrow_mut().pending.remove(&id);
+                continue;
+            }
+
+            let maybe_outcome = {
+                let mut registry = self.async_registry.borrow_mut();
+                let entry = match registry.pending.get_mut(&id) {
+                    Some(entry) => entry,
+                    None => continue,
+                };
+
+                if !entry.take_should_poll() {
+                    continue;
+                }
+
+                let waker = entry.make_waker();
+                let mut cx = Context::from_waker(&waker);
+                match entry.future.as_mut().poll(&mut cx) {
+                    Poll::Ready(result) => {
+                        let handle = entry.handle;
+                        registry.pending.remove(&id);
+                        Some((handle, result))
+                    }
+
+                    Poll::Pending => None,
+                }
+            };
+
+            if let Some(outcome) = maybe_outcome {
+                completions.push(outcome);
+            }
+        }
+
+        for (handle, outcome) in completions {
+            match outcome {
+                Ok(value) => {
+                    self.vm.resume_task_handle(handle, Some(value))?;
+                }
+
+                Err(message) => {
+                    self.vm.fail_task_handle(
+                        handle,
+                        LustError::RuntimeError { message },
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn has_pending_async_tasks(&self) -> bool {
+        !self.async_registry.borrow().is_empty()
     }
 }
 
@@ -493,6 +868,8 @@ fn compile_in_memory(
         struct_defs,
         enum_defs,
         entry_script,
+        entry_module: program.entry_module,
+        async_registry: Rc::new(RefCell::new(AsyncRegistry::new())),
     })
 }
 
@@ -797,6 +1174,192 @@ fn string_matcher(_: &Value, ty: &Type) -> bool {
             .iter()
             .any(|alt| matches!(&alt.kind, TypeKind::String | TypeKind::Unknown)),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
+
+    #[derive(Default)]
+    struct ManualAsyncState {
+        result: Mutex<Option<std::result::Result<i64, String>>>,
+        waker: Mutex<Option<Waker>>,
+    }
+
+    impl ManualAsyncState {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn future(self: &Arc<Self>) -> ManualFuture {
+            ManualFuture {
+                state: Arc::clone(self),
+            }
+        }
+
+        fn complete_ok(&self, value: i64) {
+            self.complete(Ok(value));
+        }
+
+        fn complete_err(&self, message: impl Into<String>) {
+            self.complete(Err(message.into()));
+        }
+
+        fn complete(&self, value: std::result::Result<i64, String>) {
+            {
+                let mut slot = self.result.lock().unwrap();
+                *slot = Some(value);
+            }
+
+            if let Some(waker) = self.waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+    }
+
+    struct ManualFuture {
+        state: Arc<ManualAsyncState>,
+    }
+
+    impl Future for ManualFuture {
+        type Output = std::result::Result<i64, String>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            {
+                let mut slot = self.state.result.lock().unwrap();
+                if let Some(result) = slot.take() {
+                    return Poll::Ready(result);
+                }
+            }
+
+            let mut waker_slot = self.state.waker.lock().unwrap();
+            *waker_slot = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    fn build_program(source: &str) -> EmbeddedProgram {
+        EmbeddedProgram::builder()
+            .module("main", source)
+            .entry_module("main")
+            .compile()
+            .expect("compile embedded program")
+    }
+
+    #[test]
+    fn async_native_resumes_task_on_completion() {
+        let source = r#"
+            extern {
+                function fetch_value(): int
+            }
+
+            function compute(): int
+                return fetch_value()
+            end
+        "#;
+
+        let mut program = build_program(source);
+
+        let state = ManualAsyncState::new();
+        let register_state = Arc::clone(&state);
+        program
+            .register_async_typed_native::<(), i64, _, _>("fetch_value", move |_| {
+                register_state.future()
+            })
+            .expect("register async native");
+
+        let handle = {
+            let vm = program.vm_mut();
+            let compute_fn = vm
+                .function_value("main.compute")
+                .expect("compute function");
+            vm.spawn_task_value(compute_fn, Vec::new())
+                .expect("spawn task")
+        };
+
+        assert!(program.has_pending_async_tasks());
+        program.poll_async_tasks().expect("initial poll");
+        assert!(program.has_pending_async_tasks());
+
+        state.complete_ok(123);
+        program
+            .poll_async_tasks()
+            .expect("resume after completion");
+
+        {
+            let vm = program.vm_mut();
+            let task = vm.get_task_instance(handle).expect("task exists");
+            let result = task
+                .last_result
+                .as_ref()
+                .and_then(|value| value.as_int())
+                .expect("task produced result");
+            assert_eq!(result, 123);
+            assert!(task.error.is_none());
+        }
+
+        assert!(!program.has_pending_async_tasks());
+    }
+
+    #[test]
+    fn async_native_failure_marks_task_failed() {
+        let source = r#"
+            extern {
+                function fetch_value(): int
+            }
+
+            function compute(): int
+                return fetch_value()
+            end
+        "#;
+
+        let mut program = build_program(source);
+
+        let state = ManualAsyncState::new();
+        let register_state = Arc::clone(&state);
+        program
+            .register_async_typed_native::<(), i64, _, _>("fetch_value", move |_| {
+                register_state.future()
+            })
+            .expect("register async native");
+
+        let handle = {
+            let vm = program.vm_mut();
+            let compute_fn = vm
+                .function_value("main.compute")
+                .expect("compute function");
+            vm.spawn_task_value(compute_fn, Vec::new())
+                .expect("spawn task")
+        };
+
+        program.poll_async_tasks().expect("initial poll");
+        state.complete_err("boom");
+        let err = program
+            .poll_async_tasks()
+            .expect_err("poll should propagate failure");
+        match err {
+            LustError::RuntimeError { message } => assert_eq!(message, "boom"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        {
+            let vm = program.vm_mut();
+            let task = vm.get_task_instance(handle).expect("task exists");
+            assert!(task.last_result.is_none());
+            let error_message = task
+                .error
+                .as_ref()
+                .map(|e| e.to_string())
+                .expect("task should record error");
+            assert!(error_message.contains("boom"));
+        }
+
+        assert!(!program.has_pending_async_tasks());
     }
 }
 

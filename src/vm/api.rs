@@ -374,4 +374,36 @@ impl VM {
             Err(e) => Err(self.annotate_runtime_error(e)),
         }
     }
+
+    pub fn function_value(&self, function_name: &str) -> Option<Value> {
+        let canonical = if function_name.contains("::") {
+            function_name.replace("::", ".")
+        } else {
+            function_name.to_string()
+        };
+        self.functions
+            .iter()
+            .position(|f| f.name == canonical)
+            .map(Value::Function)
+    }
+
+    pub fn fail_task_handle(&mut self, handle: TaskHandle, error: LustError) -> Result<()> {
+        let task_id = self.task_id_from_handle(handle)?;
+        let mut task = self
+            .task_manager
+            .detach(task_id)
+            .ok_or_else(|| LustError::RuntimeError {
+                message: format!("Invalid task handle {}", handle.id()),
+            })?;
+        task.state = TaskState::Failed;
+        task.error = Some(error.clone());
+        task.last_yield = None;
+        task.last_result = None;
+        task.yield_dest = None;
+        task.call_stack.clear();
+        task.pending_return_value = None;
+        task.pending_return_dest = None;
+        self.task_manager.attach(task);
+        Err(error)
+    }
 }

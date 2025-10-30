@@ -209,7 +209,7 @@ impl VM {
         Ok(task_id.to_handle())
     }
 
-    pub(super) fn spawn_task_value(&mut self, func: Value, args: Vec<Value>) -> Result<TaskHandle> {
+    pub fn spawn_task_value(&mut self, func: Value, args: Vec<Value>) -> Result<TaskHandle> {
         let handle = self.create_task_value(func, args)?;
         let task_id = TaskId(handle.id());
         if let Err(err) = self.run_task_internal(task_id, None) {
@@ -220,7 +220,7 @@ impl VM {
         Ok(handle)
     }
 
-    pub(super) fn resume_task_handle(
+    pub fn resume_task_handle(
         &mut self,
         handle: TaskHandle,
         resume_value: Option<Value>,
@@ -284,7 +284,7 @@ impl VM {
         Ok(())
     }
 
-    pub(super) fn get_task_instance(&self, handle: TaskHandle) -> Result<&TaskInstance> {
+    pub fn get_task_instance(&self, handle: TaskHandle) -> Result<&TaskInstance> {
         let task_id = self.task_id_from_handle(handle)?;
         self.task_manager
             .get(task_id)
@@ -293,7 +293,7 @@ impl VM {
             })
     }
 
-    pub(super) fn current_task_handle(&self) -> Option<TaskHandle> {
+    pub fn current_task_handle(&self) -> Option<TaskHandle> {
         self.current_task.map(|id| id.to_handle())
     }
 

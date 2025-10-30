@@ -1,6 +1,6 @@
 [package]
 name = "lust-analyzer"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
 license-file = "LICENSE"

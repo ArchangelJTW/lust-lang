@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "lust-analyzer"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "lust-rs",
  "tokio",
@@ -1241,3 +1241,7 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[patch.unused]]
+name = "crunchy"
+version = "0.2.3"

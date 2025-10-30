@@ -14,7 +14,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Paths
-BINARY="./target/release/lust"
+BINARY="lust"
 EXAMPLES_DIR="./examples"
 BASIC_DIR="$EXAMPLES_DIR/basic"
 ADVANCED_DIR="$EXAMPLES_DIR/advanced"
@@ -26,11 +26,11 @@ FAILED=0
 TOTAL=0
 
 # Check if binary exists
-if [ ! -f "$BINARY" ]; then
-	echo -e "${RED}Error: Release binary not found at $BINARY${NC}"
-	echo -e "${YELLOW}Run 'cargo build --release' first${NC}"
-	exit 1
-fi
+# if [ ! -f "$BINARY" ]; then
+# 	echo -e "${RED}Error: Release binary not found at $BINARY${NC}"
+# 	echo -e "${YELLOW}Run 'cargo build --release' first${NC}"
+# 	exit 1
+# fi
 
 # Function to run a single example
 run_example() {

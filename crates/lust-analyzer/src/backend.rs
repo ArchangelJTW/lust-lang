@@ -19,11 +19,8 @@ use lust::ast::{
 };
 use lust::builtins::{self, BuiltinFunction, BuiltinMethod, TypeExpr};
 use lust::{Compiler, ModuleLoader, Span, TypeChecker};
-use std::{
-    collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use hashbrown::{HashMap, HashSet};
+use std::{path::{Path, PathBuf}, sync::Arc};
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{

@@ -2,7 +2,7 @@ use super::*;
 use crate::utils::analyzer_lust_config;
 use lust::modules::ModuleLoader;
 use lust::TypeChecker;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1149,4 +1149,3 @@ fn analyze_context_handles_cursor_on_trigger() {
     assert!(ctx_after.prefix.is_empty());
     assert_eq!(ctx_after.object_name.as_deref(), Some("self"));
 }
-

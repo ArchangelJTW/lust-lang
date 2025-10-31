@@ -2,7 +2,7 @@ use crate::utils::{simple_type_name, span_for_identifier};
 use lust::ast::{Expr, ExprKind, ExternItem, Item, ItemKind, Stmt, StmtKind, Type, TypeKind};
 use lust::modules::LoadedModule;
 use lust::Span;
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 use tower_lsp::lsp_types::{SemanticToken, SemanticTokenType};
 pub(crate) const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::TYPE,

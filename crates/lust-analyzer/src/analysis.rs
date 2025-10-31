@@ -6,12 +6,8 @@ use crate::utils::{
 use lust::ast::{EnumDef, FunctionParam, ItemKind, StructDef, TraitDef, Type, Visibility};
 use lust::modules::{LoadedModule, Program};
 use lust::{Span, TypeCollection};
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Write,
-    fs,
-    path::{Path, PathBuf},
-};
+use hashbrown::{HashMap, HashSet};
+use std::{fmt::Write, fs, path::{Path, PathBuf}};
 use tower_lsp::lsp_types::{Hover, HoverContents, Location, MarkupContent, MarkupKind, Position};
 use url::Url;
 #[derive(Clone)]

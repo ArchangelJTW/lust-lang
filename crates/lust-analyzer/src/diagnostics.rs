@@ -1,5 +1,5 @@
 use lust::LustError;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 pub(crate) fn error_to_diagnostics(

@@ -1,7 +1,8 @@
+use alloc::{format, string::ToString, vec::Vec};
 use crate::bytecode::{Register, Value};
 use crate::jit;
 use crate::jit::trace::{Trace, TraceOp};
-use std::collections::HashSet;
+use hashbrown::HashSet;
 pub struct TraceOptimizer {
     hoisted_constants: Vec<(Register, Value)>,
 }
@@ -106,7 +107,7 @@ impl TraceOptimizer {
             if i + 1 < trace.ops.len() {
                 let current = &trace.ops[i];
                 let next = &trace.ops[i + 1];
-                if let Some((arith_dest, final_dest)) = self.match_arithmetic_move(current, next) {
+                if let Some((_, final_dest)) = self.match_arithmetic_move(current, next) {
                     let mut rewritten = current.clone();
                     self.rewrite_arithmetic_dest(&mut rewritten, final_dest);
                     new_ops.push(rewritten);
@@ -164,10 +165,10 @@ impl TraceOptimizer {
         }
 
         let loop_condition_op = trace.ops.iter().find_map(|op| match op {
-            TraceOp::Le { dest, lhs, rhs } => Some((op.clone(), *dest)),
-            TraceOp::Lt { dest, lhs, rhs } => Some((op.clone(), *dest)),
-            TraceOp::Ge { dest, lhs, rhs } => Some((op.clone(), *dest)),
-            TraceOp::Gt { dest, lhs, rhs } => Some((op.clone(), *dest)),
+            TraceOp::Le { dest, .. }
+            | TraceOp::Lt { dest, .. }
+            | TraceOp::Ge { dest, .. }
+            | TraceOp::Gt { dest, .. } => Some((op.clone(), *dest)),
             _ => None,
         });
         if loop_condition_op.is_none() {
@@ -178,7 +179,7 @@ impl TraceOptimizer {
         let original_ops = trace.ops.clone();
         let mut new_ops = Vec::new();
         new_ops.extend(original_ops.iter().cloned());
-        for iteration in 1..factor {
+        for _ in 1..factor {
             new_ops.push(loop_cmp_op.clone());
             new_ops.push(TraceOp::GuardLoopContinue {
                 condition_register: cond_reg,

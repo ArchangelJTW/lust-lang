@@ -3,8 +3,10 @@ pub(super) use crate::ast::{
     BinaryOp, ExprKind, ExternItem, Item, ItemKind, Literal, Stmt, StmtKind, UnaryOp,
 };
 use crate::config::LustConfig;
+pub(super) use crate::number::LustInt;
 pub(super) use crate::{Expr, LustError, Result};
-pub(super) use std::collections::{HashMap, HashSet};
+pub(super) use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+pub(super) use hashbrown::{HashMap, HashSet};
 mod closures;
 mod expressions;
 mod methods;

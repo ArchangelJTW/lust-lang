@@ -1,4 +1,10 @@
 use super::*;
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 impl TypeChecker {
     pub fn check_array_literal(
         &mut self,

@@ -1,4 +1,6 @@
 use super::*;
+use alloc::{format, string::ToString};
+use core::{array, cell::RefCell, mem};
 impl VM {
     pub(super) fn run_task_internal(
         &mut self,
@@ -51,12 +53,12 @@ impl VM {
             return Err(LustError::RuntimeError { message });
         }
 
-        std::mem::swap(&mut self.call_stack, &mut task.call_stack);
-        std::mem::swap(
+        mem::swap(&mut self.call_stack, &mut task.call_stack);
+        mem::swap(
             &mut self.pending_return_value,
             &mut task.pending_return_value,
         );
-        std::mem::swap(&mut self.pending_return_dest, &mut task.pending_return_dest);
+        mem::swap(&mut self.pending_return_dest, &mut task.pending_return_dest);
         self.current_task = Some(task_id);
         self.last_task_signal = None;
         let run_result = self.run();
@@ -102,12 +104,12 @@ impl VM {
             }
         }
 
-        std::mem::swap(&mut self.call_stack, &mut task.call_stack);
-        std::mem::swap(
+        mem::swap(&mut self.call_stack, &mut task.call_stack);
+        mem::swap(
             &mut self.pending_return_value,
             &mut task.pending_return_value,
         );
-        std::mem::swap(&mut self.pending_return_dest, &mut task.pending_return_dest);
+        mem::swap(&mut self.pending_return_dest, &mut task.pending_return_dest);
         self.task_manager.attach(task);
         if let Some(err) = error_result {
             Err(err)
@@ -148,7 +150,7 @@ impl VM {
                 let mut frame = CallFrame {
                     function_idx: func_idx,
                     ip: 0,
-                    registers: std::array::from_fn(|_| Value::Nil),
+                    registers: array::from_fn(|_| Value::Nil),
                     base_register: 0,
                     return_dest: None,
                     upvalues: Vec::new(),
@@ -179,7 +181,7 @@ impl VM {
                 let mut frame = CallFrame {
                     function_idx,
                     ip: 0,
-                    registers: std::array::from_fn(|_| Value::Nil),
+                    registers: array::from_fn(|_| Value::Nil),
                     base_register: 0,
                     return_dest: None,
                     upvalues: captured,
@@ -480,10 +482,10 @@ impl VM {
                 "iter" => {
                     let items = arr.borrow().clone();
                     let iter = crate::bytecode::value::IteratorState::Array { items, index: 0 };
-                    Ok(Value::Iterator(Rc::new(std::cell::RefCell::new(iter))))
+                    Ok(Value::Iterator(Rc::new(RefCell::new(iter))))
                 }
 
-                "len" => Ok(Value::Int(arr.borrow().len() as i64)),
+                "len" => Ok(Value::Int(int_from_usize(arr.borrow().len()))),
                 "get" => {
                     if args.is_empty() {
                         return Err(LustError::RuntimeError {
@@ -634,10 +636,10 @@ impl VM {
                     let items: Vec<Value> =
                         s.chars().map(|c| Value::string(c.to_string())).collect();
                     let iter = crate::bytecode::value::IteratorState::Array { items, index: 0 };
-                    Ok(Value::Iterator(Rc::new(std::cell::RefCell::new(iter))))
+                    Ok(Value::Iterator(Rc::new(RefCell::new(iter))))
                 }
 
-                "len" => Ok(Value::Int(s.len() as i64)),
+                "len" => Ok(Value::Int(int_from_usize(s.len()))),
                 "substring" => {
                     if args.len() < 2 {
                         return Err(LustError::RuntimeError {
@@ -671,7 +673,7 @@ impl VM {
                         message: "Search string must be a string".to_string(),
                     })?;
                     match s.find(search) {
-                        Some(pos) => Ok(Value::some(Value::Int(pos as i64))),
+                        Some(pos) => Ok(Value::some(Value::Int(int_from_usize(pos)))),
                         None => Ok(Value::none()),
                     }
                 }
@@ -779,10 +781,10 @@ impl VM {
                             .collect();
                         let iter =
                             crate::bytecode::value::IteratorState::MapPairs { items, index: 0 };
-                        return Ok(Value::Iterator(Rc::new(std::cell::RefCell::new(iter))));
+                        return Ok(Value::Iterator(Rc::new(RefCell::new(iter))));
                     }
 
-                    "len" => Ok(Value::Int(map.borrow().len() as i64)),
+                    "len" => Ok(Value::Int(int_from_usize(map.borrow().len()))),
                     "get" => {
                         if args.is_empty() {
                             return Err(LustError::RuntimeError {
@@ -890,10 +892,10 @@ impl VM {
                             .collect();
                         let iter =
                             crate::bytecode::value::IteratorState::TablePairs { items, index: 0 };
-                        return Ok(Value::Iterator(Rc::new(std::cell::RefCell::new(iter))));
+                        return Ok(Value::Iterator(Rc::new(RefCell::new(iter))));
                     }
 
-                    "len" => Ok(Value::Int(table.borrow().len() as i64)),
+                    "len" => Ok(Value::Int(int_from_usize(table.borrow().len()))),
                     "get" => {
                         if args.is_empty() {
                             return Err(LustError::RuntimeError {
@@ -1041,7 +1043,7 @@ impl VM {
                         });
                     }
 
-                    Ok(Value::Int(*f as i64))
+                    Ok(Value::Int(int_from_float(*f)))
                 }
 
                 "floor" => {
@@ -1051,7 +1053,7 @@ impl VM {
                         });
                     }
 
-                    Ok(Value::Float(f.floor()))
+                    Ok(Value::Float(float_floor(*f)))
                 }
 
                 "ceil" => {
@@ -1061,7 +1063,7 @@ impl VM {
                         });
                     }
 
-                    Ok(Value::Float(f.ceil()))
+                    Ok(Value::Float(float_ceil(*f)))
                 }
 
                 "round" => {
@@ -1071,7 +1073,7 @@ impl VM {
                         });
                     }
 
-                    Ok(Value::Float(f.round()))
+                    Ok(Value::Float(float_round(*f)))
                 }
 
                 "sqrt" => {
@@ -1087,7 +1089,7 @@ impl VM {
                         });
                     }
 
-                    Ok(Value::Float(f.sqrt()))
+                    Ok(Value::Float(float_sqrt(*f)))
                 }
 
                 "abs" => {
@@ -1097,7 +1099,7 @@ impl VM {
                         });
                     }
 
-                    Ok(Value::Float(f.abs()))
+                    Ok(Value::Float(float_abs(*f)))
                 }
 
                 "clamp" => {
@@ -1119,7 +1121,7 @@ impl VM {
                         });
                     }
 
-                    Ok(Value::Float(f.clamp(min, max)))
+                    Ok(Value::Float(float_clamp(*f, min, max)))
                 }
 
                 _ => Err(LustError::RuntimeError {
@@ -1134,7 +1136,7 @@ impl VM {
                         });
                     }
 
-                    Ok(Value::Float(*i as f64))
+                    Ok(Value::Float(float_from_int(*i)))
                 }
 
                 "abs" => {

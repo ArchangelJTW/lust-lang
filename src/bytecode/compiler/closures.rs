@@ -5,7 +5,7 @@ impl Compiler {
         expr: &Expr,
         params: &[(String, Option<crate::ast::Type>)],
     ) -> Result<Vec<String>> {
-        use std::collections::HashSet;
+        use hashbrown::HashSet;
         let mut free_vars = HashSet::new();
         let mut bound_vars = HashSet::new();
         for (param_name, _) in params {
@@ -26,8 +26,8 @@ impl Compiler {
     pub(super) fn find_free_vars_in_expr(
         &self,
         expr: &Expr,
-        free_vars: &mut std::collections::HashSet<String>,
-        bound_vars: &std::collections::HashSet<String>,
+        free_vars: &mut HashSet<String>,
+        bound_vars: &HashSet<String>,
     ) {
         match &expr.kind {
             ExprKind::Identifier(name) => {
@@ -162,8 +162,8 @@ impl Compiler {
     pub(super) fn find_free_vars_in_stmt(
         &self,
         stmt: &Stmt,
-        free_vars: &mut std::collections::HashSet<String>,
-        bound_vars: &mut std::collections::HashSet<String>,
+        free_vars: &mut HashSet<String>,
+        bound_vars: &mut HashSet<String>,
     ) {
         match &stmt.kind {
             StmtKind::Local {
@@ -288,8 +288,8 @@ impl Compiler {
     pub(super) fn find_free_vars_in_pattern(
         &self,
         pattern: &crate::ast::Pattern,
-        free_vars: &mut std::collections::HashSet<String>,
-        bound_vars: &std::collections::HashSet<String>,
+        free_vars: &mut HashSet<String>,
+        bound_vars: &HashSet<String>,
     ) {
         use crate::ast::Pattern;
         match pattern {

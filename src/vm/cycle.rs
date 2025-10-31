@@ -4,9 +4,10 @@ use crate::vm::task::TaskInstance;
 use crate::vm::CallFrame;
 use crate::vm::TaskSignal;
 use crate::vm::VM;
-use std::cell::RefCell;
-use std::collections::{hash_map::Entry, HashMap, HashSet};
-use std::rc::{Rc, Weak};
+use alloc::rc::{Rc, Weak};
+use alloc::vec::Vec;
+use core::cell::RefCell;
+use hashbrown::{hash_map::Entry, HashMap, HashSet};
 const COLLECT_INTERVAL: usize = 512;
 const REGISTRATION_THRESHOLD: usize = 256;
 #[derive(Default)]

@@ -1,15 +1,38 @@
+#[cfg(feature = "std")]
 pub mod codegen;
 pub mod optimizer;
 pub mod profiler;
 pub mod trace;
 use crate::bytecode::Value;
 use crate::VM;
+#[cfg(feature = "std")]
 pub use codegen::JitCompiler;
+#[cfg(not(feature = "std"))]
+pub struct JitCompiler;
 pub use optimizer::TraceOptimizer;
 pub use profiler::{HotSpot, Profiler};
-use std::collections::HashMap;
+use alloc::{string::String, vec::Vec};
+use hashbrown::HashMap;
 pub use trace::{Trace, TraceOp, TraceRecorder};
-#[cfg(debug_assertions)]
+#[cfg(not(feature = "std"))]
+impl JitCompiler {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn compile_trace(
+        &mut self,
+        _trace: &Trace,
+        _trace_id: TraceId,
+        _parent: Option<TraceId>,
+        _hoisted_constants: Vec<(u8, Value)>,
+    ) -> crate::Result<CompiledTrace> {
+        Err(crate::LustError::RuntimeError {
+            message: "JIT is unavailable without the `std` feature".into(),
+        })
+    }
+}
+#[cfg(all(debug_assertions, feature = "std"))]
 #[inline]
 pub(crate) fn log<F>(message: F)
 where
@@ -18,7 +41,7 @@ where
     println!("{}", message());
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(all(debug_assertions, feature = "std")))]
 #[inline]
 pub(crate) fn log<F>(_message: F)
 where
@@ -90,7 +113,7 @@ pub struct JitState {
 
 impl JitState {
     pub fn new() -> Self {
-        let enabled = cfg!(target_arch = "x86_64");
+        let enabled = cfg!(all(feature = "std", target_arch = "x86_64"));
         Self {
             profiler: Profiler::new(),
             traces: HashMap::new(),

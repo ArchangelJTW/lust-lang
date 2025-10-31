@@ -580,7 +580,7 @@ impl Compiler {
             for (i, var) in variables.iter().enumerate() {
                 let var_reg = self.next_local_slot();
                 let idx_reg = self.allocate_register();
-                let idx_const = self.add_int_const(i as i64);
+                let idx_const = self.add_int_const(i as LustInt);
                 self.emit(Instruction::LoadConst(idx_reg, idx_const), 0);
                 self.emit(Instruction::GetIndex(var_reg, temp_val_reg, idx_reg), 0);
                 self.free_register(idx_reg);

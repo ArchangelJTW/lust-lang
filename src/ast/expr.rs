@@ -1,5 +1,7 @@
 use super::{Span, Type};
-use std::fmt;
+use alloc::{boxed::Box, format, string::{String, ToString}, vec::Vec};
+use core::fmt;
+use crate::number::{LustFloat, LustInt};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Expr {
     pub kind: ExprKind,
@@ -113,8 +115,8 @@ pub enum Pattern {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
-    Integer(i64),
-    Float(f64),
+    Integer(LustInt),
+    Float(LustFloat),
     String(String),
     Bool(bool),
 }

@@ -1,4 +1,5 @@
 use super::{Expr, Span, Stmt, Type};
+use alloc::{string::String, vec::Vec};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
     pub kind: ItemKind,

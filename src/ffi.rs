@@ -1,5 +1,6 @@
 use crate::bytecode::Value;
 use crate::embed::{EmbeddedBuilder, EmbeddedProgram};
+use crate::number::{LustFloat, LustInt};
 use crate::{LustError, Result};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -55,8 +56,8 @@ pub enum LustFfiValueTag {
 pub struct LustFfiValue {
     pub tag: LustFfiValueTag,
     pub bool_value: bool,
-    pub int_value: i64,
-    pub float_value: f64,
+    pub int_value: LustInt,
+    pub float_value: LustFloat,
     pub string_ptr: *mut c_char,
 }
 
@@ -507,3 +508,4 @@ pub extern "C" fn lust_program_set_global(
     program_ref.set_global_value(name_str, converted);
     true
 }
+// #![cfg(feature = "std")]

@@ -8,25 +8,32 @@ use crate::{
     config::LustConfig,
     error::{LustError, Result},
 };
+pub(super) use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::mem;
+use hashbrown::{HashMap, HashSet};
 pub use type_env::FunctionSignature;
 pub use type_env::TypeEnv;
 pub struct TypeChecker {
     env: TypeEnv,
     current_function_return_type: Option<Type>,
     in_loop: bool,
-    pending_generic_instances: Option<std::collections::HashMap<String, Type>>,
+    pending_generic_instances: Option<HashMap<String, Type>>,
     expected_lambda_signature: Option<(Vec<Type>, Option<Type>)>,
-    current_trait_bounds: std::collections::HashMap<String, Vec<String>>,
+    current_trait_bounds: HashMap<String, Vec<String>>,
     current_module: Option<String>,
-    imports_by_module: std::collections::HashMap<String, ModuleImports>,
-    expr_types_by_module: std::collections::HashMap<String, std::collections::HashMap<Span, Type>>,
-    variable_types_by_module:
-        std::collections::HashMap<String, std::collections::HashMap<Span, Type>>,
+    imports_by_module: HashMap<String, ModuleImports>,
+    expr_types_by_module: HashMap<String, HashMap<Span, Type>>,
+    variable_types_by_module: HashMap<String, HashMap<Span, Type>>,
 }
 
 pub struct TypeCollection {
-    pub expr_types: std::collections::HashMap<String, std::collections::HashMap<Span, Type>>,
-    pub variable_types: std::collections::HashMap<String, std::collections::HashMap<Span, Type>>,
+    pub expr_types: HashMap<String, HashMap<Span, Type>>,
+    pub variable_types: HashMap<String, HashMap<Span, Type>>,
 }
 
 impl TypeChecker {
@@ -41,11 +48,11 @@ impl TypeChecker {
             in_loop: false,
             pending_generic_instances: None,
             expected_lambda_signature: None,
-            current_trait_bounds: std::collections::HashMap::new(),
+            current_trait_bounds: HashMap::new(),
             current_module: None,
-            imports_by_module: std::collections::HashMap::new(),
-            expr_types_by_module: std::collections::HashMap::new(),
-            variable_types_by_module: std::collections::HashMap::new(),
+            imports_by_module: HashMap::new(),
+            expr_types_by_module: HashMap::new(),
+            variable_types_by_module: HashMap::new(),
         }
     }
 
@@ -94,7 +101,7 @@ impl TypeChecker {
     }
 
     fn validate_struct_cycles(&self) -> Result<()> {
-        use std::collections::{HashMap, HashSet};
+        use hashbrown::{HashMap, HashSet};
         let struct_defs = self.env.struct_definitions();
         if struct_defs.is_empty() {
             return Ok(());
@@ -136,7 +143,7 @@ impl TypeChecker {
                         )));
                     };
                     let resolved = self.resolve_struct_name_for_cycle(
-                        target_name,
+                        target_name.as_str(),
                         module_prefix.as_deref(),
                         &struct_defs,
                         &simple_to_full,
@@ -223,9 +230,9 @@ impl TypeChecker {
         &self,
         ty: &Type,
         parent_module: Option<&str>,
-        struct_defs: &std::collections::HashMap<String, StructDef>,
-        simple_to_full: &std::collections::HashMap<String, Vec<String>>,
-        out: &mut std::collections::HashSet<String>,
+        struct_defs: &HashMap<String, StructDef>,
+        simple_to_full: &HashMap<String, Vec<String>>,
+        out: &mut HashSet<String>,
     ) {
         match &ty.kind {
             TypeKind::Named(name) => {
@@ -318,8 +325,8 @@ impl TypeChecker {
         &self,
         name: &str,
         parent_module: Option<&str>,
-        struct_defs: &std::collections::HashMap<String, StructDef>,
-        simple_to_full: &std::collections::HashMap<String, Vec<String>>,
+        struct_defs: &HashMap<String, StructDef>,
+        simple_to_full: &HashMap<String, Vec<String>>,
     ) -> Option<String> {
         if struct_defs.contains_key(name) {
             return Some(name.to_string());
@@ -348,28 +355,28 @@ impl TypeChecker {
         None
     }
 
-    pub fn set_imports_by_module(&mut self, map: std::collections::HashMap<String, ModuleImports>) {
+    pub fn set_imports_by_module(&mut self, map: HashMap<String, ModuleImports>) {
         self.imports_by_module = map;
     }
 
     pub fn take_type_info(&mut self) -> TypeCollection {
         TypeCollection {
-            expr_types: std::mem::take(&mut self.expr_types_by_module),
-            variable_types: std::mem::take(&mut self.variable_types_by_module),
+            expr_types: mem::take(&mut self.expr_types_by_module),
+            variable_types: mem::take(&mut self.variable_types_by_module),
         }
     }
 
     pub fn function_signatures(
         &self,
-    ) -> std::collections::HashMap<String, type_env::FunctionSignature> {
+    ) -> HashMap<String, type_env::FunctionSignature> {
         self.env.function_signatures()
     }
 
-    pub fn struct_definitions(&self) -> std::collections::HashMap<String, StructDef> {
+    pub fn struct_definitions(&self) -> HashMap<String, StructDef> {
         self.env.struct_definitions()
     }
 
-    pub fn enum_definitions(&self) -> std::collections::HashMap<String, EnumDef> {
+    pub fn enum_definitions(&self) -> HashMap<String, EnumDef> {
         self.env.enum_definitions()
     }
 
@@ -385,7 +392,7 @@ impl TypeChecker {
                     for stmt in &func.body {
                         if let StmtKind::Local {
                             bindings,
-                            mutable,
+                            ref mutable,
                             initializer,
                         } = &stmt.kind
                         {

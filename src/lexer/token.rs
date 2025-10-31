@@ -1,4 +1,5 @@
-use std::fmt;
+use alloc::string::String;
+use core::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub kind: TokenKind,

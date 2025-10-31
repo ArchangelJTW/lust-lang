@@ -7,6 +7,6 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-lust = { path = "../../../..", version = "1.3.9", package = "lust-rs" }
+lust = { path = "../../../..", version = "1.5.9", package = "lust-rs" }
 
 [workspace]

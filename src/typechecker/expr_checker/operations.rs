@@ -1,4 +1,12 @@
 use super::*;
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use hashbrown::HashMap;
 impl TypeChecker {
     pub fn check_literal(&self, lit: &Literal) -> Result<Type> {
         let span = Self::dummy_span();
@@ -238,7 +246,7 @@ impl TypeChecker {
                             ));
                         }
 
-                        let mut type_params = std::collections::HashMap::new();
+                        let mut type_params = HashMap::new();
                         for (arg, expected_type) in args.iter().zip(expected_fields.iter()) {
                             let arg_type = self.check_expr(arg)?;
                             if let TypeKind::Generic(type_param) = &expected_type.kind {
@@ -1052,7 +1060,7 @@ impl TypeChecker {
                 _ => {}
             },
             TypeKind::Named(type_name) => {
-                if let Some(method_def) = self.env.lookup_method(type_name, method) {
+                if let Some(method_def) = self.env.lookup_method(type_name.as_str(), method) {
                     let method_def = method_def.clone();
                     let expected_args = method_def.params.len().saturating_sub(1);
                     if args.len() != expected_args {
@@ -1089,13 +1097,15 @@ impl TypeChecker {
             }
 
             TypeKind::Generic(type_param) => {
-                if let Some(trait_names) = self.current_trait_bounds.get(type_param) {
+                if let Some(trait_names) =
+                    self.current_trait_bounds.get(type_param.as_str())
+                {
                     for trait_name in trait_names {
                         if let Some(trait_def) = {
-                            let key = self.resolve_type_key(trait_name);
+                            let key = self.resolve_type_key(trait_name.as_str());
                             self.env
                                 .lookup_trait(&key)
-                                .or_else(|| self.env.lookup_trait(trait_name))
+                                .or_else(|| self.env.lookup_trait(trait_name.as_str()))
                         } {
                             if let Some(trait_method) =
                                 trait_def.methods.iter().find(|m| m.name == method)
@@ -1126,7 +1136,7 @@ impl TypeChecker {
                     let key = self.resolve_type_key(trait_name);
                     self.env
                         .lookup_trait(&key)
-                        .or_else(|| self.env.lookup_trait(trait_name))
+                        .or_else(|| self.env.lookup_trait(trait_name.as_str()))
                 } {
                     if let Some(trait_method) = trait_def.methods.iter().find(|m| m.name == method)
                     {
@@ -1237,13 +1247,13 @@ impl TypeChecker {
         match &object_type.kind {
             TypeKind::Array(elem_type) => {
                 self.unify(&Type::new(TypeKind::Int, Self::dummy_span()), &index_type)?;
-                Ok((**elem_type).clone())
+                Ok(elem_type.as_ref().clone())
             }
 
             TypeKind::Map(key_type, value_type) => {
-                self.unify(key_type, &index_type)?;
+                self.unify(key_type.as_ref(), &index_type)?;
                 Ok(Type::new(
-                    TypeKind::Option(Box::new((**value_type).clone())),
+                    TypeKind::Option(Box::new(value_type.as_ref().clone())),
                     Self::dummy_span(),
                 ))
             }

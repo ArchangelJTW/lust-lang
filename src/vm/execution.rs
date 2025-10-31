@@ -1,4 +1,5 @@
 use super::*;
+use core::{array, ptr};
 impl VM {
     pub(super) fn push_current_vm(&mut self) {
         let ptr = self as *mut VM;
@@ -86,7 +87,7 @@ impl VM {
                     let entry = self.jit.get_trace(trace_id).map(|t| t.entry);
                     if let Some(entry_fn) = entry {
                         let result =
-                            entry_fn(registers_ptr, self as *mut VM, std::ptr::null());
+                            entry_fn(registers_ptr, self as *mut VM, ptr::null());
                         if result == 0 {
                             if let Some(frame) = self.call_stack.last_mut() {
                                 frame.ip = loop_start_ip;
@@ -115,7 +116,7 @@ impl VM {
                                         side_entry_fn(
                                             registers_ptr,
                                             self as *mut VM,
-                                            std::ptr::null(),
+                                            ptr::null(),
                                         );
                                     if side_result == 0 {
                                         crate::jit::log(|| {
@@ -314,9 +315,19 @@ impl VM {
                     } else if let Some(value) = self.natives.get(name) {
                         self.set_register(dest, value.clone())?;
                     } else {
-                        return Err(LustError::RuntimeError {
-                            message: format!("Undefined global: {}", name),
-                        });
+                        if let Some((_, value)) =
+                            self.globals.iter().find(|(key, _)| key.as_str() == name)
+                        {
+                            self.set_register(dest, value.clone())?;
+                        } else if let Some((_, value)) =
+                            self.natives.iter().find(|(key, _)| key.as_str() == name)
+                        {
+                            self.set_register(dest, value.clone())?;
+                        } else {
+                            return Err(LustError::RuntimeError {
+                                message: format!("Undefined global: {}", name),
+                            });
+                        }
                     }
                 }
 
@@ -340,8 +351,12 @@ impl VM {
                     self.binary_op(dest, lhs, rhs, |l, r| match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
                         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
-                        (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
-                        (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + *b as f64)),
+                        (Value::Int(a), Value::Float(b)) => {
+                            Ok(Value::Float(float_from_int(*a) + *b))
+                        }
+                        (Value::Float(a), Value::Int(b)) => {
+                            Ok(Value::Float(*a + float_from_int(*b)))
+                        }
                         _ => Err(LustError::RuntimeError {
                             message: format!("Cannot add {:?} and {:?}", l, r),
                         }),
@@ -352,8 +367,12 @@ impl VM {
                     self.binary_op(dest, lhs, rhs, |l, r| match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
                         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
-                        (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
-                        (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - *b as f64)),
+                        (Value::Int(a), Value::Float(b)) => {
+                            Ok(Value::Float(float_from_int(*a) - *b))
+                        }
+                        (Value::Float(a), Value::Int(b)) => {
+                            Ok(Value::Float(*a - float_from_int(*b)))
+                        }
                         _ => Err(LustError::RuntimeError {
                             message: format!("Cannot subtract {:?} and {:?}", l, r),
                         }),
@@ -364,8 +383,12 @@ impl VM {
                     self.binary_op(dest, lhs, rhs, |l, r| match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
                         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
-                        (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 * b)),
-                        (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * *b as f64)),
+                        (Value::Int(a), Value::Float(b)) => {
+                            Ok(Value::Float(float_from_int(*a) * *b))
+                        }
+                        (Value::Float(a), Value::Int(b)) => {
+                            Ok(Value::Float(*a * float_from_int(*b)))
+                        }
                         _ => Err(LustError::RuntimeError {
                             message: format!("Cannot multiply {:?} and {:?}", l, r),
                         }),
@@ -384,9 +407,13 @@ impl VM {
                             }
                         }
 
-                        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a / b)),
-                        (Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 / b)),
-                        (Value::Float(a), Value::Int(b)) => Ok(Value::Float(a / *b as f64)),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(*a / *b)),
+                        (Value::Int(a), Value::Float(b)) => {
+                            Ok(Value::Float(float_from_int(*a) / *b))
+                        }
+                        (Value::Float(a), Value::Int(b)) => {
+                            Ok(Value::Float(*a / float_from_int(*b)))
+                        }
                         _ => Err(LustError::RuntimeError {
                             message: format!("Cannot divide {:?} and {:?}", l, r),
                         }),
@@ -505,7 +532,7 @@ impl VM {
                             let mut frame = CallFrame {
                                 function_idx: func_idx,
                                 ip: 0,
-                                registers: std::array::from_fn(|_| Value::Nil),
+                                registers: array::from_fn(|_| Value::Nil),
                                 base_register: 0,
                                 return_dest: Some(dest_reg),
                                 upvalues: Vec::new(),
@@ -531,7 +558,7 @@ impl VM {
                             let mut frame = CallFrame {
                                 function_idx: func_idx,
                                 ip: 0,
-                                registers: std::array::from_fn(|_| Value::Nil),
+                                registers: array::from_fn(|_| Value::Nil),
                                 base_register: 0,
                                 return_dest: Some(dest_reg),
                                 upvalues: upvalue_values,
@@ -911,7 +938,7 @@ impl VM {
                     let collection = self.get_register(array_reg)?;
                     match collection {
                         Value::Array(arr) => {
-                            let len = arr.borrow().len() as i64;
+                            let len = int_from_usize(arr.borrow().len());
                             self.set_register(dest, Value::Int(len))?;
                         }
 
@@ -954,7 +981,7 @@ impl VM {
                             let mut frame = CallFrame {
                                 function_idx: func_idx,
                                 ip: 0,
-                                registers: std::array::from_fn(|_| Value::Nil),
+                                registers: array::from_fn(|_| Value::Nil),
                                 base_register: 0,
                                 return_dest: Some(dest_reg),
                                 upvalues: Vec::new(),
@@ -1157,15 +1184,15 @@ impl VM {
         op: F,
     ) -> Result<()>
     where
-        F: FnOnce(f64, f64) -> bool,
+        F: FnOnce(LustFloat, LustFloat) -> bool,
     {
         let left = self.get_register(lhs)?;
         let right = self.get_register(rhs)?;
         let result = match (left, right) {
-            (Value::Int(a), Value::Int(b)) => op(*a as f64, *b as f64),
+            (Value::Int(a), Value::Int(b)) => op(float_from_int(*a), float_from_int(*b)),
             (Value::Float(a), Value::Float(b)) => op(*a, *b),
-            (Value::Int(a), Value::Float(b)) => op(*a as f64, *b),
-            (Value::Float(a), Value::Int(b)) => op(*a, *b as f64),
+            (Value::Int(a), Value::Float(b)) => op(float_from_int(*a), *b),
+            (Value::Float(a), Value::Int(b)) => op(*a, float_from_int(*b)),
             _ => {
                 return Err(LustError::RuntimeError {
                     message: format!("Cannot compare {:?} and {:?}", left, right),
@@ -1233,63 +1260,6 @@ impl VM {
         }
 
         false
-    }
-
-    pub(super) fn call_function(
-        &mut self,
-        func_reg: Register,
-        first_arg: Register,
-        arg_count: u8,
-    ) -> Result<Value> {
-        let func_value = self.get_register(func_reg)?.clone();
-        match func_value {
-            Value::Function(func_idx) => {
-                let mut args = Vec::new();
-                for i in 0..arg_count {
-                    args.push(self.get_register(first_arg + i)?.clone());
-                }
-
-                let mut frame = CallFrame {
-                    function_idx: func_idx,
-                    ip: 0,
-                    registers: std::array::from_fn(|_| Value::Nil),
-                    base_register: 0,
-                    return_dest: None,
-                    upvalues: Vec::new(),
-                };
-                for (i, arg) in args.into_iter().enumerate() {
-                    frame.registers[i] = arg;
-                }
-
-                self.call_stack.push(frame);
-                Ok(Value::Nil)
-            }
-
-            Value::NativeFunction(native_fn) => {
-                let mut args = Vec::new();
-                for i in 0..arg_count {
-                    args.push(self.get_register(first_arg + i)?.clone());
-                }
-
-                self.push_current_vm();
-                let outcome = native_fn(&args);
-                self.pop_current_vm();
-                let outcome = outcome.map_err(|e| LustError::RuntimeError { message: e })?;
-                match outcome {
-                    NativeCallResult::Return(value) => Ok(value),
-                    NativeCallResult::Yield(_) | NativeCallResult::Stop(_) => {
-                        Err(LustError::RuntimeError {
-                            message: "Yielding or stopping is not allowed from this context"
-                                .to_string(),
-                        })
-                    }
-                }
-            }
-
-            _ => Err(LustError::RuntimeError {
-                message: format!("Cannot call non-function value: {:?}", func_value),
-            }),
-        }
     }
 
     pub(super) fn get_register(&self, reg: Register) -> Result<&Value> {
@@ -1363,7 +1333,7 @@ impl VM {
                 let mut frame = CallFrame {
                     function_idx: *func_idx,
                     ip: 0,
-                    registers: std::array::from_fn(|_| Value::Nil),
+                    registers: array::from_fn(|_| Value::Nil),
                     base_register: 0,
                     return_dest: None,
                     upvalues: Vec::new(),
@@ -1389,7 +1359,7 @@ impl VM {
                 let mut frame = CallFrame {
                     function_idx: *func_idx,
                     ip: 0,
-                    registers: std::array::from_fn(|_| Value::Nil),
+                    registers: array::from_fn(|_| Value::Nil),
                     base_register: 0,
                     return_dest: None,
                     upvalues: upvalue_values,

@@ -1,7 +1,8 @@
 use super::CallFrame;
 use crate::bytecode::{Register, TaskHandle, Value};
 use crate::error::LustError;
-use std::collections::HashMap;
+use alloc::{vec, vec::Vec};
+use hashbrown::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TaskId(pub u64);
 impl TaskId {
@@ -40,7 +41,7 @@ impl TaskState {
 pub struct TaskInstance {
     pub id: TaskId,
     pub state: TaskState,
-    pub call_stack: Vec<CallFrame>,
+    pub(super) call_stack: Vec<CallFrame>,
     pub pending_return_value: Option<Value>,
     pub pending_return_dest: Option<Register>,
     pub yield_dest: Option<Register>,
@@ -51,7 +52,7 @@ pub struct TaskInstance {
 }
 
 impl TaskInstance {
-    pub fn new(id: TaskId, initial_frame: CallFrame) -> Self {
+    pub(super) fn new(id: TaskId, initial_frame: CallFrame) -> Self {
         Self {
             id,
             state: TaskState::Ready,
@@ -113,10 +114,6 @@ impl TaskManager {
 
     pub fn get(&self, id: TaskId) -> Option<&TaskInstance> {
         self.tasks.get(&id)
-    }
-
-    pub fn get_mut(&mut self, id: TaskId) -> Option<&mut TaskInstance> {
-        self.tasks.get_mut(&id)
     }
 
     pub fn next_id(&mut self) -> TaskId {

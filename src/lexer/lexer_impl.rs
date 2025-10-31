@@ -1,5 +1,6 @@
 use super::token::{Token, TokenKind};
 use crate::error::{LustError, Result};
+use alloc::{format, string::{String, ToString}, vec::Vec};
 pub struct Lexer {
     input: Vec<char>,
     position: usize,

@@ -2,8 +2,14 @@ use crate::bytecode::value::NativeFn;
 use crate::bytecode::Instruction;
 use crate::bytecode::{Register, Value};
 use crate::LustError;
-use std::fmt;
-use std::rc::Rc;
+use alloc::{
+    format,
+    rc::Rc,
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::fmt;
+use hashbrown::HashSet;
 
 #[derive(Clone)]
 pub struct TracedNativeFn {
@@ -215,7 +221,7 @@ pub struct TraceRecorder {
     pub trace: Trace,
     max_length: usize,
     recording: bool,
-    guarded_registers: std::collections::HashSet<Register>,
+    guarded_registers: HashSet<Register>,
 }
 
 impl TraceRecorder {
@@ -230,7 +236,7 @@ impl TraceRecorder {
             },
             max_length,
             recording: true,
-            guarded_registers: std::collections::HashSet::new(),
+            guarded_registers: HashSet::new(),
         }
     }
 
@@ -672,7 +678,7 @@ impl TraceRecorder {
                 }
             }
 
-            Instruction::JumpIf(cond, _) | Instruction::JumpIfNot(cond, _) => {
+            Instruction::JumpIf(_cond, _) | Instruction::JumpIfNot(_cond, _) => {
                 return Ok(());
             }
 

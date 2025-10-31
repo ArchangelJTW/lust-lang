@@ -4,6 +4,7 @@ use crate::{
     error::Result,
     lexer::TokenKind,
 };
+use alloc::{vec, vec::Vec};
 impl Parser {
     pub(super) fn parse_stmt(&mut self) -> Result<Stmt> {
         let start_token = self.current_token().clone();

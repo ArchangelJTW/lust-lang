@@ -1,4 +1,4 @@
-use std::fmt;
+use core::fmt;
 pub type Register = u8;
 pub type ConstIndex = u16;
 pub type JumpOffset = i16;

@@ -13,10 +13,6 @@ impl Compiler {
         max_reg
     }
 
-    pub(super) fn active_local_count(&self) -> u8 {
-        self.scopes.iter().map(|s| s.locals.len() as u8).sum::<u8>()
-    }
-
     pub(super) fn next_local_slot(&mut self) -> Register {
         let reg = (self.max_local_register_index() + 1).max(0) as u8;
         if self.next_register <= reg {
@@ -30,7 +26,7 @@ impl Compiler {
         reg
     }
 
-    pub(super) fn add_int_const(&mut self, n: i64) -> u16 {
+    pub(super) fn add_int_const(&mut self, n: LustInt) -> u16 {
         self.add_constant(Value::Int(n))
     }
 

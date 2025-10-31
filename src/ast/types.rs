@@ -1,5 +1,6 @@
 use super::Span;
-use std::fmt;
+use alloc::{boxed::Box, string::{String, ToString}, vec::Vec};
+use core::fmt;
 #[derive(Debug, Clone, Eq, Hash)]
 pub struct Type {
     pub kind: TypeKind,

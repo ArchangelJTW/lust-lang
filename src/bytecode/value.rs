@@ -1,10 +1,21 @@
 use crate::jit;
+use crate::number::{
+    float_from_int, float_is_nan, float_to_hash_bits, int_from_float, int_from_usize, LustFloat,
+    LustInt,
+};
 use crate::vm::{pop_vm_ptr, push_vm_ptr, VM};
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::rc::{Rc, Weak};
+use alloc::{
+    format,
+    rc::{Rc, Weak},
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use core::cell::RefCell;
+use core::fmt;
+use core::hash::{Hash, Hasher};
+use core::{ptr, slice, str};
+use hashbrown::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TaskHandle(pub u64);
 impl TaskHandle {
@@ -15,8 +26,8 @@ impl TaskHandle {
 
 #[derive(Clone, Debug)]
 pub enum ValueKey {
-    Int(i64),
-    Float(f64),
+    Int(LustInt),
+    Float(LustFloat),
     String(Rc<String>),
     Bool(bool),
 }
@@ -47,7 +58,7 @@ impl PartialEq for ValueKey {
         match (self, other) {
             (ValueKey::Int(a), ValueKey::Int(b)) => a == b,
             (ValueKey::Float(a), ValueKey::Float(b)) => {
-                if a.is_nan() && b.is_nan() {
+                if float_is_nan(*a) && float_is_nan(*b) {
                     true
                 } else {
                     a == b
@@ -72,10 +83,10 @@ impl Hash for ValueKey {
 
             ValueKey::Float(f) => {
                 1u8.hash(state);
-                if f.is_nan() {
+                if float_is_nan(*f) {
                     u64::MAX.hash(state);
                 } else {
-                    f.to_bits().hash(state);
+                    float_to_hash_bits(*f).hash(state);
                 }
             }
 
@@ -320,8 +331,8 @@ impl StructLayout {
 pub enum Value {
     Nil,
     Bool(bool),
-    Int(i64),
-    Float(f64),
+    Int(LustInt),
+    Float(LustFloat),
     String(Rc<String>),
     Array(Rc<RefCell<Vec<Value>>>),
     Tuple(Rc<Vec<Value>>),
@@ -506,18 +517,18 @@ impl Value {
         self.is_truthy()
     }
 
-    pub fn as_int(&self) -> Option<i64> {
+    pub fn as_int(&self) -> Option<LustInt> {
         match self {
             Value::Int(i) => Some(*i),
-            Value::Float(f) => Some(*f as i64),
+            Value::Float(f) => Some(int_from_float(*f)),
             _ => None,
         }
     }
 
-    pub fn as_float(&self) -> Option<f64> {
+    pub fn as_float(&self) -> Option<LustFloat> {
         match self {
             Value::Float(f) => Some(*f),
-            Value::Int(i) => Some(*i as f64),
+            Value::Int(i) => Some(float_from_int(*i)),
             _ => None,
         }
     }
@@ -1175,6 +1186,7 @@ impl PartialEq for Value {
     }
 }
 
+#[cfg(feature = "std")]
 #[no_mangle]
 pub unsafe extern "C" fn jit_array_get_safe(
     array_value_ptr: *const Value,
@@ -1208,10 +1220,11 @@ pub unsafe extern "C" fn jit_array_get_safe(
         return 0;
     }
 
-    std::ptr::write(out, borrowed[idx].clone());
+    ptr::write(out, borrowed[idx].clone());
     1
 }
 
+#[cfg(feature = "std")]
 #[no_mangle]
 pub unsafe extern "C" fn jit_array_len_safe(array_value_ptr: *const Value) -> i64 {
     if array_value_ptr.is_null() {
@@ -1221,13 +1234,14 @@ pub unsafe extern "C" fn jit_array_len_safe(array_value_ptr: *const Value) -> i6
     let array_value = &*array_value_ptr;
     match array_value {
         Value::Array(arr) => match arr.try_borrow() {
-            Ok(borrowed) => borrowed.len() as i64,
+            Ok(borrowed) => int_from_usize(borrowed.len()),
             Err(_) => -1,
         },
         _ => -1,
     }
 }
 
+#[cfg(feature = "std")]
 #[no_mangle]
 pub unsafe extern "C" fn jit_concat_safe(
     left_value_ptr: *const Value,
@@ -1263,7 +1277,7 @@ pub unsafe extern "C" fn jit_concat_safe(
     combined.push_str(left_str.as_ref());
     combined.push_str(right_str.as_ref());
     let result = Value::string(combined);
-    std::ptr::write(out, result);
+    ptr::write(out, result);
     1
 }
 
@@ -1368,7 +1382,7 @@ pub unsafe extern "C" fn jit_call_native_safe(
 
     match outcome {
         NativeCallResult::Return(value) => {
-            std::ptr::write(out, value);
+            ptr::write(out, value);
             1
         }
 
@@ -1401,8 +1415,8 @@ pub unsafe extern "C" fn jit_call_method_safe(
         return 0;
     }
 
-    let method_name_slice = std::slice::from_raw_parts(method_name_ptr, method_name_len);
-    let method_name = match std::str::from_utf8(method_name_slice) {
+    let method_name_slice = slice::from_raw_parts(method_name_ptr, method_name_len);
+    let method_name = match str::from_utf8(method_name_slice) {
         Ok(s) => s,
         Err(_) => return 0,
     };
@@ -1421,7 +1435,7 @@ pub unsafe extern "C" fn jit_call_method_safe(
         Ok(val) => val,
         Err(_) => return 0,
     };
-    std::ptr::write(out, result);
+    ptr::write(out, result);
     1
 }
 
@@ -1503,7 +1517,7 @@ fn call_builtin_method_simple(
             )),
         },
         Value::Array(arr) => match method_name {
-            "len" => Ok(Value::Int(arr.borrow().len() as i64)),
+            "len" => Ok(Value::Int(int_from_usize(arr.borrow().len()))),
             "push" => {
                 let value = args
                     .get(0)
@@ -1564,8 +1578,8 @@ pub unsafe extern "C" fn jit_get_field_safe(
         return 0;
     }
 
-    let field_name_slice = std::slice::from_raw_parts(field_name_ptr, field_name_len);
-    let field_name = match std::str::from_utf8(field_name_slice) {
+    let field_name_slice = slice::from_raw_parts(field_name_ptr, field_name_len);
+    let field_name = match str::from_utf8(field_name_slice) {
         Ok(s) => s,
         Err(_) => return 0,
     };
@@ -1580,7 +1594,7 @@ pub unsafe extern "C" fn jit_get_field_safe(
         },
         _ => return 0,
     };
-    std::ptr::write(out, field_value);
+    ptr::write(out, field_value);
     1
 }
 
@@ -1595,8 +1609,8 @@ pub unsafe extern "C" fn jit_set_field_safe(
         return 0;
     }
 
-    let field_name_slice = std::slice::from_raw_parts(field_name_ptr, field_name_len);
-    let field_name = match std::str::from_utf8(field_name_slice) {
+    let field_name_slice = slice::from_raw_parts(field_name_ptr, field_name_len);
+    let field_name = match str::from_utf8(field_name_slice) {
         Ok(s) => s,
         Err(_) => return 0,
     };
@@ -1631,7 +1645,7 @@ pub unsafe extern "C" fn jit_get_field_indexed_safe(
     let object = &*object_ptr;
     match object.struct_get_field_indexed(field_index) {
         Some(value) => {
-            std::ptr::write(out, value);
+            ptr::write(out, value);
             1
         }
 
@@ -1747,8 +1761,8 @@ pub unsafe extern "C" fn jit_new_struct_safe(
         return 0;
     }
 
-    let struct_name_slice = std::slice::from_raw_parts(struct_name_ptr, struct_name_len);
-    let struct_name = match std::str::from_utf8(struct_name_slice) {
+    let struct_name_slice = slice::from_raw_parts(struct_name_ptr, struct_name_len);
+    let struct_name = match str::from_utf8(struct_name_slice) {
         Ok(s) => s.to_string(),
         Err(_) => return 0,
     };
@@ -1756,8 +1770,8 @@ pub unsafe extern "C" fn jit_new_struct_safe(
     for i in 0..field_count {
         let field_name_ptr = *field_names_ptr.add(i);
         let field_name_len = *field_name_lens_ptr.add(i);
-        let field_name_slice = std::slice::from_raw_parts(field_name_ptr, field_name_len);
-        let field_name = match std::str::from_utf8(field_name_slice) {
+        let field_name_slice = slice::from_raw_parts(field_name_ptr, field_name_len);
+        let field_name = match str::from_utf8(field_name_slice) {
             Ok(s) => Rc::new(s.to_string()),
             Err(_) => return 0,
         };
@@ -1773,7 +1787,7 @@ pub unsafe extern "C" fn jit_new_struct_safe(
         Ok(value) => value,
         Err(_) => return 0,
     };
-    std::ptr::write(out, struct_value);
+    ptr::write(out, struct_value);
     1
 }
 
@@ -1785,6 +1799,6 @@ pub unsafe extern "C" fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Val
 
     let src_value = &*src_ptr;
     let cloned_value = src_value.clone();
-    std::ptr::write(dest_ptr, cloned_value);
+    ptr::write(dest_ptr, cloned_value);
     1
 }

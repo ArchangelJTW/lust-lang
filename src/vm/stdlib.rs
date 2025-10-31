@@ -4,8 +4,8 @@ use super::{
 };
 use crate::bytecode::{NativeCallResult, Value, ValueKey};
 use crate::config::LustConfig;
-use crate::LustError;
-use std::collections::HashMap;
+use crate::{LustError, LustInt};
+use hashbrown::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::rc::Rc;
@@ -334,7 +334,10 @@ fn create_io_read_file_bytes_fn() -> Value {
 
         match fs::read(path) {
             Ok(bytes) => {
-                let values: Vec<Value> = bytes.into_iter().map(|b| Value::Int(b as i64)).collect();
+                let values: Vec<Value> = bytes
+                    .into_iter()
+                    .map(|b| Value::Int(b as LustInt))
+                    .collect();
                 Ok(NativeCallResult::Return(Value::ok(Value::array(values))))
             }
 

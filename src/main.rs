@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 use lust::{
     build_local_module, collect_stub_files, load_local_module, stub_files_from_exports,
@@ -266,7 +267,6 @@ fn run_file(filename: &str, disassemble: bool) {
     vm.load_functions(functions);
     vm.register_structs(&struct_defs);
     for (type_name, trait_name) in trait_impls {
-        eprintln!("DEBUG: Registering {} implements {}", type_name, trait_name);
         vm.register_trait_impl(type_name, trait_name);
     }
 
@@ -278,7 +278,6 @@ fn run_file(filename: &str, disassemble: bool) {
             process::exit(1);
         }
     };
-
     for init in init_funcs {
         if let Err(e) = vm.call(&init, vec![]) {
             print_error_with_context(&source, filename, &e);
@@ -300,14 +299,14 @@ fn compile_program(
         Vec<lust::bytecode::Function>,
         Vec<(String, String)>,
         Vec<String>,
-        std::collections::HashMap<String, lust::ast::StructDef>,
+        hashbrown::HashMap<String, lust::ast::StructDef>,
     ),
     lust::LustError,
 > {
     let mut loader = ModuleLoader::new(".");
     let program = loader.load_program_from_entry(entry_filename)?;
-    let mut imports_map: std::collections::HashMap<String, lust::modules::ModuleImports> =
-        std::collections::HashMap::new();
+    use hashbrown::HashMap;
+    let mut imports_map: HashMap<String, lust::modules::ModuleImports> = HashMap::new();
     for m in &program.modules {
         imports_map.insert(m.path.clone(), m.imports.clone());
     }

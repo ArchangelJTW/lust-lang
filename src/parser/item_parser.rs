@@ -8,6 +8,7 @@ use crate::{
     error::Result,
     lexer::TokenKind,
 };
+use alloc::{boxed::Box, format, string::{String, ToString}, vec, vec::Vec};
 impl Parser {
     pub(super) fn parse_item(&mut self) -> Result<Item> {
         let start_token = self.current_token().clone();

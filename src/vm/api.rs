@@ -1,6 +1,10 @@
 use super::*;
 use crate::config::LustConfig;
-use std::rc::Rc;
+use alloc::rc::Rc;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::{array, mem};
+use core::result::Result as CoreResult;
 
 #[derive(Debug, Clone)]
 pub struct NativeExportParam {
@@ -115,7 +119,8 @@ impl VM {
             .insert(("string".to_string(), "Hashable".to_string()), true);
         vm.trait_impls
             .insert(("bool".to_string(), "Hashable".to_string()), true);
-        for (name, func) in stdlib::create_stdlib(config) {
+        #[cfg(feature = "std")]
+        for (name, func) in super::stdlib::create_stdlib(config) {
             vm.register_native(name, func);
         }
 
@@ -127,27 +132,22 @@ impl VM {
     }
 
     pub(super) fn maybe_collect_cycles(&mut self) {
-        let mut collector = std::mem::take(&mut self.cycle_collector);
+        let mut collector = mem::take(&mut self.cycle_collector);
         collector.maybe_collect(self);
         self.cycle_collector = collector;
     }
 
-    pub fn with_current<F, R>(f: F) -> std::result::Result<R, String>
+    pub fn with_current<F, R>(f: F) -> CoreResult<R, String>
     where
-        F: FnOnce(&mut VM) -> std::result::Result<R, String>,
+        F: FnOnce(&mut VM) -> CoreResult<R, String>,
     {
-        CURRENT_VM_STACK.with(|stack_cell| {
-            let ptr_opt = {
-                let stack = stack_cell.borrow();
-                stack.last().copied()
-            };
-            if let Some(ptr) = ptr_opt {
-                let vm = unsafe { &mut *ptr };
-                f(vm)
-            } else {
-                Err("task API requires a running VM".to_string())
-            }
-        })
+        let ptr_opt = super::with_vm_stack(|stack| stack.last().copied());
+        if let Some(ptr) = ptr_opt {
+            let vm = unsafe { &mut *ptr };
+            f(vm)
+        } else {
+            Err("task API requires a running VM".to_string())
+        }
     }
 
     pub fn load_functions(&mut self, functions: Vec<Function>) {
@@ -264,7 +264,9 @@ impl VM {
         let name = name.into();
         match value {
             Value::NativeFunction(_) => {
-                self.natives.insert(name, value);
+                let cloned = value.clone();
+                self.natives.insert(name.clone(), value);
+                self.globals.insert(name, cloned);
             }
 
             other => {
@@ -289,7 +291,7 @@ impl VM {
 
     pub fn register_exported_native<F>(&mut self, export: NativeExport, func: F)
     where
-        F: Fn(&[Value]) -> std::result::Result<NativeCallResult, String> + 'static,
+        F: Fn(&[Value]) -> CoreResult<NativeCallResult, String> + 'static,
     {
         let mut export = export;
         if let Some(prefix) = self.current_export_prefix() {
@@ -313,7 +315,7 @@ impl VM {
     }
 
     pub fn take_exported_natives(&mut self) -> Vec<NativeExport> {
-        std::mem::take(&mut self.exported_natives)
+        mem::take(&mut self.exported_natives)
     }
 
     pub fn clear_native_functions(&mut self) {
@@ -347,7 +349,7 @@ impl VM {
         let mut frame = CallFrame {
             function_idx: func_idx,
             ip: 0,
-            registers: std::array::from_fn(|_| Value::Nil),
+            registers: array::from_fn(|_| Value::Nil),
             base_register: 0,
             return_dest: None,
             upvalues: Vec::new(),

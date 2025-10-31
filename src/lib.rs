@@ -1,14 +1,22 @@
 #![allow(improper_ctypes)]
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+mod lazy;
 pub mod ast;
 pub mod builtins;
 pub mod bytecode;
 pub mod config;
+#[cfg(feature = "std")]
 pub mod embed;
 pub mod error;
+#[cfg(feature = "std")]
 pub mod ffi;
 pub mod jit;
 pub mod lexer;
 pub mod modules;
+pub mod number;
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 pub mod packages;
 pub mod parser;
@@ -16,9 +24,11 @@ pub mod typechecker;
 pub mod vm;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
+pub use number::{LustFloat, LustInt};
 pub use ast::{Expr, Item, Span, Stmt, Type};
 pub use bytecode::{Chunk, Compiler, Function, Instruction, Value};
 pub use config::{ConfigError, LustConfig};
+#[cfg(feature = "std")]
 pub use embed::{
     EmbeddedBuilder, EmbeddedProgram, EnumInstance, FromLustValue, FunctionArgs, IntoLustValue,
     StructInstance,

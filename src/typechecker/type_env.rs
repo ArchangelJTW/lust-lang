@@ -4,7 +4,8 @@ use crate::{
     config::LustConfig,
     error::{LustError, Result},
 };
-use std::collections::{HashMap, HashSet};
+use alloc::{boxed::Box, format, string::{String, ToString}, vec, vec::Vec};
+use hashbrown::{HashMap, HashSet};
 pub struct TypeEnv {
     scopes: Vec<HashMap<String, Type>>,
     refinements: Vec<HashMap<String, Type>>,

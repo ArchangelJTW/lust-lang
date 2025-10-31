@@ -1,37 +1,49 @@
+use alloc::string::String;
+#[cfg(feature = "std")]
+use alloc::vec::Vec;
+use hashbrown::HashSet;
+#[cfg(feature = "std")]
 use serde::Deserialize;
+#[cfg(feature = "std")]
 use std::{
-    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
-
 use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[cfg(feature = "std")]
     #[error("failed to read configuration: {0}")]
     Io(#[from] std::io::Error),
+    #[cfg(feature = "std")]
     #[error("failed to parse configuration: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct LustConfig {
     enabled_modules: HashSet<String>,
     jit_enabled: bool,
+    #[cfg(feature = "std")]
     rust_modules: Vec<RustModule>,
 }
 
+#[cfg(feature = "std")]
 #[derive(Debug, Clone)]
 pub struct RustModule {
     path: PathBuf,
     externs: Option<PathBuf>,
 }
 
+#[cfg(feature = "std")]
 #[derive(Debug, Deserialize)]
 struct LustConfigToml {
     settings: Settings,
 }
 
+#[cfg(feature = "std")]
 #[derive(Debug, Deserialize)]
 struct Settings {
     #[serde(default)]
@@ -42,6 +54,7 @@ struct Settings {
     rust_modules: Vec<RustModuleEntry>,
 }
 
+#[cfg(feature = "std")]
 #[derive(Debug, Deserialize)]
 struct RustModuleEntry {
     path: String,
@@ -58,12 +71,14 @@ impl Default for LustConfig {
         Self {
             enabled_modules: HashSet::new(),
             jit_enabled: true,
+            #[cfg(feature = "std")]
             rust_modules: Vec::new(),
         }
     }
 }
 
 impl LustConfig {
+    #[cfg(feature = "std")]
     pub fn load_from_path<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
         let path_ref = path.as_ref();
         let content = fs::read_to_string(path_ref)?;
@@ -71,11 +86,13 @@ impl LustConfig {
         Ok(Self::from_parsed(parsed, path_ref.parent()))
     }
 
+    #[cfg(feature = "std")]
     pub fn from_toml_str(source: &str) -> Result<Self, ConfigError> {
         let parsed: LustConfigToml = toml::from_str(source)?;
         Ok(Self::from_parsed(parsed, None))
     }
 
+    #[cfg(feature = "std")]
     pub fn load_from_dir<P: AsRef<Path>>(dir: P) -> Result<Self, ConfigError> {
         let mut path = PathBuf::from(dir.as_ref());
         path.push("lust-config.toml");
@@ -86,6 +103,7 @@ impl LustConfig {
         Self::load_from_path(path)
     }
 
+    #[cfg(feature = "std")]
     pub fn load_for_entry<P: AsRef<Path>>(entry_file: P) -> Result<Self, ConfigError> {
         let entry_path = entry_file.as_ref();
         let dir = entry_path.parent().unwrap_or_else(|| Path::new("."));
@@ -129,10 +147,12 @@ impl LustConfig {
         config
     }
 
+    #[cfg(feature = "std")]
     pub fn rust_modules(&self) -> impl Iterator<Item = &RustModule> {
         self.rust_modules.iter()
     }
 
+    #[cfg(feature = "std")]
     fn from_parsed(parsed: LustConfigToml, base_dir: Option<&Path>) -> Self {
         let modules = parsed
             .settings
@@ -162,6 +182,7 @@ impl LustConfig {
     }
 }
 
+#[cfg(feature = "std")]
 impl RustModule {
     pub fn path(&self) -> &Path {
         &self.path
@@ -182,6 +203,7 @@ impl RustModule {
     }
 }
 
+#[cfg(feature = "std")]
 #[cfg(test)]
 mod tests {
     use super::*;

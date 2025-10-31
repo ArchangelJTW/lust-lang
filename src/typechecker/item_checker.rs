@@ -1,5 +1,6 @@
 use super::{type_env::FunctionSignature, TypeChecker};
 use crate::{ast::*, error::Result};
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
 impl TypeChecker {
     pub(super) fn check_item(&mut self, item: &Item) -> Result<()> {
         match &item.kind {

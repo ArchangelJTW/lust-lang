@@ -1,11 +1,12 @@
 use crate::ast::{EnumDef, FieldOwnership, Item, ItemKind, Span, StructDef, Type, TypeKind};
 use crate::bytecode::{Compiler, NativeCallResult, TaskHandle, Value};
 use crate::modules::{ModuleImports, ModuleLoader};
+use crate::number::{LustFloat, LustInt};
 use crate::typechecker::{FunctionSignature, TypeChecker};
 use crate::vm::VM;
 use crate::{LustConfig, LustError, Result};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::path::{Path, PathBuf};
@@ -1101,14 +1102,14 @@ macro_rules! impl_into_typed_for_primitive {
     };
 }
 
-impl_into_typed_for_primitive!(i64, "int", |_, ty: &Type| match &ty.kind {
+impl_into_typed_for_primitive!(LustInt, "int", |_, ty: &Type| match &ty.kind {
     TypeKind::Int | TypeKind::Unknown => true,
     TypeKind::Union(types) => types
         .iter()
         .any(|alt| matches!(&alt.kind, TypeKind::Int | TypeKind::Unknown)),
     _ => false,
 });
-impl_into_typed_for_primitive!(f64, "float", |_, ty: &Type| match &ty.kind {
+impl_into_typed_for_primitive!(LustFloat, "float", |_, ty: &Type| match &ty.kind {
     TypeKind::Float | TypeKind::Unknown => true,
     TypeKind::Union(types) => types
         .iter()
@@ -1187,7 +1188,7 @@ mod tests {
 
     #[derive(Default)]
     struct ManualAsyncState {
-        result: Mutex<Option<std::result::Result<i64, String>>>,
+        result: Mutex<Option<std::result::Result<LustInt, String>>>,
         waker: Mutex<Option<Waker>>,
     }
 
@@ -1202,7 +1203,7 @@ mod tests {
             }
         }
 
-        fn complete_ok(&self, value: i64) {
+        fn complete_ok(&self, value: LustInt) {
             self.complete(Ok(value));
         }
 
@@ -1210,7 +1211,7 @@ mod tests {
             self.complete(Err(message.into()));
         }
 
-        fn complete(&self, value: std::result::Result<i64, String>) {
+        fn complete(&self, value: std::result::Result<LustInt, String>) {
             {
                 let mut slot = self.result.lock().unwrap();
                 *slot = Some(value);
@@ -1227,7 +1228,7 @@ mod tests {
     }
 
     impl Future for ManualFuture {
-        type Output = std::result::Result<i64, String>;
+        type Output = std::result::Result<LustInt, String>;
 
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             {
@@ -1268,7 +1269,7 @@ mod tests {
         let state = ManualAsyncState::new();
         let register_state = Arc::clone(&state);
         program
-            .register_async_typed_native::<(), i64, _, _>("fetch_value", move |_| {
+            .register_async_typed_native::<(), LustInt, _, _>("fetch_value", move |_| {
                 register_state.future()
             })
             .expect("register async native");
@@ -1323,7 +1324,7 @@ mod tests {
         let state = ManualAsyncState::new();
         let register_state = Arc::clone(&state);
         program
-            .register_async_typed_native::<(), i64, _, _>("fetch_value", move |_| {
+            .register_async_typed_native::<(), LustInt, _, _>("fetch_value", move |_| {
                 register_state.future()
             })
             .expect("register async native");
@@ -1541,7 +1542,7 @@ impl FromLustValue for Value {
     }
 }
 
-impl IntoLustValue for i64 {
+impl IntoLustValue for LustInt {
     fn into_value(self) -> Value {
         Value::Int(self)
     }
@@ -1555,7 +1556,7 @@ impl IntoLustValue for i64 {
     }
 }
 
-impl FromLustValue for i64 {
+impl FromLustValue for LustInt {
     fn from_value(value: Value) -> Result<Self> {
         match value {
             Value::Int(v) => Ok(v),
@@ -1574,7 +1575,7 @@ impl FromLustValue for i64 {
     }
 }
 
-impl IntoLustValue for f64 {
+impl IntoLustValue for LustFloat {
     fn into_value(self) -> Value {
         Value::Float(self)
     }
@@ -1588,7 +1589,7 @@ impl IntoLustValue for f64 {
     }
 }
 
-impl FromLustValue for f64 {
+impl FromLustValue for LustFloat {
     fn from_value(value: Value) -> Result<Self> {
         match value {
             Value::Float(v) => Ok(v),

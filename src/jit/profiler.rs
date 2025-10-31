@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use alloc::vec::Vec;
+use hashbrown::HashMap;
 pub struct Profiler {
     backedges: HashMap<(usize, usize), u32>,
     hot_spots: Vec<HotSpot>,

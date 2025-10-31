@@ -1,7 +1,14 @@
 use crate::ast::{Span, Type, TypeKind};
+use crate::lazy::StaticOnceCell;
 use crate::FunctionSignature;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::LazyLock;
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    string::ToString,
+    vec,
+    vec::Vec,
+};
+use hashbrown::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct BuiltinSignature {
@@ -865,7 +872,9 @@ fn int_methods() -> Vec<BuiltinMethod> {
     ]
 }
 
-static BASE_FUNCTIONS: LazyLock<Vec<BuiltinFunction>> = LazyLock::new(|| {
+static BASE_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+
+fn build_base_functions() -> Vec<BuiltinFunction> {
     vec![
         BuiltinFunction {
             name: "print",
@@ -904,9 +913,11 @@ static BASE_FUNCTIONS: LazyLock<Vec<BuiltinFunction>> = LazyLock::new(|| {
             param_names: &["value"],
         },
     ]
-});
+}
 
-static TASK_FUNCTIONS: LazyLock<Vec<BuiltinFunction>> = LazyLock::new(|| {
+static TASK_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+
+fn build_task_functions() -> Vec<BuiltinFunction> {
     vec![
         BuiltinFunction {
             name: "task.run",
@@ -990,9 +1001,11 @@ static TASK_FUNCTIONS: LazyLock<Vec<BuiltinFunction>> = LazyLock::new(|| {
             param_names: &[],
         },
     ]
-});
+}
 
-static IO_FUNCTIONS: LazyLock<Vec<BuiltinFunction>> = LazyLock::new(|| {
+static IO_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+
+fn build_io_functions() -> Vec<BuiltinFunction> {
     vec![
         BuiltinFunction {
             name: "io.read_file",
@@ -1061,9 +1074,11 @@ static IO_FUNCTIONS: LazyLock<Vec<BuiltinFunction>> = LazyLock::new(|| {
             param_names: &["value"],
         },
     ]
-});
+}
 
-static OS_FUNCTIONS: LazyLock<Vec<BuiltinFunction>> = LazyLock::new(|| {
+static OS_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+
+fn build_os_functions() -> Vec<BuiltinFunction> {
     vec![
         BuiltinFunction {
             name: "os.create_file",
@@ -1111,9 +1126,11 @@ static OS_FUNCTIONS: LazyLock<Vec<BuiltinFunction>> = LazyLock::new(|| {
             param_names: &["from", "to"],
         },
     ]
-});
+}
 
-static BUILTIN_METHODS: LazyLock<Vec<BuiltinMethod>> = LazyLock::new(|| {
+static BUILTIN_METHODS: StaticOnceCell<Vec<BuiltinMethod>> = StaticOnceCell::new();
+
+fn build_builtin_methods() -> Vec<BuiltinMethod> {
     let mut methods = Vec::new();
     methods.extend(string_methods());
     methods.extend(array_methods());
@@ -1125,26 +1142,26 @@ static BUILTIN_METHODS: LazyLock<Vec<BuiltinMethod>> = LazyLock::new(|| {
     methods.extend(float_methods());
     methods.extend(int_methods());
     methods
-});
+}
 
 pub fn base_functions() -> &'static [BuiltinFunction] {
-    (&*BASE_FUNCTIONS).as_slice()
+    BASE_FUNCTIONS.get_or_init(build_base_functions).as_slice()
 }
 
 pub fn task_functions() -> &'static [BuiltinFunction] {
-    (&*TASK_FUNCTIONS).as_slice()
+    TASK_FUNCTIONS.get_or_init(build_task_functions).as_slice()
 }
 
 pub fn io_functions() -> &'static [BuiltinFunction] {
-    (&*IO_FUNCTIONS).as_slice()
+    IO_FUNCTIONS.get_or_init(build_io_functions).as_slice()
 }
 
 pub fn os_functions() -> &'static [BuiltinFunction] {
-    (&*OS_FUNCTIONS).as_slice()
+    OS_FUNCTIONS.get_or_init(build_os_functions).as_slice()
 }
 
 pub fn builtin_methods() -> &'static [BuiltinMethod] {
-    (&*BUILTIN_METHODS).as_slice()
+    BUILTIN_METHODS.get_or_init(build_builtin_methods).as_slice()
 }
 
 pub struct BuiltinModule {
@@ -1213,7 +1230,9 @@ fn receiver_key(expr: &TypeExpr) -> Option<&'static str> {
     }
 }
 
-static BUILTINS_DATABASE: LazyLock<BuiltinsDatabase> = LazyLock::new(|| {
+static BUILTINS_DATABASE: StaticOnceCell<BuiltinsDatabase> = StaticOnceCell::new();
+
+fn build_builtins_database() -> BuiltinsDatabase {
     let mut modules: BTreeMap<&'static str, BuiltinModule> = BTreeMap::new();
     let module_specs: [(&'static str, &'static str, &'static [BuiltinFunction]); 3] = [
         ("task", "task runtime module", task_functions()),
@@ -1251,10 +1270,10 @@ static BUILTINS_DATABASE: LazyLock<BuiltinsDatabase> = LazyLock::new(|| {
         modules,
         methods,
     }
-});
+}
 
 pub fn builtins() -> &'static BuiltinsDatabase {
-    &*BUILTINS_DATABASE
+    BUILTINS_DATABASE.get_or_init(build_builtins_database)
 }
 
 pub fn lookup_builtin_method(

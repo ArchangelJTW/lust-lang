@@ -1,6 +1,7 @@
 use super::{Instruction, Value};
 use crate::ast::TypeKind;
-use std::collections::HashMap;
+use alloc::{format, string::String, vec::Vec};
+use hashbrown::HashMap;
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub instructions: Vec<Instruction>,

@@ -1,3 +1,4 @@
+use alloc::{format, string::String, vec::Vec};
 use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackFrame {
@@ -82,4 +83,4 @@ fn format_stack_trace(frames: &[StackFrame]) -> String {
     output
 }
 
-pub type Result<T> = std::result::Result<T, LustError>;
+pub type Result<T> = core::result::Result<T, LustError>;

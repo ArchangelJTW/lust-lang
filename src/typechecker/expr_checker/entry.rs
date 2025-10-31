@@ -1,4 +1,11 @@
 use super::*;
+use alloc::{
+    boxed::Box,
+    format,
+    string::ToString,
+    vec::Vec,
+};
+use hashbrown::HashMap;
 impl TypeChecker {
     pub fn check_expr(&mut self, expr: &Expr) -> Result<Type> {
         let mut ty = self.check_expr_with_hint(expr, None)?;
@@ -188,7 +195,7 @@ impl TypeChecker {
                         )));
                     }
 
-                    let mut type_params = std::collections::HashMap::new();
+                    let mut type_params = HashMap::new();
                     for (arg, expected_type) in args.iter().zip(expected_fields.iter()) {
                         let arg_type = self.check_expr(arg)?;
                         if let TypeKind::Generic(type_param) = &expected_type.kind {

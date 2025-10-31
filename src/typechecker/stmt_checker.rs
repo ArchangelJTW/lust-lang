@@ -1,5 +1,6 @@
-use super::TypeChecker;
+use super::*;
 use crate::{ast::*, error::Result};
+use hashbrown::HashMap;
 impl TypeChecker {
     pub(super) fn check_stmt(&mut self, stmt: &Stmt) -> Result<()> {
         match &stmt.kind {
@@ -82,7 +83,7 @@ impl TypeChecker {
 
         let binding_count = bindings.len();
         let mut expr_types: Vec<Type> = Vec::new();
-        let mut expr_generics: Vec<Option<std::collections::HashMap<String, Type>>> = Vec::new();
+        let mut expr_generics: Vec<Option<HashMap<String, Type>>> = Vec::new();
         let annotation_hint = if bindings.len() == 1 {
             bindings[0]
                 .type_annotation
@@ -110,7 +111,7 @@ impl TypeChecker {
         }
 
         let mut value_types: Vec<Type> = Vec::new();
-        let mut value_generics: Vec<Option<std::collections::HashMap<String, Type>>> = Vec::new();
+        let mut value_generics: Vec<Option<HashMap<String, Type>>> = Vec::new();
         if let Some(exprs) = initializer {
             if binding_count == 1 && exprs.len() == 1 {
                 value_types.push(expr_types[0].clone());
@@ -590,9 +591,9 @@ impl TypeChecker {
                     self.in_loop = true;
                     self.env.push_scope();
                     self.env
-                        .declare_variable(variables[0].clone(), (**key_ty).clone())?;
+                        .declare_variable(variables[0].clone(), key_ty.as_ref().clone())?;
                     self.env
-                        .declare_variable(variables[1].clone(), (**val_ty).clone())?;
+                        .declare_variable(variables[1].clone(), val_ty.as_ref().clone())?;
                     for stmt in body {
                         self.check_stmt(stmt)?;
                     }
@@ -638,7 +639,7 @@ impl TypeChecker {
                     self.in_loop = true;
                     self.env.push_scope();
                     self.env
-                        .declare_variable(variables[0].clone(), (**elem_ty).clone())?;
+                        .declare_variable(variables[0].clone(), elem_ty.as_ref().clone())?;
                     for stmt in body {
                         self.check_stmt(stmt)?;
                     }
@@ -665,7 +666,7 @@ impl TypeChecker {
                 self.in_loop = true;
                 self.env.push_scope();
                 self.env
-                    .declare_variable(variables[0].clone(), (**elem_type).clone())?;
+                    .declare_variable(variables[0].clone(), elem_type.as_ref().clone())?;
                 for stmt in body {
                     self.check_stmt(stmt)?;
                 }

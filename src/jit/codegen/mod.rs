@@ -3,8 +3,9 @@ pub(super) use super::{CompiledTrace, Guard, GuardKind, Trace, TraceId, TraceOp}
 pub(super) use crate::bytecode::{Function, Value, ValueTag};
 pub(super) use crate::jit;
 pub(super) use crate::Result;
+pub(super) use alloc::vec::Vec;
 pub(super) use dynasmrt::{dynasm, x64::Assembler, DynasmApi, DynasmLabelApi};
-pub(super) use std::mem;
+pub(super) use core::mem;
 mod arithmetic;
 mod builder;
 mod comparisons;

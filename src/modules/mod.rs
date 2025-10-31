@@ -4,11 +4,10 @@ use crate::{
     lexer::Lexer,
     parser::Parser,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    path::{Path, PathBuf},
-};
+use alloc::{format, string::String, vec, vec::Vec};
+use hashbrown::{HashMap, HashSet};
+#[cfg(feature = "std")]
+use std::{fs, path::{Path, PathBuf}};
 #[derive(Debug, Clone, Default)]
 pub struct ModuleImports {
     pub function_aliases: HashMap<String, String>,
@@ -22,6 +21,8 @@ pub struct ModuleExports {
     pub types: HashMap<String, String>,
 }
 
+pub mod embedded;
+
 #[derive(Debug, Clone)]
 pub struct LoadedModule {
     pub path: String,
@@ -29,6 +30,7 @@ pub struct LoadedModule {
     pub imports: ModuleImports,
     pub exports: ModuleExports,
     pub init_function: Option<String>,
+    #[cfg(feature = "std")]
     pub source_path: PathBuf,
 }
 
@@ -38,6 +40,7 @@ pub struct Program {
     pub entry_module: String,
 }
 
+pub use embedded::{build_directory_map, load_program_from_embedded, EmbeddedModule};
 #[derive(Clone, Copy, Debug, Default)]
 struct ImportResolution {
     import_value: bool,
@@ -53,6 +56,7 @@ impl ImportResolution {
     }
 }
 
+#[cfg(feature = "std")]
 pub struct ModuleLoader {
     base_dir: PathBuf,
     cache: HashMap<String, LoadedModule>,
@@ -60,6 +64,7 @@ pub struct ModuleLoader {
     source_overrides: HashMap<PathBuf, String>,
 }
 
+#[cfg(feature = "std")]
 impl ModuleLoader {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -623,5 +628,34 @@ impl ModuleLoader {
     fn module_path_for_file(path: &Path) -> String {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         stem.to_string()
+    }
+}
+
+#[cfg(not(feature = "std"))]
+pub struct ModuleLoader {
+    cache: HashMap<String, LoadedModule>,
+    visited: HashSet<String>,
+}
+
+#[cfg(not(feature = "std"))]
+impl ModuleLoader {
+    pub fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+            visited: HashSet::new(),
+        }
+    }
+
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
+        self.visited.clear();
+    }
+
+    pub fn load_program_from_modules(
+        &mut self,
+        modules: Vec<LoadedModule>,
+        entry_module: String,
+    ) -> Program {
+        Program { modules, entry_module }
     }
 }

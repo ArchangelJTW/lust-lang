@@ -44,6 +44,13 @@ impl ValueKey {
         }
     }
 
+    pub fn string<S>(value: S) -> Self
+    where
+        S: Into<String>,
+    {
+        ValueKey::String(Rc::new(value.into()))
+    }
+
     pub fn to_value(&self) -> Value {
         match self {
             ValueKey::Int(i) => Value::Int(*i),
@@ -112,6 +119,42 @@ impl fmt::Display for ValueKey {
             ValueKey::String(s) => write!(f, "{}", s),
             ValueKey::Bool(b) => write!(f, "{}", b),
         }
+    }
+}
+
+impl From<LustInt> for ValueKey {
+    fn from(value: LustInt) -> Self {
+        ValueKey::Int(value)
+    }
+}
+
+impl From<LustFloat> for ValueKey {
+    fn from(value: LustFloat) -> Self {
+        ValueKey::Float(value)
+    }
+}
+
+impl From<bool> for ValueKey {
+    fn from(value: bool) -> Self {
+        ValueKey::Bool(value)
+    }
+}
+
+impl From<String> for ValueKey {
+    fn from(value: String) -> Self {
+        ValueKey::String(Rc::new(value))
+    }
+}
+
+impl From<&str> for ValueKey {
+    fn from(value: &str) -> Self {
+        ValueKey::String(Rc::new(value.to_owned()))
+    }
+}
+
+impl From<Rc<String>> for ValueKey {
+    fn from(value: Rc<String>) -> Self {
+        ValueKey::String(value)
     }
 }
 

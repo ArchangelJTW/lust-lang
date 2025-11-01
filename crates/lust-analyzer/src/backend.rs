@@ -13,14 +13,17 @@ use crate::utils::{
     span_from_identifier, span_overlaps_range, span_start_before_or_equal, span_starts_after,
     span_to_range, split_type_member,
 };
+use hashbrown::{HashMap, HashSet};
 use lust::ast::{
     Expr, ExprKind, ExternItem, FunctionParam, Item, ItemKind, Stmt, StmtKind, Type, TypeKind,
     Visibility,
 };
 use lust::builtins::{self, BuiltinFunction, BuiltinMethod, TypeExpr};
 use lust::{Compiler, ModuleLoader, Span, TypeChecker};
-use hashbrown::{HashMap, HashSet};
-use std::{path::{Path, PathBuf}, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{

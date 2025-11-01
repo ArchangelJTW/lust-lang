@@ -1,7 +1,7 @@
-use alloc::{format, string::ToString, vec::Vec};
 use crate::bytecode::{Register, Value};
 use crate::jit;
 use crate::jit::trace::{Trace, TraceOp};
+use alloc::{format, string::ToString, vec::Vec};
 use hashbrown::HashSet;
 pub struct TraceOptimizer {
     hoisted_constants: Vec<(Register, Value)>,

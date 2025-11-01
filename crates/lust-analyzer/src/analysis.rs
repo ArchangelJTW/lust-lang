@@ -3,11 +3,15 @@ use crate::utils::{
     method_display_name, named_type_name, qualify_type_name, simple_type_name,
     span_contains_position, span_size, span_to_range,
 };
+use hashbrown::{HashMap, HashSet};
 use lust::ast::{EnumDef, FunctionParam, ItemKind, StructDef, TraitDef, Type, Visibility};
 use lust::modules::{LoadedModule, Program};
 use lust::{Span, TypeCollection};
-use hashbrown::{HashMap, HashSet};
-use std::{fmt::Write, fs, path::{Path, PathBuf}};
+use std::{
+    fmt::Write,
+    fs,
+    path::{Path, PathBuf},
+};
 use tower_lsp::lsp_types::{Hover, HoverContents, Location, MarkupContent, MarkupKind, Position};
 use url::Url;
 #[derive(Clone)]

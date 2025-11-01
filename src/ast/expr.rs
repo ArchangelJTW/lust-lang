@@ -1,7 +1,12 @@
 use super::{Span, Type};
-use alloc::{boxed::Box, format, string::{String, ToString}, vec::Vec};
-use core::fmt;
 use crate::number::{LustFloat, LustInt};
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Expr {
     pub kind: ExprKind,

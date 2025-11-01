@@ -4,7 +4,13 @@ use crate::{
     config::LustConfig,
     error::{LustError, Result},
 };
-use alloc::{boxed::Box, format, string::{String, ToString}, vec, vec::Vec};
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 use hashbrown::{HashMap, HashSet};
 pub struct TypeEnv {
     scopes: Vec<HashMap<String, Type>>,

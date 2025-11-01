@@ -1,8 +1,8 @@
 #!/bin/bash
 
 if [ -z "$1" ]; then
-  echo "Usage: $0 <benchmark_name>"
-  exit 1
+	echo "Usage: $0 <benchmark_name>"
+	exit 1
 fi
 
 benchmark_name="$1"
@@ -12,7 +12,7 @@ time luajit ./benchmarks/"$benchmark_name"/benchmark.lua
 echo ""
 
 echo "==Lust=="
-time ./target/release/lust ./benchmarks/"$benchmark_name"/benchmark.lust
+time lust ./benchmarks/"$benchmark_name"/benchmark.lust
 echo ""
 
 echo "==Python=="

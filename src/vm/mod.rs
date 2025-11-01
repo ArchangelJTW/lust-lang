@@ -1,3 +1,4 @@
+mod corelib;
 mod cycle;
 #[cfg(feature = "std")]
 pub mod stdlib;

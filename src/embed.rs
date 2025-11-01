@@ -5,14 +5,14 @@ use crate::number::{LustFloat, LustInt};
 use crate::typechecker::{FunctionSignature, TypeChecker};
 use crate::vm::VM;
 use crate::{LustConfig, LustError, Result};
-use std::cell::RefCell;
 use hashbrown::HashMap;
+use std::cell::RefCell;
 use std::future::Future;
-use std::pin::Pin;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 type AsyncValueFuture = Pin<Box<dyn Future<Output = std::result::Result<Value, String>>>>;
@@ -255,6 +255,14 @@ impl EmbeddedProgram {
         &mut self.vm
     }
 
+    pub fn global_names(&self) -> Vec<String> {
+        self.vm.global_names()
+    }
+
+    pub fn globals(&self) -> Vec<(String, Value)> {
+        self.vm.globals_snapshot()
+    }
+
     pub fn signature(&self, function_name: &str) -> Option<&FunctionSignature> {
         self.find_signature(function_name).map(|(_, sig)| sig)
     }
@@ -351,12 +359,8 @@ impl EmbeddedProgram {
         name.rsplit(|c| c == '.' || c == ':').next().unwrap_or(name)
     }
 
-    fn register_native_with_aliases<F>(
-        &mut self,
-        requested_name: &str,
-        canonical: String,
-        func: F,
-    ) where
+    fn register_native_with_aliases<F>(&mut self, requested_name: &str, canonical: String, func: F)
+    where
         F: Fn(&[Value]) -> std::result::Result<NativeCallResult, String> + 'static,
     {
         let native_fn: Rc<dyn Fn(&[Value]) -> std::result::Result<NativeCallResult, String>> =
@@ -404,15 +408,14 @@ impl EmbeddedProgram {
         self.vm.set_global(normalized, value);
     }
 
-    pub fn struct_instance<I, K, V>(
+    pub fn struct_instance<I>(
         &self,
         type_name: impl Into<String>,
         fields: I,
     ) -> Result<StructInstance>
     where
-        I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: IntoTypedValue,
+        I: IntoIterator,
+        I::Item: Into<StructField>,
     {
         let type_name = type_name.into();
         let def = self
@@ -423,7 +426,10 @@ impl EmbeddedProgram {
             })?;
         let mut provided: HashMap<String, TypedValue> = fields
             .into_iter()
-            .map(|(name, value)| (name.into(), value.into_typed_value()))
+            .map(|field| {
+                let field: StructField = field.into();
+                field.into_parts()
+            })
             .collect();
         let mut ordered_fields: Vec<(Rc<String>, Value)> = Vec::with_capacity(def.fields.len());
         for field in &def.fields {
@@ -578,11 +584,7 @@ impl EmbeddedProgram {
         self.vm.register_native(name, native);
     }
 
-    pub fn register_async_native<F, Fut>(
-        &mut self,
-        name: impl Into<String>,
-        func: F,
-    ) -> Result<()>
+    pub fn register_async_native<F, Fut>(&mut self, name: impl Into<String>, func: F) -> Result<()>
     where
         F: Fn(Vec<Value>) -> Fut + 'static,
         Fut: Future<Output = std::result::Result<Value, String>> + 'static,
@@ -770,10 +772,8 @@ impl EmbeddedProgram {
                 }
 
                 Err(message) => {
-                    self.vm.fail_task_handle(
-                        handle,
-                        LustError::RuntimeError { message },
-                    )?;
+                    self.vm
+                        .fail_task_handle(handle, LustError::RuntimeError { message })?;
                 }
             }
         }
@@ -943,6 +943,42 @@ impl TypedValue {
     }
 }
 
+pub struct StructField {
+    name: String,
+    value: TypedValue,
+}
+
+impl StructField {
+    pub fn new(name: impl Into<String>, value: impl IntoTypedValue) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into_typed_value(),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn into_parts(self) -> (String, TypedValue) {
+        (self.name, self.value)
+    }
+}
+
+pub fn struct_field(name: impl Into<String>, value: impl IntoTypedValue) -> StructField {
+    StructField::new(name, value)
+}
+
+impl<K, V> From<(K, V)> for StructField
+where
+    K: Into<String>,
+    V: IntoTypedValue,
+{
+    fn from((name, value): (K, V)) -> Self {
+        StructField::new(name, value)
+    }
+}
+
 #[derive(Clone)]
 pub struct StructInstance {
     type_name: String,
@@ -983,6 +1019,116 @@ impl StructInstance {
                         })?;
                 let materialized = layout.materialize_field_value(index, stored);
                 T::from_value(materialized)
+            }
+
+            _ => Err(LustError::RuntimeError {
+                message: "StructInstance does not contain a struct value".to_string(),
+            }),
+        }
+    }
+
+    pub fn set_field<V: IntoTypedValue>(&self, field: &str, value: V) -> Result<()> {
+        match &self.value {
+            Value::Struct { layout, fields, .. } => {
+                let index = layout
+                    .index_of_str(field)
+                    .ok_or_else(|| LustError::RuntimeError {
+                        message: format!(
+                            "Struct '{}' has no field named '{}'",
+                            self.type_name, field
+                        ),
+                    })?;
+                let typed_value = value.into_typed_value();
+                let matches_declared = typed_value.matches(layout.field_type(index));
+                let matches_ref_inner = layout.is_weak(index)
+                    && layout
+                        .weak_target(index)
+                        .map(|inner| typed_value.matches(inner))
+                        .unwrap_or(false);
+                if !(matches_declared || matches_ref_inner) {
+                    return Err(LustError::TypeError {
+                        message: format!(
+                            "Struct '{}' field '{}' expects Lust type '{}' but Rust provided '{}'",
+                            self.type_name,
+                            field,
+                            layout.field_type(index),
+                            typed_value.description()
+                        ),
+                    });
+                }
+
+                let canonical_value = layout
+                    .canonicalize_field_value(index, typed_value.into_value())
+                    .map_err(|message| LustError::TypeError { message })?;
+                fields.borrow_mut()[index] = canonical_value;
+                Ok(())
+            }
+
+            _ => Err(LustError::RuntimeError {
+                message: "StructInstance does not contain a struct value".to_string(),
+            }),
+        }
+    }
+
+    pub fn update_field<F, V>(&self, field: &str, update: F) -> Result<()>
+    where
+        F: FnOnce(Value) -> Result<V>,
+        V: IntoTypedValue,
+    {
+        match &self.value {
+            Value::Struct { layout, fields, .. } => {
+                let index = layout
+                    .index_of_str(field)
+                    .ok_or_else(|| LustError::RuntimeError {
+                        message: format!(
+                            "Struct '{}' has no field named '{}'",
+                            self.type_name, field
+                        ),
+                    })?;
+                let mut slots = fields.borrow_mut();
+                let slot = slots
+                    .get_mut(index)
+                    .ok_or_else(|| LustError::RuntimeError {
+                        message: format!(
+                            "Struct '{}' field '{}' is unavailable",
+                            self.type_name, field
+                        ),
+                    })?;
+                let fallback = slot.clone();
+                let current_canonical = std::mem::replace(slot, Value::Nil);
+                let current_materialized = layout.materialize_field_value(index, current_canonical);
+                let updated = match update(current_materialized) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        *slot = fallback;
+                        return Err(err);
+                    }
+                };
+                let typed_value = updated.into_typed_value();
+                let matches_declared = typed_value.matches(layout.field_type(index));
+                let matches_ref_inner = layout.is_weak(index)
+                    && layout
+                        .weak_target(index)
+                        .map(|inner| typed_value.matches(inner))
+                        .unwrap_or(false);
+                if !(matches_declared || matches_ref_inner) {
+                    *slot = fallback;
+                    return Err(LustError::TypeError {
+                        message: format!(
+                            "Struct '{}' field '{}' expects Lust type '{}' but Rust provided '{}'",
+                            self.type_name,
+                            field,
+                            layout.field_type(index),
+                            typed_value.description()
+                        ),
+                    });
+                }
+
+                let canonical_value = layout
+                    .canonicalize_field_value(index, typed_value.into_value())
+                    .map_err(|message| LustError::TypeError { message })?;
+                *slot = canonical_value;
+                Ok(())
             }
 
             _ => Err(LustError::RuntimeError {
@@ -1253,6 +1399,192 @@ mod tests {
     }
 
     #[test]
+    fn struct_instance_supports_mixed_field_types() {
+        let source = r#"
+            struct Mixed
+                count: int
+                label: string
+                enabled: bool
+            end
+        "#;
+
+        let program = build_program(source);
+        let mixed = program
+            .struct_instance(
+                "main.Mixed",
+                [
+                    struct_field("count", 7_i64),
+                    struct_field("label", "hi"),
+                    struct_field("enabled", true),
+                ],
+            )
+            .expect("struct instance");
+
+        assert_eq!(mixed.field::<i64>("count").expect("count field"), 7);
+        assert_eq!(mixed.field::<String>("label").expect("label field"), "hi");
+        assert!(mixed.field::<bool>("enabled").expect("enabled field"));
+    }
+
+    #[test]
+    fn struct_instance_allows_setting_fields() {
+        let source = r#"
+            struct Mixed
+                count: int
+                label: string
+                enabled: bool
+            end
+        "#;
+
+        let program = build_program(source);
+        let mixed = program
+            .struct_instance(
+                "main.Mixed",
+                [
+                    struct_field("count", 1_i64),
+                    struct_field("label", "start"),
+                    struct_field("enabled", false),
+                ],
+            )
+            .expect("struct instance");
+
+        mixed
+            .set_field("count", 11_i64)
+            .expect("update count field");
+        assert_eq!(mixed.field::<i64>("count").expect("count field"), 11);
+
+        let err = mixed
+            .set_field("count", "oops")
+            .expect_err("type mismatch should fail");
+        match err {
+            LustError::TypeError { message } => {
+                assert!(message.contains("count"));
+                assert!(message.contains("int"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(mixed.field::<i64>("count").expect("count field"), 11);
+
+        mixed
+            .set_field("label", String::from("updated"))
+            .expect("update label");
+        assert_eq!(
+            mixed.field::<String>("label").expect("label field"),
+            "updated"
+        );
+
+        mixed.set_field("enabled", true).expect("update enabled");
+        assert!(mixed.field::<bool>("enabled").expect("enabled field"));
+    }
+
+    #[test]
+    fn struct_instance_accepts_nested_structs() {
+        let source = r#"
+            struct Child
+                value: int
+            end
+
+            struct Parent
+                child: main.Child
+            end
+        "#;
+
+        let program = build_program(source);
+        let child = program
+            .struct_instance("main.Child", [struct_field("value", 42_i64)])
+            .expect("child struct");
+        let parent = program
+            .struct_instance("main.Parent", [struct_field("child", child.clone())])
+            .expect("parent struct");
+
+        let nested: StructInstance = parent.field("child").expect("child field");
+        assert_eq!(nested.field::<i64>("value").expect("value field"), 42);
+    }
+
+    #[test]
+    fn globals_snapshot_exposes_lust_values() {
+        let source = r#"
+            struct Child
+                value: int
+            end
+
+            struct Parent
+                child: unknown
+            end
+
+            function make_parent(): Parent
+                return Parent { child = Child { value = 3 } }
+            end
+        "#;
+
+        let mut program = build_program(source);
+        program.run_entry_script().expect("run entry script");
+        let parent: StructInstance = program
+            .call_typed("main.make_parent", ())
+            .expect("call make_parent");
+        program.set_global_value("main.some_nested_structure", parent.clone());
+
+        let globals = program.globals();
+        let (_, value) = globals
+            .into_iter()
+            .find(|(name, _)| name.ends_with("some_nested_structure"))
+            .expect("global binding present");
+        let stored = StructInstance::from_value(value).expect("convert to struct");
+        let child_value = stored
+            .field::<StructInstance>("child")
+            .expect("nested child");
+        assert_eq!(child_value.field::<i64>("value").expect("child value"), 3);
+    }
+
+    #[test]
+    fn update_field_modifies_value_in_place() {
+        let source = r#"
+            struct Counter
+                value: int
+            end
+        "#;
+
+        let program = build_program(source);
+        let counter = program
+            .struct_instance("main.Counter", [struct_field("value", 10_i64)])
+            .expect("counter struct");
+
+        counter
+            .update_field("value", |current| match current {
+                Value::Int(v) => Ok(v + 5),
+                other => Err(LustError::RuntimeError {
+                    message: format!("unexpected value {other:?}"),
+                }),
+            })
+            .expect("update in place");
+        assert_eq!(counter.field::<i64>("value").expect("value field"), 15);
+
+        let err = counter
+            .update_field("value", |_| Ok(String::from("oops")))
+            .expect_err("string should fail type check");
+        match err {
+            LustError::TypeError { message } => {
+                assert!(message.contains("value"));
+                assert!(message.contains("int"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(counter.field::<i64>("value").expect("value field"), 15);
+
+        let err = counter
+            .update_field("value", |_| -> Result<i64> {
+                Err(LustError::RuntimeError {
+                    message: "closure failure".to_string(),
+                })
+            })
+            .expect_err("closure error should propagate");
+        match err {
+            LustError::RuntimeError { message } => assert_eq!(message, "closure failure"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(counter.field::<i64>("value").expect("value field"), 15);
+    }
+
+    #[test]
     fn async_native_resumes_task_on_completion() {
         let source = r#"
             extern {
@@ -1276,9 +1608,7 @@ mod tests {
 
         let handle = {
             let vm = program.vm_mut();
-            let compute_fn = vm
-                .function_value("main.compute")
-                .expect("compute function");
+            let compute_fn = vm.function_value("main.compute").expect("compute function");
             vm.spawn_task_value(compute_fn, Vec::new())
                 .expect("spawn task")
         };
@@ -1288,9 +1618,7 @@ mod tests {
         assert!(program.has_pending_async_tasks());
 
         state.complete_ok(123);
-        program
-            .poll_async_tasks()
-            .expect("resume after completion");
+        program.poll_async_tasks().expect("resume after completion");
 
         {
             let vm = program.vm_mut();
@@ -1331,9 +1659,7 @@ mod tests {
 
         let handle = {
             let vm = program.vm_mut();
-            let compute_fn = vm
-                .function_value("main.compute")
-                .expect("compute function");
+            let compute_fn = vm.function_value("main.compute").expect("compute function");
             vm.spawn_task_value(compute_fn, Vec::new())
                 .expect("spawn task")
         };
@@ -1366,9 +1692,11 @@ mod tests {
 
 fn matches_lust_struct(value: &Value, ty: &Type) -> bool {
     match (value, &ty.kind) {
-        (Value::Struct { name, .. }, TypeKind::Named(expected)) => name == expected,
+        (Value::Struct { name, .. }, TypeKind::Named(expected)) => {
+            lust_type_names_match(name, expected)
+        }
         (Value::Struct { name, .. }, TypeKind::GenericInstance { name: expected, .. }) => {
-            name == expected
+            lust_type_names_match(name, expected)
         }
 
         (value, TypeKind::Union(types)) => types.iter().any(|alt| matches_lust_struct(value, alt)),
@@ -1379,15 +1707,35 @@ fn matches_lust_struct(value: &Value, ty: &Type) -> bool {
 
 fn matches_lust_enum(value: &Value, ty: &Type) -> bool {
     match (value, &ty.kind) {
-        (Value::Enum { enum_name, .. }, TypeKind::Named(expected)) => enum_name == expected,
+        (Value::Enum { enum_name, .. }, TypeKind::Named(expected)) => {
+            lust_type_names_match(enum_name, expected)
+        }
         (Value::Enum { enum_name, .. }, TypeKind::GenericInstance { name: expected, .. }) => {
-            enum_name == expected
+            lust_type_names_match(enum_name, expected)
         }
 
         (value, TypeKind::Union(types)) => types.iter().any(|alt| matches_lust_enum(value, alt)),
         (_, TypeKind::Unknown) => true,
         _ => false,
     }
+}
+
+fn lust_type_names_match(value: &str, expected: &str) -> bool {
+    if value == expected {
+        return true;
+    }
+
+    let normalized_value = normalize_global_name(value);
+    let normalized_expected = normalize_global_name(expected);
+    if normalized_value == normalized_expected {
+        return true;
+    }
+
+    simple_type_name(&normalized_value) == simple_type_name(&normalized_expected)
+}
+
+fn simple_type_name(name: &str) -> &str {
+    name.rsplit(|c| c == '.' || c == ':').next().unwrap_or(name)
 }
 
 fn matches_array_type<F>(ty: &Type, matcher: &F) -> bool

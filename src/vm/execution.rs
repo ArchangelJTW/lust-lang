@@ -86,8 +86,7 @@ impl VM {
                     let registers_ptr = frame.registers.as_mut_ptr();
                     let entry = self.jit.get_trace(trace_id).map(|t| t.entry);
                     if let Some(entry_fn) = entry {
-                        let result =
-                            entry_fn(registers_ptr, self as *mut VM, ptr::null());
+                        let result = entry_fn(registers_ptr, self as *mut VM, ptr::null());
                         if result == 0 {
                             if let Some(frame) = self.call_stack.last_mut() {
                                 frame.ip = loop_start_ip;
@@ -113,11 +112,7 @@ impl VM {
                                 let side_entry = self.jit.get_trace(side_trace_id).map(|t| t.entry);
                                 if let Some(side_entry_fn) = side_entry {
                                     let side_result =
-                                        side_entry_fn(
-                                            registers_ptr,
-                                            self as *mut VM,
-                                            ptr::null(),
-                                        );
+                                        side_entry_fn(registers_ptr, self as *mut VM, ptr::null());
                                     if side_result == 0 {
                                         crate::jit::log(|| {
                                             format!(

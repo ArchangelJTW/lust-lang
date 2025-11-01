@@ -1,10 +1,5 @@
 use super::*;
-use alloc::{
-    boxed::Box,
-    format,
-    string::ToString,
-    vec::Vec,
-};
+use alloc::{boxed::Box, format, string::ToString, vec::Vec};
 use hashbrown::HashMap;
 impl TypeChecker {
     pub fn check_expr(&mut self, expr: &Expr) -> Result<Type> {

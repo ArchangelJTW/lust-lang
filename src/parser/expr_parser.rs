@@ -5,7 +5,13 @@ use crate::{
     lexer::{Token, TokenKind},
     number::{parse_float, LustInt},
 };
-use alloc::{boxed::Box, format, string::{String, ToString}, vec, vec::Vec};
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 use core::{matches, unreachable};
 impl Parser {
     pub(super) fn parse_expr(&mut self) -> Result<Expr> {
@@ -444,8 +450,8 @@ impl Parser {
 
             TokenKind::Float => {
                 let token = self.advance();
-                let value = parse_float(&token.lexeme)
-                    .map_err(|_| self.error("Invalid float literal"))?;
+                let value =
+                    parse_float(&token.lexeme).map_err(|_| self.error("Invalid float literal"))?;
                 ExprKind::Literal(Literal::Float(value))
             }
 

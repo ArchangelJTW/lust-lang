@@ -1097,9 +1097,7 @@ impl TypeChecker {
             }
 
             TypeKind::Generic(type_param) => {
-                if let Some(trait_names) =
-                    self.current_trait_bounds.get(type_param.as_str())
-                {
+                if let Some(trait_names) = self.current_trait_bounds.get(type_param.as_str()) {
                     for trait_name in trait_names {
                         if let Some(trait_def) = {
                             let key = self.resolve_type_key(trait_name.as_str());

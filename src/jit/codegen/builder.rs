@@ -164,13 +164,7 @@ impl JitCompiler {
                     arg_count,
                 } => {
                     let expected_ptr = function.pointer();
-                    self.compile_call_native(
-                        *dest,
-                        *callee,
-                        expected_ptr,
-                        *first_arg,
-                        *arg_count,
-                    )?;
+                    self.compile_call_native(*dest, *callee, expected_ptr, *first_arg, *arg_count)?;
                 }
 
                 TraceOp::CallMethod {

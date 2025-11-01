@@ -1,12 +1,12 @@
 use crate::ast::{EnumDef, FieldOwnership, Item, ItemKind, Span, StructDef, Type, TypeKind};
-use crate::bytecode::{Compiler, NativeCallResult, TaskHandle, Value};
+use crate::bytecode::{Compiler, FieldStorage, NativeCallResult, TaskHandle, Value, ValueKey};
 use crate::modules::{ModuleImports, ModuleLoader};
 use crate::number::{LustFloat, LustInt};
 use crate::typechecker::{FunctionSignature, TypeChecker};
 use crate::vm::VM;
 use crate::{LustConfig, LustError, Result};
 use hashbrown::HashMap;
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell, RefMut};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -996,6 +996,11 @@ impl StructInstance {
     }
 
     pub fn field<T: FromLustValue>(&self, field: &str) -> Result<T> {
+        let value_ref = self.borrow_field(field)?;
+        T::from_value(value_ref.into_owned())
+    }
+
+    pub fn borrow_field(&self, field: &str) -> Result<ValueRef<'_>> {
         match &self.value {
             Value::Struct { layout, fields, .. } => {
                 let index = layout
@@ -1006,19 +1011,40 @@ impl StructInstance {
                             self.type_name, field
                         ),
                     })?;
-                let stored =
-                    fields
-                        .borrow()
-                        .get(index)
-                        .cloned()
-                        .ok_or_else(|| LustError::RuntimeError {
-                            message: format!(
-                                "Struct '{}' field '{}' is unavailable",
-                                self.type_name, field
-                            ),
-                        })?;
-                let materialized = layout.materialize_field_value(index, stored);
-                T::from_value(materialized)
+                match layout.field_storage(index) {
+                    FieldStorage::Strong => {
+                        let slots = fields.borrow();
+                        if slots.get(index).is_none() {
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "Struct '{}' field '{}' is unavailable",
+                                    self.type_name, field
+                                ),
+                            });
+                        }
+
+                        Ok(ValueRef::borrowed(Ref::map(slots, move |values| {
+                            &values[index]
+                        })))
+                    }
+
+                    FieldStorage::Weak => {
+                        let stored = {
+                            let slots = fields.borrow();
+                            slots
+                                .get(index)
+                                .cloned()
+                                .ok_or_else(|| LustError::RuntimeError {
+                                    message: format!(
+                                        "Struct '{}' field '{}' is unavailable",
+                                        self.type_name, field
+                                    ),
+                                })?
+                        };
+                        let materialized = layout.materialize_field_value(index, stored);
+                        Ok(ValueRef::owned(materialized))
+                    }
+                }
             }
 
             _ => Err(LustError::RuntimeError {
@@ -1139,6 +1165,302 @@ impl StructInstance {
 
     pub fn as_value(&self) -> &Value {
         &self.value
+    }
+}
+
+pub enum ValueRef<'a> {
+    Borrowed(Ref<'a, Value>),
+    Owned(Value),
+}
+
+impl<'a> ValueRef<'a> {
+    fn borrowed(inner: Ref<'a, Value>) -> Self {
+        Self::Borrowed(inner)
+    }
+
+    fn owned(value: Value) -> Self {
+        Self::Owned(value)
+    }
+
+    pub fn as_value(&self) -> &Value {
+        match self {
+            ValueRef::Borrowed(inner) => &*inner,
+            ValueRef::Owned(value) => value,
+        }
+    }
+
+    pub fn to_owned(&self) -> Value {
+        self.as_value().clone()
+    }
+
+    pub fn into_owned(self) -> Value {
+        match self {
+            ValueRef::Borrowed(inner) => inner.clone(),
+            ValueRef::Owned(value) => value,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self.as_value() {
+            Value::Bool(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn as_int(&self) -> Option<LustInt> {
+        self.as_value().as_int()
+    }
+
+    pub fn as_float(&self) -> Option<LustFloat> {
+        self.as_value().as_float()
+    }
+
+    pub fn as_string(&self) -> Option<&str> {
+        self.as_value().as_string()
+    }
+
+    pub fn as_rc_string(&self) -> Option<Rc<String>> {
+        match self.as_value() {
+            Value::String(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn as_array_handle(&self) -> Option<ArrayHandle> {
+        match self.as_value() {
+            Value::Array(items) => Some(ArrayHandle::from_rc(items.clone())),
+            _ => None,
+        }
+    }
+
+    pub fn as_map_handle(&self) -> Option<MapHandle> {
+        match self.as_value() {
+            Value::Map(map) => Some(MapHandle::from_rc(map.clone())),
+            _ => None,
+        }
+    }
+
+    pub fn as_table_handle(&self) -> Option<TableHandle> {
+        match self.as_value() {
+            Value::Table(table) => Some(TableHandle::from_rc(table.clone())),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ArrayHandle {
+    inner: Rc<RefCell<Vec<Value>>>,
+}
+
+impl ArrayHandle {
+    fn from_rc(inner: Rc<RefCell<Vec<Value>>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn borrow(&self) -> Ref<'_, [Value]> {
+        Ref::map(self.inner.borrow(), |values| values.as_slice())
+    }
+
+    pub fn borrow_mut(&self) -> RefMut<'_, Vec<Value>> {
+        self.inner.borrow_mut()
+    }
+
+    pub fn push(&self, value: Value) {
+        self.inner.borrow_mut().push(value);
+    }
+
+    pub fn extend<I>(&self, iter: I)
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        self.inner.borrow_mut().extend(iter);
+    }
+
+    pub fn get(&self, index: usize) -> Option<ValueRef<'_>> {
+        {
+            let values = self.inner.borrow();
+            if values.get(index).is_none() {
+                return None;
+            }
+        }
+
+        let values = self.inner.borrow();
+        Some(ValueRef::borrowed(Ref::map(values, move |items| {
+            &items[index]
+        })))
+    }
+
+    pub fn with_ref<R>(&self, f: impl FnOnce(&[Value]) -> R) -> R {
+        let values = self.inner.borrow();
+        f(values.as_slice())
+    }
+
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut Vec<Value>) -> R) -> R {
+        let mut values = self.inner.borrow_mut();
+        f(&mut values)
+    }
+}
+
+#[derive(Clone)]
+pub struct MapHandle {
+    inner: Rc<RefCell<HashMap<ValueKey, Value>>>,
+}
+
+impl MapHandle {
+    fn from_rc(inner: Rc<RefCell<HashMap<ValueKey, Value>>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn borrow(&self) -> Ref<'_, HashMap<ValueKey, Value>> {
+        self.inner.borrow()
+    }
+
+    pub fn borrow_mut(&self) -> RefMut<'_, HashMap<ValueKey, Value>> {
+        self.inner.borrow_mut()
+    }
+
+    pub fn contains_key<K>(&self, key: K) -> bool
+    where
+        K: Into<ValueKey>,
+    {
+        self.inner.borrow().contains_key(&key.into())
+    }
+
+    pub fn get<K>(&self, key: K) -> Option<ValueRef<'_>>
+    where
+        K: Into<ValueKey>,
+    {
+        let key = key.into();
+        {
+            if !self.inner.borrow().contains_key(&key) {
+                return None;
+            }
+        }
+        let lookup = key.clone();
+        let map = self.inner.borrow();
+        Some(ValueRef::borrowed(Ref::map(map, move |values| {
+            values
+                .get(&lookup)
+                .expect("lookup key should be present after contains_key")
+        })))
+    }
+
+    pub fn insert<K>(&self, key: K, value: Value) -> Option<Value>
+    where
+        K: Into<ValueKey>,
+    {
+        self.inner.borrow_mut().insert(key.into(), value)
+    }
+
+    pub fn remove<K>(&self, key: K) -> Option<Value>
+    where
+        K: Into<ValueKey>,
+    {
+        self.inner.borrow_mut().remove(&key.into())
+    }
+
+    pub fn with_ref<R>(&self, f: impl FnOnce(&HashMap<ValueKey, Value>) -> R) -> R {
+        let map = self.inner.borrow();
+        f(&map)
+    }
+
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut HashMap<ValueKey, Value>) -> R) -> R {
+        let mut map = self.inner.borrow_mut();
+        f(&mut map)
+    }
+}
+
+#[derive(Clone)]
+pub struct TableHandle {
+    inner: Rc<RefCell<HashMap<ValueKey, Value>>>,
+}
+
+impl TableHandle {
+    fn from_rc(inner: Rc<RefCell<HashMap<ValueKey, Value>>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn borrow(&self) -> Ref<'_, HashMap<ValueKey, Value>> {
+        self.inner.borrow()
+    }
+
+    pub fn borrow_mut(&self) -> RefMut<'_, HashMap<ValueKey, Value>> {
+        self.inner.borrow_mut()
+    }
+
+    pub fn contains_key<K>(&self, key: K) -> bool
+    where
+        K: Into<ValueKey>,
+    {
+        self.inner.borrow().contains_key(&key.into())
+    }
+
+    pub fn get<K>(&self, key: K) -> Option<ValueRef<'_>>
+    where
+        K: Into<ValueKey>,
+    {
+        let key = key.into();
+        {
+            if !self.inner.borrow().contains_key(&key) {
+                return None;
+            }
+        }
+        let lookup = key.clone();
+        let table = self.inner.borrow();
+        Some(ValueRef::borrowed(Ref::map(table, move |values| {
+            values
+                .get(&lookup)
+                .expect("lookup key should be present after contains_key")
+        })))
+    }
+
+    pub fn insert<K>(&self, key: K, value: Value) -> Option<Value>
+    where
+        K: Into<ValueKey>,
+    {
+        self.inner.borrow_mut().insert(key.into(), value)
+    }
+
+    pub fn remove<K>(&self, key: K) -> Option<Value>
+    where
+        K: Into<ValueKey>,
+    {
+        self.inner.borrow_mut().remove(&key.into())
+    }
+
+    pub fn with_ref<R>(&self, f: impl FnOnce(&HashMap<ValueKey, Value>) -> R) -> R {
+        let table = self.inner.borrow();
+        f(&table)
+    }
+
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut HashMap<ValueKey, Value>) -> R) -> R {
+        let mut table = self.inner.borrow_mut();
+        f(&mut table)
     }
 }
 
@@ -1314,6 +1636,27 @@ where
     }
 }
 
+impl IntoTypedValue for ArrayHandle {
+    fn into_typed_value(self) -> TypedValue {
+        let value = self.into_value();
+        TypedValue::new(value, |_, ty| matches_array_handle_type(ty), "array")
+    }
+}
+
+impl IntoTypedValue for MapHandle {
+    fn into_typed_value(self) -> TypedValue {
+        let value = self.into_value();
+        TypedValue::new(value, |_, ty| matches_map_handle_type(ty), "map")
+    }
+}
+
+impl IntoTypedValue for TableHandle {
+    fn into_typed_value(self) -> TypedValue {
+        let value = self.into_value();
+        TypedValue::new(value, |_, ty| matches_table_handle_type(ty), "table")
+    }
+}
+
 fn string_matcher(_: &Value, ty: &Type) -> bool {
     match &ty.kind {
         TypeKind::String | TypeKind::Unknown => true,
@@ -1423,6 +1766,43 @@ mod tests {
         assert_eq!(mixed.field::<i64>("count").expect("count field"), 7);
         assert_eq!(mixed.field::<String>("label").expect("label field"), "hi");
         assert!(mixed.field::<bool>("enabled").expect("enabled field"));
+    }
+
+    #[test]
+    fn struct_instance_borrow_field_provides_reference_view() {
+        let source = r#"
+            struct Sample
+                name: string
+            end
+        "#;
+
+        let program = build_program(source);
+        let sample = program
+            .struct_instance("main.Sample", [struct_field("name", "Borrowed")])
+            .expect("struct instance");
+
+        let name_ref = sample.borrow_field("name").expect("borrow name field");
+        assert_eq!(name_ref.as_string().unwrap(), "Borrowed");
+        assert!(name_ref.as_array_handle().is_none());
+    }
+
+    #[test]
+    fn array_handle_allows_in_place_mutation() {
+        let value = Value::array(vec![Value::Int(1)]);
+        let handle = ArrayHandle::from_value(value).expect("array handle");
+
+        {
+            let mut slots = handle.borrow_mut();
+            slots.push(Value::Int(2));
+            slots.push(Value::Int(3));
+        }
+
+        let snapshot: Vec<_> = handle
+            .borrow()
+            .iter()
+            .map(|value| value.as_int().expect("int value"))
+            .collect();
+        assert_eq!(snapshot, vec![1, 2, 3]);
     }
 
     #[test]
@@ -1750,6 +2130,30 @@ where
     }
 }
 
+fn matches_array_handle_type(ty: &Type) -> bool {
+    match &ty.kind {
+        TypeKind::Array(_) | TypeKind::Unknown => true,
+        TypeKind::Union(types) => types.iter().any(|alt| matches_array_handle_type(alt)),
+        _ => false,
+    }
+}
+
+fn matches_map_handle_type(ty: &Type) -> bool {
+    match &ty.kind {
+        TypeKind::Map(_, _) | TypeKind::Unknown => true,
+        TypeKind::Union(types) => types.iter().any(|alt| matches_map_handle_type(alt)),
+        _ => false,
+    }
+}
+
+fn matches_table_handle_type(ty: &Type) -> bool {
+    match &ty.kind {
+        TypeKind::Table | TypeKind::Unknown => true,
+        TypeKind::Union(types) => types.iter().any(|alt| matches_table_handle_type(alt)),
+        _ => false,
+    }
+}
+
 pub trait FromLustArgs: Sized {
     fn from_values(values: &[Value]) -> std::result::Result<Self, String>;
     fn matches_signature(params: &[Type]) -> bool;
@@ -2003,6 +2407,20 @@ impl IntoLustValue for String {
     }
 }
 
+impl IntoLustValue for Rc<String> {
+    fn into_value(self) -> Value {
+        Value::String(self)
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        matches!(ty.kind, TypeKind::String | TypeKind::Unknown)
+    }
+
+    fn type_description() -> &'static str {
+        "string"
+    }
+}
+
 impl IntoLustValue for StructInstance {
     fn into_value(self) -> Value {
         self.value
@@ -2120,6 +2538,48 @@ where
     }
 }
 
+impl IntoLustValue for ArrayHandle {
+    fn into_value(self) -> Value {
+        Value::Array(self.inner)
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        matches_array_handle_type(ty)
+    }
+
+    fn type_description() -> &'static str {
+        "array"
+    }
+}
+
+impl IntoLustValue for MapHandle {
+    fn into_value(self) -> Value {
+        Value::Map(self.inner)
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        matches_map_handle_type(ty)
+    }
+
+    fn type_description() -> &'static str {
+        "map"
+    }
+}
+
+impl IntoLustValue for TableHandle {
+    fn into_value(self) -> Value {
+        Value::Table(self.inner)
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        matches_table_handle_type(ty)
+    }
+
+    fn type_description() -> &'static str {
+        "table"
+    }
+}
+
 impl<T> FromLustValue for Vec<T>
 where
     T: FromLustValue,
@@ -2148,6 +2608,63 @@ where
 
     fn type_description() -> &'static str {
         "array"
+    }
+}
+
+impl FromLustValue for ArrayHandle {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::Array(items) => Ok(ArrayHandle::from_rc(items)),
+            other => Err(LustError::RuntimeError {
+                message: format!("Expected Lust value 'array' but received '{:?}'", other),
+            }),
+        }
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        matches_array_handle_type(ty)
+    }
+
+    fn type_description() -> &'static str {
+        "array"
+    }
+}
+
+impl FromLustValue for MapHandle {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::Map(map) => Ok(MapHandle::from_rc(map)),
+            other => Err(LustError::RuntimeError {
+                message: format!("Expected Lust value 'map' but received '{:?}'", other),
+            }),
+        }
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        matches_map_handle_type(ty)
+    }
+
+    fn type_description() -> &'static str {
+        "map"
+    }
+}
+
+impl FromLustValue for TableHandle {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::Table(table) => Ok(TableHandle::from_rc(table)),
+            other => Err(LustError::RuntimeError {
+                message: format!("Expected Lust value 'table' but received '{:?}'", other),
+            }),
+        }
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        matches_table_handle_type(ty)
+    }
+
+    fn type_description() -> &'static str {
+        "table"
     }
 }
 
@@ -2183,6 +2700,25 @@ impl FromLustValue for String {
     fn from_value(value: Value) -> Result<Self> {
         match value {
             Value::String(s) => Ok((*s).clone()),
+            other => Err(LustError::RuntimeError {
+                message: format!("Expected Lust value 'string' but received '{:?}'", other),
+            }),
+        }
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        matches!(ty.kind, TypeKind::String | TypeKind::Unknown)
+    }
+
+    fn type_description() -> &'static str {
+        "string"
+    }
+}
+
+impl FromLustValue for Rc<String> {
+    fn from_value(value: Value) -> Result<Self> {
+        match value {
+            Value::String(s) => Ok(s),
             other => Err(LustError::RuntimeError {
                 message: format!("Expected Lust value 'string' but received '{:?}'", other),
             }),

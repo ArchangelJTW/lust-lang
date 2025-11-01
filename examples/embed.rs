@@ -1,4 +1,4 @@
-use lust::{struct_field, EmbeddedProgram, StructInstance};
+use lust::{bytecode::ValueKey, struct_field, EmbeddedProgram, StructInstance, Value};
 
 fn main() -> lust::Result<()> {
     let module = r#"
@@ -18,6 +18,14 @@ fn main() -> lust::Result<()> {
         extern {
             function host_scale(int): int
         }
+
+        arr_global: Array<int> = [1, 2, 3]
+
+        map_global: Map<string, int> = {["one"] = 1, ["two"] = 2}
+
+        table_global: Table = {}
+        table_global:set("one", 1)
+        table_global:set(2, "two")
 
         pub function translate(point: Point, dx: int, dy: int): Point
             println("Point Name: " .. point.name)
@@ -48,6 +56,7 @@ fn main() -> lust::Result<()> {
         pub function bump_scale(): ()
             SCALE_FACTOR = SCALE_FACTOR + 1
         end
+
     "#;
 
     let mut program = EmbeddedProgram::builder()
@@ -125,5 +134,45 @@ fn main() -> lust::Result<()> {
 
     let amplified_after_bump: i64 = program.call_typed("main.amplify", 7_i64)?;
     println!("Amplify(7) after bump (SCALE_FACTOR = {bumped_scale}) -> {amplified_after_bump}");
+
+    // Demonstrate working with Lust arrays.
+    if let Some(Value::Array(items)) = program.get_global_value("main.arr_global") {
+        items.borrow_mut().push(Value::Int(4));
+        let snapshot = items
+            .borrow()
+            .iter()
+            .map(|v| v.as_int().unwrap())
+            .collect::<Vec<_>>();
+        println!("Modified array = {:?}", snapshot);
+    }
+
+    // Demonstrate working with Lust maps.
+    if let Some(Value::Map(map)) = program.get_global_value("main.map_global") {
+        map.borrow_mut().insert(
+            ValueKey::String(std::rc::Rc::new("three".to_string())),
+            Value::Int(3),
+        );
+        let snapshot = map
+            .borrow()
+            .iter()
+            .map(|(k, v)| (format!("{:?}", k), v.as_int().unwrap_or_default()))
+            .collect::<Vec<_>>();
+        println!("Modified map = {:?}", snapshot);
+    }
+
+    // Demonstrate working with Lust tables.
+    if let Some(Value::Table(table)) = program.get_global_value("main.table_global") {
+        table.borrow_mut().insert(
+            ValueKey::String(std::rc::Rc::new("three".to_string())),
+            Value::Int(3),
+        );
+        let snapshot = table
+            .borrow()
+            .iter()
+            .map(|(k, v)| (format!("{:?}", k), v.as_int().unwrap_or_default()))
+            .collect::<Vec<_>>();
+        println!("Modified table = {:?}", snapshot);
+    }
+
     Ok(())
 }

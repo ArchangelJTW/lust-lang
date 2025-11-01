@@ -30,6 +30,12 @@ fn main() -> lust::Result<()> {
         table_global:set("one", 1)
         table_global:set(2, "two")
 
+        lust_point: Point = Point {
+            x = 1,
+            y = 2,
+            name = "Lust Point"
+        }
+
         pub function translate(point: Point, dx: int, dy: int): Point
             println("Point Name: " .. point.name)
             return Point { x = point.x + dx, y = point.y + dy, name = point.name }
@@ -165,6 +171,17 @@ fn main() -> lust::Result<()> {
                 .collect::<Vec<_>>()
         });
         println!("Modified map = {:?}", snapshot);
+    }
+
+    if let Some(lust_point_value) = program.get_global_value("main.lust_point") {
+        if let Ok(lust_point_struct) = StructInstance::from_value(lust_point_value) {
+            println!(
+                "Read Lust Point ({}, {}, \"{}\")",
+                lust_point_struct.field::<i64>("x")?,
+                lust_point_struct.field::<i64>("y")?,
+                lust_point_struct.field::<String>("name")?
+            );
+        }
     }
 
     if let Some(table_value) = program.get_global_value("main.table_global") {

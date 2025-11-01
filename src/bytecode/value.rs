@@ -6,6 +6,7 @@ use crate::number::{
 };
 use crate::vm::{pop_vm_ptr, push_vm_ptr, VM};
 use alloc::{
+    borrow::ToOwned,
     format,
     rc::{Rc, Weak},
     string::{String, ToString},

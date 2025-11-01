@@ -1,5 +1,9 @@
 use super::Span;
-use alloc::{boxed::Box, string::{String, ToString}, vec::Vec};
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::fmt;
 #[derive(Debug, Clone, Eq, Hash)]
 pub struct Type {

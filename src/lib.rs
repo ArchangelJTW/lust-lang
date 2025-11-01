@@ -3,7 +3,6 @@
 
 extern crate alloc;
 
-mod lazy;
 pub mod ast;
 pub mod builtins;
 pub mod bytecode;
@@ -14,6 +13,7 @@ pub mod error;
 #[cfg(feature = "std")]
 pub mod ffi;
 pub mod jit;
+mod lazy;
 pub mod lexer;
 pub mod modules;
 pub mod number;
@@ -24,19 +24,19 @@ pub mod typechecker;
 pub mod vm;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
-pub use number::{LustFloat, LustInt};
 pub use ast::{Expr, Item, Span, Stmt, Type};
 pub use bytecode::{Chunk, Compiler, Function, Instruction, Value};
 pub use config::{ConfigError, LustConfig};
 #[cfg(feature = "std")]
 pub use embed::{
-    EmbeddedBuilder, EmbeddedProgram, EnumInstance, FromLustValue, FunctionArgs, IntoLustValue,
-    StructInstance,
+    struct_field, EmbeddedBuilder, EmbeddedProgram, EnumInstance, FromLustValue, FunctionArgs,
+    IntoLustValue, StructField, StructInstance,
 };
 pub use error::{LustError, Result};
 pub use jit::{JitCompiler, JitState};
 pub use lexer::{Lexer, Token, TokenKind};
 pub use modules::{LoadedModule, ModuleImports, ModuleLoader, Program};
+pub use number::{LustFloat, LustInt};
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 pub use packages::{
     build_local_module, collect_stub_files, load_local_module, stub_files_from_exports,

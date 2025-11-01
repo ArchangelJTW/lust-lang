@@ -366,9 +366,7 @@ impl TypeChecker {
         }
     }
 
-    pub fn function_signatures(
-        &self,
-    ) -> HashMap<String, type_env::FunctionSignature> {
+    pub fn function_signatures(&self) -> HashMap<String, type_env::FunctionSignature> {
         self.env.function_signatures()
     }
 

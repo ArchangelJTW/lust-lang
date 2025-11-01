@@ -2,11 +2,15 @@ mod expr_parser;
 mod item_parser;
 mod stmt_parser;
 mod type_parser;
-use alloc::{format, string::{String, ToString}, vec::Vec};
 use crate::{
     ast::{Item, ItemKind, Span},
     error::{LustError, Result},
     lexer::{Token, TokenKind},
+};
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
 };
 pub struct Parser {
     tokens: Vec<Token>,

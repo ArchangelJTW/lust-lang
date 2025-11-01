@@ -1,10 +1,11 @@
 use super::*;
+use crate::ast::Type;
 use crate::config::LustConfig;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::{array, mem};
 use core::result::Result as CoreResult;
+use core::{array, mem};
 
 #[derive(Debug, Clone)]
 pub struct NativeExportParam {
@@ -119,6 +120,7 @@ impl VM {
             .insert(("string".to_string(), "Hashable".to_string()), true);
         vm.trait_impls
             .insert(("bool".to_string(), "Hashable".to_string()), true);
+        super::corelib::install_core_builtins(&mut vm);
         #[cfg(feature = "std")]
         for (name, func) in super::stdlib::create_stdlib(config) {
             vm.register_native(name, func);
@@ -169,10 +171,18 @@ impl VM {
                     FieldOwnership::Strong => FieldStorage::Strong,
                 })
                 .collect();
+            let field_types: Vec<Type> = def.fields.iter().map(|field| field.ty.clone()).collect();
+            let weak_targets: Vec<Option<Type>> = def
+                .fields
+                .iter()
+                .map(|field| field.weak_target.clone())
+                .collect();
             let layout = Rc::new(StructLayout::new(
                 def.name.clone(),
                 field_names,
                 field_storage,
+                field_types,
+                weak_targets,
             ));
             self.struct_metadata.insert(
                 name.clone(),
@@ -330,6 +340,17 @@ impl VM {
         }
     }
 
+    pub fn global_names(&self) -> Vec<String> {
+        self.globals.keys().cloned().collect()
+    }
+
+    pub fn globals_snapshot(&self) -> Vec<(String, Value)> {
+        self.globals
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+
     pub fn set_global(&mut self, name: impl Into<String>, value: Value) {
         let name = name.into();
         self.observe_value(&value);
@@ -391,12 +412,12 @@ impl VM {
 
     pub fn fail_task_handle(&mut self, handle: TaskHandle, error: LustError) -> Result<()> {
         let task_id = self.task_id_from_handle(handle)?;
-        let mut task = self
-            .task_manager
-            .detach(task_id)
-            .ok_or_else(|| LustError::RuntimeError {
-                message: format!("Invalid task handle {}", handle.id()),
-            })?;
+        let mut task =
+            self.task_manager
+                .detach(task_id)
+                .ok_or_else(|| LustError::RuntimeError {
+                    message: format!("Invalid task handle {}", handle.id()),
+                })?;
         task.state = TaskState::Failed;
         task.error = Some(error.clone());
         task.last_yield = None;

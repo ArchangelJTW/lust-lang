@@ -41,8 +41,7 @@ pub fn load_program_from_embedded(
     entries: &[EmbeddedModule<'_>],
     entry_module: &str,
 ) -> Result<Program> {
-    let mut module_names: HashSet<String> =
-        entries.iter().map(|e| e.module.to_string()).collect();
+    let mut module_names: HashSet<String> = entries.iter().map(|e| e.module.to_string()).collect();
 
     let mut registry: HashMap<String, LoadedModule> = HashMap::new();
     for entry in entries {
@@ -315,10 +314,7 @@ fn process_use_tree(
             }
 
             if !module.is_empty() {
-                let alias_name = prefix
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| module.clone());
+                let alias_name = prefix.last().cloned().unwrap_or_else(|| module.clone());
                 imports.module_aliases.insert(alias_name, module);
             }
         }

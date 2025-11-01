@@ -5,7 +5,12 @@ pub(super) use crate::ast::{
 use crate::config::LustConfig;
 pub(super) use crate::number::LustInt;
 pub(super) use crate::{Expr, LustError, Result};
-pub(super) use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+pub(super) use alloc::{
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 pub(super) use hashbrown::{HashMap, HashSet};
 mod closures;
 mod expressions;

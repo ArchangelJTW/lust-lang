@@ -9,10 +9,10 @@ use crate::VM;
 pub use codegen::JitCompiler;
 #[cfg(not(feature = "std"))]
 pub struct JitCompiler;
-pub use optimizer::TraceOptimizer;
-pub use profiler::{HotSpot, Profiler};
 use alloc::{string::String, vec::Vec};
 use hashbrown::HashMap;
+pub use optimizer::TraceOptimizer;
+pub use profiler::{HotSpot, Profiler};
 pub use trace::{Trace, TraceOp, TraceRecorder};
 #[cfg(not(feature = "std"))]
 impl JitCompiler {

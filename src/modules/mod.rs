@@ -7,7 +7,10 @@ use crate::{
 use alloc::{format, string::String, vec, vec::Vec};
 use hashbrown::{HashMap, HashSet};
 #[cfg(feature = "std")]
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 #[derive(Debug, Clone, Default)]
 pub struct ModuleImports {
     pub function_aliases: HashMap<String, String>,
@@ -656,6 +659,9 @@ impl ModuleLoader {
         modules: Vec<LoadedModule>,
         entry_module: String,
     ) -> Program {
-        Program { modules, entry_module }
+        Program {
+            modules,
+            entry_module,
+        }
     }
 }

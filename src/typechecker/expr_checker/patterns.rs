@@ -1,5 +1,10 @@
 use super::*;
-use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 impl TypeChecker {
     pub fn validate_is_pattern(&mut self, pattern: &Pattern, scrutinee_type: &Type) -> Result<()> {
         match pattern {

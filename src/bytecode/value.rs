@@ -1,3 +1,4 @@
+use crate::ast::Type;
 use crate::jit;
 use crate::number::{
     float_from_int, float_is_nan, float_to_hash_bits, int_from_float, int_from_usize, LustFloat,
@@ -155,6 +156,8 @@ pub struct StructLayout {
     field_lookup_ptr: HashMap<usize, usize>,
     field_lookup_str: HashMap<String, usize>,
     field_storage: Vec<FieldStorage>,
+    field_types: Vec<Type>,
+    weak_targets: Vec<Option<Type>>,
 }
 
 impl StructLayout {
@@ -162,11 +165,23 @@ impl StructLayout {
         name: String,
         field_names: Vec<Rc<String>>,
         field_storage: Vec<FieldStorage>,
+        field_types: Vec<Type>,
+        weak_targets: Vec<Option<Type>>,
     ) -> Self {
         debug_assert_eq!(
             field_names.len(),
             field_storage.len(),
             "StructLayout::new expects field names and storage metadata to align"
+        );
+        debug_assert_eq!(
+            field_names.len(),
+            field_types.len(),
+            "StructLayout::new expects field names and type metadata to align"
+        );
+        debug_assert_eq!(
+            field_names.len(),
+            weak_targets.len(),
+            "StructLayout::new expects field names and weak target metadata to align"
         );
         let mut field_lookup_ptr = HashMap::with_capacity(field_names.len());
         let mut field_lookup_str = HashMap::with_capacity(field_names.len());
@@ -182,6 +197,8 @@ impl StructLayout {
             field_lookup_ptr,
             field_lookup_str,
             field_storage,
+            field_types,
+            weak_targets,
         }
     }
 
@@ -212,6 +229,16 @@ impl StructLayout {
     #[inline]
     pub fn field_storage(&self, index: usize) -> FieldStorage {
         self.field_storage[index]
+    }
+
+    #[inline]
+    pub fn field_type(&self, index: usize) -> &Type {
+        &self.field_types[index]
+    }
+
+    #[inline]
+    pub fn weak_target(&self, index: usize) -> Option<&Type> {
+        self.weak_targets[index].as_ref()
     }
 
     #[inline]
@@ -1339,7 +1366,12 @@ pub unsafe extern "C" fn jit_call_native_safe(
     let native_fn = match callee {
         Value::NativeFunction(func) => func.clone(),
         other => {
-            jit::log(|| format!("jit_call_native_safe: callee not native ({:?})", other.tag()));
+            jit::log(|| {
+                format!(
+                    "jit_call_native_safe: callee not native ({:?})",
+                    other.tag()
+                )
+            });
             return 0;
         }
     };
@@ -1532,11 +1564,19 @@ fn call_builtin_method_simple(
             }
             "first" => {
                 let borrowed = arr.borrow();
-                Ok(borrowed.first().cloned().map(Value::some).unwrap_or_else(Value::none))
+                Ok(borrowed
+                    .first()
+                    .cloned()
+                    .map(Value::some)
+                    .unwrap_or_else(Value::none))
             }
             "last" => {
                 let borrowed = arr.borrow();
-                Ok(borrowed.last().cloned().map(Value::some).unwrap_or_else(Value::none))
+                Ok(borrowed
+                    .last()
+                    .cloned()
+                    .map(Value::some)
+                    .unwrap_or_else(Value::none))
             }
             "get" => {
                 let index = args

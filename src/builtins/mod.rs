@@ -1,13 +1,7 @@
 use crate::ast::{Span, Type, TypeKind};
 use crate::lazy::StaticOnceCell;
 use crate::FunctionSignature;
-use alloc::{
-    boxed::Box,
-    collections::BTreeMap,
-    string::ToString,
-    vec,
-    vec::Vec,
-};
+use alloc::{boxed::Box, collections::BTreeMap, string::ToString, vec, vec::Vec};
 use hashbrown::HashMap;
 
 #[derive(Debug, Clone)]
@@ -1161,7 +1155,9 @@ pub fn os_functions() -> &'static [BuiltinFunction] {
 }
 
 pub fn builtin_methods() -> &'static [BuiltinMethod] {
-    BUILTIN_METHODS.get_or_init(build_builtin_methods).as_slice()
+    BUILTIN_METHODS
+        .get_or_init(build_builtin_methods)
+        .as_slice()
 }
 
 pub struct BuiltinModule {

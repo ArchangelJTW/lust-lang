@@ -581,7 +581,14 @@ impl Value {
     }
 
     pub fn is_truthy(&self) -> bool {
-        !matches!(self, Value::Nil | Value::Bool(false))
+        match self {
+            Value::Nil => false,
+            Value::Bool(false) => false,
+            Value::Enum {
+                enum_name, variant, ..
+            } if enum_name == "Option" && variant == "None" => false,
+            _ => true,
+        }
     }
 
     pub fn to_bool(&self) -> bool {

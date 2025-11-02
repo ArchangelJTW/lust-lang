@@ -29,11 +29,19 @@ pub struct TypeChecker {
     imports_by_module: HashMap<String, ModuleImports>,
     expr_types_by_module: HashMap<String, HashMap<Span, Type>>,
     variable_types_by_module: HashMap<String, HashMap<Span, Type>>,
+    short_circuit_info: HashMap<String, HashMap<Span, ShortCircuitInfo>>,
 }
 
 pub struct TypeCollection {
     pub expr_types: HashMap<String, HashMap<Span, Type>>,
     pub variable_types: HashMap<String, HashMap<Span, Type>>,
+}
+
+#[derive(Clone, Debug)]
+struct ShortCircuitInfo {
+    truthy: Option<Type>,
+    falsy: Option<Type>,
+    option_inner: Option<Type>,
 }
 
 impl TypeChecker {
@@ -53,6 +61,7 @@ impl TypeChecker {
             imports_by_module: HashMap::new(),
             expr_types_by_module: HashMap::new(),
             variable_types_by_module: HashMap::new(),
+            short_circuit_info: HashMap::new(),
         }
     }
 
@@ -364,6 +373,24 @@ impl TypeChecker {
             expr_types: mem::take(&mut self.expr_types_by_module),
             variable_types: mem::take(&mut self.variable_types_by_module),
         }
+    }
+
+    pub fn take_option_coercions(&mut self) -> HashMap<String, HashSet<Span>> {
+        let mut result: HashMap<String, HashSet<Span>> = HashMap::new();
+        let info = mem::take(&mut self.short_circuit_info);
+        for (module, entries) in info {
+            let mut spans: HashSet<Span> = HashSet::new();
+            for (span, entry) in entries {
+                if entry.option_inner.is_some() {
+                    spans.insert(span);
+                }
+            }
+            if !spans.is_empty() {
+                result.insert(module, spans);
+            }
+        }
+
+        result
     }
 
     pub fn function_signatures(&self) -> HashMap<String, type_env::FunctionSignature> {
@@ -760,6 +787,11 @@ impl TypeChecker {
                 }
             }
 
+            (TypeKind::Map(exp_key, exp_value), TypeKind::Map(act_key, act_value)) => {
+                self.unify(exp_key, act_key)?;
+                return self.unify(exp_value, act_value);
+            }
+
             (TypeKind::Named(name), TypeKind::Option(_))
             | (TypeKind::Option(_), TypeKind::Named(name))
                 if name == "Option" =>
@@ -953,5 +985,183 @@ impl TypeChecker {
         }
 
         self.unify(expected, actual)
+    }
+
+    fn record_short_circuit_info(&mut self, span: Span, info: &ShortCircuitInfo) {
+        let truthy = info.truthy.as_ref().map(|ty| self.canonicalize_type(ty));
+        let falsy = info.falsy.as_ref().map(|ty| self.canonicalize_type(ty));
+        let option_inner = info
+            .option_inner
+            .as_ref()
+            .map(|ty| self.canonicalize_type(ty));
+        let module_key = self.current_module_key();
+        self.short_circuit_info
+            .entry(module_key)
+            .or_default()
+            .insert(
+                span,
+                ShortCircuitInfo {
+                    truthy,
+                    falsy,
+                    option_inner,
+                },
+            );
+    }
+
+    fn short_circuit_profile(&self, expr: &Expr, ty: &Type) -> ShortCircuitInfo {
+        let module_key = self
+            .current_module
+            .as_ref()
+            .map(String::as_str)
+            .unwrap_or("");
+        if let Some(module_map) = self.short_circuit_info.get(module_key) {
+            if let Some(info) = module_map.get(&expr.span) {
+                return info.clone();
+            }
+        }
+
+        ShortCircuitInfo {
+            truthy: if self.type_can_be_truthy(ty) {
+                Some(self.canonicalize_type(ty))
+            } else {
+                None
+            },
+            falsy: self.extract_falsy_type(ty),
+            option_inner: None,
+        }
+    }
+
+    fn current_module_key(&self) -> String {
+        self.current_module
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| "".to_string())
+    }
+
+    fn clear_option_for_span(&mut self, span: Span) {
+        let module_key = self.current_module_key();
+        if let Some(module_map) = self.short_circuit_info.get_mut(&module_key) {
+            if let Some(info) = module_map.get_mut(&span) {
+                info.option_inner = None;
+            }
+        }
+    }
+
+    fn type_can_be_truthy(&self, ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::Union(members) => {
+                members.iter().any(|member| self.type_can_be_truthy(member))
+            }
+            TypeKind::Bool => true,
+            TypeKind::Unknown => true,
+            _ => true,
+        }
+    }
+
+    fn type_can_be_falsy(&self, ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::Union(members) => members.iter().any(|member| self.type_can_be_falsy(member)),
+            TypeKind::Bool => true,
+            TypeKind::Unknown => true,
+            TypeKind::Option(_) => true,
+            _ => false,
+        }
+    }
+
+    fn extract_falsy_type(&self, ty: &Type) -> Option<Type> {
+        match &ty.kind {
+            TypeKind::Bool => Some(Type::new(TypeKind::Bool, ty.span)),
+            TypeKind::Unknown => Some(Type::new(TypeKind::Unknown, ty.span)),
+            TypeKind::Option(inner) => Some(Type::new(
+                TypeKind::Option(Box::new(self.canonicalize_type(inner))),
+                ty.span,
+            )),
+            TypeKind::Union(members) => {
+                let mut parts = Vec::new();
+                for member in members {
+                    if let Some(part) = self.extract_falsy_type(member) {
+                        parts.push(part);
+                    }
+                }
+                self.merge_optional_types(parts)
+            }
+            _ => None,
+        }
+    }
+
+    fn merge_optional_types(&self, types: Vec<Type>) -> Option<Type> {
+        if types.is_empty() {
+            return None;
+        }
+
+        Some(self.make_union_from_types(types))
+    }
+
+    fn make_union_from_types(&self, types: Vec<Type>) -> Type {
+        let mut flat: Vec<Type> = Vec::new();
+        for ty in types {
+            let canonical = self.canonicalize_type(&ty);
+            match &canonical.kind {
+                TypeKind::Union(members) => {
+                    for member in members {
+                        self.push_unique_type(&mut flat, member.clone());
+                    }
+                }
+                _ => self.push_unique_type(&mut flat, canonical),
+            }
+        }
+
+        match flat.len() {
+            0 => Type::new(TypeKind::Unknown, Self::dummy_span()),
+            1 => flat.into_iter().next().unwrap(),
+            _ => Type::new(TypeKind::Union(flat), Self::dummy_span()),
+        }
+    }
+
+    fn push_unique_type(&self, list: &mut Vec<Type>, candidate: Type) {
+        if !list
+            .iter()
+            .any(|existing| self.types_equal(existing, &candidate))
+        {
+            list.push(candidate);
+        }
+    }
+
+    fn combine_truthy_falsy(&self, truthy: Option<Type>, falsy: Option<Type>) -> Type {
+        match (truthy, falsy) {
+            (Some(t), Some(f)) => self.make_union_from_types(vec![t, f]),
+            (Some(t), None) => t,
+            (None, Some(f)) => f,
+            (None, None) => Type::new(TypeKind::Unknown, Self::dummy_span()),
+        }
+    }
+
+    fn is_bool_like(&self, ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::Bool => true,
+            TypeKind::Union(members) => members.iter().all(|member| self.is_bool_like(member)),
+            _ => false,
+        }
+    }
+
+    fn option_inner_type<'a>(&self, ty: &'a Type) -> Option<&'a Type> {
+        match &ty.kind {
+            TypeKind::Option(inner) => Some(inner.as_ref()),
+            TypeKind::Union(members) => {
+                for member in members {
+                    if let Some(inner) = self.option_inner_type(member) {
+                        return Some(inner);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn should_optionize(&self, left: &Type, right: &Type) -> bool {
+        self.is_bool_like(left)
+            && !self.is_bool_like(right)
+            && self.option_inner_type(right).is_none()
     }
 }

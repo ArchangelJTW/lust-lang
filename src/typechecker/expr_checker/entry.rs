@@ -30,7 +30,9 @@ impl TypeChecker {
             ExprKind::Identifier(name) => self.env.lookup_variable(name).ok_or_else(|| {
                 self.type_error_at(format!("Undefined variable '{}'", name), expr.span)
             }),
-            ExprKind::Binary { left, op, right } => self.check_binary_expr(left, op, right),
+            ExprKind::Binary { left, op, right } => {
+                self.check_binary_expr(expr.span, left, op, right)
+            }
             ExprKind::Unary { op, operand } => self.check_unary_expr(op, operand),
             ExprKind::Call { callee, args } => self.check_call_expr(expr.span, callee, args),
             ExprKind::MethodCall {
@@ -73,7 +75,7 @@ impl TypeChecker {
 
             ExprKind::Index { object, index } => self.check_index_expr(object, index),
             ExprKind::Array(elements) => self.check_array_literal(elements, expected_type),
-            ExprKind::Map(entries) => self.check_map_literal(entries),
+            ExprKind::Map(entries) => self.check_map_literal(entries, expected_type),
             ExprKind::StructLiteral { name, fields } => {
                 self.check_struct_literal(expr.span, name, fields)
             }

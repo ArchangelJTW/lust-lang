@@ -1,3 +1,4 @@
+use super::super::ShortCircuitInfo;
 use super::*;
 use alloc::{
     boxed::Box,
@@ -18,34 +19,22 @@ impl TypeChecker {
         })
     }
 
-    pub fn check_binary_expr(&mut self, left: &Expr, op: &BinaryOp, right: &Expr) -> Result<Type> {
-        let span = Self::dummy_span();
+    pub fn check_binary_expr(
+        &mut self,
+        span: Span,
+        left: &Expr,
+        op: &BinaryOp,
+        right: &Expr,
+    ) -> Result<Type> {
         if matches!(op, BinaryOp::And) {
-            let mut pattern_bindings = Vec::new();
-            pattern_bindings.extend(self.extract_all_pattern_bindings_from_expr(left));
-            pattern_bindings.extend(self.extract_all_pattern_bindings_from_expr(right));
-            if !pattern_bindings.is_empty() {
-                let left_type = self.check_expr(left)?;
-                self.unify(&Type::new(TypeKind::Bool, span), &left_type)?;
-                self.env.push_scope();
-                for (scrutinee, pattern) in pattern_bindings {
-                    if let Ok(scrutinee_type) = self.check_expr(scrutinee) {
-                        let _ = self.bind_pattern(&pattern, &scrutinee_type);
-                    }
-                }
-
-                let right_narrowings = self.extract_type_narrowings_from_expr(right);
-                for (var_name, narrowed_type) in right_narrowings {
-                    self.env.refine_variable_type(var_name, narrowed_type);
-                }
-
-                let right_type = self.check_expr(right)?;
-                self.unify(&Type::new(TypeKind::Bool, span), &right_type)?;
-                self.env.pop_scope();
-                return Ok(Type::new(TypeKind::Bool, span));
-            }
+            return self.check_and_expr(span, left, right);
         }
 
+        if matches!(op, BinaryOp::Or) {
+            return self.check_or_expr(span, left, right);
+        }
+
+        let span = Self::dummy_span();
         let left_type = self.check_expr(left)?;
         let right_type = self.check_expr(right)?;
         match op {
@@ -98,12 +87,6 @@ impl TypeChecker {
                 Ok(Type::new(TypeKind::Bool, span))
             }
 
-            BinaryOp::And | BinaryOp::Or => {
-                self.unify(&Type::new(TypeKind::Bool, span), &left_type)?;
-                self.unify(&Type::new(TypeKind::Bool, span), &right_type)?;
-                Ok(Type::new(TypeKind::Bool, span))
-            }
-
             BinaryOp::Concat => {
                 if !self.env.type_implements_trait(&left_type, "ToString") {
                     return Err(self.type_error_at(
@@ -133,7 +116,190 @@ impl TypeChecker {
                     "Range operator is not supported; use numeric for-loops".to_string(),
                 ));
             }
+
+            BinaryOp::And | BinaryOp::Or => {
+                unreachable!("short-circuit operators handled earlier in check_binary_expr")
+            }
         }
+    }
+
+    fn check_and_expr(&mut self, span: Span, left: &Expr, right: &Expr) -> Result<Type> {
+        let bool_type = Type::new(TypeKind::Bool, Self::dummy_span());
+        let left_bindings = self.extract_all_pattern_bindings_from_expr(left);
+        let left_narrowings = self.extract_type_narrowings_from_expr(left);
+        let left_type = self.check_expr(left)?;
+        if !left_bindings.is_empty() {
+            self.unify(&bool_type, &left_type)?;
+        }
+
+        let left_info = self.short_circuit_profile(left, &left_type);
+
+        self.env.push_scope();
+        if !left_bindings.is_empty() {
+            for (scrutinee, pattern) in left_bindings {
+                if let Ok(scrutinee_type) = self.check_expr(scrutinee) {
+                    let _ = self.bind_pattern(&pattern, &scrutinee_type);
+                }
+            }
+        }
+
+        for (var_name, narrowed_type) in left_narrowings {
+            self.env.refine_variable_type(var_name, narrowed_type);
+        }
+
+        let right_type = self.check_expr(right)?;
+        let right_bindings = self.extract_all_pattern_bindings_from_expr(right);
+        if !right_bindings.is_empty() {
+            self.unify(&bool_type, &right_type)?;
+        }
+
+        let right_narrowings = self.extract_type_narrowings_from_expr(right);
+        for (var_name, narrowed_type) in right_narrowings {
+            self.env.refine_variable_type(var_name, narrowed_type);
+        }
+
+        self.env.pop_scope();
+
+        let right_info = self.short_circuit_profile(right, &right_type);
+        let mut option_inner: Option<Type> = None;
+        let (truthy, falsy, result_type) = if self.should_optionize(&left_type, &right_type) {
+            let inner = self.canonicalize_type(&right_type);
+            option_inner = Some(inner.clone());
+            let option_type = Type::new(TypeKind::Option(Box::new(inner)), span);
+            (
+                Some(option_type.clone()),
+                Some(option_type.clone()),
+                option_type,
+            )
+        } else {
+            let truthy = if self.type_can_be_truthy(&left_type) {
+                right_info
+                    .truthy
+                    .clone()
+                    .or_else(|| Some(self.canonicalize_type(&right_type)))
+            } else {
+                None
+            };
+
+            let mut falsy_parts = Vec::new();
+            if let Some(falsy) = left_info.falsy.clone() {
+                falsy_parts.push(falsy);
+            }
+
+            if self.type_can_be_truthy(&left_type) {
+                if let Some(falsy) = right_info.falsy.clone() {
+                    falsy_parts.push(falsy);
+                }
+            }
+
+            let falsy = self.merge_optional_types(falsy_parts);
+            let result = self.combine_truthy_falsy(truthy.clone(), falsy.clone());
+            (truthy, falsy, result)
+        };
+
+        self.record_short_circuit_info(
+            span,
+            &ShortCircuitInfo {
+                truthy: truthy.clone(),
+                falsy: falsy.clone(),
+                option_inner: option_inner.clone(),
+            },
+        );
+        Ok(result_type)
+    }
+
+    fn check_or_expr(&mut self, span: Span, left: &Expr, right: &Expr) -> Result<Type> {
+        let left_type = self.check_expr(left)?;
+        let left_info = self.short_circuit_profile(left, &left_type);
+
+        let right_type = self.check_expr(right)?;
+        let right_info = self.short_circuit_profile(right, &right_type);
+
+        let mut option_candidates: Vec<Type> = Vec::new();
+        let mut option_spans: Vec<Span> = Vec::new();
+        if let Some(inner) = left_info.option_inner.clone() {
+            option_candidates.push(inner);
+            option_spans.push(left.span);
+        } else if let Some(inner) = self
+            .option_inner_type(&left_type)
+            .map(|ty| self.canonicalize_type(ty))
+        {
+            option_candidates.push(inner);
+        }
+
+        if let Some(inner) = right_info.option_inner.clone() {
+            option_candidates.push(inner);
+            option_spans.push(right.span);
+        } else if let Some(inner) = self
+            .option_inner_type(&right_type)
+            .map(|ty| self.canonicalize_type(ty))
+        {
+            option_candidates.push(inner);
+        }
+
+        if option_candidates.len() >= 2 {
+            let mut resolved_inner = option_candidates[0].clone();
+            for candidate in option_candidates.iter().skip(1) {
+                self.unify(&resolved_inner, candidate)?;
+            }
+            resolved_inner = self.canonicalize_type(&resolved_inner);
+            let option_type = Type::new(TypeKind::Option(Box::new(resolved_inner.clone())), span);
+            self.record_short_circuit_info(
+                span,
+                &ShortCircuitInfo {
+                    truthy: Some(option_type.clone()),
+                    falsy: Some(option_type.clone()),
+                    option_inner: Some(resolved_inner),
+                },
+            );
+            return Ok(option_type);
+        }
+
+        for span_to_clear in option_spans {
+            self.clear_option_for_span(span_to_clear);
+        }
+
+        let mut truthy_parts: Vec<Type> = Vec::new();
+        if self.type_can_be_truthy(&left_type) {
+            if let Some(inner) = left_info.option_inner.clone() {
+                truthy_parts.push(inner);
+            } else if let Some(truthy) = left_info.truthy.clone() {
+                truthy_parts.push(truthy);
+            } else {
+                truthy_parts.push(self.canonicalize_type(&left_type));
+            }
+        }
+
+        if self.type_can_be_falsy(&left_type) && self.type_can_be_truthy(&right_type) {
+            if let Some(inner) = right_info.option_inner.clone() {
+                truthy_parts.push(inner);
+            } else if let Some(truthy) = right_info.truthy.clone() {
+                truthy_parts.push(truthy);
+            } else {
+                truthy_parts.push(self.canonicalize_type(&right_type));
+            }
+        }
+
+        let truthy = self.merge_optional_types(truthy_parts);
+        let falsy = if self.type_can_be_falsy(&left_type) {
+            right_info
+                .falsy
+                .clone()
+                .or_else(|| self.extract_falsy_type(&right_type))
+        } else {
+            None
+        };
+
+        let result = self.combine_truthy_falsy(truthy.clone(), falsy.clone());
+        self.record_short_circuit_info(
+            span,
+            &ShortCircuitInfo {
+                truthy,
+                falsy,
+                option_inner: None,
+            },
+        );
+        Ok(result)
     }
 
     pub fn check_unary_expr(&mut self, op: &UnaryOp, operand: &Expr) -> Result<Type> {

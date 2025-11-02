@@ -38,36 +38,9 @@ impl TypeChecker {
             ExprKind::MethodCall {
                 receiver,
                 method,
-                type_args,
+                type_args: _,
                 args,
-            } => {
-                if method == "as" && type_args.is_some() {
-                    let _receiver_type = self.check_expr(receiver)?;
-                    if !args.is_empty() {
-                        return Err(self.type_error(":as<T>() takes no arguments".to_string()));
-                    }
-
-                    let target_type = &type_args.as_ref().unwrap()[0];
-                    let actual_target_type = if let TypeKind::Named(name) = &target_type.kind {
-                        let resolved = self.resolve_type_key(name);
-                        if self.env.lookup_trait(&resolved).is_some() {
-                            Type::new(TypeKind::Trait(name.clone()), target_type.span)
-                        } else {
-                            target_type.clone()
-                        }
-                    } else {
-                        target_type.clone()
-                    };
-                    let span = Self::dummy_span();
-                    return Ok(Type::new(
-                        TypeKind::Option(Box::new(actual_target_type)),
-                        span,
-                    ));
-                }
-
-                let _ = type_args;
-                self.check_method_call(receiver, method, args)
-            }
+            } => self.check_method_call(receiver, method, args),
 
             ExprKind::FieldAccess { object, field } => {
                 self.check_field_access_with_hint(expr.span, object, field, expected_type)

@@ -317,56 +317,6 @@ impl VM {
             }
         }
 
-        if method_name == "as" {
-            if args.is_empty() {
-                return Err(LustError::RuntimeError {
-                    message: ":as() requires a type name argument".to_string(),
-                });
-            }
-
-            let type_name = args[0].as_string().ok_or_else(|| LustError::RuntimeError {
-                message: ":as() type argument must be a string".to_string(),
-            })?;
-            let matches = match (object, type_name) {
-                (Value::Int(_), "int") => true,
-                (Value::Float(_), "float") => true,
-                (Value::String(_), "string") => true,
-                (Value::Bool(_), "bool") => true,
-                (Value::Nil, "nil") => true,
-                (Value::Array(_), t) if t.starts_with("Array") => true,
-                (Value::Map(_), t) if t.starts_with("Map") => true,
-                (Value::Table(_), "Table") => true,
-                (Value::Struct { name, .. }, t) => {
-                    if name == t {
-                        true
-                    } else {
-                        self.trait_impls
-                            .contains_key(&(name.clone(), t.to_string()))
-                    }
-                }
-
-                (Value::Enum { enum_name, .. }, t) => {
-                    if enum_name == t || t.starts_with(enum_name) {
-                        true
-                    } else {
-                        self.trait_impls
-                            .contains_key(&(enum_name.clone(), t.to_string()))
-                    }
-                }
-
-                (Value::Function(_), "function") => true,
-                (Value::NativeFunction(_), "function") => true,
-                (Value::Closure { .. }, "function") => true,
-                (_, "unknown") => true,
-                _ => false,
-            };
-            if matches {
-                return Ok(Value::some(object.clone()));
-            } else {
-                return Ok(Value::none());
-            }
-        }
-
         match object {
             Value::Enum {
                 enum_name,
@@ -881,118 +831,6 @@ impl VM {
                 }
             }
 
-            Value::Table(table) => {
-                use crate::bytecode::ValueKey;
-                match method_name {
-                    "iter" => {
-                        let items: Vec<(ValueKey, Value)> = table
-                            .borrow()
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
-                        let iter =
-                            crate::bytecode::value::IteratorState::TablePairs { items, index: 0 };
-                        return Ok(Value::Iterator(Rc::new(RefCell::new(iter))));
-                    }
-
-                    "len" => Ok(Value::Int(int_from_usize(table.borrow().len()))),
-                    "get" => {
-                        if args.is_empty() {
-                            return Err(LustError::RuntimeError {
-                                message: "get requires a key argument".to_string(),
-                            });
-                        }
-
-                        let key = ValueKey::from_value(&args[0]).ok_or_else(|| {
-                            LustError::RuntimeError {
-                                message: format!(
-                                    "Cannot use {:?} as table key (not hashable)",
-                                    args[0]
-                                ),
-                            }
-                        })?;
-                        match table.borrow().get(&key) {
-                            Some(value) => Ok(Value::some(value.clone())),
-                            None => Ok(Value::none()),
-                        }
-                    }
-
-                    "set" => {
-                        if args.len() < 2 {
-                            return Err(LustError::RuntimeError {
-                                message: "set requires key and value arguments".to_string(),
-                            });
-                        }
-
-                        let key = ValueKey::from_value(&args[0]).ok_or_else(|| {
-                            LustError::RuntimeError {
-                                message: format!(
-                                    "Cannot use {:?} as table key (not hashable)",
-                                    args[0]
-                                ),
-                            }
-                        })?;
-                        let value = args[1].clone();
-                        table.borrow_mut().insert(key, value);
-                        Ok(Value::Nil)
-                    }
-
-                    "has" => {
-                        if args.is_empty() {
-                            return Err(LustError::RuntimeError {
-                                message: "has requires a key argument".to_string(),
-                            });
-                        }
-
-                        let key = ValueKey::from_value(&args[0]).ok_or_else(|| {
-                            LustError::RuntimeError {
-                                message: format!(
-                                    "Cannot use {:?} as table key (not hashable)",
-                                    args[0]
-                                ),
-                            }
-                        })?;
-                        Ok(Value::Bool(table.borrow().contains_key(&key)))
-                    }
-
-                    "delete" => {
-                        if args.is_empty() {
-                            return Err(LustError::RuntimeError {
-                                message: "delete requires a key argument".to_string(),
-                            });
-                        }
-
-                        let key = ValueKey::from_value(&args[0]).ok_or_else(|| {
-                            LustError::RuntimeError {
-                                message: format!(
-                                    "Cannot use {:?} as table key (not hashable)",
-                                    args[0]
-                                ),
-                            }
-                        })?;
-                        match table.borrow_mut().remove(&key) {
-                            Some(value) => Ok(Value::some(value)),
-                            None => Ok(Value::none()),
-                        }
-                    }
-
-                    "keys" => {
-                        let keys: Vec<Value> =
-                            table.borrow().keys().map(|k| k.to_value()).collect();
-                        Ok(Value::array(keys))
-                    }
-
-                    "values" => {
-                        let values: Vec<Value> = table.borrow().values().cloned().collect();
-                        Ok(Value::array(values))
-                    }
-
-                    _ => Err(LustError::RuntimeError {
-                        message: format!("Table has no method '{}'", method_name),
-                    }),
-                }
-            }
-
             Value::Iterator(state_rc) => match method_name {
                 "iter" => Ok(Value::Iterator(state_rc.clone())),
                 "next" => {
@@ -1010,16 +848,6 @@ impl VM {
                         }
 
                         IteratorState::MapPairs { items, index } => {
-                            if *index < items.len() {
-                                let (k, v) = items[*index].clone();
-                                *index += 1;
-                                Ok(Value::some(Value::array(vec![k.to_value(), v])))
-                            } else {
-                                Ok(Value::none())
-                            }
-                        }
-
-                        IteratorState::TablePairs { items, index } => {
                             if *index < items.len() {
                                 let (k, v) = items[*index].clone();
                                 *index += 1;

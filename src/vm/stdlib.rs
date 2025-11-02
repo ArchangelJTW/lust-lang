@@ -67,7 +67,6 @@ fn create_type_fn() -> Value {
             Value::Array(_) => "array",
             Value::Tuple(_) => "tuple",
             Value::Map(_) => "map",
-            Value::Table(_) => "table",
             Value::Struct { .. } | Value::WeakStruct(_) => "struct",
             Value::Enum { .. } => "enum",
             Value::Function(_) => "function",
@@ -91,7 +90,7 @@ fn create_io_module() -> Value {
     entries.insert(string_key("read_stdin"), create_io_read_stdin_fn());
     entries.insert(string_key("read_line"), create_io_read_line_fn());
     entries.insert(string_key("write_stdout"), create_io_write_stdout_fn());
-    Value::table(entries)
+    Value::map(entries)
 }
 
 fn create_io_read_file_fn() -> Value {
@@ -246,7 +245,7 @@ fn create_os_module() -> Value {
     entries.insert(string_key("remove_file"), create_os_remove_file_fn());
     entries.insert(string_key("remove_dir"), create_os_remove_dir_fn());
     entries.insert(string_key("rename"), create_os_rename_fn());
-    Value::table(entries)
+    Value::map(entries)
 }
 
 fn create_os_create_file_fn() -> Value {

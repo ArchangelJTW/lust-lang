@@ -239,27 +239,6 @@ impl Compiler {
                         return self.compile_reduce_method(receiver, &args[0], &args[1]);
                     }
 
-                    "as" if type_args.is_some() => {
-                        let type_arg = &type_args.as_ref().unwrap()[0];
-                        let type_name = Self::type_to_string(&type_arg.kind);
-                        let obj_reg = self.compile_expr(receiver)?;
-                        let method_idx = self.add_string_constant(method);
-                        let type_str_const_idx = self.add_string_constant(&type_name);
-                        let type_arg_reg = self.allocate_register();
-                        self.emit(Instruction::LoadConst(type_arg_reg, type_str_const_idx), 0);
-                        self.emit(
-                            Instruction::CallMethod(
-                                obj_reg,
-                                method_idx,
-                                type_arg_reg,
-                                1,
-                                type_arg_reg,
-                            ),
-                            0,
-                        );
-                        return Ok(type_arg_reg);
-                    }
-
                     _ => {}
                 }
 

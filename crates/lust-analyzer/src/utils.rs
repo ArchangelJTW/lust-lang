@@ -240,7 +240,6 @@ pub(crate) fn base_type_name(ty: &Type) -> Option<String> {
         TypeKind::Result(_, _) => Some("Result".to_string()),
         TypeKind::Array(_) => Some("Array".to_string()),
         TypeKind::Map(_, _) => Some("Map".to_string()),
-        TypeKind::Table => Some("Table".to_string()),
         TypeKind::String => Some("String".to_string()),
         TypeKind::Int => Some("Int".to_string()),
         TypeKind::Float => Some("Float".to_string()),

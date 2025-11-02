@@ -46,7 +46,7 @@ pub(super) fn create_task_module() -> Value {
     entries.insert(string_key("stop"), create_task_stop_fn());
     entries.insert(string_key("restart"), create_task_restart_fn());
     entries.insert(string_key("current"), create_task_current_fn());
-    Value::table(entries)
+    Value::map(entries)
 }
 
 pub(super) fn string_key(name: &str) -> ValueKey {

@@ -603,30 +603,6 @@ impl TypeChecker {
                     return Ok(());
                 }
 
-                (TypeKind::Table, "iter") => {
-                    if variables.len() != 2 {
-                        return Err(self.type_error(format!(
-                            "Table iteration yields 2 values (key, value), but {} variables were specified",
-                            variables.len()
-                        )));
-                    }
-
-                    let prev_in_loop = self.in_loop;
-                    self.in_loop = true;
-                    self.env.push_scope();
-                    let unknown = Type::new(TypeKind::Unknown, TypeChecker::dummy_span());
-                    self.env
-                        .declare_variable(variables[0].clone(), unknown.clone())?;
-                    self.env.declare_variable(variables[1].clone(), unknown)?;
-                    for stmt in body {
-                        self.check_stmt(stmt)?;
-                    }
-
-                    self.env.pop_scope();
-                    self.in_loop = prev_in_loop;
-                    return Ok(());
-                }
-
                 (TypeKind::Array(elem_ty), "iter") => {
                     if variables.len() != 1 {
                         return Err(self.type_error(format!(

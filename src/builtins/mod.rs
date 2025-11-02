@@ -49,7 +49,6 @@ pub enum TypeExpr {
     Map(Box<TypeExpr>, Box<TypeExpr>),
     Result(Box<TypeExpr>, Box<TypeExpr>),
     Option(Box<TypeExpr>),
-    Table,
     Generic(&'static str),
     SelfType,
     Function {
@@ -147,7 +146,6 @@ impl TypeExpr {
                 TypeKind::Option(Box::new(inner.instantiate(generics, Some(span)))),
                 span,
             ),
-            TypeExpr::Table => Type::new(TypeKind::Table, span),
             TypeExpr::Generic(name) => generics
                 .get(name)
                 .cloned()
@@ -212,7 +210,6 @@ fn match_type_expr(
             match_type_expr(pattern_ok, actual_ok, bindings)
                 && match_type_expr(pattern_err, actual_err, bindings)
         }
-        (TypeExpr::Table, TypeKind::Table) => true,
         _ => false,
     }
 }
@@ -603,75 +600,6 @@ fn map_methods() -> Vec<BuiltinMethod> {
             &[],
             vec![],
             TypeExpr::Array(Box::new(TypeExpr::Generic("V"))),
-        ),
-    ]
-}
-
-fn table_methods() -> Vec<BuiltinMethod> {
-    vec![
-        method(
-            TypeExpr::Table,
-            "iter",
-            "Iterate over key/value pairs",
-            &[],
-            vec![],
-            TypeExpr::Named("Iterator"),
-        ),
-        method(
-            TypeExpr::Table,
-            "len",
-            "Return the number of entries in the table",
-            &[],
-            vec![],
-            TypeExpr::Int,
-        ),
-        method(
-            TypeExpr::Table,
-            "get",
-            "Look up a value by key",
-            &["key"],
-            vec![TypeExpr::Unknown],
-            TypeExpr::Option(Box::new(TypeExpr::Unknown)),
-        ),
-        method(
-            TypeExpr::Table,
-            "set",
-            "Insert or overwrite a key/value pair",
-            &["key", "value"],
-            vec![TypeExpr::Unknown, TypeExpr::Unknown],
-            TypeExpr::Unit,
-        ),
-        method(
-            TypeExpr::Table,
-            "has",
-            "Check whether the table contains a key",
-            &["key"],
-            vec![TypeExpr::Unknown],
-            TypeExpr::Bool,
-        ),
-        method(
-            TypeExpr::Table,
-            "delete",
-            "Remove an entry from the table",
-            &["key"],
-            vec![TypeExpr::Unknown],
-            TypeExpr::Option(Box::new(TypeExpr::Unknown)),
-        ),
-        method(
-            TypeExpr::Table,
-            "keys",
-            "Return the keys as an array",
-            &[],
-            vec![],
-            TypeExpr::Array(Box::new(TypeExpr::Unknown)),
-        ),
-        method(
-            TypeExpr::Table,
-            "values",
-            "Return the values as an array",
-            &[],
-            vec![],
-            TypeExpr::Array(Box::new(TypeExpr::Unknown)),
         ),
     ]
 }
@@ -1129,7 +1057,6 @@ fn build_builtin_methods() -> Vec<BuiltinMethod> {
     methods.extend(string_methods());
     methods.extend(array_methods());
     methods.extend(map_methods());
-    methods.extend(table_methods());
     methods.extend(iterator_methods());
     methods.extend(option_methods());
     methods.extend(result_methods());
@@ -1211,7 +1138,6 @@ fn receiver_key(expr: &TypeExpr) -> Option<&'static str> {
         TypeExpr::String => Some("String"),
         TypeExpr::Array(_) => Some("Array"),
         TypeExpr::Map(_, _) => Some("Map"),
-        TypeExpr::Table => Some("Table"),
         TypeExpr::Named(name) => Some(name),
         TypeExpr::Option(_) => Some("Option"),
         TypeExpr::Result(_, _) => Some("Result"),

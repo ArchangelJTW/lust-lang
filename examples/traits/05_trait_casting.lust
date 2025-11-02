@@ -38,19 +38,19 @@ function process_object(obj: unknown)
     println("Processing object...")
     
     -- Try to cast to Drawable trait
-    local drawable = obj:as<Drawable>()
-    if drawable:is_some() then
+    local drawable = obj
+    if drawable is Drawable then
         println("Object is drawable!")
-        drawable:unwrap():draw()
+        drawable:draw()
     else
         println("Object is not drawable")
     end
     
     -- Try to cast to Printable trait
-    local printable = obj:as<Printable>()
-    if printable:is_some() then
+    local printable = obj
+    if printable is Printable then
         println("Object is printable!")
-        printable:unwrap():print()
+        printable:print()
     else
         println("Object is not printable")
     end

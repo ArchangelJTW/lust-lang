@@ -903,94 +903,6 @@ impl TypeChecker {
 
                 _ => {}
             },
-            TypeKind::Table => match method {
-                "iter" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("iter() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Named("Iterator".to_string()), span));
-                }
-
-                "len" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("len() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Int, span));
-                }
-
-                "get" => {
-                    if args.len() != 1 {
-                        return Err(self.type_error("get() requires 1 argument (key)".to_string()));
-                    }
-
-                    self.check_expr(&args[0])?;
-                    return Ok(Type::new(
-                        TypeKind::Option(Box::new(Type::new(TypeKind::Unknown, span))),
-                        span,
-                    ));
-                }
-
-                "set" => {
-                    if args.len() != 2 {
-                        return Err(
-                            self.type_error("set() requires 2 arguments (key, value)".to_string())
-                        );
-                    }
-
-                    self.check_expr(&args[0])?;
-                    self.check_expr(&args[1])?;
-                    return Ok(Type::new(TypeKind::Unit, span));
-                }
-
-                "has" => {
-                    if args.len() != 1 {
-                        return Err(self.type_error("has() requires 1 argument (key)".to_string()));
-                    }
-
-                    self.check_expr(&args[0])?;
-                    return Ok(Type::new(TypeKind::Bool, span));
-                }
-
-                "delete" => {
-                    if args.len() != 1 {
-                        return Err(
-                            self.type_error("delete() requires 1 argument (key)".to_string())
-                        );
-                    }
-
-                    self.check_expr(&args[0])?;
-                    return Ok(Type::new(
-                        TypeKind::Option(Box::new(Type::new(TypeKind::Unknown, span))),
-                        span,
-                    ));
-                }
-
-                "keys" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("keys() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(
-                        TypeKind::Array(Box::new(Type::new(TypeKind::Unknown, span))),
-                        span,
-                    ));
-                }
-
-                "values" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("values() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(
-                        TypeKind::Array(Box::new(Type::new(TypeKind::Unknown, span))),
-                        span,
-                    ));
-                }
-
-                _ => {}
-            },
             TypeKind::Named(type_name) if type_name == "Array" => match method {
                 "len" => {
                     if !args.is_empty() {
@@ -1420,11 +1332,6 @@ impl TypeChecker {
                     TypeKind::Option(Box::new(value_type.as_ref().clone())),
                     Self::dummy_span(),
                 ))
-            }
-
-            TypeKind::Table => {
-                self.check_expr(index)?;
-                Ok(Type::new(TypeKind::Unknown, Self::dummy_span()))
             }
 
             _ => Err(self.type_error(format!("Cannot index type '{}'", object_type))),

@@ -19,21 +19,21 @@ end
 -- Handle unknown with match patterns
 function describe_unknown(val: unknown): string
     -- Match on specific types to narrow from unknown
-    -- Note: We use :as<T>() to get Option<T>, then match on the Option
-    local as_int = val:as<int>()
+    -- Note: We use `is-and` pattern to get Option<T>, then match on the Option
+    local as_int = val is int and val
     if as_int:is_some() then
         local i = as_int:unwrap()
         return "Found int: " .. tostring(i)
     end
 
-    local as_str = val:as<string>()
+    local as_str = val is string and val
     if as_str:is_some() then
         local s = as_str:unwrap()
         return "Found string: " .. s
     end
 
-    local as_bool = val:as<bool>()
-    if as_bool:is_some() then
+    local as_bool = val is bool
+    if as_bool then
         return "Found bool"
     end
 
@@ -62,10 +62,10 @@ println(process_with_match(42))
 println(process_with_match(true))
 println(process_with_match(false))
 
--- Test 2: Match with unknown from Table
+-- Test 2: Match with unknown from Map
 println("")
 println("Test 2: Unknown narrowing")
-local config: Table = {}
+local config: Map<string, unknown> = {}
 config:set("port", 8080)
 config:set("host", "localhost")
 config:set("debug", true)

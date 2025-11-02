@@ -46,7 +46,6 @@ impl Parser {
                         "string" => TypeKind::String,
                         "bool" => TypeKind::Bool,
                         "unknown" => TypeKind::Unknown,
-                        "Table" => TypeKind::Table,
                         _ => {
                             if self.check(TokenKind::Less) {
                                 let type_args = self.parse_type_arguments()?;

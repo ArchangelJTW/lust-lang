@@ -184,7 +184,6 @@ impl Compiler {
                 Self::type_to_string(&key.kind),
                 Self::type_to_string(&val.kind)
             ),
-            TypeKind::Table => "Table".to_string(),
             TypeKind::Option(inner) => format!("Option<{}>", Self::type_to_string(&inner.kind)),
             TypeKind::Result(ok, err) => format!(
                 "Result<{}, {}>",
@@ -263,7 +262,6 @@ impl Compiler {
                 | "string"
                 | "bool"
                 | "unknown"
-                | "Table"
                 | "Array"
                 | "Map"
                 | "Option"

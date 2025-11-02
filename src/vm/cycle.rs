@@ -25,7 +25,6 @@ struct ContainerEntry {
 enum ContainerKind {
     Array(Weak<RefCell<Vec<Value>>>),
     Map(Weak<RefCell<HashMap<ValueKey, Value>>>),
-    Table(Weak<RefCell<HashMap<ValueKey, Value>>>),
     Struct(Weak<RefCell<Vec<Value>>>),
     Iterator(Weak<RefCell<IteratorState>>),
 }
@@ -54,12 +53,6 @@ impl CycleCollector {
 
             Value::Map(rc) => {
                 if self.register_map(rc) {
-                    self.pending_registrations += 1;
-                }
-            }
-
-            Value::Table(rc) => {
-                if self.register_table(rc) {
                     self.pending_registrations += 1;
                 }
             }
@@ -180,7 +173,6 @@ impl CycleCollector {
         match value {
             Value::Array(rc) => self.mark_array(rc, visited),
             Value::Map(rc) => self.mark_map(rc, visited),
-            Value::Table(rc) => self.mark_table(rc, visited),
             Value::Struct { fields, .. } => self.mark_struct(fields, visited),
             Value::Enum {
                 values: Some(rc), ..
@@ -264,33 +256,6 @@ impl CycleCollector {
         }
     }
 
-    fn mark_table(
-        &mut self,
-        rc: &Rc<RefCell<HashMap<ValueKey, Value>>>,
-        visited: &mut HashSet<usize>,
-    ) {
-        let ptr = Rc::as_ptr(rc) as usize;
-        let entry = self
-            .containers
-            .entry(ptr)
-            .or_insert_with(|| ContainerEntry {
-                kind: ContainerKind::Table(Rc::downgrade(rc)),
-                marked: false,
-            });
-        entry.kind = ContainerKind::Table(Rc::downgrade(rc));
-        if !visited.insert(ptr) {
-            entry.marked = true;
-            return;
-        }
-
-        entry.marked = true;
-        if let Ok(borrowed) = rc.try_borrow() {
-            for value in borrowed.values() {
-                self.mark_value(value, visited);
-            }
-        }
-    }
-
     fn mark_struct(&mut self, fields: &Rc<RefCell<Vec<Value>>>, visited: &mut HashSet<usize>) {
         let ptr = Rc::as_ptr(fields) as usize;
         let entry = self
@@ -338,7 +303,7 @@ impl CycleCollector {
                     }
                 }
 
-                IteratorState::MapPairs { items, .. } | IteratorState::TablePairs { items, .. } => {
+                IteratorState::MapPairs { items, .. } => {
                     for (_key, value) in items {
                         self.mark_value(value, visited);
                     }
@@ -378,24 +343,6 @@ impl CycleCollector {
 
             Entry::Occupied(mut entry) => {
                 entry.get_mut().kind = ContainerKind::Map(Rc::downgrade(rc));
-                false
-            }
-        }
-    }
-
-    fn register_table(&mut self, rc: &Rc<RefCell<HashMap<ValueKey, Value>>>) -> bool {
-        let ptr = Rc::as_ptr(rc) as usize;
-        match self.containers.entry(ptr) {
-            Entry::Vacant(entry) => {
-                entry.insert(ContainerEntry {
-                    kind: ContainerKind::Table(Rc::downgrade(rc)),
-                    marked: false,
-                });
-                true
-            }
-
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().kind = ContainerKind::Table(Rc::downgrade(rc));
                 false
             }
         }
@@ -473,7 +420,7 @@ impl ContainerKind {
                 }
             }
 
-            ContainerKind::Map(weak) | ContainerKind::Table(weak) => {
+            ContainerKind::Map(weak) => {
                 if let Some(rc) = weak.upgrade() {
                     if let Ok(mut borrowed) = rc.try_borrow_mut() {
                         borrowed.clear();
@@ -512,11 +459,6 @@ impl ContainerKind {
                             }
 
                             IteratorState::MapPairs { items, index } => {
-                                items.clear();
-                                *index = 0;
-                            }
-
-                            IteratorState::TablePairs { items, index } => {
                                 items.clear();
                                 *index = 0;
                             }

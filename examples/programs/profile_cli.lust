@@ -8,7 +8,7 @@ local DEFAULT_NAME = "Friend"
 local DEFAULT_AGE = "25"
 local DEFAULT_COLOR = "Blue"
 
-function get_profile_field(profile: Table, key: string, fallback: string): string
+function get_profile_field(profile: Map<string, unknown>, key: string, fallback: string): string
     local value_opt = profile:get(key)
     if value_opt is Some(value) and value is string then
         return value
@@ -16,15 +16,15 @@ function get_profile_field(profile: Table, key: string, fallback: string): strin
     return fallback
 end
 
-function new_profile(name: string, age: string, color: string): Table
-    local profile: Table = {}
+function new_profile(name: string, age: string, color: string): Map<string, unknown>
+    local profile: Map<string, unknown> = {}
     profile:set("name", name)
     profile:set("age", age)
     profile:set("color", color)
     return profile
 end
 
-function clone_profile(profile: Table): Table
+function clone_profile(profile: Map<string, unknown>): Map<string, unknown>
     return new_profile(
         get_profile_field(profile, "name", DEFAULT_NAME),
         get_profile_field(profile, "age", DEFAULT_AGE),
@@ -32,7 +32,7 @@ function clone_profile(profile: Table): Table
     )
 end
 
-function parse_profile(text: string, defaults: Table): Table
+function parse_profile(text: string, defaults: Map<string, unknown>): Map<string, unknown>
     local profile = clone_profile(defaults)
     local lines = text:split("\n")
     local i: int = 0
@@ -51,16 +51,17 @@ function parse_profile(text: string, defaults: Table): Table
     return profile
 end
 
-function load_profile(path: string): Table
+function load_profile(path: string): Map<string, unknown>
     local defaults = new_profile(DEFAULT_NAME, DEFAULT_AGE, DEFAULT_COLOR)
     local read_result = io.read_file(path)
     if read_result is Ok(contents) then
         return parse_profile(contents, defaults)
+    else println("Did not find file at: " .. path)
     end
     return defaults
 end
 
-function save_profile(path: string, profile: Table): Result<(), string>
+function save_profile(path: string, profile: Map<string, unknown>): Result<(), string>
     local name = get_profile_field(profile, "name", DEFAULT_NAME)
     local age = get_profile_field(profile, "age", DEFAULT_AGE)
     local color = get_profile_field(profile, "color", DEFAULT_COLOR)

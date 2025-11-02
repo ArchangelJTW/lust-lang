@@ -363,7 +363,6 @@ module.exports = grammar({
       $.array_expression,
       $.map_expression,
       $.lambda_expression,
-      $.type_cast_expression,
       $.parenthesized_expression,
     ),
 
@@ -512,16 +511,6 @@ module.exports = grammar({
       repeat($._statement),
       'end'
     ),
-
-    // Type cast
-    type_cast_expression: $ => prec(10, seq(
-      field('value', $._expression),
-      ':as',
-      '<',
-      field('type', $.type_annotation),
-      '>',
-      '()'
-    )),
 
     // Parenthesized expression
     parenthesized_expression: $ => seq(

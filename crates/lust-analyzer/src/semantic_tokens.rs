@@ -615,8 +615,7 @@ fn collect_tokens_from_type(
             collect_tokens_from_type(inner, text, line_offsets, tokens, seen);
         }
 
-        TypeKind::Table
-        | TypeKind::String
+        TypeKind::String
         | TypeKind::Int
         | TypeKind::Float
         | TypeKind::Bool

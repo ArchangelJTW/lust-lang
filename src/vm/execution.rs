@@ -656,10 +656,6 @@ impl VM {
                     self.set_register(dest, Value::map(HashMap::new()))?;
                 }
 
-                Instruction::NewTable(dest) => {
-                    self.set_register(dest, Value::table(HashMap::new()))?;
-                }
-
                 Instruction::NewStruct(
                     dest,
                     name_idx,
@@ -792,12 +788,6 @@ impl VM {
                             map.borrow().get(&key).cloned().unwrap_or(Value::Nil)
                         }
 
-                        Value::Table(table) => {
-                            use crate::bytecode::ValueKey;
-                            let key = ValueKey::String(field_name.clone());
-                            table.borrow().get(&key).cloned().unwrap_or(Value::Nil)
-                        }
-
                         _ => {
                             return Err(LustError::RuntimeError {
                                 message: format!(
@@ -905,19 +895,6 @@ impl VM {
                                 }
                             })?;
                             map.borrow().get(&key).cloned().unwrap_or(Value::Nil)
-                        }
-
-                        Value::Table(table) => {
-                            use crate::bytecode::ValueKey;
-                            let key = ValueKey::from_value(index).ok_or_else(|| {
-                                LustError::RuntimeError {
-                                    message: format!(
-                                        "Cannot use {:?} as table key (not hashable)",
-                                        index
-                                    ),
-                                }
-                            })?;
-                            table.borrow().get(&key).cloned().unwrap_or(Value::Nil)
                         }
 
                         _ => {
@@ -1094,19 +1071,6 @@ impl VM {
                             map.borrow_mut().insert(key, value);
                         }
 
-                        Value::Table(table) => {
-                            use crate::bytecode::ValueKey;
-                            let key = ValueKey::from_value(index).ok_or_else(|| {
-                                LustError::RuntimeError {
-                                    message: format!(
-                                        "Cannot use {:?} as table key (not hashable)",
-                                        index
-                                    ),
-                                }
-                            })?;
-                            table.borrow_mut().insert(key, value);
-                        }
-
                         _ => {
                             return Err(LustError::RuntimeError {
                                 message: format!("Cannot index {:?}", collection.type_of()),
@@ -1207,7 +1171,6 @@ impl VM {
             Value::Array(_) => "Array",
             Value::Tuple(_) => "Tuple",
             Value::Map(_) => "Map",
-            Value::Table(_) => "Table",
             Value::Struct { name, .. } => name.as_str(),
             Value::WeakStruct(weak) => weak.struct_name(),
             Value::Enum { enum_name, .. } => enum_name.as_str(),

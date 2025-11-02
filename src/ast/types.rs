@@ -39,7 +39,6 @@ pub enum TypeKind {
     Generic(String),
     Array(Box<Type>),
     Map(Box<Type>, Box<Type>),
-    Table,
     Function {
         params: Vec<Type>,
         return_type: Box<Type>,
@@ -85,7 +84,6 @@ impl fmt::Display for TypeKind {
             TypeKind::Generic(name) => write!(f, "{name}"),
             TypeKind::Array(inner) => write!(f, "Array<{}>", inner),
             TypeKind::Map(key, value) => write!(f, "Map<{}, {}>", key, value),
-            TypeKind::Table => write!(f, "Table"),
             TypeKind::Function {
                 params,
                 return_type,

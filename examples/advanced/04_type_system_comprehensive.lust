@@ -19,7 +19,7 @@ function process_api_field(key: string, value: unknown): string
         return "    Integer value: " .. tostring(i)
     end
 
-    local as_bool = (value is bool) and value
+    local as_bool = value is bool and value
     if as_bool:is_some() then
         local b = as_bool:unwrap()
         if b then

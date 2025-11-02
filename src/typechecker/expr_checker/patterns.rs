@@ -192,6 +192,10 @@ impl TypeChecker {
                 }
             }
 
+            ExprKind::Paren(inner) => {
+                narrowings.extend(self.extract_type_narrowings_from_expr(inner));
+            }
+
             _ => {}
         }
 
@@ -222,6 +226,10 @@ impl TypeChecker {
                     bindings.extend(self.extract_all_pattern_bindings_from_expr(left));
                     bindings.extend(self.extract_all_pattern_bindings_from_expr(right));
                 }
+            }
+
+            ExprKind::Paren(inner) => {
+                bindings.extend(self.extract_all_pattern_bindings_from_expr(inner));
             }
 
             _ => {}

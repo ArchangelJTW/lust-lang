@@ -162,7 +162,10 @@ impl TypeChecker {
 
         let right_info = self.short_circuit_profile(right, &right_type);
         let mut option_inner: Option<Type> = None;
-        let (truthy, falsy, result_type) = if self.should_optionize(&left_type, &right_type) {
+        let should_optionize =
+            self.should_optionize(&left_type, &right_type)
+                || self.should_optionize_narrowed_value(left, right, &right_type);
+        let (truthy, falsy, result_type) = if should_optionize {
             let inner = self.canonicalize_type(&right_type);
             option_inner = Some(inner.clone());
             let option_type = Type::new(TypeKind::Option(Box::new(inner)), span);
@@ -206,6 +209,46 @@ impl TypeChecker {
             },
         );
         Ok(result_type)
+    }
+
+    fn should_optionize_narrowed_value(
+        &self,
+        left: &Expr,
+        right: &Expr,
+        right_type: &Type,
+    ) -> bool {
+        if self.option_inner_type(right_type).is_some() {
+            return false;
+        }
+
+        let scrutinee = match Self::extract_short_circuit_scrutinee(left) {
+            Some(expr) => expr,
+            None => return false,
+        };
+
+        let left_ident = Self::identifier_from_expr(scrutinee);
+        let right_ident = Self::identifier_from_expr(right);
+        match (left_ident, right_ident) {
+            (Some(lhs), Some(rhs)) => lhs == rhs,
+            _ => false,
+        }
+    }
+
+    fn extract_short_circuit_scrutinee<'a>(expr: &'a Expr) -> Option<&'a Expr> {
+        match &expr.kind {
+            ExprKind::TypeCheck { expr: scrutinee, .. } => Some(scrutinee),
+            ExprKind::IsPattern { expr: scrutinee, .. } => Some(scrutinee),
+            ExprKind::Paren(inner) => Self::extract_short_circuit_scrutinee(inner),
+            _ => None,
+        }
+    }
+
+    fn identifier_from_expr<'a>(expr: &'a Expr) -> Option<&'a str> {
+        match &expr.kind {
+            ExprKind::Identifier(name) => Some(name.as_str()),
+            ExprKind::Paren(inner) => Self::identifier_from_expr(inner),
+            _ => None,
+        }
     }
 
     fn check_or_expr(&mut self, span: Span, left: &Expr, right: &Expr) -> Result<Type> {

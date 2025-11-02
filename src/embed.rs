@@ -1241,13 +1241,6 @@ impl<'a> ValueRef<'a> {
             _ => None,
         }
     }
-
-    pub fn as_table_handle(&self) -> Option<TableHandle> {
-        match self.as_value() {
-            Value::Table(table) => Some(TableHandle::from_rc(table.clone())),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -1386,83 +1379,6 @@ impl MapHandle {
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut HashMap<ValueKey, Value>) -> R) -> R {
         let mut map = self.inner.borrow_mut();
         f(&mut map)
-    }
-}
-
-#[derive(Clone)]
-pub struct TableHandle {
-    inner: Rc<RefCell<HashMap<ValueKey, Value>>>,
-}
-
-impl TableHandle {
-    fn from_rc(inner: Rc<RefCell<HashMap<ValueKey, Value>>>) -> Self {
-        Self { inner }
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.borrow().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn borrow(&self) -> Ref<'_, HashMap<ValueKey, Value>> {
-        self.inner.borrow()
-    }
-
-    pub fn borrow_mut(&self) -> RefMut<'_, HashMap<ValueKey, Value>> {
-        self.inner.borrow_mut()
-    }
-
-    pub fn contains_key<K>(&self, key: K) -> bool
-    where
-        K: Into<ValueKey>,
-    {
-        self.inner.borrow().contains_key(&key.into())
-    }
-
-    pub fn get<K>(&self, key: K) -> Option<ValueRef<'_>>
-    where
-        K: Into<ValueKey>,
-    {
-        let key = key.into();
-        {
-            if !self.inner.borrow().contains_key(&key) {
-                return None;
-            }
-        }
-        let lookup = key.clone();
-        let table = self.inner.borrow();
-        Some(ValueRef::borrowed(Ref::map(table, move |values| {
-            values
-                .get(&lookup)
-                .expect("lookup key should be present after contains_key")
-        })))
-    }
-
-    pub fn insert<K>(&self, key: K, value: Value) -> Option<Value>
-    where
-        K: Into<ValueKey>,
-    {
-        self.inner.borrow_mut().insert(key.into(), value)
-    }
-
-    pub fn remove<K>(&self, key: K) -> Option<Value>
-    where
-        K: Into<ValueKey>,
-    {
-        self.inner.borrow_mut().remove(&key.into())
-    }
-
-    pub fn with_ref<R>(&self, f: impl FnOnce(&HashMap<ValueKey, Value>) -> R) -> R {
-        let table = self.inner.borrow();
-        f(&table)
-    }
-
-    pub fn with_mut<R>(&self, f: impl FnOnce(&mut HashMap<ValueKey, Value>) -> R) -> R {
-        let mut table = self.inner.borrow_mut();
-        f(&mut table)
     }
 }
 
@@ -1649,13 +1565,6 @@ impl IntoTypedValue for MapHandle {
     fn into_typed_value(self) -> TypedValue {
         let value = self.into_value();
         TypedValue::new(value, |_, ty| matches_map_handle_type(ty), "map")
-    }
-}
-
-impl IntoTypedValue for TableHandle {
-    fn into_typed_value(self) -> TypedValue {
-        let value = self.into_value();
-        TypedValue::new(value, |_, ty| matches_table_handle_type(ty), "table")
     }
 }
 
@@ -2148,14 +2057,6 @@ fn matches_map_handle_type(ty: &Type) -> bool {
     }
 }
 
-fn matches_table_handle_type(ty: &Type) -> bool {
-    match &ty.kind {
-        TypeKind::Table | TypeKind::Unknown => true,
-        TypeKind::Union(types) => types.iter().any(|alt| matches_table_handle_type(alt)),
-        _ => false,
-    }
-}
-
 pub trait FromLustArgs: Sized {
     fn from_values(values: &[Value]) -> std::result::Result<Self, String>;
     fn matches_signature(params: &[Type]) -> bool;
@@ -2568,20 +2469,6 @@ impl IntoLustValue for MapHandle {
     }
 }
 
-impl IntoLustValue for TableHandle {
-    fn into_value(self) -> Value {
-        Value::Table(self.inner)
-    }
-
-    fn matches_lust_type(ty: &Type) -> bool {
-        matches_table_handle_type(ty)
-    }
-
-    fn type_description() -> &'static str {
-        "table"
-    }
-}
-
 impl<T> FromLustValue for Vec<T>
 where
     T: FromLustValue,
@@ -2648,25 +2535,6 @@ impl FromLustValue for MapHandle {
 
     fn type_description() -> &'static str {
         "map"
-    }
-}
-
-impl FromLustValue for TableHandle {
-    fn from_value(value: Value) -> Result<Self> {
-        match value {
-            Value::Table(table) => Ok(TableHandle::from_rc(table)),
-            other => Err(LustError::RuntimeError {
-                message: format!("Expected Lust value 'table' but received '{:?}'", other),
-            }),
-        }
-    }
-
-    fn matches_lust_type(ty: &Type) -> bool {
-        matches_table_handle_type(ty)
-    }
-
-    fn type_description() -> &'static str {
-        "table"
     }
 }
 

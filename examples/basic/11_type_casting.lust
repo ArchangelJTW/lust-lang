@@ -1,9 +1,9 @@
--- Type casting with :as<T>() method
+-- Type casting with `is` and short circuit output
 
 -- Type casting returns Option<T>
 
--- Cast from Unknown (from Table)
-local data: Table = {}
+-- Cast from Unknown (from Map)
+local data: Map<string, unknown> = {}
 data:set("age", 30)
 data:set("name", "Alice")
 
@@ -12,13 +12,13 @@ if age_opt:is_some() then
     local unknown_val = age_opt:unwrap()  -- Unknown type
 
     -- Try to cast to int (succeeds)
-    local int_val = unknown_val:as<int>()
+    local int_val = unknown_val is int and unknown_val
     if int_val:is_some() then
         println(int_val:unwrap())         -- Outputs: 30
     end
 
     -- Try to cast to string (fails)
-    local str_val = unknown_val:as<string>()
+    local str_val = unknown_val is string and unknown_val
     if str_val:is_none() then
         println("Not a string")           -- This prints
     end
@@ -28,14 +28,9 @@ end
 local name_opt = data:get("name")
 if name_opt:is_some() then
     local unknown_name = name_opt:unwrap()
-    local str_name = unknown_name:as<string>()
+    local str_name = unknown_name is string and unknown_name
     if str_name:is_some() then
         println(str_name:unwrap())        -- Outputs: Alice
     end
 end
-
--- Direct casts on primitives
-println(42:as<int>():is_some())           -- Outputs: true
-println(42:as<string>():is_none())        -- Outputs: true
- 
 

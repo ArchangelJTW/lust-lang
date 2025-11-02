@@ -27,30 +27,32 @@ function process_value(value: string | int | float): int
 end
  
 
--- Handle unknown type from Table
+-- Handle unknown type from Map
 function handle_unknown(val: unknown): string
     -- Must narrow unknown before using type-specific operations
 
     -- Try int first
-    local as_int = val:as<int>()
+    local as_int = val is int and val
     if as_int:is_some() then
         return "Integer: " .. tostring(as_int:unwrap())
     end
 
     -- Try string
-    local as_str = val:as<string>()
+    local as_str = val is string and val
     if as_str:is_some() then
         return "String: " .. as_str:unwrap()
     end
 
     -- Try bool
-    local as_bool = val:as<bool>()
+    --[[
+    local as_bool = val is bool and val
     if as_bool:is_some() then
         if as_bool:unwrap() then
             return "Boolean: true"
         end
         return "Boolean: false"
     end
+    ]]
 
     return "Unknown type"
 end
@@ -71,10 +73,10 @@ println("")
 local result3 = process_value(3.14)
 println("  Result: " .. tostring(result3))
 
--- Test 2: Unknown type narrowing with Table
+-- Test 2: Unknown type narrowing with Map
 println("")
 println("Test 2: Unknown type narrowing")
-local data: Table = {}
+local data: Map<string, unknown> = {}
 data:set("id", 100)
 data:set("name", "Bob")
 data:set("verified", true)

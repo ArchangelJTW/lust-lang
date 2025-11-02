@@ -129,42 +129,18 @@ impl TypeChecker {
         let mut allow_mixed_keys = false;
         let mut allow_mixed_values = false;
         if let Some(expected) = expected_type {
-            match &expected.kind {
-                TypeKind::Map(key, value) => {
-                    expected_key_ty = Some(key.as_ref());
-                    expected_value_ty = Some(value.as_ref());
-                    allow_mixed_keys = matches!(key.kind, TypeKind::Unknown | TypeKind::Infer);
-                    allow_mixed_values = matches!(value.kind, TypeKind::Unknown | TypeKind::Infer);
-                }
-
-                TypeKind::Table => {
-                    allow_mixed_keys = true;
-                    allow_mixed_values = true;
-                }
-
-                _ => {}
+            if let TypeKind::Map(key, value) = &expected.kind {
+                expected_key_ty = Some(key.as_ref());
+                expected_value_ty = Some(value.as_ref());
+                allow_mixed_keys = matches!(key.kind, TypeKind::Unknown | TypeKind::Infer);
+                allow_mixed_values = matches!(value.kind, TypeKind::Unknown | TypeKind::Infer);
             }
         }
 
         if entries.is_empty() {
             if let Some(expected) = expected_type {
-                match &expected.kind {
-                    TypeKind::Map(_, _) => {
-                        return Ok(self.canonicalize_type(expected));
-                    }
-
-                    TypeKind::Table => {
-                        let span = Self::dummy_span();
-                        return Ok(Type::new(
-                            TypeKind::Map(
-                                Box::new(Type::new(TypeKind::Unknown, span)),
-                                Box::new(Type::new(TypeKind::Unknown, span)),
-                            ),
-                            span,
-                        ));
-                    }
-
-                    _ => {}
+                if let TypeKind::Map(_, _) = &expected.kind {
+                    return Ok(self.canonicalize_type(expected));
                 }
             }
 
@@ -201,7 +177,7 @@ impl TypeChecker {
             } else {
                 self.check_expr(key_expr)?
             };
-            if !self.env.type_implements_trait(&raw_key_type, "Hashable") {
+            if !allow_mixed_keys && !self.env.type_implements_trait(&raw_key_type, "Hashable") {
                 return Err(self.type_error(format!(
                     "Map key type '{}' must implement Hashable trait",
                     raw_key_type

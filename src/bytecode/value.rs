@@ -170,7 +170,6 @@ pub enum ValueTag {
     Array,
     Tuple,
     Map,
-    Table,
     Struct,
     Enum,
     Function,
@@ -408,7 +407,6 @@ pub enum Value {
     Array(Rc<RefCell<Vec<Value>>>),
     Tuple(Rc<Vec<Value>>),
     Map(Rc<RefCell<HashMap<ValueKey, Value>>>),
-    Table(Rc<RefCell<HashMap<ValueKey, Value>>>),
     Struct {
         name: String,
         layout: Rc<StructLayout>,
@@ -469,10 +467,6 @@ pub enum IteratorState {
         items: Vec<(ValueKey, Value)>,
         index: usize,
     },
-    TablePairs {
-        items: Vec<(ValueKey, Value)>,
-        index: usize,
-    },
 }
 
 #[derive(Clone)]
@@ -526,7 +520,6 @@ pub enum ValueType {
     Array,
     Tuple,
     Map,
-    Table,
     Struct,
     Enum,
     Function,
@@ -548,7 +541,6 @@ impl Value {
             Value::Array(_) => ValueTag::Array,
             Value::Tuple(_) => ValueTag::Tuple,
             Value::Map(_) => ValueTag::Map,
-            Value::Table(_) => ValueTag::Table,
             Value::Struct { .. } | Value::WeakStruct(_) => ValueTag::Struct,
             Value::Enum { .. } => ValueTag::Enum,
             Value::Function(_) => ValueTag::Function,
@@ -569,7 +561,6 @@ impl Value {
             Value::Array(_) => ValueType::Array,
             Value::Tuple(_) => ValueType::Tuple,
             Value::Map(_) => ValueType::Map,
-            Value::Table(_) => ValueType::Table,
             Value::Struct { .. } | Value::WeakStruct(_) => ValueType::Struct,
             Value::Enum { .. } => ValueType::Enum,
             Value::Function(_) => ValueType::Function,
@@ -717,52 +708,6 @@ impl Value {
         }
     }
 
-    pub fn as_table(&self) -> Option<HashMap<ValueKey, Value>> {
-        match self {
-            Value::Table(table) => Some(table.borrow().clone()),
-            _ => None,
-        }
-    }
-
-    pub fn table_get(&self, key: &ValueKey) -> Option<Value> {
-        match self {
-            Value::Table(table) => table.borrow().get(key).cloned(),
-            _ => None,
-        }
-    }
-
-    pub fn table_set(&self, key: ValueKey, value: Value) -> Result<(), String> {
-        match self {
-            Value::Table(table) => {
-                table.borrow_mut().insert(key, value);
-                Ok(())
-            }
-
-            _ => Err("Cannot set key on non-table".to_string()),
-        }
-    }
-
-    pub fn table_has(&self, key: &ValueKey) -> Option<bool> {
-        match self {
-            Value::Table(table) => Some(table.borrow().contains_key(key)),
-            _ => None,
-        }
-    }
-
-    pub fn table_delete(&self, key: &ValueKey) -> Result<Option<Value>, String> {
-        match self {
-            Value::Table(table) => Ok(table.borrow_mut().remove(key)),
-            _ => Err("Cannot delete key from non-table".to_string()),
-        }
-    }
-
-    pub fn table_len(&self) -> Option<usize> {
-        match self {
-            Value::Table(table) => Some(table.borrow().len()),
-            _ => None,
-        }
-    }
-
     pub fn string(s: impl Into<String>) -> Self {
         Value::String(Rc::new(s.into()))
     }
@@ -791,10 +736,6 @@ impl Value {
 
     pub fn map(entries: HashMap<ValueKey, Value>) -> Self {
         Value::Map(Rc::new(RefCell::new(entries)))
-    }
-
-    pub fn table(entries: HashMap<ValueKey, Value>) -> Self {
-        Value::Table(Rc::new(RefCell::new(entries)))
     }
 
     pub fn task(handle: TaskHandle) -> Self {
@@ -984,7 +925,6 @@ impl fmt::Debug for Value {
             Value::Array(arr) => write!(f, "Array({:?})", arr.borrow()),
             Value::Tuple(values) => write!(f, "Tuple({:?})", values),
             Value::Map(map) => write!(f, "Map({:?})", map.borrow()),
-            Value::Table(table) => write!(f, "Table({:?})", table.borrow()),
             Value::Struct {
                 name,
                 layout,
@@ -1092,20 +1032,6 @@ impl fmt::Display for Value {
                 write!(f, "}}")
             }
 
-            Value::Table(table) => {
-                write!(f, "{{")?;
-                let borrowed = table.borrow();
-                for (i, (k, v)) in borrowed.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
-
-                    write!(f, "{}: {}", k, v)?;
-                }
-
-                write!(f, "}}")
-            }
-
             Value::Struct {
                 name,
                 layout,
@@ -1175,7 +1101,6 @@ impl PartialEq for Value {
             (Value::Array(a), Value::Array(b)) => *a.borrow() == *b.borrow(),
             (Value::Tuple(a), Value::Tuple(b)) => *a == *b,
             (Value::Map(a), Value::Map(b)) => *a.borrow() == *b.borrow(),
-            (Value::Table(a), Value::Table(b)) => *a.borrow() == *b.borrow(),
             (
                 Value::Struct {
                     name: n1,
@@ -1547,16 +1472,6 @@ fn call_builtin_method_simple(
                     }
 
                     IteratorState::MapPairs { items, index } => {
-                        if *index < items.len() {
-                            let (k, v) = items[*index].clone();
-                            *index += 1;
-                            Ok(Value::some(Value::array(vec![k.to_value(), v])))
-                        } else {
-                            Ok(Value::none())
-                        }
-                    }
-
-                    IteratorState::TablePairs { items, index } => {
                         if *index < items.len() {
                             let (k, v) = items[*index].clone();
                             *index += 1;

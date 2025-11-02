@@ -1,6 +1,5 @@
 use lust::{
-    struct_field, ArrayHandle, EmbeddedProgram, FromLustValue, MapHandle, StructInstance,
-    TableHandle, Value,
+    struct_field, ArrayHandle, EmbeddedProgram, FromLustValue, MapHandle, StructInstance, Value,
 };
 
 fn main() -> lust::Result<()> {
@@ -26,11 +25,7 @@ fn main() -> lust::Result<()> {
 
         map_global: Map<string, int> = {["one"] = 1, ["two"] = 2}
 
-        table_global: Table = {}
-        table_global:set("one", 1)
-        table_global:set(2, "two")
-
-        lust_point: Point = Point {
+        local lust_point: Point = Point {
             x = 1,
             y = 2,
             name = "Lust Point"
@@ -184,23 +179,15 @@ fn main() -> lust::Result<()> {
         }
     }
 
-    if let Some(table_value) = program.get_global_value("main.table_global") {
-        if let Ok(table) = TableHandle::from_value(table_value.clone()) {
-            table.insert("three", Value::Int(3));
-            let snapshot = table.with_ref(|view| {
-                view.iter()
-                    .map(|(k, v)| (format!("{:?}", k), v.as_int().unwrap_or_default()))
-                    .collect::<Vec<_>>()
-            });
-            println!("Modified table = {:?}", snapshot);
-        } else if let Ok(map) = MapHandle::from_value(table_value) {
+    if let Some(map_value) = program.get_global_value("main.map_global") {
+        if let Ok(map) = MapHandle::from_value(map_value) {
             map.insert("three", Value::Int(3));
             let snapshot = map.with_ref(|view| {
                 view.iter()
                     .map(|(k, v)| (format!("{:?}", k), v.as_int().unwrap_or_default()))
                     .collect::<Vec<_>>()
             });
-            println!("Modified table (as map) = {:?}", snapshot);
+            println!("Modified map = {:?}", snapshot);
         }
     }
 

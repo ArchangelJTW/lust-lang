@@ -32,7 +32,6 @@ pub enum Instruction {
     Return(Register),
     NewArray(Register, Register, u8),
     NewMap(Register),
-    NewTable(Register),
     NewStruct(Register, ConstIndex, ConstIndex, Register, u8),
     NewEnumUnit(Register, ConstIndex, ConstIndex),
     NewEnumVariant(Register, ConstIndex, ConstIndex, Register, u8),
@@ -83,7 +82,6 @@ pub enum OpCode {
     Return,
     NewArray,
     NewMap,
-    NewTable,
     NewStruct,
     NewEnumUnit,
     NewEnumVariant,
@@ -135,7 +133,6 @@ impl Instruction {
             Instruction::Return(_) => OpCode::Return,
             Instruction::NewArray(_, _, _) => OpCode::NewArray,
             Instruction::NewMap(_) => OpCode::NewMap,
-            Instruction::NewTable(_) => OpCode::NewTable,
             Instruction::NewStruct(_, _, _, _, _) => OpCode::NewStruct,
             Instruction::NewEnumUnit(_, _, _) => OpCode::NewEnumUnit,
             Instruction::NewEnumVariant(_, _, _, _, _) => OpCode::NewEnumVariant,
@@ -211,7 +208,6 @@ impl fmt::Display for Instruction {
             }
 
             Instruction::NewMap(r) => write!(f, "NewMap R{}", r),
-            Instruction::NewTable(r) => write!(f, "NewTable R{}", r),
             Instruction::NewStruct(d, name, field_names, fields, cnt) => {
                 write!(
                     f,

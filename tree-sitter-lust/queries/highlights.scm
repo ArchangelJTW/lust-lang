@@ -88,7 +88,6 @@
 ; Special operators
 ":" @punctuation.delimiter
 "." @punctuation.delimiter
-":as" @keyword.operator
 "is" @keyword.operator
 
 ; Delimiters

@@ -691,7 +691,6 @@ fn format_type_expr(ty: &TypeExpr) -> String {
             format_type_expr(err)
         ),
         TypeExpr::Option(inner) => format!("Option<{}>", format_type_expr(inner)),
-        TypeExpr::Table => "Table".to_string(),
         TypeExpr::SelfType => "Self".to_string(),
         TypeExpr::Function {
             params,

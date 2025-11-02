@@ -836,22 +836,6 @@ impl TypeChecker {
             _ => {}
         }
 
-        match (&expected.kind, &actual.kind) {
-            (TypeKind::Table, TypeKind::Map(key, val)) => {
-                if matches!(key.kind, TypeKind::Unknown) && matches!(val.kind, TypeKind::Unknown) {
-                    return Ok(());
-                }
-            }
-
-            (TypeKind::Map(key, val), TypeKind::Table) => {
-                if matches!(key.kind, TypeKind::Unknown) && matches!(val.kind, TypeKind::Unknown) {
-                    return Ok(());
-                }
-            }
-
-            _ => {}
-        }
-
         if self.types_equal(expected, actual) {
             Ok(())
         } else {

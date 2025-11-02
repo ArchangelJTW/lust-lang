@@ -7,19 +7,19 @@ function process_api_field(key: string, value: unknown): string
     println("  Processing field '" .. key .. "':")
 
     -- Use type narrowing to handle different value types
-    local as_string = value:as<string>()
+    local as_string = value is string and value
     if as_string:is_some() then
         local s = as_string:unwrap()
         return "    String value: '" .. s .. "' (length: " .. tostring(s:len()) .. ")"
     end
 
-    local as_int = value:as<int>()
+    local as_int = value is int and value
     if as_int:is_some() then
         local i = as_int:unwrap()
         return "    Integer value: " .. tostring(i)
     end
 
-    local as_bool = value:as<bool>()
+    local as_bool = (value is bool) and value
     if as_bool:is_some() then
         local b = as_bool:unwrap()
         if b then
@@ -60,7 +60,7 @@ end
 -- For now, we test the 'is' operator in if statements
 
 -- Complex example: parse and validate configuration
-function parse_config(config: Table): bool
+function parse_config(config: Map<string, unknown>): bool
     println("Parsing configuration...")
     local all_valid: bool = true
 
@@ -68,7 +68,7 @@ function parse_config(config: Table): bool
     local port_opt = config:get("port")
     if port_opt:is_some() then
         local port_unknown = port_opt:unwrap()
-        local port_int = port_unknown:as<int>()
+        local port_int = port_unknown is int and port_unknown
 
         if port_int:is_some() then
             local port = port_int:unwrap()
@@ -88,7 +88,7 @@ function parse_config(config: Table): bool
     local host_opt = config:get("host")
     if host_opt:is_some() then
         local host_unknown = host_opt:unwrap()
-        local host_str = host_unknown:as<string>()
+        local host_str = host_unknown is string and host_unknown
 
         if host_str:is_some() then
             local host = host_str:unwrap()
@@ -108,7 +108,7 @@ function parse_config(config: Table): bool
     local debug_opt = config:get("debug")
     if debug_opt:is_some() then
         local debug_unknown = debug_opt:unwrap()
-        local debug_bool = debug_unknown:as<bool>()
+        local debug_bool = (debug_unknown is bool) and debug_unknown
 
         if debug_bool:is_some() then
             if debug_bool:unwrap() then
@@ -130,7 +130,7 @@ println("")
 
 -- Test 1: API field processing
 println("Test 1: API Response Processing")
-local api_response: Table = {}
+local api_response: Map<string, unknown> = {}
 api_response:set("status", 200)
 api_response:set("message", "Success")
 api_response:set("authenticated", true)
@@ -174,7 +174,7 @@ end
 -- Test 4: Configuration parsing
 println("")
 println("Test 4: Configuration Validation")
-local config: Table = {}
+local config: Map<string, unknown> = {}
 config:set("port", 8080)
 config:set("host", "localhost")
 config:set("debug", true)

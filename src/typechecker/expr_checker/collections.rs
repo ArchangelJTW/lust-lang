@@ -119,8 +119,55 @@ impl TypeChecker {
         ))
     }
 
-    pub fn check_map_literal(&mut self, entries: &[(Expr, Expr)]) -> Result<Type> {
+    pub fn check_map_literal(
+        &mut self,
+        entries: &[(Expr, Expr)],
+        expected_type: Option<&Type>,
+    ) -> Result<Type> {
+        let mut expected_key_ty: Option<&Type> = None;
+        let mut expected_value_ty: Option<&Type> = None;
+        let mut allow_mixed_keys = false;
+        let mut allow_mixed_values = false;
+        if let Some(expected) = expected_type {
+            match &expected.kind {
+                TypeKind::Map(key, value) => {
+                    expected_key_ty = Some(key.as_ref());
+                    expected_value_ty = Some(value.as_ref());
+                    allow_mixed_keys = matches!(key.kind, TypeKind::Unknown | TypeKind::Infer);
+                    allow_mixed_values = matches!(value.kind, TypeKind::Unknown | TypeKind::Infer);
+                }
+
+                TypeKind::Table => {
+                    allow_mixed_keys = true;
+                    allow_mixed_values = true;
+                }
+
+                _ => {}
+            }
+        }
+
         if entries.is_empty() {
+            if let Some(expected) = expected_type {
+                match &expected.kind {
+                    TypeKind::Map(_, _) => {
+                        return Ok(self.canonicalize_type(expected));
+                    }
+
+                    TypeKind::Table => {
+                        let span = Self::dummy_span();
+                        return Ok(Type::new(
+                            TypeKind::Map(
+                                Box::new(Type::new(TypeKind::Unknown, span)),
+                                Box::new(Type::new(TypeKind::Unknown, span)),
+                            ),
+                            span,
+                        ));
+                    }
+
+                    _ => {}
+                }
+            }
+
             let span = Self::dummy_span();
             return Ok(Type::new(
                 TypeKind::Map(
@@ -131,22 +178,76 @@ impl TypeChecker {
             ));
         }
 
-        let (first_key, first_value) = &entries[0];
-        let key_type = self.check_expr(first_key)?;
-        let value_type = self.check_expr(first_value)?;
-        if !self.env.type_implements_trait(&key_type, "Hashable") {
-            return Err(self.type_error(format!(
-                "Map key type '{}' must implement Hashable trait",
-                key_type
-            )));
+        let key_hint = expected_key_ty.and_then(|ty| {
+            if matches!(ty.kind, TypeKind::Unknown | TypeKind::Infer) {
+                None
+            } else {
+                Some(ty)
+            }
+        });
+        let value_hint = expected_value_ty.and_then(|ty| {
+            if matches!(ty.kind, TypeKind::Unknown | TypeKind::Infer) {
+                None
+            } else {
+                Some(ty)
+            }
+        });
+
+        let mut inferred_key_type: Option<Type> = None;
+        let mut inferred_value_type: Option<Type> = None;
+        for (key_expr, value_expr) in entries {
+            let raw_key_type = if let Some(hint) = key_hint {
+                self.check_expr_with_hint(key_expr, Some(hint))?
+            } else {
+                self.check_expr(key_expr)?
+            };
+            if !self.env.type_implements_trait(&raw_key_type, "Hashable") {
+                return Err(self.type_error(format!(
+                    "Map key type '{}' must implement Hashable trait",
+                    raw_key_type
+                )));
+            }
+            let canonical_key = self.canonicalize_type(&raw_key_type);
+
+            let raw_value_type = if let Some(hint) = value_hint {
+                self.check_expr_with_hint(value_expr, Some(hint))?
+            } else {
+                self.check_expr(value_expr)?
+            };
+            let canonical_value = self.canonicalize_type(&raw_value_type);
+
+            if let Some(existing_key) = &inferred_key_type {
+                if !allow_mixed_keys {
+                    self.unify(existing_key, &canonical_key)?;
+                }
+            } else {
+                inferred_key_type = Some(canonical_key.clone());
+            }
+
+            if let Some(existing_value) = &inferred_value_type {
+                if !allow_mixed_values {
+                    self.unify(existing_value, &canonical_value)?;
+                }
+            } else {
+                inferred_value_type = Some(canonical_value.clone());
+            }
         }
 
-        for (key, value) in &entries[1..] {
-            let k_type = self.check_expr(key)?;
-            let v_type = self.check_expr(value)?;
-            self.unify(&key_type, &k_type)?;
-            self.unify(&value_type, &v_type)?;
-        }
+        let span = Self::dummy_span();
+        let key_type = if allow_mixed_keys {
+            expected_key_ty
+                .and_then(|ty| Some(self.canonicalize_type(ty)))
+                .unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
+        } else {
+            inferred_key_type.unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
+        };
+        let value_type = if allow_mixed_values {
+            expected_value_ty
+                .and_then(|ty| Some(self.canonicalize_type(ty)))
+                .unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
+        } else {
+            inferred_value_type.unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
+        };
 
         Ok(Type::new(
             TypeKind::Map(Box::new(key_type), Box::new(value_type)),

@@ -1,6 +1,6 @@
 pub(super) use super::{Chunk, Function, Instruction, Register, Value};
 pub(super) use crate::ast::{
-    BinaryOp, ExprKind, ExternItem, Item, ItemKind, Literal, Stmt, StmtKind, UnaryOp,
+    BinaryOp, ExprKind, ExternItem, Item, ItemKind, Literal, Span, Stmt, StmtKind, UnaryOp,
 };
 use crate::config::LustConfig;
 pub(super) use crate::number::LustInt;
@@ -37,6 +37,7 @@ pub struct Compiler {
     pub(super) current_function_name: Option<String>,
     pub(super) extern_function_aliases: HashMap<String, String>,
     pub(super) stdlib_symbols: HashSet<String>,
+    option_coercions: HashMap<String, HashSet<Span>>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +73,7 @@ impl Compiler {
             current_function_name: None,
             extern_function_aliases: HashMap::new(),
             stdlib_symbols: HashSet::new(),
+            option_coercions: HashMap::new(),
         };
         compiler.configure_stdlib(&LustConfig::default());
         compiler
@@ -107,8 +109,19 @@ impl Compiler {
         }
     }
 
+    pub fn set_option_coercions(&mut self, map: HashMap<String, HashSet<Span>>) {
+        self.option_coercions = map;
+    }
+
     pub(super) fn is_stdlib_symbol(&self, name: &str) -> bool {
         self.stdlib_symbols.contains(name)
+    }
+
+    pub(super) fn should_wrap_option(&self, span: Span) -> bool {
+        let module = self.current_module.as_deref().unwrap_or("");
+        self.option_coercions
+            .get(module)
+            .map_or(false, |set| set.contains(&span))
     }
 
     pub(super) fn record_extern_function(&mut self, name: &str) {

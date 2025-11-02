@@ -325,8 +325,10 @@ fn compile_program(
     let mut typechecker = TypeChecker::with_config(config);
     typechecker.set_imports_by_module(imports_map.clone());
     typechecker.check_program(&program.modules)?;
+    let option_coercions = typechecker.take_option_coercions();
     let struct_defs = typechecker.struct_definitions();
     let mut compiler = Compiler::new();
+    compiler.set_option_coercions(option_coercions);
     compiler.configure_stdlib(config);
     compiler.set_imports_by_module(imports_map);
     compiler.set_entry_module(program.entry_module.clone());

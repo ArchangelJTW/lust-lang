@@ -1,5 +1,7 @@
 println("[lib.math.vector] init")
 
+local captured_variable = "my_captured_variable"
+
 pub struct IntVector
     x: int
     y: int
@@ -10,6 +12,7 @@ pub function make(x: int, y: int): IntVector
 end
 
 pub function zero(): IntVector
+    println(captured_variable)
     return IntVector { x = 0, y = 0 }
 end
 

@@ -82,57 +82,22 @@ impl Compiler {
                 )))
             }
 
-            ExprKind::Binary { left, op, right } => {
-                if matches!(op, BinaryOp::And) {
-                    let left_bindings = self.extract_all_pattern_bindings(left);
-                    let right_bindings = self.extract_all_pattern_bindings(right);
-                    if !left_bindings.is_empty() || !right_bindings.is_empty() {
-                        let left_reg = self.compile_expr(left)?;
-                        let jump_to_end = self.emit(Instruction::JumpIfNot(left_reg, 0), 0);
-                        for (scrutinee_expr, pattern) in &left_bindings {
-                            let enum_reg = self.compile_expr(scrutinee_expr)?;
-                            self.bind_pattern_variables(enum_reg, pattern)?;
-                            self.free_register(enum_reg);
-                        }
-
-                        let right_reg = self.compile_expr(right)?;
-                        let right_skip_bindings = if !right_bindings.is_empty() {
-                            Some(self.emit(Instruction::JumpIfNot(right_reg, 0), 0))
-                        } else {
-                            None
-                        };
-                        for (scrutinee_expr, pattern) in &right_bindings {
-                            let enum_reg = self.compile_expr(scrutinee_expr)?;
-                            self.bind_pattern_variables(enum_reg, pattern)?;
-                            self.free_register(enum_reg);
-                        }
-
-                        if let Some(skip_idx) = right_skip_bindings {
-                            let end_idx = self.current_chunk().instructions.len();
-                            self.current_chunk_mut().patch_jump(skip_idx, end_idx);
-                        }
-
-                        let and_pos = self.current_chunk().instructions.len();
-                        self.current_chunk_mut().patch_jump(jump_to_end, and_pos);
-                        let result_reg = self.allocate_register();
-                        self.emit(Instruction::And(result_reg, left_reg, right_reg), 0);
-                        self.free_register(left_reg);
-                        self.free_register(right_reg);
-                        return Ok(result_reg);
+            ExprKind::Binary { left, op, right } => match op {
+                BinaryOp::And => self.compile_and_expr(expr.span, left, right),
+                BinaryOp::Or => self.compile_or_expr(left, right),
+                _ => {
+                    let left_reg = self.compile_expr(left)?;
+                    let saved_freereg = self.next_register;
+                    let right_reg = self.compile_expr(right)?;
+                    if self.next_register < saved_freereg {
+                        self.next_register = saved_freereg;
                     }
-                }
 
-                let left_reg = self.compile_expr(left)?;
-                let saved_freereg = self.next_register;
-                let right_reg = self.compile_expr(right)?;
-                if self.next_register < saved_freereg {
-                    self.next_register = saved_freereg;
+                    let result_reg = self.allocate_register();
+                    self.compile_binary_op(*op, result_reg, left_reg, right_reg)?;
+                    Ok(result_reg)
                 }
-
-                let result_reg = self.allocate_register();
-                self.compile_binary_op(*op, result_reg, left_reg, right_reg)?;
-                Ok(result_reg)
-            }
+            },
 
             ExprKind::Unary { op, operand } => {
                 let operand_reg = self.compile_expr(operand)?;
@@ -628,6 +593,99 @@ impl Compiler {
                 Self::describe_expr_kind(&expr.kind)
             ))),
         }
+    }
+
+    fn compile_and_expr(&mut self, span: Span, left: &Expr, right: &Expr) -> Result<Register> {
+        let left_bindings = self.extract_all_pattern_bindings(left);
+        let right_bindings = self.extract_all_pattern_bindings(right);
+
+        let left_reg = self.compile_expr(left)?;
+        let skip_right = self.emit(Instruction::JumpIfNot(left_reg, 0), 0);
+        let wrap_option = self.should_wrap_option(span);
+        let option_indices = if wrap_option {
+            let option_idx = self.add_string_constant("Option");
+            let some_idx = self.add_string_constant("Some");
+            let none_idx = self.add_string_constant("None");
+            Some((option_idx, some_idx, none_idx))
+        } else {
+            None
+        };
+
+        for (scrutinee_expr, pattern) in &left_bindings {
+            let enum_reg = self.compile_expr(scrutinee_expr)?;
+            self.bind_pattern_variables(enum_reg, pattern)?;
+            self.free_register(enum_reg);
+        }
+
+        let saved_next = self.next_register;
+        let right_reg = self.compile_expr(right)?;
+        if self.next_register < saved_next {
+            self.next_register = saved_next;
+        }
+
+        let right_skip_bindings = if !right_bindings.is_empty() {
+            Some(self.emit(Instruction::JumpIfNot(right_reg, 0), 0))
+        } else {
+            None
+        };
+
+        for (scrutinee_expr, pattern) in &right_bindings {
+            let enum_reg = self.compile_expr(scrutinee_expr)?;
+            self.bind_pattern_variables(enum_reg, pattern)?;
+            self.free_register(enum_reg);
+        }
+
+        if let Some(skip_idx) = right_skip_bindings {
+            let end_idx = self.current_chunk().instructions.len();
+            self.current_chunk_mut().patch_jump(skip_idx, end_idx);
+        }
+
+        if let Some((option_idx, some_idx, _)) = option_indices {
+            self.emit(
+                Instruction::NewEnumVariant(left_reg, option_idx, some_idx, right_reg, 1),
+                0,
+            );
+        } else {
+            self.emit(Instruction::Move(left_reg, right_reg), 0);
+        }
+        self.free_register(right_reg);
+
+        let jump_to_end = if wrap_option {
+            Some(self.emit(Instruction::Jump(0), 0))
+        } else {
+            None
+        };
+
+        let end_idx = self.current_chunk().instructions.len();
+        self.current_chunk_mut().patch_jump(skip_right, end_idx);
+
+        if let Some((option_idx, _, none_idx)) = option_indices {
+            self.emit(Instruction::NewEnumUnit(left_reg, option_idx, none_idx), 0);
+        }
+
+        if let Some(jump_idx) = jump_to_end {
+            let exit_idx = self.current_chunk().instructions.len();
+            self.current_chunk_mut().patch_jump(jump_idx, exit_idx);
+        }
+        Ok(left_reg)
+    }
+
+    fn compile_or_expr(&mut self, left: &Expr, right: &Expr) -> Result<Register> {
+        let left_reg = self.compile_expr(left)?;
+        let skip_right = self.emit(Instruction::JumpIf(left_reg, 0), 0);
+
+        let saved_next = self.next_register;
+        let right_reg = self.compile_expr(right)?;
+        if self.next_register < saved_next {
+            self.next_register = saved_next;
+        }
+
+        self.emit(Instruction::Move(left_reg, right_reg), 0);
+        self.free_register(right_reg);
+
+        let end_idx = self.current_chunk().instructions.len();
+        self.current_chunk_mut().patch_jump(skip_right, end_idx);
+        Ok(left_reg)
     }
 
     pub(super) fn compile_binary_op(

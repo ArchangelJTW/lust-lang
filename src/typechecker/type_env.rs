@@ -333,12 +333,6 @@ impl TypeEnv {
             .scopes
             .last_mut()
             .expect("Type environment has no scope");
-        if scope.contains_key(&name) {
-            return Err(LustError::TypeError {
-                message: format!("Variable '{}' is already declared in this scope", name),
-            });
-        }
-
         scope.insert(name, ty);
         Ok(())
     }

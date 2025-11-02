@@ -4,7 +4,7 @@ exclude = ["examples/rust-extension/extensions/**"]
 
 [package]
 name = "lust-rs"
-version = "1.5.14"
+version = "2.0.0"
 edition = "2021"
 include = ["src/**", "include/**", "Cargo.toml", "README.md", "LICENSE"]
 license-file = "LICENSE"

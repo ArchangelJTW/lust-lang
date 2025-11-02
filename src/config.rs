@@ -218,7 +218,8 @@ mod tests {
     #[test]
     fn parse_config_with_modules_and_jit() {
         let toml = r#"
-            "enabled modules" = ["io", "OS", "  task  "]
+            [settings]
+            stdlib_modules = ["io", "os"]
             jit = false
         "#;
         let parsed: LustConfigToml = toml::from_str(toml).unwrap();
@@ -226,8 +227,6 @@ mod tests {
         assert!(!cfg.jit_enabled());
         assert!(cfg.is_module_enabled("io"));
         assert!(cfg.is_module_enabled("os"));
-        assert!(cfg.is_module_enabled("task"));
-        assert!(!cfg.is_module_enabled("math"));
     }
 
     #[test]

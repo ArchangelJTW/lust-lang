@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "lust-analyzer"
-version = "0.1.13"
+version = "0.2.13"
 dependencies = [
  "hashbrown 0.16.0",
  "lust-rs",
@@ -1260,7 +1260,3 @@ dependencies = [
  "quote",
  "syn",
 ]
-
-[[patch.unused]]
-name = "crunchy"
-version = "0.2.3"

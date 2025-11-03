@@ -427,6 +427,36 @@ impl VM {
                             }
                         }
 
+                        (Value::Float(a), Value::Float(b)) => {
+                            if *b == 0.0 {
+                                Err(LustError::RuntimeError {
+                                    message: "Modulo by zero".to_string(),
+                                })
+                            } else {
+                                Ok(Value::Float(a % b))
+                            }
+                        }
+
+                        (Value::Int(a), Value::Float(b)) => {
+                            if *b == 0.0 {
+                                Err(LustError::RuntimeError {
+                                    message: "Modulo by zero".to_string(),
+                                })
+                            } else {
+                                Ok(Value::Float(float_from_int(*a) % *b))
+                            }
+                        }
+
+                        (Value::Float(a), Value::Int(b)) => {
+                            if *b == 0 {
+                                Err(LustError::RuntimeError {
+                                    message: "Modulo by zero".to_string(),
+                                })
+                            } else {
+                                Ok(Value::Float(*a % float_from_int(*b)))
+                            }
+                        }
+
                         _ => Err(LustError::RuntimeError {
                             message: format!("Cannot modulo {:?} and {:?}", l, r),
                         }),

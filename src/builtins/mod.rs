@@ -1003,6 +1003,24 @@ static OS_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new(
 fn build_os_functions() -> Vec<BuiltinFunction> {
     vec![
         BuiltinFunction {
+            name: "os.time",
+            description: "Get the current UNIX timestamp with sub-second precision",
+            signature: BuiltinSignature {
+                params: vec![],
+                return_type: TypeExpr::Float,
+            },
+            param_names: &[],
+        },
+        BuiltinFunction {
+            name: "os.sleep",
+            description: "Sleep for the given number of seconds",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Float],
+                return_type: TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
+            },
+            param_names: &["seconds"],
+        },
+        BuiltinFunction {
             name: "os.create_file",
             description: "Create an empty file on disk",
             signature: BuiltinSignature {

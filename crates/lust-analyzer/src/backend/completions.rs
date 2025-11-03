@@ -4,17 +4,20 @@ use crate::analysis::{
 use crate::utils::{
     base_type_name, char_at_index, identifier_name_at_span, identifier_prefix_range,
     identifier_range_before, identifier_text, is_identifier_char, method_display_name,
-    offset_to_position, prev_char_index, qualify_type_name, simple_type_name, span_contains_position,
-    span_from_identifier, span_start_before_or_equal, span_starts_after, split_type_member,
+    offset_to_position, prev_char_index, qualify_type_name, simple_type_name,
+    span_contains_position, span_from_identifier, span_start_before_or_equal, span_starts_after,
+    split_type_member,
 };
 use hashbrown::HashSet;
-use lust::ast::{ExternItem, FunctionParam, Item, ItemKind, Stmt, StmtKind, Type, TypeKind, Visibility};
+use lust::ast::{
+    ExternItem, FunctionParam, Item, ItemKind, Stmt, StmtKind, Type, TypeKind, Visibility,
+};
 use lust::builtins::{self, BuiltinFunction, BuiltinMethod, TypeExpr};
 use lust::Span;
 use std::path::Path;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent,
-    MarkupKind, Position,
+    CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent, MarkupKind,
+    Position,
 };
 
 pub(crate) enum CompletionKind {

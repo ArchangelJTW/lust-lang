@@ -6,6 +6,8 @@ use hashbrown::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::rc::Rc;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub fn create_stdlib(config: &LustConfig) -> Vec<(&'static str, Value)> {
     let mut stdlib = vec![
         ("print", create_print_fn()),
@@ -240,12 +242,67 @@ fn create_io_write_stdout_fn() -> Value {
 
 fn create_os_module() -> Value {
     let mut entries: HashMap<ValueKey, Value> = HashMap::new();
+    entries.insert(string_key("time"), create_os_time_fn());
+    entries.insert(string_key("sleep"), create_os_sleep_fn());
     entries.insert(string_key("create_file"), create_os_create_file_fn());
     entries.insert(string_key("create_dir"), create_os_create_dir_fn());
     entries.insert(string_key("remove_file"), create_os_remove_file_fn());
     entries.insert(string_key("remove_dir"), create_os_remove_dir_fn());
     entries.insert(string_key("rename"), create_os_rename_fn());
     Value::map(entries)
+}
+
+fn create_os_time_fn() -> Value {
+    Value::NativeFunction(Rc::new(|args: &[Value]| {
+        if !args.is_empty() {
+            return Ok(NativeCallResult::Return(Value::err(Value::string(
+                "os.time() takes no arguments",
+            ))));
+        }
+
+        let now = SystemTime::now();
+        let seconds = match now.duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs_f64(),
+            Err(err) => -(err.duration().as_secs_f64()),
+        };
+
+        Ok(NativeCallResult::Return(Value::Float(seconds)))
+    }))
+}
+
+fn create_os_sleep_fn() -> Value {
+    Value::NativeFunction(Rc::new(|args: &[Value]| {
+        if args.len() != 1 {
+            return Ok(NativeCallResult::Return(Value::err(Value::string(
+                "os.sleep(seconds) requires a single float duration",
+            ))));
+        }
+
+        let seconds = match args[0].as_float() {
+            Some(value) => value,
+            None => {
+                return Ok(NativeCallResult::Return(Value::err(Value::string(
+                    "os.sleep(seconds) requires a float duration",
+                ))))
+            }
+        };
+
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Ok(NativeCallResult::Return(Value::err(Value::string(
+                "os.sleep(seconds) requires a finite, non-negative duration",
+            ))));
+        }
+
+        if seconds > (u64::MAX as f64) {
+            return Ok(NativeCallResult::Return(Value::err(Value::string(
+                "os.sleep(seconds) duration is too large",
+            ))));
+        }
+
+        thread::sleep(Duration::from_secs_f64(seconds));
+
+        Ok(NativeCallResult::Return(Value::ok(Value::Nil)))
+    }))
 }
 
 fn create_os_create_file_fn() -> Value {

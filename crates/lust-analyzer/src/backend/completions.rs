@@ -1,51 +1,23 @@
 use crate::analysis::{
-    choose_definition, find_type_for_position, hover_from_definition, location_from_definition,
-    AnalysisSnapshot, MethodInfo, ModuleSnapshot, TypeDefinitionKind,
+    find_type_for_position, AnalysisSnapshot, MethodInfo, ModuleSnapshot, TypeDefinitionKind,
 };
-use crate::diagnostics::error_to_diagnostics;
-use crate::semantic_tokens::SEMANTIC_TOKEN_TYPES;
 use crate::utils::{
-    analyzer_lust_config, base_type_name, char_at_index, compute_line_offsets,
-    extract_word_at_position, identifier_name_at_span, identifier_prefix_range,
-    identifier_range_before, identifier_text, is_identifier_char, is_word_char,
-    method_display_name, nth_char_byte_index, offset_to_position, position_to_offset,
-    prev_char_index, qualify_type_name, simple_type_name, span_contains_position,
-    span_from_identifier, span_overlaps_range, span_start_before_or_equal, span_starts_after,
-    span_to_range, split_type_member,
+    base_type_name, char_at_index, identifier_name_at_span, identifier_prefix_range,
+    identifier_range_before, identifier_text, is_identifier_char, method_display_name,
+    offset_to_position, prev_char_index, qualify_type_name, simple_type_name, span_contains_position,
+    span_from_identifier, span_start_before_or_equal, span_starts_after, split_type_member,
 };
-use hashbrown::{HashMap, HashSet};
-use lust::ast::{
-    Expr, ExprKind, ExternItem, FunctionParam, Item, ItemKind, Stmt, StmtKind, Type, TypeKind,
-    Visibility,
-};
+use hashbrown::HashSet;
+use lust::ast::{ExternItem, FunctionParam, Item, ItemKind, Stmt, StmtKind, Type, TypeKind, Visibility};
 use lust::builtins::{self, BuiltinFunction, BuiltinMethod, TypeExpr};
-use lust::{Compiler, ModuleLoader, Span, TypeChecker};
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-use tokio::sync::RwLock;
-use tower_lsp::jsonrpc::Result;
+use lust::Span;
+use std::path::Path;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    CompletionTriggerKind, Diagnostic, Documentation, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
-    InitializedParams, InlayHint, InlayHintKind, InlayHintLabel, InlayHintOptions, InlayHintParams,
-    InlayHintServerCapabilities, InsertTextFormat, MarkupContent, MarkupKind, MessageType, OneOf,
-    Position, Range, SemanticToken, SemanticTokens, SemanticTokensFullOptions,
-    SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, SemanticTokensRangeParams,
-    SemanticTokensRangeResult, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent,
+    MarkupKind, Position,
 };
-use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
-use url::Url;
-#[derive(Clone)]
-struct DocumentState {
-    text: String,
-    version: i32,
-}
 
-enum CompletionKind {
+pub(crate) enum CompletionKind {
     Member,
     Method,
     Pattern,
@@ -53,16 +25,16 @@ enum CompletionKind {
     ModulePath,
 }
 
-struct CompletionContext {
-    kind: CompletionKind,
-    object_start: Option<usize>,
-    object_end: usize,
-    object_name: Option<String>,
-    prefix: String,
-    path_segments: Vec<String>,
+pub(crate) struct CompletionContext {
+    pub(crate) kind: CompletionKind,
+    pub(crate) object_start: Option<usize>,
+    pub(crate) object_end: usize,
+    pub(crate) object_name: Option<String>,
+    pub(crate) prefix: String,
+    pub(crate) path_segments: Vec<String>,
 }
 
-fn format_method_signature(method: &MethodInfo) -> String {
+pub(crate) fn format_method_signature(method: &MethodInfo) -> String {
     let params = method
         .params
         .iter()
@@ -150,7 +122,7 @@ fn method_visible(method: &MethodInfo, module_path: Option<&str>) -> bool {
     }
 }
 
-fn struct_field_completions(
+pub(crate) fn struct_field_completions(
     snapshot: &AnalysisSnapshot,
     module_path: Option<&str>,
     type_name: &str,
@@ -190,7 +162,7 @@ fn builtin_enum_variants(type_name: &str) -> Option<Vec<(&'static str, usize)>> 
     }
 }
 
-fn enum_variant_completions(
+pub(crate) fn enum_variant_completions(
     snapshot: &AnalysisSnapshot,
     module_path: Option<&str>,
     type_name: &str,
@@ -263,7 +235,7 @@ fn enum_variant_completions(
     items
 }
 
-fn identifier_completions(
+pub(crate) fn identifier_completions(
     module: &ModuleSnapshot,
     snapshot: &AnalysisSnapshot,
     file_path: &Path,
@@ -534,7 +506,7 @@ fn resolve_module_path_for_segments(
     }
 }
 
-fn module_alias_member_completions(
+pub(crate) fn module_alias_member_completions(
     snapshot: &AnalysisSnapshot,
     module: &ModuleSnapshot,
     prefix: &str,
@@ -606,7 +578,7 @@ fn module_alias_member_completions(
     items
 }
 
-fn module_path_completions(
+pub(crate) fn module_path_completions(
     snapshot: &AnalysisSnapshot,
     module: &ModuleSnapshot,
     segments: &[String],
@@ -861,7 +833,7 @@ fn method_completion(method: &BuiltinMethod) -> CompletionItem {
     item
 }
 
-fn builtin_global_completions(object_name: &str, prefix: &str) -> Vec<CompletionItem> {
+pub(crate) fn builtin_global_completions(object_name: &str, prefix: &str) -> Vec<CompletionItem> {
     let database = builtins::builtins();
     let simple = simple_type_name(object_name);
     let mut module = database.module(simple);
@@ -888,11 +860,17 @@ fn builtin_global_completions(object_name: &str, prefix: &str) -> Vec<Completion
         .collect()
 }
 
-fn builtin_static_method_completions(_owner: &str, _prefix: &str) -> Vec<CompletionItem> {
+pub(crate) fn builtin_static_method_completions(
+    _owner: &str,
+    _prefix: &str,
+) -> Vec<CompletionItem> {
     Vec::new()
 }
 
-fn builtin_instance_method_completions(owner: &str, prefix: &str) -> Vec<CompletionItem> {
+pub(crate) fn builtin_instance_method_completions(
+    owner: &str,
+    prefix: &str,
+) -> Vec<CompletionItem> {
     let database = builtins::builtins();
     let simple = simple_type_name(owner);
     let Some(methods) = database.methods_for(simple) else {
@@ -911,7 +889,7 @@ fn builtin_instance_method_completions(owner: &str, prefix: &str) -> Vec<Complet
         .collect()
 }
 
-fn static_method_completions(
+pub(crate) fn static_method_completions(
     snapshot: &AnalysisSnapshot,
     owner: &str,
     module_path: Option<&str>,
@@ -960,7 +938,7 @@ fn static_method_completions(
     items
 }
 
-fn instance_method_completions(
+pub(crate) fn instance_method_completions(
     snapshot: &AnalysisSnapshot,
     owner: &str,
     module_path: Option<&str>,
@@ -1009,7 +987,7 @@ fn instance_method_completions(
     items
 }
 
-fn type_for_identifier(
+pub(crate) fn type_for_identifier(
     module: &ModuleSnapshot,
     text: &str,
     line_offsets: &[usize],
@@ -1082,7 +1060,10 @@ fn type_for_identifier(
     best.map(|(_, ty)| ty)
 }
 
-fn analyze_member_method_context(text: &str, offset: usize) -> Option<CompletionContext> {
+pub(crate) fn analyze_member_method_context(
+    text: &str,
+    offset: usize,
+) -> Option<CompletionContext> {
     let is_repeated_trigger = |idx: usize, ch: char| -> bool {
         if ch == '.' {
             if let Some((_, prev)) = prev_char_index(text, idx) {
@@ -1187,7 +1168,7 @@ fn analyze_member_method_context(text: &str, offset: usize) -> Option<Completion
     None
 }
 
-fn analyze_pattern_context(text: &str, offset: usize) -> Option<CompletionContext> {
+pub(crate) fn analyze_pattern_context(text: &str, offset: usize) -> Option<CompletionContext> {
     let (prefix_start, _) = identifier_prefix_range(text, offset);
     let prefix = identifier_text(text, (prefix_start, offset));
     let (keyword_start, keyword_end) = identifier_range_before(text, prefix_start)?;
@@ -1208,7 +1189,7 @@ fn analyze_pattern_context(text: &str, offset: usize) -> Option<CompletionContex
     })
 }
 
-fn analyze_identifier_context(text: &str, offset: usize) -> Option<CompletionContext> {
+pub(crate) fn analyze_identifier_context(text: &str, offset: usize) -> Option<CompletionContext> {
     let (prefix_start, _) = identifier_prefix_range(text, offset);
     let prefix = identifier_text(text, (prefix_start, offset));
     Some(CompletionContext {
@@ -1221,7 +1202,7 @@ fn analyze_identifier_context(text: &str, offset: usize) -> Option<CompletionCon
     })
 }
 
-fn analyze_module_path_context(
+pub(crate) fn analyze_module_path_context(
     text: &str,
     offset: usize,
     module: &ModuleSnapshot,
@@ -1672,7 +1653,7 @@ fn stmts_contain_position(stmts: &[Stmt], position: &Position) -> bool {
     false
 }
 
-fn resolve_type_candidates(type_name: &str, module: &ModuleSnapshot) -> Vec<String> {
+pub(crate) fn resolve_type_candidates(type_name: &str, module: &ModuleSnapshot) -> Vec<String> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
     let mut push = |value: String| {
@@ -1698,7 +1679,7 @@ fn resolve_type_candidates(type_name: &str, module: &ModuleSnapshot) -> Vec<Stri
     candidates
 }
 
-fn infer_struct_literal_base_name(
+pub(crate) fn infer_struct_literal_base_name(
     text: &str,
     trigger_offset: usize,
     module: &ModuleSnapshot,
@@ -1770,7 +1751,7 @@ fn infer_struct_literal_base_name(
     None
 }
 
-fn infer_constructor_call_base_name(
+pub(crate) fn infer_constructor_call_base_name(
     text: &str,
     trigger_offset: usize,
     module: &ModuleSnapshot,
@@ -1861,7 +1842,7 @@ fn infer_constructor_call_base_name(
     None
 }
 
-fn resolve_base_type_name_for_context(
+pub(crate) fn resolve_base_type_name_for_context(
     module: &ModuleSnapshot,
     snapshot: &AnalysisSnapshot,
     module_path: Option<&str>,
@@ -1931,1172 +1912,4 @@ fn resolve_base_type_name_for_context(
     }
 
     base_name
-}
-
-fn hover_for_method_call(
-    snapshot: &AnalysisSnapshot,
-    module: &ModuleSnapshot,
-    module_path: Option<&str>,
-    text: &str,
-    position: Position,
-    method_token: &str,
-) -> Option<Hover> {
-    if method_token.is_empty() {
-        return None;
-    }
-
-    let line_offsets = compute_line_offsets(text);
-    let line_idx = position.line as usize;
-    if line_idx >= line_offsets.len() {
-        return None;
-    }
-
-    let line_start = line_offsets[line_idx];
-    let line_end = line_offsets
-        .get(line_idx + 1)
-        .copied()
-        .unwrap_or_else(|| text.len());
-    if line_start >= line_end || line_end > text.len() {
-        return None;
-    }
-
-    let line_slice = &text[line_start..line_end];
-    let chars: Vec<char> = line_slice.chars().collect();
-    if chars.is_empty() {
-        return None;
-    }
-
-    let mut char_idx = position.character as usize;
-    if char_idx >= chars.len() {
-        char_idx = chars.len().saturating_sub(1);
-    }
-
-    if !is_word_char(chars[char_idx]) {
-        while char_idx > 0 && !is_word_char(chars[char_idx]) {
-            char_idx -= 1;
-        }
-
-        if !is_word_char(chars[char_idx]) {
-            return None;
-        }
-    }
-
-    let mut start_char = char_idx;
-    while start_char > 0 && is_word_char(chars[start_char - 1]) {
-        start_char -= 1;
-    }
-
-    let mut end_char = char_idx + 1;
-    while end_char < chars.len() && is_word_char(chars[end_char]) {
-        end_char += 1;
-    }
-
-    let line_start_byte = nth_char_byte_index(line_slice, start_char);
-    let line_end_byte = nth_char_byte_index(line_slice, end_char);
-    if line_start_byte > line_end_byte || line_end_byte > line_slice.len() {
-        return None;
-    }
-
-    let token_str = &line_slice[line_start_byte..line_end_byte];
-    let desired_name = method_token.rsplit('.').next().unwrap_or(method_token);
-    let method_segment = token_str.rsplit('.').next().unwrap_or(token_str);
-    if method_segment != desired_name {
-        return None;
-    }
-
-    let prefix_len = token_str.len().saturating_sub(method_segment.len());
-    let method_start_byte = line_start_byte + prefix_len;
-    let method_end_byte = method_start_byte + method_segment.len();
-    let start_offset = line_start + method_start_byte;
-    let end_offset = line_start + method_end_byte;
-    let next_char = text[end_offset..]
-        .chars()
-        .skip_while(|c| c.is_whitespace())
-        .next();
-    if next_char != Some('(') {
-        return None;
-    }
-
-    let context = analyze_member_method_context(text, end_offset)?;
-    if !matches!(
-        context.kind,
-        CompletionKind::Method | CompletionKind::Member
-    ) {
-        return None;
-    }
-
-    let expect_instance = matches!(context.kind, CompletionKind::Method);
-    let base_name = resolve_base_type_name_for_context(
-        module,
-        snapshot,
-        module_path,
-        text,
-        &line_offsets,
-        &context,
-    )?;
-    let methods = snapshot.methods_for_type(&base_name)?;
-    let method = methods
-        .iter()
-        .find(|m| m.name == desired_name && m.is_instance == expect_instance)?;
-    let hover_span = span_from_identifier(text, start_offset, method_segment, &line_offsets);
-    let signature = format_method_signature(method);
-    let mut body = format!("```lust\n{}\n```", signature);
-    body.push_str(&format!("\nDefined on `{}`", method.owner));
-    if !method.module_path.is_empty() {
-        body.push_str(&format!("\nModule `{}`", method.module_path));
-    }
-
-    Some(Hover {
-        contents: HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: body,
-        }),
-        range: hover_span.map(span_to_range),
-    })
-}
-
-fn collect_inlay_hints_for_module(module: &ModuleSnapshot, range: &Range) -> Vec<InlayHint> {
-    let mut hints = Vec::new();
-    for item in &module.module.items {
-        collect_inlay_hints_from_item(item, module, range, &mut hints);
-    }
-
-    hints
-}
-
-fn collect_inlay_hints_from_item(
-    item: &Item,
-    module: &ModuleSnapshot,
-    range: &Range,
-    hints: &mut Vec<InlayHint>,
-) {
-    match &item.kind {
-        ItemKind::Function(func) => {
-            collect_inlay_hints_from_stmts(&func.body, module, range, hints)
-        }
-
-        ItemKind::Script(stmts) => collect_inlay_hints_from_stmts(stmts, module, range, hints),
-        ItemKind::Impl(impl_block) => {
-            for method in &impl_block.methods {
-                collect_inlay_hints_from_stmts(&method.body, module, range, hints);
-            }
-        }
-
-        ItemKind::Module { items, .. } => {
-            for child in items {
-                collect_inlay_hints_from_item(child, module, range, hints);
-            }
-        }
-
-        _ => {}
-    }
-}
-
-fn collect_inlay_hints_from_stmts(
-    stmts: &[Stmt],
-    module: &ModuleSnapshot,
-    range: &Range,
-    hints: &mut Vec<InlayHint>,
-) {
-    for stmt in stmts {
-        collect_inlay_hints_from_stmt(stmt, module, range, hints);
-    }
-}
-
-fn collect_inlay_hints_from_stmt(
-    stmt: &Stmt,
-    module: &ModuleSnapshot,
-    range: &Range,
-    hints: &mut Vec<InlayHint>,
-) {
-    match &stmt.kind {
-        StmtKind::Local {
-            bindings,
-            initializer,
-            ..
-        } => {
-            for binding in bindings {
-                if binding.type_annotation.is_some() {
-                    continue;
-                }
-
-                if !span_overlaps_range(binding.span, range) {
-                    continue;
-                }
-
-                if let Some(ty) = module.variable_types.get(&binding.span) {
-                    if matches!(ty.kind, TypeKind::Infer | TypeKind::Unknown) {
-                        continue;
-                    }
-
-                    if binding.span.start_line == 0 {
-                        continue;
-                    }
-
-                    let position = Position::new(
-                        binding.span.start_line.saturating_sub(1) as u32,
-                        binding
-                            .span
-                            .start_col
-                            .saturating_sub(1)
-                            .saturating_add(binding.name.chars().count())
-                            as u32,
-                    );
-                    let label: InlayHintLabel = format!(": {}", ty).into();
-                    hints.push(InlayHint {
-                        position,
-                        label,
-                        kind: Some(InlayHintKind::TYPE),
-                        text_edits: None,
-                        tooltip: None,
-                        padding_left: Some(true),
-                        padding_right: None,
-                        data: None,
-                    });
-                }
-            }
-
-            if let Some(exprs) = initializer {
-                for expr in exprs {
-                    collect_inlay_hints_from_expr(expr, module, range, hints);
-                }
-            }
-        }
-
-        StmtKind::Assign { targets, values } => {
-            for target in targets {
-                collect_inlay_hints_from_expr(target, module, range, hints);
-            }
-
-            for value in values {
-                collect_inlay_hints_from_expr(value, module, range, hints);
-            }
-        }
-
-        StmtKind::CompoundAssign { target, value, .. } => {
-            collect_inlay_hints_from_expr(target, module, range, hints);
-            collect_inlay_hints_from_expr(value, module, range, hints);
-        }
-
-        StmtKind::Expr(expr) => collect_inlay_hints_from_expr(expr, module, range, hints),
-        StmtKind::If {
-            condition,
-            then_block,
-            elseif_branches,
-            else_block,
-        } => {
-            collect_inlay_hints_from_expr(condition, module, range, hints);
-            collect_inlay_hints_from_stmts(then_block, module, range, hints);
-            for (expr, block) in elseif_branches {
-                collect_inlay_hints_from_expr(expr, module, range, hints);
-                collect_inlay_hints_from_stmts(block, module, range, hints);
-            }
-
-            if let Some(block) = else_block {
-                collect_inlay_hints_from_stmts(block, module, range, hints);
-            }
-        }
-
-        StmtKind::While { condition, body } => {
-            collect_inlay_hints_from_expr(condition, module, range, hints);
-            collect_inlay_hints_from_stmts(body, module, range, hints);
-        }
-
-        StmtKind::ForNumeric {
-            start,
-            end,
-            step,
-            body,
-            ..
-        } => {
-            collect_inlay_hints_from_expr(start, module, range, hints);
-            collect_inlay_hints_from_expr(end, module, range, hints);
-            if let Some(step) = step {
-                collect_inlay_hints_from_expr(step, module, range, hints);
-            }
-
-            collect_inlay_hints_from_stmts(body, module, range, hints);
-        }
-
-        StmtKind::ForIn { iterator, body, .. } => {
-            collect_inlay_hints_from_expr(iterator, module, range, hints);
-            collect_inlay_hints_from_stmts(body, module, range, hints);
-        }
-
-        StmtKind::Return(exprs) => {
-            for expr in exprs {
-                collect_inlay_hints_from_expr(expr, module, range, hints);
-            }
-        }
-
-        StmtKind::Block(stmts) => collect_inlay_hints_from_stmts(stmts, module, range, hints),
-        StmtKind::Break | StmtKind::Continue => {}
-    }
-}
-
-fn collect_inlay_hints_from_expr(
-    expr: &Expr,
-    module: &ModuleSnapshot,
-    range: &Range,
-    hints: &mut Vec<InlayHint>,
-) {
-    match &expr.kind {
-        ExprKind::Binary { left, right, .. } => {
-            collect_inlay_hints_from_expr(left, module, range, hints);
-            collect_inlay_hints_from_expr(right, module, range, hints);
-        }
-
-        ExprKind::Unary { operand, .. } => {
-            collect_inlay_hints_from_expr(operand, module, range, hints);
-        }
-
-        ExprKind::Call { callee, args } => {
-            collect_inlay_hints_from_expr(callee, module, range, hints);
-            for arg in args {
-                collect_inlay_hints_from_expr(arg, module, range, hints);
-            }
-        }
-
-        ExprKind::MethodCall { receiver, args, .. } => {
-            collect_inlay_hints_from_expr(receiver, module, range, hints);
-            for arg in args {
-                collect_inlay_hints_from_expr(arg, module, range, hints);
-            }
-        }
-
-        ExprKind::FieldAccess { object, .. } => {
-            collect_inlay_hints_from_expr(object, module, range, hints);
-        }
-
-        ExprKind::Index { object, index } => {
-            collect_inlay_hints_from_expr(object, module, range, hints);
-            collect_inlay_hints_from_expr(index, module, range, hints);
-        }
-
-        ExprKind::Array(elements) | ExprKind::Tuple(elements) => {
-            for element in elements {
-                collect_inlay_hints_from_expr(element, module, range, hints);
-            }
-        }
-
-        ExprKind::Map(entries) => {
-            for (key, value) in entries {
-                collect_inlay_hints_from_expr(key, module, range, hints);
-                collect_inlay_hints_from_expr(value, module, range, hints);
-            }
-        }
-
-        ExprKind::StructLiteral { fields, .. } => {
-            for field in fields {
-                collect_inlay_hints_from_expr(&field.value, module, range, hints);
-            }
-        }
-
-        ExprKind::EnumConstructor { args, .. } => {
-            for arg in args {
-                collect_inlay_hints_from_expr(arg, module, range, hints);
-            }
-        }
-
-        ExprKind::Lambda { body, .. } => {
-            collect_inlay_hints_from_expr(body, module, range, hints);
-        }
-
-        ExprKind::Paren(inner)
-        | ExprKind::Cast { expr: inner, .. }
-        | ExprKind::TypeCheck { expr: inner, .. }
-        | ExprKind::IsPattern { expr: inner, .. } => {
-            collect_inlay_hints_from_expr(inner, module, range, hints);
-        }
-
-        ExprKind::If {
-            condition,
-            then_branch,
-            else_branch,
-        } => {
-            collect_inlay_hints_from_expr(condition, module, range, hints);
-            collect_inlay_hints_from_expr(then_branch, module, range, hints);
-            if let Some(else_branch) = else_branch {
-                collect_inlay_hints_from_expr(else_branch, module, range, hints);
-            }
-        }
-
-        ExprKind::Block(stmts) => collect_inlay_hints_from_stmts(stmts, module, range, hints),
-        ExprKind::Range { start, end, .. } => {
-            collect_inlay_hints_from_expr(start, module, range, hints);
-            collect_inlay_hints_from_expr(end, module, range, hints);
-        }
-
-        ExprKind::Return(values) => {
-            for value in values {
-                collect_inlay_hints_from_expr(value, module, range, hints);
-            }
-        }
-
-        ExprKind::Literal(_) | ExprKind::Identifier(_) => {}
-    }
-}
-
-struct Backend {
-    client: Client,
-    documents: Arc<RwLock<HashMap<Url, DocumentState>>>,
-    last_published: Arc<RwLock<HashMap<Url, HashSet<Url>>>>,
-    analysis: Arc<RwLock<Option<AnalysisSnapshot>>>,
-}
-
-impl Backend {
-    fn new(client: Client) -> Self {
-        Self {
-            client,
-            documents: Arc::new(RwLock::new(HashMap::new())),
-            last_published: Arc::new(RwLock::new(HashMap::new())),
-            analysis: Arc::new(RwLock::new(None)),
-        }
-    }
-
-    async fn semantic_tokens_for_path(&self, path: &Path) -> Option<Vec<SemanticToken>> {
-        let analysis = self.analysis.read().await;
-        analysis
-            .as_ref()
-            .and_then(|snapshot| snapshot.semantic_tokens_for_path(path))
-    }
-
-    async fn document_text(&self, uri: &Url) -> Option<String> {
-        let cached = {
-            let docs = self.documents.read().await;
-            docs.get(uri).map(|doc| doc.text.clone())
-        };
-        if cached.is_some() {
-            return cached;
-        }
-
-        let path = uri.to_file_path().ok()?;
-        std::fs::read_to_string(path).ok()
-    }
-
-    async fn analyze(&self, uri: &Url) {
-        let version = {
-            let docs = self.documents.read().await;
-            docs.get(uri).map(|doc| doc.version)
-        };
-        let Some(version) = version else {
-            return;
-        };
-        let diagnostics = self.compute_diagnostics(uri).await;
-        self.publish_diagnostics(uri.clone(), version, diagnostics)
-            .await;
-    }
-
-    async fn compute_diagnostics(&self, uri: &Url) -> HashMap<Url, Vec<Diagnostic>> {
-        let entry_path = match uri.to_file_path() {
-            Ok(path) => path,
-            Err(_) => {
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("Unsupported document URI scheme: {uri}"),
-                    )
-                    .await;
-                return HashMap::new();
-            }
-        };
-        let overrides = {
-            let docs = self.documents.read().await;
-            let mut map = HashMap::new();
-            for (doc_uri, state) in docs.iter() {
-                if let Ok(path) = doc_uri.to_file_path() {
-                    map.insert(path, state.text.clone());
-                }
-            }
-
-            map
-        };
-        let entry_dir = entry_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let entry_path_str = match entry_path.to_str() {
-            Some(s) => s.to_string(),
-            None => {
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("Non-UTF-8 file path not supported: {:?}", entry_path),
-                    )
-                    .await;
-                return HashMap::new();
-            }
-        };
-        let mut loader = ModuleLoader::new(".");
-        loader.set_source_overrides(overrides.clone());
-        match loader.load_program_from_entry(&entry_path_str) {
-            Ok(program) => {
-                let module_path_map: HashMap<String, PathBuf> = program
-                    .modules
-                    .iter()
-                    .map(|m| (m.path.clone(), m.source_path.clone()))
-                    .collect();
-                let mut imports_map = HashMap::new();
-                for module in &program.modules {
-                    imports_map.insert(module.path.clone(), module.imports.clone());
-                }
-
-                let mut wrapped_items: Vec<Item> = Vec::new();
-                for module in &program.modules {
-                    wrapped_items.push(Item::new(
-                        ItemKind::Module {
-                            name: module.path.clone(),
-                            items: module.items.clone(),
-                        },
-                        Span::new(0, 0, 0, 0),
-                    ));
-                }
-
-                let config = analyzer_lust_config();
-                let mut typechecker = TypeChecker::with_config(&config);
-                typechecker.set_imports_by_module(imports_map.clone());
-                let type_result = typechecker.check_program(&program.modules);
-                let option_coercions = typechecker.take_option_coercions();
-                let struct_defs = typechecker.struct_definitions();
-                let enum_defs = typechecker.enum_definitions();
-                let type_info = typechecker.take_type_info();
-                let snapshot =
-                    AnalysisSnapshot::new(&program, type_info, &overrides, struct_defs, enum_defs);
-                {
-                    let mut analysis = self.analysis.write().await;
-                    *analysis = Some(snapshot);
-                }
-
-                if let Err(error) = type_result {
-                    return self.convert_path_map_to_url_map(error_to_diagnostics(
-                        error,
-                        &entry_path,
-                        &entry_dir,
-                        &module_path_map,
-                    ));
-                }
-
-                let mut compiler = Compiler::new();
-                compiler.set_option_coercions(option_coercions);
-                compiler.configure_stdlib(&config);
-                compiler.set_imports_by_module(imports_map);
-                compiler.set_entry_module(program.entry_module.clone());
-                if let Err(error) = compiler.compile_module(&wrapped_items) {
-                    return self.convert_path_map_to_url_map(error_to_diagnostics(
-                        error,
-                        &entry_path,
-                        &entry_dir,
-                        &module_path_map,
-                    ));
-                }
-
-                let mut result = HashMap::new();
-                if let Ok(url) = Url::from_file_path(&entry_path) {
-                    result.insert(url, Vec::new());
-                }
-
-                result
-            }
-
-            Err(error) => self.convert_path_map_to_url_map(error_to_diagnostics(
-                error,
-                &entry_path,
-                &entry_dir,
-                &HashMap::new(),
-            )),
-        }
-    }
-
-    fn convert_path_map_to_url_map(
-        &self,
-        path_map: HashMap<PathBuf, Vec<Diagnostic>>,
-    ) -> HashMap<Url, Vec<Diagnostic>> {
-        let mut result = HashMap::new();
-        for (path, diagnostics) in path_map {
-            if let Ok(url) = Url::from_file_path(&path) {
-                result.insert(url, diagnostics);
-            }
-        }
-
-        result
-    }
-
-    async fn publish_diagnostics(
-        &self,
-        entry_uri: Url,
-        entry_version: i32,
-        mut new_diagnostics: HashMap<Url, Vec<Diagnostic>>,
-    ) {
-        new_diagnostics
-            .entry(entry_uri.clone())
-            .or_insert_with(Vec::new);
-        let associated_uris: HashSet<Url> = new_diagnostics.keys().cloned().collect();
-        let previous_uris = {
-            let mut tracker = self.last_published.write().await;
-            tracker
-                .insert(entry_uri.clone(), associated_uris.clone())
-                .unwrap_or_default()
-        };
-        let version_lookup = {
-            let docs = self.documents.read().await;
-            docs.iter()
-                .map(|(u, state)| (u.clone(), state.version))
-                .collect::<HashMap<_, _>>()
-        };
-        for (uri, diagnostics) in new_diagnostics {
-            let version = version_lookup.get(&uri).copied().or_else(|| {
-                if uri == entry_uri {
-                    Some(entry_version)
-                } else {
-                    None
-                }
-            });
-            self.client
-                .publish_diagnostics(uri, diagnostics, version)
-                .await;
-        }
-
-        for uri in previous_uris.difference(&associated_uris) {
-            let version = version_lookup.get(uri).copied();
-            self.client
-                .publish_diagnostics(uri.clone(), Vec::new(), version)
-                .await;
-        }
-    }
-}
-
-#[async_trait]
-impl LanguageServer for Backend {
-    async fn initialize(&self, _params: InitializeParams) -> Result<InitializeResult> {
-        let text_document_sync = TextDocumentSyncOptions {
-            open_close: Some(true),
-            change: Some(TextDocumentSyncKind::FULL),
-            ..Default::default()
-        };
-        let hover_provider = Some(HoverProviderCapability::Simple(true));
-        let definition_provider = Some(OneOf::Left(true));
-        let inlay_hint_provider = Some(OneOf::Right(InlayHintServerCapabilities::Options(
-            InlayHintOptions::default(),
-        )));
-        let semantic_tokens_provider = Some(
-            SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
-                legend: SemanticTokensLegend {
-                    token_types: SEMANTIC_TOKEN_TYPES.to_vec(),
-                    token_modifiers: Vec::new(),
-                },
-                full: Some(SemanticTokensFullOptions::Bool(true)),
-                range: Some(false),
-                ..Default::default()
-            }),
-        );
-        let completion_provider = Some(CompletionOptions {
-            resolve_provider: Some(false),
-            trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
-            ..CompletionOptions::default()
-        });
-        Ok(InitializeResult {
-            capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Options(text_document_sync)),
-                hover_provider,
-                definition_provider,
-                inlay_hint_provider,
-                semantic_tokens_provider,
-                completion_provider,
-                ..ServerCapabilities::default()
-            },
-            ..InitializeResult::default()
-        })
-    }
-
-    async fn initialized(&self, _: InitializedParams) {
-        self.client
-            .log_message(MessageType::INFO, "lust-analyzer initialized")
-            .await;
-    }
-
-    async fn shutdown(&self) -> Result<()> {
-        Ok(())
-    }
-
-    async fn did_open(&self, params: tower_lsp::lsp_types::DidOpenTextDocumentParams) {
-        let document = params.text_document;
-        {
-            let mut docs = self.documents.write().await;
-            docs.insert(
-                document.uri.clone(),
-                DocumentState {
-                    text: document.text,
-                    version: document.version,
-                },
-            );
-        }
-
-        self.analyze(&document.uri).await;
-    }
-
-    async fn did_change(&self, params: tower_lsp::lsp_types::DidChangeTextDocumentParams) {
-        let uri = params.text_document.uri;
-        let version = params.text_document.version;
-        if let Some(change) = params.content_changes.last() {
-            {
-                let mut docs = self.documents.write().await;
-                if let Some(doc) = docs.get_mut(&uri) {
-                    doc.text = change.text.clone();
-                    doc.version = version;
-                }
-            }
-
-            self.analyze(&uri).await;
-        } else {
-            self.client
-                .log_message(
-                    MessageType::WARNING,
-                    "didChange event received without content changes",
-                )
-                .await;
-        }
-    }
-
-    async fn did_close(&self, params: tower_lsp::lsp_types::DidCloseTextDocumentParams) {
-        let uri = params.text_document.uri;
-        {
-            let mut docs = self.documents.write().await;
-            docs.remove(&uri);
-        }
-
-        let associated = {
-            let mut tracker = self.last_published.write().await;
-            tracker.remove(&uri).unwrap_or_default()
-        };
-        let version_lookup = {
-            let docs = self.documents.read().await;
-            docs.iter()
-                .map(|(u, state)| (u.clone(), state.version))
-                .collect::<HashMap<_, _>>()
-        };
-        for related_uri in associated {
-            let version = version_lookup.get(&related_uri).copied();
-            self.client
-                .publish_diagnostics(related_uri.clone(), Vec::new(), version)
-                .await;
-        }
-
-        self.client.publish_diagnostics(uri, Vec::new(), None).await;
-    }
-
-    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        let uri = params.text_document_position.text_document.uri;
-        let position = params.text_document_position.position;
-        let mut text = match self.document_text(&uri).await {
-            Some(text) => text,
-            None => return Ok(None),
-        };
-        let file_path = match uri.to_file_path() {
-            Ok(path) => path,
-            Err(_) => return Ok(None),
-        };
-        let analysis = self.analysis.read().await;
-        let snapshot = match analysis.as_ref() {
-            Some(snapshot) => snapshot,
-            None => return Ok(None),
-        };
-        let module = match snapshot.module_for_file(&file_path) {
-            Some(module) => module,
-            None => return Ok(None),
-        };
-        let module_path = snapshot
-            .module_path_for_file(&file_path)
-            .map(|s| s.to_string());
-        let mut line_offsets = compute_line_offsets(&text);
-        let mut offset = match position_to_offset(&text, position, &line_offsets) {
-            Some(value) => value,
-            None => return Ok(None),
-        };
-        if let Some(context_info) = params.context.as_ref() {
-            if context_info.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER {
-                if let Some(trigger_str) = context_info.trigger_character.as_ref() {
-                    let mut chars = trigger_str.chars();
-                    if let Some(trigger_char) = chars.next() {
-                        if chars.next().is_none() {
-                            let has_trigger = prev_char_index(&text, offset)
-                                .map(|(_, ch)| ch == trigger_char)
-                                .unwrap_or(false);
-                            if !has_trigger {
-                                if offset <= text.len() {
-                                    text.insert(offset, trigger_char);
-                                } else {
-                                    text.push(trigger_char);
-                                }
-
-                                line_offsets = compute_line_offsets(&text);
-                                offset = match position_to_offset(&text, position, &line_offsets) {
-                                    Some(value) => value,
-                                    None => return Ok(None),
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut context = analyze_member_method_context(&text, offset)
-            .or_else(|| analyze_pattern_context(&text, offset));
-        if context.is_none() {
-            context = analyze_module_path_context(&text, offset, module, &position);
-        }
-
-        if context.is_none() {
-            context = analyze_identifier_context(&text, offset);
-        }
-
-        let Some(context) = context else {
-            return Ok(None);
-        };
-        let mut items: Vec<CompletionItem> = Vec::new();
-        match context.kind {
-            CompletionKind::Member | CompletionKind::Method | CompletionKind::Pattern => {
-                let base_name = resolve_base_type_name_for_context(
-                    module,
-                    snapshot,
-                    module_path.as_deref(),
-                    &text,
-                    &line_offsets,
-                    &context,
-                );
-                match context.kind {
-                    CompletionKind::Member => {
-                        if let Some(owner) = base_name.as_deref() {
-                            items.extend(struct_field_completions(
-                                snapshot,
-                                module_path.as_deref(),
-                                owner,
-                                &context.prefix,
-                            ));
-                        }
-
-                        if let Some(object_name) = context.object_name.as_ref() {
-                            let candidates = resolve_type_candidates(object_name, module);
-                            let mut seen_candidates = HashSet::new();
-                            for candidate in candidates {
-                                if !seen_candidates.insert(candidate.clone()) {
-                                    continue;
-                                }
-
-                                items.extend(enum_variant_completions(
-                                    snapshot,
-                                    module_path.as_deref(),
-                                    &candidate,
-                                    &context.prefix,
-                                ));
-                                items.extend(static_method_completions(
-                                    snapshot,
-                                    &candidate,
-                                    module_path.as_deref(),
-                                    &context.prefix,
-                                ));
-                            }
-
-                            items.extend(builtin_global_completions(object_name, &context.prefix));
-                            items.extend(builtin_static_method_completions(
-                                object_name,
-                                &context.prefix,
-                            ));
-                            items.extend(module_alias_member_completions(
-                                snapshot,
-                                module,
-                                &context.prefix,
-                                object_name,
-                            ));
-                        }
-                    }
-
-                    CompletionKind::Method => {
-                        if let Some(owner) = base_name.as_deref() {
-                            items.extend(instance_method_completions(
-                                snapshot,
-                                owner,
-                                module_path.as_deref(),
-                                &context.prefix,
-                            ));
-                            items.extend(builtin_instance_method_completions(
-                                owner,
-                                &context.prefix,
-                            ));
-                        }
-                    }
-
-                    CompletionKind::Pattern => {
-                        if let Some(owner) = base_name.as_deref() {
-                            items.extend(enum_variant_completions(
-                                snapshot,
-                                module_path.as_deref(),
-                                owner,
-                                &context.prefix,
-                            ));
-                        }
-                    }
-
-                    _ => {}
-                }
-            }
-
-            CompletionKind::Identifier => {
-                items.extend(identifier_completions(
-                    module,
-                    snapshot,
-                    &file_path,
-                    position,
-                    &context.prefix,
-                ));
-            }
-
-            CompletionKind::ModulePath => {
-                items.extend(module_path_completions(
-                    snapshot,
-                    module,
-                    &context.path_segments,
-                    &context.prefix,
-                ));
-            }
-        }
-
-        if items.is_empty() {
-            return Ok(None);
-        }
-
-        let mut unique = Vec::new();
-        let mut seen_labels = HashSet::new();
-        for item in items.into_iter() {
-            if seen_labels.insert(item.label.clone()) {
-                unique.push(item);
-            }
-        }
-
-        Ok(Some(CompletionResponse::Array(unique)))
-    }
-
-    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        let uri = params.text_document_position_params.text_document.uri;
-        let position = params.text_document_position_params.position;
-        let file_path = match uri.to_file_path() {
-            Ok(path) => path,
-            Err(_) => return Ok(None),
-        };
-        let text = self.document_text(&uri).await;
-        let word = text
-            .as_ref()
-            .and_then(|source| extract_word_at_position(source, position));
-        let (method_hover, def_opt, type_opt) = {
-            let analysis = self.analysis.read().await;
-            let Some(snapshot) = analysis.as_ref() else {
-                return Ok(None);
-            };
-            let module_path = snapshot
-                .module_path_for_file(&file_path)
-                .map(|s| s.to_string());
-            let module = snapshot.module_for_file(&file_path);
-            let method_hover = if let (Some(module), Some(source), Some(token)) =
-                (module, text.as_ref(), word.as_deref())
-            {
-                hover_for_method_call(
-                    snapshot,
-                    module,
-                    module_path.as_deref(),
-                    source,
-                    position,
-                    token,
-                )
-            } else {
-                None
-            };
-            let mut def_clone = None;
-            if let Some(defs) = snapshot.definitions_in_file(&file_path) {
-                if let Some(def) = defs
-                    .iter()
-                    .find(|d| span_contains_position(d.span, &position))
-                {
-                    def_clone = Some(def.clone());
-                }
-            }
-
-            if def_clone.is_none() {
-                if let Some(word) = word.as_ref() {
-                    if let Some(def) = snapshot.definition_by_qualified(word) {
-                        def_clone = Some(def.clone());
-                    } else if let Some(defs) = snapshot.definitions_by_simple(word) {
-                        if let Some(def) = choose_definition(defs, module_path.as_deref()) {
-                            def_clone = Some(def.clone());
-                        }
-                    }
-                }
-            }
-
-            let type_opt = if def_clone.is_none() {
-                module
-                    .and_then(|module| find_type_for_position(module, position))
-                    .map(|(span, ty)| {
-                        let type_def = match &ty.kind {
-                            TypeKind::Named(name) => snapshot
-                                .definition_by_qualified(name)
-                                .cloned()
-                                .or_else(|| {
-                                    if let Some(mp) = module_path.as_ref() {
-                                        let qualified = format!("{}.{}", mp, name);
-                                        snapshot.definition_by_qualified(&qualified).cloned()
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .or_else(|| {
-                                    snapshot
-                                        .definitions_by_simple(name)
-                                        .and_then(|defs| {
-                                            choose_definition(defs, module_path.as_deref())
-                                        })
-                                        .cloned()
-                                }),
-                            _ => None,
-                        };
-                        (span, ty, type_def)
-                    })
-            } else {
-                None
-            };
-            (method_hover, def_clone, type_opt)
-        };
-        if let Some(hover) = method_hover {
-            return Ok(Some(hover));
-        }
-
-        if let Some(def) = def_opt {
-            return Ok(Some(hover_from_definition(&def)));
-        }
-
-        if let Some((span, ty, type_def)) = type_opt {
-            if let Some(def) = type_def {
-                return Ok(Some(hover_from_definition(&def)));
-            }
-
-            let hover = Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: format!("`{}`", ty),
-                }),
-                range: Some(span_to_range(span)),
-            };
-            return Ok(Some(hover));
-        }
-
-        Ok(None)
-    }
-
-    async fn goto_definition(
-        &self,
-        params: GotoDefinitionParams,
-    ) -> Result<Option<GotoDefinitionResponse>> {
-        let uri = params.text_document_position_params.text_document.uri;
-        let position = params.text_document_position_params.position;
-        let file_path = match uri.to_file_path() {
-            Ok(path) => path,
-            Err(_) => return Ok(None),
-        };
-        let text = self.document_text(&uri).await;
-        let word = text
-            .as_ref()
-            .and_then(|source| extract_word_at_position(source, position));
-        let def_opt = {
-            let analysis = self.analysis.read().await;
-            let Some(snapshot) = analysis.as_ref() else {
-                return Ok(None);
-            };
-            let mut def_clone = None;
-            if let Some(defs) = snapshot.definitions_in_file(&file_path) {
-                if let Some(def) = defs
-                    .iter()
-                    .find(|d| span_contains_position(d.span, &position))
-                {
-                    def_clone = Some(def.clone());
-                }
-            }
-
-            if def_clone.is_none() {
-                let module_path = snapshot.module_path_for_file(&file_path);
-                if let Some(word) = word.as_ref() {
-                    if let Some(def) = snapshot.definition_by_qualified(word) {
-                        def_clone = Some(def.clone());
-                    } else if let Some(defs) = snapshot.definitions_by_simple(word) {
-                        if let Some(def) = choose_definition(defs, module_path) {
-                            def_clone = Some(def.clone());
-                        }
-                    }
-                }
-            }
-
-            def_clone
-        };
-        if let Some(def) = def_opt {
-            if let Some(location) = location_from_definition(&def) {
-                return Ok(Some(GotoDefinitionResponse::Scalar(location)));
-            }
-        }
-
-        Ok(None)
-    }
-
-    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
-        let uri = params.text_document.uri;
-        let range = params.range;
-        let file_path = match uri.to_file_path() {
-            Ok(path) => path,
-            Err(_) => return Ok(None),
-        };
-        let hints = {
-            let analysis = self.analysis.read().await;
-            let Some(snapshot) = analysis.as_ref() else {
-                return Ok(None);
-            };
-            snapshot
-                .module_for_file(&file_path)
-                .map(|module| collect_inlay_hints_for_module(module, &range))
-        };
-        Ok(hints.or(Some(Vec::new())))
-    }
-
-    async fn semantic_tokens_full(
-        &self,
-        params: SemanticTokensParams,
-    ) -> Result<Option<SemanticTokensResult>> {
-        let uri = params.text_document.uri;
-        let path = match uri.to_file_path() {
-            Ok(path) => path,
-            Err(_) => return Ok(None),
-        };
-        let tokens = self.semantic_tokens_for_path(&path).await;
-        Ok(tokens.map(|data| {
-            SemanticTokensResult::Tokens(SemanticTokens {
-                result_id: None,
-                data,
-            })
-        }))
-    }
-
-    async fn semantic_tokens_range(
-        &self,
-        _params: SemanticTokensRangeParams,
-    ) -> Result<Option<SemanticTokensRangeResult>> {
-        Ok(None)
-    }
-}
-
-pub async fn run() {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    let (service, socket) = LspService::build(|client| Backend::new(client)).finish();
-    Server::new(stdin, stdout, socket).serve(service).await;
-}
-
-#[cfg(test)]
-mod tests {
-    include!("tests.rs");
 }

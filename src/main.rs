@@ -11,6 +11,7 @@ use std::fs;
 use std::path::Path;
 use std::process;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {

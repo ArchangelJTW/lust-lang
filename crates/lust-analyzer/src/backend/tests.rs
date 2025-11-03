@@ -1,11 +1,16 @@
 use super::*;
-use crate::utils::analyzer_lust_config;
+use crate::analysis::{find_type_for_position, AnalysisSnapshot};
+use crate::utils::{
+    analyzer_lust_config, base_type_name, compute_line_offsets, offset_to_position,
+    span_from_identifier,
+};
 use lust::modules::ModuleLoader;
 use lust::TypeChecker;
 use hashbrown::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tower_lsp::lsp_types::HoverContents;
 struct TempDir {
     path: PathBuf,
 }

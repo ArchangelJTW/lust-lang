@@ -162,9 +162,8 @@ impl TypeChecker {
 
         let right_info = self.short_circuit_profile(right, &right_type);
         let mut option_inner: Option<Type> = None;
-        let should_optionize =
-            self.should_optionize(&left_type, &right_type)
-                || self.should_optionize_narrowed_value(left, right, &right_type);
+        let should_optionize = self.should_optionize(&left_type, &right_type)
+            || self.should_optionize_narrowed_value(left, right, &right_type);
         let (truthy, falsy, result_type) = if should_optionize {
             let inner = self.canonicalize_type(&right_type);
             option_inner = Some(inner.clone());
@@ -236,8 +235,12 @@ impl TypeChecker {
 
     fn extract_short_circuit_scrutinee<'a>(expr: &'a Expr) -> Option<&'a Expr> {
         match &expr.kind {
-            ExprKind::TypeCheck { expr: scrutinee, .. } => Some(scrutinee),
-            ExprKind::IsPattern { expr: scrutinee, .. } => Some(scrutinee),
+            ExprKind::TypeCheck {
+                expr: scrutinee, ..
+            } => Some(scrutinee),
+            ExprKind::IsPattern {
+                expr: scrutinee, ..
+            } => Some(scrutinee),
             ExprKind::Paren(inner) => Self::extract_short_circuit_scrutinee(inner),
             _ => None,
         }

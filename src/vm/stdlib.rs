@@ -450,8 +450,13 @@ mod tests {
 
     #[test]
     fn stdlib_includes_optional_modules_when_configured() {
-        let cfg =
-            LustConfig::from_toml_str("\"enabled modules\" = [\"io\", \"os\"]").expect("parse");
+        let cfg = LustConfig::from_toml_str(
+            r#"
+                [settings]
+                stdlib_modules = ["io", "os"]
+            "#,
+        )
+        .expect("parse");
         let stdlib = create_stdlib(&cfg);
         assert!(stdlib.iter().any(|(name, _)| *name == "io"));
         assert!(stdlib.iter().any(|(name, _)| *name == "os"));

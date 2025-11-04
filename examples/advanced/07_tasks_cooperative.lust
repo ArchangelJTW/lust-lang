@@ -10,8 +10,8 @@ function ticker(name: string, count: int): string
 end
 
 function describe_unknown(opt: Option<unknown>): string
-    if opt:is_some() then
-        return tostring(opt:unwrap())
+    if opt is Some(val) then
+        return tostring(val)
     end
     return "None"
 end
@@ -28,7 +28,7 @@ end
 
 function step_task(label: string, handle: Task): bool
     local status = task.status(handle)
-    if status == TaskStatus.Completed or status == TaskStatus.Stopped or status == TaskStatus.Failed then
+    if status is Completed or status is Stopped or status is Failed then
         local info = task.info(handle)
         log_completion(label, info)
         return true

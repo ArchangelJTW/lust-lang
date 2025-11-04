@@ -1,4 +1,4 @@
-use super::task::{TaskInstance, TaskState};
+use super::task::{TaskInstance, TaskKind, TaskState};
 use super::VM;
 use crate::bytecode::{NativeCallResult, Value, ValueKey};
 use crate::LustError;
@@ -131,6 +131,24 @@ fn create_task_resume_fn() -> Value {
             .ok_or_else(|| "task.resume() requires a task handle value".to_string())?;
         let resume_value = args.get(1).cloned();
         VM::with_current(move |vm| {
+            let kind = vm
+                .get_task_instance(handle)
+                .map(|task| task.kind().clone())
+                .map_err(|e| e.to_string())?;
+
+            if matches!(kind, TaskKind::NativeFuture { .. }) {
+                if resume_value.is_some() {
+                    return Err(
+                        "task.resume() does not accept a resume value for native async tasks"
+                            .to_string(),
+                    );
+                }
+
+                let task = vm.get_task_instance(handle).map_err(|e| e.to_string())?;
+                let info = build_task_info_value(vm, task).map_err(|e| e.to_string())?;
+                return Ok(NativeCallResult::Return(info));
+            }
+
             vm.resume_task_handle(handle, resume_value.clone())
                 .map_err(|e| e.to_string())?;
             let task = vm.get_task_instance(handle).map_err(|e| e.to_string())?;

@@ -48,7 +48,14 @@ pub struct TaskInstance {
     pub last_yield: Option<Value>,
     pub last_result: Option<Value>,
     pub error: Option<LustError>,
-    initial_frame: CallFrame,
+    kind: TaskKind,
+    initial_frame: Option<CallFrame>,
+}
+
+#[derive(Clone, Debug)]
+pub enum TaskKind {
+    Script,
+    NativeFuture { future_id: Option<u64> },
 }
 
 impl TaskInstance {
@@ -63,27 +70,68 @@ impl TaskInstance {
             last_yield: None,
             last_result: None,
             error: None,
-            initial_frame,
+            kind: TaskKind::Script,
+            initial_frame: Some(initial_frame),
+        }
+    }
+
+    pub(super) fn new_native_future(id: TaskId) -> Self {
+        Self {
+            id,
+            state: TaskState::Yielded,
+            call_stack: Vec::new(),
+            pending_return_value: None,
+            pending_return_dest: None,
+            yield_dest: None,
+            last_yield: None,
+            last_result: None,
+            error: None,
+            kind: TaskKind::NativeFuture { future_id: None },
+            initial_frame: None,
         }
     }
 
     pub fn reset(&mut self) {
-        self.state = TaskState::Ready;
-        self.call_stack = vec![self.initial_frame.clone()];
-        self.pending_return_value = None;
-        self.pending_return_dest = None;
-        self.yield_dest = None;
-        self.last_yield = None;
-        self.last_result = None;
-        self.error = None;
+        match self.kind {
+            TaskKind::Script => {
+                self.state = TaskState::Ready;
+                if let Some(frame) = self.initial_frame.clone() {
+                    self.call_stack = vec![frame];
+                }
+                self.pending_return_value = None;
+                self.pending_return_dest = None;
+                self.yield_dest = None;
+                self.last_yield = None;
+                self.last_result = None;
+                self.error = None;
+            }
+            TaskKind::NativeFuture { .. } => {
+                self.state = TaskState::Yielded;
+                self.call_stack.clear();
+                self.pending_return_value = None;
+                self.pending_return_dest = None;
+                self.yield_dest = None;
+                self.last_yield = None;
+                self.last_result = None;
+                self.error = None;
+            }
+        }
     }
 
     pub fn handle(&self) -> TaskHandle {
         self.id.to_handle()
     }
 
-    pub(super) fn initial_frame(&self) -> &CallFrame {
-        &self.initial_frame
+    pub(super) fn initial_frame(&self) -> Option<&CallFrame> {
+        self.initial_frame.as_ref()
+    }
+
+    pub fn kind(&self) -> &TaskKind {
+        &self.kind
+    }
+
+    pub fn kind_mut(&mut self) -> &mut TaskKind {
+        &mut self.kind
     }
 }
 

@@ -154,7 +154,9 @@ impl CycleCollector {
             self.mark_frame(frame, visited);
         }
 
-        self.mark_frame(task.initial_frame(), visited);
+        if let Some(frame) = task.initial_frame() {
+            self.mark_frame(frame, visited);
+        }
         if let Some(value) = &task.pending_return_value {
             self.mark_value(value, visited);
         }

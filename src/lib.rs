@@ -29,12 +29,15 @@ pub use bytecode::{Chunk, Compiler, Function, Instruction, Value};
 pub use config::{ConfigError, LustConfig};
 #[cfg(feature = "std")]
 pub use embed::{
-    struct_field, ArrayHandle, EmbeddedBuilder, EmbeddedProgram, EnumInstance, FromLustValue,
-    FunctionArgs, IntoLustValue, MapHandle, StructField, StructInstance, ValueRef,
+    struct_field, ArrayHandle, AsyncDriver, AsyncTaskQueue, EmbeddedBuilder, EmbeddedProgram,
+    EnumInstance, FromLustValue, FromStructField, FunctionArgs, IntoLustValue, MapHandle,
+    StringRef, StructField, StructHandle, StructInstance, ValueRef,
 };
 pub use error::{LustError, Result};
 pub use jit::{JitCompiler, JitState};
 pub use lexer::{Lexer, Token, TokenKind};
+#[cfg(feature = "std")]
+pub use lust_macros::LustStructView;
 pub use modules::{LoadedModule, ModuleImports, ModuleLoader, Program};
 pub use number::{LustFloat, LustInt};
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]

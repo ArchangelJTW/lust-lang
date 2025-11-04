@@ -228,7 +228,8 @@ fn main() -> lust::Result<()> {
     }
 
     let queue = AsyncTaskQueue::<FunctionHandle, lust::LustInt>::new();
-    program.register_async_task_queue::<FunctionHandle, lust::LustInt>("fetch_value", queue.clone())?;
+    program
+        .register_async_task_queue::<FunctionHandle, lust::LustInt>("fetch_value", queue.clone())?;
 
     // Simulate Lust calling the native async function
     let lust_task = program.call_raw("main.get_async_value", Vec::new())?;

@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::fmt::Write;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
+
 #[wasm_bindgen]
 pub fn run_lust(source: &str) -> Result<String, JsValue> {
     console_error_panic_hook::set_once();

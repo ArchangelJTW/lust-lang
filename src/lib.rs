@@ -30,8 +30,8 @@ pub use config::{ConfigError, LustConfig};
 #[cfg(feature = "std")]
 pub use embed::{
     struct_field, ArrayHandle, AsyncDriver, AsyncTaskQueue, EmbeddedBuilder, EmbeddedProgram,
-    EnumInstance, FromLustValue, FromStructField, FunctionArgs, IntoLustValue, MapHandle,
-    StringRef, StructField, StructHandle, StructInstance, ValueRef,
+    EnumInstance, FromLustValue, FromStructField, FunctionArgs, FunctionHandle, IntoLustValue,
+    MapHandle, StringRef, StructField, StructHandle, StructInstance, ValueRef,
 };
 pub use error::{LustError, Result};
 pub use jit::{JitCompiler, JitState};

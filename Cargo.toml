@@ -62,7 +62,7 @@ hashbrown = { version = "0.16.0", default-features = false, features = [
   "equivalent",
 ] }
 libm = { version = "0.2.8", default-features = false }
-lust-macros = { path = "crates/lust-macros", optional = true }
+lust-macros = { path = "crates/lust-macros", version = "0.1.0", optional = true }
 
 [build-dependencies]
 dynasm = "4.0.1"

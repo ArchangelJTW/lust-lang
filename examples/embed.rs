@@ -1,6 +1,19 @@
+use lust::embed::LustStructView as _;
 use lust::{
-    struct_field, ArrayHandle, EmbeddedProgram, FromLustValue, MapHandle, StructInstance, Value,
+    struct_field, ArrayHandle, AsyncDriver, AsyncTaskQueue, EmbeddedProgram, FromLustValue,
+    LustStructView, MapHandle, StringRef, StructHandle, StructInstance, Value,
 };
+
+#[derive(LustStructView)]
+#[lust(type = "main.Point")]
+struct PointView<'a> {
+    #[lust(field = "x")]
+    x: lust::LustInt,
+    #[lust(field = "y")]
+    y: lust::LustInt,
+    #[lust(field = "name")]
+    name: StringRef<'a>,
+}
 
 fn main() -> lust::Result<()> {
     let module = r#"
@@ -19,6 +32,7 @@ fn main() -> lust::Result<()> {
 
         extern {
             function host_scale(int): int
+            function fetch_value(): Task
         }
 
         arr_global: Array<int> = [1, 2, 3]
@@ -59,6 +73,24 @@ fn main() -> lust::Result<()> {
 
         pub function bump_scale(): ()
             SCALE_FACTOR = SCALE_FACTOR + 1
+        end
+
+        pub function get_async_value(): Task
+            return fetch_value()
+        end
+
+        pub function await_fetch(): Option<int>
+            local job = fetch_value()
+            while true do
+                local info = task.info(job)
+                if info.state is TaskStatus.Completed then
+                    return Option.Some(info.last_result:unwrap())
+                elseif info.state is TaskStatus.Failed then
+                    println(info.error:unwrap_or("native async failure"))
+                end
+                task.yield(Option.None)
+            end
+            return Option.None
         end
 
     "#;
@@ -166,6 +198,48 @@ fn main() -> lust::Result<()> {
                 .collect::<Vec<_>>()
         });
         println!("Modified map = {:?}", snapshot);
+    }
+
+    if let Some(point_handle) = program.get_typed_global::<StructHandle>("main.lust_point")? {
+        let view = PointView::from_handle(&point_handle)?;
+        let name = view.name.as_str();
+        println!("Derived PointView ({}, {}, \"{}\")", view.x, view.y, name);
+    }
+
+    let queue = AsyncTaskQueue::<(), lust::LustInt>::new();
+    program.register_async_task_queue::<(), lust::LustInt>("fetch_value", queue.clone())?;
+
+    // Simulate Lust calling the native async function
+    let lust_task = program.call_raw("main.get_async_value", Vec::new())?;
+    let task_handle = match lust_task {
+        Value::Task(handle) => handle,
+        other => panic!("expected Task, got {other:?}"),
+    };
+
+    // Drive the pending job from Rust
+    let pending_job = queue
+        .pop() // pop_blocking can be used for continuous blocking polling
+        .expect("fetch_value should enqueue a pending job");
+    let mut driver = AsyncDriver::new(&mut program);
+    pending_job.complete_ok(77);
+    driver.pump_until_idle()?;
+
+    // Inspect the task via the VM just like scripts would
+    let (state, last_result, last_error) = {
+        let vm = program.vm_mut();
+        let task = vm.get_task_instance(task_handle).expect("async task info");
+        (
+            task.state.as_str().to_string(),
+            task.last_result.clone(),
+            task.error.clone(),
+        )
+    };
+    println!("Async task state = {}", state);
+    if let Some(err) = last_error {
+        println!("Async task error = {}", err);
+    }
+    if let Some(value) = last_result.and_then(|v| v.as_int()) {
+        println!("Async fetch returned {value}");
     }
 
     if let Some(lust_point_value) = program.get_global_value("main.lust_point") {

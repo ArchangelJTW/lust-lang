@@ -1,5 +1,7 @@
 use crate::ast::{EnumDef, FieldOwnership, Item, ItemKind, Span, StructDef, Type, TypeKind};
-use crate::bytecode::{Compiler, FieldStorage, NativeCallResult, TaskHandle, Value, ValueKey};
+use crate::bytecode::{
+    Compiler, FieldStorage, NativeCallResult, StructLayout, TaskHandle, Value, ValueKey,
+};
 use crate::modules::{ModuleImports, ModuleLoader};
 use crate::number::{LustFloat, LustInt};
 use crate::typechecker::{FunctionSignature, TypeChecker};
@@ -7,43 +9,44 @@ use crate::vm::VM;
 use crate::{LustConfig, LustError, Result};
 use hashbrown::HashMap;
 use std::cell::{Ref, RefCell, RefMut};
+use std::collections::VecDeque;
 use std::future::Future;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 type AsyncValueFuture = Pin<Box<dyn Future<Output = std::result::Result<Value, String>>>>;
 
 struct AsyncRegistry {
+    next_id: u64,
     pending: HashMap<u64, AsyncTaskEntry>,
 }
 
 impl AsyncRegistry {
     fn new() -> Self {
         Self {
+            next_id: 1,
             pending: HashMap::new(),
         }
     }
 
-    fn register(
-        &mut self,
-        handle: TaskHandle,
-        future: AsyncValueFuture,
-    ) -> std::result::Result<(), String> {
-        let key = handle.id();
-        if self.pending.contains_key(&key) {
-            return Err(format!(
-                "Task {} already has a pending async native call",
-                key
-            ));
-        }
+    fn register(&mut self, entry: AsyncTaskEntry) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.pending.insert(id, entry);
+        id
+    }
 
-        self.pending
-            .insert(key, AsyncTaskEntry::new(handle, future));
-        Ok(())
+    fn has_pending_for(&self, handle: TaskHandle) -> bool {
+        self.pending.values().any(|entry| match entry.target {
+            AsyncTaskTarget::ScriptTask(existing) | AsyncTaskTarget::NativeTask(existing) => {
+                existing == handle
+            }
+        })
     }
 
     fn is_empty(&self) -> bool {
@@ -52,16 +55,22 @@ impl AsyncRegistry {
 }
 
 struct AsyncTaskEntry {
-    handle: TaskHandle,
+    target: AsyncTaskTarget,
     future: AsyncValueFuture,
     wake_flag: Arc<WakeFlag>,
     immediate_poll: bool,
 }
 
+#[derive(Clone, Copy)]
+enum AsyncTaskTarget {
+    ScriptTask(TaskHandle),
+    NativeTask(TaskHandle),
+}
+
 impl AsyncTaskEntry {
-    fn new(handle: TaskHandle, future: AsyncValueFuture) -> Self {
+    fn new(target: AsyncTaskTarget, future: AsyncValueFuture) -> Self {
         Self {
-            handle,
+            target,
             future,
             wake_flag: Arc::new(WakeFlag::new()),
             immediate_poll: true,
@@ -139,6 +148,172 @@ static ASYNC_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     async_waker_wake_by_ref,
     async_waker_drop,
 );
+
+struct AsyncTaskQueueInner<Args, R> {
+    queue: Mutex<VecDeque<PendingAsyncTask<Args, R>>>,
+    condvar: Condvar,
+}
+
+pub struct AsyncTaskQueue<Args, R> {
+    inner: Arc<AsyncTaskQueueInner<Args, R>>,
+}
+
+impl<Args, R> Clone for AsyncTaskQueue<Args, R> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<Args, R> AsyncTaskQueue<Args, R> {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(AsyncTaskQueueInner {
+                queue: Mutex::new(VecDeque::new()),
+                condvar: Condvar::new(),
+            }),
+        }
+    }
+
+    pub fn push(&self, task: PendingAsyncTask<Args, R>) {
+        let mut guard = self.inner.queue.lock().unwrap();
+        guard.push_back(task);
+        self.inner.condvar.notify_one();
+    }
+
+    pub fn pop(&self) -> Option<PendingAsyncTask<Args, R>> {
+        let mut guard = self.inner.queue.lock().unwrap();
+        guard.pop_front()
+    }
+
+    pub fn pop_blocking(&self) -> PendingAsyncTask<Args, R> {
+        let mut guard = self.inner.queue.lock().unwrap();
+        loop {
+            if let Some(task) = guard.pop_front() {
+                return task;
+            }
+            guard = self.inner.condvar.wait(guard).unwrap();
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        let guard = self.inner.queue.lock().unwrap();
+        guard.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let guard = self.inner.queue.lock().unwrap();
+        guard.is_empty()
+    }
+}
+
+pub struct PendingAsyncTask<Args, R> {
+    task: TaskHandle,
+    args: Args,
+    completer: AsyncCompleter<R>,
+}
+
+impl<Args, R> PendingAsyncTask<Args, R> {
+    fn new(task: TaskHandle, args: Args, completer: AsyncCompleter<R>) -> Self {
+        Self {
+            task,
+            args,
+            completer,
+        }
+    }
+
+    pub fn task(&self) -> TaskHandle {
+        self.task
+    }
+
+    pub fn args(&self) -> &Args {
+        &self.args
+    }
+
+    pub fn complete_ok(self, value: R) {
+        self.completer.complete_ok(value);
+    }
+
+    pub fn complete_err(self, message: impl Into<String>) {
+        self.completer.complete_err(message);
+    }
+}
+
+struct AsyncSignalState<T> {
+    result: Mutex<Option<std::result::Result<T, String>>>,
+    waker: Mutex<Option<Waker>>,
+}
+
+struct AsyncCompleter<T> {
+    inner: Arc<AsyncSignalState<T>>,
+}
+
+impl<T> Clone for AsyncCompleter<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T> AsyncCompleter<T> {
+    fn complete_ok(&self, value: T) {
+        self.set_result(Ok(value));
+    }
+
+    fn complete_err(&self, message: impl Into<String>) {
+        self.set_result(Err(message.into()));
+    }
+
+    fn set_result(&self, value: std::result::Result<T, String>) {
+        {
+            let mut guard = self.inner.result.lock().unwrap();
+            if guard.is_some() {
+                return;
+            }
+            *guard = Some(value);
+        }
+
+        if let Some(waker) = self.inner.waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+}
+
+struct AsyncSignalFuture<T> {
+    inner: Arc<AsyncSignalState<T>>,
+}
+
+impl<T> Future for AsyncSignalFuture<T> {
+    type Output = std::result::Result<T, String>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        {
+            let mut guard = self.inner.result.lock().unwrap();
+            if let Some(result) = guard.take() {
+                return Poll::Ready(result);
+            }
+        }
+
+        let mut waker_slot = self.inner.waker.lock().unwrap();
+        *waker_slot = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+fn signal_pair<T>() -> (AsyncCompleter<T>, AsyncSignalFuture<T>) {
+    let inner = Arc::new(AsyncSignalState {
+        result: Mutex::new(None),
+        waker: Mutex::new(None),
+    });
+    (
+        AsyncCompleter {
+            inner: Arc::clone(&inner),
+        },
+        AsyncSignalFuture { inner },
+    )
+}
 pub struct EmbeddedBuilder {
     base_dir: PathBuf,
     modules: HashMap<String, String>,
@@ -244,6 +419,31 @@ pub struct EmbeddedProgram {
     entry_script: Option<String>,
     entry_module: String,
     async_registry: Rc<RefCell<AsyncRegistry>>,
+}
+
+pub struct AsyncDriver<'a> {
+    program: &'a mut EmbeddedProgram,
+}
+
+impl<'a> AsyncDriver<'a> {
+    pub fn new(program: &'a mut EmbeddedProgram) -> Self {
+        Self { program }
+    }
+
+    pub fn poll(&mut self) -> Result<()> {
+        self.program.poll_async_tasks()
+    }
+
+    pub fn pump_until_idle(&mut self) -> Result<()> {
+        while self.program.has_pending_async_tasks() {
+            self.program.poll_async_tasks()?;
+        }
+        Ok(())
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.program.has_pending_async_tasks()
+    }
 }
 
 impl EmbeddedProgram {
@@ -598,7 +798,18 @@ impl EmbeddedProgram {
                 let handle = vm
                     .current_task_handle()
                     .ok_or_else(|| "Async native functions require a running task".to_string())?;
-                registry.borrow_mut().register(handle, future)?;
+                let mut registry = registry.borrow_mut();
+                if registry.has_pending_for(handle) {
+                    return Err(format!(
+                        "Task {} already has a pending async native call",
+                        handle.id()
+                    ));
+                }
+
+                registry.register(AsyncTaskEntry::new(
+                    AsyncTaskTarget::ScriptTask(handle),
+                    future,
+                ));
                 Ok(NativeCallResult::Yield(Value::Nil))
             })
         };
@@ -654,7 +865,6 @@ impl EmbeddedProgram {
             });
         }
 
-        ensure_return_type::<R>(name, &signature.return_type)?;
         let registry = self.async_registry.clone();
         let handler = move |values: &[Value]| -> std::result::Result<NativeCallResult, String> {
             let args = Args::from_values(values)?;
@@ -670,8 +880,105 @@ impl EmbeddedProgram {
                 let handle = vm
                     .current_task_handle()
                     .ok_or_else(|| "Async native functions require a running task".to_string())?;
-                registry.borrow_mut().register(handle, future)?;
+                let mut registry = registry.borrow_mut();
+                if registry.has_pending_for(handle) {
+                    return Err(format!(
+                        "Task {} already has a pending async native call",
+                        handle.id()
+                    ));
+                }
+
+                registry.register(AsyncTaskEntry::new(
+                    AsyncTaskTarget::ScriptTask(handle),
+                    future,
+                ));
                 Ok(NativeCallResult::Yield(Value::Nil))
+            })
+        };
+        self.register_native_with_aliases(name, canonical, handler);
+        Ok(())
+    }
+
+    pub fn register_async_task_native<Args, R, F, Fut>(&mut self, name: &str, func: F) -> Result<()>
+    where
+        Args: FromLustArgs,
+        R: IntoLustValue + FromLustValue,
+        F: Fn(Args) -> Fut + 'static,
+        Fut: Future<Output = std::result::Result<R, String>> + 'static,
+    {
+        let (canonical, signature) = self.resolve_signature(name)?;
+        let signature = signature.clone();
+        if !Args::matches_signature(&signature.params) {
+            return Err(LustError::TypeError {
+                message: format!(
+                    "Native '{}' argument types do not match Lust signature",
+                    name
+                ),
+            });
+        }
+
+        let registry = self.async_registry.clone();
+        let handler = move |values: &[Value]| -> std::result::Result<NativeCallResult, String> {
+            let args = Args::from_values(values)?;
+            let future = func(args);
+            let mapped = async move {
+                match future.await {
+                    Ok(result) => Ok(result.into_value()),
+                    Err(err) => Err(err),
+                }
+            };
+            let future: AsyncValueFuture = Box::pin(mapped);
+            VM::with_current(|vm| {
+                let mut registry = registry.borrow_mut();
+                let handle = vm.create_native_future_task();
+                let entry = AsyncTaskEntry::new(AsyncTaskTarget::NativeTask(handle), future);
+                registry.register(entry);
+                Ok(NativeCallResult::Return(Value::task(handle)))
+            })
+        };
+        self.register_native_with_aliases(name, canonical, handler);
+        Ok(())
+    }
+
+    pub fn register_async_task_queue<Args, R>(
+        &mut self,
+        name: &str,
+        queue: AsyncTaskQueue<Args, R>,
+    ) -> Result<()>
+    where
+        Args: FromLustArgs + 'static,
+        R: IntoLustValue + FromLustValue + 'static,
+    {
+        let (canonical, signature) = self.resolve_signature(name)?;
+        let signature = signature.clone();
+        if !Args::matches_signature(&signature.params) {
+            return Err(LustError::TypeError {
+                message: format!(
+                    "Native '{}' argument types do not match Lust signature",
+                    name
+                ),
+            });
+        }
+
+        let registry = self.async_registry.clone();
+        let queue_clone = queue.clone();
+        let handler = move |values: &[Value]| -> std::result::Result<NativeCallResult, String> {
+            let args = Args::from_values(values)?;
+            let (completer, signal_future) = signal_pair::<R>();
+            let future: AsyncValueFuture = Box::pin(async move {
+                match signal_future.await {
+                    Ok(result) => Ok(result.into_value()),
+                    Err(err) => Err(err),
+                }
+            });
+
+            VM::with_current(|vm| {
+                let mut registry = registry.borrow_mut();
+                let handle = vm.create_native_future_task();
+                let entry = AsyncTaskEntry::new(AsyncTaskTarget::NativeTask(handle), future);
+                registry.register(entry);
+                queue_clone.push(PendingAsyncTask::new(handle, args, completer));
+                Ok(NativeCallResult::Return(Value::task(handle)))
             })
         };
         self.register_native_with_aliases(name, canonical, handler);
@@ -728,15 +1035,10 @@ impl EmbeddedProgram {
             registry.pending.keys().copied().collect()
         };
 
-        let mut completions: Vec<(TaskHandle, std::result::Result<Value, String>)> = Vec::new();
         for id in pending_ids {
-            let handle = TaskHandle(id);
-            if self.vm.get_task_instance(handle).is_err() {
-                self.async_registry.borrow_mut().pending.remove(&id);
-                continue;
-            }
-
-            let maybe_outcome = {
+            let mut completion: Option<(AsyncTaskTarget, std::result::Result<Value, String>)> =
+                None;
+            {
                 let mut registry = self.async_registry.borrow_mut();
                 let entry = match registry.pending.get_mut(&id) {
                     Some(entry) => entry,
@@ -749,31 +1051,28 @@ impl EmbeddedProgram {
 
                 let waker = entry.make_waker();
                 let mut cx = Context::from_waker(&waker);
-                match entry.future.as_mut().poll(&mut cx) {
-                    Poll::Ready(result) => {
-                        let handle = entry.handle;
-                        registry.pending.remove(&id);
-                        Some((handle, result))
-                    }
-
-                    Poll::Pending => None,
+                if let Poll::Ready(result) = entry.future.as_mut().poll(&mut cx) {
+                    completion = Some((entry.target, result));
                 }
-            };
-
-            if let Some(outcome) = maybe_outcome {
-                completions.push(outcome);
             }
-        }
 
-        for (handle, outcome) in completions {
-            match outcome {
-                Ok(value) => {
-                    self.vm.resume_task_handle(handle, Some(value))?;
-                }
+            if let Some((target, outcome)) = completion {
+                self.async_registry.borrow_mut().pending.remove(&id);
+                match target {
+                    AsyncTaskTarget::ScriptTask(handle) => match outcome {
+                        Ok(value) => {
+                            self.vm.resume_task_handle(handle, Some(value))?;
+                        }
 
-                Err(message) => {
-                    self.vm
-                        .fail_task_handle(handle, LustError::RuntimeError { message })?;
+                        Err(message) => {
+                            self.vm
+                                .fail_task_handle(handle, LustError::RuntimeError { message })?;
+                        }
+                    },
+
+                    AsyncTaskTarget::NativeTask(handle) => {
+                        self.vm.complete_native_future_task(handle, outcome)?;
+                    }
                 }
             }
         }
@@ -1170,6 +1469,110 @@ impl StructInstance {
     }
 }
 
+#[derive(Clone)]
+pub struct StructHandle {
+    instance: StructInstance,
+}
+
+impl StructHandle {
+    fn from_instance(instance: StructInstance) -> Self {
+        Self { instance }
+    }
+
+    fn from_parts(
+        name: &String,
+        layout: &Rc<StructLayout>,
+        fields: &Rc<RefCell<Vec<Value>>>,
+    ) -> Self {
+        let value = Value::Struct {
+            name: name.clone(),
+            layout: layout.clone(),
+            fields: fields.clone(),
+        };
+        Self::from_instance(StructInstance::new(name.clone(), value))
+    }
+
+    pub fn from_value(value: Value) -> Result<Self> {
+        <StructInstance as FromLustValue>::from_value(value).map(StructHandle::from)
+    }
+
+    pub fn type_name(&self) -> &str {
+        self.instance.type_name()
+    }
+
+    pub fn field<T: FromLustValue>(&self, field: &str) -> Result<T> {
+        self.instance.field(field)
+    }
+
+    pub fn borrow_field(&self, field: &str) -> Result<ValueRef<'_>> {
+        self.instance.borrow_field(field)
+    }
+
+    pub fn set_field<V: IntoTypedValue>(&self, field: &str, value: V) -> Result<()> {
+        self.instance.set_field(field, value)
+    }
+
+    pub fn update_field<F, V>(&self, field: &str, update: F) -> Result<()>
+    where
+        F: FnOnce(Value) -> Result<V>,
+        V: IntoTypedValue,
+    {
+        self.instance.update_field(field, update)
+    }
+
+    pub fn as_value(&self) -> &Value {
+        self.instance.as_value()
+    }
+
+    pub fn to_instance(&self) -> StructInstance {
+        self.instance.clone()
+    }
+
+    pub fn into_instance(self) -> StructInstance {
+        self.instance
+    }
+
+    pub fn matches_type(&self, expected: &str) -> bool {
+        lust_type_names_match(self.type_name(), expected)
+    }
+
+    pub fn ensure_type(&self, expected: &str) -> Result<()> {
+        if self.matches_type(expected) {
+            Ok(())
+        } else {
+            Err(LustError::TypeError {
+                message: format!(
+                    "Struct '{}' does not match expected type '{}'",
+                    self.type_name(),
+                    expected
+                ),
+            })
+        }
+    }
+}
+
+impl StructInstance {
+    pub fn to_handle(&self) -> StructHandle {
+        StructHandle::from_instance(self.clone())
+    }
+
+    pub fn into_handle(self) -> StructHandle {
+        StructHandle::from_instance(self)
+    }
+}
+
+impl From<StructInstance> for StructHandle {
+    fn from(instance: StructInstance) -> Self {
+        StructHandle::from_instance(instance)
+    }
+}
+
+impl From<StructHandle> for StructInstance {
+    fn from(handle: StructHandle) -> Self {
+        handle.into_instance()
+    }
+}
+
 pub enum ValueRef<'a> {
     Borrowed(Ref<'a, Value>),
     Owned(Value),
@@ -1240,6 +1643,58 @@ impl<'a> ValueRef<'a> {
             Value::Map(map) => Some(MapHandle::from_rc(map.clone())),
             _ => None,
         }
+    }
+
+    pub fn as_struct_handle(&self) -> Option<StructHandle> {
+        match self.as_value() {
+            Value::Struct {
+                name,
+                layout,
+                fields,
+            } => Some(StructHandle::from_parts(name, layout, fields)),
+            Value::WeakStruct(weak) => weak
+                .upgrade()
+                .and_then(|value| StructHandle::from_value(value).ok()),
+            _ => None,
+        }
+    }
+}
+
+pub struct StringRef<'a> {
+    value: ValueRef<'a>,
+}
+
+impl<'a> StringRef<'a> {
+    fn new(value: ValueRef<'a>) -> Self {
+        Self { value }
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.value
+            .as_string()
+            .expect("StringRef must wrap a Lust string")
+    }
+
+    pub fn as_rc(&self) -> Rc<String> {
+        self.value
+            .as_rc_string()
+            .expect("StringRef must wrap a Lust string")
+    }
+
+    pub fn to_value(&self) -> &Value {
+        self.value.as_value()
+    }
+
+    pub fn into_value_ref(self) -> ValueRef<'a> {
+        self.value
+    }
+}
+
+impl<'a> Deref for StringRef<'a> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
     }
 }
 
@@ -1446,6 +1901,136 @@ impl EnumInstance {
     }
 }
 
+fn struct_field_type_error(field: &str, expected: &str, actual: &Value) -> LustError {
+    LustError::TypeError {
+        message: format!(
+            "Struct field '{}' expects '{}' but received value of type '{:?}'",
+            field,
+            expected,
+            actual.type_of()
+        ),
+    }
+}
+
+pub trait FromStructField<'a>: Sized {
+    fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self>;
+}
+
+impl<'a> FromStructField<'a> for ValueRef<'a> {
+    fn from_value(_field: &str, value: ValueRef<'a>) -> Result<Self> {
+        Ok(value)
+    }
+}
+
+impl<'a> FromStructField<'a> for StructHandle {
+    fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self> {
+        value
+            .as_struct_handle()
+            .ok_or_else(|| struct_field_type_error(field, "struct", value.as_value()))
+    }
+}
+
+impl<'a> FromStructField<'a> for StructInstance {
+    fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self> {
+        value
+            .as_struct_handle()
+            .map(|handle| handle.to_instance())
+            .ok_or_else(|| struct_field_type_error(field, "struct", value.as_value()))
+    }
+}
+
+impl<'a> FromStructField<'a> for ArrayHandle {
+    fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self> {
+        value
+            .as_array_handle()
+            .ok_or_else(|| struct_field_type_error(field, "array", value.as_value()))
+    }
+}
+
+impl<'a> FromStructField<'a> for MapHandle {
+    fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self> {
+        value
+            .as_map_handle()
+            .ok_or_else(|| struct_field_type_error(field, "map", value.as_value()))
+    }
+}
+
+impl<'a> FromStructField<'a> for LustInt {
+    fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self> {
+        value
+            .as_int()
+            .ok_or_else(|| struct_field_type_error(field, "int", value.as_value()))
+    }
+}
+
+impl<'a> FromStructField<'a> for LustFloat {
+    fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self> {
+        value
+            .as_float()
+            .ok_or_else(|| struct_field_type_error(field, "float", value.as_value()))
+    }
+}
+
+impl<'a> FromStructField<'a> for bool {
+    fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self> {
+        value
+            .as_bool()
+            .ok_or_else(|| struct_field_type_error(field, "bool", value.as_value()))
+    }
+}
+
+impl<'a> FromStructField<'a> for Rc<String> {
+    fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self> {
+        value
+            .as_rc_string()
+            .ok_or_else(|| struct_field_type_error(field, "string", value.as_value()))
+    }
+}
+
+impl<'a> FromStructField<'a> for Value {
+    fn from_value(_field: &str, value: ValueRef<'a>) -> Result<Self> {
+        Ok(value.into_owned())
+    }
+}
+
+impl<'a, T> FromStructField<'a> for Option<T>
+where
+    T: FromStructField<'a>,
+{
+    fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self> {
+        if matches!(value.as_value(), Value::Nil) {
+            Ok(None)
+        } else {
+            T::from_value(field, value).map(Some)
+        }
+    }
+}
+
+impl<'a> FromStructField<'a> for StringRef<'a> {
+    fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self> {
+        if value.as_string().is_some() {
+            Ok(StringRef::new(value))
+        } else {
+            Err(struct_field_type_error(field, "string", value.as_value()))
+        }
+    }
+}
+
+impl<'a> FromStructField<'a> for EnumInstance {
+    fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self> {
+        match value.as_value() {
+            Value::Enum { .. } => <EnumInstance as FromLustValue>::from_value(value.into_owned()),
+            other => Err(struct_field_type_error(field, "enum", other)),
+        }
+    }
+}
+
+pub trait LustStructView<'a>: Sized {
+    const TYPE_NAME: &'static str;
+
+    fn from_handle(handle: &'a StructHandle) -> Result<Self>;
+}
+
 pub trait IntoTypedValue {
     fn into_typed_value(self) -> TypedValue;
 }
@@ -1463,6 +2048,12 @@ impl IntoTypedValue for StructInstance {
             value,
         } = self;
         TypedValue::new(value, |v, ty| matches_lust_struct(v, ty), "struct")
+    }
+}
+
+impl IntoTypedValue for StructHandle {
+    fn into_typed_value(self) -> TypedValue {
+        <StructInstance as IntoTypedValue>::into_typed_value(self.into_instance())
     }
 }
 
@@ -1581,67 +2172,12 @@ fn string_matcher(_: &Value, ty: &Type) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll, Waker};
+    use crate::embed::LustStructView;
+    use std::rc::Rc;
 
-    #[derive(Default)]
-    struct ManualAsyncState {
-        result: Mutex<Option<std::result::Result<LustInt, String>>>,
-        waker: Mutex<Option<Waker>>,
-    }
-
-    impl ManualAsyncState {
-        fn new() -> Arc<Self> {
-            Arc::new(Self::default())
-        }
-
-        fn future(self: &Arc<Self>) -> ManualFuture {
-            ManualFuture {
-                state: Arc::clone(self),
-            }
-        }
-
-        fn complete_ok(&self, value: LustInt) {
-            self.complete(Ok(value));
-        }
-
-        fn complete_err(&self, message: impl Into<String>) {
-            self.complete(Err(message.into()));
-        }
-
-        fn complete(&self, value: std::result::Result<LustInt, String>) {
-            {
-                let mut slot = self.result.lock().unwrap();
-                *slot = Some(value);
-            }
-
-            if let Some(waker) = self.waker.lock().unwrap().take() {
-                waker.wake();
-            }
-        }
-    }
-
-    struct ManualFuture {
-        state: Arc<ManualAsyncState>,
-    }
-
-    impl Future for ManualFuture {
-        type Output = std::result::Result<LustInt, String>;
-
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            {
-                let mut slot = self.state.result.lock().unwrap();
-                if let Some(result) = slot.take() {
-                    return Poll::Ready(result);
-                }
-            }
-
-            let mut waker_slot = self.state.waker.lock().unwrap();
-            *waker_slot = Some(cx.waker().clone());
-            Poll::Pending
-        }
+    fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|err| err.into_inner())
     }
 
     fn build_program(source: &str) -> EmbeddedProgram {
@@ -1654,6 +2190,7 @@ mod tests {
 
     #[test]
     fn struct_instance_supports_mixed_field_types() {
+        let _guard = serial_guard();
         let source = r#"
             struct Mixed
                 count: int
@@ -1681,6 +2218,7 @@ mod tests {
 
     #[test]
     fn struct_instance_borrow_field_provides_reference_view() {
+        let _guard = serial_guard();
         let source = r#"
             struct Sample
                 name: string
@@ -1699,8 +2237,9 @@ mod tests {
 
     #[test]
     fn array_handle_allows_in_place_mutation() {
+        let _guard = serial_guard();
         let value = Value::array(vec![Value::Int(1)]);
-        let handle = ArrayHandle::from_value(value).expect("array handle");
+        let handle = <ArrayHandle as FromLustValue>::from_value(value).expect("array handle");
 
         {
             let mut slots = handle.borrow_mut();
@@ -1718,6 +2257,7 @@ mod tests {
 
     #[test]
     fn struct_instance_allows_setting_fields() {
+        let _guard = serial_guard();
         let source = r#"
             struct Mixed
                 count: int
@@ -1769,6 +2309,7 @@ mod tests {
 
     #[test]
     fn struct_instance_accepts_nested_structs() {
+        let _guard = serial_guard();
         let source = r#"
             struct Child
                 value: int
@@ -1792,7 +2333,143 @@ mod tests {
     }
 
     #[test]
+    fn struct_handle_allows_field_mutation() {
+        let _guard = serial_guard();
+        let source = r#"
+            struct Counter
+                value: int
+            end
+        "#;
+
+        let program = build_program(source);
+        let counter = program
+            .struct_instance("main.Counter", [struct_field("value", 1_i64)])
+            .expect("counter struct");
+        let handle = counter.to_handle();
+
+        handle
+            .set_field("value", 7_i64)
+            .expect("update through handle");
+        assert_eq!(handle.field::<i64>("value").expect("value field"), 7);
+        assert_eq!(counter.field::<i64>("value").expect("value field"), 7);
+
+        handle
+            .update_field("value", |current| match current {
+                Value::Int(v) => Ok(v + 1),
+                other => Err(LustError::RuntimeError {
+                    message: format!("unexpected value {other:?}"),
+                }),
+            })
+            .expect("increment value");
+        assert_eq!(counter.field::<i64>("value").expect("value field"), 8);
+    }
+
+    #[test]
+    fn value_ref_can_materialize_struct_handle() {
+        let _guard = serial_guard();
+        let source = r#"
+            struct Child
+                value: int
+            end
+
+            struct Parent
+                child: main.Child
+            end
+        "#;
+
+        let program = build_program(source);
+        let child = program
+            .struct_instance("main.Child", [struct_field("value", 10_i64)])
+            .expect("child struct");
+        let parent = program
+            .struct_instance("main.Parent", [struct_field("child", child)])
+            .expect("parent struct");
+
+        let handle = {
+            let child_ref = parent.borrow_field("child").expect("child field borrow");
+            child_ref
+                .as_struct_handle()
+                .expect("struct handle from value ref")
+        };
+        handle
+            .set_field("value", 55_i64)
+            .expect("update nested value");
+
+        let nested = parent
+            .field::<StructInstance>("child")
+            .expect("child field");
+        assert_eq!(nested.field::<i64>("value").expect("value field"), 55);
+    }
+
+    #[derive(crate::LustStructView)]
+    #[lust(type = "main.Child", crate = "crate")]
+    struct ChildView<'a> {
+        #[lust(field = "value")]
+        value: ValueRef<'a>,
+    }
+
+    #[derive(crate::LustStructView)]
+    #[lust(type = "main.Parent", crate = "crate")]
+    struct ParentView<'a> {
+        #[lust(field = "child")]
+        child: StructHandle,
+        #[lust(field = "label")]
+        label: StringRef<'a>,
+    }
+
+    #[test]
+    fn derive_struct_view_zero_copy() {
+        let _guard = serial_guard();
+        let source = r#"
+            struct Child
+                value: int
+            end
+
+            struct Parent
+                child: main.Child
+                label: string
+            end
+        "#;
+
+        let program = build_program(source);
+        let child = program
+            .struct_instance("main.Child", [struct_field("value", 7_i64)])
+            .expect("child struct");
+        let parent = program
+            .struct_instance(
+                "main.Parent",
+                [
+                    struct_field("child", child.clone()),
+                    struct_field("label", "parent label"),
+                ],
+            )
+            .expect("parent struct");
+
+        let handle = parent.to_handle();
+        let view = ParentView::from_handle(&handle).expect("construct view");
+        assert_eq!(view.child.field::<i64>("value").expect("child value"), 7);
+        let label_rc_from_view = view.label.as_rc();
+        assert_eq!(&*label_rc_from_view, "parent label");
+
+        let label_ref = parent.borrow_field("label").expect("borrow label");
+        let label_rc = label_ref.as_rc_string().expect("label rc");
+        assert!(Rc::ptr_eq(&label_rc_from_view, &label_rc));
+
+        let child_view = ChildView::from_handle(&view.child).expect("child view");
+        assert_eq!(child_view.value.as_int().expect("child value"), 7);
+
+        match ParentView::from_handle(&child.to_handle()) {
+            Ok(_) => panic!("expected type mismatch"),
+            Err(LustError::TypeError { message }) => {
+                assert!(message.contains("Parent"), "unexpected message: {message}");
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn globals_snapshot_exposes_lust_values() {
+        let _guard = serial_guard();
         let source = r#"
             struct Child
                 value: int
@@ -1819,7 +2496,8 @@ mod tests {
             .into_iter()
             .find(|(name, _)| name.ends_with("some_nested_structure"))
             .expect("global binding present");
-        let stored = StructInstance::from_value(value).expect("convert to struct");
+        let stored =
+            <StructInstance as FromLustValue>::from_value(value).expect("convert to struct");
         let child_value = stored
             .field::<StructInstance>("child")
             .expect("nested child");
@@ -1827,7 +2505,58 @@ mod tests {
     }
 
     #[test]
+    fn async_task_native_returns_task_handle() {
+        let _guard = serial_guard();
+        let source = r#"
+            extern {
+                function fetch_value(): Task
+            }
+
+            pub function start(): Task
+                return fetch_value()
+            end
+        "#;
+
+        let mut program = build_program(source);
+        program
+            .register_async_task_native::<(), LustInt, _, _>("fetch_value", move |_| async move {
+                Ok(42_i64)
+            })
+            .expect("register async task native");
+
+        let task_value = program
+            .call_raw("main.start", Vec::new())
+            .expect("call start");
+        let handle = match task_value {
+            Value::Task(handle) => handle,
+            other => panic!("expected task handle, found {other:?}"),
+        };
+
+        {
+            let mut driver = AsyncDriver::new(&mut program);
+            driver.pump_until_idle().expect("poll async");
+        }
+
+        let (state_label, last_result, err) = {
+            let vm = program.vm_mut();
+            let task = vm.get_task_instance(handle).expect("task instance");
+            (
+                task.state.as_str().to_string(),
+                task.last_result.clone(),
+                task.error.clone(),
+            )
+        };
+        assert_eq!(state_label, "completed");
+        assert!(err.is_none());
+        let int_value = last_result
+            .and_then(|value| value.as_int())
+            .expect("int result");
+        assert_eq!(int_value, 42);
+    }
+
+    #[test]
     fn update_field_modifies_value_in_place() {
+        let _guard = serial_guard();
         let source = r#"
             struct Counter
                 value: int
@@ -1873,111 +2602,6 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
         assert_eq!(counter.field::<i64>("value").expect("value field"), 15);
-    }
-
-    #[test]
-    fn async_native_resumes_task_on_completion() {
-        let source = r#"
-            extern {
-                function fetch_value(): int
-            }
-
-            function compute(): int
-                return fetch_value()
-            end
-        "#;
-
-        let mut program = build_program(source);
-
-        let state = ManualAsyncState::new();
-        let register_state = Arc::clone(&state);
-        program
-            .register_async_typed_native::<(), LustInt, _, _>("fetch_value", move |_| {
-                register_state.future()
-            })
-            .expect("register async native");
-
-        let handle = {
-            let vm = program.vm_mut();
-            let compute_fn = vm.function_value("main.compute").expect("compute function");
-            vm.spawn_task_value(compute_fn, Vec::new())
-                .expect("spawn task")
-        };
-
-        assert!(program.has_pending_async_tasks());
-        program.poll_async_tasks().expect("initial poll");
-        assert!(program.has_pending_async_tasks());
-
-        state.complete_ok(123);
-        program.poll_async_tasks().expect("resume after completion");
-
-        {
-            let vm = program.vm_mut();
-            let task = vm.get_task_instance(handle).expect("task exists");
-            let result = task
-                .last_result
-                .as_ref()
-                .and_then(|value| value.as_int())
-                .expect("task produced result");
-            assert_eq!(result, 123);
-            assert!(task.error.is_none());
-        }
-
-        assert!(!program.has_pending_async_tasks());
-    }
-
-    #[test]
-    fn async_native_failure_marks_task_failed() {
-        let source = r#"
-            extern {
-                function fetch_value(): int
-            }
-
-            function compute(): int
-                return fetch_value()
-            end
-        "#;
-
-        let mut program = build_program(source);
-
-        let state = ManualAsyncState::new();
-        let register_state = Arc::clone(&state);
-        program
-            .register_async_typed_native::<(), LustInt, _, _>("fetch_value", move |_| {
-                register_state.future()
-            })
-            .expect("register async native");
-
-        let handle = {
-            let vm = program.vm_mut();
-            let compute_fn = vm.function_value("main.compute").expect("compute function");
-            vm.spawn_task_value(compute_fn, Vec::new())
-                .expect("spawn task")
-        };
-
-        program.poll_async_tasks().expect("initial poll");
-        state.complete_err("boom");
-        let err = program
-            .poll_async_tasks()
-            .expect_err("poll should propagate failure");
-        match err {
-            LustError::RuntimeError { message } => assert_eq!(message, "boom"),
-            other => panic!("unexpected error: {other:?}"),
-        }
-
-        {
-            let vm = program.vm_mut();
-            let task = vm.get_task_instance(handle).expect("task exists");
-            assert!(task.last_result.is_none());
-            let error_message = task
-                .error
-                .as_ref()
-                .map(|e| e.to_string())
-                .expect("task should record error");
-            assert!(error_message.contains("boom"));
-        }
-
-        assert!(!program.has_pending_async_tasks());
     }
 }
 
@@ -2344,6 +2968,20 @@ impl IntoLustValue for StructInstance {
     }
 }
 
+impl IntoLustValue for StructHandle {
+    fn into_value(self) -> Value {
+        <StructInstance as IntoLustValue>::into_value(self.into_instance())
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        <StructInstance as IntoLustValue>::matches_lust_type(ty)
+    }
+
+    fn type_description() -> &'static str {
+        <StructInstance as IntoLustValue>::type_description()
+    }
+}
+
 impl FromLustValue for StructInstance {
     fn from_value(value: Value) -> Result<Self> {
         match &value {
@@ -2369,6 +3007,20 @@ impl FromLustValue for StructInstance {
 
     fn type_description() -> &'static str {
         "struct"
+    }
+}
+
+impl FromLustValue for StructHandle {
+    fn from_value(value: Value) -> Result<Self> {
+        <StructInstance as FromLustValue>::from_value(value).map(StructHandle::from)
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        <StructInstance as FromLustValue>::matches_lust_type(ty)
+    }
+
+    fn type_description() -> &'static str {
+        <StructInstance as FromLustValue>::type_description()
     }
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::vm::task::TaskKind;
 use alloc::{format, string::ToString};
 use core::{array, cell::RefCell, mem};
 impl VM {
@@ -15,6 +16,15 @@ impl VM {
                 })
             }
         };
+        if matches!(task.kind(), TaskKind::NativeFuture { .. }) {
+            let message = format!(
+                "Task {} is managed by the host runtime and cannot be resumed manually",
+                task_id.as_u64()
+            );
+            self.task_manager.attach(task);
+            return Err(LustError::RuntimeError { message });
+        }
+
         match task.state {
             TaskState::Completed | TaskState::Failed | TaskState::Stopped => {
                 let message = format!(
@@ -297,6 +307,61 @@ impl VM {
 
     pub fn current_task_handle(&self) -> Option<TaskHandle> {
         self.current_task.map(|id| id.to_handle())
+    }
+
+    pub fn create_native_future_task(&mut self) -> TaskHandle {
+        let id = self.task_manager.next_id();
+        let task = TaskInstance::new_native_future(id);
+        let handle = task.handle();
+        self.task_manager.insert(task);
+        handle
+    }
+
+    pub fn complete_native_future_task(
+        &mut self,
+        handle: TaskHandle,
+        outcome: std::result::Result<Value, String>,
+    ) -> Result<()> {
+        let task_id = self.task_id_from_handle(handle)?;
+        let mut task = match self.task_manager.detach(task_id) {
+            Some(task) => task,
+            None => {
+                return Err(LustError::RuntimeError {
+                    message: format!("Invalid task handle {}", handle.id()),
+                })
+            }
+        };
+
+        match task.kind_mut() {
+            TaskKind::NativeFuture { .. } => {
+                match outcome {
+                    Ok(value) => {
+                        task.state = TaskState::Completed;
+                        task.last_result = Some(value);
+                        task.error = None;
+                    }
+                    Err(err_msg) => {
+                        task.state = TaskState::Failed;
+                        task.last_result = None;
+                        task.error = Some(LustError::RuntimeError { message: err_msg });
+                    }
+                }
+                task.last_yield = None;
+                task.pending_return_value = None;
+                task.pending_return_dest = None;
+                task.yield_dest = None;
+                self.task_manager.attach(task);
+                Ok(())
+            }
+
+            TaskKind::Script => {
+                self.task_manager.attach(task);
+                Err(LustError::RuntimeError {
+                    message: "Attempted to complete a script task using native future completion"
+                        .to_string(),
+                })
+            }
+        }
     }
 
     pub(super) fn call_builtin_method(

@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "lust-analyzer"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "hashbrown 0.16.0",
  "lust-rs",
@@ -530,8 +530,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lust-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "lust-rs"
-version = "2.0.2"
+version = "2.1.2"
 dependencies = [
  "console_error_panic_hook",
  "dirs",
@@ -540,6 +549,7 @@ dependencies = [
  "hashbrown 0.16.0",
  "libloading",
  "libm",
+ "lust-macros",
  "serde",
  "tempfile",
  "thiserror",

@@ -1,10 +1,10 @@
 [workspace]
-members = [".", "crates/lust-analyzer"]
+members = [".", "crates/lust-analyzer", "crates/lust-macros"]
 exclude = ["examples/rust-extension/extensions/**"]
 
 [package]
 name = "lust-rs"
-version = "2.0.2"
+version = "2.1.2"
 edition = "2021"
 include = ["src/**", "include/**", "Cargo.toml", "README.md", "LICENSE"]
 license-file = "LICENSE"
@@ -31,7 +31,13 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = ["std", "packages"]
-std = ["dep:dynasmrt", "dep:toml", "serde/std", "thiserror/std"]
+std = [
+  "dep:dynasmrt",
+  "dep:toml",
+  "serde/std",
+  "thiserror/std",
+  "dep:lust-macros",
+]
 libloading = ["std", "dep:libloading"]
 dirs = ["std", "dep:dirs"]
 packages = ["std", "libloading", "dirs"]
@@ -56,6 +62,7 @@ hashbrown = { version = "0.16.0", default-features = false, features = [
   "equivalent",
 ] }
 libm = { version = "0.2.8", default-features = false }
+lust-macros = { path = "crates/lust-macros", optional = true }
 
 [build-dependencies]
 dynasm = "4.0.1"

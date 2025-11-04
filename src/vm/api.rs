@@ -410,6 +410,10 @@ impl VM {
             .map(Value::Function)
     }
 
+    pub fn function_name(&self, index: usize) -> Option<&str> {
+        self.functions.get(index).map(|f| f.name.as_str())
+    }
+
     pub fn fail_task_handle(&mut self, handle: TaskHandle, error: LustError) -> Result<()> {
         let task_id = self.task_id_from_handle(handle)?;
         let mut task =

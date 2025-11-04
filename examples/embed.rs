@@ -1,7 +1,7 @@
 use lust::embed::LustStructView as _;
 use lust::{
     struct_field, ArrayHandle, AsyncDriver, AsyncTaskQueue, EmbeddedProgram, FromLustValue,
-    LustStructView, MapHandle, StringRef, StructHandle, StructInstance, Value,
+    FunctionHandle, LustStructView, MapHandle, StringRef, StructHandle, StructInstance, Value,
 };
 
 #[derive(LustStructView)]
@@ -32,7 +32,7 @@ fn main() -> lust::Result<()> {
 
         extern {
             function host_scale(int): int
-            function fetch_value(): Task
+            function fetch_value(function(int)): Task
         }
 
         arr_global: Array<int> = [1, 2, 3]
@@ -76,11 +76,15 @@ fn main() -> lust::Result<()> {
         end
 
         pub function get_async_value(): Task
-            return fetch_value()
+            return fetch_value(function(value: int)
+                println("callback invoked from Rust with " .. tostring(value))
+            end)
         end
 
         pub function await_fetch(): Option<int>
-            local job = fetch_value()
+            local job = fetch_value(function(value: int)
+                println("callback (await) saw " .. tostring(value))
+            end)
             while true do
                 local info = task.info(job)
                 if info.state is TaskStatus.Completed then
@@ -165,6 +169,23 @@ fn main() -> lust::Result<()> {
         moved.field::<i64>("y")?
     );
 
+    let translate_handle = program.function_handle("main.translate")?;
+    let handle_point = program.struct_instance(
+        "main.Point",
+        [
+            struct_field("x", 2_i64),
+            struct_field("y", 3_i64),
+            struct_field("name", "HandlePoint"),
+        ],
+    )?;
+    let via_handle: StructInstance =
+        translate_handle.call_typed(&mut program, (handle_point, 1_i64, 1_i64))?;
+    println!(
+        "Translated via handle -> ({}, {})",
+        via_handle.field::<i64>("x")?,
+        via_handle.field::<i64>("y")?
+    );
+
     let total: i64 = program.call_typed("main.summarize", vec![1_i64, 2_i64, 3_i64])?;
     println!("Summarize([1,2,3]) = {total}");
 
@@ -206,8 +227,8 @@ fn main() -> lust::Result<()> {
         println!("Derived PointView ({}, {}, \"{}\")", view.x, view.y, name);
     }
 
-    let queue = AsyncTaskQueue::<(), lust::LustInt>::new();
-    program.register_async_task_queue::<(), lust::LustInt>("fetch_value", queue.clone())?;
+    let queue = AsyncTaskQueue::<FunctionHandle, lust::LustInt>::new();
+    program.register_async_task_queue::<FunctionHandle, lust::LustInt>("fetch_value", queue.clone())?;
 
     // Simulate Lust calling the native async function
     let lust_task = program.call_raw("main.get_async_value", Vec::new())?;
@@ -220,8 +241,11 @@ fn main() -> lust::Result<()> {
     let pending_job = queue
         .pop() // pop_blocking can be used for continuous blocking polling
         .expect("fetch_value should enqueue a pending job");
+    let callback = pending_job.args().clone();
+    println!("Rust: invoking Lust callback with 77");
+    callback.call_typed::<_, ()>(&mut program, 77_i64)?;
     let mut driver = AsyncDriver::new(&mut program);
-    pending_job.complete_ok(77);
+    pending_job.complete_ok(77_i64);
     driver.pump_until_idle()?;
 
     // Inspect the task via the VM just like scripts would

@@ -1011,6 +1011,20 @@ impl EmbeddedProgram {
         self.vm.call(function_name, args)
     }
 
+    pub fn function_handle(&self, function_name: &str) -> Result<FunctionHandle> {
+        let mut candidates = Vec::new();
+        candidates.push(function_name.to_string());
+        candidates.extend(self.signature_lookup_candidates(function_name));
+        for name in candidates {
+            if let Some(value) = self.vm.function_value(&name) {
+                return FunctionHandle::from_value(value);
+            }
+        }
+        Err(LustError::RuntimeError {
+            message: format!("Function '{}' not found in embedded program", function_name),
+        })
+    }
+
     pub fn run_entry_script(&mut self) -> Result<()> {
         let Some(entry) = &self.entry_script else {
             return Err(LustError::RuntimeError {
@@ -1467,6 +1481,124 @@ impl StructInstance {
     pub fn as_value(&self) -> &Value {
         &self.value
     }
+}
+
+#[derive(Clone)]
+pub struct FunctionHandle {
+    value: Value,
+}
+
+impl FunctionHandle {
+    fn is_callable_value(value: &Value) -> bool {
+        matches!(
+            value,
+            Value::Function(_) | Value::Closure { .. } | Value::NativeFunction(_)
+        )
+    }
+
+    fn new_unchecked(value: Value) -> Self {
+        Self { value }
+    }
+
+    pub fn from_value(value: Value) -> Result<Self> {
+        if Self::is_callable_value(&value) {
+            Ok(Self::new_unchecked(value))
+        } else {
+            Err(LustError::RuntimeError {
+                message: format!("Expected Lust value 'function' but received '{:?}'", value),
+            })
+        }
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.value
+    }
+
+    pub fn into_value(self) -> Value {
+        self.value
+    }
+
+    fn function_index(&self) -> Option<usize> {
+        match &self.value {
+            Value::Function(idx) => Some(*idx),
+            Value::Closure { function_idx, .. } => Some(*function_idx),
+            _ => None,
+        }
+    }
+
+    fn function_name<'a>(&'a self, program: &'a EmbeddedProgram) -> Option<&'a str> {
+        let idx = self.function_index()?;
+        program.vm.function_name(idx)
+    }
+
+    pub fn signature<'a>(
+        &'a self,
+        program: &'a EmbeddedProgram,
+    ) -> Option<(&'a str, &'a FunctionSignature)> {
+        let name = self.function_name(program)?;
+        program.signature(name).map(|sig| (name, sig))
+    }
+
+    pub fn matches_signature(
+        &self,
+        program: &EmbeddedProgram,
+        expected: &FunctionSignature,
+    ) -> bool {
+        match self.signature(program) {
+            Some((_, actual)) => signatures_match(actual, expected),
+            None => false,
+        }
+    }
+
+    pub fn validate_signature(
+        &self,
+        program: &EmbeddedProgram,
+        expected: &FunctionSignature,
+    ) -> Result<()> {
+        let (name, actual) = self.signature(program).ok_or_else(|| LustError::TypeError {
+            message: "No type information available for function value; use call_raw if the function is dynamically typed"
+                .into(),
+        })?;
+        if signatures_match(actual, expected) {
+            Ok(())
+        } else {
+            Err(LustError::TypeError {
+                message: format!(
+                    "Function '{}' signature mismatch: expected {}, found {}",
+                    name,
+                    signature_to_string(expected),
+                    signature_to_string(actual)
+                ),
+            })
+        }
+    }
+
+    pub fn call_raw(&self, program: &mut EmbeddedProgram, args: Vec<Value>) -> Result<Value> {
+        program.vm.call_value(self.as_value(), args)
+    }
+
+    pub fn call_typed<Args, R>(
+        &self,
+        program: &mut EmbeddedProgram,
+        args: Args,
+    ) -> Result<R>
+    where
+        Args: FunctionArgs,
+        R: FromLustValue,
+    {
+        let program_ref: &EmbeddedProgram = &*program;
+        let values = args.into_values();
+        if let Some((name, signature)) = self.signature(program_ref) {
+            Args::validate_signature(name, &signature.params)?;
+            ensure_return_type::<R>(name, &signature.return_type)?;
+            let value = program.vm.call_value(self.as_value(), values)?;
+            R::from_value(value)
+        } else {
+            let value = program.vm.call_value(self.as_value(), values)?;
+            R::from_value(value)
+        }
+    }
+
 }
 
 #[derive(Clone)]
@@ -1955,6 +2087,14 @@ impl<'a> FromStructField<'a> for MapHandle {
     }
 }
 
+impl<'a> FromStructField<'a> for FunctionHandle {
+    fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self> {
+        let owned = value.to_owned();
+        FunctionHandle::from_value(owned)
+            .map_err(|_| struct_field_type_error(field, "function", value.as_value()))
+    }
+}
+
 impl<'a> FromStructField<'a> for LustInt {
     fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self> {
         value
@@ -2065,6 +2205,13 @@ impl IntoTypedValue for EnumInstance {
             value,
         } = self;
         TypedValue::new(value, |v, ty| matches_lust_enum(v, ty), "enum")
+    }
+}
+
+impl IntoTypedValue for FunctionHandle {
+    fn into_typed_value(self) -> TypedValue {
+        let value = self.into_value();
+        TypedValue::new(value, |_v, ty| matches_function_handle_type(ty), "function")
     }
 }
 
@@ -2505,6 +2652,46 @@ mod tests {
     }
 
     #[test]
+    fn function_handle_supports_typed_and_raw_calls() {
+        let _guard = serial_guard();
+        let source = r#"
+            pub function add(a: int, b: int): int
+                return a + b
+            end
+        "#;
+
+        let mut program = build_program(source);
+        let handle = program
+            .function_handle("main.add")
+            .expect("function handle");
+
+        let typed: i64 = handle
+            .call_typed(&mut program, (2_i64, 3_i64))
+            .expect("typed call");
+        assert_eq!(typed, 5);
+
+        let raw = handle
+            .call_raw(&mut program, vec![Value::Int(4_i64), Value::Int(6_i64)])
+            .expect("raw call");
+        assert_eq!(raw.as_int(), Some(10));
+
+        let signature = program
+            .signature("main.add")
+            .expect("signature")
+            .clone();
+        handle
+            .validate_signature(&program, &signature)
+            .expect("matching signature");
+
+        let mut mismatched = signature.clone();
+        mismatched.return_type = Type::new(TypeKind::Bool, Span::new(0, 0, 0, 0));
+        assert!(
+            handle.validate_signature(&program, &mismatched).is_err(),
+            "expected signature mismatch"
+        );
+    }
+
+    #[test]
     fn async_task_native_returns_task_handle() {
         let _guard = serial_guard();
         let source = r#"
@@ -2679,6 +2866,36 @@ fn matches_map_handle_type(ty: &Type) -> bool {
         TypeKind::Union(types) => types.iter().any(|alt| matches_map_handle_type(alt)),
         _ => false,
     }
+}
+
+fn matches_function_handle_type(ty: &Type) -> bool {
+    match &ty.kind {
+        TypeKind::Function { .. } | TypeKind::Unknown => true,
+        TypeKind::Union(types) => types.iter().any(|alt| matches_function_handle_type(alt)),
+        _ => false,
+    }
+}
+
+fn signatures_match(a: &FunctionSignature, b: &FunctionSignature) -> bool {
+    if a.is_method != b.is_method || a.params.len() != b.params.len() {
+        return false;
+    }
+
+    if a.return_type != b.return_type {
+        return false;
+    }
+
+    a.params.iter().zip(&b.params).all(|(left, right)| left == right)
+}
+
+fn signature_to_string(signature: &FunctionSignature) -> String {
+    let params = signature
+        .params
+        .iter()
+        .map(|param| param.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("function({}) -> {}", params, signature.return_type)
 }
 
 pub trait FromLustArgs: Sized {
@@ -2982,6 +3199,20 @@ impl IntoLustValue for StructHandle {
     }
 }
 
+impl IntoLustValue for FunctionHandle {
+    fn into_value(self) -> Value {
+        self.into_value()
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        matches_function_handle_type(ty)
+    }
+
+    fn type_description() -> &'static str {
+        "function"
+    }
+}
+
 impl FromLustValue for StructInstance {
     fn from_value(value: Value) -> Result<Self> {
         match &value {
@@ -3021,6 +3252,26 @@ impl FromLustValue for StructHandle {
 
     fn type_description() -> &'static str {
         <StructInstance as FromLustValue>::type_description()
+    }
+}
+
+impl FromLustValue for FunctionHandle {
+    fn from_value(value: Value) -> Result<Self> {
+        if FunctionHandle::is_callable_value(&value) {
+            Ok(FunctionHandle::new_unchecked(value))
+        } else {
+            Err(LustError::RuntimeError {
+                message: format!("Expected Lust value 'function' but received '{:?}'", value),
+            })
+        }
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        matches_function_handle_type(ty)
+    }
+
+    fn type_description() -> &'static str {
+        "function"
     }
 }
 

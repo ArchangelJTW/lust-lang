@@ -2,6 +2,13 @@
 name = "lust-macros"
 version = "0.1.0"
 edition = "2021"
+include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
+license-file = "LICENSE"
+readme = "README.md"
+keywords = ["lust", "macros"]
+categories = ["development-tools"]
+description = "Procedural macros for the Lust programming language"
+homepage = "https://lust-lang.dev/"
 
 [lib]
 proc-macro = true

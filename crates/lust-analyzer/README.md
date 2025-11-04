@@ -1,6 +1,6 @@
 # Lust Analyzer
 
-[lust-lang.dev](https://lust-lang.dev) · [Docs](https://lust-lang.dev/docs) · [Core crate](https://crates.io/crates/lust-lang)
+[lust-lang.dev](https://lust-lang.dev) · [Docs](https://lust-lang.dev/docs) · [Core crate](https://crates.io/crates/lust-rs)
 
 Heavily WIP language server for the Lust scripting language. It targets editor integrations by forwarding parsing, typing, and diagnostics through the main `lust` library.
 

@@ -284,11 +284,24 @@ impl TypeChecker {
         }
 
         if option_candidates.len() >= 2 {
-            let mut resolved_inner = option_candidates[0].clone();
+            let resolved_inner = option_candidates[0].clone();
+            let mut all_compatible = true;
             for candidate in option_candidates.iter().skip(1) {
-                self.unify(&resolved_inner, candidate)?;
+                if self
+                    .unify(&resolved_inner, candidate)
+                    .and_then(|_| self.unify(candidate, &resolved_inner))
+                    .is_err()
+                {
+                    all_compatible = false;
+                    break;
+                }
             }
-            resolved_inner = self.canonicalize_type(&resolved_inner);
+
+            let resolved_inner = if all_compatible {
+                self.canonicalize_type(&resolved_inner)
+            } else {
+                self.canonicalize_type(&self.make_union_from_types(option_candidates))
+            };
             let option_type = Type::new(TypeKind::Option(Box::new(resolved_inner.clone())), span);
             self.record_short_circuit_info(
                 span,

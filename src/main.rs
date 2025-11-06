@@ -110,14 +110,6 @@ fn print_help(program: &str) {
             "    {} pkg <command> [options]         Manage Lust packages",
             program
         );
-        println!(
-            "    {} login [--token <token>]         Authenticate with the registry",
-            program
-        );
-        println!(
-            "    {} logout                          Clear registry credentials",
-            program
-        );
     }
     println!();
     println!("EXAMPLES:");

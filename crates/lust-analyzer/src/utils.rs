@@ -466,6 +466,7 @@ pub(crate) fn span_for_identifier(
     ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn analyzer_lust_config() -> LustConfig {
     let mut config = LustConfig::default();
     config.enable_module("io");

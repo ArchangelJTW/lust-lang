@@ -40,7 +40,12 @@ std = [
 ]
 libloading = ["std", "dep:libloading"]
 dirs = ["std", "dep:dirs"]
-packages = ["std", "libloading", "dirs"]
+packages = [
+  "std",
+  "libloading",
+  "dirs",
+  "dep:serde_json",
+]
 
 [[bin]]
 name = "lust"
@@ -63,6 +68,7 @@ hashbrown = { version = "0.16.0", default-features = false, features = [
 ] }
 libm = { version = "0.2.8", default-features = false }
 lust-macros = { path = "crates/lust-macros", version = "0.1.0", optional = true }
+serde_json = { version = "1.0.128", optional = true, features = ["std"] }
 
 [build-dependencies]
 dynasm = "4.0.1"

@@ -1,15 +1,23 @@
 #![cfg(feature = "std")]
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
-use lust::{
-    build_local_module, collect_stub_files, load_local_module, stub_files_from_exports,
-    write_stub_files, LoadedRustModule,
+use lust::packages::{
+    build_local_module, build_package_archive, clear_credentials, collect_stub_files,
+    credentials_file, load_credentials, load_local_module, resolve_dependencies, save_credentials,
+    stub_files_from_exports, write_stub_files, BuildOptions, DependencyResolution,
+    DownloadedArchive, LocalBuildOutput, PackageManager, PackageManifest, RegistryClient,
+    ResolvedRustDependency, StubFile, DEFAULT_BASE_URL,
 };
-use lust::{Compiler, Item, LustConfig, ModuleLoader, Span, TypeChecker, VM};
-use std::env;
-use std::fs;
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
-use std::path::Path;
-use std::process;
+use lust::LoadedRustModule;
+use lust::{Compiler, Item, LustConfig, ModuleLoader, Span, TypeChecker, VM};
+use std::{
+    env, fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    process::{self, Command},
+};
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+use toml::{self, map::Map, Value};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
@@ -46,6 +54,14 @@ fn main() {
             dump_externs(&args[2]);
         }
 
+        #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+        "pkg" => {
+            if let Err(err) = handle_pkg_command(&args) {
+                eprintln!("Error: {err}");
+                process::exit(1);
+            }
+        }
+
         filename => {
             run_file(filename, false);
         }
@@ -56,6 +72,12 @@ fn print_usage(program: &str) {
     eprintln!("Usage: {} [options] <script.lust>", program);
     eprintln!("       {} --help", program);
     eprintln!("       {} --version", program);
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+    {
+        eprintln!("       {} pkg <command> [options]", program);
+        eprintln!("       {} login [--token <token>]", program);
+        eprintln!("       {} logout", program);
+    }
 }
 
 fn print_help(program: &str) {
@@ -82,6 +104,21 @@ fn print_help(program: &str) {
         "    {} --dump-externs <script.lust>    Create extern stubs for rust library modules",
         program
     );
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+    {
+        println!(
+            "    {} pkg <command> [options]         Manage Lust packages",
+            program
+        );
+        println!(
+            "    {} login [--token <token>]         Authenticate with the registry",
+            program
+        );
+        println!(
+            "    {} logout                          Clear registry credentials",
+            program
+        );
+    }
     println!();
     println!("EXAMPLES:");
     println!(
@@ -99,6 +136,433 @@ fn print_version() {
 }
 
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn handle_pkg_command(args: &[String]) -> Result<(), String> {
+    if args.len() < 3 {
+        print_pkg_usage(&args[0]);
+        return Err("pkg requires a subcommand".to_string());
+    }
+
+    let program = args[0].clone();
+    let subcommand = args[2].as_str();
+    let rest = &args[3..];
+
+    match subcommand {
+        "add" => handle_pkg_add(&program, rest),
+        "remove" => handle_pkg_remove(&program, rest),
+        "login" => handle_pkg_login(&program, rest),
+        "logout" => handle_pkg_logout(&program, rest),
+        "publish" => handle_pkg_publish(&program, rest),
+        "help" | "--help" | "-h" => {
+            print_pkg_usage(&program);
+            Ok(())
+        }
+        other => {
+            print_pkg_usage(&program);
+            Err(format!("unknown pkg command '{other}'"))
+        }
+    }
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn print_pkg_usage(program: &str) {
+    println!("Package commands:");
+    println!("  {program} pkg add <name[@version]> [--registry <url>]");
+    println!("  {program} pkg remove <name>");
+    println!("  {program} pkg login [--token <token>]");
+    println!("  {program} pkg logout");
+    println!("  {program} pkg publish [--manifest-path <path>] [--token <token>] [--registry <url>] [--readme <path>]");
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn handle_pkg_add(program: &str, args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        print_pkg_usage(program);
+        return Err("pkg add requires a package spec".to_string());
+    }
+    let spec = &args[0];
+    let mut registry: Option<String> = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--registry" => {
+                let value = take_option_value(args, &mut index, "--registry")?;
+                registry = Some(value);
+            }
+            other => {
+                return Err(format!("unknown option '{other}'"));
+            }
+        }
+        index += 1;
+    }
+
+    let (name, requested_version) = parse_dependency_spec(spec)?;
+    let registry_url = resolve_registry_base(registry.as_deref());
+    let client = RegistryClient::new(&registry_url).map_err(|err| err.to_string())?;
+    let details = client
+        .package_details(&name)
+        .map_err(|err| err.to_string())?;
+    let (download_target, resolved_version) = match requested_version {
+        Some(version) => {
+            let exists = details.versions.iter().any(|info| info.version == version);
+            if !exists {
+                return Err(format!(
+                    "package '{name}' does not have published version '{version}'"
+                ));
+            }
+            (version.clone(), version)
+        }
+        None => {
+            let latest = details
+                .latest_version
+                .and_then(|info| {
+                    let trimmed = info.version.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(info.version.clone())
+                    }
+                })
+                .ok_or_else(|| format!("package '{name}' does not have any published versions"))?;
+            ("latest".to_string(), latest)
+        }
+    };
+
+    let archive: DownloadedArchive = client
+        .download_package(&name, &download_target)
+        .map_err(|err| err.to_string())?;
+    let manager = PackageManager::new(PackageManager::default_root());
+    manager.ensure_layout().map_err(|err| err.to_string())?;
+    let package_dir = manager.root().join(&name).join(&resolved_version);
+    if package_dir.exists() {
+        fs::remove_dir_all(&package_dir).map_err(|err| err.to_string())?;
+    }
+    extract_package_archive(archive.path(), &package_dir)?;
+
+    update_dependency_in_config(&name, &resolved_version)?;
+    println!(
+        "Added {} {} (stored in {})",
+        name,
+        resolved_version,
+        package_dir.display()
+    );
+    Ok(())
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn handle_pkg_remove(program: &str, args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        print_pkg_usage(program);
+        return Err("pkg remove requires a package name".to_string());
+    }
+    let name = args[0].trim();
+    if name.is_empty() {
+        return Err("package name cannot be empty".to_string());
+    }
+
+    remove_dependency_from_config(name)?;
+    println!("Removed dependency '{}'", name);
+    Ok(())
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn parse_dependency_spec(spec: &str) -> Result<(String, Option<String>), String> {
+    let mut parts = spec.splitn(2, '@');
+    let name = parts
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "package name cannot be empty".to_string())?
+        .to_string();
+    let version = parts
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    Ok((name, version))
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn resolve_registry_base(input: Option<&str>) -> String {
+    match input {
+        Some(value) => {
+            if value.ends_with('/') {
+                value.to_string()
+            } else {
+                format!("{value}/")
+            }
+        }
+        None => DEFAULT_BASE_URL.to_string(),
+    }
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn extract_package_archive(archive_path: &Path, destination: &Path) -> Result<(), String> {
+    if destination.exists() {
+        fs::remove_dir_all(destination).map_err(|err| err.to_string())?;
+    }
+    fs::create_dir_all(destination).map_err(|err| err.to_string())?;
+    let status = Command::new(resolve_tar_command())
+        .arg("-xzf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(destination)
+        .status()
+        .map_err(|err| err.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to extract archive with tar (exit code {})",
+            status.code().unwrap_or(-1)
+        ))
+    }
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn resolve_tar_command() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "tar.exe"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "tar"
+    }
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn configuration_path() -> Result<std::path::PathBuf, String> {
+    env::current_dir()
+        .map(|dir| dir.join("lust-config.toml"))
+        .map_err(|err| err.to_string())
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn read_or_create_config(path: &Path) -> Result<Value, String> {
+    if path.exists() {
+        let content = fs::read_to_string(path).map_err(|err| err.to_string())?;
+        toml::from_str(&content).map_err(|err| err.to_string())
+    } else {
+        let mut root = Map::new();
+        root.insert("settings".into(), Value::Table(Map::new()));
+        Ok(Value::Table(root))
+    }
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn ensure_dependencies_table<'a>(doc: &'a mut Value) -> Result<&'a mut Map<String, Value>, String> {
+    let table = doc
+        .as_table_mut()
+        .ok_or_else(|| "configuration root must be a table".to_string())?;
+    let settings_entry = table
+        .entry("settings".to_string())
+        .or_insert_with(|| Value::Table(Map::new()));
+    let settings_table = settings_entry
+        .as_table_mut()
+        .ok_or_else(|| "[settings] must be a table".to_string())?;
+    let deps_entry = settings_table
+        .entry("dependencies".to_string())
+        .or_insert_with(|| Value::Table(Map::new()));
+    deps_entry
+        .as_table_mut()
+        .ok_or_else(|| "[settings.dependencies] must be a table".to_string())
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn update_dependency_in_config(name: &str, version: &str) -> Result<(), String> {
+    let path = configuration_path()?;
+    let mut doc = read_or_create_config(&path)?;
+    {
+        let deps = ensure_dependencies_table(&mut doc)?;
+        deps.insert(name.to_string(), Value::String(version.to_string()));
+    }
+    let content = toml::to_string_pretty(&doc).map_err(|err| err.to_string())?;
+    fs::write(&path, content).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn remove_dependency_from_config(name: &str) -> Result<(), String> {
+    let path = configuration_path()?;
+    if !path.exists() {
+        return Err("no lust-config.toml found in the current directory".to_string());
+    }
+    let mut doc = read_or_create_config(&path)?;
+    {
+        let table = doc
+            .as_table_mut()
+            .ok_or_else(|| "configuration root must be a table".to_string())?;
+        let settings = match table.get_mut("settings") {
+            Some(value) => value
+                .as_table_mut()
+                .ok_or_else(|| "[settings] must be a table".to_string())?,
+            None => return Err(format!("dependency '{name}' not found")),
+        };
+        let deps = match settings.get_mut("dependencies") {
+            Some(value) => value
+                .as_table_mut()
+                .ok_or_else(|| "[settings.dependencies] must be a table".to_string())?,
+            None => return Err(format!("dependency '{name}' not found")),
+        };
+        if deps.remove(name).is_none() {
+            return Err(format!("dependency '{name}' not found"));
+        }
+        if deps.is_empty() {
+            settings.remove("dependencies");
+        }
+    }
+    let content = toml::to_string_pretty(&doc).map_err(|err| err.to_string())?;
+    fs::write(&path, content).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn handle_pkg_login(program: &str, args: &[String]) -> Result<(), String> {
+    let mut token_arg: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--token" => {
+                let value = take_option_value(args, &mut index, "--token")?;
+                token_arg = Some(value);
+            }
+            "--help" | "-h" => {
+                println!("Usage: {program} pkg login [--token <token>]");
+                return Ok(());
+            }
+            other => {
+                return Err(format!("unknown login option '{other}'"));
+            }
+        }
+        index += 1;
+    }
+
+    let mut token = token_arg.unwrap_or_default();
+    if token.is_empty() {
+        print!("Enter API token: ");
+        io::stdout().flush().map_err(|err| err.to_string())?;
+        io::stdin()
+            .read_line(&mut token)
+            .map_err(|err| err.to_string())?;
+    }
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("token cannot be empty".to_string());
+    }
+
+    save_credentials(token).map_err(|err| err.to_string())?;
+    let path = credentials_file().map_err(|err| err.to_string())?;
+    println!("Saved token to {}", path.display());
+    Ok(())
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn handle_pkg_logout(program: &str, args: &[String]) -> Result<(), String> {
+    if let Some(flag) = args.first() {
+        if flag == "--help" || flag == "-h" {
+            println!("Usage: {program} pkg logout");
+            return Ok(());
+        }
+        return Err(format!(
+            "pkg logout does not take any arguments (unexpected '{flag}')"
+        ));
+    }
+
+    let had_credentials = load_credentials().map_err(|err| err.to_string())?.is_some();
+    clear_credentials().map_err(|err| err.to_string())?;
+    if had_credentials {
+        println!("Cleared stored Lust package token.");
+    } else {
+        println!("No stored token was found.");
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn handle_pkg_publish(program: &str, args: &[String]) -> Result<(), String> {
+    let mut manifest_path: Option<PathBuf> = None;
+    let mut token_override: Option<String> = None;
+    let mut registry: Option<String> = None;
+    let mut readme_path: Option<PathBuf> = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--manifest-path" => {
+                let value = take_option_value(args, &mut index, "--manifest-path")?;
+                manifest_path = Some(PathBuf::from(value));
+            }
+            "--token" => {
+                let value = take_option_value(args, &mut index, "--token")?;
+                token_override = Some(value);
+            }
+            "--registry" => {
+                let value = take_option_value(args, &mut index, "--registry")?;
+                registry = Some(value);
+            }
+            "--readme" => {
+                let value = take_option_value(args, &mut index, "--readme")?;
+                readme_path = Some(PathBuf::from(value));
+            }
+            "--help" | "-h" => {
+                println!(
+                    "Usage: {program} pkg publish [--manifest-path <path>] [--token <token>] [--registry <url>] [--readme <path>]"
+                );
+                return Ok(());
+            }
+            other => {
+                return Err(format!("unknown publish option '{other}'"));
+            }
+        }
+        index += 1;
+    }
+
+    let manifest = if let Some(path) = manifest_path {
+        PackageManifest::discover(path.as_path()).map_err(|err| err.to_string())?
+    } else {
+        PackageManifest::discover(Path::new(".")).map_err(|err| err.to_string())?
+    };
+
+    let readme = if let Some(path) = readme_path {
+        Some(
+            fs::read_to_string(&path)
+                .map_err(|err| format!("failed to read readme '{}': {err}", path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    let token = match token_override {
+        Some(token) => token,
+        None => load_credentials()
+            .map_err(|err| err.to_string())?
+            .map(|creds| creds.token().to_string())
+            .ok_or_else(|| "no stored token; run 'lust pkg login' first".to_string())?,
+    };
+
+    let registry_url = resolve_registry_base(registry.as_deref());
+    let client = RegistryClient::new(&registry_url).map_err(|err| err.to_string())?;
+
+    let archive = build_package_archive(manifest.root()).map_err(|err| err.to_string())?;
+    let response = client
+        .publish(&manifest, &token, &archive, readme.as_deref())
+        .map_err(|err| err.to_string())?;
+
+    println!("Published {} {}", response.package, response.version);
+    println!("Artifact SHA256: {}", response.artifact_sha256);
+    println!("Download URL: {}", response.download_url);
+    Ok(())
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn take_option_value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
+    *index += 1;
+    args.get(*index)
+        .cloned()
+        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 fn dump_externs(filename: &str) {
     let config = match LustConfig::load_for_entry(filename) {
         Ok(cfg) => cfg,
@@ -107,14 +571,23 @@ fn dump_externs(filename: &str) {
             process::exit(1);
         }
     };
-    let modules: Vec<_> = config.rust_modules().collect();
-    if modules.is_empty() {
-        println!("No Rust modules configured; nothing to dump.");
+    let entry_path = Path::new(filename);
+    let project_dir = entry_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let resolution = match resolve_dependencies(&config, &project_dir) {
+        Ok(res) => res,
+        Err(err) => {
+            eprintln!("Error resolving dependencies: {}", err);
+            process::exit(1);
+        }
+    };
+    if resolution.rust().is_empty() {
+        println!("No Rust dependencies configured; nothing to dump.");
         return;
     }
 
-    let entry_path = Path::new(filename);
-    let project_dir = entry_path.parent().unwrap_or_else(|| Path::new("."));
     let output_root = project_dir.join("externs");
     if let Err(e) = fs::create_dir_all(&output_root) {
         eprintln!(
@@ -126,52 +599,21 @@ fn dump_externs(filename: &str) {
     }
 
     let mut wrote_any = false;
-    for module in modules {
-        let build = match build_local_module(module.path()) {
-            Ok(build) => build,
+    for dep in resolution.rust() {
+        let (build, stubs) = match collect_rust_dependency_artifacts(dep) {
+            Ok(result) => result,
             Err(err) => {
                 eprintln!(
-                    "Failed to build Rust module '{}': {}",
-                    module.path().display(),
+                    "Failed to gather externs for '{}': {}",
+                    dep.crate_dir.display(),
                     err
                 );
                 process::exit(1);
             }
         };
-        let mut preview_vm = VM::new();
-        let preview_module = match load_local_module(&mut preview_vm, &build) {
-            Ok(lib) => lib,
-            Err(err) => {
-                eprintln!(
-                    "Failed to load Rust module '{}': {}",
-                    module.path().display(),
-                    err
-                );
-                process::exit(1);
-            }
-        };
-        let exports = preview_vm.take_exported_natives();
-        preview_vm.clear_native_functions();
-        drop(preview_module);
-        let mut stubs = stub_files_from_exports(&exports);
-        let extern_dir = module.externs_dir();
-        let manual_stubs = match collect_stub_files(module.path(), extern_dir.as_deref()) {
-            Ok(stubs) => stubs,
-            Err(err) => {
-                eprintln!(
-                    "Failed to collect extern stubs for '{}': {}",
-                    module.path().display(),
-                    err
-                );
-                process::exit(1);
-            }
-        };
-        if !manual_stubs.is_empty() {
-            stubs.extend(manual_stubs);
-        }
         if stubs.is_empty() {
             println!(
-                "Warning: module '{}' did not expose any extern metadata or stub files",
+                "Warning: dependency '{}' did not expose any extern metadata or stub files",
                 build.name
             );
             continue;
@@ -183,12 +625,19 @@ fn dump_externs(filename: &str) {
                 process::exit(1);
             }
         };
-        if written.is_empty() {
-            println!(
-                "Warning: module '{}' produced no extern files despite signatures",
-                build.name
-            );
-            continue;
+        if let Some(cache_dir) = &dep.cache_stub_dir {
+            if let Err(err) = fs::create_dir_all(cache_dir) {
+                eprintln!(
+                    "Failed to create extern cache directory '{}': {}",
+                    cache_dir.display(),
+                    err
+                );
+            } else if let Err(err) = write_stub_files(&build.name, &stubs, cache_dir) {
+                eprintln!(
+                    "Failed to write extern stubs for '{}' to cache: {}",
+                    build.name, err
+                );
+            }
         }
         for path in &written {
             println!(
@@ -214,16 +663,69 @@ fn dump_externs(_: &str) {
 }
 
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
-fn load_local_extensions(
-    config: &LustConfig,
+fn collect_rust_dependency_artifacts(
+    dep: &ResolvedRustDependency,
+) -> Result<(LocalBuildOutput, Vec<StubFile>), String> {
+    let build = build_local_module(
+        &dep.crate_dir,
+        BuildOptions {
+            features: &dep.features,
+            default_features: dep.default_features,
+        },
+    )
+    .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
+
+    let mut preview_vm = VM::new();
+    let preview_module = load_local_module(&mut preview_vm, &build)
+        .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
+    let exports = preview_vm.take_exported_natives();
+    preview_vm.clear_native_functions();
+    drop(preview_module);
+
+    let mut stubs = stub_files_from_exports(&exports);
+    let manual_stubs = collect_stub_files(&dep.crate_dir, dep.externs_override.as_deref())
+        .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
+    if !manual_stubs.is_empty() {
+        stubs.extend(manual_stubs);
+    }
+
+    Ok((build, stubs))
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn load_rust_dependencies(
+    deps: &DependencyResolution,
+    project_dir: &Path,
     vm: &mut VM,
 ) -> Result<Vec<LoadedRustModule>, String> {
     let mut loaded = Vec::new();
-    for module in config.rust_modules() {
-        let build = build_local_module(module.path())
-            .map_err(|err| format!("{}: {}", module.path().display(), err))?;
+    if deps.rust().is_empty() {
+        return Ok(loaded);
+    }
+
+    let extern_root = project_dir.join("externs");
+    fs::create_dir_all(&extern_root)
+        .map_err(|err| format!("{}: {}", extern_root.display(), err))?;
+
+    for dep in deps.rust() {
+        let (build, stubs) = collect_rust_dependency_artifacts(dep)?;
+        if !stubs.is_empty() {
+            write_stub_files(&build.name, &stubs, &extern_root)
+                .map_err(|err| format!("{}: {}", extern_root.display(), err))?;
+            if let Some(cache_dir) = &dep.cache_stub_dir {
+                fs::create_dir_all(cache_dir).map_err(|err| {
+                    format!(
+                        "failed to create extern cache '{}': {}",
+                        cache_dir.display(),
+                        err
+                    )
+                })?;
+                write_stub_files(&build.name, &stubs, cache_dir)
+                    .map_err(|err| format!("{}: {}", cache_dir.display(), err))?;
+            }
+        }
         let loaded_module = load_local_module(vm, &build)
-            .map_err(|err| format!("{}: {}", module.path().display(), err))?;
+            .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
         loaded.push(loaded_module);
     }
 
@@ -238,6 +740,11 @@ fn run_file(filename: &str, disassemble: bool) {
             process::exit(1);
         }
     };
+    let entry_path = Path::new(filename);
+    let project_dir = entry_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
     let config = match LustConfig::load_for_entry(filename) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -245,8 +752,20 @@ fn run_file(filename: &str, disassemble: bool) {
             process::exit(1);
         }
     };
-    let (functions, trait_impls, init_funcs, struct_defs) = match compile_program(filename, &config)
-    {
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+    let dependency_resolution = match resolve_dependencies(&config, &project_dir) {
+        Ok(res) => res,
+        Err(err) => {
+            eprintln!("Error resolving dependencies: {}", err);
+            process::exit(1);
+        }
+    };
+    let (functions, trait_impls, init_funcs, struct_defs) = match compile_program(
+        filename,
+        &config,
+        #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+        Some(&dependency_resolution),
+    ) {
         Ok(result) => result,
         Err(e) => {
             print_error_with_context(&source, filename, &e);
@@ -272,13 +791,14 @@ fn run_file(filename: &str, disassemble: bool) {
     }
 
     #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
-    let _loaded_extensions = match load_local_extensions(&config, &mut vm) {
-        Ok(mods) => mods,
-        Err(err) => {
-            eprintln!("Failed to load Rust extensions: {}", err);
-            process::exit(1);
-        }
-    };
+    let _loaded_extensions =
+        match load_rust_dependencies(&dependency_resolution, &project_dir, &mut vm) {
+            Ok(mods) => mods,
+            Err(err) => {
+                eprintln!("Failed to load Rust dependencies: {}", err);
+                process::exit(1);
+            }
+        };
     for init in init_funcs {
         if let Err(e) = vm.call(&init, vec![]) {
             print_error_with_context(&source, filename, &e);
@@ -295,6 +815,9 @@ fn run_file(filename: &str, disassemble: bool) {
 fn compile_program(
     entry_filename: &str,
     config: &LustConfig,
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))] deps: Option<
+        &DependencyResolution,
+    >,
 ) -> Result<
     (
         Vec<lust::bytecode::Function>,
@@ -304,7 +827,26 @@ fn compile_program(
     ),
     lust::LustError,
 > {
-    let mut loader = ModuleLoader::new(".");
+    let entry_path = Path::new(entry_filename);
+    let entry_dir = entry_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut loader = ModuleLoader::new(entry_dir.to_path_buf());
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+    if let Some(resolution) = deps {
+        for dependency in resolution.lust() {
+            loader.add_module_root(
+                dependency.name.clone(),
+                dependency.module_root.clone(),
+                dependency.root_module.clone(),
+            );
+            if let Some(alias) = &dependency.sanitized_name {
+                loader.add_module_root(
+                    alias.clone(),
+                    dependency.module_root.clone(),
+                    dependency.root_module.clone(),
+                );
+            }
+        }
+    }
     let program = loader.load_program_from_entry(entry_filename)?;
     use hashbrown::HashMap;
     let mut imports_map: HashMap<String, lust::modules::ModuleImports> = HashMap::new();

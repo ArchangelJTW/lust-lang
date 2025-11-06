@@ -6,7 +6,7 @@ use crate::utils::{
 };
 use lust::modules::ModuleLoader;
 use lust::TypeChecker;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,7 +78,14 @@ end
     let enum_defs = typechecker.enum_definitions();
     let type_info = typechecker.take_type_info();
     let snapshot =
-        AnalysisSnapshot::new(&program, type_info, &HashMap::new(), struct_defs, enum_defs);
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
     let module_path = snapshot
         .module_path_for_file(&entry_path)
         .expect("module path")
@@ -149,7 +156,14 @@ end
     let enum_defs = typechecker.enum_definitions();
     let type_info = typechecker.take_type_info();
     let snapshot =
-        AnalysisSnapshot::new(&program, type_info, &HashMap::new(), struct_defs, enum_defs);
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
     let module_path = snapshot
         .module_path_for_file(&entry_path)
         .expect("module path")
@@ -229,7 +243,14 @@ end
     let enum_defs = typechecker.enum_definitions();
     let type_info = typechecker.take_type_info();
     let snapshot =
-        AnalysisSnapshot::new(&program, type_info, &HashMap::new(), struct_defs, enum_defs);
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
     let module_path = snapshot
         .module_path_for_file(&entry_path)
         .expect("module path")
@@ -318,7 +339,14 @@ end
     let enum_defs = typechecker.enum_definitions();
     let type_info = typechecker.take_type_info();
     let snapshot =
-        AnalysisSnapshot::new(&program, type_info, &HashMap::new(), struct_defs, enum_defs);
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
     let module_path = snapshot
         .module_path_for_file(&entry_path)
         .expect("module path")
@@ -399,7 +427,14 @@ end
     let enum_defs = typechecker.enum_definitions();
     let type_info = typechecker.take_type_info();
     let snapshot =
-        AnalysisSnapshot::new(&program, type_info, &HashMap::new(), struct_defs, enum_defs);
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
     let module_path = snapshot
         .module_path_for_file(&entry_path)
         .expect("module path")
@@ -479,7 +514,14 @@ end
     let enum_defs = typechecker.enum_definitions();
     let type_info = typechecker.take_type_info();
     let snapshot =
-        AnalysisSnapshot::new(&program, type_info, &HashMap::new(), struct_defs, enum_defs);
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
     let module_path = snapshot
         .module_path_for_file(&entry_path)
         .expect("module path")
@@ -563,7 +605,14 @@ end
     let enum_defs = typechecker.enum_definitions();
     let type_info = typechecker.take_type_info();
     let snapshot =
-        AnalysisSnapshot::new(&program, type_info, &HashMap::new(), struct_defs, enum_defs);
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
     let module_path = snapshot
         .module_path_for_file(&entry_path)
         .expect("module path")
@@ -655,7 +704,14 @@ end
     let enum_defs = typechecker.enum_definitions();
     let type_info = typechecker.take_type_info();
     let snapshot =
-        AnalysisSnapshot::new(&program, type_info, &HashMap::new(), struct_defs, enum_defs);
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
     let module_path = snapshot
         .module_path_for_file(&entry_path)
         .expect("module path")
@@ -771,7 +827,14 @@ end
     let enum_defs = typechecker.enum_definitions();
     let type_info = typechecker.take_type_info();
     let snapshot =
-        AnalysisSnapshot::new(&program, type_info, &HashMap::new(), struct_defs, enum_defs);
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
     let module = snapshot
         .module_for_file(&entry_path)
         .expect("module snapshot");
@@ -830,7 +893,14 @@ end
     let enum_defs = typechecker.enum_definitions();
     let type_info = typechecker.take_type_info();
     let snapshot =
-        AnalysisSnapshot::new(&program, type_info, &HashMap::new(), struct_defs, enum_defs);
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
     let module = snapshot
         .module_for_file(&entry_path)
         .expect("module snapshot");
@@ -889,7 +959,14 @@ end
     let enum_defs = typechecker.enum_definitions();
     let type_info = typechecker.take_type_info();
     let snapshot =
-        AnalysisSnapshot::new(&program, type_info, &HashMap::new(), struct_defs, enum_defs);
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
     let module = snapshot
         .module_for_file(&entry_path)
         .expect("module snapshot");
@@ -961,7 +1038,14 @@ println(my_point.x)
     let enum_defs = typechecker.enum_definitions();
     let type_info = typechecker.take_type_info();
     let snapshot =
-        AnalysisSnapshot::new(&program, type_info, &HashMap::new(), struct_defs, enum_defs);
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
     let module = snapshot
         .module_for_file(&entry_path)
         .expect("module snapshot");
@@ -1027,7 +1111,14 @@ local moved = point:translate(1, 1)
     let enum_defs = typechecker.enum_definitions();
     let type_info = typechecker.take_type_info();
     let snapshot =
-        AnalysisSnapshot::new(&program, type_info, &HashMap::new(), struct_defs, enum_defs);
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
     let module = snapshot
         .module_for_file(&entry_path)
         .expect("module snapshot");
@@ -1116,7 +1207,14 @@ end
     let enum_defs = typechecker.enum_definitions();
     let type_info = typechecker.take_type_info();
     let snapshot =
-        AnalysisSnapshot::new(&program, type_info, &HashMap::new(), struct_defs, enum_defs);
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
     let module = snapshot
         .module_for_file(&entry_path)
         .expect("module snapshot");

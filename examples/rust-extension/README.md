@@ -14,6 +14,16 @@ examples/rust-extension/
 └── main.lust
 ```
 
+The `lust-config.toml` declares the Rust extension crates via the new dependency table:
+
+```toml
+[settings]
+
+[dependencies]
+lust-double = { path = "extensions/double", kind = "rust" }
+lust-triple = { path = "extensions/triple", kind = "rust" }
+```
+
 ## Running the example
 
 1. From the project root, ask the CLI to build the extension and emit extern stubs:

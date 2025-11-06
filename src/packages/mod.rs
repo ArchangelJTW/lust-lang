@@ -1,4 +1,5 @@
 use crate::{NativeExport, VM};
+use dirs::home_dir;
 use libloading::Library;
 use serde::Deserialize;
 use std::{
@@ -11,6 +12,27 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 use thiserror::Error;
+
+pub mod archive;
+pub mod credentials;
+pub mod dependencies;
+pub mod manifest;
+pub mod registry;
+
+pub use archive::{build_package_archive, ArchiveError, PackageArchive};
+pub use credentials::{
+    clear_credentials, credentials_file, load_credentials, save_credentials, Credentials,
+    CredentialsError,
+};
+pub use dependencies::{
+    resolve_dependencies, DependencyResolution, DependencyResolutionError, ResolvedLustDependency,
+    ResolvedRustDependency,
+};
+pub use manifest::{ManifestError, ManifestKind, PackageManifest, PackageSection};
+pub use registry::{
+    DownloadedArchive, PackageDetails, PackageSearchResponse, PackageSummary, PackageVersionInfo,
+    PublishResponse, RegistryClient, RegistryError, SearchParameters, DEFAULT_BASE_URL,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageKind {
@@ -50,8 +72,8 @@ impl PackageManager {
     }
 
     pub fn default_root() -> PathBuf {
-        let mut base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".lust/cache"));
-        base.push("lust");
+        let mut base = home_dir().unwrap_or_else(|| PathBuf::from("."));
+        base.push(".lust");
         base.push("packages");
         base
     }
@@ -120,7 +142,25 @@ pub struct StubFile {
     pub contents: String,
 }
 
-pub fn build_local_module(module_dir: &Path) -> Result<LocalBuildOutput, LocalModuleError> {
+#[derive(Debug, Clone)]
+pub struct BuildOptions<'a> {
+    pub features: &'a [String],
+    pub default_features: bool,
+}
+
+impl<'a> Default for BuildOptions<'a> {
+    fn default() -> Self {
+        Self {
+            features: &[],
+            default_features: true,
+        }
+    }
+}
+
+pub fn build_local_module(
+    module_dir: &Path,
+    options: BuildOptions<'_>,
+) -> Result<LocalBuildOutput, LocalModuleError> {
     let crate_name = read_crate_name(module_dir)?;
     let profile = extension_profile();
     let mut command = Command::new("cargo");
@@ -134,6 +174,13 @@ pub fn build_local_module(module_dir: &Path) -> Result<LocalBuildOutput, LocalMo
         other => {
             command.args(["--profile", other]);
         }
+    }
+    if !options.default_features {
+        command.arg("--no-default-features");
+    }
+    if !options.features.is_empty() {
+        command.arg("--features");
+        command.arg(options.features.join(","));
     }
     command.current_dir(module_dir);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());

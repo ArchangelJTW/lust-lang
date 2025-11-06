@@ -86,6 +86,7 @@ pub(crate) struct AnalysisSnapshot {
     modules_by_path: HashMap<PathBuf, ModuleSnapshot>,
     modules_by_name: HashMap<String, PathBuf>,
     module_children: HashMap<String, HashSet<String>>,
+    dependency_roots: HashSet<String>,
     type_index: TypeIndex,
     semantic_tokens: HashMap<PathBuf, SemanticTokenData>,
     structs_by_qualified: HashMap<String, StructInfo>,
@@ -103,6 +104,7 @@ impl AnalysisSnapshot {
         source_overrides: &HashMap<PathBuf, String>,
         builtin_structs: HashMap<String, StructDef>,
         builtin_enums: HashMap<String, EnumDef>,
+        dependency_roots: HashSet<String>,
     ) -> Self {
         let mut modules_by_path = HashMap::new();
         let mut modules_by_name = HashMap::new();
@@ -278,11 +280,18 @@ impl AnalysisSnapshot {
                 },
             );
         }
+        if !dependency_roots.is_empty() {
+            module_children
+                .entry(String::new())
+                .or_default()
+                .extend(dependency_roots.iter().cloned());
+        }
 
         Self {
             modules_by_path,
             modules_by_name,
             module_children,
+            dependency_roots,
             type_index,
             semantic_tokens,
             structs_by_qualified,
@@ -305,6 +314,14 @@ impl AnalysisSnapshot {
 
     pub(crate) fn module_children(&self, name: &str) -> Option<&HashSet<String>> {
         self.module_children.get(name)
+    }
+
+    pub(crate) fn dependency_roots(&self) -> impl Iterator<Item = &String> {
+        self.dependency_roots.iter()
+    }
+
+    pub(crate) fn has_dependency_root(&self, name: &str) -> bool {
+        self.dependency_roots.contains(name)
     }
 
     pub(crate) fn has_struct(&self, qualified: &str) -> bool {

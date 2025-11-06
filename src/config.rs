@@ -1,15 +1,15 @@
-use alloc::string::String;
-#[cfg(feature = "std")]
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use hashbrown::HashSet;
 #[cfg(feature = "std")]
 use serde::Deserialize;
 #[cfg(feature = "std")]
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
 use thiserror::Error;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[cfg(feature = "std")]
@@ -18,8 +18,66 @@ pub enum ConfigError {
     #[cfg(feature = "std")]
     #[error("failed to parse configuration: {0}")]
     Parse(#[from] toml::de::Error),
+    #[cfg(feature = "std")]
+    #[error("dependency '{0}' must specify either a version or a path")]
+    MissingDependencySource(String),
+    #[cfg(feature = "std")]
+    #[error("dependency '{0}' has unknown kind '{1}'")]
+    UnknownDependencyKind(String, String),
     #[error("{0}")]
     Unsupported(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyKind {
+    Lust,
+    Rust,
+}
+
+#[derive(Debug, Clone)]
+pub struct DependencySpec {
+    name: String,
+    version: Option<String>,
+    path: Option<String>,
+    kind: Option<DependencyKind>,
+    features: Vec<String>,
+    default_features: Option<bool>,
+    externs: Option<String>,
+    legacy: bool,
+}
+
+impl DependencySpec {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
+    pub fn kind(&self) -> Option<DependencyKind> {
+        self.kind
+    }
+
+    pub fn features(&self) -> &[String] {
+        &self.features
+    }
+
+    pub fn default_features(&self) -> Option<bool> {
+        self.default_features
+    }
+
+    pub fn externs(&self) -> Option<&str> {
+        self.externs.as_deref()
+    }
+
+    pub fn is_legacy(&self) -> bool {
+        self.legacy
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -27,43 +85,7 @@ pub struct LustConfig {
     enabled_modules: HashSet<String>,
     jit_enabled: bool,
     #[cfg(feature = "std")]
-    rust_modules: Vec<RustModule>,
-}
-
-#[cfg(feature = "std")]
-#[derive(Debug, Clone)]
-pub struct RustModule {
-    path: PathBuf,
-    externs: Option<PathBuf>,
-}
-
-#[cfg(feature = "std")]
-#[derive(Debug, Deserialize)]
-struct LustConfigToml {
-    settings: Settings,
-}
-
-#[cfg(feature = "std")]
-#[derive(Debug, Deserialize)]
-struct Settings {
-    #[serde(default)]
-    stdlib_modules: Vec<String>,
-    #[serde(default = "default_jit_enabled")]
-    jit: bool,
-    #[serde(default)]
-    rust_modules: Vec<RustModuleEntry>,
-}
-
-#[cfg(feature = "std")]
-#[derive(Debug, Deserialize)]
-struct RustModuleEntry {
-    path: String,
-    #[serde(default)]
-    externs: Option<String>,
-}
-
-const fn default_jit_enabled() -> bool {
-    true
+    dependencies: Vec<DependencySpec>,
 }
 
 impl Default for LustConfig {
@@ -72,7 +94,7 @@ impl Default for LustConfig {
             enabled_modules: HashSet::new(),
             jit_enabled: true,
             #[cfg(feature = "std")]
-            rust_modules: Vec::new(),
+            dependencies: Vec::new(),
         }
     }
 }
@@ -83,13 +105,13 @@ impl LustConfig {
         let path_ref = path.as_ref();
         let content = fs::read_to_string(path_ref)?;
         let parsed: LustConfigToml = toml::from_str(&content)?;
-        Ok(Self::from_parsed(parsed, path_ref.parent()))
+        Self::from_parsed(parsed, path_ref.parent())
     }
 
     #[cfg(feature = "std")]
     pub fn from_toml_str(source: &str) -> Result<Self, ConfigError> {
         let parsed: LustConfigToml = toml::from_str(source)?;
-        Ok(Self::from_parsed(parsed, None))
+        Self::from_parsed(parsed, None)
     }
 
     #[cfg(feature = "std")]
@@ -148,12 +170,12 @@ impl LustConfig {
     }
 
     #[cfg(feature = "std")]
-    pub fn rust_modules(&self) -> impl Iterator<Item = &RustModule> {
-        self.rust_modules.iter()
+    pub fn dependencies(&self) -> &[DependencySpec] {
+        &self.dependencies
     }
 
     #[cfg(feature = "std")]
-    fn from_parsed(parsed: LustConfigToml, base_dir: Option<&Path>) -> Self {
+    fn from_parsed(parsed: LustConfigToml, _base_dir: Option<&Path>) -> Result<Self, ConfigError> {
         let modules = parsed
             .settings
             .stdlib_modules
@@ -161,53 +183,140 @@ impl LustConfig {
             .map(|m| m.trim().to_ascii_lowercase())
             .filter(|m| !m.is_empty())
             .collect::<HashSet<_>>();
-        let rust_modules = parsed
-            .settings
-            .rust_modules
-            .into_iter()
-            .map(|entry| {
-                let path = match base_dir {
-                    Some(root) => root.join(&entry.path),
-                    None => PathBuf::from(&entry.path),
-                };
-                let externs = entry.externs.map(PathBuf::from);
-                RustModule { path, externs }
-            })
-            .collect();
-        Self {
+
+        let mut dependencies = Vec::new();
+        for (name, entry) in parsed.settings.dependencies {
+            let (version, path, kind, features, default_features, externs) = match entry {
+                DependencyToml::Version(version) => {
+                    (Some(version), None, None, Vec::new(), None, None)
+                }
+                DependencyToml::Detailed(table) => {
+                    let kind = match table.kind {
+                        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                            "lust" => Some(DependencyKind::Lust),
+                            "rust" => Some(DependencyKind::Rust),
+                            other => {
+                                return Err(ConfigError::UnknownDependencyKind(
+                                    name.clone(),
+                                    other.to_string(),
+                                ))
+                            }
+                        },
+                        None => None,
+                    };
+                    (
+                        table.version,
+                        table.path,
+                        kind,
+                        table.features,
+                        table.default_features,
+                        table.externs,
+                    )
+                }
+            };
+            let has_path = path.as_ref().map(|p| !p.trim().is_empty()).unwrap_or(false);
+            if version.is_none() && !has_path {
+                return Err(ConfigError::MissingDependencySource(name));
+            }
+            dependencies.push(DependencySpec {
+                name,
+                version,
+                path,
+                kind,
+                features,
+                default_features,
+                externs,
+                legacy: false,
+            });
+        }
+
+        for legacy in parsed.settings.rust_modules {
+            let inferred_name = Path::new(&legacy.path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&legacy.path)
+                .to_string();
+            dependencies.push(DependencySpec {
+                name: inferred_name,
+                version: None,
+                path: Some(legacy.path),
+                kind: Some(DependencyKind::Rust),
+                features: Vec::new(),
+                default_features: None,
+                externs: legacy.externs,
+                legacy: true,
+            });
+        }
+
+        Ok(Self {
             enabled_modules: modules,
             jit_enabled: parsed.settings.jit,
-            rust_modules,
-        }
+            dependencies,
+        })
     }
 }
 
 #[cfg(feature = "std")]
-impl RustModule {
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
+#[derive(Debug, Deserialize)]
+struct LustConfigToml {
+    settings: Settings,
+}
 
-    pub fn externs(&self) -> Option<&Path> {
-        self.externs.as_deref()
-    }
+#[cfg(feature = "std")]
+#[derive(Debug, Deserialize)]
+struct Settings {
+    #[serde(default)]
+    stdlib_modules: Vec<String>,
+    #[serde(default = "default_jit_enabled")]
+    jit: bool,
+    #[serde(default)]
+    rust_modules: Vec<RustModuleEntry>,
+    #[serde(default)]
+    dependencies: BTreeMap<String, DependencyToml>,
+}
 
-    pub fn externs_dir(&self) -> Option<PathBuf> {
-        self.externs.as_ref().map(|path| {
-            if path.is_absolute() {
-                path.clone()
-            } else {
-                self.path.join(path)
-            }
-        })
-    }
+#[cfg(feature = "std")]
+#[derive(Debug, Deserialize)]
+struct RustModuleEntry {
+    path: String,
+    #[serde(default)]
+    externs: Option<String>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DependencyToml {
+    Version(String),
+    Detailed(DependencyTomlTable),
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug, Default, Deserialize)]
+struct DependencyTomlTable {
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default)]
+    default_features: Option<bool>,
+    #[serde(default)]
+    externs: Option<String>,
+}
+
+const fn default_jit_enabled() -> bool {
+    true
 }
 
 #[cfg(feature = "std")]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+
     #[test]
     fn default_config_has_jit_enabled() {
         let cfg = LustConfig::default();
@@ -223,14 +332,30 @@ mod tests {
             jit = false
         "#;
         let parsed: LustConfigToml = toml::from_str(toml).unwrap();
-        let cfg = LustConfig::from_parsed(parsed, None);
+        let cfg = LustConfig::from_parsed(parsed, None).unwrap();
         assert!(!cfg.jit_enabled());
         assert!(cfg.is_module_enabled("io"));
         assert!(cfg.is_module_enabled("os"));
     }
 
     #[test]
-    fn rust_modules_are_resolved_relative_to_config() {
+    fn dependencies_parse_version() {
+        let toml = r#"
+            [settings]
+            [dependencies]
+            foo = "1.2.3"
+        "#;
+        let parsed: LustConfigToml = toml::from_str(toml).unwrap();
+        let cfg = LustConfig::from_parsed(parsed, None).unwrap();
+        let deps = cfg.dependencies();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name(), "foo");
+        assert_eq!(deps[0].version(), Some("1.2.3"));
+        assert!(deps[0].path().is_none());
+    }
+
+    #[test]
+    fn legacy_rust_modules_are_mapped_to_dependencies() {
         let toml = r#"
             [settings]
             rust_modules = [
@@ -239,16 +364,14 @@ mod tests {
             ]
         "#;
         let parsed: LustConfigToml = toml::from_str(toml).unwrap();
-        let base = PathBuf::from("/var/project");
-        let cfg = LustConfig::from_parsed(parsed, Some(base.as_path()));
-        let modules: Vec<&RustModule> = cfg.rust_modules().collect();
-        assert_eq!(modules.len(), 2);
-        assert_eq!(modules[0].path(), Path::new("/var/project/ext/foo"));
-        assert_eq!(
-            modules[0].externs_dir(),
-            Some(PathBuf::from("/var/project/ext/foo/externs"))
-        );
-        assert_eq!(modules[1].path(), Path::new("/absolute/bar"));
-        assert!(modules[1].externs().is_none());
+        let cfg = LustConfig::from_parsed(parsed, None).unwrap();
+        let deps = cfg.dependencies();
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].path(), Some("ext/foo"));
+        assert_eq!(deps[0].externs(), Some("externs"));
+        assert_eq!(deps[0].kind(), Some(DependencyKind::Rust));
+        assert!(deps[0].is_legacy());
+        assert_eq!(deps[1].path(), Some("/absolute/bar"));
+        assert!(deps[1].externs().is_none());
     }
 }

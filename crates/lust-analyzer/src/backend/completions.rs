@@ -502,6 +502,7 @@ fn resolve_module_path_for_segments(
     if resolved_path.is_empty()
         || snapshot.module_for_name(&resolved_path).is_some()
         || snapshot.module_children(&resolved_path).is_some()
+        || snapshot.has_dependency_root(&resolved_path)
     {
         Some(resolved_path)
     } else {
@@ -549,6 +550,17 @@ pub(crate) fn module_alias_member_completions(
     };
     if let Some(children) = snapshot.module_children(&resolved_path) {
         let mut names: Vec<_> = children.iter().cloned().collect();
+        names.sort();
+        for child in names {
+            push_item(
+                child,
+                CompletionItemKind::MODULE,
+                Some("module".to_string()),
+            );
+        }
+    }
+    if resolved_path.is_empty() {
+        let mut names: Vec<_> = snapshot.dependency_roots().cloned().collect();
         names.sort();
         for child in names {
             push_item(

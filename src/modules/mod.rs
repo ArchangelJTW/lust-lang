@@ -65,6 +65,14 @@ pub struct ModuleLoader {
     cache: HashMap<String, LoadedModule>,
     visited: HashSet<String>,
     source_overrides: HashMap<PathBuf, String>,
+    module_roots: HashMap<String, ModuleRoot>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug, Clone)]
+struct ModuleRoot {
+    base: PathBuf,
+    root_module: Option<PathBuf>,
 }
 
 #[cfg(feature = "std")]
@@ -75,6 +83,7 @@ impl ModuleLoader {
             cache: HashMap::new(),
             visited: HashSet::new(),
             source_overrides: HashMap::new(),
+            module_roots: HashMap::new(),
         }
     }
 
@@ -88,6 +97,21 @@ impl ModuleLoader {
 
     pub fn clear_source_overrides(&mut self) {
         self.source_overrides.clear();
+    }
+
+    pub fn add_module_root(
+        &mut self,
+        prefix: impl Into<String>,
+        root: impl Into<PathBuf>,
+        root_module: Option<PathBuf>,
+    ) {
+        self.module_roots.insert(
+            prefix.into(),
+            ModuleRoot {
+                base: root.into(),
+                root_module,
+            },
+        );
     }
 
     pub fn load_program_from_entry(&mut self, entry_file: &str) -> Result<Program> {
@@ -619,13 +643,45 @@ impl ModuleLoader {
     }
 
     fn file_for_module_path(&self, module_path: &str) -> PathBuf {
-        let mut p = self.base_dir.clone();
-        for seg in module_path.split('.') {
-            p.push(seg);
+        let segments: Vec<&str> = module_path.split('.').collect();
+        if let Some((root, consumed)) = self.resolve_dependency_root(&segments) {
+            let mut path = root.base.clone();
+            if consumed == segments.len() {
+                if let Some(relative) = &root.root_module {
+                    path.push(relative);
+                } else if let Some(last) = segments.last() {
+                    path.push(format!("{last}.lust"));
+                }
+                return path;
+            }
+            for seg in &segments[consumed..segments.len() - 1] {
+                path.push(seg);
+            }
+            if let Some(last) = segments.last() {
+                path.push(format!("{last}.lust"));
+            }
+            return path;
         }
 
-        p.set_extension("lust");
-        p
+        let mut fallback = self.base_dir.clone();
+        for seg in &segments {
+            fallback.push(seg);
+        }
+        fallback.set_extension("lust");
+        fallback
+    }
+
+    fn resolve_dependency_root(&self, segments: &[&str]) -> Option<(&ModuleRoot, usize)> {
+        let mut matched: Option<(&ModuleRoot, usize)> = None;
+        let mut prefix_segments: Vec<&str> = Vec::new();
+        for (index, segment) in segments.iter().enumerate() {
+            prefix_segments.push(*segment);
+            let key = prefix_segments.join(".");
+            if let Some(root) = self.module_roots.get(&key) {
+                matched = Some((root, index + 1));
+            }
+        }
+        matched
     }
 
     fn module_path_for_file(path: &Path) -> String {

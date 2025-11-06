@@ -551,6 +551,7 @@ dependencies = [
  "libm",
  "lust-macros",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "toml",

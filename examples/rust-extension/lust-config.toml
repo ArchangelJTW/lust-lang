@@ -1,2 +1,5 @@
 [settings]
-rust_modules = [{ path = "extensions/double" }, { path = "extensions/triple" }]
+
+[dependencies]
+lust-double = { path = "extensions/double" }
+lust-triple = { path = "extensions/triple" }

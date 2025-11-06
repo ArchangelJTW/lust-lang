@@ -24,6 +24,11 @@ Install the CLI:
 ```bash
 cargo install lust-rs
 lust --help
+lust pkg add example-package
+lust pkg remove example-package
+lust pkg login
+lust pkg publish
+lust pkg logout
 ```
 
 ## Embedding in Rust

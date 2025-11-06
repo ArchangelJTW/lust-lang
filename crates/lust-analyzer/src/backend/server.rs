@@ -5,12 +5,19 @@ use crate::analysis::{
 use crate::diagnostics::error_to_diagnostics;
 use crate::semantic_tokens::SEMANTIC_TOKEN_TYPES;
 use crate::utils::{
-    analyzer_lust_config, compute_line_offsets, extract_word_at_position, position_to_offset,
-    prev_char_index, span_contains_position, span_to_range,
+    compute_line_offsets, extract_word_at_position, position_to_offset, prev_char_index,
+    span_contains_position, span_to_range,
 };
 use hashbrown::{HashMap, HashSet};
 use lust::ast::{Item, ItemKind, TypeKind};
-use lust::{Compiler, ModuleLoader, Span, TypeChecker};
+#[cfg(all(not(target_arch = "wasm32")))]
+use lust::{
+    build_local_module, collect_stub_files, load_local_module, resolve_dependencies,
+    stub_files_from_exports, write_stub_files, BuildOptions, DependencyResolution, VM,
+};
+use lust::{Compiler, LustConfig, ModuleLoader, Span, TypeChecker};
+#[cfg(all(not(target_arch = "wasm32")))]
+use std::fs;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -137,8 +144,72 @@ impl Backend {
                 return HashMap::new();
             }
         };
-        let mut loader = ModuleLoader::new(".");
+        let config = match LustConfig::load_for_entry(&entry_path) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Failed to load configuration: {}", err),
+                    )
+                    .await;
+                return HashMap::new();
+            }
+        };
+        #[cfg(all(not(target_arch = "wasm32")))]
+        let dependency_resolution = match resolve_dependencies(&config, &entry_dir) {
+            Ok(res) => res,
+            Err(err) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Failed to resolve dependencies: {}", err),
+                    )
+                    .await;
+                return HashMap::new();
+            }
+        };
+        #[cfg(all(not(target_arch = "wasm32")))]
+        if let Err(err) = Self::ensure_rust_dependency_stubs(&dependency_resolution, &entry_dir) {
+            self.client
+                .log_message(
+                    MessageType::ERROR,
+                    format!("Failed to prepare extern stubs: {}", err),
+                )
+                .await;
+        }
+        #[cfg(all(not(target_arch = "wasm32")))]
+        let dependency_root_set: HashSet<String> = dependency_resolution
+            .lust()
+            .iter()
+            .flat_map(|dep| {
+                let mut names = vec![dep.name.clone()];
+                if let Some(alias) = &dep.sanitized_name {
+                    names.push(alias.clone());
+                }
+                names
+            })
+            .collect();
+        #[cfg(any(target_arch = "wasm32"))]
+        let dependency_root_set = HashSet::new();
+
+        let mut loader = ModuleLoader::new(entry_dir.clone());
         loader.set_source_overrides(overrides.clone());
+        #[cfg(all(not(target_arch = "wasm32")))]
+        for dependency in dependency_resolution.lust() {
+            loader.add_module_root(
+                dependency.name.clone(),
+                dependency.module_root.clone(),
+                dependency.root_module.clone(),
+            );
+            if let Some(alias) = &dependency.sanitized_name {
+                loader.add_module_root(
+                    alias.clone(),
+                    dependency.module_root.clone(),
+                    dependency.root_module.clone(),
+                );
+            }
+        }
         match loader.load_program_from_entry(&entry_path_str) {
             Ok(program) => {
                 let module_path_map: HashMap<String, PathBuf> = program
@@ -162,7 +233,6 @@ impl Backend {
                     ));
                 }
 
-                let config = analyzer_lust_config();
                 let mut typechecker = TypeChecker::with_config(&config);
                 typechecker.set_imports_by_module(imports_map.clone());
                 let type_result = typechecker.check_program(&program.modules);
@@ -170,8 +240,14 @@ impl Backend {
                 let struct_defs = typechecker.struct_definitions();
                 let enum_defs = typechecker.enum_definitions();
                 let type_info = typechecker.take_type_info();
-                let snapshot =
-                    AnalysisSnapshot::new(&program, type_info, &overrides, struct_defs, enum_defs);
+                let snapshot = AnalysisSnapshot::new(
+                    &program,
+                    type_info,
+                    &overrides,
+                    struct_defs,
+                    enum_defs,
+                    dependency_root_set.clone(),
+                );
                 {
                     let mut analysis = self.analysis.write().await;
                     *analysis = Some(snapshot);
@@ -215,6 +291,61 @@ impl Backend {
                 &HashMap::new(),
             )),
         }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32")))]
+    fn ensure_rust_dependency_stubs(
+        deps: &DependencyResolution,
+        project_dir: &Path,
+    ) -> std::result::Result<(), String> {
+        if deps.rust().is_empty() {
+            return Ok(());
+        }
+
+        let extern_root = project_dir.join("externs");
+        fs::create_dir_all(&extern_root)
+            .map_err(|err| format!("{}: {}", extern_root.display(), err))?;
+
+        for dep in deps.rust() {
+            let build = build_local_module(
+                &dep.crate_dir,
+                BuildOptions {
+                    features: &dep.features,
+                    default_features: dep.default_features,
+                },
+            )
+            .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
+            let mut preview_vm = VM::new();
+            let preview_module = load_local_module(&mut preview_vm, &build)
+                .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
+            let exports = preview_vm.take_exported_natives();
+            preview_vm.clear_native_functions();
+            drop(preview_module);
+
+            let mut stubs = stub_files_from_exports(&exports);
+            let manual_stubs = collect_stub_files(&dep.crate_dir, dep.externs_override.as_deref())
+                .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
+            if !manual_stubs.is_empty() {
+                stubs.extend(manual_stubs);
+            }
+            if !stubs.is_empty() {
+                write_stub_files(&build.name, &stubs, &extern_root)
+                    .map_err(|err| format!("{}: {}", extern_root.display(), err))?;
+                if let Some(cache_dir) = &dep.cache_stub_dir {
+                    fs::create_dir_all(cache_dir).map_err(|err| {
+                        format!(
+                            "failed to create extern cache '{}': {}",
+                            cache_dir.display(),
+                            err
+                        )
+                    })?;
+                    write_stub_files(&build.name, &stubs, cache_dir)
+                        .map_err(|err| format!("{}: {}", cache_dir.display(), err))?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn convert_path_map_to_url_map(

@@ -1,11 +1,11 @@
 #![cfg(feature = "std")]
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 use lust::packages::{
-    build_local_module, build_package_archive, clear_credentials, collect_stub_files,
-    credentials_file, load_credentials, load_local_module, resolve_dependencies, save_credentials,
-    stub_files_from_exports, write_stub_files, BuildOptions, DependencyResolution,
-    DownloadedArchive, LocalBuildOutput, PackageManager, PackageManifest, RegistryClient,
-    ResolvedRustDependency, StubFile, DEFAULT_BASE_URL,
+    build_package_archive, clear_credentials, collect_rust_dependency_artifacts, credentials_file,
+    load_credentials, load_prepared_rust_dependencies, prepare_rust_dependencies,
+    resolve_dependencies, save_credentials, write_stub_files, DependencyResolution,
+    DownloadedArchive, PackageManager, PackageManifest, PreparedRustDependency, RegistryClient,
+    DEFAULT_BASE_URL,
 };
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 use lust::LoadedRustModule;
@@ -695,76 +695,6 @@ fn dump_externs(_: &str) {
     process::exit(1);
 }
 
-#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
-fn collect_rust_dependency_artifacts(
-    dep: &ResolvedRustDependency,
-) -> Result<(LocalBuildOutput, Vec<StubFile>), String> {
-    let build = build_local_module(
-        &dep.crate_dir,
-        BuildOptions {
-            features: &dep.features,
-            default_features: dep.default_features,
-        },
-    )
-    .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
-
-    let mut preview_vm = VM::new();
-    let preview_module = load_local_module(&mut preview_vm, &build)
-        .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
-    let exports = preview_vm.take_exported_natives();
-    preview_vm.clear_native_functions();
-    drop(preview_module);
-
-    let mut stubs = stub_files_from_exports(&exports);
-    let manual_stubs = collect_stub_files(&dep.crate_dir, dep.externs_override.as_deref())
-        .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
-    if !manual_stubs.is_empty() {
-        stubs.extend(manual_stubs);
-    }
-
-    Ok((build, stubs))
-}
-
-#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
-fn load_rust_dependencies(
-    deps: &DependencyResolution,
-    project_dir: &Path,
-    vm: &mut VM,
-) -> Result<Vec<LoadedRustModule>, String> {
-    let mut loaded = Vec::new();
-    if deps.rust().is_empty() {
-        return Ok(loaded);
-    }
-
-    let extern_root = project_dir.join("externs");
-    fs::create_dir_all(&extern_root)
-        .map_err(|err| format!("{}: {}", extern_root.display(), err))?;
-
-    for dep in deps.rust() {
-        let (build, stubs) = collect_rust_dependency_artifacts(dep)?;
-        if !stubs.is_empty() {
-            write_stub_files(&build.name, &stubs, &extern_root)
-                .map_err(|err| format!("{}: {}", extern_root.display(), err))?;
-            if let Some(cache_dir) = &dep.cache_stub_dir {
-                fs::create_dir_all(cache_dir).map_err(|err| {
-                    format!(
-                        "failed to create extern cache '{}': {}",
-                        cache_dir.display(),
-                        err
-                    )
-                })?;
-                write_stub_files(&build.name, &stubs, cache_dir)
-                    .map_err(|err| format!("{}: {}", cache_dir.display(), err))?;
-            }
-        }
-        let loaded_module = load_local_module(vm, &build)
-            .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
-        loaded.push(loaded_module);
-    }
-
-    Ok(loaded)
-}
-
 fn run_file(filename: &str, disassemble: bool) {
     let source = match fs::read_to_string(filename) {
         Ok(content) => content,
@@ -793,11 +723,21 @@ fn run_file(filename: &str, disassemble: bool) {
             process::exit(1);
         }
     };
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+    let prepared_rust = match prepare_rust_dependencies(&dependency_resolution, &project_dir) {
+        Ok(list) => list,
+        Err(err) => {
+            eprintln!("Failed to prepare Rust dependencies: {}", err);
+            process::exit(1);
+        }
+    };
     let (functions, trait_impls, init_funcs, struct_defs) = match compile_program(
         filename,
         &config,
         #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
         Some(&dependency_resolution),
+        #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+        Some(&prepared_rust),
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -824,8 +764,8 @@ fn run_file(filename: &str, disassemble: bool) {
     }
 
     #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
-    let _loaded_extensions =
-        match load_rust_dependencies(&dependency_resolution, &project_dir, &mut vm) {
+    let _loaded_extensions: Vec<LoadedRustModule> =
+        match load_prepared_rust_dependencies(&prepared_rust, &mut vm) {
             Ok(mods) => mods,
             Err(err) => {
                 eprintln!("Failed to load Rust dependencies: {}", err);
@@ -850,6 +790,9 @@ fn compile_program(
     config: &LustConfig,
     #[cfg(all(feature = "packages", not(target_arch = "wasm32")))] deps: Option<
         &DependencyResolution,
+    >,
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))] prepared_rust: Option<
+        &[PreparedRustDependency],
     >,
 ) -> Result<
     (
@@ -877,6 +820,18 @@ fn compile_program(
                     dependency.module_root.clone(),
                     dependency.root_module.clone(),
                 );
+            }
+        }
+    }
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+    if let Some(prepared) = prepared_rust {
+        let mut seen = hashbrown::HashSet::new();
+        for entry in prepared {
+            for root in &entry.stub_roots {
+                let key = (root.prefix.clone(), root.directory.clone());
+                if seen.insert(key.clone()) {
+                    loader.add_module_root(root.prefix.clone(), root.directory.clone(), None);
+                }
             }
         }
     }

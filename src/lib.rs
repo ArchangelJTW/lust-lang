@@ -43,13 +43,14 @@ pub use number::{LustFloat, LustInt};
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 pub use packages::{
     build_local_module, build_package_archive, clear_credentials, collect_stub_files,
-    credentials_file, load_credentials, load_local_module, resolve_dependencies, save_credentials,
-    stub_files_from_exports, write_stub_files, ArchiveError, BuildOptions, Credentials,
-    CredentialsError, DependencyResolution, DependencyResolutionError, DownloadedArchive,
-    LoadedRustModule, LocalBuildOutput, LocalModuleError, ManifestError, PackageArchive,
-    PackageDetails, PackageKind, PackageManager, PackageManifest, PackageSpecifier, PackageSummary,
-    PackageVersionInfo, PublishResponse, RegistryClient, RegistryError, ResolvedLustDependency,
-    ResolvedRustDependency, SearchParameters, StubFile, DEFAULT_BASE_URL,
+    credentials_file, load_credentials, load_local_module, load_local_module_with_namespace,
+    resolve_dependencies, save_credentials, stub_files_from_exports, write_stub_files,
+    ArchiveError, BuildOptions, Credentials, CredentialsError, DependencyResolution,
+    DependencyResolutionError, DownloadedArchive, LoadedRustModule, LocalBuildOutput,
+    LocalModuleError, ManifestError, PackageArchive, PackageDetails, PackageKind, PackageManager,
+    PackageManifest, PackageSpecifier, PackageSummary, PackageVersionInfo, PublishResponse,
+    RegistryClient, RegistryError, ResolvedLustDependency, ResolvedRustDependency,
+    SearchParameters, StubFile, DEFAULT_BASE_URL,
 };
 pub use parser::Parser;
 pub use typechecker::{FunctionSignature, TypeChecker, TypeCollection};

@@ -65,7 +65,7 @@ pub struct ModuleLoader {
     cache: HashMap<String, LoadedModule>,
     visited: HashSet<String>,
     source_overrides: HashMap<PathBuf, String>,
-    module_roots: HashMap<String, ModuleRoot>,
+    module_roots: HashMap<String, Vec<ModuleRoot>>,
 }
 
 #[cfg(feature = "std")]
@@ -105,13 +105,13 @@ impl ModuleLoader {
         root: impl Into<PathBuf>,
         root_module: Option<PathBuf>,
     ) {
-        self.module_roots.insert(
-            prefix.into(),
-            ModuleRoot {
+        self.module_roots
+            .entry(prefix.into())
+            .or_default()
+            .push(ModuleRoot {
                 base: root.into(),
                 root_module,
-            },
-        );
+            });
     }
 
     pub fn load_program_from_entry(&mut self, entry_file: &str) -> Result<Program> {
@@ -644,23 +644,21 @@ impl ModuleLoader {
 
     fn file_for_module_path(&self, module_path: &str) -> PathBuf {
         let segments: Vec<&str> = module_path.split('.').collect();
-        if let Some((root, consumed)) = self.resolve_dependency_root(&segments) {
-            let mut path = root.base.clone();
-            if consumed == segments.len() {
-                if let Some(relative) = &root.root_module {
-                    path.push(relative);
-                } else if let Some(last) = segments.last() {
-                    path.push(format!("{last}.lust"));
+        let candidates = self.resolve_dependency_roots(&segments);
+        if !candidates.is_empty() {
+            let mut fallback: Option<PathBuf> = None;
+            for (root, consumed) in candidates.iter().rev() {
+                let candidate = Self::path_from_root(root, &segments, *consumed);
+                if candidate.exists() {
+                    return candidate;
                 }
+                if fallback.is_none() {
+                    fallback = Some(candidate);
+                }
+            }
+            if let Some(path) = fallback {
                 return path;
             }
-            for seg in &segments[consumed..segments.len() - 1] {
-                path.push(seg);
-            }
-            if let Some(last) = segments.last() {
-                path.push(format!("{last}.lust"));
-            }
-            return path;
         }
 
         let mut fallback = self.base_dir.clone();
@@ -671,17 +669,38 @@ impl ModuleLoader {
         fallback
     }
 
-    fn resolve_dependency_root(&self, segments: &[&str]) -> Option<(&ModuleRoot, usize)> {
-        let mut matched: Option<(&ModuleRoot, usize)> = None;
+    fn resolve_dependency_roots(&self, segments: &[&str]) -> Vec<(&ModuleRoot, usize)> {
+        let mut matched: Vec<(&ModuleRoot, usize)> = Vec::new();
         let mut prefix_segments: Vec<&str> = Vec::new();
         for (index, segment) in segments.iter().enumerate() {
             prefix_segments.push(*segment);
             let key = prefix_segments.join(".");
-            if let Some(root) = self.module_roots.get(&key) {
-                matched = Some((root, index + 1));
+            if let Some(roots) = self.module_roots.get(&key) {
+                for root in roots {
+                    matched.push((root, index + 1));
+                }
             }
         }
         matched
+    }
+
+    fn path_from_root(root: &ModuleRoot, segments: &[&str], consumed: usize) -> PathBuf {
+        let mut path = root.base.clone();
+        if consumed == segments.len() {
+            if let Some(relative) = &root.root_module {
+                path.push(relative);
+            } else if let Some(last) = segments.last() {
+                path.push(format!("{last}.lust"));
+            }
+            return path;
+        }
+        for seg in &segments[consumed..segments.len() - 1] {
+            path.push(seg);
+        }
+        if let Some(last) = segments.last() {
+            path.push(format!("{last}.lust"));
+        }
+        path
     }
 
     fn module_path_for_file(path: &Path) -> String {

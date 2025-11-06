@@ -11,13 +11,8 @@ use crate::utils::{
 use hashbrown::{HashMap, HashSet};
 use lust::ast::{Item, ItemKind, TypeKind};
 #[cfg(all(not(target_arch = "wasm32")))]
-use lust::{
-    build_local_module, collect_stub_files, load_local_module, resolve_dependencies,
-    stub_files_from_exports, write_stub_files, BuildOptions, DependencyResolution, VM,
-};
+use lust::{packages::prepare_rust_dependencies, resolve_dependencies};
 use lust::{Compiler, LustConfig, ModuleLoader, Span, TypeChecker};
-#[cfg(all(not(target_arch = "wasm32")))]
-use std::fs;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -170,14 +165,18 @@ impl Backend {
             }
         };
         #[cfg(all(not(target_arch = "wasm32")))]
-        if let Err(err) = Self::ensure_rust_dependency_stubs(&dependency_resolution, &entry_dir) {
-            self.client
-                .log_message(
-                    MessageType::ERROR,
-                    format!("Failed to prepare extern stubs: {}", err),
-                )
-                .await;
-        }
+        let prepared_rust = match prepare_rust_dependencies(&dependency_resolution, &entry_dir) {
+            Ok(list) => list,
+            Err(err) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Failed to prepare extern stubs: {}", err),
+                    )
+                    .await;
+                Vec::new()
+            }
+        };
         #[cfg(all(not(target_arch = "wasm32")))]
         let dependency_root_set: HashSet<String> = dependency_resolution
             .lust()
@@ -208,6 +207,19 @@ impl Backend {
                     dependency.module_root.clone(),
                     dependency.root_module.clone(),
                 );
+            }
+        }
+        #[cfg(all(not(target_arch = "wasm32")))]
+        {
+            use hashbrown::HashSet;
+            let mut seen: HashSet<(String, PathBuf)> = HashSet::new();
+            for entry in &prepared_rust {
+                for root in &entry.stub_roots {
+                    let key = (root.prefix.clone(), root.directory.clone());
+                    if seen.insert(key.clone()) {
+                        loader.add_module_root(root.prefix.clone(), root.directory.clone(), None);
+                    }
+                }
             }
         }
         match loader.load_program_from_entry(&entry_path_str) {
@@ -291,61 +303,6 @@ impl Backend {
                 &HashMap::new(),
             )),
         }
-    }
-
-    #[cfg(all(not(target_arch = "wasm32")))]
-    fn ensure_rust_dependency_stubs(
-        deps: &DependencyResolution,
-        project_dir: &Path,
-    ) -> std::result::Result<(), String> {
-        if deps.rust().is_empty() {
-            return Ok(());
-        }
-
-        let extern_root = project_dir.join("externs");
-        fs::create_dir_all(&extern_root)
-            .map_err(|err| format!("{}: {}", extern_root.display(), err))?;
-
-        for dep in deps.rust() {
-            let build = build_local_module(
-                &dep.crate_dir,
-                BuildOptions {
-                    features: &dep.features,
-                    default_features: dep.default_features,
-                },
-            )
-            .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
-            let mut preview_vm = VM::new();
-            let preview_module = load_local_module(&mut preview_vm, &build)
-                .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
-            let exports = preview_vm.take_exported_natives();
-            preview_vm.clear_native_functions();
-            drop(preview_module);
-
-            let mut stubs = stub_files_from_exports(&exports);
-            let manual_stubs = collect_stub_files(&dep.crate_dir, dep.externs_override.as_deref())
-                .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
-            if !manual_stubs.is_empty() {
-                stubs.extend(manual_stubs);
-            }
-            if !stubs.is_empty() {
-                write_stub_files(&build.name, &stubs, &extern_root)
-                    .map_err(|err| format!("{}: {}", extern_root.display(), err))?;
-                if let Some(cache_dir) = &dep.cache_stub_dir {
-                    fs::create_dir_all(cache_dir).map_err(|err| {
-                        format!(
-                            "failed to create extern cache '{}': {}",
-                            cache_dir.display(),
-                            err
-                        )
-                    })?;
-                    write_stub_files(&build.name, &stubs, cache_dir)
-                        .map_err(|err| format!("{}: {}", cache_dir.display(), err))?;
-                }
-            }
-        }
-
-        Ok(())
     }
 
     fn convert_path_map_to_url_map(

@@ -285,9 +285,13 @@ impl VM {
         }
     }
 
-    pub(crate) fn push_export_prefix(&mut self, crate_name: &str) {
+    pub(crate) fn push_export_prefix(&mut self, crate_name: &str, include_extern_namespace: bool) {
         let sanitized = crate_name.replace('-', "_");
-        let prefix = format!("externs.{sanitized}");
+        let prefix = if include_extern_namespace {
+            format!("externs.{sanitized}")
+        } else {
+            sanitized
+        };
         self.export_prefix_stack.push(prefix);
     }
 

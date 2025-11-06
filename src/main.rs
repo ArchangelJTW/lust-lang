@@ -343,9 +343,7 @@ fn read_or_create_config(path: &Path) -> Result<Value, String> {
         let content = fs::read_to_string(path).map_err(|err| err.to_string())?;
         toml::from_str(&content).map_err(|err| err.to_string())
     } else {
-        let mut root = Map::new();
-        root.insert("settings".into(), Value::Table(Map::new()));
-        Ok(Value::Table(root))
+        Ok(Value::Table(Map::new()))
     }
 }
 
@@ -354,18 +352,45 @@ fn ensure_dependencies_table<'a>(doc: &'a mut Value) -> Result<&'a mut Map<Strin
     let table = doc
         .as_table_mut()
         .ok_or_else(|| "configuration root must be a table".to_string())?;
-    let settings_entry = table
-        .entry("settings".to_string())
-        .or_insert_with(|| Value::Table(Map::new()));
-    let settings_table = settings_entry
-        .as_table_mut()
-        .ok_or_else(|| "[settings] must be a table".to_string())?;
-    let deps_entry = settings_table
+    if table.contains_key("dependencies") {
+        let value = table
+            .get_mut("dependencies")
+            .ok_or_else(|| "[dependencies] entry missing".to_string())?;
+        return value
+            .as_table_mut()
+            .ok_or_else(|| "[dependencies] must be a table".to_string());
+    }
+
+    let settings_has_dependencies = if let Some(value) = table.get("settings") {
+        let settings_table = value
+            .as_table()
+            .ok_or_else(|| "[settings] must be a table".to_string())?;
+        settings_table.contains_key("dependencies")
+    } else {
+        false
+    };
+
+    if settings_has_dependencies {
+        let settings_value = table
+            .get_mut("settings")
+            .ok_or_else(|| "[settings] entry missing".to_string())?;
+        let settings_table = settings_value
+            .as_table_mut()
+            .ok_or_else(|| "[settings] must be a table".to_string())?;
+        let deps_value = settings_table
+            .get_mut("dependencies")
+            .ok_or_else(|| "[settings.dependencies] entry missing".to_string())?;
+        return deps_value
+            .as_table_mut()
+            .ok_or_else(|| "[settings.dependencies] must be a table".to_string());
+    }
+
+    let deps_entry = table
         .entry("dependencies".to_string())
         .or_insert_with(|| Value::Table(Map::new()));
     deps_entry
         .as_table_mut()
-        .ok_or_else(|| "[settings.dependencies] must be a table".to_string())
+        .ok_or_else(|| "[dependencies] must be a table".to_string())
 }
 
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
@@ -388,27 +413,43 @@ fn remove_dependency_from_config(name: &str) -> Result<(), String> {
         return Err("no lust-config.toml found in the current directory".to_string());
     }
     let mut doc = read_or_create_config(&path)?;
+    let mut removed = false;
     {
         let table = doc
             .as_table_mut()
             .ok_or_else(|| "configuration root must be a table".to_string())?;
-        let settings = match table.get_mut("settings") {
-            Some(value) => value
+
+        if let Some(value) = table.get_mut("dependencies") {
+            let deps = value
                 .as_table_mut()
-                .ok_or_else(|| "[settings] must be a table".to_string())?,
-            None => return Err(format!("dependency '{name}' not found")),
-        };
-        let deps = match settings.get_mut("dependencies") {
-            Some(value) => value
-                .as_table_mut()
-                .ok_or_else(|| "[settings.dependencies] must be a table".to_string())?,
-            None => return Err(format!("dependency '{name}' not found")),
-        };
-        if deps.remove(name).is_none() {
-            return Err(format!("dependency '{name}' not found"));
+                .ok_or_else(|| "[dependencies] must be a table".to_string())?;
+            if deps.remove(name).is_some() {
+                removed = true;
+                if deps.is_empty() {
+                    table.remove("dependencies");
+                }
+            }
         }
-        if deps.is_empty() {
-            settings.remove("dependencies");
+
+        if !removed {
+            let settings = match table.get_mut("settings") {
+                Some(value) => value
+                    .as_table_mut()
+                    .ok_or_else(|| "[settings] must be a table".to_string())?,
+                None => return Err(format!("dependency '{name}' not found")),
+            };
+            let deps = match settings.get_mut("dependencies") {
+                Some(value) => value
+                    .as_table_mut()
+                    .ok_or_else(|| "[settings.dependencies] must be a table".to_string())?,
+                None => return Err(format!("dependency '{name}' not found")),
+            };
+            if deps.remove(name).is_none() {
+                return Err(format!("dependency '{name}' not found"));
+            }
+            if deps.is_empty() {
+                settings.remove("dependencies");
+            }
         }
     }
     let content = toml::to_string_pretty(&doc).map_err(|err| err.to_string())?;

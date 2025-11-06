@@ -142,6 +142,22 @@ pub struct StubFile {
     pub contents: String,
 }
 
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone)]
+pub struct PreparedRustDependency {
+    pub dependency: ResolvedRustDependency,
+    pub build: LocalBuildOutput,
+    pub stub_roots: Vec<StubRoot>,
+    pub export_with_extern_namespace: bool,
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone)]
+pub struct StubRoot {
+    pub prefix: String,
+    pub directory: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct BuildOptions<'a> {
     pub features: &'a [String],
@@ -221,12 +237,20 @@ pub fn load_local_module(
     vm: &mut VM,
     build: &LocalBuildOutput,
 ) -> Result<LoadedRustModule, LocalModuleError> {
+    load_local_module_with_namespace(vm, build, true)
+}
+
+pub fn load_local_module_with_namespace(
+    vm: &mut VM,
+    build: &LocalBuildOutput,
+    include_extern_namespace: bool,
+) -> Result<LoadedRustModule, LocalModuleError> {
     let library = get_or_load_library(&build.library_path)?;
     unsafe {
         let register = library
             .get::<unsafe extern "C" fn(*mut VM) -> bool>(b"lust_extension_register\0")
             .map_err(|_| LocalModuleError::RegisterSymbolMissing(build.name.clone()))?;
-        vm.push_export_prefix(&build.name);
+        vm.push_export_prefix(&build.name, include_extern_namespace);
         let success = register(vm as *mut VM);
         vm.pop_export_prefix();
         if !success {
@@ -282,6 +306,133 @@ pub fn write_stub_files(
     }
 
     Ok(written)
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+pub fn collect_rust_dependency_artifacts(
+    dep: &ResolvedRustDependency,
+) -> Result<(LocalBuildOutput, Vec<StubFile>), String> {
+    let build = build_local_module(
+        &dep.crate_dir,
+        BuildOptions {
+            features: &dep.features,
+            default_features: dep.default_features,
+        },
+    )
+    .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
+
+    let include_extern_namespace = dep.cache_stub_dir.is_none();
+    let mut preview_vm = VM::new();
+    let preview_module =
+        load_local_module_with_namespace(&mut preview_vm, &build, include_extern_namespace)
+            .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
+    let exports = preview_vm.take_exported_natives();
+    preview_vm.clear_native_functions();
+    drop(preview_module);
+
+    let mut stubs = stub_files_from_exports(&exports);
+    let manual_stubs = collect_stub_files(&dep.crate_dir, dep.externs_override.as_deref())
+        .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
+    if !manual_stubs.is_empty() {
+        stubs.extend(manual_stubs);
+    }
+
+    Ok((build, stubs))
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+pub fn prepare_rust_dependencies(
+    deps: &DependencyResolution,
+    project_dir: &Path,
+) -> Result<Vec<PreparedRustDependency>, String> {
+    if deps.rust().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut prepared = Vec::new();
+    let mut project_extern_root: Option<PathBuf> = None;
+
+    for dep in deps.rust() {
+        let include_extern_namespace = dep.cache_stub_dir.is_none();
+        let (build, stubs) = collect_rust_dependency_artifacts(dep)?;
+        let mut stub_roots = Vec::new();
+        let sanitized_prefix = sanitized_crate_name(&build.name);
+        let mut register_root = |dir: &Path| {
+            let dir_buf = dir.to_path_buf();
+            if include_extern_namespace
+                && !stub_roots
+                    .iter()
+                    .any(|root: &StubRoot| root.prefix == "externs" && root.directory == dir_buf)
+            {
+                stub_roots.push(StubRoot {
+                    prefix: "externs".to_string(),
+                    directory: dir_buf.clone(),
+                });
+            }
+            if !stub_roots
+                .iter()
+                .any(|root: &StubRoot| root.prefix == sanitized_prefix && root.directory == dir_buf)
+            {
+                stub_roots.push(StubRoot {
+                    prefix: sanitized_prefix.clone(),
+                    directory: dir_buf,
+                });
+            }
+        };
+
+        if let Some(cache_dir) = &dep.cache_stub_dir {
+            fs::create_dir_all(cache_dir).map_err(|err| {
+                format!(
+                    "failed to create extern cache '{}': {}",
+                    cache_dir.display(),
+                    err
+                )
+            })?;
+            if !stubs.is_empty() {
+                write_stub_files(&build.name, &stubs, cache_dir)
+                    .map_err(|err| format!("{}: {}", cache_dir.display(), err))?;
+            }
+            if cache_dir.exists() {
+                register_root(cache_dir);
+            }
+        } else {
+            let root = project_extern_root
+                .get_or_insert_with(|| project_dir.join("externs"))
+                .clone();
+            if !stubs.is_empty() {
+                fs::create_dir_all(&root).map_err(|err| format!("{}: {}", root.display(), err))?;
+                write_stub_files(&build.name, &stubs, &root)
+                    .map_err(|err| format!("{}: {}", root.display(), err))?;
+                register_root(&root);
+            } else if root.exists() {
+                register_root(&root);
+            }
+        }
+
+        prepared.push(PreparedRustDependency {
+            dependency: dep.clone(),
+            build,
+            stub_roots,
+            export_with_extern_namespace: include_extern_namespace,
+        });
+    }
+
+    Ok(prepared)
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+pub fn load_prepared_rust_dependencies(
+    prepared: &[PreparedRustDependency],
+    vm: &mut VM,
+) -> Result<Vec<LoadedRustModule>, String> {
+    let mut loaded = Vec::new();
+    for item in prepared {
+        let module =
+            load_local_module_with_namespace(vm, &item.build, item.export_with_extern_namespace)
+                .map_err(|err| format!("{}: {}", item.dependency.crate_dir.display(), err))?;
+        loaded.push(module);
+    }
+    Ok(loaded)
 }
 
 fn extension_profile() -> String {

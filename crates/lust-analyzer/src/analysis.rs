@@ -87,6 +87,7 @@ pub(crate) struct AnalysisSnapshot {
     modules_by_name: HashMap<String, PathBuf>,
     module_children: HashMap<String, HashSet<String>>,
     dependency_roots: HashSet<String>,
+    project_module_roots: HashSet<String>,
     type_index: TypeIndex,
     semantic_tokens: HashMap<PathBuf, SemanticTokenData>,
     structs_by_qualified: HashMap<String, StructInfo>,
@@ -116,10 +117,14 @@ impl AnalysisSnapshot {
         let mut enums_by_qualified = HashMap::new();
         let mut enums_by_simple: HashMap<String, Vec<String>> = HashMap::new();
         let mut methods_by_type: HashMap<String, Vec<MethodInfo>> = HashMap::new();
+        let mut entry_module_path: Option<PathBuf> = None;
         for module in &program.modules {
             let module_path = module.path.clone();
             let file_path = module.source_path.clone();
             modules_by_name.insert(module_path.clone(), file_path.clone());
+            if module_path == program.entry_module {
+                entry_module_path = Some(file_path.clone());
+            }
             register_module_children(&mut module_children, &module_path);
             let source = source_overrides
                 .get(&file_path)
@@ -286,12 +291,24 @@ impl AnalysisSnapshot {
                 .or_default()
                 .extend(dependency_roots.iter().cloned());
         }
+        let project_module_roots = entry_module_path
+            .as_deref()
+            .and_then(|path| path.parent())
+            .map(|root| collect_project_module_roots(root))
+            .unwrap_or_default();
+        if !project_module_roots.is_empty() {
+            module_children
+                .entry(String::new())
+                .or_default()
+                .extend(project_module_roots.iter().cloned());
+        }
 
         Self {
             modules_by_path,
             modules_by_name,
             module_children,
             dependency_roots,
+            project_module_roots,
             type_index,
             semantic_tokens,
             structs_by_qualified,
@@ -322,6 +339,10 @@ impl AnalysisSnapshot {
 
     pub(crate) fn has_dependency_root(&self, name: &str) -> bool {
         self.dependency_roots.contains(name)
+    }
+
+    pub(crate) fn project_module_roots(&self) -> impl Iterator<Item = &String> {
+        self.project_module_roots.iter()
     }
 
     pub(crate) fn has_struct(&self, qualified: &str) -> bool {
@@ -448,6 +469,72 @@ fn register_module_children(map: &mut HashMap<String, HashSet<String>>, module_p
         let child = segments[idx].to_string();
         map.entry(parent).or_default().insert(child);
     }
+}
+
+fn collect_project_module_roots(root_dir: &Path) -> HashSet<String> {
+    let mut roots = HashSet::new();
+    let Ok(entries) = fs::read_dir(root_dir) else {
+        return roots;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        if should_skip_entry(name) {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_file() {
+            if path.extension().and_then(|ext| ext.to_str()) == Some("lust") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    roots.insert(stem.to_string());
+                }
+            }
+        } else if file_type.is_dir() && directory_contains_lust(&path) {
+            roots.insert(name.to_string());
+        }
+    }
+    roots
+}
+
+fn directory_contains_lust(path: &Path) -> bool {
+    let mut stack = vec![PathBuf::from(path)];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name_os = entry.file_name();
+            let Some(name) = name_os.to_str() else {
+                continue;
+            };
+            if should_skip_entry(name) {
+                continue;
+            }
+            let entry_path = entry.path();
+            if file_type.is_file() {
+                if entry_path.extension().and_then(|ext| ext.to_str()) == Some("lust") {
+                    return true;
+                }
+            } else if file_type.is_dir() {
+                stack.push(entry_path);
+            }
+        }
+    }
+    false
+}
+
+fn should_skip_entry(name: &str) -> bool {
+    matches!(name, "." | "..")
+        || name.starts_with('.')
+        || matches!(name, "target" | "node_modules" | "__pycache__")
 }
 
 impl TypeIndex {

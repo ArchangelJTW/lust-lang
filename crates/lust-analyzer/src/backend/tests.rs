@@ -1,16 +1,17 @@
 use super::*;
-use crate::analysis::{find_type_for_position, AnalysisSnapshot};
+use crate::analysis::{find_type_for_position, AnalysisSnapshot, ModuleSnapshot};
 use crate::utils::{
     analyzer_lust_config, base_type_name, compute_line_offsets, offset_to_position,
     span_from_identifier,
 };
-use lust::modules::ModuleLoader;
+use lust::modules::{LoadedModule, ModuleImports, ModuleLoader, ModuleExports};
 use lust::TypeChecker;
 use hashbrown::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tower_lsp::lsp_types::HoverContents;
+use tower_lsp::lsp_types::{HoverContents, Position};
 struct TempDir {
     path: PathBuf,
 }
@@ -41,6 +42,10 @@ impl Drop for TempDir {
 }
 
 fn new_typechecker() -> TypeChecker {
+    static BUILTINS_INIT: Once = Once::new();
+    BUILTINS_INIT.call_once(|| {
+        prewarm_builtins();
+    });
     let config = analyzer_lust_config();
     TypeChecker::with_config(&config)
 }
@@ -1236,6 +1241,173 @@ end
         .collect();
     assert!(export_labels.contains(&"Point"));
     assert!(export_labels.contains(&"add"));
+}
+
+#[test]
+fn module_path_completion_includes_root_modules() {
+    let tmp = TempDir::new();
+    let lib_dir = tmp.path().join("lib");
+    fs::create_dir_all(&lib_dir).expect("create lib dir");
+    let math_path = lib_dir.join("math.lust");
+    let math_source = r#"
+pub struct Point
+x: int
+y: int
+end
+"#;
+    fs::write(&math_path, math_source.trim_start()).expect("write math");
+    let entry_path = tmp.path().join("main.lust");
+    let entry_source = r#"
+function main(): int
+return 0
+end
+"#;
+    fs::write(&entry_path, entry_source.trim_start()).expect("write main");
+    let mut loader = ModuleLoader::new(tmp.path());
+    let program = loader
+        .load_program_from_entry(entry_path.to_str().expect("utf8 path"))
+        .expect("program");
+    let mut imports_map = HashMap::new();
+    for module in &program.modules {
+        imports_map.insert(module.path.clone(), module.imports.clone());
+    }
+
+    let mut typechecker = new_typechecker();
+    typechecker.set_imports_by_module(imports_map);
+    typechecker
+        .check_program(&program.modules)
+        .expect("typecheck");
+    let struct_defs = typechecker.struct_definitions();
+    let enum_defs = typechecker.enum_definitions();
+    let type_info = typechecker.take_type_info();
+    let snapshot =
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
+    let module = snapshot
+        .module_for_file(&entry_path)
+        .expect("module snapshot");
+    let project_roots: Vec<_> = snapshot.project_module_roots().cloned().collect();
+    assert!(
+        project_roots.contains(&"lib".to_string()),
+        "expected project module roots to include 'lib', got {project_roots:?}"
+    );
+    let root_items = module_path_completions(&snapshot, module, &[], "");
+    let root_labels: Vec<_> = root_items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect();
+    assert!(
+        root_labels.contains(&"lib"),
+        "expected root completions to include 'lib', got {root_labels:?}"
+    );
+    let filtered_items = module_path_completions(&snapshot, module, &[], "l");
+    let filtered_labels: Vec<_> = filtered_items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect();
+    assert!(
+        filtered_labels.contains(&"lib"),
+        "expected filtered root completions to include 'lib', got {filtered_labels:?}"
+    );
+}
+
+#[test]
+fn module_path_completion_filters_invalid_dependency_roots() {
+    let tmp = TempDir::new();
+    let entry_path = tmp.path().join("main.lust");
+    let entry_source = r#"
+function main(): int
+return 0
+end
+"#;
+    fs::write(&entry_path, entry_source.trim_start()).expect("write main");
+    let mut loader = ModuleLoader::new(tmp.path());
+    let program = loader
+        .load_program_from_entry(entry_path.to_str().expect("utf8 path"))
+        .expect("program");
+    let mut imports_map = HashMap::new();
+    for module in &program.modules {
+        imports_map.insert(module.path.clone(), module.imports.clone());
+    }
+    let mut typechecker = new_typechecker();
+    typechecker.set_imports_by_module(imports_map);
+    typechecker
+        .check_program(&program.modules)
+        .expect("typecheck");
+    let struct_defs = typechecker.struct_definitions();
+    let enum_defs = typechecker.enum_definitions();
+    let type_info = typechecker.take_type_info();
+    let dependency_roots = HashSet::from([
+        "pkg-test".to_string(),
+        "pkg_test".to_string(),
+    ]);
+    let snapshot =
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            dependency_roots,
+        );
+    let module = snapshot
+        .module_for_file(&entry_path)
+        .expect("module snapshot");
+    let root_items = module_path_completions(&snapshot, module, &[], "");
+    let root_labels: Vec<_> = root_items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect();
+    assert!(
+        root_labels.contains(&"pkg_test"),
+        "expected dependency root completions to include 'pkg_test', got {root_labels:?}"
+    );
+    assert!(
+        !root_labels.contains(&"pkg-test"),
+        "expected dependency root completions to exclude 'pkg-test', got {root_labels:?}"
+    );
+    let filtered_items = module_path_completions(&snapshot, module, &[], "pkg");
+    let filtered_labels: Vec<_> = filtered_items
+        .iter()
+        .map(|item| item.label.as_str())
+        .collect();
+    assert!(
+        filtered_labels.contains(&"pkg_test"),
+        "expected filtered dependency completions to include 'pkg_test', got {filtered_labels:?}"
+    );
+    assert!(
+        !filtered_labels.contains(&"pkg-test"),
+        "expected filtered dependency completions to exclude 'pkg-test', got {filtered_labels:?}"
+    );
+}
+
+#[test]
+fn analyze_module_path_context_handles_incomplete_use_without_ast() {
+    let text = "use ";
+    let offset = text.len();
+    let position = Position::new(0, offset as u32);
+    let module = ModuleSnapshot {
+        module: LoadedModule {
+            path: "main".to_string(),
+            items: Vec::new(),
+            imports: ModuleImports::default(),
+            exports: ModuleExports::default(),
+            init_function: None,
+            source_path: PathBuf::new(),
+        },
+        expr_types: HashMap::new(),
+        variable_types: HashMap::new(),
+    };
+    let context =
+        analyze_module_path_context(text, offset, &module, &position).expect("module context");
+    assert!(context.path_segments.is_empty());
+    assert!(context.prefix.is_empty());
 }
 
 #[test]

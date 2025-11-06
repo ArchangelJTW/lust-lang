@@ -17,8 +17,6 @@ examples/rust-extension/
 The `lust-config.toml` declares the Rust extension crates via the new dependency table:
 
 ```toml
-[settings]
-
 [dependencies]
 lust-double = { path = "extensions/double", kind = "rust" }
 lust-triple = { path = "extensions/triple", kind = "rust" }

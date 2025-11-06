@@ -552,6 +552,9 @@ pub(crate) fn module_alias_member_completions(
         let mut names: Vec<_> = children.iter().cloned().collect();
         names.sort();
         for child in names {
+            if !is_valid_module_identifier(&child) {
+                continue;
+            }
             push_item(
                 child,
                 CompletionItemKind::MODULE,
@@ -560,9 +563,12 @@ pub(crate) fn module_alias_member_completions(
         }
     }
     if resolved_path.is_empty() {
-        let mut names: Vec<_> = snapshot.dependency_roots().cloned().collect();
-        names.sort();
-        for child in names {
+        let mut dependency_roots: Vec<_> = snapshot.dependency_roots().cloned().collect();
+        dependency_roots.sort();
+        for child in dependency_roots {
+            if !is_valid_module_identifier(&child) {
+                continue;
+            }
             push_item(
                 child,
                 CompletionItemKind::MODULE,
@@ -626,6 +632,9 @@ pub(crate) fn module_path_completions(
         let mut names: Vec<_> = children.iter().cloned().collect();
         names.sort();
         for child in names {
+            if !is_valid_module_identifier(&child) {
+                continue;
+            }
             push_item(
                 child,
                 CompletionItemKind::MODULE,
@@ -846,6 +855,11 @@ fn method_completion(method: &BuiltinMethod) -> CompletionItem {
     item.detail = Some(detail.clone());
     item.documentation = completion_documentation(&detail, method.description);
     item
+}
+
+#[cfg(test)]
+pub(crate) fn prewarm_builtins() {
+    let _ = builtins::builtins();
 }
 
 pub(crate) fn builtin_global_completions(object_name: &str, prefix: &str) -> Vec<CompletionItem> {
@@ -1224,7 +1238,9 @@ pub(crate) fn analyze_module_path_context(
     position: &Position,
 ) -> Option<CompletionContext> {
     let (segments, prefix) = parse_module_path_at(text, offset)?;
-    if !is_within_use_item(&module.module.items, position) {
+    if !is_within_use_item(&module.module.items, position)
+        && !appears_like_use_statement(text, offset)
+    {
         return None;
     }
 
@@ -1342,6 +1358,40 @@ fn is_within_use_item(items: &[Item], position: &Position) -> bool {
     }
 
     false
+}
+
+fn is_valid_module_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !is_identifier_start(first) {
+        return false;
+    }
+
+    chars.all(is_identifier_char)
+}
+
+fn is_identifier_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn appears_like_use_statement(text: &str, offset: usize) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+
+    let cursor = offset.min(text.len());
+    let line_start = text[..cursor].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    let snippet = text[line_start..cursor].trim_start();
+    if !snippet.starts_with("use") {
+        return false;
+    }
+    let after_use = snippet.strip_prefix("use").unwrap_or(snippet);
+    matches!(
+        after_use.chars().next(),
+        None | Some(' ') | Some('\t') | Some('{')
+    )
 }
 
 struct LocalInfo {

@@ -1,5 +1,3 @@
-[settings]
-
 [dependencies]
 lust-double = { path = "extensions/double" }
 lust-triple = { path = "extensions/triple" }

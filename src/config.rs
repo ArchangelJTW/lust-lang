@@ -176,16 +176,29 @@ impl LustConfig {
 
     #[cfg(feature = "std")]
     fn from_parsed(parsed: LustConfigToml, _base_dir: Option<&Path>) -> Result<Self, ConfigError> {
-        let modules = parsed
-            .settings
-            .stdlib_modules
+        let LustConfigToml {
+            settings,
+            dependencies: mut root_dependencies,
+        } = parsed;
+        let Settings {
+            stdlib_modules,
+            jit,
+            rust_modules,
+            dependencies: nested_dependencies,
+        } = settings;
+
+        let modules = stdlib_modules
             .into_iter()
             .map(|m| m.trim().to_ascii_lowercase())
             .filter(|m| !m.is_empty())
             .collect::<HashSet<_>>();
 
+        for (name, entry) in nested_dependencies {
+            root_dependencies.insert(name, entry);
+        }
+
         let mut dependencies = Vec::new();
-        for (name, entry) in parsed.settings.dependencies {
+        for (name, entry) in root_dependencies {
             let (version, path, kind, features, default_features, externs) = match entry {
                 DependencyToml::Version(version) => {
                     (Some(version), None, None, Vec::new(), None, None)
@@ -230,7 +243,7 @@ impl LustConfig {
             });
         }
 
-        for legacy in parsed.settings.rust_modules {
+        for legacy in rust_modules {
             let inferred_name = Path::new(&legacy.path)
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -250,7 +263,7 @@ impl LustConfig {
 
         Ok(Self {
             enabled_modules: modules,
-            jit_enabled: parsed.settings.jit,
+            jit_enabled: jit,
             dependencies,
         })
     }
@@ -259,11 +272,14 @@ impl LustConfig {
 #[cfg(feature = "std")]
 #[derive(Debug, Deserialize)]
 struct LustConfigToml {
+    #[serde(default)]
     settings: Settings,
+    #[serde(default)]
+    dependencies: BTreeMap<String, DependencyToml>,
 }
 
 #[cfg(feature = "std")]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct Settings {
     #[serde(default)]
     stdlib_modules: Vec<String>,
@@ -341,7 +357,6 @@ mod tests {
     #[test]
     fn dependencies_parse_version() {
         let toml = r#"
-            [settings]
             [dependencies]
             foo = "1.2.3"
         "#;
@@ -350,6 +365,41 @@ mod tests {
         let deps = cfg.dependencies();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name(), "foo");
+        assert_eq!(deps[0].version(), Some("1.2.3"));
+        assert!(deps[0].path().is_none());
+    }
+
+    #[test]
+    fn settings_dependencies_still_supported() {
+        let toml = r#"
+            [settings]
+            [settings.dependencies]
+            bar = { path = "ext/bar", kind = "rust" }
+        "#;
+        let parsed: LustConfigToml = toml::from_str(toml).unwrap();
+        let cfg = LustConfig::from_parsed(parsed, None).unwrap();
+        let deps = cfg.dependencies();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name(), "bar");
+        assert_eq!(deps[0].path(), Some("ext/bar"));
+        assert_eq!(deps[0].kind(), Some(DependencyKind::Rust));
+    }
+
+    #[test]
+    fn settings_dependencies_override_top_level() {
+        let toml = r#"
+            [dependencies]
+            baz = { path = "ext/baz" }
+
+            [settings]
+            [settings.dependencies]
+            baz = { version = "1.2.3" }
+        "#;
+        let parsed: LustConfigToml = toml::from_str(toml).unwrap();
+        let cfg = LustConfig::from_parsed(parsed, None).unwrap();
+        let deps = cfg.dependencies();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name(), "baz");
         assert_eq!(deps[0].version(), Some("1.2.3"));
         assert!(deps[0].path().is_none());
     }

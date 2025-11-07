@@ -102,6 +102,7 @@ impl VM {
             cycle_collector: cycle::CycleCollector::new(),
             exported_natives: Vec::new(),
             export_prefix_stack: Vec::new(),
+            exported_type_stubs: Vec::new(),
         };
         vm.jit.enabled = vm.jit.enabled && config.jit_enabled();
         vm.trait_impls
@@ -303,6 +304,10 @@ impl VM {
         self.export_prefix_stack.last().map(|s| s.as_str())
     }
 
+    pub fn export_prefix(&self) -> Option<String> {
+        self.current_export_prefix().map(|s| s.to_string())
+    }
+
     pub fn register_exported_native<F>(&mut self, export: NativeExport, func: F)
     where
         F: Fn(&[Value]) -> CoreResult<NativeCallResult, String> + 'static,
@@ -324,6 +329,17 @@ impl VM {
         self.register_native(name, native);
     }
 
+    pub fn register_type_stubs(&mut self, stubs: Vec<ModuleStub>) {
+        if stubs.is_empty() {
+            return;
+        }
+        self.exported_type_stubs.extend(stubs);
+    }
+
+    pub fn take_type_stubs(&mut self) -> Vec<ModuleStub> {
+        mem::take(&mut self.exported_type_stubs)
+    }
+
     pub fn exported_natives(&self) -> &[NativeExport] {
         &self.exported_natives
     }
@@ -334,6 +350,7 @@ impl VM {
 
     pub fn clear_native_functions(&mut self) {
         self.natives.clear();
+        self.exported_type_stubs.clear();
     }
 
     pub fn get_global(&self, name: &str) -> Option<Value> {

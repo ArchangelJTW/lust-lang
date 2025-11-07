@@ -444,7 +444,7 @@ impl Compiler {
             if let Some(arr_expr) = array_receiver_expr {
                 self.begin_scope();
                 let array_reg = self.compile_expr(arr_expr)?;
-                let elem_reg = self.next_local_slot();
+                let elem_reg = self.allocate_register();
                 if let Some(scope) = self.scopes.last_mut() {
                     scope.locals.insert(variables[0].clone(), (elem_reg, false));
                 }
@@ -503,6 +503,7 @@ impl Compiler {
                     self.current_chunk_mut().patch_jump(b, end_pos);
                 }
 
+                self.free_register(elem_reg);
                 self.free_register(len_reg);
                 self.free_register(i_reg);
                 self.free_register(array_reg);

@@ -1,15 +1,18 @@
 # Rust Extension Example
 
-This example shows how to pair a Lust script with a local Rust extension crate that
-registers native functions at runtime and lets the CLI generate extern stubs automatically.
+This example shows how to pair a Lust script with local Rust extension crates that
+register native functions **and** Lust-visible types at runtime. The CLI inspects those
+bindings and generates extern stubs automatically.
 
 ```
 examples/rust-extension/
 ├── extensions/
-│   └── double/
+│   ├── double/
+│   │   ├── Cargo.toml
+│   │   └── src/lib.rs
+│   └── triple/
 │       ├── Cargo.toml
-│       └── src/
-│           └── lib.rs
+│       └── src/lib.rs
 ├── lust-config.toml
 └── main.lust
 ```
@@ -28,23 +31,39 @@ lust-triple = { path = "extensions/triple", kind = "rust" }
    ```bash
    lust --dump-externs examples/rust-extension/main.lust
    ```
-   The CLI compiles `extensions/double` with Cargo, runs its register hook in a temporary VM,
-   and synthesises extern blocks from the metadata it records. Generated stubs land under
-   `examples/rust-extension/externs/`.
+   The CLI compiles each extension crate, executes its `lust_extension_register` hook in a
+   temporary VM, and captures every struct/enum/function it exposes through `ExternRegistry`
+   and `register_exported_native`. Generated stubs land under `examples/rust-extension/externs/`.
 
 2. Execute the Lust program:
    ```bash
    lust examples/rust-extension/main.lust
    ```
-   The runtime loads the compiled shared library, invokes its
-   `lust_extension_register` hook, and the script can call `host_double`
-   (via `use externs.lust_double.*`) as if it were a regular Lust function.
+   The runtime loads the compiled shared libraries, invokes their register hooks, and the
+   script can construct `Factor` structs, invoke `Factor:apply`, and work with the
+   `Operation` enum just like native Lust definitions.
 
 ## Extension crate
 
-- `src/lib.rs` exposes the required `#[no_mangle] extern "C" fn lust_extension_register`
-  entrypoint. It receives the VM pointer and uses `vm.register_exported_native` to bind
-  `host_double`, which the loader automatically maps to
-  `externs.lust_double.host_double` while recording its signature for stub generation.
-- The crate is built as a `cdylib` and depends on the root `lust-lang` crate with the
-  `packages` feature enabled so it can access the runtime types.
+- Each crate exposes the required `#[no_mangle] extern "C" fn lust_extension_register`
+  entrypoint. Inside that hook it builds an `ExternRegistry`, declares Rust-driven
+  structs/enums/functions, and then registers native implementations via
+  `vm.register_exported_native`.
+- The crates are built as `cdylib`s and depend on the root `lust-lang` crate (with the
+  `packages` feature) to access runtime types and helpers.
+
+### `lust-double`
+
+- Declares a `Factor` struct (with `base` and `multiplier` fields) and a helper function
+  `make_factor` that constructs instances from Rust.
+- Provides a method-like native `Factor:apply` plus the classic `host_double` /
+  `host_quadruple` helpers.
+
+### `lust-triple`
+
+- Declares an `Operation` enum with `Double`, `Triple`, and `Scale(int)` variants, along
+  with helpers to build and apply operations.
+- Demonstrates how native code can emit enum payloads for Lust to consume.
+
+The updated `main.lust` script shows how to consume all of these bindings after running
+`lust --dump-externs ...`.

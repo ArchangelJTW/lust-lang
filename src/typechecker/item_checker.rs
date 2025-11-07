@@ -274,14 +274,64 @@ impl TypeChecker {
                     params,
                     return_type,
                 } => {
+                    let canonical_params: Vec<Type> =
+                        params.iter().map(|ty| self.canonicalize_type(ty)).collect();
+                    let canonical_return = return_type
+                        .clone()
+                        .map(|ty| self.canonicalize_type(&ty))
+                        .unwrap_or(Type::new(TypeKind::Unit, TypeChecker::dummy_span()));
                     let sig = FunctionSignature {
-                        params: params.clone(),
-                        return_type: return_type
-                            .clone()
-                            .unwrap_or(Type::new(TypeKind::Unit, TypeChecker::dummy_span())),
+                        params: canonical_params.clone(),
+                        return_type: canonical_return.clone(),
                         is_method: false,
                     };
-                    self.env.register_function(name.clone(), sig)?;
+                    self.register_external_function((name.clone(), sig.clone()))?;
+                    if let Some((_struct_name_raw, method_name)) = name.split_once(':') {
+                        if let Some(self_ty) = canonical_params.first() {
+                            let canonical_self = self_ty.clone();
+                            if matches!(
+                                canonical_self.kind,
+                                TypeKind::Named(_) | TypeKind::GenericInstance { .. }
+                            ) {
+                                let struct_name = match &canonical_self.kind {
+                                    TypeKind::Named(name) => name.clone(),
+                                    TypeKind::GenericInstance { name, .. } => name.clone(),
+                                    _ => unreachable!(),
+                                };
+                                let mut method_params: Vec<FunctionParam> = Vec::new();
+                                method_params.push(FunctionParam {
+                                    name: "self".to_string(),
+                                    ty: canonical_self.clone(),
+                                    is_self: true,
+                                });
+                                for (idx, ty) in canonical_params.iter().enumerate().skip(1) {
+                                    method_params.push(FunctionParam {
+                                        name: format!("arg{}", idx),
+                                        ty: ty.clone(),
+                                        is_self: false,
+                                    });
+                                }
+                                let method_def = FunctionDef {
+                                    name: format!("{}:{}", struct_name, method_name),
+                                    type_params: Vec::new(),
+                                    trait_bounds: Vec::new(),
+                                    params: method_params,
+                                    return_type: Some(canonical_return.clone()),
+                                    body: Vec::new(),
+                                    is_method: true,
+                                    visibility: Visibility::Public,
+                                };
+                                let impl_block = ImplBlock {
+                                    type_params: Vec::new(),
+                                    trait_name: None,
+                                    target_type: canonical_self.clone(),
+                                    methods: vec![method_def],
+                                    where_clause: Vec::new(),
+                                };
+                                self.register_external_impl(impl_block)?;
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -947,7 +947,10 @@ pub(crate) fn signature_to_string(signature: &FunctionSignature) -> String {
 mod tests {
     use super::*;
     use crate::ast::Span;
-    use crate::embed::{AsyncDriver, EmbeddedProgram, LustStructView};
+    use crate::embed::{
+        struct_field_decl, AsyncDriver, EmbeddedProgram, FunctionBuilder, LustStructView,
+        StructBuilder,
+    };
     use std::rc::Rc;
 
     fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -1320,9 +1323,9 @@ mod tests {
     fn async_task_native_returns_task_handle() {
         let _guard = serial_guard();
         let source = r#"
-            extern {
+            extern
                 function fetch_value(): Task
-            }
+            end
 
             pub function start(): Task
                 return fetch_value()
@@ -1364,6 +1367,52 @@ mod tests {
             .and_then(|value| value.as_int())
             .expect("int result");
         assert_eq!(int_value, 42);
+    }
+
+    #[test]
+    fn rust_declared_struct_and_static_method_are_available() {
+        let _guard = serial_guard();
+        let struct_def = StructBuilder::new("externs.math.Point")
+            .field(struct_field_decl(
+                "x",
+                Type::new(TypeKind::Int, Span::dummy()),
+            ))
+            .field(struct_field_decl(
+                "y",
+                Type::new(TypeKind::Int, Span::dummy()),
+            ))
+            .finish();
+        let origin_fn = FunctionBuilder::new("externs.math.origin_x")
+            .return_type(Type::new(TypeKind::Int, Span::dummy()))
+            .finish();
+
+        let module = r#"
+            pub function make(): externs.math.Point
+                return externs.math.Point { x = 10, y = 20 }
+            end
+        "#;
+
+        let mut program = EmbeddedProgram::builder()
+            .module("main", module)
+            .entry_module("main")
+            .declare_struct(struct_def)
+            .declare_function(origin_fn)
+            .compile()
+            .expect("compile program");
+
+        let point_value = program
+            .call_raw("main.make", Vec::new())
+            .expect("call make");
+        match point_value {
+            Value::Struct { name, .. } => assert_eq!(name, "externs.math.Point"),
+            other => panic!("expected struct value, found {other:?}"),
+        }
+
+        program
+            .register_typed_native::<(), LustInt, _>("externs.math.origin_x", |_| Ok(123_i64))
+            .expect("register static origin");
+        let signature = program.signature("externs.math.origin_x");
+        assert!(signature.is_some());
     }
 
     #[test]

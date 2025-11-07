@@ -1,12 +1,12 @@
 [package]
 name = "lust-double"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-lust = { path = "../../../..", version = "2.2.5", package = "lust-rs" }
+lust = { path = "../../../..", version = "2.2.6", package = "lust-rs" }
 
 [workspace]

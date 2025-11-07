@@ -2,23 +2,56 @@ use externs.lust_double.*
 use externs.lust_double.nested.host_quadruple
 use externs.lust_triple.*
 
-pub function main()
-    local data: Array<int> = []
+local factors: Array<Factor> = []
+local operations: Array<Operation> = []
 
-    for i = 1, 50 do
-        data:push(i)
+pub function build_examples()
+    factors:clear()
+    operations:clear()
+
+    factors:push(make_factor(2, 3))
+    factors:push(make_factor(4, 5))
+
+    operations:push(Operation.Double)
+    operations:push(Operation.Triple)
+    operations:push(make_scale(10))
+end
+
+pub function report_factor_results()
+    for factor in factors do
+        local label = "Factor(base=" .. tostring(factor.base) ..
+            ", multiplier=" .. tostring(factor.multiplier) .. ")"
+        for value = 1, 5 do
+            println(label .. ": apply(" .. tostring(value) .. ") = " ..
+                tostring(factor:apply(value)))
+        end
     end
+end
 
-    local sum = 0
-    for value in data do
-        sum = sum + host_double(value)
-        println("Test print")
+pub function report_host_calls()
+    for value = 1, 5 do
         println("host_double(" .. tostring(value) .. ") = " .. tostring(host_double(value)))
         println("host_triple(" .. tostring(value) .. ") = " .. tostring(host_triple(value)))
         println("host_quadruple(" .. tostring(value) .. ") = " .. tostring(host_quadruple(value)))
     end
+end
 
-    println(sum)
+pub function apply_operations_to(value: int): Array<int>
+    local results = []
+    for operation in operations do
+        results:push(apply_operation(operation, value))
+    end
+    return results
+end
+
+pub function main()
+    build_examples()
+    report_host_calls()
+    report_factor_results()
+
+    local value = 12
+    local applied = apply_operations_to(value)
+    println("Operations applied to " .. tostring(value) .. ": " .. tostring(applied))
 end
 
 main()

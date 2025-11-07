@@ -5,8 +5,12 @@ use super::async_runtime::{
 use super::conversions::{
     FromLustArgs, FromLustValue, FunctionArgs, IntoLustValue, IntoTypedValue,
 };
+use super::native_types::ExternRegistry;
 use super::values::{EnumInstance, FunctionHandle, StructField, StructInstance, TypedValue};
-use crate::ast::{EnumDef, FieldOwnership, Item, ItemKind, Span, StructDef, Type, TypeKind};
+use crate::ast::{
+    EnumDef, FieldOwnership, FunctionDef, ImplBlock, Item, ItemKind, Span, StructDef, TraitDef,
+    Type, TypeKind,
+};
 use crate::bytecode::{Compiler, NativeCallResult, Value};
 use crate::modules::{ModuleImports, ModuleLoader};
 use crate::typechecker::{FunctionSignature, TypeChecker};
@@ -24,6 +28,7 @@ pub struct EmbeddedBuilder {
     modules: HashMap<String, String>,
     entry_module: Option<String>,
     config: LustConfig,
+    extern_registry: ExternRegistry,
 }
 
 impl Default for EmbeddedBuilder {
@@ -33,6 +38,7 @@ impl Default for EmbeddedBuilder {
             modules: HashMap::new(),
             entry_module: None,
             config: LustConfig::default(),
+            extern_registry: ExternRegistry::new(),
         }
     }
 }
@@ -64,6 +70,40 @@ impl EmbeddedBuilder {
     pub fn add_stdlib_module<S: AsRef<str>>(mut self, module: S) -> Self {
         self.config.enable_module(module);
         self
+    }
+
+    pub fn declare_struct(mut self, def: StructDef) -> Self {
+        self.extern_registry.add_struct(def);
+        self
+    }
+
+    pub fn declare_enum(mut self, def: EnumDef) -> Self {
+        self.extern_registry.add_enum(def);
+        self
+    }
+
+    pub fn declare_trait(mut self, def: TraitDef) -> Self {
+        self.extern_registry.add_trait(def);
+        self
+    }
+
+    pub fn declare_impl(mut self, impl_block: ImplBlock) -> Self {
+        self.extern_registry.add_impl(impl_block);
+        self
+    }
+
+    pub fn declare_function(mut self, func: FunctionDef) -> Self {
+        self.extern_registry.add_function(func);
+        self
+    }
+
+    pub fn with_extern_registry(mut self, registry: ExternRegistry) -> Self {
+        self.extern_registry = registry;
+        self
+    }
+
+    pub fn extern_registry_mut(&mut self) -> &mut ExternRegistry {
+        &mut self.extern_registry
     }
 
     pub fn with_config(mut self, config: LustConfig) -> Self {
@@ -112,7 +152,13 @@ impl EmbeddedBuilder {
             .into_iter()
             .map(|(module, source)| (module_path_to_file(&self.base_dir, &module), source))
             .collect();
-        compile_in_memory(self.base_dir, entry_module, overrides, self.config)
+        compile_in_memory(
+            self.base_dir,
+            entry_module,
+            overrides,
+            self.config,
+            self.extern_registry,
+        )
     }
 }
 
@@ -292,6 +338,11 @@ impl EmbeddedProgram {
 
         aliases.sort();
         aliases.dedup();
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "register_native_with_aliases requested='{}' canonical='{}' aliases={:?}",
+            requested_name, canonical, aliases
+        );
         for key in aliases {
             self.vm.register_native(key, value.clone());
         }
@@ -810,6 +861,7 @@ fn compile_in_memory(
     entry_module: String,
     overrides: HashMap<PathBuf, String>,
     config: LustConfig,
+    extern_registry: ExternRegistry,
 ) -> Result<EmbeddedProgram> {
     let mut loader = ModuleLoader::new(base_dir.clone());
     loader.set_source_overrides(overrides);
@@ -837,10 +889,17 @@ fn compile_in_memory(
 
     let mut typechecker = TypeChecker::with_config(&config);
     typechecker.set_imports_by_module(imports_map.clone());
+    extern_registry.register_with_typechecker(&mut typechecker)?;
     typechecker.check_program(&program.modules)?;
     let option_coercions = typechecker.take_option_coercions();
-    let struct_defs = typechecker.struct_definitions();
-    let enum_defs = typechecker.enum_definitions();
+    let mut struct_defs = typechecker.struct_definitions();
+    for def in extern_registry.structs() {
+        struct_defs.insert(def.name.clone(), def.clone());
+    }
+    let mut enum_defs = typechecker.enum_definitions();
+    for def in extern_registry.enums() {
+        enum_defs.insert(def.name.clone(), def.clone());
+    }
     let mut signatures = typechecker.function_signatures();
     let mut compiler = Compiler::new();
     compiler.set_option_coercions(option_coercions);
@@ -876,6 +935,7 @@ fn compile_in_memory(
     let mut vm = VM::with_config(&config);
     vm.load_functions(functions);
     vm.register_structs(&struct_defs);
+    extern_registry.register_type_stubs(&mut vm);
     for (type_name, trait_name) in trait_impls {
         vm.register_trait_impl(type_name, trait_name);
     }

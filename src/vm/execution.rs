@@ -997,6 +997,45 @@ impl VM {
                             self.call_stack.push(frame);
                             continue;
                         }
+
+                        let mut candidate_names = vec![mangled_name.clone()];
+                        if let Some(simple) = struct_name.rsplit(|c| c == '.' || c == ':').next() {
+                            candidate_names.push(format!("{}:{}", simple, method_name));
+                        }
+
+                        let mut handled = false;
+                        for candidate in candidate_names {
+                            let mut resolved = None;
+                            for variant in [candidate.clone(), candidate.replace('.', "::")] {
+                                if let Some((_name, value)) =
+                                    self.globals.iter().find(|(name, _)| *name == &variant)
+                                {
+                                    resolved = Some(value.clone());
+                                    break;
+                                }
+                                if let Some((_name, value)) =
+                                    self.natives.iter().find(|(name, _)| *name == &variant)
+                                {
+                                    resolved = Some(value.clone());
+                                    break;
+                                }
+                            }
+
+                            if let Some(global_func) = resolved {
+                                let mut call_args = Vec::with_capacity(1 + arg_count as usize);
+                                call_args.push(object.clone());
+                                for i in 0..arg_count {
+                                    call_args.push(self.get_register(first_arg + i)?.clone());
+                                }
+                                let result = self.call_value(&global_func, call_args)?;
+                                self.set_register(dest_reg, result)?;
+                                handled = true;
+                                break;
+                            }
+                        }
+                        if handled {
+                            continue;
+                        }
                     }
 
                     let mut args = Vec::new();

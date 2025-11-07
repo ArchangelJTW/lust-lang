@@ -277,7 +277,15 @@ impl ModuleLoader {
                                 return_type,
                             } => {
                                 let mut new_name = name.clone();
-                                if !new_name.contains('.') && !new_name.contains(':') {
+                                if let Some((head, tail)) = new_name.split_once(':') {
+                                    let qualified_head =
+                                        if head.contains('.') || head.contains("::") {
+                                            head.to_string()
+                                        } else {
+                                            format!("{}.{}", module_path, head)
+                                        };
+                                    new_name = format!("{}:{}", qualified_head, tail);
+                                } else if !new_name.contains('.') {
                                     new_name = format!("{}.{}", module_path, new_name);
                                 }
 

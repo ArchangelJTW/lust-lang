@@ -747,6 +747,12 @@ impl Value {
             Value::Struct { layout, fields, .. } => layout
                 .index_of_rc(field)
                 .or_else(|| layout.index_of_str(field.as_str()))
+                .or_else(|| {
+                    layout
+                        .field_names()
+                        .iter()
+                        .position(|name| name.as_str() == field.as_str())
+                })
                 .and_then(|idx| {
                     fields
                         .borrow()

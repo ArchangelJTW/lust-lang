@@ -389,6 +389,31 @@ impl TypeEnv {
         Ok(())
     }
 
+    pub fn register_or_update_function(
+        &mut self,
+        name: String,
+        sig: FunctionSignature,
+    ) -> Result<()> {
+        if let Some(existing) = self.functions.get_mut(&name) {
+            if existing.params != sig.params || existing.return_type != sig.return_type {
+                return Err(LustError::TypeError {
+                    message: format!(
+                        "Function '{}' is already defined with a different signature",
+                        name
+                    ),
+                });
+            }
+
+            if sig.is_method && !existing.is_method {
+                existing.is_method = true;
+            }
+            return Ok(());
+        }
+
+        self.functions.insert(name, sig);
+        Ok(())
+    }
+
     pub fn lookup_function(&self, name: &str) -> Option<&FunctionSignature> {
         self.functions.get(name)
     }

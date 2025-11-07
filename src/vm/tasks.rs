@@ -377,8 +377,29 @@ impl VM {
             let mangled_name = format!("{}:{}", struct_name, method_name);
             if let Some(func_idx) = self.functions.iter().position(|f| f.name == mangled_name) {
                 let mut method_args = vec![object.clone()];
-                method_args.extend(args);
+                method_args.extend(args.clone());
                 return self.call_value(&Value::Function(func_idx), method_args);
+            }
+
+            let mut candidate_names = vec![mangled_name.clone()];
+            if let Some(simple) = struct_name.rsplit(|c| c == '.' || c == ':').next() {
+                candidate_names.push(format!("{}:{}", simple, method_name));
+            }
+
+            for candidate in candidate_names {
+                let mut resolved = None;
+                for variant in [candidate.clone(), candidate.replace('.', "::")] {
+                    if let Some(value) = self.get_global(&variant) {
+                        resolved = Some(value);
+                        break;
+                    }
+                }
+
+                if let Some(global_func) = resolved {
+                    let mut method_args = vec![object.clone()];
+                    method_args.extend(args.clone());
+                    return self.call_value(&global_func, method_args);
+                }
             }
         }
 

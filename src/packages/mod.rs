@@ -1,3 +1,4 @@
+use crate::embed::native_types::ModuleStub;
 use crate::{NativeExport, VM};
 use dirs::home_dir;
 use libloading::Library;
@@ -327,10 +328,11 @@ pub fn collect_rust_dependency_artifacts(
         load_local_module_with_namespace(&mut preview_vm, &build, include_extern_namespace)
             .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
     let exports = preview_vm.take_exported_natives();
+    let type_stubs = preview_vm.take_type_stubs();
     preview_vm.clear_native_functions();
     drop(preview_module);
 
-    let mut stubs = stub_files_from_exports(&exports);
+    let mut stubs = stub_files_from_exports(&exports, &type_stubs);
     let manual_stubs = collect_stub_files(&dep.crate_dir, dep.externs_override.as_deref())
         .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
     if !manual_stubs.is_empty() {
@@ -503,49 +505,130 @@ fn visit_stub_dir(
     Ok(())
 }
 
-pub fn stub_files_from_exports(exports: &[NativeExport]) -> Vec<StubFile> {
-    if exports.is_empty() {
+pub fn stub_files_from_exports(
+    exports: &[NativeExport],
+    type_stubs: &[ModuleStub],
+) -> Vec<StubFile> {
+    if exports.is_empty() && type_stubs.iter().all(ModuleStub::is_empty) {
         return Vec::new();
     }
 
-    let mut grouped: BTreeMap<String, Vec<&NativeExport>> = BTreeMap::new();
+    #[derive(Default)]
+    struct CombinedModule<'a> {
+        type_stub: ModuleStub,
+        functions: Vec<&'a NativeExport>,
+    }
+
+    let mut combined: BTreeMap<String, CombinedModule<'_>> = BTreeMap::new();
+    for stub in type_stubs {
+        if stub.is_empty() {
+            continue;
+        }
+        let entry = combined
+            .entry(stub.module.clone())
+            .or_insert_with(|| CombinedModule {
+                type_stub: ModuleStub {
+                    module: stub.module.clone(),
+                    ..ModuleStub::default()
+                },
+                ..CombinedModule::default()
+            });
+        entry.type_stub.struct_defs.extend(stub.struct_defs.clone());
+        entry.type_stub.enum_defs.extend(stub.enum_defs.clone());
+        entry.type_stub.trait_defs.extend(stub.trait_defs.clone());
+    }
+
     for export in exports {
-        let (module, _function) = match export.name().rsplit_once('.') {
+        let (module, _) = match export.name().rsplit_once('.') {
             Some(parts) => parts,
             None => continue,
         };
-        grouped.entry(module.to_string()).or_default().push(export);
+        let entry = combined
+            .entry(module.to_string())
+            .or_insert_with(|| CombinedModule {
+                type_stub: ModuleStub {
+                    module: module.to_string(),
+                    ..ModuleStub::default()
+                },
+                ..CombinedModule::default()
+            });
+        entry.functions.push(export);
     }
 
     let mut result = Vec::new();
-    for (module, mut items) in grouped {
-        items.sort_by(|a, b| a.name().cmp(b.name()));
+    for (module, mut combined_entry) in combined {
+        combined_entry
+            .functions
+            .sort_by(|a, b| a.name().cmp(b.name()));
         let mut contents = String::new();
-        contents.push_str("pub extern {\n");
-        for export in items {
-            if let Some((_, function)) = export.name().rsplit_once('.') {
-                let params = format_params(export);
-                let return_type = export.return_type();
-                if let Some(doc) = export.doc() {
-                    contents.push_str("    -- ");
-                    contents.push_str(doc);
-                    if !doc.ends_with('\n') {
-                        contents.push('\n');
-                    }
-                }
-                contents.push_str("    function ");
-                contents.push_str(function);
-                contents.push('(');
-                contents.push_str(&params);
-                contents.push(')');
-                if !return_type.trim().is_empty() && return_type.trim() != "()" {
-                    contents.push_str(": ");
-                    contents.push_str(return_type);
-                }
+
+        let mut wrote_type = false;
+        let append_defs = |defs: &Vec<String>, contents: &mut String, wrote_flag: &mut bool| {
+            if defs.is_empty() {
+                return;
+            }
+            if *wrote_flag && !contents.ends_with("\n\n") && !contents.is_empty() {
                 contents.push('\n');
             }
+            for def in defs {
+                contents.push_str(def);
+                if !def.ends_with('\n') {
+                    contents.push('\n');
+                }
+            }
+            *wrote_flag = true;
+        };
+
+        append_defs(
+            &combined_entry.type_stub.struct_defs,
+            &mut contents,
+            &mut wrote_type,
+        );
+        append_defs(
+            &combined_entry.type_stub.enum_defs,
+            &mut contents,
+            &mut wrote_type,
+        );
+        append_defs(
+            &combined_entry.type_stub.trait_defs,
+            &mut contents,
+            &mut wrote_type,
+        );
+
+        if !combined_entry.functions.is_empty() {
+            if wrote_type && !contents.ends_with("\n\n") {
+                contents.push('\n');
+            }
+            contents.push_str("pub extern\n");
+            for export in combined_entry.functions {
+                if let Some((_, function)) = export.name().rsplit_once('.') {
+                    let params = format_params(export);
+                    let return_type = export.return_type();
+                    if let Some(doc) = export.doc() {
+                        contents.push_str("    -- ");
+                        contents.push_str(doc);
+                        if !doc.ends_with('\n') {
+                            contents.push('\n');
+                        }
+                    }
+                    contents.push_str("    function ");
+                    contents.push_str(function);
+                    contents.push('(');
+                    contents.push_str(&params);
+                    contents.push(')');
+                    if !return_type.trim().is_empty() && return_type.trim() != "()" {
+                        contents.push_str(": ");
+                        contents.push_str(return_type);
+                    }
+                    contents.push('\n');
+                }
+            }
+            contents.push_str("end\n");
         }
-        contents.push_str("}\n");
+
+        if contents.is_empty() {
+            continue;
+        }
         let mut relative = relative_stub_path(&module);
         if relative.extension().is_none() {
             relative.set_extension("lust");

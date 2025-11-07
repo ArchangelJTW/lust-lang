@@ -475,6 +475,112 @@ impl TypeChecker {
         None
     }
 
+    pub fn register_external_struct(&mut self, mut def: StructDef) -> Result<()> {
+        def.name = self.resolve_type_key(&def.name);
+        for field in &mut def.fields {
+            field.ty = self.canonicalize_type(&field.ty);
+            if let Some(target) = &field.weak_target {
+                field.weak_target = Some(self.canonicalize_type(target));
+            }
+        }
+        self.env.register_struct(&def)
+    }
+
+    pub fn register_external_enum(&mut self, mut def: EnumDef) -> Result<()> {
+        def.name = self.resolve_type_key(&def.name);
+        for variant in &mut def.variants {
+            if let Some(fields) = &mut variant.fields {
+                for field in fields {
+                    *field = self.canonicalize_type(field);
+                }
+            }
+        }
+        self.env.register_enum(&def)
+    }
+
+    pub fn register_external_trait(&mut self, mut def: TraitDef) -> Result<()> {
+        def.name = self.resolve_type_key(&def.name);
+        for method in &mut def.methods {
+            for param in &mut method.params {
+                param.ty = self.canonicalize_type(&param.ty);
+            }
+            if let Some(ret) = method.return_type.clone() {
+                method.return_type = Some(self.canonicalize_type(&ret));
+            }
+        }
+        self.env.register_trait(&def)
+    }
+
+    pub fn register_external_function(
+        &mut self,
+        (name, mut signature): (String, FunctionSignature),
+    ) -> Result<()> {
+        signature.params = signature
+            .params
+            .into_iter()
+            .map(|ty| self.canonicalize_type(&ty))
+            .collect();
+        signature.return_type = self.canonicalize_type(&signature.return_type);
+        let canonical = self.resolve_type_key(&name);
+        self.env.register_or_update_function(canonical, signature)
+    }
+
+    pub fn register_external_impl(&mut self, mut impl_block: ImplBlock) -> Result<()> {
+        impl_block.target_type = self.canonicalize_type(&impl_block.target_type);
+        if let Some(trait_name) = &impl_block.trait_name {
+            impl_block.trait_name = Some(self.resolve_type_key(trait_name));
+        }
+        for method in &mut impl_block.methods {
+            for param in &mut method.params {
+                param.ty = self.canonicalize_type(&param.ty);
+            }
+            if let Some(ret) = method.return_type.clone() {
+                method.return_type = Some(self.canonicalize_type(&ret));
+            }
+        }
+
+        let type_name = match &impl_block.target_type.kind {
+            TypeKind::Named(name) => self.resolve_type_key(name),
+            TypeKind::GenericInstance { name, .. } => self.resolve_type_key(name),
+            _ => {
+                return Err(self.type_error(
+                    "Impl target must be a named type when registering from Rust".to_string(),
+                ))
+            }
+        };
+
+        self.env.register_impl(&impl_block);
+        for method in &impl_block.methods {
+            let params: Vec<Type> = method.params.iter().map(|p| p.ty.clone()).collect();
+            let return_type = method
+                .return_type
+                .clone()
+                .unwrap_or(Type::new(TypeKind::Unit, Span::dummy()));
+            let has_self = method.params.iter().any(|p| p.is_self);
+            let canonical_name = if method.name.contains(':') || method.name.contains('.') {
+                self.resolve_type_key(&method.name)
+            } else if has_self {
+                format!("{}:{}", type_name, method.name)
+            } else {
+                format!("{}.{}", type_name, method.name)
+            };
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "register_external_impl canonical method {} (has_self={})",
+                canonical_name, has_self
+            );
+            let signature = FunctionSignature {
+                params,
+                return_type,
+                is_method: has_self,
+            };
+            self.env
+                .register_or_update_function(canonical_name, signature)?;
+        }
+
+        Ok(())
+    }
+
     pub fn resolve_type_key(&self, name: &str) -> String {
         if let Some((head, tail)) = name.split_once('.') {
             if let Some(module) = &self.current_module {

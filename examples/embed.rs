@@ -30,10 +30,10 @@ fn main() -> lust::Result<()> {
 
         SCALE_FACTOR: int = 3
 
-        extern {
+        extern
             function host_scale(int): int
             function fetch_value(function(int)): Task
-        }
+        end
 
         arr_global: Array<int> = [1, 2, 3]
 

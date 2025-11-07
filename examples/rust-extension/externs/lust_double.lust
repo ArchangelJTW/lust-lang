@@ -1,3 +1,10 @@
-pub extern {
+pub struct Factor
+    pub base: int
+    pub multiplier: int
+end
+
+pub extern
+    function Factor:apply(Factor, int): int
     function host_double(int): int
-}
+    function make_factor(int, int): Factor
+end

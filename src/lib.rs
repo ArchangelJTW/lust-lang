@@ -29,9 +29,13 @@ pub use bytecode::{Chunk, Compiler, Function, Instruction, Value};
 pub use config::{ConfigError, DependencyKind, DependencySpec, LustConfig};
 #[cfg(feature = "std")]
 pub use embed::{
-    struct_field, ArrayHandle, AsyncDriver, AsyncTaskQueue, EmbeddedBuilder, EmbeddedProgram,
-    EnumInstance, FromLustValue, FromStructField, FunctionArgs, FunctionHandle, IntoLustValue,
-    MapHandle, StringRef, StructField, StructHandle, StructInstance, ValueRef,
+    enum_variant, enum_variant_with, function_param, private_struct_field_decl, self_param,
+    struct_field, struct_field_decl, trait_bound, type_named, type_unit, type_unknown,
+    weak_struct_field_decl, ArrayHandle, AsyncDriver, AsyncTaskQueue, EmbeddedBuilder,
+    EmbeddedProgram, EnumInstance, ExternRegistry, FromLustValue, FromStructField, FunctionArgs,
+    FunctionBuilder, FunctionHandle, ImplBuilder, IntoLustValue, MapHandle, ModuleStub, StringRef,
+    StructBuilder, StructField, StructHandle, StructInstance, TraitBuilder, TraitMethodBuilder,
+    ValueRef,
 };
 pub use error::{LustError, Result};
 pub use jit::{JitCompiler, JitState};

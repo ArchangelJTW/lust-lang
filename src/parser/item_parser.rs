@@ -195,11 +195,36 @@ impl Parser {
                 } else {
                     "C".to_string()
                 };
-                self.consume(TokenKind::LeftBrace, "Expected '{' after extern")?;
                 let mut items = Vec::new();
-                while !self.check(TokenKind::RightBrace) && !self.is_at_end() {
+                let uses_braces = if self.check(TokenKind::LeftBrace) {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let terminator = if uses_braces {
+                    TokenKind::RightBrace
+                } else {
+                    TokenKind::End
+                };
+                while !self.check(terminator) && !self.is_at_end() {
                     self.consume(TokenKind::Function, "Expected 'function' in extern block")?;
-                    let name = self.expect_identifier()?;
+                    let mut name = self.expect_identifier()?;
+                    loop {
+                        if self.check(TokenKind::Colon) {
+                            self.advance();
+                            let part = self.expect_identifier()?;
+                            name.push(':');
+                            name.push_str(&part);
+                        } else if self.check(TokenKind::Dot) {
+                            self.advance();
+                            let part = self.expect_identifier()?;
+                            name.push('.');
+                            name.push_str(&part);
+                        } else {
+                            break;
+                        }
+                    }
                     self.consume(TokenKind::LeftParen, "Expected '(' after function name")?;
                     let mut params = Vec::new();
                     if !self.check(TokenKind::RightParen) {
@@ -222,7 +247,15 @@ impl Parser {
                     });
                 }
 
-                self.consume(TokenKind::RightBrace, "Expected '}' after extern block")?;
+                if uses_braces {
+                    self.consume(TokenKind::RightBrace, "Expected '}' after extern block")?;
+                    // allow optional trailing 'end' for compatibility
+                    if self.match_token(&[TokenKind::End]) {
+                        // consumed optional end
+                    }
+                } else {
+                    self.consume(TokenKind::End, "Expected 'end' after extern block")?;
+                }
                 ItemKind::Extern { abi, items }
             }
 

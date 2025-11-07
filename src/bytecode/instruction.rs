@@ -186,14 +186,9 @@ impl fmt::Display for Instruction {
                 if *cnt == 0 {
                     write!(f, "Call R{}, <no args>, R{}", func, dest)
                 } else {
-                    write!(
-                        f,
-                        "Call R{}, R{}..R{}, R{}",
-                        func,
-                        args,
-                        args + cnt - 1,
-                        dest
-                    )
+                    let arg_start = *args as usize;
+                    let arg_end = arg_start + (*cnt as usize) - 1;
+                    write!(f, "Call R{}, R{}..R{}, R{}", func, args, arg_end, dest)
                 }
             }
 
@@ -209,16 +204,23 @@ impl fmt::Display for Instruction {
 
             Instruction::NewMap(r) => write!(f, "NewMap R{}", r),
             Instruction::NewStruct(d, name, field_names, fields, cnt) => {
-                write!(
-                    f,
-                    "NewStruct R{}, K{}, K{}..K{}, R{}..R{}",
-                    d,
-                    name,
-                    field_names,
-                    field_names + (*cnt as u16) - 1,
-                    fields,
-                    fields + cnt - 1
-                )
+                if *cnt == 0 {
+                    write!(
+                        f,
+                        "NewStruct R{}, K{}, <no fields>, R{}..R{}",
+                        d, name, fields, fields
+                    )
+                } else {
+                    let field_name_start = *field_names as usize;
+                    let field_name_end = field_name_start + (*cnt as usize) - 1;
+                    let value_start = *fields as usize;
+                    let value_end = value_start + (*cnt as usize) - 1;
+                    write!(
+                        f,
+                        "NewStruct R{}, K{}, K{}..K{}, R{}..R{}",
+                        d, name, field_names, field_name_end, fields, value_end
+                    )
+                }
             }
 
             Instruction::NewEnumUnit(d, enum_name, variant) => {
@@ -226,19 +228,31 @@ impl fmt::Display for Instruction {
             }
 
             Instruction::NewEnumVariant(d, enum_name, variant, values, cnt) => {
-                write!(
-                    f,
-                    "NewEnumVariant R{}, K{}, K{}, R{}..R{}",
-                    d,
-                    enum_name,
-                    variant,
-                    values,
-                    values + cnt - 1
-                )
+                if *cnt == 0 {
+                    write!(
+                        f,
+                        "NewEnumVariant R{}, K{}, K{}, <no values>",
+                        d, enum_name, variant
+                    )
+                } else {
+                    let value_start = *values as usize;
+                    let value_end = value_start + (*cnt as usize) - 1;
+                    write!(
+                        f,
+                        "NewEnumVariant R{}, K{}, K{}, R{}..R{}",
+                        d, enum_name, variant, values, value_end
+                    )
+                }
             }
 
             Instruction::TupleNew(d, first, cnt) => {
-                write!(f, "TupleNew R{}, R{}..R{}", d, first, first + cnt - 1)
+                if *cnt == 0 {
+                    write!(f, "TupleNew R{}, <empty>", d)
+                } else {
+                    let start = *first as usize;
+                    let end = start + (*cnt as usize) - 1;
+                    write!(f, "TupleNew R{}, R{}..R{}", d, first, end)
+                }
             }
 
             Instruction::TupleGet(d, tuple, idx) => {
@@ -273,15 +287,17 @@ impl fmt::Display for Instruction {
 
             Instruction::Concat(d, l, r) => write!(f, "Concat R{}, R{}, R{}", d, l, r),
             Instruction::CallMethod(obj, method, args, cnt, dest) => {
-                write!(
-                    f,
-                    "CallMethod R{}, K{}, R{}..R{}, R{}",
-                    obj,
-                    method,
-                    args,
-                    args + cnt - 1,
-                    dest
-                )
+                if *cnt == 0 {
+                    write!(f, "CallMethod R{}, K{}, <no args>, R{}", obj, method, dest)
+                } else {
+                    let arg_start = *args as usize;
+                    let arg_end = arg_start + (*cnt as usize) - 1;
+                    write!(
+                        f,
+                        "CallMethod R{}, K{}, R{}..R{}, R{}",
+                        obj, method, args, arg_end, dest
+                    )
+                }
             }
 
             Instruction::TypeIs(d, val, type_name) => {
@@ -291,14 +307,13 @@ impl fmt::Display for Instruction {
             Instruction::LoadUpvalue(d, idx) => write!(f, "LoadUpvalue R{}, U{}", d, idx),
             Instruction::StoreUpvalue(idx, s) => write!(f, "StoreUpvalue U{}, R{}", idx, s),
             Instruction::Closure(d, func, upvals, cnt) => {
-                write!(
-                    f,
-                    "Closure R{}, F{}, R{}..R{}",
-                    d,
-                    func,
-                    upvals,
-                    upvals + cnt - 1
-                )
+                if *cnt == 0 {
+                    write!(f, "Closure R{}, F{}, <no upvalues>", d, func)
+                } else {
+                    let start = *upvals as usize;
+                    let end = start + (*cnt as usize) - 1;
+                    write!(f, "Closure R{}, F{}, R{}..R{}", d, func, upvals, end)
+                }
             }
         }
     }

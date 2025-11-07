@@ -10,10 +10,7 @@ fn ty_int() -> Type {
 }
 
 fn ty_operation() -> Type {
-    Type::new(
-        TypeKind::Named("Operation".to_string()),
-        Span::dummy(),
-    )
+    Type::new(TypeKind::Named("Operation".to_string()), Span::dummy())
 }
 
 fn register_types(vm: &mut VM) {
@@ -70,7 +67,7 @@ fn register_functions(vm: &mut VM) -> Result<(), String> {
             .and_then(|value| value.as_int())
             .ok_or_else(|| "expected scale factor".to_string())?;
         Ok(NativeCallResult::Return(Value::enum_variant(
-            "externs.lust_triple.Operation",
+            "lust_triple.Operation",
             "Scale",
             vec![Value::Int(factor)],
         )))
@@ -98,24 +95,29 @@ fn register_functions(vm: &mut VM) -> Result<(), String> {
                 enum_name,
                 variant,
                 values: payload,
-            } if enum_name == "externs.lust_triple.Operation" || enum_name == "Operation" => match variant.as_str() {
-                "Double" => input * 2,
-                "Triple" => input * 3,
-                "Scale" => {
-                    let factor = payload
-                        .as_ref()
-                        .and_then(|values| values.get(0))
-                        .and_then(|value| value.as_int())
-                        .ok_or_else(|| "Scale variant requires factor".to_string())?;
-                    input * factor
+            } if enum_name == "lust_triple.Operation"
+                || enum_name == "externs.lust_triple.Operation"
+                || enum_name == "Operation" =>
+            {
+                match variant.as_str() {
+                    "Double" => input * 2,
+                    "Triple" => input * 3,
+                    "Scale" => {
+                        let factor = payload
+                            .as_ref()
+                            .and_then(|values| values.get(0))
+                            .and_then(|value| value.as_int())
+                            .ok_or_else(|| "Scale variant requires factor".to_string())?;
+                        input * factor
+                    }
+                    other => {
+                        return Err(format!("Unknown Operation variant '{}'", other));
+                    }
                 }
-                other => {
-                    return Err(format!("Unknown Operation variant '{}'", other));
-                }
-            },
+            }
             other => {
                 return Err(format!(
-                    "Expected externs.lust_triple.Operation but received {:?}",
+                    "Expected lust_triple.Operation but received {:?}",
                     other
                 ));
             }

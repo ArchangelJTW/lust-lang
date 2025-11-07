@@ -1372,7 +1372,7 @@ mod tests {
     #[test]
     fn rust_declared_struct_and_static_method_are_available() {
         let _guard = serial_guard();
-        let struct_def = StructBuilder::new("externs.math.Point")
+        let struct_def = StructBuilder::new("math.Point")
             .field(struct_field_decl(
                 "x",
                 Type::new(TypeKind::Int, Span::dummy()),
@@ -1382,13 +1382,13 @@ mod tests {
                 Type::new(TypeKind::Int, Span::dummy()),
             ))
             .finish();
-        let origin_fn = FunctionBuilder::new("externs.math.origin_x")
+        let origin_fn = FunctionBuilder::new("math.origin_x")
             .return_type(Type::new(TypeKind::Int, Span::dummy()))
             .finish();
 
         let module = r#"
-            pub function make(): externs.math.Point
-                return externs.math.Point { x = 10, y = 20 }
+            pub function make(): math.Point
+                return math.Point { x = 10, y = 20 }
             end
         "#;
 
@@ -1404,14 +1404,14 @@ mod tests {
             .call_raw("main.make", Vec::new())
             .expect("call make");
         match point_value {
-            Value::Struct { name, .. } => assert_eq!(name, "externs.math.Point"),
+            Value::Struct { name, .. } => assert_eq!(name, "math.Point"),
             other => panic!("expected struct value, found {other:?}"),
         }
 
         program
-            .register_typed_native::<(), LustInt, _>("externs.math.origin_x", |_| Ok(123_i64))
+            .register_typed_native::<(), LustInt, _>("math.origin_x", |_| Ok(123_i64))
             .expect("register static origin");
-        let signature = program.signature("externs.math.origin_x");
+        let signature = program.signature("math.origin_x");
         assert!(signature.is_some());
     }
 

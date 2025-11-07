@@ -286,14 +286,9 @@ impl VM {
         }
     }
 
-    pub(crate) fn push_export_prefix(&mut self, crate_name: &str, include_extern_namespace: bool) {
+    pub(crate) fn push_export_prefix(&mut self, crate_name: &str) {
         let sanitized = crate_name.replace('-', "_");
-        let prefix = if include_extern_namespace {
-            format!("externs.{sanitized}")
-        } else {
-            sanitized
-        };
-        self.export_prefix_stack.push(prefix);
+        self.export_prefix_stack.push(sanitized);
     }
 
     pub(crate) fn pop_export_prefix(&mut self) {
@@ -314,13 +309,22 @@ impl VM {
     {
         let mut export = export;
         if let Some(prefix) = self.current_export_prefix() {
-            if !export.name.starts_with("externs.") {
-                let name = if export.name.is_empty() {
+            let needs_prefix = match export.name.strip_prefix(prefix) {
+                Some(rest) => {
+                    if rest.is_empty() {
+                        false
+                    } else {
+                        !matches!(rest.chars().next(), Some('.') | Some(':'))
+                    }
+                }
+                None => true,
+            };
+            if needs_prefix {
+                export.name = if export.name.is_empty() {
                     prefix.to_string()
                 } else {
                     format!("{prefix}.{}", export.name)
                 };
-                export.name = name;
             }
         }
         let name = export.name.clone();

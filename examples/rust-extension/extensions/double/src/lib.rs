@@ -97,7 +97,7 @@ fn register_functions(vm: &mut VM) -> Result<(), String> {
         let factor_value = unsafe {
             let vm = &mut *vm_ptr;
             vm.instantiate_struct(
-                "externs.lust_double.Factor",
+                "lust_double.Factor",
                 vec![
                     (Rc::new("base".to_string()), Value::Int(base)),
                     (Rc::new("multiplier".to_string()), Value::Int(multiplier)),
@@ -121,17 +121,16 @@ fn register_functions(vm: &mut VM) -> Result<(), String> {
             .get(0)
             .cloned()
             .ok_or_else(|| "expected Factor as first argument".to_string())?;
-        let factor =
-            StructInstance::from_value(factor_value).map_err(|err| err.to_string())?;
+        let factor = StructInstance::from_value(factor_value).map_err(|err| err.to_string())?;
         let base: i64 = factor.field("base").map_err(|err| err.to_string())?;
-        let multiplier: i64 = factor
-            .field("multiplier")
-            .map_err(|err| err.to_string())?;
+        let multiplier: i64 = factor.field("multiplier").map_err(|err| err.to_string())?;
         let input = values
             .get(1)
             .and_then(|value| value.as_int())
             .ok_or_else(|| "expected int value".to_string())?;
-        Ok(NativeCallResult::Return(Value::Int(base * input * multiplier)))
+        Ok(NativeCallResult::Return(Value::Int(
+            base * input * multiplier,
+        )))
     });
 
     Ok(())

@@ -33,15 +33,21 @@ lust-triple = { path = "extensions/triple", kind = "rust" }
    ```
    The CLI compiles each extension crate, executes its `lust_extension_register` hook in a
    temporary VM, and captures every struct/enum/function it exposes through `ExternRegistry`
-   and `register_exported_native`. Generated stubs land under `examples/rust-extension/externs/`.
+   and `register_exported_native`. Generated stubs land under
+   `examples/rust-extension/externs/<crate_name>/`.
 
 2. Execute the Lust program:
    ```bash
    lust examples/rust-extension/main.lust
    ```
-   The runtime loads the compiled shared libraries, invokes their register hooks, and the
-   script can construct `Factor` structs, invoke `Factor:apply`, and work with the
-   `Operation` enum just like native Lust definitions.
+The runtime loads the compiled shared libraries, invokes their register hooks, and the
+script can construct `Factor` structs, invoke `Factor:apply`, and work with the
+`Operation` enum just like native Lust definitions. The Lust source references the
+bindings via the sanitized crate prefix (for example `use lust_double.*`), regardless of
+whether the stubs come from the working tree, the package cache, or the generated
+`externs/` folder. Resolution checks the project sources first, then the package cache,
+and finally the `externs/` directory—so local edits automatically override cached
+artifacts.
 
 ## Extension crate
 

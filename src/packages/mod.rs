@@ -149,7 +149,6 @@ pub struct PreparedRustDependency {
     pub dependency: ResolvedRustDependency,
     pub build: LocalBuildOutput,
     pub stub_roots: Vec<StubRoot>,
-    pub export_with_extern_namespace: bool,
 }
 
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
@@ -238,20 +237,12 @@ pub fn load_local_module(
     vm: &mut VM,
     build: &LocalBuildOutput,
 ) -> Result<LoadedRustModule, LocalModuleError> {
-    load_local_module_with_namespace(vm, build, true)
-}
-
-pub fn load_local_module_with_namespace(
-    vm: &mut VM,
-    build: &LocalBuildOutput,
-    include_extern_namespace: bool,
-) -> Result<LoadedRustModule, LocalModuleError> {
     let library = get_or_load_library(&build.library_path)?;
     unsafe {
         let register = library
             .get::<unsafe extern "C" fn(*mut VM) -> bool>(b"lust_extension_register\0")
             .map_err(|_| LocalModuleError::RegisterSymbolMissing(build.name.clone()))?;
-        vm.push_export_prefix(&build.name, include_extern_namespace);
+        vm.push_export_prefix(&build.name);
         let success = register(vm as *mut VM);
         vm.pop_export_prefix();
         if !success {
@@ -322,11 +313,9 @@ pub fn collect_rust_dependency_artifacts(
     )
     .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
 
-    let include_extern_namespace = dep.cache_stub_dir.is_none();
     let mut preview_vm = VM::new();
-    let preview_module =
-        load_local_module_with_namespace(&mut preview_vm, &build, include_extern_namespace)
-            .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
+    let preview_module = load_local_module(&mut preview_vm, &build)
+        .map_err(|err| format!("{}: {}", dep.crate_dir.display(), err))?;
     let exports = preview_vm.take_exported_natives();
     let type_stubs = preview_vm.take_type_stubs();
     preview_vm.clear_native_functions();
@@ -355,25 +344,15 @@ pub fn prepare_rust_dependencies(
     let mut project_extern_root: Option<PathBuf> = None;
 
     for dep in deps.rust() {
-        let include_extern_namespace = dep.cache_stub_dir.is_none();
         let (build, stubs) = collect_rust_dependency_artifacts(dep)?;
         let mut stub_roots = Vec::new();
         let sanitized_prefix = sanitized_crate_name(&build.name);
         let mut register_root = |dir: &Path| {
-            let dir_buf = dir.to_path_buf();
-            if include_extern_namespace
+            let dir_buf = dir.join(&sanitized_prefix);
+            if dir_buf.exists()
                 && !stub_roots
                     .iter()
-                    .any(|root: &StubRoot| root.prefix == "externs" && root.directory == dir_buf)
-            {
-                stub_roots.push(StubRoot {
-                    prefix: "externs".to_string(),
-                    directory: dir_buf.clone(),
-                });
-            }
-            if !stub_roots
-                .iter()
-                .any(|root: &StubRoot| root.prefix == sanitized_prefix && root.directory == dir_buf)
+                    .any(|root: &StubRoot| root.directory == dir_buf)
             {
                 stub_roots.push(StubRoot {
                     prefix: sanitized_prefix.clone(),
@@ -381,6 +360,9 @@ pub fn prepare_rust_dependencies(
                 });
             }
         };
+
+        let fallback_root = project_dir.join("externs");
+        register_root(&fallback_root);
 
         if let Some(cache_dir) = &dep.cache_stub_dir {
             fs::create_dir_all(cache_dir).map_err(|err| {
@@ -415,7 +397,6 @@ pub fn prepare_rust_dependencies(
             dependency: dep.clone(),
             build,
             stub_roots,
-            export_with_extern_namespace: include_extern_namespace,
         });
     }
 
@@ -429,9 +410,8 @@ pub fn load_prepared_rust_dependencies(
 ) -> Result<Vec<LoadedRustModule>, String> {
     let mut loaded = Vec::new();
     for item in prepared {
-        let module =
-            load_local_module_with_namespace(vm, &item.build, item.export_with_extern_namespace)
-                .map_err(|err| format!("{}: {}", item.dependency.crate_dir.display(), err))?;
+        let module = load_local_module(vm, &item.build)
+            .map_err(|err| format!("{}: {}", item.dependency.crate_dir.display(), err))?;
         loaded.push(module);
     }
     Ok(loaded)
@@ -666,8 +646,16 @@ fn relative_stub_path(module: &str) -> PathBuf {
             segments.remove(0);
         }
     }
-    for seg in segments {
-        path.push(seg);
+    if let Some(first) = segments.first() {
+        path.push(first);
+    }
+    if segments.len() > 1 {
+        for seg in &segments[1..segments.len() - 1] {
+            path.push(seg);
+        }
+        path.push(segments.last().unwrap());
+    } else if let Some(first) = segments.first() {
+        path.push(first);
     }
     path
 }

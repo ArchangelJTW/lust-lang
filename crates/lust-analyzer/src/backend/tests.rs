@@ -1244,6 +1244,147 @@ end
 }
 
 #[test]
+fn module_path_completion_suggests_nested_modules_from_directory() {
+    let tmp = TempDir::new();
+    let lib_dir = tmp.path().join("lib");
+    let math_dir = lib_dir.join("math");
+    fs::create_dir_all(&math_dir).expect("create math dir");
+    let math_path = lib_dir.join("math.lust");
+    let math_source = r#"
+pub function add(a: int, b: int): int
+return a + b
+end
+"#;
+    fs::write(&math_path, math_source.trim_start()).expect("write math");
+    let geometry_path = math_dir.join("geometry.lust");
+    let geometry_source = r#"
+pub function area(r: float): float
+return r * r
+end
+"#;
+    fs::write(&geometry_path, geometry_source.trim_start()).expect("write geometry");
+    let entry_path = tmp.path().join("main.lust");
+    let entry_source = r#"
+use lib.math
+function main(): int
+return 0
+end
+"#;
+    fs::write(&entry_path, entry_source.trim_start()).expect("write main");
+    let mut loader = ModuleLoader::new(tmp.path());
+    let program = loader
+        .load_program_from_entry(entry_path.to_str().expect("utf8 path"))
+        .expect("program");
+    let mut imports_map = HashMap::new();
+    for module in &program.modules {
+        imports_map.insert(module.path.clone(), module.imports.clone());
+    }
+
+    let mut typechecker = new_typechecker();
+    typechecker.set_imports_by_module(imports_map);
+    typechecker
+        .check_program(&program.modules)
+        .expect("typecheck");
+    let struct_defs = typechecker.struct_definitions();
+    let enum_defs = typechecker.enum_definitions();
+    let type_info = typechecker.take_type_info();
+    let snapshot = AnalysisSnapshot::new(
+        &program,
+        type_info,
+        &HashMap::new(),
+        struct_defs,
+        enum_defs,
+        HashSet::new(),
+    );
+    let module = snapshot
+        .module_for_file(&entry_path)
+        .expect("module snapshot");
+    let completions = module_path_completions(
+        &snapshot,
+        module,
+        &["lib".to_string(), "math".to_string()],
+        "",
+    );
+    let labels: Vec<_> = completions.iter().map(|item| item.label.as_str()).collect();
+    assert!(
+        labels.contains(&"geometry"),
+        "expected geometry in {:?}",
+        labels
+    );
+}
+
+#[test]
+fn module_path_completion_suggests_dependency_stub_modules() {
+    let tmp = TempDir::new();
+    let extern_root = tmp.path().join("externs");
+    let lust_double_dir = extern_root.join("lust_double");
+    fs::create_dir_all(&lust_double_dir).expect("create lust_double dir");
+    let root_path = lust_double_dir.join("lust_double.lust");
+    let root_source = r#"
+pub extern
+    function host_double(int): int
+end
+"#;
+    fs::write(&root_path, root_source.trim_start()).expect("write root stub");
+    let nested_path = lust_double_dir.join("nested.lust");
+    let nested_source = r#"
+pub extern
+    function host_quadruple(int): int
+end
+"#;
+    fs::write(&nested_path, nested_source.trim_start()).expect("write nested stub");
+    let entry_path = tmp.path().join("main.lust");
+    let entry_source = r#"
+use lust_double.host_double
+function main(): int
+return host_double(2)
+end
+"#;
+    fs::write(&entry_path, entry_source.trim_start()).expect("write entry");
+    let mut loader = ModuleLoader::new(tmp.path());
+    loader.add_module_root("lust_double", lust_double_dir.clone(), None);
+    let program = loader
+        .load_program_from_entry(entry_path.to_str().expect("utf8 path"))
+        .expect("program");
+    let mut imports_map = HashMap::new();
+    for module in &program.modules {
+        imports_map.insert(module.path.clone(), module.imports.clone());
+    }
+
+    let mut typechecker = new_typechecker();
+    typechecker.set_imports_by_module(imports_map);
+    typechecker
+        .check_program(&program.modules)
+        .expect("typecheck");
+    let struct_defs = typechecker.struct_definitions();
+    let enum_defs = typechecker.enum_definitions();
+    let type_info = typechecker.take_type_info();
+    let snapshot = AnalysisSnapshot::new(
+        &program,
+        type_info,
+        &HashMap::new(),
+        struct_defs,
+        enum_defs,
+        HashSet::new(),
+    );
+    let module = snapshot
+        .module_for_file(&entry_path)
+        .expect("module snapshot");
+    let completions = module_path_completions(
+        &snapshot,
+        module,
+        &["lust_double".to_string()],
+        "",
+    );
+    let labels: Vec<_> = completions.iter().map(|item| item.label.as_str()).collect();
+    assert!(
+        labels.contains(&"nested"),
+        "expected nested in {:?}",
+        labels
+    );
+}
+
+#[test]
 fn module_path_completion_includes_root_modules() {
     let tmp = TempDir::new();
     let lib_dir = tmp.path().join("lib");

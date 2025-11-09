@@ -1,6 +1,6 @@
 use lust_double.*
-use lust_double.nested.host_quadruple
 use lust_triple.*
+use lust_double.nested.host_quadruple
 
 local factors: Array<Factor> = []
 local operations: Array<Operation> = []

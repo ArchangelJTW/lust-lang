@@ -126,6 +126,11 @@ impl AnalysisSnapshot {
                 entry_module_path = Some(file_path.clone());
             }
             register_module_children(&mut module_children, &module_path);
+            register_module_children_from_source(
+                &mut module_children,
+                &module_path,
+                &file_path,
+            );
             let source = source_overrides
                 .get(&file_path)
                 .cloned()
@@ -469,6 +474,85 @@ fn register_module_children(map: &mut HashMap<String, HashSet<String>>, module_p
         let child = segments[idx].to_string();
         map.entry(parent).or_default().insert(child);
     }
+}
+
+fn register_module_children_from_source(
+    map: &mut HashMap<String, HashSet<String>>,
+    module_path: &str,
+    source_path: &Path,
+) {
+    let Some(parent_dir) = source_path.parent() else { return; };
+    let Some(stem) = source_path.file_stem().and_then(|s| s.to_str()) else { return; };
+    if stem.is_empty() {
+        return;
+    }
+
+    let segments: Vec<&str> = module_path.split('.').filter(|s| !s.is_empty()).collect();
+    let last_segment = segments.last().copied().unwrap_or("");
+
+    let mut register_child = |name: &str| {
+        if name.is_empty() || name == stem || !is_valid_module_name(name) {
+            return;
+        }
+        map.entry(module_path.to_string())
+            .or_default()
+            .insert(name.to_string());
+    };
+
+    let scan_lust_files = |dir: &Path, include_dirs: bool, register: &mut dyn FnMut(&str)| {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                let name_os = entry.file_name();
+                let Some(name) = name_os.to_str() else {
+                    continue;
+                };
+                if should_skip_entry(name) {
+                    continue;
+                }
+                if file_type.is_file() {
+                    if entry.path().extension().and_then(|ext| ext.to_str()) != Some("lust") {
+                        continue;
+                    }
+                    if let Some(child) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                        register(child);
+                    }
+                } else if include_dirs && file_type.is_dir() {
+                    let candidate = entry.path().join(format!("{name}.lust"));
+                    let mod_candidate = entry.path().join("mod.lust");
+                    if candidate.exists() || mod_candidate.exists() {
+                        register(name);
+                    }
+                }
+            }
+        }
+    };
+
+    let module_dir = parent_dir.join(stem);
+    if module_dir.is_dir() {
+        scan_lust_files(&module_dir, true, &mut register_child);
+    }
+
+    if !last_segment.is_empty() {
+        if let Some(parent_name) = parent_dir.file_name().and_then(|s| s.to_str()) {
+            if parent_name == last_segment {
+                scan_lust_files(parent_dir, true, &mut register_child);
+            }
+        }
+    }
+}
+
+fn is_valid_module_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn collect_project_module_roots(root_dir: &Path) -> HashSet<String> {

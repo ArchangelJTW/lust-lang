@@ -307,16 +307,16 @@ impl JitCompiler {
     ) -> Result<()> {
         let _ = (_function_idx, is_closure, upvalues_ptr);
         let callee_offset = (callee as i32) * (mem::size_of::<Value>() as i32);
-        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
         let first_arg_offset = (first_arg as i32) * (mem::size_of::<Value>() as i32);
         let arg_count_i32 = arg_count as i32;
+        let dest_i32 = dest as i32;
         extern "C" {
             fn jit_call_function_safe(
                 vm_ptr: *mut crate::VM,
                 callee_ptr: *const Value,
                 args_ptr: *const Value,
                 arg_count: u8,
-                out: *mut Value,
+                dest_reg: u8,
             ) -> u8;
             fn jit_current_registers(vm_ptr: *mut crate::VM) -> *mut Value;
         }
@@ -326,22 +326,21 @@ impl JitCompiler {
             ; lea rsi, [r12 + callee_offset]
             ; lea rdx, [r12 + first_arg_offset]
             ; mov ecx, DWORD arg_count_i32
-            ; lea r8, [r12 + dest_offset]
+            ; mov r8d, DWORD dest_i32
             ; mov rax, QWORD jit_call_function_safe as _
             ; call rax
             ; test al, al
             ; jz >fail
         );
-        if self.inline_depth == 0 {
-            dynasm!(self.ops
-                ; mov rdi, r13
-                ; mov rax, QWORD jit_current_registers as _
-                ; call rax
-                ; test rax, rax
-                ; jz >fail
-                ; mov r12, rax
-            );
-        }
+
+        dynasm!(self.ops
+            ; mov rdi, r13
+            ; mov rax, QWORD jit_current_registers as _
+            ; call rax
+            ; test rax, rax
+            ; jz >fail
+            ; mov r12, rax
+        );
         Ok(())
     }
 
@@ -354,7 +353,7 @@ impl JitCompiler {
         arg_count: u8,
     ) -> Result<()> {
         let object_offset = (object as i32) * (mem::size_of::<Value>() as i32);
-        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
+        let dest_i32 = dest as i32;
         extern "C" {
             fn jit_call_method_safe(
                 vm_ptr: *mut crate::VM,
@@ -363,7 +362,7 @@ impl JitCompiler {
                 method_name_len: usize,
                 args_ptr: *const Value,
                 arg_count: u8,
-                out: *mut Value,
+                dest_reg: u8,
             ) -> u8;
             fn jit_current_registers(vm_ptr: *mut crate::VM) -> *mut Value;
         }
@@ -381,7 +380,7 @@ impl JitCompiler {
             ; lea r8, [r12 + first_arg_offset]
             ; mov r9d, DWORD arg_count_i32
             ; sub rsp, 16
-            ; lea rax, [r12 + dest_offset]
+            ; mov rax, QWORD dest_i32 as i64
             ; mov [rsp], rax
             ; mov rax, QWORD jit_call_method_safe as _
             ; call rax
@@ -389,16 +388,15 @@ impl JitCompiler {
             ; test al, al
             ; jz >fail
         );
-        if self.inline_depth == 0 {
-            dynasm!(self.ops
-                ; mov rdi, r13
-                ; mov rax, QWORD jit_current_registers as _
-                ; call rax
-                ; test rax, rax
-                ; jz >fail
-                ; mov r12, rax
-            );
-        }
+
+        dynasm!(self.ops
+            ; mov rdi, r13
+            ; mov rax, QWORD jit_current_registers as _
+            ; call rax
+            ; test rax, rax
+            ; jz >fail
+            ; mov r12, rax
+        );
         Ok(())
     }
 

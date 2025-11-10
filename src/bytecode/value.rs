@@ -1511,9 +1511,9 @@ pub unsafe extern "C" fn jit_call_function_safe(
     callee_ptr: *const Value,
     args_ptr: *const Value,
     arg_count: u8,
-    out: *mut Value,
+    dest_reg: u8,
 ) -> u8 {
-    if vm_ptr.is_null() || callee_ptr.is_null() || out.is_null() {
+    if vm_ptr.is_null() || callee_ptr.is_null() {
         jit::log(|| "jit_call_function_safe: null argument".to_string());
         return 0;
     }
@@ -1523,7 +1523,8 @@ pub unsafe extern "C" fn jit_call_function_safe(
         return 0;
     }
 
-    let callee = &*callee_ptr;
+    // Clone the callee BEFORE any operations that might reallocate registers
+    let callee = (&*callee_ptr).clone();
     let mut args = Vec::with_capacity(arg_count as usize);
     for i in 0..(arg_count as usize) {
         let arg_ptr = args_ptr.add(i);
@@ -1537,7 +1538,7 @@ pub unsafe extern "C" fn jit_call_function_safe(
     let jit_was_enabled = vm.jit.enabled;
     vm.jit.enabled = false;
 
-    let call_result = vm.call_value(callee, args);
+    let call_result = vm.call_value(&callee, args);
 
     // Restore JIT state
     vm.jit.enabled = jit_was_enabled;
@@ -1545,8 +1546,25 @@ pub unsafe extern "C" fn jit_call_function_safe(
 
     match call_result {
         Ok(value) => {
-            ptr::write(out, value);
-            1
+            // Get current registers pointer AFTER the call (it may have reallocated)
+            let vm = &mut *vm_ptr;
+            if let Some(frame) = vm.call_stack.last_mut() {
+                if (dest_reg as usize) < frame.registers.len() {
+                    frame.registers[dest_reg as usize] = value;
+                    1
+                } else {
+                    jit::log(|| {
+                        format!(
+                            "jit_call_function_safe: dest_reg {} out of bounds",
+                            dest_reg
+                        )
+                    });
+                    0
+                }
+            } else {
+                jit::log(|| "jit_call_function_safe: no call frame".to_string());
+                0
+            }
         }
 
         Err(err) => {
@@ -1696,9 +1714,9 @@ pub unsafe extern "C" fn jit_call_method_safe(
     method_name_len: usize,
     args_ptr: *const Value,
     arg_count: u8,
-    out: *mut Value,
+    dest_reg: u8,
 ) -> u8 {
-    if vm_ptr.is_null() || object_ptr.is_null() || method_name_ptr.is_null() || out.is_null() {
+    if vm_ptr.is_null() || object_ptr.is_null() || method_name_ptr.is_null() {
         jit::log(|| "jit_call_method_safe: null pointer argument".to_string());
         return 0;
     }
@@ -1712,7 +1730,8 @@ pub unsafe extern "C" fn jit_call_method_safe(
         Ok(s) => s,
         Err(_) => return 0,
     };
-    let object = &*object_ptr;
+
+    let object = (&*object_ptr).clone();
     if matches!(object, Value::Struct { .. }) {
         return 0;
     }
@@ -1724,12 +1743,25 @@ pub unsafe extern "C" fn jit_call_method_safe(
     }
 
     crate::vm::push_vm_ptr(vm_ptr);
-    let outcome = call_builtin_method_simple(object, method_name, args);
+    let outcome = call_builtin_method_simple(&object, method_name, args);
     crate::vm::pop_vm_ptr();
     match outcome {
         Ok(val) => {
-            ptr::write(out, val);
-            1
+            let vm = &mut *vm_ptr;
+            if let Some(frame) = vm.call_stack.last_mut() {
+                if (dest_reg as usize) < frame.registers.len() {
+                    frame.registers[dest_reg as usize] = val;
+                    1
+                } else {
+                    jit::log(|| {
+                        format!("jit_call_method_safe: dest_reg {} out of bounds", dest_reg)
+                    });
+                    0
+                }
+            } else {
+                jit::log(|| "jit_call_method_safe: no call frame".to_string());
+                0
+            }
         }
         Err(_) => 0,
     }
@@ -1781,6 +1813,8 @@ fn call_builtin_method_simple(
             variant,
             values,
         } if enum_name == "Option" => match method_name {
+            "is_some" => Ok(Value::Bool(variant == "Some")),
+            "is_none" => Ok(Value::Bool(variant == "None")),
             "unwrap" => {
                 if variant == "Some" {
                     if let Some(vals) = values {

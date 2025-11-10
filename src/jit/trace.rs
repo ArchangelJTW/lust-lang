@@ -252,6 +252,7 @@ pub enum TraceOp {
     },
     GuardLoopContinue {
         condition_register: Register,
+        expect_truthy: bool,
         bailout_ip: usize,
     },
     NestedLoopCall {
@@ -937,8 +938,7 @@ impl TraceRecorder {
                         let mut did_inline = false;
                         if let Some(callee_fn) = functions.get(*function_idx) {
                             if self.should_inline(*function_idx)
-                                && (arg_count as usize)
-                                    <= callee_fn.register_count as usize
+                                && (arg_count as usize) <= callee_fn.register_count as usize
                             {
                                 let mut arg_registers = Vec::with_capacity(arg_count as usize);
                                 for i in 0..arg_count {
@@ -991,8 +991,7 @@ impl TraceRecorder {
                         let mut did_inline = false;
                         if let Some(callee_fn) = functions.get(*function_idx) {
                             if self.should_inline(*function_idx)
-                                && (arg_count as usize)
-                                    <= callee_fn.register_count as usize
+                                && (arg_count as usize) <= callee_fn.register_count as usize
                             {
                                 let mut arg_registers = Vec::with_capacity(arg_count as usize);
                                 for i in 0..arg_count {
@@ -1108,7 +1107,41 @@ impl TraceRecorder {
                 }
             }
 
-            Instruction::JumpIf(_, _) | Instruction::JumpIfNot(_, _) => Ok(()),
+            Instruction::JumpIf(cond, offset) => {
+                let condition = &registers[cond as usize];
+                let is_truthy = condition.is_truthy();
+                let target_offset = (current_ip as isize) + (offset as isize);
+                let target = if target_offset < 0 {
+                    0
+                } else {
+                    target_offset as usize
+                };
+                let bailout_ip = if is_truthy { current_ip } else { target };
+                self.push_op(TraceOp::GuardLoopContinue {
+                    condition_register: cond,
+                    expect_truthy: is_truthy,
+                    bailout_ip,
+                });
+                Ok(())
+            }
+
+            Instruction::JumpIfNot(cond, offset) => {
+                let condition = &registers[cond as usize];
+                let is_truthy = condition.is_truthy();
+                let target_offset = (current_ip as isize) + (offset as isize);
+                let target = if target_offset < 0 {
+                    0
+                } else {
+                    target_offset as usize
+                };
+                let bailout_ip = if !is_truthy { current_ip } else { target };
+                self.push_op(TraceOp::GuardLoopContinue {
+                    condition_register: cond,
+                    expect_truthy: is_truthy,
+                    bailout_ip,
+                });
+                Ok(())
+            }
 
             _ => {
                 self.recording = false;

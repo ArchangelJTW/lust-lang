@@ -331,7 +331,11 @@ impl JitCompiler {
                     )?;
                 }
 
-                TraceOp::InlineCall { dest, callee, trace } => {
+                TraceOp::InlineCall {
+                    dest,
+                    callee,
+                    trace,
+                } => {
                     self.compile_inline_call(*dest, *callee, trace, guard_index, guards)?;
                 }
 
@@ -436,10 +440,12 @@ impl JitCompiler {
 
                 TraceOp::GuardLoopContinue {
                     condition_register,
+                    expect_truthy,
                     bailout_ip,
                 } => {
-                    let guard = self.compile_loop_continue_guard(
+                    let guard = self.compile_truth_guard(
                         *condition_register,
+                        *expect_truthy,
                         *bailout_ip,
                         *guard_index as usize,
                     )?;
@@ -520,41 +526,41 @@ impl JitCompiler {
             });
 
             let value_size = mem::size_of::<Value>() as i32;
-        let frame_size = trace.register_count as i32 * value_size;
-        let align_adjust = ((16 - (frame_size & 15)) & 15) as i32;
-        let metadata_size = 32i32;
-        let outer_fail = self.current_fail_label();
-        let inline_fail = self.ops.new_dynamic_label();
-        let inline_end = self.ops.new_dynamic_label();
-        extern "C" {
-            fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
+            let frame_size = trace.register_count as i32 * value_size;
+            let align_adjust = ((16 - (frame_size & 15)) & 15) as i32;
+            let metadata_size = 32i32;
+            let outer_fail = self.current_fail_label();
+            let inline_fail = self.ops.new_dynamic_label();
+            let inline_end = self.ops.new_dynamic_label();
+            extern "C" {
+                fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
             }
 
             // Save inline metadata (frame size, caller registers, previous inline frame).
-        dynasm!(self.ops
-            ; sub rsp, metadata_size
-        );
-        dynasm!(self.ops
-            ; mov eax, DWORD frame_size as _
-            ; mov [rsp], rax
-            ; mov [rsp + 8], r12
-            ; mov [rsp + 16], r15
-        );
-        dynasm!(self.ops
-            ; mov eax, DWORD align_adjust as _
-            ; mov [rsp + 24], rax
-            ; mov r15, rsp
-        );
-        if align_adjust != 0 {
             dynasm!(self.ops
-                ; sub rsp, align_adjust
+                ; sub rsp, metadata_size
             );
-        }
-        // Allocate space for callee registers.
-        dynasm!(self.ops
-            ; sub rsp, frame_size
-            ; mov r12, rsp
-        );
+            dynasm!(self.ops
+                ; mov eax, DWORD frame_size as _
+                ; mov [rsp], rax
+                ; mov [rsp + 8], r12
+                ; mov [rsp + 16], r15
+            );
+            dynasm!(self.ops
+                ; mov eax, DWORD align_adjust as _
+                ; mov [rsp + 24], rax
+                ; mov r15, rsp
+            );
+            if align_adjust != 0 {
+                dynasm!(self.ops
+                    ; sub rsp, align_adjust
+                );
+            }
+            // Allocate space for callee registers.
+            dynasm!(self.ops
+                ; sub rsp, frame_size
+                ; mov r12, rsp
+            );
 
             for reg in 0..trace.register_count {
                 self.compile_load_const(reg, &Value::Nil)?;
@@ -620,13 +626,13 @@ impl JitCompiler {
                 );
             }
 
-        dynasm!(self.ops
-            ; => inline_fail
-            ; mov eax, DWORD [r15]
-            ; mov rbx, rax
-            ; add rsp, rbx
-        );
-        dynasm!(self.ops
+            dynasm!(self.ops
+                ; => inline_fail
+                ; mov eax, DWORD [r15]
+                ; mov rbx, rax
+                ; add rsp, rbx
+            );
+            dynasm!(self.ops
             ; mov eax, DWORD [r15 + 24]
             ; add rsp, rax
             ; mov r12, [r15 + 8]

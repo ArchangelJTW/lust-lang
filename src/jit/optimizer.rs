@@ -175,7 +175,11 @@ impl TraceOptimizer {
             return;
         }
 
-        if trace.ops.iter().any(|op| matches!(op, TraceOp::InlineCall { .. })) {
+        if trace
+            .ops
+            .iter()
+            .any(|op| matches!(op, TraceOp::InlineCall { .. }))
+        {
             return;
         }
 
@@ -198,6 +202,7 @@ impl TraceOptimizer {
             new_ops.push(loop_cmp_op.clone());
             new_ops.push(TraceOp::GuardLoopContinue {
                 condition_register: cond_reg,
+                expect_truthy: true,
                 bailout_ip: trace.start_ip,
             });
             for op in &original_ops {

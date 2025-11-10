@@ -35,7 +35,7 @@ impl JitCompiler {
             kind: match expected_type {
                 ValueType::Int => GuardKind::IntType { register },
                 ValueType::Float => GuardKind::FloatType { register },
-                ValueType::Bool => GuardKind::Truthy { register },
+                ValueType::Bool => GuardKind::BoolType { register },
                 ValueType::String => GuardKind::IntType { register },
                 ValueType::Array => GuardKind::IntType { register },
                 ValueType::Tuple => GuardKind::IntType { register },
@@ -179,31 +179,53 @@ impl JitCompiler {
         })
     }
 
-    pub(super) fn compile_loop_continue_guard(
+    pub(super) fn compile_truth_guard(
         &mut self,
         condition_register: u8,
+        expect_truthy: bool,
         bailout_ip: usize,
         guard_index: usize,
     ) -> Result<Guard> {
         let cond_offset = (condition_register as i32) * (mem::size_of::<Value>() as i32);
         let guard_return_value = (guard_index + 1) as i32;
         let exit_label = self.current_exit_label();
+        extern "C" {
+            fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
+        }
         dynasm!(self.ops
-            ; mov al, [r12 + cond_offset + 8]
+            ; lea rdi, [r12 + cond_offset]
+            ; mov rax, QWORD jit_value_is_truthy as _
+            ; call rax
             ; test al, al
-            ; jz >loop_exit
-            ; jmp >loop_continue
-            ; loop_exit:
-            ; mov eax, DWORD guard_return_value
-            ; jmp => exit_label
-            ; loop_continue:
         );
+        if expect_truthy {
+            dynasm!(self.ops
+                ; jnz >guard_ok
+                ; mov eax, DWORD guard_return_value
+                ; jmp => exit_label
+                ; guard_ok:
+            );
+        } else {
+            dynasm!(self.ops
+                ; jz >guard_ok
+                ; mov eax, DWORD guard_return_value
+                ; jmp => exit_label
+                ; guard_ok:
+            );
+        }
+        let kind = if expect_truthy {
+            GuardKind::Truthy {
+                register: condition_register,
+            }
+        } else {
+            GuardKind::Falsy {
+                register: condition_register,
+            }
+        };
         Ok(Guard {
             index: guard_index,
             bailout_ip,
-            kind: GuardKind::Truthy {
-                register: condition_register,
-            },
+            kind,
             fail_count: 0,
             side_trace: None,
         })

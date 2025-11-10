@@ -1,6 +1,6 @@
+pub(super) use super::trace::InlineTrace;
 pub(super) use super::trace::ValueType;
 pub(super) use super::{CompiledTrace, Guard, GuardKind, Trace, TraceId, TraceOp};
-pub(super) use super::trace::InlineTrace;
 pub(super) use crate::bytecode::{Function, Value, ValueTag};
 pub(super) use crate::jit;
 pub(super) use crate::Result;

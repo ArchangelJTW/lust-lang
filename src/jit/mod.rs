@@ -83,6 +83,9 @@ pub enum GuardKind {
     FloatType {
         register: u8,
     },
+    BoolType {
+        register: u8,
+    },
     Truthy {
         register: u8,
     },

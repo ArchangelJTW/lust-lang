@@ -1588,6 +1588,20 @@ pub unsafe extern "C" fn jit_current_registers(vm_ptr: *mut VM) -> *mut Value {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn jit_value_is_truthy(value_ptr: *const Value) -> u8 {
+    if value_ptr.is_null() {
+        return 0;
+    }
+
+    let value = &*value_ptr;
+    if value.is_truthy() {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn jit_new_enum_unit_safe(
     enum_name_ptr: *const u8,
     enum_name_len: usize,

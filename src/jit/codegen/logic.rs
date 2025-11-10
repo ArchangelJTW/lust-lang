@@ -131,10 +131,8 @@ impl JitCompiler {
             ; lea rdi, [r12 + lhs_offset]
             ; lea rsi, [r12 + rhs_offset]
             ; lea rdx, [r12 + dest_offset]
-            ; sub rsp, 8
             ; mov rax, QWORD jit_concat_safe as _
             ; call rax
-            ; add rsp, 8
             ; test al, al
             ; jz >fail
         );

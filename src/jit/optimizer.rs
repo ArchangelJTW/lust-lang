@@ -35,8 +35,13 @@ impl TraceOptimizer {
     fn hoist_constants(&mut self, trace: &mut Trace) {
         let mut non_hoistable: HashSet<Register> = HashSet::new();
         for op in &trace.ops {
-            if let TraceOp::CallNative { callee, .. } = op {
-                non_hoistable.insert(*callee);
+            match op {
+                TraceOp::CallNative { callee, .. }
+                | TraceOp::CallFunction { callee, .. }
+                | TraceOp::InlineCall { callee, .. } => {
+                    non_hoistable.insert(*callee);
+                }
+                _ => {}
             }
         }
 
@@ -68,7 +73,13 @@ impl TraceOptimizer {
                 | TraceOp::CallMethod { dest, .. }
                 | TraceOp::GetField { dest, .. }
                 | TraceOp::NewStruct { dest, .. }
-                | TraceOp::CallNative { dest, .. } => Some(*dest),
+                | TraceOp::NewEnumUnit { dest, .. }
+                | TraceOp::NewEnumVariant { dest, .. }
+                | TraceOp::IsEnumVariant { dest, .. }
+                | TraceOp::GetEnumValue { dest, .. }
+                | TraceOp::CallNative { dest, .. }
+                | TraceOp::CallFunction { dest, .. }
+                | TraceOp::InlineCall { dest, .. } => Some(*dest),
                 _ => None,
             }
         };
@@ -161,6 +172,10 @@ impl TraceOptimizer {
 
     fn unroll_loop(&mut self, trace: &mut Trace, factor: usize) {
         if factor <= 1 || trace.ops.is_empty() {
+            return;
+        }
+
+        if trace.ops.iter().any(|op| matches!(op, TraceOp::InlineCall { .. })) {
             return;
         }
 

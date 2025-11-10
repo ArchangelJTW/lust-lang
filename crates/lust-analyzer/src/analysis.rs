@@ -126,11 +126,7 @@ impl AnalysisSnapshot {
                 entry_module_path = Some(file_path.clone());
             }
             register_module_children(&mut module_children, &module_path);
-            register_module_children_from_source(
-                &mut module_children,
-                &module_path,
-                &file_path,
-            );
+            register_module_children_from_source(&mut module_children, &module_path, &file_path);
             let source = source_overrides
                 .get(&file_path)
                 .cloned()
@@ -481,8 +477,12 @@ fn register_module_children_from_source(
     module_path: &str,
     source_path: &Path,
 ) {
-    let Some(parent_dir) = source_path.parent() else { return; };
-    let Some(stem) = source_path.file_stem().and_then(|s| s.to_str()) else { return; };
+    let Some(parent_dir) = source_path.parent() else {
+        return;
+    };
+    let Some(stem) = source_path.file_stem().and_then(|s| s.to_str()) else {
+        return;
+    };
     if stem.is_empty() {
         return;
     }

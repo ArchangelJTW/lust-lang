@@ -42,6 +42,19 @@ pub struct Trace {
 }
 
 #[derive(Debug, Clone)]
+pub struct InlineTrace {
+    pub function_idx: usize,
+    pub register_count: u8,
+    pub first_arg: Register,
+    pub arg_count: u8,
+    pub arg_registers: Vec<Register>,
+    pub body: Vec<TraceOp>,
+    pub return_register: Option<Register>,
+    pub is_closure: bool,
+    pub upvalues_ptr: Option<*const ()>,
+}
+
+#[derive(Debug, Clone)]
 pub enum TraceOp {
     LoadConst {
         dest: Register,
@@ -152,12 +165,35 @@ pub enum TraceOp {
         register: Register,
         function: TracedNativeFn,
     },
+    GuardFunction {
+        register: Register,
+        function_idx: usize,
+    },
+    GuardClosure {
+        register: Register,
+        function_idx: usize,
+        upvalues_ptr: *const (),
+    },
     CallNative {
         dest: Register,
         callee: Register,
         function: TracedNativeFn,
         first_arg: Register,
         arg_count: u8,
+    },
+    CallFunction {
+        dest: Register,
+        callee: Register,
+        function_idx: usize,
+        first_arg: Register,
+        arg_count: u8,
+        is_closure: bool,
+        upvalues_ptr: Option<*const ()>,
+    },
+    InlineCall {
+        dest: Register,
+        callee: Register,
+        trace: InlineTrace,
     },
     CallMethod {
         dest: Register,
@@ -187,6 +223,28 @@ pub enum TraceOp {
         struct_name: String,
         field_names: Vec<String>,
         field_registers: Vec<Register>,
+    },
+    NewEnumUnit {
+        dest: Register,
+        enum_name: String,
+        variant_name: String,
+    },
+    NewEnumVariant {
+        dest: Register,
+        enum_name: String,
+        variant_name: String,
+        value_registers: Vec<Register>,
+    },
+    IsEnumVariant {
+        dest: Register,
+        value: Register,
+        enum_name: String,
+        variant_name: String,
+    },
+    GetEnumValue {
+        dest: Register,
+        enum_reg: Register,
+        index: u8,
     },
     Guard {
         register: Register,
@@ -222,6 +280,24 @@ pub struct TraceRecorder {
     max_length: usize,
     recording: bool,
     guarded_registers: HashSet<Register>,
+    inline_stack: Vec<InlineContext>,
+    op_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct InlineContext {
+    function_idx: usize,
+    register_count: u8,
+    dest: Register,
+    callee_reg: Register,
+    first_arg: Register,
+    arg_count: u8,
+    arg_registers: Vec<Register>,
+    ops: Vec<TraceOp>,
+    guarded_registers: HashSet<Register>,
+    return_register: Option<Register>,
+    is_closure: bool,
+    upvalues_ptr: Option<*const ()>,
 }
 
 impl TraceRecorder {
@@ -237,7 +313,112 @@ impl TraceRecorder {
             max_length,
             recording: true,
             guarded_registers: HashSet::new(),
+            inline_stack: Vec::new(),
+            op_count: 0,
         }
+    }
+
+    fn current_function_idx(&self) -> usize {
+        self.inline_stack
+            .last()
+            .map(|ctx| ctx.function_idx)
+            .unwrap_or(self.trace.function_idx)
+    }
+
+    fn current_guard_set(&self) -> &HashSet<Register> {
+        self.inline_stack
+            .last()
+            .map(|ctx| &ctx.guarded_registers)
+            .unwrap_or(&self.guarded_registers)
+    }
+
+    fn current_guard_set_mut(&mut self) -> &mut HashSet<Register> {
+        self.inline_stack
+            .last_mut()
+            .map(|ctx| &mut ctx.guarded_registers)
+            .unwrap_or(&mut self.guarded_registers)
+    }
+
+    fn is_guarded(&self, register: Register) -> bool {
+        self.current_guard_set().contains(&register)
+    }
+
+    fn mark_guarded(&mut self, register: Register) {
+        let set = self.current_guard_set_mut();
+        set.insert(register);
+    }
+
+    fn push_op(&mut self, op: TraceOp) {
+        self.op_count += 1;
+        if let Some(ctx) = self.inline_stack.last_mut() {
+            ctx.ops.push(op);
+        } else {
+            self.trace.ops.push(op);
+        }
+    }
+
+    fn should_inline(&self, function_idx: usize) -> bool {
+        if function_idx == self.trace.function_idx {
+            return false;
+        }
+
+        if self
+            .inline_stack
+            .iter()
+            .any(|ctx| ctx.function_idx == function_idx)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    fn push_inline_context(
+        &mut self,
+        function_idx: usize,
+        register_count: u8,
+        dest: Register,
+        callee_reg: Register,
+        first_arg: Register,
+        arg_count: u8,
+        arg_registers: Vec<Register>,
+        is_closure: bool,
+        upvalues_ptr: Option<*const ()>,
+    ) {
+        self.inline_stack.push(InlineContext {
+            function_idx,
+            register_count,
+            dest,
+            callee_reg,
+            first_arg,
+            arg_count,
+            arg_registers,
+            ops: Vec::new(),
+            guarded_registers: HashSet::new(),
+            return_register: None,
+            is_closure,
+            upvalues_ptr,
+        });
+    }
+
+    fn finalize_inline_context(&mut self) -> Option<TraceOp> {
+        let context = self.inline_stack.pop()?;
+        let trace = InlineTrace {
+            function_idx: context.function_idx,
+            register_count: context.register_count,
+            first_arg: context.first_arg,
+            arg_count: context.arg_count,
+            arg_registers: context.arg_registers,
+            body: context.ops,
+            return_register: context.return_register,
+            is_closure: context.is_closure,
+            upvalues_ptr: context.upvalues_ptr,
+        };
+        Some(TraceOp::InlineCall {
+            dest: context.dest,
+            callee: context.callee_reg,
+            trace,
+        })
     }
 
     pub fn record_instruction(
@@ -247,56 +428,62 @@ impl TraceRecorder {
         registers: &[Value; 256],
         function: &crate::bytecode::Function,
         function_idx: usize,
+        functions: &[crate::bytecode::Function],
     ) -> Result<(), LustError> {
         if !self.recording {
             return Ok(());
         }
 
-        if function_idx != self.trace.function_idx {
+        if function_idx != self.current_function_idx() {
             return Ok(());
         }
 
-        let trace_op = match instruction {
+        let outcome: Result<(), LustError> = match instruction {
             Instruction::LoadConst(dest, _) => {
                 if let Some(_ty) = Self::get_value_type(&registers[dest as usize]) {
-                    self.guarded_registers.insert(dest);
+                    self.mark_guarded(dest);
                 }
 
-                TraceOp::LoadConst {
+                self.push_op(TraceOp::LoadConst {
                     dest,
                     value: registers[dest as usize].clone(),
-                }
+                });
+                Ok(())
             }
 
             Instruction::LoadGlobal(dest, _) => {
                 if let Some(_ty) = Self::get_value_type(&registers[dest as usize]) {
-                    self.guarded_registers.insert(dest);
+                    self.mark_guarded(dest);
                 }
 
-                TraceOp::LoadConst {
+                self.push_op(TraceOp::LoadConst {
                     dest,
                     value: registers[dest as usize].clone(),
-                }
+                });
+                Ok(())
             }
 
-            Instruction::StoreGlobal(_, _) => {
-                return Ok(());
+            Instruction::StoreGlobal(_, _) => Ok(()),
+
+            Instruction::Move(dest, src) => {
+                self.push_op(TraceOp::Move { dest, src });
+                Ok(())
             }
 
-            Instruction::Move(dest, src) => TraceOp::Move { dest, src },
             Instruction::Add(dest, lhs, rhs) => {
                 self.add_type_guards(lhs, rhs, registers, function)?;
                 let lhs_type =
                     Self::get_value_type(&registers[lhs as usize]).unwrap_or(ValueType::Int);
                 let rhs_type =
                     Self::get_value_type(&registers[rhs as usize]).unwrap_or(ValueType::Int);
-                TraceOp::Add {
+                self.push_op(TraceOp::Add {
                     dest,
                     lhs,
                     rhs,
                     lhs_type,
                     rhs_type,
-                }
+                });
+                Ok(())
             }
 
             Instruction::Sub(dest, lhs, rhs) => {
@@ -305,13 +492,14 @@ impl TraceRecorder {
                     Self::get_value_type(&registers[lhs as usize]).unwrap_or(ValueType::Int);
                 let rhs_type =
                     Self::get_value_type(&registers[rhs as usize]).unwrap_or(ValueType::Int);
-                TraceOp::Sub {
+                self.push_op(TraceOp::Sub {
                     dest,
                     lhs,
                     rhs,
                     lhs_type,
                     rhs_type,
-                }
+                });
+                Ok(())
             }
 
             Instruction::Mul(dest, lhs, rhs) => {
@@ -320,13 +508,14 @@ impl TraceRecorder {
                     Self::get_value_type(&registers[lhs as usize]).unwrap_or(ValueType::Int);
                 let rhs_type =
                     Self::get_value_type(&registers[rhs as usize]).unwrap_or(ValueType::Int);
-                TraceOp::Mul {
+                self.push_op(TraceOp::Mul {
                     dest,
                     lhs,
                     rhs,
                     lhs_type,
                     rhs_type,
-                }
+                });
+                Ok(())
             }
 
             Instruction::Div(dest, lhs, rhs) => {
@@ -335,13 +524,14 @@ impl TraceRecorder {
                     Self::get_value_type(&registers[lhs as usize]).unwrap_or(ValueType::Int);
                 let rhs_type =
                     Self::get_value_type(&registers[rhs as usize]).unwrap_or(ValueType::Int);
-                TraceOp::Div {
+                self.push_op(TraceOp::Div {
                     dest,
                     lhs,
                     rhs,
                     lhs_type,
                     rhs_type,
-                }
+                });
+                Ok(())
             }
 
             Instruction::Mod(dest, lhs, rhs) => {
@@ -350,85 +540,129 @@ impl TraceRecorder {
                     Self::get_value_type(&registers[lhs as usize]).unwrap_or(ValueType::Int);
                 let rhs_type =
                     Self::get_value_type(&registers[rhs as usize]).unwrap_or(ValueType::Int);
-                TraceOp::Mod {
+                self.push_op(TraceOp::Mod {
                     dest,
                     lhs,
                     rhs,
                     lhs_type,
                     rhs_type,
-                }
+                });
+                Ok(())
             }
 
-            Instruction::Neg(dest, src) => TraceOp::Neg { dest, src },
-            Instruction::Eq(dest, lhs, rhs) => TraceOp::Eq { dest, lhs, rhs },
-            Instruction::Ne(dest, lhs, rhs) => TraceOp::Ne { dest, lhs, rhs },
-            Instruction::Lt(dest, lhs, rhs) => TraceOp::Lt { dest, lhs, rhs },
-            Instruction::Le(dest, lhs, rhs) => TraceOp::Le { dest, lhs, rhs },
-            Instruction::Gt(dest, lhs, rhs) => TraceOp::Gt { dest, lhs, rhs },
-            Instruction::Ge(dest, lhs, rhs) => TraceOp::Ge { dest, lhs, rhs },
-            Instruction::And(dest, lhs, rhs) => TraceOp::And { dest, lhs, rhs },
-            Instruction::Or(dest, lhs, rhs) => TraceOp::Or { dest, lhs, rhs },
-            Instruction::Not(dest, src) => TraceOp::Not { dest, src },
+            Instruction::Neg(dest, src) => {
+                self.push_op(TraceOp::Neg { dest, src });
+                Ok(())
+            }
+
+            Instruction::Eq(dest, lhs, rhs) => {
+                self.push_op(TraceOp::Eq { dest, lhs, rhs });
+                Ok(())
+            }
+
+            Instruction::Ne(dest, lhs, rhs) => {
+                self.push_op(TraceOp::Ne { dest, lhs, rhs });
+                Ok(())
+            }
+
+            Instruction::Lt(dest, lhs, rhs) => {
+                self.push_op(TraceOp::Lt { dest, lhs, rhs });
+                Ok(())
+            }
+
+            Instruction::Le(dest, lhs, rhs) => {
+                self.push_op(TraceOp::Le { dest, lhs, rhs });
+                Ok(())
+            }
+
+            Instruction::Gt(dest, lhs, rhs) => {
+                self.push_op(TraceOp::Gt { dest, lhs, rhs });
+                Ok(())
+            }
+
+            Instruction::Ge(dest, lhs, rhs) => {
+                self.push_op(TraceOp::Ge { dest, lhs, rhs });
+                Ok(())
+            }
+
+            Instruction::And(dest, lhs, rhs) => {
+                self.push_op(TraceOp::And { dest, lhs, rhs });
+                Ok(())
+            }
+
+            Instruction::Or(dest, lhs, rhs) => {
+                self.push_op(TraceOp::Or { dest, lhs, rhs });
+                Ok(())
+            }
+
+            Instruction::Not(dest, src) => {
+                self.push_op(TraceOp::Not { dest, src });
+                Ok(())
+            }
+
             Instruction::Concat(dest, lhs, rhs) => {
                 if let Some(ty) = Self::get_value_type(&registers[lhs as usize]) {
-                    if !self.guarded_registers.contains(&lhs) {
-                        self.trace.ops.push(TraceOp::Guard {
+                    if !self.is_guarded(lhs) {
+                        self.push_op(TraceOp::Guard {
                             register: lhs,
                             expected_type: ty,
                         });
-                        self.guarded_registers.insert(lhs);
+                        self.mark_guarded(lhs);
                     }
                 }
 
                 if let Some(ty) = Self::get_value_type(&registers[rhs as usize]) {
-                    if !self.guarded_registers.contains(&rhs) {
-                        self.trace.ops.push(TraceOp::Guard {
+                    if !self.is_guarded(rhs) {
+                        self.push_op(TraceOp::Guard {
                             register: rhs,
                             expected_type: ty,
                         });
-                        self.guarded_registers.insert(rhs);
+                        self.mark_guarded(rhs);
                     }
                 }
 
-                TraceOp::Concat { dest, lhs, rhs }
+                self.push_op(TraceOp::Concat { dest, lhs, rhs });
+                Ok(())
             }
 
             Instruction::GetIndex(dest, array, index) => {
                 if let Some(ty) = Self::get_value_type(&registers[array as usize]) {
-                    if !self.guarded_registers.contains(&array) {
-                        self.trace.ops.push(TraceOp::Guard {
+                    if !self.is_guarded(array) {
+                        self.push_op(TraceOp::Guard {
                             register: array,
                             expected_type: ty,
                         });
-                        self.guarded_registers.insert(array);
+                        self.mark_guarded(array);
                     }
                 }
 
                 if let Some(ty) = Self::get_value_type(&registers[index as usize]) {
-                    if !self.guarded_registers.contains(&index) {
-                        self.trace.ops.push(TraceOp::Guard {
+                    if !self.is_guarded(index) {
+                        self.push_op(TraceOp::Guard {
                             register: index,
                             expected_type: ty,
                         });
-                        self.guarded_registers.insert(index);
+                        self.mark_guarded(index);
                     }
                 }
 
-                TraceOp::GetIndex { dest, array, index }
+                self.push_op(TraceOp::GetIndex { dest, array, index });
+                Ok(())
             }
 
             Instruction::ArrayLen(dest, array) => {
                 if let Some(ty) = Self::get_value_type(&registers[array as usize]) {
-                    if !self.guarded_registers.contains(&array) {
-                        self.trace.ops.push(TraceOp::Guard {
+                    if !self.is_guarded(array) {
+                        self.push_op(TraceOp::Guard {
                             register: array,
                             expected_type: ty,
                         });
-                        self.guarded_registers.insert(array);
+                        self.mark_guarded(array);
                     }
                 }
 
-                TraceOp::ArrayLen { dest, array }
+                self.push_op(TraceOp::ArrayLen { dest, array });
+                Ok(())
             }
 
             Instruction::CallMethod(obj_reg, method_name_idx, first_arg, arg_count, dest_reg) => {
@@ -437,35 +671,36 @@ impl TraceRecorder {
                     .unwrap_or("unknown")
                     .to_string();
                 if let Some(ty) = Self::get_value_type(&registers[obj_reg as usize]) {
-                    if !self.guarded_registers.contains(&obj_reg) {
-                        self.trace.ops.push(TraceOp::Guard {
+                    if !self.is_guarded(obj_reg) {
+                        self.push_op(TraceOp::Guard {
                             register: obj_reg,
                             expected_type: ty,
                         });
-                        self.guarded_registers.insert(obj_reg);
+                        self.mark_guarded(obj_reg);
                     }
                 }
 
                 for i in 0..arg_count {
                     let arg_reg = first_arg + i;
                     if let Some(ty) = Self::get_value_type(&registers[arg_reg as usize]) {
-                        if !self.guarded_registers.contains(&arg_reg) {
-                            self.trace.ops.push(TraceOp::Guard {
+                        if !self.is_guarded(arg_reg) {
+                            self.push_op(TraceOp::Guard {
                                 register: arg_reg,
                                 expected_type: ty,
                             });
-                            self.guarded_registers.insert(arg_reg);
+                            self.mark_guarded(arg_reg);
                         }
                     }
                 }
 
-                TraceOp::CallMethod {
+                self.push_op(TraceOp::CallMethod {
                     dest: dest_reg,
                     object: obj_reg,
                     method_name,
                     first_arg,
                     arg_count,
-                }
+                });
+                Ok(())
             }
 
             Instruction::GetField(dest, obj_reg, field_name_idx) => {
@@ -483,24 +718,25 @@ impl TraceRecorder {
                     _ => (None, false),
                 };
                 if let Some(ty) = Self::get_value_type(&registers[obj_reg as usize]) {
-                    if !self.guarded_registers.contains(&obj_reg) {
-                        self.trace.ops.push(TraceOp::Guard {
+                    if !self.is_guarded(obj_reg) {
+                        self.push_op(TraceOp::Guard {
                             register: obj_reg,
                             expected_type: ty,
                         });
-                        self.guarded_registers.insert(obj_reg);
+                        self.mark_guarded(obj_reg);
                     }
                 }
 
                 let value_type = Self::get_value_type(&registers[dest as usize]);
-                TraceOp::GetField {
+                self.push_op(TraceOp::GetField {
                     dest,
                     object: obj_reg,
                     field_name,
                     field_index,
                     value_type,
                     is_weak: is_weak_field,
-                }
+                });
+                Ok(())
             }
 
             Instruction::SetField(obj_reg, field_name_idx, value_reg) => {
@@ -518,34 +754,35 @@ impl TraceRecorder {
                     _ => (None, false),
                 };
                 if let Some(ty) = Self::get_value_type(&registers[obj_reg as usize]) {
-                    if !self.guarded_registers.contains(&obj_reg) {
-                        self.trace.ops.push(TraceOp::Guard {
+                    if !self.is_guarded(obj_reg) {
+                        self.push_op(TraceOp::Guard {
                             register: obj_reg,
                             expected_type: ty,
                         });
-                        self.guarded_registers.insert(obj_reg);
+                        self.mark_guarded(obj_reg);
                     }
                 }
 
                 let value_type = Self::get_value_type(&registers[value_reg as usize]);
                 if let Some(ty) = value_type {
-                    if !self.guarded_registers.contains(&value_reg) {
-                        self.trace.ops.push(TraceOp::Guard {
+                    if !self.is_guarded(value_reg) {
+                        self.push_op(TraceOp::Guard {
                             register: value_reg,
                             expected_type: ty,
                         });
-                        self.guarded_registers.insert(value_reg);
+                        self.mark_guarded(value_reg);
                     }
                 }
 
-                TraceOp::SetField {
+                self.push_op(TraceOp::SetField {
                     object: obj_reg,
                     field_name,
                     value: value_reg,
                     field_index,
                     value_type,
                     is_weak: is_weak_field,
-                }
+                });
+                Ok(())
             }
 
             Instruction::NewStruct(
@@ -574,51 +811,235 @@ impl TraceRecorder {
                     let field_reg = first_field_reg + i;
                     field_registers.push(field_reg);
                     if let Some(ty) = Self::get_value_type(&registers[field_reg as usize]) {
-                        if !self.guarded_registers.contains(&field_reg) {
-                            self.trace.ops.push(TraceOp::Guard {
+                        if !self.is_guarded(field_reg) {
+                            self.push_op(TraceOp::Guard {
                                 register: field_reg,
                                 expected_type: ty,
                             });
-                            self.guarded_registers.insert(field_reg);
+                            self.mark_guarded(field_reg);
                         }
                     }
                 }
 
-                TraceOp::NewStruct {
+                self.push_op(TraceOp::NewStruct {
                     dest,
                     struct_name,
                     field_names,
                     field_registers,
+                });
+                Ok(())
+            }
+
+            Instruction::NewEnumUnit(dest, enum_name_idx, variant_idx) => {
+                let enum_name = function.chunk.constants[enum_name_idx as usize]
+                    .as_string()
+                    .unwrap_or("unknown")
+                    .to_string();
+                let variant_name = function.chunk.constants[variant_idx as usize]
+                    .as_string()
+                    .unwrap_or("unknown")
+                    .to_string();
+                self.push_op(TraceOp::NewEnumUnit {
+                    dest,
+                    enum_name,
+                    variant_name,
+                });
+                Ok(())
+            }
+
+            Instruction::NewEnumVariant(
+                dest,
+                enum_name_idx,
+                variant_idx,
+                first_value,
+                value_count,
+            ) => {
+                let enum_name = function.chunk.constants[enum_name_idx as usize]
+                    .as_string()
+                    .unwrap_or("unknown")
+                    .to_string();
+                let variant_name = function.chunk.constants[variant_idx as usize]
+                    .as_string()
+                    .unwrap_or("unknown")
+                    .to_string();
+                let mut value_registers = Vec::new();
+                for i in 0..value_count {
+                    value_registers.push(first_value + i);
                 }
+
+                self.push_op(TraceOp::NewEnumVariant {
+                    dest,
+                    enum_name,
+                    variant_name,
+                    value_registers,
+                });
+                Ok(())
+            }
+
+            Instruction::IsEnumVariant(dest, value_reg, enum_name_idx, variant_idx) => {
+                let enum_name = function.chunk.constants[enum_name_idx as usize]
+                    .as_string()
+                    .unwrap_or("unknown")
+                    .to_string();
+                let variant_name = function.chunk.constants[variant_idx as usize]
+                    .as_string()
+                    .unwrap_or("unknown")
+                    .to_string();
+                self.push_op(TraceOp::IsEnumVariant {
+                    dest,
+                    value: value_reg,
+                    enum_name,
+                    variant_name,
+                });
+                Ok(())
+            }
+
+            Instruction::GetEnumValue(dest, enum_reg, index) => {
+                self.push_op(TraceOp::GetEnumValue {
+                    dest,
+                    enum_reg,
+                    index,
+                });
+                Ok(())
             }
 
             Instruction::Call(func_reg, first_arg, arg_count, dest_reg) => {
                 match &registers[func_reg as usize] {
                     Value::NativeFunction(native_fn) => {
                         let traced = TracedNativeFn::new(native_fn.clone());
-                        if !self.guarded_registers.contains(&func_reg) {
-                            self.trace.ops.push(TraceOp::GuardNativeFunction {
+                        if !self.is_guarded(func_reg) {
+                            self.push_op(TraceOp::GuardNativeFunction {
                                 register: func_reg,
                                 function: traced.clone(),
                             });
-                            self.guarded_registers.insert(func_reg);
+                            self.mark_guarded(func_reg);
                         }
 
-                        self.trace.ops.push(TraceOp::CallNative {
+                        self.push_op(TraceOp::CallNative {
                             dest: dest_reg,
                             callee: func_reg,
                             function: traced,
                             first_arg,
                             arg_count,
                         });
-                        return Ok(());
+                        Ok(())
+                    }
+
+                    Value::Function(function_idx) => {
+                        if !self.is_guarded(func_reg) {
+                            self.push_op(TraceOp::GuardFunction {
+                                register: func_reg,
+                                function_idx: *function_idx,
+                            });
+                            self.mark_guarded(func_reg);
+                        }
+
+                        let mut did_inline = false;
+                        if let Some(callee_fn) = functions.get(*function_idx) {
+                            if self.should_inline(*function_idx)
+                                && (arg_count as usize)
+                                    <= callee_fn.register_count as usize
+                            {
+                                let mut arg_registers = Vec::with_capacity(arg_count as usize);
+                                for i in 0..arg_count {
+                                    arg_registers.push(first_arg + i);
+                                }
+                                self.push_inline_context(
+                                    *function_idx,
+                                    callee_fn.register_count,
+                                    dest_reg,
+                                    func_reg,
+                                    first_arg,
+                                    arg_count,
+                                    arg_registers,
+                                    false,
+                                    None,
+                                );
+                                did_inline = true;
+                            }
+                        }
+
+                        if !did_inline {
+                            self.push_op(TraceOp::CallFunction {
+                                dest: dest_reg,
+                                callee: func_reg,
+                                function_idx: *function_idx,
+                                first_arg,
+                                arg_count,
+                                is_closure: false,
+                                upvalues_ptr: None,
+                            });
+                        }
+
+                        Ok(())
+                    }
+
+                    Value::Closure {
+                        function_idx,
+                        upvalues,
+                    } => {
+                        let upvalues_ptr = Rc::as_ptr(upvalues) as *const ();
+                        if !self.is_guarded(func_reg) {
+                            self.push_op(TraceOp::GuardClosure {
+                                register: func_reg,
+                                function_idx: *function_idx,
+                                upvalues_ptr,
+                            });
+                            self.mark_guarded(func_reg);
+                        }
+
+                        let mut did_inline = false;
+                        if let Some(callee_fn) = functions.get(*function_idx) {
+                            if self.should_inline(*function_idx)
+                                && (arg_count as usize)
+                                    <= callee_fn.register_count as usize
+                            {
+                                let mut arg_registers = Vec::with_capacity(arg_count as usize);
+                                for i in 0..arg_count {
+                                    arg_registers.push(first_arg + i);
+                                }
+                                self.push_inline_context(
+                                    *function_idx,
+                                    callee_fn.register_count,
+                                    dest_reg,
+                                    func_reg,
+                                    first_arg,
+                                    arg_count,
+                                    arg_registers,
+                                    true,
+                                    Some(upvalues_ptr),
+                                );
+                                did_inline = true;
+                            }
+                        }
+
+                        if !did_inline {
+                            self.push_op(TraceOp::CallFunction {
+                                dest: dest_reg,
+                                callee: func_reg,
+                                function_idx: *function_idx,
+                                first_arg,
+                                arg_count,
+                                is_closure: true,
+                                upvalues_ptr: Some(upvalues_ptr),
+                            });
+                        }
+
+                        Ok(())
                     }
 
                     _ => {
                         self.recording = false;
-                        return Err(LustError::RuntimeError {
-                            message: "Trace aborted: unsupported operation".to_string(),
+                        crate::jit::log(|| {
+                            format!(
+                                "Trace aborted: unsupported call operation on register {} (value {:?})",
+                                func_reg,
+                                registers[func_reg as usize].tag()
+                            )
                         });
+                        Err(LustError::RuntimeError {
+                            message: "Trace aborted: unsupported call operation".to_string(),
+                        })
                     }
                 }
             }
@@ -627,23 +1048,30 @@ impl TraceRecorder {
             | Instruction::NewMap(_)
             | Instruction::SetIndex(_, _, _) => {
                 self.recording = false;
-                return Err(LustError::RuntimeError {
-                    message: "Trace aborted: unsupported operation".to_string(),
-                });
+                Err(LustError::RuntimeError {
+                    message: "Trace aborted: unsupported index operation".to_string(),
+                })
             }
 
             Instruction::Return(value_reg) => {
-                if function_idx == self.trace.function_idx {
-                    self.recording = false;
-                    return Ok(());
+                let return_reg = if value_reg == 255 {
+                    None
                 } else {
-                    TraceOp::Return {
-                        value: if value_reg == 255 {
-                            None
-                        } else {
-                            Some(value_reg)
-                        },
+                    Some(value_reg)
+                };
+
+                if let Some(ctx) = self.inline_stack.last_mut() {
+                    ctx.return_register = return_reg;
+                    if let Some(inline_op) = self.finalize_inline_context() {
+                        self.push_op(inline_op);
                     }
+                    Ok(())
+                } else if function_idx == self.trace.function_idx {
+                    self.recording = false;
+                    Ok(())
+                } else {
+                    self.push_op(TraceOp::Return { value: return_reg });
+                    Ok(())
                 }
             }
 
@@ -652,45 +1080,53 @@ impl TraceRecorder {
                     let target_calc = (current_ip as isize) + (offset as isize);
                     if target_calc < 0 {
                         self.recording = false;
-                        return Err(LustError::RuntimeError {
+                        Err(LustError::RuntimeError {
                             message: format!(
                                 "Invalid jump target: offset={}, current_ip={}, target={}",
                                 offset, current_ip, target_calc
                             ),
-                        });
-                    }
-
-                    let jump_target = target_calc as usize;
-                    if function_idx == self.trace.function_idx && jump_target == self.trace.start_ip
-                    {
-                        self.recording = false;
-                        return Ok(());
+                        })
                     } else {
-                        let bailout_ip = current_ip.saturating_sub(1);
-                        TraceOp::NestedLoopCall {
-                            function_idx,
-                            loop_start_ip: jump_target,
-                            bailout_ip,
+                        let jump_target = target_calc as usize;
+                        if function_idx == self.trace.function_idx
+                            && jump_target == self.trace.start_ip
+                        {
+                            self.recording = false;
+                            Ok(())
+                        } else {
+                            let bailout_ip = current_ip.saturating_sub(1);
+                            self.push_op(TraceOp::NestedLoopCall {
+                                function_idx,
+                                loop_start_ip: jump_target,
+                                bailout_ip,
+                            });
+                            Ok(())
                         }
                     }
                 } else {
-                    return Ok(());
+                    Ok(())
                 }
             }
 
-            Instruction::JumpIf(_cond, _) | Instruction::JumpIfNot(_cond, _) => {
-                return Ok(());
-            }
+            Instruction::JumpIf(_, _) | Instruction::JumpIfNot(_, _) => Ok(()),
 
             _ => {
                 self.recording = false;
-                return Err(LustError::RuntimeError {
-                    message: "Trace aborted: unsupported instruction".to_string(),
+                crate::jit::log(|| {
+                    format!(
+                        "Trace aborted: unsupported instruction {:?}",
+                        instruction.opcode()
+                    )
                 });
+                Err(LustError::RuntimeError {
+                    message: "Trace aborted: unsupported instruction".to_string(),
+                })
             }
         };
-        self.trace.ops.push(trace_op);
-        if self.trace.ops.len() >= self.max_length {
+
+        outcome?;
+
+        if self.op_count >= self.max_length {
             self.recording = false;
             return Err(LustError::RuntimeError {
                 message: "Trace too long".to_string(),
@@ -699,7 +1135,6 @@ impl TraceRecorder {
 
         Ok(())
     }
-
     fn add_type_guards(
         &mut self,
         lhs: Register,
@@ -708,7 +1143,7 @@ impl TraceRecorder {
         function: &crate::bytecode::Function,
     ) -> Result<(), LustError> {
         if let Some(ty) = Self::get_value_type(&registers[lhs as usize]) {
-            let needs_guard = if self.guarded_registers.contains(&lhs) {
+            let needs_guard = if self.is_guarded(lhs) {
                 false
             } else if let Some(static_type) = function.register_types.get(&lhs) {
                 !Self::type_kind_matches_value_type(static_type, ty)
@@ -716,18 +1151,18 @@ impl TraceRecorder {
                 true
             };
             if needs_guard {
-                self.trace.ops.push(TraceOp::Guard {
+                self.push_op(TraceOp::Guard {
                     register: lhs,
                     expected_type: ty,
                 });
-                self.guarded_registers.insert(lhs);
+                self.mark_guarded(lhs);
             } else {
-                self.guarded_registers.insert(lhs);
+                self.mark_guarded(lhs);
             }
         }
 
         if let Some(ty) = Self::get_value_type(&registers[rhs as usize]) {
-            let needs_guard = if self.guarded_registers.contains(&rhs) {
+            let needs_guard = if self.is_guarded(rhs) {
                 false
             } else if let Some(static_type) = function.register_types.get(&rhs) {
                 !Self::type_kind_matches_value_type(static_type, ty)
@@ -735,13 +1170,13 @@ impl TraceRecorder {
                 true
             };
             if needs_guard {
-                self.trace.ops.push(TraceOp::Guard {
+                self.push_op(TraceOp::Guard {
                     register: rhs,
                     expected_type: ty,
                 });
-                self.guarded_registers.insert(rhs);
+                self.mark_guarded(rhs);
             } else {
-                self.guarded_registers.insert(rhs);
+                self.mark_guarded(rhs);
             }
         }
 

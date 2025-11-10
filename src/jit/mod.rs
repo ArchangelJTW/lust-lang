@@ -101,6 +101,15 @@ pub enum GuardKind {
         register: u8,
         expected: *const (),
     },
+    Function {
+        register: u8,
+        function_idx: usize,
+    },
+    Closure {
+        register: u8,
+        function_idx: usize,
+        upvalues_ptr: *const (),
+    },
 }
 
 pub struct JitState {

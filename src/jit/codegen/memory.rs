@@ -93,10 +93,8 @@ impl JitCompiler {
             ; call_helper:
             ; lea rdi, [r12 + src_offset]
             ; lea rsi, [r12 + dest_offset]
-            ; sub rsp, 8
             ; mov rax, QWORD jit_move_safe as _
             ; call rax
-            ; add rsp, 8
             ; move_done:
         );
         Ok(())
@@ -120,10 +118,8 @@ impl JitCompiler {
             ; lea rdi, [r12 + array_offset]
             ; mov rsi, [r12 + index_offset + 8]
             ; lea rdx, [r12 + dest_offset]
-            ; sub rsp, 8
             ; mov rax, QWORD jit_array_get_safe as _
             ; call rax
-            ; add rsp, 8
             ; test al, al
             ; jz >fail
         );
@@ -142,10 +138,8 @@ impl JitCompiler {
             ; cmp al, 5
             ; jne >fail
             ; lea rdi, [r12 + array_offset]
-            ; sub rsp, 8
             ; mov rax, QWORD jit_array_len_safe as _
             ; call rax
-            ; add rsp, 8
             ; test rax, rax
             ; js >fail
             ; mov BYTE [r12 + dest_offset], 2
@@ -160,8 +154,8 @@ impl JitCompiler {
         object: u8,
         field_name: &str,
         field_index: Option<usize>,
-        value_type: Option<ValueType>,
-        is_weak: bool,
+        _value_type: Option<ValueType>,
+        _is_weak: bool,
     ) -> Result<()> {
         let object_offset = (object as i32) * (mem::size_of::<Value>() as i32);
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
@@ -177,37 +171,15 @@ impl JitCompiler {
                 field_index: usize,
                 out: *mut Value,
             ) -> u8;
-            fn jit_get_field_indexed_int_fast(
-                object_ptr: *const Value,
-                field_index: usize,
-                out: *mut Value,
-            ) -> u8;
         }
 
         if let Some(index) = field_index {
-            if !is_weak && matches!(value_type, Some(ValueType::Int)) {
-                dynasm!(self.ops
-                    ; lea rdi, [r12 + object_offset]
-                    ; mov rsi, QWORD index as _
-                    ; lea rdx, [r12 + dest_offset]
-                    ; sub rsp, 8
-                    ; mov rax, QWORD jit_get_field_indexed_int_fast as _
-                    ; call rax
-                    ; add rsp, 8
-                    ; test al, al
-                    ; jz >fail
-                );
-                return Ok(());
-            }
-
             dynasm!(self.ops
                 ; lea rdi, [r12 + object_offset]
                 ; mov rsi, QWORD index as _
                 ; lea rdx, [r12 + dest_offset]
-                ; sub rsp, 8
                 ; mov rax, QWORD jit_get_field_indexed_safe as _
                 ; call rax
-                ; add rsp, 8
                 ; test al, al
                 ; jz >fail
             );
@@ -220,10 +192,8 @@ impl JitCompiler {
                 ; mov rsi, QWORD field_name_ptr as _
                 ; mov rdx, QWORD field_name_len as _
                 ; lea rcx, [r12 + dest_offset]
-                ; sub rsp, 8
                 ; mov rax, QWORD jit_get_field_safe as _
                 ; call rax
-                ; add rsp, 8
                 ; test al, al
                 ; jz >fail
             );
@@ -238,8 +208,8 @@ impl JitCompiler {
         field_name: &str,
         value: u8,
         field_index: Option<usize>,
-        value_type: Option<ValueType>,
-        is_weak: bool,
+        _value_type: Option<ValueType>,
+        _is_weak: bool,
     ) -> Result<()> {
         let object_offset = (object as i32) * (mem::size_of::<Value>() as i32);
         let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
@@ -255,37 +225,15 @@ impl JitCompiler {
                 field_index: usize,
                 value_ptr: *const Value,
             ) -> u8;
-            fn jit_set_field_indexed_int_fast(
-                object_ptr: *const Value,
-                field_index: usize,
-                value_ptr: *const Value,
-            ) -> u8;
         }
 
         if let Some(index) = field_index {
-            if !is_weak && matches!(value_type, Some(ValueType::Int)) {
-                dynasm!(self.ops
-                    ; lea rdi, [r12 + object_offset]
-                    ; mov rsi, QWORD index as _
-                    ; lea rdx, [r12 + value_offset]
-                    ; sub rsp, 8
-                    ; mov rax, QWORD jit_set_field_indexed_int_fast as _
-                    ; call rax
-                    ; add rsp, 8
-                    ; test al, al
-                    ; jz >fail
-                );
-                return Ok(());
-            }
-
             dynasm!(self.ops
                 ; lea rdi, [r12 + object_offset]
                 ; mov rsi, QWORD index as _
                 ; lea rdx, [r12 + value_offset]
-                ; sub rsp, 8
                 ; mov rax, QWORD jit_set_field_indexed_safe as _
                 ; call rax
-                ; add rsp, 8
                 ; test al, al
                 ; jz >fail
             );
@@ -298,10 +246,8 @@ impl JitCompiler {
                 ; mov rsi, QWORD field_name_ptr as _
                 ; mov rdx, QWORD field_name_len as _
                 ; lea rcx, [r12 + value_offset]
-                ; sub rsp, 8
                 ; mov rax, QWORD jit_set_field_safe as _
                 ; call rax
-                ; add rsp, 8
                 ; test al, al
                 ; jz >fail
             );
@@ -340,14 +286,62 @@ impl JitCompiler {
             ; lea rcx, [r12 + first_arg_offset]
             ; mov r8, DWORD arg_count_i32
             ; lea r9, [r12 + dest_offset]
-            ; sub rsp, 8
             ; mov rax, QWORD jit_call_native_safe as _
             ; call rax
-            ; add rsp, 8
             ; test al, al
             ; jz >fail
         );
 
+        Ok(())
+    }
+
+    pub(super) fn compile_call_function(
+        &mut self,
+        dest: u8,
+        callee: u8,
+        _function_idx: usize,
+        first_arg: u8,
+        arg_count: u8,
+        is_closure: bool,
+        upvalues_ptr: Option<*const ()>,
+    ) -> Result<()> {
+        let _ = (_function_idx, is_closure, upvalues_ptr);
+        let callee_offset = (callee as i32) * (mem::size_of::<Value>() as i32);
+        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
+        let first_arg_offset = (first_arg as i32) * (mem::size_of::<Value>() as i32);
+        let arg_count_i32 = arg_count as i32;
+        extern "C" {
+            fn jit_call_function_safe(
+                vm_ptr: *mut crate::VM,
+                callee_ptr: *const Value,
+                args_ptr: *const Value,
+                arg_count: u8,
+                out: *mut Value,
+            ) -> u8;
+            fn jit_current_registers(vm_ptr: *mut crate::VM) -> *mut Value;
+        }
+
+        dynasm!(self.ops
+            ; mov rdi, r13
+            ; lea rsi, [r12 + callee_offset]
+            ; lea rdx, [r12 + first_arg_offset]
+            ; mov ecx, DWORD arg_count_i32
+            ; lea r8, [r12 + dest_offset]
+            ; mov rax, QWORD jit_call_function_safe as _
+            ; call rax
+            ; test al, al
+            ; jz >fail
+        );
+        if self.inline_depth == 0 {
+            dynasm!(self.ops
+                ; mov rdi, r13
+                ; mov rax, QWORD jit_current_registers as _
+                ; call rax
+                ; test rax, rax
+                ; jz >fail
+                ; mov r12, rax
+            );
+        }
         Ok(())
     }
 
@@ -363,6 +357,7 @@ impl JitCompiler {
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
         extern "C" {
             fn jit_call_method_safe(
+                vm_ptr: *mut crate::VM,
                 object_ptr: *const Value,
                 method_name_ptr: *const u8,
                 method_name_len: usize,
@@ -370,6 +365,7 @@ impl JitCompiler {
                 arg_count: u8,
                 out: *mut Value,
             ) -> u8;
+            fn jit_current_registers(vm_ptr: *mut crate::VM) -> *mut Value;
         }
 
         let method_name_box = Box::leak(Box::new(method_name.to_string()));
@@ -378,19 +374,31 @@ impl JitCompiler {
         let first_arg_offset = (first_arg as i32) * (mem::size_of::<Value>() as i32);
         let arg_count_i32 = arg_count as i32;
         dynasm!(self.ops
-            ; lea rdi, [r12 + object_offset]
-            ; mov rsi, QWORD method_name_ptr as _
-            ; mov rdx, QWORD method_name_len as _
-            ; lea rcx, [r12 + first_arg_offset]
-            ; mov r8, DWORD arg_count_i32
-            ; lea r9, [r12 + dest_offset]
-            ; sub rsp, 8
+            ; mov rdi, r13
+            ; lea rsi, [r12 + object_offset]
+            ; mov rdx, QWORD method_name_ptr as _
+            ; mov rcx, QWORD method_name_len as _
+            ; lea r8, [r12 + first_arg_offset]
+            ; mov r9d, DWORD arg_count_i32
+            ; sub rsp, 16
+            ; lea rax, [r12 + dest_offset]
+            ; mov [rsp], rax
             ; mov rax, QWORD jit_call_method_safe as _
             ; call rax
-            ; add rsp, 8
+            ; add rsp, 16
             ; test al, al
             ; jz >fail
         );
+        if self.inline_depth == 0 {
+            dynasm!(self.ops
+                ; mov rdi, r13
+                ; mov rax, QWORD jit_current_registers as _
+                ; call rax
+                ; test rax, rax
+                ; jz >fail
+                ; mov r12, rax
+            );
+        }
         Ok(())
     }
 
@@ -404,6 +412,7 @@ impl JitCompiler {
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
         extern "C" {
             fn jit_new_struct_safe(
+                vm_ptr: *mut crate::VM,
                 struct_name_ptr: *const u8,
                 struct_name_len: usize,
                 field_names_ptr: *const *const u8,
@@ -412,6 +421,7 @@ impl JitCompiler {
                 field_count: usize,
                 out: *mut Value,
             ) -> u8;
+            fn jit_current_registers(vm_ptr: *mut crate::VM) -> *mut Value;
         }
 
         let struct_name_box = Box::leak(Box::new(struct_name.to_string()));
@@ -430,21 +440,204 @@ impl JitCompiler {
         let field_name_lens_box = Box::leak(field_name_lens.into_boxed_slice());
         let field_name_ptrs_ptr = field_name_ptrs_box.as_ptr();
         let field_name_lens_ptr = field_name_lens_box.as_ptr();
-        let first_field_reg = field_registers[0];
-        let first_field_offset = (first_field_reg as i32) * (mem::size_of::<Value>() as i32);
+        let (has_fields, first_field_offset) = if let Some(first) = field_registers.first() {
+            (true, (*first as i32) * (mem::size_of::<Value>() as i32))
+        } else {
+            (false, 0)
+        };
         dynasm!(self.ops
-            ; mov rdi, QWORD struct_name_ptr as _
-            ; mov rsi, QWORD struct_name_len as _
-            ; mov rdx, QWORD field_name_ptrs_ptr as _
-            ; mov rcx, QWORD field_name_lens_ptr as _
-            ; lea r8, [r12 + first_field_offset]
-            ; mov r9, QWORD field_count as _
-            ; sub rsp, 8
+            ; mov rdi, r13
+            ; mov rsi, QWORD struct_name_ptr as _
+            ; mov rdx, QWORD struct_name_len as _
+            ; mov rcx, QWORD field_name_ptrs_ptr as _
+            ; mov r8, QWORD field_name_lens_ptr as _
+        );
+        if has_fields {
+            dynasm!(self.ops
+                ; lea r9, [r12 + first_field_offset]
+            );
+        } else {
+            dynasm!(self.ops
+                ; xor r9d, r9d
+            );
+        }
+        dynasm!(self.ops
+            ; sub rsp, 16
+            ; mov rax, QWORD field_count as _
+            ; mov [rsp], rax
             ; lea rax, [r12 + dest_offset]
-            ; push rax
+            ; mov [rsp + 8], rax
             ; mov rax, QWORD jit_new_struct_safe as _
             ; call rax
             ; add rsp, 16
+            ; test al, al
+            ; jz >fail
+        );
+        if self.inline_depth == 0 {
+            dynasm!(self.ops
+                ; mov rdi, r13
+                ; mov rax, QWORD jit_current_registers as _
+                ; call rax
+                ; test rax, rax
+                ; jz >fail
+                ; mov r12, rax
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn compile_new_enum_unit(
+        &mut self,
+        dest: u8,
+        enum_name: &str,
+        variant_name: &str,
+    ) -> Result<()> {
+        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
+        extern "C" {
+            fn jit_new_enum_unit_safe(
+                enum_name_ptr: *const u8,
+                enum_name_len: usize,
+                variant_name_ptr: *const u8,
+                variant_name_len: usize,
+                out: *mut Value,
+            ) -> u8;
+        }
+        let enum_name_box = Box::leak(Box::new(enum_name.to_string()));
+        let enum_name_ptr = enum_name_box.as_ptr();
+        let enum_name_len = enum_name_box.len();
+        let variant_name_box = Box::leak(Box::new(variant_name.to_string()));
+        let variant_name_ptr = variant_name_box.as_ptr();
+        let variant_name_len = variant_name_box.len();
+        dynasm!(self.ops
+            ; mov rdi, QWORD enum_name_ptr as _
+            ; mov rsi, QWORD enum_name_len as _
+            ; mov rdx, QWORD variant_name_ptr as _
+            ; mov rcx, QWORD variant_name_len as _
+            ; lea r8, [r12 + dest_offset]
+            ; mov rax, QWORD jit_new_enum_unit_safe as _
+            ; call rax
+            ; test al, al
+            ; jz >fail
+        );
+        Ok(())
+    }
+
+    pub(super) fn compile_new_enum_variant(
+        &mut self,
+        dest: u8,
+        enum_name: &str,
+        variant_name: &str,
+        value_registers: &[u8],
+    ) -> Result<()> {
+        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
+        extern "C" {
+            fn jit_new_enum_variant_safe(
+                enum_name_ptr: *const u8,
+                enum_name_len: usize,
+                variant_name_ptr: *const u8,
+                variant_name_len: usize,
+                values_ptr: *const Value,
+                value_count: usize,
+                out: *mut Value,
+            ) -> u8;
+        }
+        let enum_name_box = Box::leak(Box::new(enum_name.to_string()));
+        let enum_name_ptr = enum_name_box.as_ptr();
+        let enum_name_len = enum_name_box.len();
+        let variant_name_box = Box::leak(Box::new(variant_name.to_string()));
+        let variant_name_ptr = variant_name_box.as_ptr();
+        let variant_name_len = variant_name_box.len();
+        let (first_value_offset, value_count) = if let Some(first_reg) = value_registers.first() {
+            (
+                (*first_reg as i32) * (mem::size_of::<Value>() as i32),
+                value_registers.len(),
+            )
+        } else {
+            (0, 0)
+        };
+        dynasm!(self.ops
+            ; mov rdi, QWORD enum_name_ptr as _
+            ; mov rsi, QWORD enum_name_len as _
+            ; mov rdx, QWORD variant_name_ptr as _
+            ; mov rcx, QWORD variant_name_len as _
+            ; lea r8, [r12 + first_value_offset]
+            ; mov r9, QWORD value_count as _
+            ; lea rax, [r12 + dest_offset]
+            ; push rax
+            ; mov rax, QWORD jit_new_enum_variant_safe as _
+            ; call rax
+            ; add rsp, 8
+            ; test al, al
+            ; jz >fail
+        );
+        Ok(())
+    }
+
+    pub(super) fn compile_is_enum_variant(
+        &mut self,
+        dest: u8,
+        value: u8,
+        enum_name: &str,
+        variant_name: &str,
+    ) -> Result<()> {
+        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
+        let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
+        extern "C" {
+            fn jit_is_enum_variant_safe(
+                value_ptr: *const Value,
+                enum_name_ptr: *const u8,
+                enum_name_len: usize,
+                variant_name_ptr: *const u8,
+                variant_name_len: usize,
+            ) -> u8;
+        }
+        let enum_name_box = Box::leak(Box::new(enum_name.to_string()));
+        let enum_name_ptr = enum_name_box.as_ptr();
+        let enum_name_len = enum_name_box.len();
+        let variant_name_box = Box::leak(Box::new(variant_name.to_string()));
+        let variant_name_ptr = variant_name_box.as_ptr();
+        let variant_name_len = variant_name_box.len();
+        dynasm!(self.ops
+            ; lea rdi, [r12 + value_offset]
+            ; mov rsi, QWORD enum_name_ptr as _
+            ; mov rdx, QWORD enum_name_len as _
+            ; mov rcx, QWORD variant_name_ptr as _
+            ; mov r8, QWORD variant_name_len as _
+            ; mov rax, QWORD jit_is_enum_variant_safe as _
+            ; call rax
+            ; test al, al
+            ; jnz >store_true
+            ; mov BYTE [r12 + dest_offset], 1
+            ; mov QWORD [r12 + dest_offset + 8], 0
+            ; jmp >store_done
+            ; store_true:
+            ; mov BYTE [r12 + dest_offset], 1
+            ; mov QWORD [r12 + dest_offset + 8], 0
+            ; mov BYTE [r12 + dest_offset + 8], 1
+            ; store_done:
+        );
+        Ok(())
+    }
+
+    pub(super) fn compile_get_enum_value(
+        &mut self,
+        dest: u8,
+        enum_reg: u8,
+        index: u8,
+    ) -> Result<()> {
+        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
+        let enum_offset = (enum_reg as i32) * (mem::size_of::<Value>() as i32);
+        extern "C" {
+            fn jit_get_enum_value_safe(enum_ptr: *const Value, index: usize, out: *mut Value)
+                -> u8;
+        }
+        let index_usize = index as usize;
+        dynasm!(self.ops
+            ; lea rdi, [r12 + enum_offset]
+            ; mov rsi, QWORD index_usize as _
+            ; lea rdx, [r12 + dest_offset]
+            ; mov rax, QWORD jit_get_enum_value_safe as _
+            ; call rax
             ; test al, al
             ; jz >fail
         );

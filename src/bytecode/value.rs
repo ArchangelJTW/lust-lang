@@ -1331,6 +1331,99 @@ pub unsafe extern "C" fn jit_guard_native_function(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn jit_guard_function_identity(
+    value_ptr: *const Value,
+    expected_kind: u8,
+    expected_function_idx: usize,
+    expected_upvalues: *const (),
+    register_index: u8,
+) -> u8 {
+    if value_ptr.is_null() {
+        jit::log(|| "jit_guard_function_identity: null pointer input".to_string());
+        return 0;
+    }
+
+    let value = &*value_ptr;
+    match (expected_kind, value) {
+        (0, Value::Function(idx)) => {
+            if *idx == expected_function_idx {
+                1
+            } else {
+                jit::log(|| {
+                    format!(
+                        "jit_guard_function_identity: function idx mismatch (reg {}) actual={} expected={}",
+                        register_index, idx, expected_function_idx
+                    )
+                });
+                0
+            }
+        }
+
+        (
+            1,
+            Value::Closure {
+                function_idx,
+                upvalues,
+            },
+        ) => {
+            if *function_idx != expected_function_idx {
+                jit::log(|| {
+                    format!(
+                        "jit_guard_function_identity: closure idx mismatch (reg {}) actual={} expected={}",
+                        register_index, function_idx, expected_function_idx
+                    )
+                });
+                return 0;
+            }
+
+            let actual_ptr = Rc::as_ptr(upvalues) as *const ();
+            if actual_ptr == expected_upvalues {
+                1
+            } else {
+                jit::log(|| {
+                    format!(
+                        "jit_guard_function_identity: upvalues mismatch (reg {}) actual={:p} expected={:p}",
+                        register_index, actual_ptr, expected_upvalues
+                    )
+                });
+                0
+            }
+        }
+
+        (0, Value::Closure { function_idx, .. }) => {
+            jit::log(|| {
+                format!(
+                    "jit_guard_function_identity: expected function, saw closure (reg {}, idx {})",
+                    register_index, function_idx
+                )
+            });
+            0
+        }
+
+        (1, Value::Function(idx)) => {
+            jit::log(|| {
+                format!(
+                    "jit_guard_function_identity: expected closure, saw function (reg {}, idx {})",
+                    register_index, idx
+                )
+            });
+            0
+        }
+
+        (_, other) => {
+            jit::log(|| {
+                format!(
+                    "jit_guard_function_identity: value in reg {} not callable ({:?})",
+                    register_index,
+                    other.tag()
+                )
+            });
+            0
+        }
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn jit_call_native_safe(
     vm_ptr: *mut VM,
     callee_ptr: *const Value,
@@ -1413,7 +1506,191 @@ pub unsafe extern "C" fn jit_call_native_safe(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn jit_call_function_safe(
+    vm_ptr: *mut VM,
+    callee_ptr: *const Value,
+    args_ptr: *const Value,
+    arg_count: u8,
+    out: *mut Value,
+) -> u8 {
+    if vm_ptr.is_null() || callee_ptr.is_null() || out.is_null() {
+        jit::log(|| "jit_call_function_safe: null argument".to_string());
+        return 0;
+    }
+
+    if arg_count > 0 && args_ptr.is_null() {
+        jit::log(|| "jit_call_function_safe: args_ptr null with non-zero arg_count".to_string());
+        return 0;
+    }
+
+    let callee = &*callee_ptr;
+    let mut args = Vec::with_capacity(arg_count as usize);
+    for i in 0..(arg_count as usize) {
+        let arg_ptr = args_ptr.add(i);
+        args.push((&*arg_ptr).clone());
+    }
+
+    let vm = &mut *vm_ptr;
+    push_vm_ptr(vm_ptr);
+
+    // Temporarily disable JIT to prevent recursive JIT execution
+    let jit_was_enabled = vm.jit.enabled;
+    vm.jit.enabled = false;
+
+    let call_result = vm.call_value(callee, args);
+
+    // Restore JIT state
+    vm.jit.enabled = jit_was_enabled;
+    pop_vm_ptr();
+
+    match call_result {
+        Ok(value) => {
+            ptr::write(out, value);
+            1
+        }
+
+        Err(err) => {
+            jit::log(|| format!("jit_call_function_safe: {}", err));
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_current_registers(vm_ptr: *mut VM) -> *mut Value {
+    if vm_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    let vm = &mut *vm_ptr;
+    vm.call_stack
+        .last_mut()
+        .map(|frame| frame.registers.as_mut_ptr())
+        .unwrap_or(core::ptr::null_mut())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_new_enum_unit_safe(
+    enum_name_ptr: *const u8,
+    enum_name_len: usize,
+    variant_name_ptr: *const u8,
+    variant_name_len: usize,
+    out: *mut Value,
+) -> u8 {
+    if enum_name_ptr.is_null() || variant_name_ptr.is_null() || out.is_null() {
+        return 0;
+    }
+
+    let enum_name_slice = slice::from_raw_parts(enum_name_ptr, enum_name_len);
+    let variant_name_slice = slice::from_raw_parts(variant_name_ptr, variant_name_len);
+    let enum_name = match str::from_utf8(enum_name_slice) {
+        Ok(s) => s.to_string(),
+        Err(_) => return 0,
+    };
+    let variant_name = match str::from_utf8(variant_name_slice) {
+        Ok(s) => s.to_string(),
+        Err(_) => return 0,
+    };
+    let value = Value::enum_unit(enum_name, variant_name);
+    ptr::write(out, value);
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_new_enum_variant_safe(
+    enum_name_ptr: *const u8,
+    enum_name_len: usize,
+    variant_name_ptr: *const u8,
+    variant_name_len: usize,
+    values_ptr: *const Value,
+    value_count: usize,
+    out: *mut Value,
+) -> u8 {
+    if enum_name_ptr.is_null() || variant_name_ptr.is_null() || out.is_null() {
+        return 0;
+    }
+
+    if value_count > 0 && values_ptr.is_null() {
+        return 0;
+    }
+
+    let enum_name_slice = slice::from_raw_parts(enum_name_ptr, enum_name_len);
+    let variant_name_slice = slice::from_raw_parts(variant_name_ptr, variant_name_len);
+    let enum_name = match str::from_utf8(enum_name_slice) {
+        Ok(s) => s.to_string(),
+        Err(_) => return 0,
+    };
+    let variant_name = match str::from_utf8(variant_name_slice) {
+        Ok(s) => s.to_string(),
+        Err(_) => return 0,
+    };
+    let mut values = Vec::with_capacity(value_count);
+    for i in 0..value_count {
+        let value = &*values_ptr.add(i);
+        values.push(value.clone());
+    }
+
+    let value = Value::enum_variant(enum_name, variant_name, values);
+    ptr::write(out, value);
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_is_enum_variant_safe(
+    value_ptr: *const Value,
+    enum_name_ptr: *const u8,
+    enum_name_len: usize,
+    variant_name_ptr: *const u8,
+    variant_name_len: usize,
+) -> u8 {
+    if value_ptr.is_null() || enum_name_ptr.is_null() || variant_name_ptr.is_null() {
+        return 0;
+    }
+
+    let value = &*value_ptr;
+    let enum_name_slice = slice::from_raw_parts(enum_name_ptr, enum_name_len);
+    let variant_name_slice = slice::from_raw_parts(variant_name_ptr, variant_name_len);
+    let enum_name = match str::from_utf8(enum_name_slice) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let variant_name = match str::from_utf8(variant_name_slice) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    if value.is_enum_variant(enum_name, variant_name) {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_get_enum_value_safe(
+    enum_ptr: *const Value,
+    index: usize,
+    out: *mut Value,
+) -> u8 {
+    if enum_ptr.is_null() || out.is_null() {
+        return 0;
+    }
+
+    let enum_value = &*enum_ptr;
+    if let Some((_, _, Some(values))) = enum_value.as_enum() {
+        if index < values.len() {
+            ptr::write(out, values[index].clone());
+            1
+        } else {
+            0
+        }
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn jit_call_method_safe(
+    vm_ptr: *mut VM,
     object_ptr: *const Value,
     method_name_ptr: *const u8,
     method_name_len: usize,
@@ -1421,7 +1698,8 @@ pub unsafe extern "C" fn jit_call_method_safe(
     arg_count: u8,
     out: *mut Value,
 ) -> u8 {
-    if object_ptr.is_null() || method_name_ptr.is_null() || out.is_null() {
+    if vm_ptr.is_null() || object_ptr.is_null() || method_name_ptr.is_null() || out.is_null() {
+        jit::log(|| "jit_call_method_safe: null pointer argument".to_string());
         return 0;
     }
 
@@ -1445,12 +1723,16 @@ pub unsafe extern "C" fn jit_call_method_safe(
         args.push((&*arg_ptr).clone());
     }
 
-    let result = match call_builtin_method_simple(object, method_name, args) {
-        Ok(val) => val,
-        Err(_) => return 0,
-    };
-    ptr::write(out, result);
-    1
+    crate::vm::push_vm_ptr(vm_ptr);
+    let outcome = call_builtin_method_simple(object, method_name, args);
+    crate::vm::pop_vm_ptr();
+    match outcome {
+        Ok(val) => {
+            ptr::write(out, val);
+            1
+        }
+        Err(_) => 0,
+    }
 }
 
 fn call_builtin_method_simple(
@@ -1753,6 +2035,7 @@ pub unsafe extern "C" fn jit_set_field_indexed_int_fast(
 
 #[no_mangle]
 pub unsafe extern "C" fn jit_new_struct_safe(
+    vm_ptr: *mut VM,
     struct_name_ptr: *const u8,
     struct_name_len: usize,
     field_names_ptr: *const *const u8,
@@ -1761,7 +2044,8 @@ pub unsafe extern "C" fn jit_new_struct_safe(
     field_count: usize,
     out: *mut Value,
 ) -> u8 {
-    if struct_name_ptr.is_null() || out.is_null() {
+    if struct_name_ptr.is_null() || out.is_null() || vm_ptr.is_null() {
+        jit::log(|| "jit_new_struct_safe: null pointer input".to_string());
         return 0;
     }
 
@@ -1792,12 +2076,18 @@ pub unsafe extern "C" fn jit_new_struct_safe(
         fields.push((field_name, field_value));
     }
 
-    let struct_value = match crate::vm::VM::with_current(move |vm| {
-        vm.instantiate_struct(&struct_name, fields)
-            .map_err(|err| err.to_string())
-    }) {
+    let vm = &mut *vm_ptr;
+    let struct_value = match vm.instantiate_struct(&struct_name, fields) {
         Ok(value) => value,
-        Err(_) => return 0,
+        Err(err) => {
+            jit::log(|| {
+                format!(
+                    "jit_new_struct_safe: failed to instantiate '{}': {}",
+                    struct_name, err
+                )
+            });
+            return 0;
+        }
     };
     ptr::write(out, struct_value);
     1

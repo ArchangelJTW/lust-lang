@@ -40,6 +40,13 @@ impl VM {
                 });
             }
 
+            let executing_frame_index =
+                self.call_stack
+                    .len()
+                    .checked_sub(1)
+                    .ok_or_else(|| LustError::RuntimeError {
+                        message: "Empty call stack".to_string(),
+                    })?;
             let frame = self
                 .call_stack
                 .last_mut()
@@ -1169,13 +1176,24 @@ impl VM {
                             self.skip_next_trace_record = false;
                         } else {
                             let function = &self.functions[func_idx];
-                            if let Some(frame) = self.call_stack.last() {
+                            let registers_opt =
+                                if let Some(frame) = self.call_stack.get(executing_frame_index) {
+                                    Some(&frame.registers)
+                                } else if executing_frame_index > 0 {
+                                    self.call_stack
+                                        .get(executing_frame_index - 1)
+                                        .map(|frame| &frame.registers)
+                                } else {
+                                    None
+                                };
+                            if let Some(registers) = registers_opt {
                                 if let Err(e) = recorder.record_instruction(
                                     instruction,
                                     ip_before_execution,
-                                    &frame.registers,
+                                    registers,
                                     function,
                                     func_idx,
+                                    &self.functions,
                                 ) {
                                     crate::jit::log(|| format!("⚠️  JIT: {}", e));
                                     self.trace_recorder = None;
@@ -1354,6 +1372,7 @@ impl VM {
         }
     }
 
+    #[inline(never)]
     pub fn call_value(&mut self, func: &Value, args: Vec<Value>) -> Result<Value> {
         match func {
             Value::Function(func_idx) => {

@@ -5,7 +5,24 @@ impl JitCompiler {
         Self {
             ops: Assembler::new().unwrap(),
             leaked_constants: Vec::new(),
+            fail_stack: Vec::new(),
+            exit_stack: Vec::new(),
+            inline_depth: 0,
         }
+    }
+
+    fn current_fail_label(&self) -> dynasmrt::DynamicLabel {
+        *self
+            .fail_stack
+            .last()
+            .expect("JIT fail label stack is empty")
+    }
+
+    pub(super) fn current_exit_label(&self) -> dynasmrt::DynamicLabel {
+        *self
+            .exit_stack
+            .last()
+            .expect("JIT exit label stack is empty")
     }
 
     pub fn compile_trace(
@@ -17,6 +34,10 @@ impl JitCompiler {
     ) -> Result<CompiledTrace> {
         let mut guards = Vec::new();
         let mut guard_index = 0i32;
+        let exit_label = self.ops.new_dynamic_label();
+        let fail_label = self.ops.new_dynamic_label();
+        self.exit_stack.push(exit_label);
+        self.fail_stack.push(fail_label);
         dynasm!(self.ops
             ; push rbp
             ; mov rbp, rsp
@@ -25,6 +46,8 @@ impl JitCompiler {
             ; push r13
             ; push r14
             ; push r15
+            ; sub rsp, 40
+            ; xor r15, r15
             ; mov r12, rdi
             ; mov r13, rsi
         );
@@ -32,7 +55,88 @@ impl JitCompiler {
             self.compile_load_const(*dest, value)?;
         }
 
-        for (_i, op) in trace.ops.iter().enumerate() {
+        let compile_result = self.compile_ops(&trace.ops, &mut guard_index, &mut guards);
+        self.exit_stack.pop();
+        self.fail_stack.pop();
+        compile_result?;
+        let unwind_label = self.ops.new_dynamic_label();
+        let fail_return_label = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; xor eax, eax
+            ; => exit_label
+            ; exit:
+            ; add rsp, 40
+            ; pop r15
+            ; pop r14
+            ; pop r13
+            ; pop r12
+            ; pop rbx
+            ; pop rbp
+            ; ret
+            ; => fail_label
+            ; fail:
+            ; mov eax, DWORD -1
+            ; => unwind_label
+            ; test r15, r15
+            ; je => fail_return_label
+            ; mov eax, DWORD [r15]
+            ; mov rbx, rax
+            ; add rsp, rbx
+            ; mov r12, [r15 + 8]
+            ; mov r15, [r15 + 16]
+            ; add rsp, 24
+            ; jmp => unwind_label
+            ; => fail_return_label
+            ; jmp => exit_label
+        );
+        let ops = mem::replace(&mut self.ops, Assembler::new().unwrap());
+        let exec_buffer = ops.finalize().unwrap();
+        let entry_point = exec_buffer.ptr(dynasmrt::AssemblyOffset(0));
+        let entry: extern "C" fn(*mut Value, *mut VM, *const Function) -> i32 =
+            unsafe { mem::transmute(entry_point) };
+        #[cfg(feature = "std")]
+        {
+            if std::env::var("LUST_JIT_DUMP").is_ok() {
+                use std::{fs, path::PathBuf};
+                let len = exec_buffer.len();
+                let bytes = unsafe { std::slice::from_raw_parts(entry_point as *const u8, len) };
+                let mut path = PathBuf::from("target");
+                let _ = fs::create_dir_all(&path);
+                path.push(format!(
+                    "jit_trace_{}_{}.bin",
+                    trace_id.0,
+                    parent.map(|p| p.0).unwrap_or(trace.function_idx)
+                ));
+                if let Err(err) = fs::write(&path, bytes) {
+                    crate::jit::log(|| {
+                        format!("⚠️  JIT: failed to dump trace to {:?}: {}", path, err)
+                    });
+                } else {
+                    crate::jit::log(|| format!("📝 JIT: Dumped trace bytes to {:?}", path));
+                }
+            }
+        }
+        Box::leak(Box::new(exec_buffer));
+        let leaked_constants = mem::take(&mut self.leaked_constants);
+        Ok(CompiledTrace {
+            id: trace_id,
+            entry,
+            trace: trace.clone(),
+            guards,
+            parent,
+            side_traces: Vec::new(),
+            leaked_constants,
+            hoisted_constants,
+        })
+    }
+
+    fn compile_ops(
+        &mut self,
+        ops: &[TraceOp],
+        guard_index: &mut i32,
+        guards: &mut Vec<Guard>,
+    ) -> Result<()> {
+        for op in ops {
             match op {
                 TraceOp::LoadConst { dest, value } => {
                     self.compile_load_const(*dest, value)?;
@@ -150,10 +254,50 @@ impl JitCompiler {
                     let guard = self.compile_guard_native_function(
                         *register,
                         expected_ptr,
-                        guard_index as usize,
+                        *guard_index as usize,
                     )?;
                     guards.push(guard);
-                    guard_index += 1;
+                    *guard_index += 1;
+                }
+
+                TraceOp::GuardFunction {
+                    register,
+                    function_idx,
+                } => {
+                    crate::jit::log(|| {
+                        format!(
+                            "🔒 JIT: guard function reg {} -> idx {}",
+                            register, function_idx
+                        )
+                    });
+                    let guard = self.compile_guard_function(
+                        *register,
+                        *function_idx,
+                        *guard_index as usize,
+                    )?;
+                    guards.push(guard);
+                    *guard_index += 1;
+                }
+
+                TraceOp::GuardClosure {
+                    register,
+                    function_idx,
+                    upvalues_ptr,
+                } => {
+                    crate::jit::log(|| {
+                        format!(
+                            "🔒 JIT: guard closure reg {} -> idx {}",
+                            register, function_idx
+                        )
+                    });
+                    let guard = self.compile_guard_closure(
+                        *register,
+                        *function_idx,
+                        *upvalues_ptr,
+                        *guard_index as usize,
+                    )?;
+                    guards.push(guard);
+                    *guard_index += 1;
                 }
 
                 TraceOp::CallNative {
@@ -165,6 +309,30 @@ impl JitCompiler {
                 } => {
                     let expected_ptr = function.pointer();
                     self.compile_call_native(*dest, *callee, expected_ptr, *first_arg, *arg_count)?;
+                }
+
+                TraceOp::CallFunction {
+                    dest,
+                    callee,
+                    function_idx,
+                    first_arg,
+                    arg_count,
+                    is_closure,
+                    upvalues_ptr,
+                } => {
+                    self.compile_call_function(
+                        *dest,
+                        *callee,
+                        *function_idx,
+                        *first_arg,
+                        *arg_count,
+                        *is_closure,
+                        *upvalues_ptr,
+                    )?;
+                }
+
+                TraceOp::InlineCall { dest, callee, trace } => {
+                    self.compile_inline_call(*dest, *callee, trace, guard_index, guards)?;
                 }
 
                 TraceOp::CallMethod {
@@ -222,14 +390,48 @@ impl JitCompiler {
                     self.compile_new_struct(*dest, struct_name, field_names, field_registers)?;
                 }
 
+                TraceOp::NewEnumUnit {
+                    dest,
+                    enum_name,
+                    variant_name,
+                } => {
+                    self.compile_new_enum_unit(*dest, enum_name, variant_name)?;
+                }
+
+                TraceOp::NewEnumVariant {
+                    dest,
+                    enum_name,
+                    variant_name,
+                    value_registers,
+                } => {
+                    self.compile_new_enum_variant(*dest, enum_name, variant_name, value_registers)?;
+                }
+
+                TraceOp::IsEnumVariant {
+                    dest,
+                    value,
+                    enum_name,
+                    variant_name,
+                } => {
+                    self.compile_is_enum_variant(*dest, *value, enum_name, variant_name)?;
+                }
+
+                TraceOp::GetEnumValue {
+                    dest,
+                    enum_reg,
+                    index,
+                } => {
+                    self.compile_get_enum_value(*dest, *enum_reg, *index)?;
+                }
+
                 TraceOp::Guard {
                     register,
                     expected_type,
                 } => {
                     let guard =
-                        self.compile_guard(*register, *expected_type, guard_index as usize)?;
+                        self.compile_guard(*register, *expected_type, *guard_index as usize)?;
                     guards.push(guard);
-                    guard_index += 1;
+                    *guard_index += 1;
                 }
 
                 TraceOp::GuardLoopContinue {
@@ -239,10 +441,10 @@ impl JitCompiler {
                     let guard = self.compile_loop_continue_guard(
                         *condition_register,
                         *bailout_ip,
-                        guard_index as usize,
+                        *guard_index as usize,
                     )?;
                     guards.push(guard);
-                    guard_index += 1;
+                    *guard_index += 1;
                 }
 
                 TraceOp::NestedLoopCall {
@@ -250,14 +452,15 @@ impl JitCompiler {
                     loop_start_ip,
                     bailout_ip,
                 } => {
+                    let exit_label = self.current_exit_label();
                     jit::log(|| {
                         format!(
                             "🔗 JIT: Nested loop detected at func {} ip {} (guard #{})",
-                            function_idx, loop_start_ip, guard_index
+                            function_idx, loop_start_ip, *guard_index
                         )
                     });
                     guards.push(Guard {
-                        index: guard_index as usize,
+                        index: *guard_index as usize,
                         bailout_ip: *bailout_ip,
                         kind: GuardKind::NestedLoop {
                             function_idx: *function_idx,
@@ -266,48 +469,176 @@ impl JitCompiler {
                         fail_count: 0,
                         side_trace: None,
                     });
-                    let current_guard_index = guard_index;
+                    let current_guard_index = *guard_index;
                     dynasm!(self.ops
                         ; mov eax, DWORD (current_guard_index + 1)
-                        ; jmp >exit
+                        ; jmp => exit_label
                     );
-                    guard_index += 1;
+                    *guard_index += 1;
                 }
 
                 TraceOp::Return { .. } => {}
             }
         }
 
+        Ok(())
+    }
+
+    fn compile_inline_call(
+        &mut self,
+        dest: u8,
+        callee: u8,
+        trace: &InlineTrace,
+        guard_index: &mut i32,
+        guards: &mut Vec<Guard>,
+    ) -> Result<()> {
+        self.inline_depth += 1;
+        let result = (|| -> Result<()> {
+            if trace.register_count == 0 {
+                crate::jit::log(|| {
+                    format!(
+                        "⚠️  JIT: Inline fallback for func {} (no registers)",
+                        trace.function_idx
+                    )
+                });
+                return self.compile_call_function(
+                    dest,
+                    callee,
+                    trace.function_idx,
+                    trace.first_arg,
+                    trace.arg_count,
+                    trace.is_closure,
+                    trace.upvalues_ptr,
+                );
+            }
+
+            crate::jit::log(|| {
+                format!(
+                    "✨ JIT: Inlining call to func {} into register R{}",
+                    trace.function_idx, dest
+                )
+            });
+
+            let value_size = mem::size_of::<Value>() as i32;
+        let frame_size = trace.register_count as i32 * value_size;
+        let align_adjust = ((16 - (frame_size & 15)) & 15) as i32;
+        let metadata_size = 32i32;
+        let outer_fail = self.current_fail_label();
+        let inline_fail = self.ops.new_dynamic_label();
+        let inline_end = self.ops.new_dynamic_label();
+        extern "C" {
+            fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
+            }
+
+            // Save inline metadata (frame size, caller registers, previous inline frame).
         dynasm!(self.ops
-            ; xor eax, eax
-            ; exit:
-            ; pop r15
-            ; pop r14
-            ; pop r13
-            ; pop r12
-            ; pop rbx
-            ; pop rbp
-            ; ret
-            ; fail:
-            ; mov eax, DWORD -1
-            ; jmp <exit
+            ; sub rsp, metadata_size
         );
-        let ops = mem::replace(&mut self.ops, Assembler::new().unwrap());
-        let buffer = ops.finalize().unwrap();
-        let entry_point = buffer.ptr(dynasmrt::AssemblyOffset(0));
-        let entry: extern "C" fn(*mut Value, *mut VM, *const Function) -> i32 =
-            unsafe { mem::transmute(entry_point) };
-        Box::leak(Box::new(buffer));
-        let leaked_constants = mem::take(&mut self.leaked_constants);
-        Ok(CompiledTrace {
-            id: trace_id,
-            entry,
-            trace: trace.clone(),
-            guards,
-            parent,
-            side_traces: Vec::new(),
-            leaked_constants,
-            hoisted_constants,
-        })
+        dynasm!(self.ops
+            ; mov eax, DWORD frame_size as _
+            ; mov [rsp], rax
+            ; mov [rsp + 8], r12
+            ; mov [rsp + 16], r15
+        );
+        dynasm!(self.ops
+            ; mov eax, DWORD align_adjust as _
+            ; mov [rsp + 24], rax
+            ; mov r15, rsp
+        );
+        if align_adjust != 0 {
+            dynasm!(self.ops
+                ; sub rsp, align_adjust
+            );
+        }
+        // Allocate space for callee registers.
+        dynasm!(self.ops
+            ; sub rsp, frame_size
+            ; mov r12, rsp
+        );
+
+            for reg in 0..trace.register_count {
+                self.compile_load_const(reg, &Value::Nil)?;
+            }
+
+            // Copy positional arguments into callee registers.
+            for (arg_index, src_reg) in trace.arg_registers.iter().enumerate() {
+                let src_offset = (*src_reg as i32) * value_size;
+                let dest_offset = (arg_index as i32) * value_size;
+                dynasm!(self.ops
+                    ; mov r14, [r15 + 8]
+                    ; lea rdi, [r14 + src_offset]
+                    ; lea rsi, [r12 + dest_offset]
+                    ; mov rax, QWORD jit_move_safe as _
+                    ; call rax
+                    ; test al, al
+                    ; jz =>inline_fail
+                );
+            }
+
+            self.fail_stack.push(inline_fail);
+            let inline_result = self.compile_ops(&trace.body, guard_index, guards);
+            self.fail_stack.pop();
+            inline_result?;
+
+            if let Some(ret_reg) = trace.return_register {
+                let ret_offset = (ret_reg as i32) * value_size;
+                let dest_offset = (dest as i32) * value_size;
+                dynasm!(self.ops
+                    ; mov r14, [r15 + 8]
+                    ; lea rdi, [r12 + ret_offset]
+                    ; lea rsi, [r14 + dest_offset]
+                    ; mov rax, QWORD jit_move_safe as _
+                    ; call rax
+                    ; test al, al
+                    ; jz =>inline_fail
+                );
+                dynasm!(self.ops
+                    ; add rsp, frame_size
+                );
+                dynasm!(self.ops
+                    ; mov eax, DWORD [r15 + 24]
+                    ; add rsp, rax
+                    ; mov r12, [r15 + 8]
+                    ; mov r15, [r15 + 16]
+                    ; add rsp, metadata_size
+                    ; jmp => inline_end
+                );
+            } else {
+                dynasm!(self.ops
+                    ; add rsp, frame_size
+                );
+                dynasm!(self.ops
+                    ; mov eax, DWORD [r15 + 24]
+                    ; add rsp, rax
+                    ; mov r12, [r15 + 8]
+                    ; mov r15, [r15 + 16]
+                    ; add rsp, metadata_size
+                );
+                self.compile_load_const(dest, &Value::Nil)?;
+                dynasm!(self.ops
+                    ; jmp => inline_end
+                );
+            }
+
+        dynasm!(self.ops
+            ; => inline_fail
+            ; mov eax, DWORD [r15]
+            ; mov rbx, rax
+            ; add rsp, rbx
+        );
+        dynasm!(self.ops
+            ; mov eax, DWORD [r15 + 24]
+            ; add rsp, rax
+            ; mov r12, [r15 + 8]
+            ; mov r15, [r15 + 16]
+            ; add rsp, metadata_size
+            ; jmp => outer_fail
+            ; => inline_end
+            );
+
+            Ok(())
+        })();
+        self.inline_depth -= 1;
+        result
     }
 }

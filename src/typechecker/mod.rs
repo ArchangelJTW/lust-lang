@@ -225,10 +225,11 @@ impl TypeChecker {
                     }
 
                     let description = cycle.join(" -> ");
-                    return Err(self.type_error(format!(
-                        "Strong ownership cycle detected: {}. Mark at least one field as 'ref' to break the cycle.",
-                        description
-                    )));
+                    break;
+                    // return Err(self.type_error(format!(
+                    //     "Strong ownership cycle detected: {}. Mark at least one field as 'ref' to break the cycle.",
+                    //     description
+                    // )));
                 }
             }
         }

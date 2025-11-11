@@ -38,6 +38,7 @@ impl JitCompiler {
         let fail_label = self.ops.new_dynamic_label();
         self.exit_stack.push(exit_label);
         self.fail_stack.push(fail_label);
+        crate::jit::log(|| "🔧 JIT: Emitting prologue with sub rsp, 40".to_string());
         dynasm!(self.ops
             ; push rbp
             ; mov rbp, rsp

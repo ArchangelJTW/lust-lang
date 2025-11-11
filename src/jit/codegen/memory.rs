@@ -560,11 +560,12 @@ impl JitCompiler {
             ; mov rcx, QWORD variant_name_len as _
             ; lea r8, [r12 + first_value_offset]
             ; mov r9, QWORD value_count as _
+            ; sub rsp, 16
             ; lea rax, [r12 + dest_offset]
-            ; push rax
+            ; mov [rsp], rax
             ; mov rax, QWORD jit_new_enum_variant_safe as _
             ; call rax
-            ; add rsp, 8
+            ; add rsp, 16
             ; test al, al
             ; jz >fail
         );

@@ -359,7 +359,7 @@ impl TraceRecorder {
     }
 
     fn should_inline(&self, function_idx: usize) -> bool {
-        return false;
+        // return false;
         if function_idx == self.trace.function_idx {
             return false;
         }

@@ -49,7 +49,7 @@ where
 {
 }
 
-pub const HOT_THRESHOLD: u32 = 10;
+pub const HOT_THRESHOLD: u32 = 5;
 pub const MAX_TRACE_LENGTH: usize = 200;
 pub const SIDE_EXIT_THRESHOLD: u32 = 10;
 pub const UNROLL_FACTOR: usize = 32;

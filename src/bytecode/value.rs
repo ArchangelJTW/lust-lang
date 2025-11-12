@@ -1292,6 +1292,28 @@ pub unsafe extern "C" fn jit_new_array_safe(
 
 #[cfg(feature = "std")]
 #[no_mangle]
+pub unsafe extern "C" fn jit_array_push_safe(
+    array_ptr: *const Value,
+    value_ptr: *const Value,
+) -> u8 {
+    if array_ptr.is_null() || value_ptr.is_null() {
+        return 0;
+    }
+
+    let array_value = &*array_ptr;
+    let value = &*value_ptr;
+
+    match array_value {
+        Value::Array(arr) => {
+            arr.borrow_mut().push(value.clone());
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(feature = "std")]
+#[no_mangle]
 pub unsafe extern "C" fn jit_concat_safe(
     left_value_ptr: *const Value,
     right_value_ptr: *const Value,

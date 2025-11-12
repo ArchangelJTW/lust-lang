@@ -347,7 +347,12 @@ impl JitCompiler {
                     first_arg,
                     arg_count,
                 } => {
-                    self.compile_call_method(*dest, *object, method_name, *first_arg, *arg_count)?;
+                    // Optimize array:push(value) to specialized JIT helper
+                    if method_name == "push" && *arg_count == 1 {
+                        self.compile_array_push(*object, *first_arg)?;
+                    } else {
+                        self.compile_call_method(*dest, *object, method_name, *first_arg, *arg_count)?;
+                    }
                 }
 
                 TraceOp::GetField {

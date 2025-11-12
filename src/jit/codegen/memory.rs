@@ -292,6 +292,29 @@ impl JitCompiler {
         Ok(())
     }
 
+    pub(super) fn compile_array_push(&mut self, array: u8, value: u8) -> Result<()> {
+        crate::jit::log(|| format!("🚀 JIT: Compiling optimized array:push() for R{} <- R{}", array, value));
+
+        let array_offset = (array as i32) * (mem::size_of::<Value>() as i32);
+        let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
+
+        extern "C" {
+            fn jit_array_push_safe(array_ptr: *const Value, value_ptr: *const Value) -> u8;
+        }
+
+        // Guards have already verified the type, so directly call the helper
+        dynasm!(self.ops
+            ; lea rdi, [r12 + array_offset]
+            ; lea rsi, [r12 + value_offset]
+            ; mov rax, QWORD jit_array_push_safe as _
+            ; call rax
+            ; test al, al
+            ; jz >fail
+        );
+
+        Ok(())
+    }
+
     pub(super) fn compile_call_native(
         &mut self,
         dest: u8,

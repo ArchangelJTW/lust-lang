@@ -256,6 +256,42 @@ impl JitCompiler {
         Ok(())
     }
 
+    pub(super) fn compile_new_array(
+        &mut self,
+        dest: u8,
+        first_element: u8,
+        count: u8,
+    ) -> Result<()> {
+        let value_size = mem::size_of::<Value>() as i32;
+        let dest_offset = (dest as i32) * value_size;
+        let first_elem_offset = (first_element as i32) * value_size;
+        let count_usize = count as usize;
+
+        crate::jit::log(|| format!("🔧 JIT: compile_new_array dest=R{} (offset=0x{:x}), first_elem=R{} (offset=0x{:x}), count={}, inline_depth={}, value_size={}",
+            dest, dest_offset, first_element, first_elem_offset, count, self.inline_depth, value_size));
+
+        extern "C" {
+            fn jit_new_array_safe(
+                elements_ptr: *const Value,
+                element_count: usize,
+                out: *mut Value,
+            ) -> u8;
+        }
+
+        // r12 is callee-saved per System V ABI, so we don't need to save it
+        dynasm!(self.ops
+            ; lea rdi, [r12 + first_elem_offset]    // elements_ptr (ignored if count == 0)
+            ; mov rsi, QWORD count_usize as _        // element_count
+            ; lea rdx, [r12 + dest_offset]           // out_ptr
+            ; mov rax, QWORD jit_new_array_safe as _
+            ; call rax
+            ; test al, al
+            ; jz >fail
+        );
+
+        Ok(())
+    }
+
     pub(super) fn compile_call_native(
         &mut self,
         dest: u8,
@@ -333,14 +369,16 @@ impl JitCompiler {
             ; jz >fail
         );
 
-        dynasm!(self.ops
-            ; mov rdi, r13
-            ; mov rax, QWORD jit_current_registers as _
-            ; call rax
-            ; test rax, rax
-            ; jz >fail
-            ; mov r12, rax
-        );
+        if self.inline_depth == 0 {
+            dynasm!(self.ops
+                ; mov rdi, r13
+                ; mov rax, QWORD jit_current_registers as _
+                ; call rax
+                ; test rax, rax
+                ; jz >fail
+                ; mov r12, rax
+            );
+        }
         Ok(())
     }
 
@@ -389,14 +427,16 @@ impl JitCompiler {
             ; jz >fail
         );
 
-        dynasm!(self.ops
-            ; mov rdi, r13
-            ; mov rax, QWORD jit_current_registers as _
-            ; call rax
-            ; test rax, rax
-            ; jz >fail
-            ; mov r12, rax
-        );
+        if self.inline_depth == 0 {
+            dynasm!(self.ops
+                ; mov rdi, r13
+                ; mov rax, QWORD jit_current_registers as _
+                ; call rax
+                ; test rax, rax
+                ; jz >fail
+                ; mov r12, rax
+            );
+        }
         Ok(())
     }
 

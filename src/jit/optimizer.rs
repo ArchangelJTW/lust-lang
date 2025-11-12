@@ -72,6 +72,7 @@ impl TraceOptimizer {
                 | TraceOp::ArrayLen { dest, .. }
                 | TraceOp::CallMethod { dest, .. }
                 | TraceOp::GetField { dest, .. }
+                | TraceOp::NewArray { dest, .. }
                 | TraceOp::NewStruct { dest, .. }
                 | TraceOp::NewEnumUnit { dest, .. }
                 | TraceOp::NewEnumVariant { dest, .. }

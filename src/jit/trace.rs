@@ -218,6 +218,11 @@ pub enum TraceOp {
         value_type: Option<ValueType>,
         is_weak: bool,
     },
+    NewArray {
+        dest: Register,
+        first_element: Register,
+        count: u8,
+    },
     NewStruct {
         dest: Register,
         struct_name: String,
@@ -1044,9 +1049,16 @@ impl TraceRecorder {
                 }
             }
 
-            Instruction::NewArray(_, _, _)
-            | Instruction::NewMap(_)
-            | Instruction::SetIndex(_, _, _) => {
+            Instruction::NewArray(dest, first_elem, count) => {
+                self.push_op(TraceOp::NewArray {
+                    dest,
+                    first_element: first_elem,
+                    count,
+                });
+                Ok(())
+            }
+
+            Instruction::NewMap(_) | Instruction::SetIndex(_, _, _) => {
                 self.recording = false;
                 Err(LustError::RuntimeError {
                     message: "Trace aborted: unsupported index operation".to_string(),
@@ -1062,6 +1074,12 @@ impl TraceRecorder {
 
                 if let Some(ctx) = self.inline_stack.last_mut() {
                     ctx.return_register = return_reg;
+                    crate::jit::log(|| {
+                        format!(
+                            "🔧 JIT: Inline return detected, return_reg={:?}",
+                            return_reg
+                        )
+                    });
                     if let Some(inline_op) = self.finalize_inline_context() {
                         self.push_op(inline_op);
                     }

@@ -1251,6 +1251,46 @@ pub unsafe extern "C" fn jit_array_len_safe(array_value_ptr: *const Value) -> i6
 }
 
 #[cfg(feature = "std")]
+static JIT_NEW_ARRAY_COUNTER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "std")]
+#[no_mangle]
+pub unsafe extern "C" fn jit_new_array_safe(
+    elements_ptr: *const Value,
+    element_count: usize,
+    out_ptr: *mut Value,
+) -> u8 {
+    let call_num = JIT_NEW_ARRAY_COUNTER.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    // jit::log(|| format!("jit_new_array_safe call #{}: ENTER - elements_ptr={:?}, count={}, out_ptr={:?}", call_num, elements_ptr, element_count, out_ptr));
+
+    if out_ptr.is_null() {
+        // jit::log(|| "jit_new_array_safe: out_ptr is null".to_string());
+        return 0;
+    }
+
+    // jit::log(|| format!("jit_new_array_safe #{}: about to create Vec", call_num));
+    let elements = if element_count == 0 {
+        Vec::new()
+    } else {
+        if elements_ptr.is_null() {
+            // jit::log(|| "jit_new_array_safe: elements_ptr is null but count > 0".to_string());
+            return 0;
+        }
+
+        let slice = slice::from_raw_parts(elements_ptr, element_count);
+        slice.to_vec()
+    };
+
+    // jit::log(|| format!("jit_new_array_safe #{}: about to call Value::array with {} elements", call_num, elements.len()));
+    let array_value = Value::array(elements);
+    // jit::log(|| format!("jit_new_array_safe #{}: about to write to out_ptr", call_num));
+    ptr::write(out_ptr, array_value);
+    // jit::log(|| format!("jit_new_array_safe #{}: EXIT - success, returning 1", call_num));
+    1
+}
+
+#[cfg(feature = "std")]
 #[no_mangle]
 pub unsafe extern "C" fn jit_concat_safe(
     left_value_ptr: *const Value,

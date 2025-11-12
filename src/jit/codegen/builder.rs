@@ -386,6 +386,14 @@ impl JitCompiler {
                     )?;
                 }
 
+                TraceOp::NewArray {
+                    dest,
+                    first_element,
+                    count,
+                } => {
+                    self.compile_new_array(*dest, *first_element, *count)?;
+                }
+
                 TraceOp::NewStruct {
                     dest,
                     struct_name,

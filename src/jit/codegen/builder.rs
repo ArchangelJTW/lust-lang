@@ -347,11 +347,20 @@ impl JitCompiler {
                     first_arg,
                     arg_count,
                 } => {
-                    // Optimize array:push(value) to specialized JIT helper
-                    if method_name == "push" && *arg_count == 1 {
-                        self.compile_array_push(*object, *first_arg)?;
-                    } else {
-                        self.compile_call_method(*dest, *object, method_name, *first_arg, *arg_count)?;
+                    // Optimize common method calls with specialized JIT helpers
+                    match (method_name.as_str(), *arg_count) {
+                        ("push", 1) => {
+                            self.compile_array_push(*object, *first_arg)?;
+                        }
+                        ("is_some", 0) => {
+                            self.compile_enum_is_some(*dest, *object)?;
+                        }
+                        ("unwrap", 0) => {
+                            self.compile_enum_unwrap(*dest, *object)?;
+                        }
+                        _ => {
+                            self.compile_call_method(*dest, *object, method_name, *first_arg, *arg_count)?;
+                        }
                     }
                 }
 

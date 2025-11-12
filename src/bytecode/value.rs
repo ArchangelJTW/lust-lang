@@ -1305,8 +1305,80 @@ pub unsafe extern "C" fn jit_array_push_safe(
 
     match array_value {
         Value::Array(arr) => {
-            arr.borrow_mut().push(value.clone());
+            // Use unchecked borrow for maximum performance
+            let cell_ptr = arr.as_ptr();
+            (*cell_ptr).push(value.clone());
             1
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(feature = "std")]
+#[no_mangle]
+pub unsafe extern "C" fn jit_enum_is_some_safe(enum_ptr: *const Value, out_ptr: *mut Value) -> u8 {
+    if enum_ptr.is_null() || out_ptr.is_null() {
+        return 0;
+    }
+
+    let enum_value = &*enum_ptr;
+    match enum_value {
+        Value::Enum { variant, .. } => {
+            let is_some = variant == "Some";
+            ptr::write(out_ptr, Value::Bool(is_some));
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(feature = "std")]
+#[no_mangle]
+pub unsafe extern "C" fn jit_enum_unwrap_safe(enum_ptr: *const Value, out_ptr: *mut Value) -> u8 {
+    if enum_ptr.is_null() || out_ptr.is_null() {
+        return 0;
+    }
+
+    let enum_value = &*enum_ptr;
+    match enum_value {
+        Value::Enum {
+            values: Some(vals), ..
+        } if vals.len() == 1 => {
+            ptr::write(out_ptr, vals[0].clone());
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(feature = "std")]
+#[no_mangle]
+pub unsafe extern "C" fn jit_set_field_strong_safe(
+    object_ptr: *const Value,
+    field_index: usize,
+    value_ptr: *const Value,
+) -> u8 {
+    if object_ptr.is_null() || value_ptr.is_null() {
+        return 0;
+    }
+
+    let object = &*object_ptr;
+    let value = (&*value_ptr).clone();
+
+    match object {
+        Value::Struct { fields, .. } => {
+            // Skip canonicalization for strong fields - just set directly
+            match fields.try_borrow_mut() {
+                Ok(mut borrowed) => {
+                    if field_index < borrowed.len() {
+                        borrowed[field_index] = value;
+                        1
+                    } else {
+                        0
+                    }
+                }
+                Err(_) => 0,
+            }
         }
         _ => 0,
     }

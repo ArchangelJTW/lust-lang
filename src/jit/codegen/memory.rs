@@ -228,15 +228,37 @@ impl JitCompiler {
         }
 
         if let Some(index) = field_index {
-            dynasm!(self.ops
-                ; lea rdi, [r12 + object_offset]
-                ; mov rsi, QWORD index as _
-                ; lea rdx, [r12 + value_offset]
-                ; mov rax, QWORD jit_set_field_indexed_safe as _
-                ; call rax
-                ; test al, al
-                ; jz >fail
-            );
+            crate::jit::log(|| format!("🔧 JIT: SetField using indexed path, field_index={}, is_weak={}", index, _is_weak));
+            // Use specialized helpers based on whether field is weak or strong
+            if _is_weak {
+                dynasm!(self.ops
+                    ; lea rdi, [r12 + object_offset]
+                    ; mov rsi, QWORD index as _
+                    ; lea rdx, [r12 + value_offset]
+                    ; mov rax, QWORD jit_set_field_indexed_safe as _
+                    ; call rax
+                    ; test al, al
+                    ; jz >fail
+                );
+            } else {
+                // Strong field - can skip canonicalization
+                extern "C" {
+                    fn jit_set_field_strong_safe(
+                        object_ptr: *const Value,
+                        field_index: usize,
+                        value_ptr: *const Value,
+                    ) -> u8;
+                }
+                dynasm!(self.ops
+                    ; lea rdi, [r12 + object_offset]
+                    ; mov rsi, QWORD index as _
+                    ; lea rdx, [r12 + value_offset]
+                    ; mov rax, QWORD jit_set_field_strong_safe as _
+                    ; call rax
+                    ; test al, al
+                    ; jz >fail
+                );
+            }
         } else {
             let field_name_box = Box::leak(Box::new(field_name.to_string()));
             let field_name_ptr = field_name_box.as_ptr();
@@ -267,9 +289,6 @@ impl JitCompiler {
         let first_elem_offset = (first_element as i32) * value_size;
         let count_usize = count as usize;
 
-        crate::jit::log(|| format!("🔧 JIT: compile_new_array dest=R{} (offset=0x{:x}), first_elem=R{} (offset=0x{:x}), count={}, inline_depth={}, value_size={}",
-            dest, dest_offset, first_element, first_elem_offset, count, self.inline_depth, value_size));
-
         extern "C" {
             fn jit_new_array_safe(
                 elements_ptr: *const Value,
@@ -293,8 +312,6 @@ impl JitCompiler {
     }
 
     pub(super) fn compile_array_push(&mut self, array: u8, value: u8) -> Result<()> {
-        crate::jit::log(|| format!("🚀 JIT: Compiling optimized array:push() for R{} <- R{}", array, value));
-
         let array_offset = (array as i32) * (mem::size_of::<Value>() as i32);
         let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
 
@@ -307,6 +324,46 @@ impl JitCompiler {
             ; lea rdi, [r12 + array_offset]
             ; lea rsi, [r12 + value_offset]
             ; mov rax, QWORD jit_array_push_safe as _
+            ; call rax
+            ; test al, al
+            ; jz >fail
+        );
+
+        Ok(())
+    }
+
+    pub(super) fn compile_enum_is_some(&mut self, dest: u8, enum_reg: u8) -> Result<()> {
+        let enum_offset = (enum_reg as i32) * (mem::size_of::<Value>() as i32);
+        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
+
+        extern "C" {
+            fn jit_enum_is_some_safe(enum_ptr: *const Value, out_ptr: *mut Value) -> u8;
+        }
+
+        dynasm!(self.ops
+            ; lea rdi, [r12 + enum_offset]
+            ; lea rsi, [r12 + dest_offset]
+            ; mov rax, QWORD jit_enum_is_some_safe as _
+            ; call rax
+            ; test al, al
+            ; jz >fail
+        );
+
+        Ok(())
+    }
+
+    pub(super) fn compile_enum_unwrap(&mut self, dest: u8, enum_reg: u8) -> Result<()> {
+        let enum_offset = (enum_reg as i32) * (mem::size_of::<Value>() as i32);
+        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
+
+        extern "C" {
+            fn jit_enum_unwrap_safe(enum_ptr: *const Value, out_ptr: *mut Value) -> u8;
+        }
+
+        dynasm!(self.ops
+            ; lea rdi, [r12 + enum_offset]
+            ; lea rsi, [r12 + dest_offset]
+            ; mov rax, QWORD jit_enum_unwrap_safe as _
             ; call rax
             ; test al, al
             ; jz >fail

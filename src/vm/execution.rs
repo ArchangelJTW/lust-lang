@@ -93,7 +93,21 @@ impl VM {
                     let registers_ptr = frame.registers.as_mut_ptr();
                     let entry = self.jit.get_trace(trace_id).map(|t| t.entry);
                     if let Some(entry_fn) = entry {
+                        crate::jit::log(|| format!("▶️  JIT: Executing trace #{} at func {} ip {}", trace_id.0, func_idx, loop_start_ip));
+
+                        // Capture RSP before and after to detect stack leaks
+                        let rsp_before: usize;
+                        unsafe { std::arch::asm!("mov {}, rsp", out(reg) rsp_before) };
+
                         let result = entry_fn(registers_ptr, self as *mut VM, ptr::null());
+
+                        let rsp_after: usize;
+                        unsafe { std::arch::asm!("mov {}, rsp", out(reg) rsp_after) };
+
+                        let rsp_diff = rsp_after as isize - rsp_before as isize;
+                        crate::jit::log(|| format!("🎯 JIT: Trace #{} execution result: {} (RSP before: {:x}, after: {:x}, diff: {})",
+                            trace_id.0, result, rsp_before, rsp_after, rsp_diff));
+
                         if result == 0 {
                             if let Some(frame) = self.call_stack.last_mut() {
                                 frame.ip = loop_start_ip;

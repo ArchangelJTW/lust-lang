@@ -602,6 +602,12 @@ impl TraceRecorder {
             return false;
         }
 
+        // Disable inlining when specialized values are active to avoid
+        // stack layout conflicts between inline frames and specialized storage
+        if !self.specialized_registers.is_empty() {
+            return false;
+        }
+
         true
     }
 

@@ -9,7 +9,7 @@ use alloc::{
     vec::Vec,
 };
 use core::fmt;
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 
 #[derive(Clone)]
 pub struct TracedNativeFn {
@@ -36,7 +36,12 @@ impl fmt::Debug for TracedNativeFn {
 pub struct Trace {
     pub function_idx: usize,
     pub start_ip: usize,
+    /// Operations executed once at trace entry (unboxing, guards, etc.)
+    pub preamble: Vec<TraceOp>,
+    /// Operations in the trace loop body
     pub ops: Vec<TraceOp>,
+    /// Operations executed once at trace exit (reboxing to restore state)
+    pub postamble: Vec<TraceOp>,
     pub inputs: Vec<Register>,
     pub outputs: Vec<Register>,
 }
@@ -268,6 +273,67 @@ pub enum TraceOp {
     Return {
         value: Option<Register>,
     },
+    /// Unbox a Value into specialized representation
+    Unbox {
+        specialized_id: usize,
+        source_reg: Register,
+        layout: crate::jit::specialization::SpecializedLayout,
+    },
+    /// Rebox a specialized value back to Value
+    Rebox {
+        dest_reg: Register,
+        specialized_id: usize,
+        layout: crate::jit::specialization::SpecializedLayout,
+    },
+    /// Operation on specialized values
+    SpecializedOp {
+        op: SpecializedOpKind,
+        operands: Vec<Operand>,
+    },
+}
+
+/// Operand for specialized operations
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Operand {
+    Register(u8),
+    Specialized(usize),
+    Immediate(i64),
+}
+
+/// Types of operations on specialized values
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecializedOpKind {
+    // Vector operations
+    VecPush,
+    VecPop,
+    VecGet,
+    VecSet,
+    VecLen,
+
+    // Map operations
+    MapInsert,
+    MapGet,
+    MapRemove,
+
+    // Struct operations
+    StructGetField { field_index: usize },
+    StructSetField { field_index: usize },
+
+    // Arithmetic on unboxed values
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Neg,
+
+    // Comparison
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,6 +354,15 @@ pub struct TraceRecorder {
     guarded_registers: HashSet<Register>,
     inline_stack: Vec<InlineContext>,
     op_count: usize,
+    /// Track which registers contain specialized values (register -> (specialized_id, layout))
+    specialized_registers:
+        HashMap<Register, (usize, crate::jit::specialization::SpecializedLayout)>,
+    /// Counter for generating specialized IDs
+    next_specialized_id: usize,
+    /// Registry for type specializations
+    specialization_registry: crate::jit::specialization::SpecializationRegistry,
+    /// Track how many times we've seen each loop backedge to enable unrolling
+    loop_iterations: HashMap<(usize, usize), usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -312,7 +387,9 @@ impl TraceRecorder {
             trace: Trace {
                 function_idx,
                 start_ip,
+                preamble: Vec::new(),
                 ops: Vec::new(),
+                postamble: Vec::new(),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
             },
@@ -321,6 +398,84 @@ impl TraceRecorder {
             guarded_registers: HashSet::new(),
             inline_stack: Vec::new(),
             op_count: 0,
+            specialized_registers: HashMap::new(),
+            next_specialized_id: 0,
+            specialization_registry: crate::jit::specialization::SpecializationRegistry::new(),
+            loop_iterations: HashMap::new(),
+        }
+    }
+
+    /// Scan live registers at trace entry and specialize any loop-invariant arrays
+    /// This should be called right after trace recording starts
+    pub fn specialize_trace_inputs(
+        &mut self,
+        registers: &[Value; 256],
+        function: &crate::bytecode::Function,
+    ) {
+        crate::jit::log(|| format!("🔍 JIT: Scanning trace inputs for specialization..."));
+
+        // Scan all registers for arrays (not just ones with type info)
+        for reg in 0u8..=255 {
+            // Check if this register contains an Array at runtime
+            if let Value::Array(ref arr_rc) = registers[reg as usize] {
+                crate::jit::log(|| format!("🔍 JIT: Found array in reg {}", reg));
+                // Try to determine the element type by inspecting the array contents
+                // If we have type info, use it; otherwise infer from first element
+                let element_type = function.register_types.get(&reg).cloned().or_else(|| {
+                    // Try to infer from array contents
+                    let arr = arr_rc.borrow();
+                    if arr.is_empty() {
+                        None
+                    } else {
+                        match &arr[0] {
+                            Value::Int(_) => Some(crate::ast::TypeKind::Int),
+                            Value::Float(_) => Some(crate::ast::TypeKind::Float),
+                            Value::Bool(_) => Some(crate::ast::TypeKind::Bool),
+                            _ => None,
+                        }
+                    }
+                });
+
+                if let Some(elem_type) = element_type {
+                    // Build the full Array<T> type
+                    // Check if elem_type is already a full Array type (stored in register_types)
+                    // vs just the element type
+                    use crate::ast::{Span, Type};
+                    let (array_type, actual_elem_type) = if matches!(elem_type, crate::ast::TypeKind::Array(_)) {
+                        // Already a full array type - use it directly
+                        (elem_type.clone(), elem_type.clone())
+                    } else {
+                        // Element type only, wrap in Array
+                        let arr_type = crate::ast::TypeKind::Array(Box::new(Type::new(elem_type.clone(), Span::dummy())));
+                        (arr_type, elem_type.clone())
+                    };
+
+                    // Check if this array type is specializable
+                    if let Some(layout) = self.specialization_registry.get_specialization(&array_type)
+                    {
+                        crate::jit::log(|| {
+                            format!(
+                                "🔬 JIT: Specializing trace input reg {} ({:?})",
+                                reg, array_type
+                            )
+                        });
+
+                        // Emit Unbox in PREAMBLE (executes once at trace entry, not in loop)
+                        let specialized_id = self.next_specialized_id;
+                        self.next_specialized_id += 1;
+
+                        self.trace.preamble.push(TraceOp::Unbox {
+                            specialized_id,
+                            source_reg: reg,
+                            layout: layout.clone(),
+                        });
+
+                        // Track this specialized value
+                        self.specialized_registers
+                            .insert(reg, (specialized_id, layout));
+                    }
+                }
+            }
         }
     }
 
@@ -363,8 +518,78 @@ impl TraceRecorder {
         }
     }
 
+    /// Finalize the trace by adding postamble operations (rebox all specialized values)
+    fn finalize_trace(&mut self) {
+        crate::jit::log(|| {
+            format!(
+                "🏁 JIT: Finalizing trace - reboxing {} specialized values",
+                self.specialized_registers.len()
+            )
+        });
+
+        // Rebox all specialized values in the postamble
+        for (&register, &(specialized_id, ref layout)) in self.specialized_registers.iter() {
+            crate::jit::log(|| {
+                format!(
+                    "📦 JIT: Adding rebox to postamble for specialized #{} in reg {}",
+                    specialized_id, register
+                )
+            });
+
+            self.trace.postamble.push(TraceOp::Rebox {
+                dest_reg: register,
+                specialized_id,
+                layout: layout.clone(),
+            });
+        }
+    }
+
+    /// Stop recording and finalize the trace
+    fn stop_recording(&mut self) {
+        crate::jit::log(|| {
+            format!(
+                "🛑 JIT: stop_recording called, recording={}, specialized_regs={}",
+                self.recording,
+                self.specialized_registers.len()
+            )
+        });
+        if self.recording {
+            self.finalize_trace();
+            self.recording = false;
+        }
+    }
+
+    /// Rebox all currently active specialized values
+    /// This must be called before any side exit to restore interpreter-compatible state
+    fn rebox_all_specialized_values(&mut self) {
+        // Collect all specialized values that need reboxing
+        let to_rebox: Vec<(Register, usize, crate::jit::specialization::SpecializedLayout)> =
+            self.specialized_registers
+                .iter()
+                .map(|(&reg, &(id, ref layout))| (reg, id, layout.clone()))
+                .collect();
+
+        // Emit Rebox operations
+        for (register, specialized_id, layout) in to_rebox {
+            crate::jit::log(|| {
+                format!(
+                    "📦 JIT: Reboxing specialized #{} back to reg {} before side exit",
+                    specialized_id, register
+                )
+            });
+
+            self.push_op(TraceOp::Rebox {
+                dest_reg: register,
+                specialized_id,
+                layout,
+            });
+
+            // Remove from tracking
+            self.specialized_registers.remove(&register);
+        }
+    }
+
     fn should_inline(&self, function_idx: usize) -> bool {
-        // return false;
         if function_idx == self.trace.function_idx {
             return false;
         }
@@ -473,6 +698,21 @@ impl TraceRecorder {
             Instruction::StoreGlobal(_, _) => Ok(()),
 
             Instruction::Move(dest, src) => {
+                // Check if we're moving a specialized value
+                if let Some(&(specialized_id, ref layout)) = self.specialized_registers.get(&src) {
+                    crate::jit::log(|| {
+                        format!(
+                            "📦 JIT: Moving specialized #{} from reg {} to reg {}",
+                            specialized_id, src, dest
+                        )
+                    });
+                    // Track that dest now contains the specialized value
+                    self.specialized_registers
+                        .insert(dest, (specialized_id, layout.clone()));
+                    // Remove from source register
+                    self.specialized_registers.remove(&src);
+                }
+
                 self.push_op(TraceOp::Move { dest, src });
                 Ok(())
             }
@@ -677,6 +917,51 @@ impl TraceRecorder {
                     .as_string()
                     .unwrap_or("unknown")
                     .to_string();
+
+                // Check if this is a method on a specialized value
+                if let Some(&(specialized_id, _)) = self.specialized_registers.get(&obj_reg) {
+                    // This is a method call on a specialized value
+                    match method_name.as_str() {
+                        "push" if arg_count == 1 => {
+                            // Specialized array push
+                            crate::jit::log(|| {
+                                format!(
+                                    "⚡ JIT: Specializing push on reg {} (specialized #{})",
+                                    obj_reg, specialized_id
+                                )
+                            });
+
+                            // Guard the argument
+                            let value_reg = first_arg;
+                            if let Some(ty) = Self::get_value_type(&registers[value_reg as usize]) {
+                                if !self.is_guarded(value_reg) {
+                                    self.push_op(TraceOp::Guard {
+                                        register: value_reg,
+                                        expected_type: ty,
+                                    });
+                                    self.mark_guarded(value_reg);
+                                }
+                            }
+
+                            // Emit specialized push operation
+                            self.push_op(TraceOp::SpecializedOp {
+                                op: SpecializedOpKind::VecPush,
+                                operands: vec![
+                                    Operand::Specialized(specialized_id),
+                                    Operand::Register(value_reg),
+                                ],
+                            });
+
+                            return Ok(());
+                        }
+                        _ => {
+                            // Other methods on specialized values - need to rebox first
+                            // For now, fall through to normal handling
+                        }
+                    }
+                }
+
+                // Normal (non-specialized) method call
                 if let Some(ty) = Self::get_value_type(&registers[obj_reg as usize]) {
                     if !self.is_guarded(obj_reg) {
                         self.push_op(TraceOp::Guard {
@@ -1034,7 +1319,7 @@ impl TraceRecorder {
                     }
 
                     _ => {
-                        self.recording = false;
+                        self.stop_recording();
                         crate::jit::log(|| {
                             format!(
                                 "Trace aborted: unsupported call operation on register {} (value {:?})",
@@ -1050,16 +1335,88 @@ impl TraceRecorder {
             }
 
             Instruction::NewArray(dest, first_elem, count) => {
-                self.push_op(TraceOp::NewArray {
-                    dest,
-                    first_element: first_elem,
-                    count,
-                });
+                // Check if we can specialize this array based on element type
+                // register_types contains the element type, not the array type
+                let can_specialize = if let Some(element_type) = function.register_types.get(&dest) {
+                    // Build the full Array type from the element type
+                    use crate::ast::{Type, Span};
+                    let array_type = crate::ast::TypeKind::Array(Box::new(Type::new(
+                        element_type.clone(),
+                        Span::dummy(),
+                    )));
+
+                    // Check if this array type is specializable
+                    self.specialization_registry
+                        .get_specialization(&array_type)
+                        .is_some()
+                } else {
+                    false
+                };
+
+                if can_specialize {
+                    let element_type = function.register_types.get(&dest).unwrap().clone();
+
+                    // Build the full Array type
+                    use crate::ast::{Type, Span};
+                    let array_type = crate::ast::TypeKind::Array(Box::new(Type::new(
+                        element_type.clone(),
+                        Span::dummy(),
+                    )));
+
+                    let layout = self
+                        .specialization_registry
+                        .get_specialization(&array_type)
+                        .unwrap();
+
+                    crate::jit::log(|| {
+                        format!(
+                            "🔬 JIT: Specializing NewArray for reg {} with element type {:?}",
+                            dest, element_type
+                        )
+                    });
+
+                    // First create the array normally (for initial values if any)
+                    if count > 0 {
+                        self.push_op(TraceOp::NewArray {
+                            dest,
+                            first_element: first_elem,
+                            count,
+                        });
+                    } else {
+                        // Empty array
+                        self.push_op(TraceOp::NewArray {
+                            dest,
+                            first_element: 0,
+                            count: 0,
+                        });
+                    }
+
+                    // Then unbox it for specialized operations
+                    let specialized_id = self.next_specialized_id;
+                    self.next_specialized_id += 1;
+
+                    self.push_op(TraceOp::Unbox {
+                        specialized_id,
+                        source_reg: dest,
+                        layout: layout.clone(),
+                    });
+
+                    // Track that this register now contains a specialized value
+                    self.specialized_registers
+                        .insert(dest, (specialized_id, layout));
+                } else {
+                    // Normal non-specialized array
+                    self.push_op(TraceOp::NewArray {
+                        dest,
+                        first_element: first_elem,
+                        count,
+                    });
+                }
                 Ok(())
             }
 
             Instruction::NewMap(_) | Instruction::SetIndex(_, _, _) => {
-                self.recording = false;
+                self.stop_recording();
                 Err(LustError::RuntimeError {
                     message: "Trace aborted: unsupported index operation".to_string(),
                 })
@@ -1071,6 +1428,28 @@ impl TraceRecorder {
                 } else {
                     Some(value_reg)
                 };
+
+                // Rebox any specialized values before return
+                if let Some(reg) = return_reg {
+                    if let Some(&(specialized_id, ref layout)) =
+                        self.specialized_registers.get(&reg)
+                    {
+                        crate::jit::log(|| {
+                            format!(
+                                "📦 JIT: Reboxing specialized #{} in reg {} before return",
+                                specialized_id, reg
+                            )
+                        });
+
+                        self.push_op(TraceOp::Rebox {
+                            dest_reg: reg,
+                            specialized_id,
+                            layout: layout.clone(),
+                        });
+
+                        self.specialized_registers.remove(&reg);
+                    }
+                }
 
                 if let Some(ctx) = self.inline_stack.last_mut() {
                     ctx.return_register = return_reg;
@@ -1085,7 +1464,7 @@ impl TraceRecorder {
                     }
                     Ok(())
                 } else if function_idx == self.trace.function_idx {
-                    self.recording = false;
+                    self.stop_recording();
                     Ok(())
                 } else {
                     self.push_op(TraceOp::Return { value: return_reg });
@@ -1097,7 +1476,7 @@ impl TraceRecorder {
                 if offset < 0 {
                     let target_calc = (current_ip as isize) + (offset as isize);
                     if target_calc < 0 {
-                        self.recording = false;
+                        self.stop_recording();
                         Err(LustError::RuntimeError {
                             message: format!(
                                 "Invalid jump target: offset={}, current_ip={}, target={}",
@@ -1106,13 +1485,52 @@ impl TraceRecorder {
                         })
                     } else {
                         let jump_target = target_calc as usize;
+                        let loop_key = (function_idx, jump_target);
+
+                        // Track how many times we've seen this loop backedge
+                        let iteration_count = self.loop_iterations.entry(loop_key).or_insert(0);
+                        *iteration_count += 1;
+
                         if function_idx == self.trace.function_idx
                             && jump_target == self.trace.start_ip
                         {
-                            self.recording = false;
-                            Ok(())
+                            // This is our main trace loop closing - check if we should unroll more
+                            if *iteration_count < crate::jit::LOOP_UNROLL_COUNT {
+                                crate::jit::log(|| {
+                                    format!(
+                                        "🔄 JIT: Unrolling main loop (iteration {}/{})",
+                                        iteration_count,
+                                        crate::jit::LOOP_UNROLL_COUNT
+                                    )
+                                });
+                                // Continue recording to unroll the loop
+                                Ok(())
+                            } else {
+                                crate::jit::log(|| {
+                                    format!(
+                                        "✅ JIT: Loop unrolled {} times, stopping trace",
+                                        iteration_count
+                                    )
+                                });
+                                self.stop_recording();
+                                Ok(())
+                            }
                         } else {
+                            // This is a nested loop that should be compiled as a separate trace
+                            // Following LuaJIT's approach: don't inline loops, compile them separately
                             let bailout_ip = current_ip.saturating_sub(1);
+
+                            crate::jit::log(|| {
+                                format!(
+                                    "🔄 JIT: Nested loop detected at func {} ip {} - will call as separate trace",
+                                    function_idx, jump_target
+                                )
+                            });
+
+                            // Rebox all specialized values before calling nested trace
+                            self.rebox_all_specialized_values();
+
+                            // Emit NestedLoopCall which will eventually call the compiled inner trace
                             self.push_op(TraceOp::NestedLoopCall {
                                 function_idx,
                                 loop_start_ip: jump_target,
@@ -1163,7 +1581,7 @@ impl TraceRecorder {
             }
 
             _ => {
-                self.recording = false;
+                self.stop_recording();
                 crate::jit::log(|| {
                     format!(
                         "Trace aborted: unsupported instruction {:?}",
@@ -1179,7 +1597,7 @@ impl TraceRecorder {
         outcome?;
 
         if self.op_count >= self.max_length {
-            self.recording = false;
+            self.stop_recording();
             return Err(LustError::RuntimeError {
                 message: "Trace too long".to_string(),
             });
@@ -1264,7 +1682,9 @@ impl TraceRecorder {
         }
     }
 
-    pub fn finish(self) -> Trace {
+    pub fn finish(mut self) -> Trace {
+        // Finalize before returning (add rebox ops to postamble)
+        self.finalize_trace();
         self.trace
     }
 
@@ -1273,6 +1693,6 @@ impl TraceRecorder {
     }
 
     pub fn abort(&mut self) {
-        self.recording = false;
+        self.stop_recording();
     }
 }

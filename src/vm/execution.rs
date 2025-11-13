@@ -277,11 +277,18 @@ impl VM {
                                     func_idx, loop_start_ip
                                 )
                             });
-                            self.trace_recorder = Some(TraceRecorder::new(
+                            let mut recorder = TraceRecorder::new(
                                 func_idx,
                                 loop_start_ip,
                                 MAX_TRACE_LENGTH,
-                            ));
+                            );
+                            // Specialize loop-invariant values at trace entry
+                            {
+                                let frame = self.call_stack.last().unwrap();
+                                let func = &self.functions[func_idx];
+                                recorder.specialize_trace_inputs(&frame.registers, func);
+                            }
+                            self.trace_recorder = Some(recorder);
                             self.skip_next_trace_record = true;
                         }
                     }

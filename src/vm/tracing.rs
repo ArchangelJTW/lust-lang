@@ -158,11 +158,18 @@ impl VM {
         if let Some((function_idx, loop_start_ip)) = should_record_side_trace {
             if self.trace_recorder.is_none() {
                 self.side_trace_context = Some((trace_id, guard_index));
-                self.trace_recorder = Some(TraceRecorder::new(
+                let mut recorder = TraceRecorder::new(
                     function_idx,
                     loop_start_ip,
                     crate::jit::MAX_TRACE_LENGTH,
-                ));
+                );
+                // Specialize loop-invariant values at side trace entry
+                {
+                    let frame = self.call_stack.last().unwrap();
+                    let func = &self.functions[function_idx];
+                    recorder.specialize_trace_inputs(&frame.registers, func);
+                }
+                self.trace_recorder = Some(recorder);
             }
         }
 

@@ -1,5 +1,6 @@
 use super::*;
 use crate::VM;
+use hashbrown::HashMap;
 impl JitCompiler {
     pub fn new() -> Self {
         Self {
@@ -8,10 +9,13 @@ impl JitCompiler {
             fail_stack: Vec::new(),
             exit_stack: Vec::new(),
             inline_depth: 0,
+            specialization_registry: SpecializationRegistry::new(),
+            specialized_values: HashMap::new(),
+            next_specialized_id: 0,
         }
     }
 
-    fn current_fail_label(&self) -> dynasmrt::DynamicLabel {
+    pub(super) fn current_fail_label(&self) -> dynasmrt::DynamicLabel {
         *self
             .fail_stack
             .last()
@@ -56,16 +60,43 @@ impl JitCompiler {
             self.compile_load_const(*dest, value)?;
         }
 
+        // Compile preamble (executed once at trace entry)
+        jit::log(|| format!("🔧 JIT: Compiling preamble ({} ops)", trace.preamble.len()));
+        self.compile_ops(&trace.preamble, &mut guard_index, &mut guards)?;
+
+        // Create a loop_start label AFTER preamble, BEFORE loop body
+        let loop_start_label = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; => loop_start_label
+            ; loop_start:
+        );
+
+        // Compile main trace body (the loop)
         let compile_result = self.compile_ops(&trace.ops, &mut guard_index, &mut guards);
-        self.exit_stack.pop();
-        self.fail_stack.pop();
         compile_result?;
+
+        // At end of loop body, jump back to loop_start to loop
+        dynasm!(self.ops
+            ; jmp => loop_start_label
+        );
+
         let unwind_label = self.ops.new_dynamic_label();
         let fail_return_label = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; xor eax, eax
             ; => exit_label
             ; exit:
+        );
+
+        // Compile postamble (executed once at trace exit)
+        jit::log(|| format!("🔧 JIT: Compiling postamble ({} ops)", trace.postamble.len()));
+        self.compile_ops(&trace.postamble, &mut guard_index, &mut guards)?;
+
+        // Now pop the label stacks after everything is compiled
+        self.exit_stack.pop();
+        self.fail_stack.pop();
+
+        dynasm!(self.ops
             ; add rsp, 40
             ; pop r15
             ; pop r14
@@ -481,10 +512,17 @@ impl JitCompiler {
                     loop_start_ip,
                     bailout_ip,
                 } => {
+                    // Nested loop call - this will be replaced with a direct call to
+                    // the compiled inner loop trace once it's compiled.
+                    // For now, exit to interpreter which will:
+                    // 1. Run the loop in interpreter
+                    // 2. Eventually compile it as a hot trace
+                    // 3. Later, this guard can become a side trace that calls the compiled loop
+
                     let exit_label = self.current_exit_label();
                     jit::log(|| {
                         format!(
-                            "🔗 JIT: Nested loop detected at func {} ip {} (guard #{})",
+                            "🔗 JIT: Nested loop at func {} ip {} - exiting to interpreter (guard #{})",
                             function_idx, loop_start_ip, *guard_index
                         )
                     });
@@ -504,6 +542,26 @@ impl JitCompiler {
                         ; jmp => exit_label
                     );
                     *guard_index += 1;
+                }
+
+                TraceOp::Unbox {
+                    specialized_id,
+                    source_reg,
+                    layout,
+                } => {
+                    self.compile_unbox(*specialized_id, *source_reg, layout)?;
+                }
+
+                TraceOp::Rebox {
+                    dest_reg,
+                    specialized_id,
+                    layout,
+                } => {
+                    self.compile_rebox(*dest_reg, *specialized_id, layout)?;
+                }
+
+                TraceOp::SpecializedOp { op, operands } => {
+                    self.compile_specialized_op(op, operands)?;
                 }
 
                 TraceOp::Return { .. } => {}

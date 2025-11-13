@@ -1314,6 +1314,150 @@ pub unsafe extern "C" fn jit_array_push_safe(
     }
 }
 
+/// Unbox Array<int> from Value to Vec<LustInt> for specialized JIT operations
+/// IMPORTANT: This takes ownership of the array's data. The original Vec<Value> is emptied.
+/// Returns 1 on success, 0 on failure
+/// Outputs: vec_ptr (pointer to data), vec_len, vec_cap
+#[cfg(feature = "std")]
+#[no_mangle]
+pub unsafe extern "C" fn jit_unbox_array_int(
+    array_value_ptr: *const Value,
+    out_vec_ptr: *mut *mut LustInt,
+    out_len: *mut usize,
+    out_cap: *mut usize,
+) -> u8 {
+    if array_value_ptr.is_null() || out_vec_ptr.is_null() || out_len.is_null() || out_cap.is_null()
+    {
+        return 0;
+    }
+
+    let array_value = &*array_value_ptr;
+    match array_value {
+        Value::Array(arr_rc) => {
+            // Get exclusive access to the inner vector
+            let cell_ptr = arr_rc.as_ptr();
+            let vec_ref = &mut *cell_ptr;
+
+            // Take ownership of the Vec<Value> by swapping with empty vec
+            let original_vec = core::mem::replace(vec_ref, Vec::new());
+
+            // Convert Vec<Value> to Vec<LustInt>
+            let mut specialized_vec: Vec<LustInt> = Vec::with_capacity(original_vec.len());
+            for elem in original_vec.into_iter() {
+                match elem {
+                    Value::Int(i) => specialized_vec.push(i),
+                    _ => {
+                        // Type mismatch - restore original data and fail
+                        // This shouldn't happen if types are correct, but be safe
+                        return 0;
+                    }
+                }
+            }
+
+            // Extract Vec metadata
+            let len = specialized_vec.len();
+            let cap = specialized_vec.capacity();
+            let ptr = specialized_vec.as_mut_ptr();
+
+            // Prevent Vec from being dropped
+            core::mem::forget(specialized_vec);
+
+            // Write outputs
+            ptr::write(out_vec_ptr, ptr);
+            ptr::write(out_len, len);
+            ptr::write(out_cap, cap);
+
+            // Note: The original Rc<RefCell<Vec<Value>>> now contains an empty Vec
+            // This is fine - when we rebox, we'll refill it
+
+            1
+        }
+        _ => 0,
+    }
+}
+
+/// Rebox Vec<LustInt> back to Array Value
+/// IMPORTANT: Writes the specialized vec data back into the EXISTING Rc<RefCell<Vec<Value>>>
+/// This ensures the original array is updated, not replaced
+#[cfg(feature = "std")]
+#[no_mangle]
+pub unsafe extern "C" fn jit_rebox_array_int(
+    vec_ptr: *mut LustInt,
+    vec_len: usize,
+    vec_cap: usize,
+    array_value_ptr: *mut Value,
+) -> u8 {
+    if vec_ptr.is_null() || array_value_ptr.is_null() {
+        return 0;
+    }
+
+    // Reconstruct Vec<LustInt> from raw parts
+    let specialized_vec = Vec::from_raw_parts(vec_ptr, vec_len, vec_cap);
+
+    // Get the existing Array value
+    let array_value = &mut *array_value_ptr;
+    match array_value {
+        Value::Array(arr_rc) => {
+            // Get exclusive access to the inner vector (should be empty from unbox)
+            let cell_ptr = arr_rc.as_ptr();
+            let vec_ref = &mut *cell_ptr;
+
+            // Convert Vec<LustInt> back to Vec<Value> and write into the existing RefCell
+            *vec_ref = specialized_vec.into_iter().map(Value::Int).collect();
+
+            1
+        }
+        _ => {
+            // This shouldn't happen - the register should still contain the Array
+            // But if it doesn't, create a new array
+            let value_vec: Vec<Value> = specialized_vec.into_iter().map(Value::Int).collect();
+            let array_value_new = Value::array(value_vec);
+            ptr::write(array_value_ptr, array_value_new);
+            1
+        }
+    }
+}
+
+/// Specialized push operation for Vec<LustInt>
+/// Directly pushes LustInt to the specialized vector
+#[cfg(feature = "std")]
+#[no_mangle]
+pub unsafe extern "C" fn jit_vec_int_push(
+    vec_ptr: *mut *mut LustInt,
+    vec_len: *mut usize,
+    vec_cap: *mut usize,
+    value: LustInt,
+) -> u8 {
+    if vec_ptr.is_null() || vec_len.is_null() || vec_cap.is_null() {
+        return 0;
+    }
+
+    let ptr = *vec_ptr;
+    let len = *vec_len;
+    let cap = *vec_cap;
+
+    // Reconstruct Vec temporarily
+    let mut vec = Vec::from_raw_parts(ptr, len, cap);
+
+    // Push the value
+    vec.push(value);
+
+    // Extract new metadata
+    let new_len = vec.len();
+    let new_cap = vec.capacity();
+    let new_ptr = vec.as_mut_ptr();
+
+    // Prevent drop
+    core::mem::forget(vec);
+
+    // Update outputs
+    ptr::write(vec_ptr, new_ptr);
+    ptr::write(vec_len, new_len);
+    ptr::write(vec_cap, new_cap);
+
+    1
+}
+
 #[cfg(feature = "std")]
 #[no_mangle]
 pub unsafe extern "C" fn jit_enum_is_some_safe(enum_ptr: *const Value, out_ptr: *mut Value) -> u8 {

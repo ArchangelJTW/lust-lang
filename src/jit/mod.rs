@@ -2,6 +2,7 @@
 pub mod codegen;
 pub mod optimizer;
 pub mod profiler;
+pub mod specialization;
 pub mod trace;
 use crate::bytecode::Value;
 use crate::VM;
@@ -50,9 +51,11 @@ where
 }
 
 pub const HOT_THRESHOLD: u32 = 5;
-pub const MAX_TRACE_LENGTH: usize = 200;
+pub const MAX_TRACE_LENGTH: usize = 2000; // Increased to allow more loop unrolling
 pub const SIDE_EXIT_THRESHOLD: u32 = 10;
 pub const UNROLL_FACTOR: usize = 32;
+/// How many times to unroll a loop during trace recording
+pub const LOOP_UNROLL_COUNT: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TraceId(pub usize);
 pub struct CompiledTrace {

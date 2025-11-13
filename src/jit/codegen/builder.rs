@@ -83,7 +83,6 @@ impl JitCompiler {
         let unwind_label = self.ops.new_dynamic_label();
         let fail_return_label = self.ops.new_dynamic_label();
         dynasm!(self.ops
-            ; xor eax, eax
             ; => exit_label
             ; exit:
         );
@@ -95,6 +94,11 @@ impl JitCompiler {
         // Now pop the label stacks after everything is compiled
         self.exit_stack.pop();
         self.fail_stack.pop();
+
+        // Set return value to 0 (success) AFTER postamble to avoid clobbering
+        dynasm!(self.ops
+            ; xor eax, eax
+        );
 
         dynasm!(self.ops
             ; add rsp, JIT_STACK_SIZE

@@ -141,10 +141,6 @@ impl JitCompiler {
         let unbox_fn = jit_unbox_array_int as *const ();
 
         dynasm!(self.ops
-            // Save callee-saved registers
-            ; push r14
-            ; push r15
-
             // Arg 1: array_ptr = r12 + reg_offset
             ; lea rdi, [r12 + reg_offset]
 
@@ -160,10 +156,6 @@ impl JitCompiler {
             // Call helper
             ; mov rax, QWORD unbox_fn as i64
             ; call rax
-
-            // Restore callee-saved registers
-            ; pop r15
-            ; pop r14
 
             // Check return value (al = 0 means failure)
             ; test al, al
@@ -205,10 +197,6 @@ impl JitCompiler {
         let rebox_fn = jit_rebox_array_int as *const ();
 
         dynasm!(self.ops
-            // Save callee-saved registers
-            ; push r14
-            ; push r15
-
             // Arg 1: vec_ptr
             ; mov rdi, [rbp + stack_offset]
 
@@ -224,10 +212,6 @@ impl JitCompiler {
             // Call helper
             ; mov rax, QWORD rebox_fn as i64
             ; call rax
-
-            // Restore callee-saved registers
-            ; pop r15
-            ; pop r14
 
             // Check return value
             ; test al, al
@@ -267,10 +251,6 @@ impl JitCompiler {
         let push_fn = jit_vec_int_push as *const ();
 
         dynasm!(self.ops
-            // Save callee-saved registers
-            ; push r14
-            ; push r15
-
             // Arg 1: address of vec_ptr (on stack)
             ; lea rdi, [rbp + stack_offset]
 
@@ -287,10 +267,6 @@ impl JitCompiler {
             ; mov rax, QWORD push_fn as i64
             ; call rax
 
-            // Restore callee-saved registers
-            ; pop r15
-            ; pop r14
-
             // Check return value
             ; test al, al
             ; jz => self.current_fail_label()
@@ -302,14 +278,14 @@ impl JitCompiler {
     /// Allocate stack space for specialized values
     /// Returns the offset from rbp (negative value)
     fn allocate_specialized_stack(&mut self, _size: usize, _align: usize) -> i32 {
-        // For now, use a simple allocation strategy
-        // In production, would need proper alignment and tracking
-        // Stack grows downward, so we use negative offsets from rbp
-
-        // Use space after the 40 bytes already allocated in prologue
-        // Start at -48 and go further down
-        let base_offset = -48;
-        let allocation_offset = self.specialized_values.len() as i32 * 32; // 32 bytes per spec value
-        base_offset - allocation_offset
+        // Stack layout after prologue:
+        // [rbp - 8]: rbx, [rbp - 16]: r12, [rbp - 24]: r13, [rbp - 32]: r14, [rbp - 40]: r15
+        // Allocated space: [rbp - 41] to [rbp - (40 + JIT_STACK_SIZE)]
+        //
+        // SPECIALIZED_BASE_OFFSET (-64) avoids overwriting saved registers
+        // Vec needs ptr, len, cap = 24 bytes
+        // Each additional specialized value uses 32 bytes (24 for data + 8 padding for alignment)
+        let allocation_offset = self.specialized_values.len() as i32 * 32;
+        SPECIALIZED_BASE_OFFSET - allocation_offset
     }
 }

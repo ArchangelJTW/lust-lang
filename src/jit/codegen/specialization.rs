@@ -191,11 +191,12 @@ impl JitCompiler {
             )
         });
 
-        let spec_value = self.specialized_values.get(&specialized_id).ok_or_else(|| {
-            crate::LustError::RuntimeError {
+        let spec_value = self
+            .specialized_values
+            .get(&specialized_id)
+            .ok_or_else(|| crate::LustError::RuntimeError {
                 message: format!("Specialized value #{} not found", specialized_id),
-            }
-        })?;
+            })?;
 
         let stack_offset = spec_value.stack_offset;
 
@@ -247,11 +248,12 @@ impl JitCompiler {
             )
         });
 
-        let spec_value = self.specialized_values.get(&vec_id).ok_or_else(|| {
-            crate::LustError::RuntimeError {
-                message: format!("Specialized vec #{} not found", vec_id),
-            }
-        })?;
+        let spec_value =
+            self.specialized_values
+                .get(&vec_id)
+                .ok_or_else(|| crate::LustError::RuntimeError {
+                    message: format!("Specialized vec #{} not found", vec_id),
+                })?;
 
         let stack_offset = spec_value.stack_offset;
         let value_offset = (value_reg as i32) * 64 + 8; // +8 to skip tag, get int value
@@ -301,11 +303,12 @@ impl JitCompiler {
             )
         });
 
-        let spec_value = self.specialized_values.get(&vec_id).ok_or_else(|| {
-            crate::LustError::RuntimeError {
-                message: format!("Specialized vec #{} not found", vec_id),
-            }
-        })?;
+        let spec_value =
+            self.specialized_values
+                .get(&vec_id)
+                .ok_or_else(|| crate::LustError::RuntimeError {
+                    message: format!("Specialized vec #{} not found", vec_id),
+                })?;
 
         let stack_offset = spec_value.stack_offset;
         let dest_offset = (dest_reg as i32) * 64;
@@ -367,11 +370,12 @@ impl JitCompiler {
     fn compile_drop_vec_int(&mut self, vec_id: usize) -> Result<()> {
         jit::log(|| format!("🗑️  JIT: Dropping specialized vec #{}", vec_id));
 
-        let spec_value = self.specialized_values.get(&vec_id).ok_or_else(|| {
-            crate::LustError::RuntimeError {
-                message: format!("Specialized vec #{} not found", vec_id),
-            }
-        })?;
+        let spec_value =
+            self.specialized_values
+                .get(&vec_id)
+                .ok_or_else(|| crate::LustError::RuntimeError {
+                    message: format!("Specialized vec #{} not found", vec_id),
+                })?;
 
         let stack_offset = spec_value.stack_offset;
 
@@ -404,12 +408,12 @@ impl JitCompiler {
     fn allocate_specialized_stack(&mut self, _size: usize, _align: usize) -> i32 {
         // Stack layout after prologue:
         // [rbp - 8]: rbx, [rbp - 16]: r12, [rbp - 24]: r13, [rbp - 32]: r14, [rbp - 40]: r15
-        // Allocated space: [rbp - 41] to [rbp - (40 + JIT_STACK_SIZE)]
+        // Allocated space: [rbp - 41] to [rbp - (40 + stack_size)]
         //
         // SPECIALIZED_BASE_OFFSET (-64) avoids overwriting saved registers
         // Vec needs ptr, len, cap = 24 bytes
         // Each additional specialized value uses 32 bytes (24 for data + 8 padding for alignment)
-        let allocation_offset = self.specialized_values.len() as i32 * 32;
+        let allocation_offset = self.specialized_values.len() as i32 * SPECIALIZED_SLOT_SIZE;
         SPECIALIZED_BASE_OFFSET - allocation_offset
     }
 }

@@ -449,17 +449,22 @@ impl TraceRecorder {
                     // Check if elem_type is already a full Array type (stored in register_types)
                     // vs just the element type
                     use crate::ast::{Span, Type};
-                    let (array_type, actual_elem_type) = if matches!(elem_type, crate::ast::TypeKind::Array(_)) {
-                        // Already a full array type - use it directly
-                        (elem_type.clone(), elem_type.clone())
-                    } else {
-                        // Element type only, wrap in Array
-                        let arr_type = crate::ast::TypeKind::Array(Box::new(Type::new(elem_type.clone(), Span::dummy())));
-                        (arr_type, elem_type.clone())
-                    };
+                    let (array_type, actual_elem_type) =
+                        if matches!(elem_type, crate::ast::TypeKind::Array(_)) {
+                            // Already a full array type - use it directly
+                            (elem_type.clone(), elem_type.clone())
+                        } else {
+                            // Element type only, wrap in Array
+                            let arr_type = crate::ast::TypeKind::Array(Box::new(Type::new(
+                                elem_type.clone(),
+                                Span::dummy(),
+                            )));
+                            (arr_type, elem_type.clone())
+                        };
 
                     // Check if this array type is specializable
-                    if let Some(layout) = self.specialization_registry.get_specialization(&array_type)
+                    if let Some(layout) =
+                        self.specialization_registry.get_specialization(&array_type)
                     {
                         crate::jit::log(|| {
                             format!(
@@ -577,11 +582,15 @@ impl TraceRecorder {
     /// This must be called before any side exit to restore interpreter-compatible state
     fn rebox_all_specialized_values(&mut self) {
         // Collect all specialized values that need reboxing
-        let to_rebox: Vec<(Register, usize, crate::jit::specialization::SpecializedLayout)> =
-            self.specialized_registers
-                .iter()
-                .map(|(&reg, &(id, ref layout))| (reg, id, layout.clone()))
-                .collect();
+        let to_rebox: Vec<(
+            Register,
+            usize,
+            crate::jit::specialization::SpecializedLayout,
+        )> = self
+            .specialized_registers
+            .iter()
+            .map(|(&reg, &(id, ref layout))| (reg, id, layout.clone()))
+            .collect();
 
         // Emit Rebox operations
         for (register, specialized_id, layout) in to_rebox {
@@ -614,7 +623,8 @@ impl TraceRecorder {
                 )
             });
             // Track this for cleanup in postamble - the Vec data needs to be dropped
-            self.leaked_specialized_values.push((specialized_id, layout));
+            self.leaked_specialized_values
+                .push((specialized_id, layout));
         }
     }
 
@@ -1436,9 +1446,10 @@ impl TraceRecorder {
 
                 // Check if we can specialize this array based on element type
                 // register_types contains the element type, not the array type
-                let can_specialize = if let Some(element_type) = function.register_types.get(&dest) {
+                let can_specialize = if let Some(element_type) = function.register_types.get(&dest)
+                {
                     // Build the full Array type from the element type
-                    use crate::ast::{Type, Span};
+                    use crate::ast::{Span, Type};
                     let array_type = crate::ast::TypeKind::Array(Box::new(Type::new(
                         element_type.clone(),
                         Span::dummy(),
@@ -1456,7 +1467,7 @@ impl TraceRecorder {
                     let element_type = function.register_types.get(&dest).unwrap().clone();
 
                     // Build the full Array type
-                    use crate::ast::{Type, Span};
+                    use crate::ast::{Span, Type};
                     let array_type = crate::ast::TypeKind::Array(Box::new(Type::new(
                         element_type.clone(),
                         Span::dummy(),

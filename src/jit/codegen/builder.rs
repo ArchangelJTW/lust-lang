@@ -36,13 +36,14 @@ impl JitCompiler {
         parent: Option<TraceId>,
         hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
+        let stack_size = Self::compute_stack_size(trace);
         let mut guards = Vec::new();
         let mut guard_index = 0i32;
         let exit_label = self.ops.new_dynamic_label();
         let fail_label = self.ops.new_dynamic_label();
         self.exit_stack.push(exit_label);
         self.fail_stack.push(fail_label);
-        crate::jit::log(|| format!("🔧 JIT: Emitting prologue with sub rsp, {}", JIT_STACK_SIZE));
+        crate::jit::log(|| format!("🔧 JIT: Emitting prologue with sub rsp, {}", stack_size));
         dynasm!(self.ops
             ; push rbp
             ; mov rbp, rsp
@@ -51,7 +52,7 @@ impl JitCompiler {
             ; push r13
             ; push r14
             ; push r15
-            ; sub rsp, JIT_STACK_SIZE
+            ; sub rsp, stack_size
             ; xor r15, r15
             ; mov r12, rdi
             ; mov r13, rsi
@@ -88,7 +89,12 @@ impl JitCompiler {
         );
 
         // Compile postamble (executed once at trace exit)
-        jit::log(|| format!("🔧 JIT: Compiling postamble ({} ops)", trace.postamble.len()));
+        jit::log(|| {
+            format!(
+                "🔧 JIT: Compiling postamble ({} ops)",
+                trace.postamble.len()
+            )
+        });
         self.compile_ops(&trace.postamble, &mut guard_index, &mut guards)?;
 
         // Now pop the label stacks after everything is compiled
@@ -101,7 +107,7 @@ impl JitCompiler {
         );
 
         dynasm!(self.ops
-            ; add rsp, JIT_STACK_SIZE
+            ; add rsp, stack_size
             ; pop r15
             ; pop r14
             ; pop r13
@@ -394,7 +400,13 @@ impl JitCompiler {
                             self.compile_enum_unwrap(*dest, *object)?;
                         }
                         _ => {
-                            self.compile_call_method(*dest, *object, method_name, *first_arg, *arg_count)?;
+                            self.compile_call_method(
+                                *dest,
+                                *object,
+                                method_name,
+                                *first_arg,
+                                *arg_count,
+                            )?;
                         }
                     }
                 }
@@ -580,6 +592,34 @@ impl JitCompiler {
         }
 
         Ok(())
+    }
+
+    fn compute_stack_size(trace: &Trace) -> i32 {
+        let specialized_slots = Self::count_specialized_slots(trace) as i32;
+        let specialized_bytes =
+            SPECIALIZED_STACK_BASE + (specialized_slots * SPECIALIZED_SLOT_SIZE);
+        let mut size = MIN_JIT_STACK_SIZE.max(specialized_bytes);
+        let remainder = size % 16;
+        if remainder != 8 {
+            size += (8 - remainder + 16) % 16;
+        }
+        crate::jit::log(|| {
+            format!(
+                "🧮 JIT: Trace requires {} specialized slots → stack {} bytes",
+                specialized_slots, size
+            )
+        });
+        size
+    }
+
+    fn count_specialized_slots(trace: &Trace) -> usize {
+        trace
+            .preamble
+            .iter()
+            .chain(trace.ops.iter())
+            .chain(trace.postamble.iter())
+            .filter(|op| matches!(op, TraceOp::Unbox { .. }))
+            .count()
     }
 
     fn compile_inline_call(

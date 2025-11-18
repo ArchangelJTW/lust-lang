@@ -44,17 +44,17 @@ impl JitCompiler {
         let leaked_value = Box::leak(Box::new(value.clone()));
         let src_ptr = leaked_value as *const Value;
         self.leaked_constants.push(src_ptr);
-        let value_size = mem::size_of::<Value>() as i32;
-        let num_qwords = (value_size + 7) / 8;
-        for i in 0..num_qwords {
-            let chunk_offset = i * 8;
-            let src_addr = (src_ptr as usize + chunk_offset as usize) as i64;
-            dynasm!(self.ops
-                ; mov rax, QWORD src_addr as _
-                ; mov rax, [rax]
-                ; mov [r12 + offset + chunk_offset], rax
-            );
+        extern "C" {
+            fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
         }
+        dynasm!(self.ops
+            ; mov rdi, QWORD src_ptr as _
+            ; lea rsi, [r12 + offset]
+            ; mov rax, QWORD jit_move_safe as _
+            ; call rax
+            ; test al, al
+            ; jz >fail
+        );
         Ok(())
     }
 
@@ -228,7 +228,12 @@ impl JitCompiler {
         }
 
         if let Some(index) = field_index {
-            crate::jit::log(|| format!("🔧 JIT: SetField using indexed path, field_index={}, is_weak={}", index, _is_weak));
+            crate::jit::log(|| {
+                format!(
+                    "🔧 JIT: SetField using indexed path, field_index={}, is_weak={}",
+                    index, _is_weak
+                )
+            });
             // Use specialized helpers based on whether field is weak or strong
             if _is_weak {
                 dynasm!(self.ops

@@ -89,6 +89,23 @@ impl JitCompiler {
                     }
                 }
             }
+            SpecializedOpKind::VecLen => {
+                if operands.len() != 2 {
+                    return Err(crate::LustError::RuntimeError {
+                        message: "VecLen requires 2 operands (vec_id, dest_reg)".into(),
+                    });
+                }
+                match (&operands[0], &operands[1]) {
+                    (Operand::Specialized(vec_id), Operand::Register(dest_reg)) => {
+                        self.compile_vec_int_len(*vec_id, *dest_reg)?;
+                    }
+                    _ => {
+                        return Err(crate::LustError::RuntimeError {
+                            message: "VecLen operands must be (Specialized, Register)".into(),
+                        });
+                    }
+                }
+            }
             _ => {
                 return Err(crate::LustError::RuntimeError {
                     message: format!("Specialized op {:?} not yet implemented", op),
@@ -270,6 +287,113 @@ impl JitCompiler {
             // Check return value
             ; test al, al
             ; jz => self.current_fail_label()
+        );
+
+        Ok(())
+    }
+
+    /// Get length of specialized Vec<int>
+    fn compile_vec_int_len(&mut self, vec_id: usize, dest_reg: u8) -> Result<()> {
+        jit::log(|| {
+            format!(
+                "⚡ JIT: Specialized len of vec #{} to reg {}",
+                vec_id, dest_reg
+            )
+        });
+
+        let spec_value = self.specialized_values.get(&vec_id).ok_or_else(|| {
+            crate::LustError::RuntimeError {
+                message: format!("Specialized vec #{} not found", vec_id),
+            }
+        })?;
+
+        let stack_offset = spec_value.stack_offset;
+        let dest_offset = (dest_reg as i32) * 64;
+
+        dynasm!(self.ops
+            // Zero out the entire 64-byte Value structure first
+            ; xor rax, rax
+            ; mov [r12 + dest_offset], rax
+            ; mov [r12 + dest_offset + 8], rax
+            ; mov [r12 + dest_offset + 16], rax
+            ; mov [r12 + dest_offset + 24], rax
+            ; mov [r12 + dest_offset + 32], rax
+            ; mov [r12 + dest_offset + 40], rax
+            ; mov [r12 + dest_offset + 48], rax
+            ; mov [r12 + dest_offset + 56], rax
+
+            // Read vec_len from JIT stack
+            ; mov rax, [rbp + stack_offset + 8]
+
+            // Store as Value::Int with proper tag
+            ; mov BYTE [r12 + dest_offset], 2 // Tag for Int
+            ; mov [r12 + dest_offset + 8], rax // Length value
+        );
+
+        Ok(())
+    }
+
+    /// Drop a specialized value without reboxing (cleanup for leaked specializations)
+    pub(super) fn compile_drop_specialized(
+        &mut self,
+        specialized_id: usize,
+        layout: &SpecializedLayout,
+    ) -> Result<()> {
+        match layout {
+            SpecializedLayout::Vec { element_layout, .. } => {
+                // Check if it's Vec<LustInt>
+                if matches!(**element_layout, SpecializedLayout::Scalar { size, .. } if size == core::mem::size_of::<LustInt>())
+                {
+                    self.compile_drop_vec_int(specialized_id)?;
+                } else {
+                    return Err(crate::LustError::RuntimeError {
+                        message: format!(
+                            "Drop not yet implemented for Vec with element type {:?}",
+                            element_layout
+                        ),
+                    });
+                }
+            }
+            _ => {
+                return Err(crate::LustError::RuntimeError {
+                    message: format!("Drop not yet implemented for layout {:?}", layout),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop Vec<LustInt> without reboxing
+    fn compile_drop_vec_int(&mut self, vec_id: usize) -> Result<()> {
+        jit::log(|| format!("🗑️  JIT: Dropping specialized vec #{}", vec_id));
+
+        let spec_value = self.specialized_values.get(&vec_id).ok_or_else(|| {
+            crate::LustError::RuntimeError {
+                message: format!("Specialized vec #{} not found", vec_id),
+            }
+        })?;
+
+        let stack_offset = spec_value.stack_offset;
+
+        // Call jit_drop_vec_int(vec_ptr, vec_len, vec_cap)
+        extern "C" {
+            fn jit_drop_vec_int(vec_ptr: *mut LustInt, vec_len: usize, vec_cap: usize);
+        }
+        let drop_fn = jit_drop_vec_int as *const ();
+
+        dynasm!(self.ops
+            // Arg 1: vec_ptr
+            ; mov rdi, [rbp + stack_offset]
+
+            // Arg 2: vec_len
+            ; mov rsi, [rbp + stack_offset + 8]
+
+            // Arg 3: vec_cap
+            ; mov rdx, [rbp + stack_offset + 16]
+
+            // Call helper
+            ; mov rax, QWORD drop_fn as i64
+            ; call rax
         );
 
         Ok(())

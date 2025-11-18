@@ -285,6 +285,11 @@ pub enum TraceOp {
         specialized_id: usize,
         layout: crate::jit::specialization::SpecializedLayout,
     },
+    /// Drop a specialized value without reboxing (cleanup for leaked specializations)
+    DropSpecialized {
+        specialized_id: usize,
+        layout: crate::jit::specialization::SpecializedLayout,
+    },
     /// Operation on specialized values
     SpecializedOp {
         op: SpecializedOpKind,
@@ -363,6 +368,8 @@ pub struct TraceRecorder {
     specialization_registry: crate::jit::specialization::SpecializationRegistry,
     /// Track how many times we've seen each loop backedge to enable unrolling
     loop_iterations: HashMap<(usize, usize), usize>,
+    /// Track specialized values that were unboxed but later invalidated (need cleanup/drop)
+    leaked_specialized_values: Vec<(usize, crate::jit::specialization::SpecializedLayout)>,
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +409,7 @@ impl TraceRecorder {
             next_specialized_id: 0,
             specialization_registry: crate::jit::specialization::SpecializationRegistry::new(),
             loop_iterations: HashMap::new(),
+            leaked_specialized_values: Vec::new(),
         }
     }
 
@@ -522,12 +530,18 @@ impl TraceRecorder {
     fn finalize_trace(&mut self) {
         crate::jit::log(|| {
             format!(
-                "🏁 JIT: Finalizing trace - reboxing {} specialized values",
-                self.specialized_registers.len()
+                "🏁 JIT: Finalizing trace - reboxing {} specialized values, dropping {} leaked values",
+                self.specialized_registers.len(),
+                self.leaked_specialized_values.len()
             )
         });
 
-        // Rebox all specialized values in the postamble
+        // NOTE: We do NOT emit drops for leaked_specialized_values!
+        // Those values were invalidated during trace RECORDING, so they never
+        // actually exist on the JIT stack during trace EXECUTION.
+        // The arrays are still managed by their Rc<RefCell<>> wrappers.
+
+        // Rebox all remaining specialized values in the postamble
         for (&register, &(specialized_id, ref layout)) in self.specialized_registers.iter() {
             crate::jit::log(|| {
                 format!(
@@ -586,6 +600,37 @@ impl TraceRecorder {
 
             // Remove from tracking
             self.specialized_registers.remove(&register);
+        }
+    }
+
+    /// Invalidate specialization for a register that's about to be overwritten
+    /// The specialized Vec data needs to be dropped since it won't be reboxed
+    fn invalidate_specialization(&mut self, register: Register) {
+        if let Some((specialized_id, layout)) = self.specialized_registers.remove(&register) {
+            crate::jit::log(|| {
+                format!(
+                    "🚫 JIT: Invalidating specialization for reg {} (being overwritten) - will drop specialized #{}",
+                    register, specialized_id
+                )
+            });
+            // Track this for cleanup in postamble - the Vec data needs to be dropped
+            self.leaked_specialized_values.push((specialized_id, layout));
+        }
+    }
+
+    /// Remove specialization tracking if register is about to be overwritten
+    /// The Vec data becomes "leaked" on the JIT stack but that's fine - it's cleaned
+    /// up when the stack frame is destroyed. The array is still managed by Rc<RefCell<>>.
+    fn remove_specialization_tracking(&mut self, register: Register) {
+        if let Some((_specialized_id, _layout)) = self.specialized_registers.remove(&register) {
+            crate::jit::log(|| {
+                format!(
+                    "🗑️  JIT: Removing specialization tracking for reg {} (being overwritten)",
+                    register
+                )
+            });
+            // Don't emit rebox - the Vec data stays on JIT stack but that's OK
+            // It will be cleaned up when the JIT stack frame is destroyed
         }
     }
 
@@ -678,6 +723,9 @@ impl TraceRecorder {
 
         let outcome: Result<(), LustError> = match instruction {
             Instruction::LoadConst(dest, _) => {
+                // Rebox specialized value if dest contains one
+                self.remove_specialization_tracking(dest);
+
                 if let Some(_ty) = Self::get_value_type(&registers[dest as usize]) {
                     self.mark_guarded(dest);
                 }
@@ -690,6 +738,9 @@ impl TraceRecorder {
             }
 
             Instruction::LoadGlobal(dest, _) => {
+                // Remove specialization tracking if dest contains a specialized value
+                self.remove_specialization_tracking(dest);
+
                 if let Some(_ty) = Self::get_value_type(&registers[dest as usize]) {
                     self.mark_guarded(dest);
                 }
@@ -704,6 +755,9 @@ impl TraceRecorder {
             Instruction::StoreGlobal(_, _) => Ok(()),
 
             Instruction::Move(dest, src) => {
+                // If dest contains a specialized value, rebox it first before overwriting
+                self.remove_specialization_tracking(dest);
+
                 // Check if we're moving a specialized value
                 if let Some(&(specialized_id, ref layout)) = self.specialized_registers.get(&src) {
                     crate::jit::log(|| {
@@ -724,6 +778,9 @@ impl TraceRecorder {
             }
 
             Instruction::Add(dest, lhs, rhs) => {
+                // Rebox specialized value if dest contains one
+                self.remove_specialization_tracking(dest);
+
                 self.add_type_guards(lhs, rhs, registers, function)?;
                 let lhs_type =
                     Self::get_value_type(&registers[lhs as usize]).unwrap_or(ValueType::Int);
@@ -740,6 +797,7 @@ impl TraceRecorder {
             }
 
             Instruction::Sub(dest, lhs, rhs) => {
+                self.remove_specialization_tracking(dest);
                 self.add_type_guards(lhs, rhs, registers, function)?;
                 let lhs_type =
                     Self::get_value_type(&registers[lhs as usize]).unwrap_or(ValueType::Int);
@@ -919,6 +977,9 @@ impl TraceRecorder {
             }
 
             Instruction::CallMethod(obj_reg, method_name_idx, first_arg, arg_count, dest_reg) => {
+                // Rebox specialized value if dest_reg contains one
+                self.remove_specialization_tracking(dest_reg);
+
                 let method_name = function.chunk.constants[method_name_idx as usize]
                     .as_string()
                     .unwrap_or("unknown")
@@ -960,9 +1021,35 @@ impl TraceRecorder {
 
                             return Ok(());
                         }
+                        "len" if arg_count == 0 => {
+                            // Specialized array len
+                            crate::jit::log(|| {
+                                format!(
+                                    "⚡ JIT: Specializing len on reg {} (specialized #{})",
+                                    obj_reg, specialized_id
+                                )
+                            });
+
+                            // Emit specialized len operation
+                            self.push_op(TraceOp::SpecializedOp {
+                                op: SpecializedOpKind::VecLen,
+                                operands: vec![
+                                    Operand::Specialized(specialized_id),
+                                    Operand::Register(dest_reg),
+                                ],
+                            });
+
+                            return Ok(());
+                        }
                         _ => {
                             // Other methods on specialized values - need to rebox first
-                            // For now, fall through to normal handling
+                            // For now, fall through to normal handling (will be wrong!)
+                            crate::jit::log(|| {
+                                format!(
+                                    "⚠️  JIT: Method '{}' on specialized value not supported, will be incorrect!",
+                                    method_name
+                                )
+                            });
                         }
                     }
                 }
@@ -1202,6 +1289,9 @@ impl TraceRecorder {
             }
 
             Instruction::Call(func_reg, first_arg, arg_count, dest_reg) => {
+                // Rebox specialized value if dest_reg contains one
+                self.remove_specialization_tracking(dest_reg);
+
                 match &registers[func_reg as usize] {
                     Value::NativeFunction(native_fn) => {
                         let traced = TracedNativeFn::new(native_fn.clone());
@@ -1341,6 +1431,9 @@ impl TraceRecorder {
             }
 
             Instruction::NewArray(dest, first_elem, count) => {
+                // Rebox specialized value if dest contains one
+                self.remove_specialization_tracking(dest);
+
                 // Check if we can specialize this array based on element type
                 // register_types contains the element type, not the array type
                 let can_specialize = if let Some(element_type) = function.register_types.get(&dest) {

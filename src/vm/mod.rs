@@ -151,6 +151,7 @@ where
 pub(super) const TO_STRING_TRAIT: &str = "ToString";
 pub(super) const TO_STRING_METHOD: &str = "to_string";
 pub struct VM {
+    pub(super) jit: JitState,
     pub(super) functions: Vec<Function>,
     pub(super) natives: HashMap<String, Value>,
     pub(super) globals: HashMap<String, Value>,
@@ -158,7 +159,6 @@ pub struct VM {
     pub(super) max_stack_depth: usize,
     pub(super) pending_return_value: Option<Value>,
     pub(super) pending_return_dest: Option<Register>,
-    pub(super) jit: JitState,
     pub(super) trace_recorder: Option<TraceRecorder>,
     pub(super) side_trace_context: Option<(crate::jit::TraceId, usize)>,
     pub(super) skip_next_trace_record: bool,

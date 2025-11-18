@@ -71,7 +71,9 @@ impl SpecializedLayout {
                     .max()
                     .unwrap_or(1)
             }
-            SpecializedLayout::Tuple { element_layouts, .. } => {
+            SpecializedLayout::Tuple {
+                element_layouts, ..
+            } => {
                 // Use maximum alignment of all elements
                 element_layouts
                     .iter()
@@ -119,10 +121,7 @@ impl SpecializationRegistry {
                 align: align_of::<LustFloat>(),
             }),
 
-            TypeKind::Bool => Some(SpecializedLayout::Scalar {
-                size: 1,
-                align: 1,
-            }),
+            TypeKind::Bool => Some(SpecializedLayout::Scalar { size: 1, align: 1 }),
 
             // Array<T> where T is specializable
             TypeKind::Array(element_type) => {
@@ -170,9 +169,8 @@ impl SpecializationRegistry {
             TypeKind::GenericInstance { name, type_args } => {
                 // Reconstruct the proper TypeKind and recurse
                 match name.as_str() {
-                    "Array" if type_args.len() == 1 => {
-                        self.compute_specialization(&TypeKind::Array(Box::new(type_args[0].clone())))
-                    }
+                    "Array" if type_args.len() == 1 => self
+                        .compute_specialization(&TypeKind::Array(Box::new(type_args[0].clone()))),
                     "Map" if type_args.len() == 2 => self.compute_specialization(&TypeKind::Map(
                         Box::new(type_args[0].clone()),
                         Box::new(type_args[1].clone()),
@@ -234,10 +232,7 @@ mod tests {
         }) = layout
         {
             assert_eq!(element_size, size_of::<LustInt>());
-            assert!(matches!(
-                *element_layout,
-                SpecializedLayout::Scalar { .. }
-            ));
+            assert!(matches!(*element_layout, SpecializedLayout::Scalar { .. }));
         } else {
             panic!("Expected Vec layout");
         }

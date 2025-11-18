@@ -80,6 +80,7 @@ impl VM {
 
     pub fn with_config(config: &LustConfig) -> Self {
         let mut vm = Self {
+            jit: JitState::new(),
             functions: Vec::new(),
             natives: HashMap::new(),
             globals: HashMap::new(),
@@ -87,7 +88,6 @@ impl VM {
             max_stack_depth: 1000,
             pending_return_value: None,
             pending_return_dest: None,
-            jit: JitState::new(),
             trace_recorder: None,
             side_trace_context: None,
             skip_next_trace_record: false,

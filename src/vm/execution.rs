@@ -93,7 +93,12 @@ impl VM {
                     let registers_ptr = frame.registers.as_mut_ptr();
                     let entry = self.jit.get_trace(trace_id).map(|t| t.entry);
                     if let Some(entry_fn) = entry {
-                        crate::jit::log(|| format!("▶️  JIT: Executing trace #{} at func {} ip {}", trace_id.0, func_idx, loop_start_ip));
+                        crate::jit::log(|| {
+                            format!(
+                                "▶️  JIT: Executing trace #{} at func {} ip {}",
+                                trace_id.0, func_idx, loop_start_ip
+                            )
+                        });
 
                         // Capture RSP before and after to detect stack leaks
                         let rsp_before: usize;
@@ -105,8 +110,10 @@ impl VM {
                         unsafe { std::arch::asm!("mov {}, rsp", out(reg) rsp_after) };
 
                         let rsp_diff = rsp_after as isize - rsp_before as isize;
-                        crate::jit::log(|| format!("🎯 JIT: Trace #{} execution result: {} (RSP before: {:x}, after: {:x}, diff: {})",
-                            trace_id.0, result, rsp_before, rsp_after, rsp_diff));
+                        crate::jit::log(|| {
+                            format!("🎯 JIT: Trace #{} execution result: {} (RSP before: {:x}, after: {:x}, diff: {})",
+                            trace_id.0, result, rsp_before, rsp_after, rsp_diff)
+                        });
 
                         if result == 0 {
                             if let Some(frame) = self.call_stack.last_mut() {
@@ -291,11 +298,8 @@ impl VM {
                                     func_idx, loop_start_ip
                                 )
                             });
-                            let mut recorder = TraceRecorder::new(
-                                func_idx,
-                                loop_start_ip,
-                                MAX_TRACE_LENGTH,
-                            );
+                            let mut recorder =
+                                TraceRecorder::new(func_idx, loop_start_ip, MAX_TRACE_LENGTH);
                             // Specialize loop-invariant values at trace entry
                             {
                                 let frame = self.call_stack.last().unwrap();

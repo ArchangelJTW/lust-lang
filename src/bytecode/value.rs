@@ -1464,7 +1464,10 @@ pub unsafe extern "C" fn jit_vec_int_push(
 #[cfg(feature = "std")]
 #[no_mangle]
 pub unsafe extern "C" fn jit_drop_vec_int(vec_ptr: *mut LustInt, vec_len: usize, vec_cap: usize) {
-    eprintln!("🗑️  jit_drop_vec_int: ptr={:p}, len={}, cap={}", vec_ptr, vec_len, vec_cap);
+    eprintln!(
+        "🗑️  jit_drop_vec_int: ptr={:p}, len={}, cap={}",
+        vec_ptr, vec_len, vec_cap
+    );
     eprintln!("🗑️  jit_drop_vec_int: THIS SHOULD NOT BE CALLED - THE VEC DATA IS STALE!");
 
     // DO NOT drop - the Vec data on the stack is stale from trace recording

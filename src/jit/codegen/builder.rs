@@ -564,6 +564,13 @@ impl JitCompiler {
                     self.compile_rebox(*dest_reg, *specialized_id, layout)?;
                 }
 
+                TraceOp::DropSpecialized {
+                    specialized_id,
+                    layout,
+                } => {
+                    self.compile_drop_specialized(*specialized_id, layout)?;
+                }
+
                 TraceOp::SpecializedOp { op, operands } => {
                     self.compile_specialized_op(op, operands)?;
                 }

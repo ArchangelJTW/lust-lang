@@ -1458,6 +1458,20 @@ pub unsafe extern "C" fn jit_vec_int_push(
     1
 }
 
+/// Drop a specialized Vec<LustInt> (cleanup for leaked specializations)
+/// WARNING: This should NOT be called! Specialized values that get invalidated
+/// during loop recording don't actually exist on the stack during execution.
+#[cfg(feature = "std")]
+#[no_mangle]
+pub unsafe extern "C" fn jit_drop_vec_int(vec_ptr: *mut LustInt, vec_len: usize, vec_cap: usize) {
+    eprintln!("🗑️  jit_drop_vec_int: ptr={:p}, len={}, cap={}", vec_ptr, vec_len, vec_cap);
+    eprintln!("🗑️  jit_drop_vec_int: THIS SHOULD NOT BE CALLED - THE VEC DATA IS STALE!");
+
+    // DO NOT drop - the Vec data on the stack is stale from trace recording
+    // The actual arrays are managed by their Rc<RefCell<>> wrappers
+    eprintln!("🗑️  jit_drop_vec_int: skipping drop (would cause corruption)");
+}
+
 #[cfg(feature = "std")]
 #[no_mangle]
 pub unsafe extern "C" fn jit_enum_is_some_safe(enum_ptr: *const Value, out_ptr: *mut Value) -> u8 {

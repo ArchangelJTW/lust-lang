@@ -633,6 +633,13 @@ impl TypeChecker {
                     }
                 }
 
+                for field in &mut s2.fields {
+                    field.ty = self.canonicalize_type(&field.ty);
+                    if let Some(target) = &field.weak_target {
+                        field.weak_target = Some(self.canonicalize_type(target));
+                    }
+                }
+
                 self.env.register_struct(&s2)?;
             }
 
@@ -644,6 +651,14 @@ impl TypeChecker {
                     }
                 }
 
+                for variant in &mut e2.variants {
+                    if let Some(fields) = &mut variant.fields {
+                        for field in fields {
+                            *field = self.canonicalize_type(field);
+                        }
+                    }
+                }
+
                 self.env.register_enum(&e2)?;
             }
 
@@ -652,6 +667,15 @@ impl TypeChecker {
                 if let Some(module) = &self.current_module {
                     if !t2.name.contains('.') {
                         t2.name = format!("{}.{}", module, t2.name);
+                    }
+                }
+
+                for method in &mut t2.methods {
+                    for param in &mut method.params {
+                        param.ty = self.canonicalize_type(&param.ty);
+                    }
+                    if let Some(ret) = method.return_type.clone() {
+                        method.return_type = Some(self.canonicalize_type(&ret));
                     }
                 }
 
@@ -672,8 +696,11 @@ impl TypeChecker {
                 } else {
                     name.clone()
                 };
-                self.env
-                    .register_type_alias(qname, type_params.clone(), target.clone())?;
+                self.env.register_type_alias(
+                    qname,
+                    type_params.clone(),
+                    self.canonicalize_type(target),
+                )?;
             }
 
             _ => {}

@@ -644,7 +644,23 @@ impl TraceRecorder {
         }
     }
 
-    fn should_inline(&self, function_idx: usize) -> bool {
+    fn rebox_specialized_register(&mut self, register: Register, context: &str) {
+        if let Some((specialized_id, layout)) = self.specialized_registers.remove(&register) {
+            crate::jit::log(|| {
+                format!(
+                    "📦 JIT: Reboxing specialized #{} from reg {} before {}",
+                    specialized_id, register, context
+                )
+            });
+            self.push_op(TraceOp::Rebox {
+                dest_reg: register,
+                specialized_id,
+                layout,
+            });
+        }
+    }
+
+    fn should_inline(&self, function_idx: usize, callee_fn: &crate::bytecode::Function) -> bool {
         if function_idx == self.trace.function_idx {
             return false;
         }
@@ -660,6 +676,15 @@ impl TraceRecorder {
         // Disable inlining when specialized values are active to avoid
         // stack layout conflicts between inline frames and specialized storage
         if !self.specialized_registers.is_empty() {
+            return false;
+        }
+
+        if callee_fn.chunk.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Jump(_) | Instruction::JumpIf(..) | Instruction::JumpIfNot(..)
+            )
+        }) {
             return false;
         }
 
@@ -1169,6 +1194,8 @@ impl TraceRecorder {
                     }
                 }
 
+                self.rebox_specialized_register(value_reg, "SetField");
+
                 self.push_op(TraceOp::SetField {
                     object: obj_reg,
                     field_name,
@@ -1216,6 +1243,10 @@ impl TraceRecorder {
                     }
                 }
 
+                for &field_reg in &field_registers {
+                    self.rebox_specialized_register(field_reg, "struct literal field");
+                }
+
                 self.push_op(TraceOp::NewStruct {
                     dest,
                     struct_name,
@@ -1260,6 +1291,10 @@ impl TraceRecorder {
                 let mut value_registers = Vec::new();
                 for i in 0..value_count {
                     value_registers.push(first_value + i);
+                }
+
+                for &value_reg in &value_registers {
+                    self.rebox_specialized_register(value_reg, "enum variant value");
                 }
 
                 self.push_op(TraceOp::NewEnumVariant {
@@ -1334,7 +1369,7 @@ impl TraceRecorder {
 
                         let mut did_inline = false;
                         if let Some(callee_fn) = functions.get(*function_idx) {
-                            if self.should_inline(*function_idx)
+                            if self.should_inline(*function_idx, callee_fn)
                                 && (arg_count as usize) <= callee_fn.register_count as usize
                             {
                                 let mut arg_registers = Vec::with_capacity(arg_count as usize);
@@ -1387,7 +1422,7 @@ impl TraceRecorder {
 
                         let mut did_inline = false;
                         if let Some(callee_fn) = functions.get(*function_idx) {
-                            if self.should_inline(*function_idx)
+                            if self.should_inline(*function_idx, callee_fn)
                                 && (arg_count as usize) <= callee_fn.register_count as usize
                             {
                                 let mut arg_registers = Vec::with_capacity(arg_count as usize);
@@ -1443,6 +1478,17 @@ impl TraceRecorder {
             Instruction::NewArray(dest, first_elem, count) => {
                 // Rebox specialized value if dest contains one
                 self.remove_specialization_tracking(dest);
+
+                // Disable specialization inside inlined functions for now to avoid
+                // register aliasing issues between inline frames and the parent trace.
+                if !self.inline_stack.is_empty() {
+                    self.push_op(TraceOp::NewArray {
+                        dest,
+                        first_element: first_elem,
+                        count,
+                    });
+                    return Ok(());
+                }
 
                 // Check if we can specialize this array based on element type
                 // register_types contains the element type, not the array type
@@ -1560,6 +1606,9 @@ impl TraceRecorder {
                         self.specialized_registers.remove(&reg);
                     }
                 }
+
+                // Ensure no specialized values leak past the return
+                self.rebox_all_specialized_values();
 
                 if let Some(ctx) = self.inline_stack.last_mut() {
                     ctx.return_register = return_reg;
@@ -1793,6 +1842,30 @@ impl TraceRecorder {
     }
 
     pub fn finish(mut self) -> Trace {
+        #[cfg(feature = "std")]
+        if std::env::var("LUST_TRACE_DEBUG").is_ok() {
+            eprintln!(
+                "🧵 Trace dump (func {}, start_ip {}):",
+                self.trace.function_idx, self.trace.start_ip
+            );
+            if !self.trace.preamble.is_empty() {
+                eprintln!("  Preamble:");
+                for (idx, op) in self.trace.preamble.iter().enumerate() {
+                    eprintln!("    {:03}: {:?}", idx, op);
+                }
+            }
+            eprintln!("  Body:");
+            for (idx, op) in self.trace.ops.iter().enumerate() {
+                eprintln!("    {:03}: {:?}", idx, op);
+            }
+            if !self.trace.postamble.is_empty() {
+                eprintln!("  Postamble:");
+                for (idx, op) in self.trace.postamble.iter().enumerate() {
+                    eprintln!("    {:03}: {:?}", idx, op);
+                }
+            }
+        }
+
         // Finalize before returning (add rebox ops to postamble)
         self.finalize_trace();
         self.trace

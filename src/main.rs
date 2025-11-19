@@ -4,8 +4,8 @@ use lust::packages::{
     build_package_archive, clear_credentials, collect_rust_dependency_artifacts, credentials_file,
     load_credentials, load_prepared_rust_dependencies, prepare_rust_dependencies,
     resolve_dependencies, save_credentials, write_stub_files, DependencyResolution,
-    DownloadedArchive, PackageManager, PackageManifest, PreparedRustDependency, RegistryClient,
-    DEFAULT_BASE_URL,
+    DownloadedArchive, PackageDetails, PackageManager, PackageManifest, PreparedRustDependency,
+    RegistryClient, DEFAULT_BASE_URL,
 };
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 use lust::LoadedRustModule;
@@ -141,6 +141,7 @@ fn handle_pkg_command(args: &[String]) -> Result<(), String> {
     match subcommand {
         "add" => handle_pkg_add(&program, rest),
         "remove" => handle_pkg_remove(&program, rest),
+        "sync" => handle_pkg_sync(&program, rest),
         "login" => handle_pkg_login(&program, rest),
         "logout" => handle_pkg_logout(&program, rest),
         "publish" => handle_pkg_publish(&program, rest),
@@ -160,6 +161,7 @@ fn print_pkg_usage(program: &str) {
     println!("Package commands:");
     println!("  {program} pkg add <name[@version]> [--registry <url>]");
     println!("  {program} pkg remove <name>");
+    println!("  {program} pkg sync [--registry <url>]");
     println!("  {program} pkg login [--token <token>]");
     println!("  {program} pkg logout");
     println!("  {program} pkg publish [--manifest-path <path>] [--token <token>] [--registry <url>] [--readme <path>]");
@@ -225,9 +227,7 @@ fn handle_pkg_add(program: &str, args: &[String]) -> Result<(), String> {
     let manager = PackageManager::new(PackageManager::default_root());
     manager.ensure_layout().map_err(|err| err.to_string())?;
     let package_dir = manager.root().join(&name).join(&resolved_version);
-    if package_dir.exists() {
-        fs::remove_dir_all(&package_dir).map_err(|err| err.to_string())?;
-    }
+    remove_existing_path(&package_dir).map_err(|err| err.to_string())?;
     extract_package_archive(archive.path(), &package_dir)?;
 
     update_dependency_in_config(&name, &resolved_version)?;
@@ -237,6 +237,114 @@ fn handle_pkg_add(program: &str, args: &[String]) -> Result<(), String> {
         resolved_version,
         package_dir.display()
     );
+    Ok(())
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn handle_pkg_sync(program: &str, args: &[String]) -> Result<(), String> {
+    let mut registry: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--registry" => {
+                let value = take_option_value(args, &mut index, "--registry")?;
+                registry = Some(value);
+            }
+            other => {
+                print_pkg_usage(program);
+                return Err(format!("unknown option '{other}'"));
+            }
+        }
+        index += 1;
+    }
+
+    let project_dir = env::current_dir().map_err(|err| err.to_string())?;
+    let config = LustConfig::load_from_dir(&project_dir).map_err(|err| err.to_string())?;
+    let dependencies = config.dependencies().to_vec();
+    if dependencies.is_empty() {
+        println!("No dependencies configured; nothing to sync.");
+        return Ok(());
+    }
+
+    let manager = PackageManager::new(PackageManager::default_root());
+    manager.ensure_layout().map_err(|err| err.to_string())?;
+    let registry_url = resolve_registry_base(registry.as_deref());
+    let client = RegistryClient::new(&registry_url).map_err(|err| err.to_string())?;
+
+    let mut downloaded = 0usize;
+    let mut updated = 0usize;
+    let mut remote_deps = 0usize;
+
+    for dep in dependencies {
+        if dep.path().is_some() {
+            continue;
+        }
+        remote_deps += 1;
+        let name = dep.name().to_string();
+        let details = client
+            .package_details(&name)
+            .map_err(|err| err.to_string())?;
+        let latest_version = latest_published_version(&details)
+            .ok_or_else(|| format!("package '{name}' does not have any published versions"))?;
+        if dep.version() != Some(latest_version.as_str()) {
+            let previous = dep
+                .version()
+                .map(|v| format!(" (was {v})"))
+                .unwrap_or_default();
+            update_dependency_in_config(&name, &latest_version)?;
+            println!("Pinned '{}' to {}{}", name, latest_version, previous);
+            updated += 1;
+        }
+
+        let package_dir = manager.root().join(&name).join(&latest_version);
+        if !package_dir.exists() {
+            let archive = client
+                .download_package(&name, &latest_version)
+                .map_err(|err| err.to_string())?;
+            extract_package_archive(archive.path(), &package_dir)?;
+            println!("Downloaded {} {}", name, latest_version);
+            downloaded += 1;
+        } else {
+            println!("Package {} {} already installed", name, latest_version);
+        }
+    }
+
+    if remote_deps == 0 {
+        println!("No registry dependencies configured; skipping download step.");
+    }
+
+    let config = LustConfig::load_from_dir(&project_dir).map_err(|err| err.to_string())?;
+    let resolution = resolve_dependencies(&config, &project_dir).map_err(|err| err.to_string())?;
+    let prepared =
+        prepare_rust_dependencies(&resolution, &project_dir).map_err(|err| err.to_string())?;
+
+    if prepared.is_empty() {
+        println!(
+            "Sync complete ({} updated, {} downloaded, 0 Rust dependencies prepared).",
+            updated, downloaded
+        );
+    } else {
+        for entry in &prepared {
+            if entry.stub_roots.is_empty() {
+                println!("Prepared Rust dependency '{}'", entry.build.name);
+            } else {
+                for root in &entry.stub_roots {
+                    println!(
+                        "Prepared Rust dependency '{}' (stubs -> {})",
+                        entry.build.name,
+                        root.directory.display()
+                    );
+                }
+            }
+        }
+        println!(
+            "Sync complete ({} updated, {} downloaded, {} Rust dependencies prepared).",
+            updated,
+            downloaded,
+            prepared.len()
+        );
+    }
+
     Ok(())
 }
 
@@ -289,9 +397,7 @@ fn resolve_registry_base(input: Option<&str>) -> String {
 
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 fn extract_package_archive(archive_path: &Path, destination: &Path) -> Result<(), String> {
-    if destination.exists() {
-        fs::remove_dir_all(destination).map_err(|err| err.to_string())?;
-    }
+    remove_existing_path(destination).map_err(|err| err.to_string())?;
     fs::create_dir_all(destination).map_err(|err| err.to_string())?;
     let status = Command::new(resolve_tar_command())
         .arg("-xzf")
@@ -320,6 +426,39 @@ fn resolve_tar_command() -> &'static str {
     {
         "tar"
     }
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn remove_existing_path(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.is_dir() {
+                fs::remove_dir_all(path)
+            } else {
+                fs::remove_file(path)
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+fn latest_published_version(details: &PackageDetails) -> Option<String> {
+    if let Some(info) = details.latest_version.as_ref() {
+        let version = info.version.trim();
+        if !version.is_empty() {
+            return Some(version.to_string());
+        }
+    }
+    details.versions.iter().find_map(|info| {
+        let version = info.version.trim();
+        if version.is_empty() {
+            None
+        } else {
+            Some(version.to_string())
+        }
+    })
 }
 
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]

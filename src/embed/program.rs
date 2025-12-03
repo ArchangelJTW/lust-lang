@@ -906,6 +906,7 @@ fn compile_in_memory(
     compiler.configure_stdlib(&config);
     compiler.set_imports_by_module(imports_map);
     compiler.set_entry_module(program.entry_module.clone());
+    compiler.set_function_signatures(signatures.clone());
     let functions = compiler.compile_module(&wrapped_items)?;
     let trait_impls = compiler.get_trait_impls().to_vec();
     let mut init_funcs = Vec::new();

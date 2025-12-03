@@ -934,13 +934,7 @@ pub(crate) fn signatures_match(a: &FunctionSignature, b: &FunctionSignature) -> 
 }
 
 pub(crate) fn signature_to_string(signature: &FunctionSignature) -> String {
-    let params = signature
-        .params
-        .iter()
-        .map(|param| param.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("function({}) -> {}", params, signature.return_type)
+    signature.to_string()
 }
 
 #[cfg(test)]

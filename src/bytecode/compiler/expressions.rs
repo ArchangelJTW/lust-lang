@@ -414,14 +414,15 @@ impl Compiler {
 
             ExprKind::Lambda {
                 params,
-                return_type: _,
+                return_type,
                 body,
             } => {
-                let captured_vars = self.analyze_free_variables(body, params)?;
+                let captured_vars = self.analyze_free_variables(body, &params)?;
                 let lambda_func_idx = self.functions.len();
                 let lambda_name = format!("<lambda@{}>", lambda_func_idx);
                 let lambda_func = Function::new(&lambda_name, params.len() as u8, false);
                 self.functions.push(lambda_func);
+                self.try_set_lambda_signature(lambda_func_idx, &params, &return_type);
                 let saved_func_idx = self.current_function;
                 let saved_scopes = self.scopes.clone();
                 let saved_next_reg = self.next_register;

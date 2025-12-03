@@ -1,5 +1,6 @@
 use super::{Instruction, Value};
 use crate::ast::TypeKind;
+use crate::typechecker::FunctionSignature;
 use alloc::{format, string::String, vec::Vec};
 use hashbrown::HashMap;
 #[derive(Debug, Clone)]
@@ -82,6 +83,7 @@ pub struct Function {
     pub chunk: Chunk,
     pub upvalues: Vec<(bool, u8)>,
     pub register_types: HashMap<u8, TypeKind>,
+    pub signature: Option<FunctionSignature>,
 }
 
 impl Function {
@@ -94,6 +96,7 @@ impl Function {
             chunk: Chunk::new(),
             upvalues: Vec::new(),
             register_types: HashMap::new(),
+            signature: None,
         }
     }
 
@@ -109,6 +112,10 @@ impl Function {
 
         self.upvalues.push((is_local, index));
         idx as u8
+    }
+
+    pub fn set_signature(&mut self, signature: FunctionSignature) {
+        self.signature = Some(signature);
     }
 
     pub fn disassemble(&self) -> String {

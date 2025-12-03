@@ -12,6 +12,7 @@ use alloc::{
     vec::Vec,
 };
 use hashbrown::{HashMap, HashSet};
+use core::fmt;
 pub struct TypeEnv {
     scopes: Vec<HashMap<String, Type>>,
     refinements: Vec<HashMap<String, Type>>,
@@ -30,6 +31,18 @@ pub struct FunctionSignature {
     pub params: Vec<Type>,
     pub return_type: Type,
     pub is_method: bool,
+}
+
+impl fmt::Display for FunctionSignature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let params = self
+            .params
+            .iter()
+            .map(|param| param.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(f, "function({}) -> {}", params, self.return_type)
+    }
 }
 
 impl TypeEnv {

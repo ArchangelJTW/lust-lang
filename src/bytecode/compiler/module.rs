@@ -37,6 +37,7 @@ impl Compiler {
                                 );
                                 self.function_table.insert(func_def.name.clone(), func_idx);
                                 self.functions.push(function);
+                                self.assign_signature_by_name(func_idx, &func_def.name);
                             }
 
                             ItemKind::Struct(_) | ItemKind::Enum(_) => {}
@@ -78,8 +79,10 @@ impl Compiler {
                                         method.params.len() as u8,
                                         has_self,
                                     );
-                                    self.function_table.insert(mangled_name, func_idx);
+                                    self.function_table
+                                        .insert(mangled_name.clone(), func_idx);
                                     self.functions.push(function);
+                                    self.assign_signature_by_name(func_idx, &mangled_name);
                                 }
                             }
 
@@ -125,6 +128,7 @@ impl Compiler {
                     );
                     self.function_table.insert(func_def.name.clone(), func_idx);
                     self.functions.push(function);
+                    self.assign_signature_by_name(func_idx, &func_def.name);
                 }
 
                 ItemKind::Struct(_) | ItemKind::Enum(_) => {}
@@ -159,8 +163,10 @@ impl Compiler {
                         };
                         let function =
                             Function::new(&mangled_name, method.params.len() as u8, has_self);
-                        self.function_table.insert(mangled_name, func_idx);
+                        self.function_table
+                            .insert(mangled_name.clone(), func_idx);
                         self.functions.push(function);
+                        self.assign_signature_by_name(func_idx, &mangled_name);
                     }
                 }
 
@@ -186,6 +192,7 @@ impl Compiler {
         self.function_table
             .insert("__script".to_string(), script_func_idx);
         self.functions.push(script_func);
+        self.assign_signature_by_name(script_func_idx, "__script");
         let mut func_idx = 0;
         for item in items {
             match &item.kind {
@@ -247,6 +254,7 @@ impl Compiler {
             }
 
             self.compile_function(script_func_idx, &fake_func)?;
+            self.assign_signature_by_name(script_func_idx, &fake_func.name);
             self.current_module = prev;
         }
 

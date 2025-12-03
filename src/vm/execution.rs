@@ -1274,6 +1274,10 @@ impl VM {
     }
 
     pub(super) fn value_is_type(&self, value: &Value, type_name: &str) -> bool {
+        if let Some(matches) = self.match_function_type(value, type_name) {
+            return matches;
+        }
+
         let value_type_name = match value {
             Value::Int(_) => "int",
             Value::Float(_) => "float",
@@ -1330,6 +1334,36 @@ impl VM {
         }
 
         false
+    }
+
+    fn match_function_type(&self, value: &Value, type_name: &str) -> Option<bool> {
+        let wants_signature = type_name.starts_with("function(");
+        let wants_generic = type_name == "function";
+        if !wants_signature && !wants_generic {
+            return None;
+        }
+
+        let matches = match value {
+            Value::Function(idx) => self.function_signature_matches(*idx, type_name),
+            Value::Closure { function_idx, .. } => {
+                self.function_signature_matches(*function_idx, type_name)
+            }
+            Value::NativeFunction(_) => wants_generic,
+            _ => false,
+        };
+        Some(matches)
+    }
+
+    fn function_signature_matches(&self, func_idx: usize, type_name: &str) -> bool {
+        if type_name == "function" {
+            return true;
+        }
+
+        self.functions
+            .get(func_idx)
+            .and_then(|func| func.signature.as_ref())
+            .map(|signature| signature.to_string() == type_name)
+            .unwrap_or(false)
     }
 
     pub(super) fn get_register(&self, reg: Register) -> Result<&Value> {

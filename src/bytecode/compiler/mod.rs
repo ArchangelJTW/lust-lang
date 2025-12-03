@@ -1,9 +1,11 @@
 pub(super) use super::{Chunk, Function, Instruction, Register, Value};
 pub(super) use crate::ast::{
-    BinaryOp, ExprKind, ExternItem, Item, ItemKind, Literal, Span, Stmt, StmtKind, UnaryOp,
+    BinaryOp, ExprKind, ExternItem, Item, ItemKind, Literal, Span, Stmt, StmtKind, Type, TypeKind,
+    UnaryOp,
 };
 use crate::config::LustConfig;
 pub(super) use crate::number::LustInt;
+use crate::typechecker::FunctionSignature;
 pub(super) use crate::{Expr, LustError, Result};
 pub(super) use alloc::{
     format,
@@ -38,6 +40,7 @@ pub struct Compiler {
     pub(super) extern_function_aliases: HashMap<String, String>,
     pub(super) stdlib_symbols: HashSet<String>,
     option_coercions: HashMap<String, HashSet<Span>>,
+    function_signatures: HashMap<String, FunctionSignature>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +77,7 @@ impl Compiler {
             extern_function_aliases: HashMap::new(),
             stdlib_symbols: HashSet::new(),
             option_coercions: HashMap::new(),
+            function_signatures: HashMap::new(),
         };
         compiler.configure_stdlib(&LustConfig::default());
         compiler
@@ -113,6 +117,10 @@ impl Compiler {
         self.option_coercions = map;
     }
 
+    pub fn set_function_signatures(&mut self, signatures: HashMap<String, FunctionSignature>) {
+        self.function_signatures = signatures;
+    }
+
     pub(super) fn is_stdlib_symbol(&self, name: &str) -> bool {
         self.stdlib_symbols.contains(name)
     }
@@ -122,6 +130,46 @@ impl Compiler {
         self.option_coercions
             .get(module)
             .map_or(false, |set| set.contains(&span))
+    }
+
+    fn assign_signature_by_name(&mut self, func_idx: usize, name: &str) {
+        if let Some(signature) = self.function_signatures.get(name).cloned() {
+            self.functions[func_idx].set_signature(signature);
+        }
+    }
+
+    fn try_set_lambda_signature(
+        &mut self,
+        func_idx: usize,
+        params: &[(String, Option<Type>)],
+        return_type: &Option<Type>,
+    ) {
+        if let Some(signature) = Self::lambda_signature(params, return_type) {
+            self.functions[func_idx].set_signature(signature);
+        }
+    }
+
+    fn lambda_signature(
+        params: &[(String, Option<Type>)],
+        return_type: &Option<Type>,
+    ) -> Option<FunctionSignature> {
+        let mut param_types = Vec::with_capacity(params.len());
+        for (_, ty) in params {
+            if let Some(ty) = ty {
+                param_types.push(ty.clone());
+            } else {
+                return None;
+            }
+        }
+
+        let return_type = return_type
+            .clone()
+            .unwrap_or_else(|| Type::new(TypeKind::Unit, Span::dummy()));
+        Some(FunctionSignature {
+            params: param_types,
+            return_type,
+            is_method: false,
+        })
     }
 
     pub(super) fn record_extern_function(&mut self, name: &str) {

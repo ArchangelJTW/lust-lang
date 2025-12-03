@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "lust-rs"
-version = "2.3.8"
+version = "2.3.9"
 dependencies = [
  "console_error_panic_hook",
  "dirs",
@@ -1271,7 +1271,3 @@ dependencies = [
  "quote",
  "syn",
 ]
-
-[[patch.unused]]
-name = "crunchy"
-version = "0.2.3"

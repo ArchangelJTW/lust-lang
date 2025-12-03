@@ -997,11 +997,13 @@ fn compile_program(
     typechecker.check_program(&program.modules)?;
     let option_coercions = typechecker.take_option_coercions();
     let struct_defs = typechecker.struct_definitions();
+    let function_signatures = typechecker.function_signatures();
     let mut compiler = Compiler::new();
     compiler.set_option_coercions(option_coercions);
     compiler.configure_stdlib(config);
     compiler.set_imports_by_module(imports_map);
     compiler.set_entry_module(program.entry_module.clone());
+    compiler.set_function_signatures(function_signatures);
     let functions = compiler.compile_module(&wrapped_items)?;
     let trait_impls = compiler.get_trait_impls().to_vec();
     let mut init_funcs: Vec<String> = Vec::new();

@@ -251,6 +251,7 @@ impl Backend {
                 let option_coercions = typechecker.take_option_coercions();
                 let struct_defs = typechecker.struct_definitions();
                 let enum_defs = typechecker.enum_definitions();
+                let function_signatures = typechecker.function_signatures();
                 let type_info = typechecker.take_type_info();
                 let snapshot = AnalysisSnapshot::new(
                     &program,
@@ -279,6 +280,7 @@ impl Backend {
                 compiler.configure_stdlib(&config);
                 compiler.set_imports_by_module(imports_map);
                 compiler.set_entry_module(program.entry_module.clone());
+                compiler.set_function_signatures(function_signatures);
                 if let Err(error) = compiler.compile_module(&wrapped_items) {
                     return self.convert_path_map_to_url_map(error_to_diagnostics(
                         error,

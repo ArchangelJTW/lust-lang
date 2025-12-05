@@ -1,0 +1,42 @@
+use socket.core.{ _DATAGRAMSIZE, _SETSIZE }
+use socket.http.{ request }
+use string as string
+use lua as lua
+
+--println("luasocket core loaded\n_DATAGRAMSIZE = " .. tostring(_DATAGRAMSIZE) .. "\n_SETSIZE = " .. tostring(_SETSIZE))
+
+local result_any: unknown = request("http://info.cern.ch")
+--println("http.request returned: " .. tostring(result_any) .. " (type " .. type(result_any) .. ")")
+if result_any is Array<LuaValue> then
+    local result: Array<LuaValue> = result_any
+    local first = result:get(0)
+    if not first:is_some() then
+        println("http.request returned empty results")
+        return
+    end
+    local body: LuaValue = first:unwrap()
+    local code_opt = result:get(1)
+    local headers_opt = result:get(2)
+    local status_opt = result:get(3)
+    local code: LuaValue = lua.nil
+    local headers: LuaValue = lua.nil
+    local status: LuaValue = lua.nil
+    if code_opt:is_some() then
+        code = code_opt:unwrap()
+    end
+    if headers_opt is Some(headers) then
+        println("Headers:")
+        println(headers)
+    end
+    if status_opt is Some(status) then
+        println("Status: " .. status .. ", Code: " .. code)
+    end
+
+    if body is String(s) then
+        println("Body:")
+        println(s)
+    end
+
+else
+    println("http.request did not return a Lua-style multi-return array")
+end

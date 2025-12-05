@@ -85,7 +85,7 @@ run_category() {
 
 # Main execution
 echo -e "${CYAN}╔═══════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   Lust Language - Example Test Runner    ║${NC}"
+echo -e "${CYAN}║   Lust Language - Example Test Runner     ║${NC}"
 echo -e "${CYAN}╚═══════════════════════════════════════════╝${NC}"
 
 # Run basic examples

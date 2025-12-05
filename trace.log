@@ -1,0 +1,1389 @@
+warning: type `lua_Number` should have an upper camel case name
+   --> src/lua_compat/mod.rs:135:10
+    |
+135 | pub type lua_Number = LustFloat;
+    |          ^^^^^^^^^^ help: convert the identifier to upper camel case: `LuaNumber`
+    |
+    = note: `#[warn(non_camel_case_types)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: type `lua_Integer` should have an upper camel case name
+   --> src/lua_compat/mod.rs:136:10
+    |
+136 | pub type lua_Integer = LustInt;
+    |          ^^^^^^^^^^^ help: convert the identifier to upper camel case: `LuaInteger`
+
+warning: type `lua_CFunction` should have an upper camel case name
+   --> src/lua_compat/mod.rs:137:10
+    |
+137 | pub type lua_CFunction = Option<unsafe extern "C" fn(*mut lua_State) -> c_int>;
+    |          ^^^^^^^^^^^^^ help: convert the identifier to upper camel case: `LuaCfunction`
+
+warning: unused variable: `call_num`
+    --> src/bytecode/value.rs:1378:9
+     |
+1378 |     let call_num = JIT_NEW_ARRAY_COUNTER.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+     |         ^^^^^^^^
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+help: if this is intentional, prefix it with an underscore
+     |
+1378 |     let _call_num = JIT_NEW_ARRAY_COUNTER.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+     |         +
+help: you might have meant to pattern match on the similarly named constant `REGISTRATION_THRESHOLD`
+     |
+1378 -     let call_num = JIT_NEW_ARRAY_COUNTER.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+1378 +     let vm::cycle::REGISTRATION_THRESHOLD = JIT_NEW_ARRAY_COUNTER.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+     |
+
+warning: unused variable: `actual_elem_type`
+   --> src/jit/trace.rs:452:38
+    |
+452 |                     let (array_type, actual_elem_type) =
+    |                                      ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_actual_elem_type`
+
+warning: variable does not need to be mutable
+    --> src/lua_compat/mod.rs:2131:17
+     |
+2131 |             let mut segments: Vec<&str> = module.split('.').collect();
+     |                 ----^^^^^^^^
+     |                 |
+     |                 help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src/typechecker/expr_checker/operations.rs:749:25
+    |
+749 |                     let mut expected_params = params.clone();
+    |                         ----^^^^^^^^^^^^^^^
+    |                         |
+    |                         help: remove this `mut`
+
+warning: associated functions `collect_top_level_locals` and `is_module_init_function` are never used
+   --> src/bytecode/compiler/module.rs:242:19
+    |
+  2 | impl Compiler {
+    | ------------- associated functions in this implementation
+...
+242 |     pub(super) fn collect_top_level_locals(stmts: &[Stmt]) -> Vec<String> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+255 |     pub(super) fn is_module_init_function(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `layout` and `source_reg` are never read
+  --> src/jit/codegen/mod.rs:36:9
+   |
+35 | pub(super) struct SpecializedValue {
+   |                   ---------------- fields in this struct
+36 |     pub layout: SpecializedLayout,
+   |         ^^^^^^
+...
+39 |     pub source_reg: Option<u8>,
+   |         ^^^^^^^^^^
+   |
+   = note: `SpecializedValue` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `specialization_registry` and `next_specialized_id` are never read
+  --> src/jit/codegen/mod.rs:49:16
+   |
+42 | pub struct JitCompiler {
+   |            ----------- fields in this struct
+...
+49 |     pub(super) specialization_registry: SpecializationRegistry,
+   |                ^^^^^^^^^^^^^^^^^^^^^^^
+...
+53 |     pub(super) next_specialized_id: usize,
+   |                ^^^^^^^^^^^^^^^^^^^
+
+warning: method `invalidate_specialization` is never used
+   --> src/jit/trace.rs:617:8
+    |
+391 | impl TraceRecorder {
+    | ------------------ method in this implementation
+...
+617 |     fn invalidate_specialization(&mut self, register: Register) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `push_string` is never used
+   --> src/lua_compat/mod.rs:954:4
+    |
+954 | fn push_string(state: &mut LuaState, s: &str) {
+    |    ^^^^^^^^^^^
+
+warning: field `return_count` is never read
+   --> src/lua_compat/transpile.rs:492:5
+    |
+489 | struct WrapperSig {
+    |        ---------- field in this struct
+...
+492 |     return_count: usize,
+    |     ^^^^^^^^^^^^
+    |
+    = note: `WrapperSig` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: methods `emit_prefix` and `emit_args` are never used
+    --> src/lua_compat/transpile.rs:1236:8
+     |
+ 495 | impl Emitter {
+     | ------------ methods in this implementation
+...
+1236 |     fn emit_prefix(&mut self, prefix: &Prefix) -> String {
+     |        ^^^^^^^^^^^
+...
+1345 |     fn emit_args(&mut self, args: &FunctionArgs) -> String {
+     |        ^^^^^^^^^
+
+warning: function `create_table_module` is never used
+   --> src/vm/stdlib.rs:520:4
+    |
+520 | fn create_table_module(vm: &VM) -> Value {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_sequence` is never used
+   --> src/vm/stdlib.rs:881:4
+    |
+881 | fn write_sequence(data: &TableData, seq: &[Value]) {
+    |    ^^^^^^^^^^^^^^
+
+warning: function `create_table_insert_fn` is never used
+   --> src/vm/stdlib.rs:911:4
+    |
+911 | fn create_table_insert_fn() -> Value {
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_table_remove_fn` is never used
+   --> src/vm/stdlib.rs:940:4
+    |
+940 | fn create_table_remove_fn() -> Value {
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_table_concat_fn` is never used
+   --> src/vm/stdlib.rs:965:4
+    |
+965 | fn create_table_concat_fn() -> Value {
+    |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_table_pack_fn` is never used
+    --> src/vm/stdlib.rs:1032:4
+     |
+1032 | fn create_table_pack_fn() -> Value {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_table_sort_fn` is never used
+    --> src/vm/stdlib.rs:1044:4
+     |
+1044 | fn create_table_sort_fn() -> Value {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_table_maxn_fn` is never used
+    --> src/vm/stdlib.rs:1064:4
+     |
+1064 | fn create_table_maxn_fn() -> Value {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_math_module` is never used
+    --> src/vm/stdlib.rs:1096:4
+     |
+1096 | fn create_math_module(vm: &VM) -> Value {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `create_math_abs_fn` is never used
+    --> src/vm/stdlib.rs:1108:4
+     |
+1108 | fn create_math_abs_fn() -> Value {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `create_math_min_fn` is never used
+    --> src/vm/stdlib.rs:1121:4
+     |
+1121 | fn create_math_min_fn() -> Value {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `create_math_max_fn` is never used
+    --> src/vm/stdlib.rs:1150:4
+     |
+1150 | fn create_math_max_fn() -> Value {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `create_math_mod_fn` is never used
+    --> src/vm/stdlib.rs:1179:4
+     |
+1179 | fn create_math_mod_fn() -> Value {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `coerce_float` is never used
+    --> src/vm/stdlib.rs:1244:4
+     |
+1244 | fn coerce_float(value: &Value) -> Option<f64> {
+     |    ^^^^^^^^^^^^
+
+warning: structure field `L` should have a snake case name
+   --> src/lua_compat/mod.rs:157:9
+    |
+157 |     pub L: *mut lua_State,
+    |         ^ help: convert the identifier to snake case: `l`
+    |
+    = note: `#[warn(non_snake_case)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1209:36
+     |
+1209 | pub unsafe extern "C" fn lua_close(L: *mut lua_State) {
+     |                                    ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1216:37
+     |
+1216 | pub unsafe extern "C" fn lua_gettop(L: *mut lua_State) -> c_int {
+     |                                     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1227:37
+     |
+1227 | pub unsafe extern "C" fn lua_settop(L: *mut lua_State, idx: c_int) {
+     |                                     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1251:40
+     |
+1251 | pub unsafe extern "C" fn lua_pushvalue(L: *mut lua_State, idx: c_int) {
+     |                                        ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1261:37
+     |
+1261 | pub unsafe extern "C" fn lua_remove(L: *mut lua_State, idx: c_int) {
+     |                                     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1275:37
+     |
+1275 | pub unsafe extern "C" fn lua_insert(L: *mut lua_State, idx: c_int) {
+     |                                     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1287:38
+     |
+1287 | pub unsafe extern "C" fn lua_replace(L: *mut lua_State, idx: c_int) {
+     |                                      ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1303:41
+     |
+1303 | pub unsafe extern "C" fn lua_checkstack(L: *mut lua_State, _sz: c_int) -> c_int {
+     |                                         ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1311:35
+     |
+1311 | pub unsafe extern "C" fn lua_type(L: *mut lua_State, idx: c_int) -> c_int {
+     |                                   ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1324:39
+     |
+1324 | pub unsafe extern "C" fn lua_typename(L: *mut lua_State, tp: c_int) -> *const c_char {
+     |                                       ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1358:39
+     |
+1358 | pub unsafe extern "C" fn lua_isstring(L: *mut lua_State, idx: c_int) -> c_int {
+     |                                       ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1363:39
+     |
+1363 | pub unsafe extern "C" fn lua_isnumber(L: *mut lua_State, idx: c_int) -> c_int {
+     |                                       ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1368:42
+     |
+1368 | pub unsafe extern "C" fn lua_iscfunction(L: *mut lua_State, idx: c_int) -> c_int {
+     |                                          ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1373:38
+     |
+1373 | pub unsafe extern "C" fn lua_istable(L: *mut lua_State, idx: c_int) -> c_int {
+     |                                      ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1378:41
+     |
+1378 | pub unsafe extern "C" fn lua_isuserdata(L: *mut lua_State, idx: c_int) -> c_int {
+     |                                         ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1383:40
+     |
+1383 | pub unsafe extern "C" fn lua_toboolean(L: *mut lua_State, idx: c_int) -> c_int {
+     |                                        ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1402:39
+     |
+1402 | pub unsafe extern "C" fn lua_tonumber(L: *mut lua_State, idx: c_int) -> lua_Number {
+     |                                       ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1417:40
+     |
+1417 | pub unsafe extern "C" fn lua_tointeger(L: *mut lua_State, idx: c_int) -> lua_Integer {
+     |                                        ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1433:5
+     |
+1433 |     L: *mut lua_State,
+     |     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1458:37
+     |
+1458 | pub unsafe extern "C" fn lua_objlen(L: *mut lua_State, idx: c_int) -> usize {
+     |                                     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1474:36
+     |
+1474 | pub unsafe extern "C" fn lua_equal(L: *mut lua_State, idx1: c_int, idx2: c_int) -> c_int {
+     |                                    ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1489:39
+     |
+1489 | pub unsafe extern "C" fn lua_rawequal(L: *mut lua_State, idx1: c_int, idx2: c_int) -> c_int {
+     |                                       ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1494:39
+     |
+1494 | pub unsafe extern "C" fn lua_lessthan(L: *mut lua_State, _idx1: c_int, _idx2: c_int) -> c_int {
+     |                                       ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1503:38
+     |
+1503 | pub unsafe extern "C" fn lua_pushnil(L: *mut lua_State) {
+     |                                      ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1511:41
+     |
+1511 | pub unsafe extern "C" fn lua_pushnumber(L: *mut lua_State, n: lua_Number) {
+     |                                         ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1519:42
+     |
+1519 | pub unsafe extern "C" fn lua_pushinteger(L: *mut lua_State, n: lua_Integer) {
+     |                                          ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1527:42
+     |
+1527 | pub unsafe extern "C" fn lua_pushlstring(L: *mut lua_State, s: *const c_char, len: usize) {
+     |                                          ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1544:41
+     |
+1544 | pub unsafe extern "C" fn lua_pushstring(L: *mut lua_State, s: *const c_char) {
+     |                                         ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1557:42
+     |
+1557 | pub unsafe extern "C" fn lua_pushfstring(L: *mut lua_State, fmt: *const c_char) -> *const c_char {
+     |                                          ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1572:42
+     |
+1572 | pub unsafe extern "C" fn lua_pushboolean(L: *mut lua_State, b: c_int) {
+     |                                          ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1580:48
+     |
+1580 | pub unsafe extern "C" fn lua_pushlightuserdata(L: *mut lua_State, p: *mut c_void) {
+     |                                                ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1588:43
+     |
+1588 | pub unsafe extern "C" fn lua_pushcclosure(L: *mut lua_State, f: lua_CFunction, _n: c_int) {
+     |                                           ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1614:44
+     |
+1614 | pub unsafe extern "C" fn lua_pushcfunction(L: *mut lua_State, f: lua_CFunction) {
+     |                                            ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1619:39
+     |
+1619 | pub unsafe extern "C" fn lua_newtable(L: *mut lua_State) {
+     |                                       ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1627:42
+     |
+1627 | pub unsafe extern "C" fn lua_createtable(L: *mut lua_State, _narr: c_int, _nrec: c_int) {
+     |                                          ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1632:39
+     |
+1632 | pub unsafe extern "C" fn lua_gettable(L: *mut lua_State, idx: c_int) {
+     |                                       ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1654:39
+     |
+1654 | pub unsafe extern "C" fn lua_settable(L: *mut lua_State, idx: c_int) {
+     |                                       ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1679:39
+     |
+1679 | pub unsafe extern "C" fn lua_getfield(L: *mut lua_State, idx: c_int, k: *const c_char) {
+     |                                       ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1702:39
+     |
+1702 | pub unsafe extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char) {
+     |                                       ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1734:35
+     |
+1734 | pub unsafe extern "C" fn lua_next(L: *mut lua_State, _idx: c_int) -> c_int {
+     |                                   ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1743:37
+     |
+1743 | pub unsafe extern "C" fn lua_rawget(L: *mut lua_State, idx: c_int) {
+     |                                     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1748:38
+     |
+1748 | pub unsafe extern "C" fn lua_rawgeti(L: *mut lua_State, idx: c_int, n: c_int) {
+     |                                      ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1766:37
+     |
+1766 | pub unsafe extern "C" fn lua_rawset(L: *mut lua_State, idx: c_int) {
+     |                                     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1771:38
+     |
+1771 | pub unsafe extern "C" fn lua_rawseti(L: *mut lua_State, idx: c_int, n: c_int) {
+     |                                      ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1787:37
+     |
+1787 | pub unsafe extern "C" fn lua_concat(L: *mut lua_State, n: c_int) {
+     |                                     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1808:43
+     |
+1808 | pub unsafe extern "C" fn lua_setmetatable(L: *mut lua_State, objindex: c_int) -> c_int {
+     |                                           ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1879:43
+     |
+1879 | pub unsafe extern "C" fn lua_getmetatable(L: *mut lua_State, objindex: c_int) -> c_int {
+     |                                           ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:1916:35
+     |
+1916 | pub unsafe extern "C" fn lua_call(L: *mut lua_State, nargs: c_int, nresults: c_int) {
+     |                                   ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2005:5
+     |
+2005 |     L: *mut lua_State,
+     |     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2015:36
+     |
+2015 | pub unsafe extern "C" fn lua_error(L: *mut lua_State) -> c_int {
+     |                                    ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2026:5
+     |
+2026 |     L: *mut lua_State,
+     |     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2044:5
+     |
+2044 |     L: *mut lua_State,
+     |     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2060:41
+     |
+2060 | pub unsafe extern "C" fn luaL_checktype(L: *mut lua_State, narg: c_int, t: c_int) {
+     |                                         ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2073:5
+     |
+2073 |     L: *mut lua_State,
+     |     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2111:5
+     |
+2111 |     L: *mut lua_State,
+     |     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2121:5
+     |
+2121 |     L: *mut lua_State,
+     |     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2202:44
+     |
+2202 | pub unsafe extern "C" fn luaL_newmetatable(L: *mut lua_State, tname: *const c_char) -> c_int {
+     |                                            ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2237:44
+     |
+2237 | pub unsafe extern "C" fn luaL_getmetatable(L: *mut lua_State, tname: *const c_char) {
+     |                                            ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2259:5
+     |
+2259 |     L: *mut lua_State,
+     |     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2271:43
+     |
+2271 | pub unsafe extern "C" fn luaL_checkstring(L: *mut lua_State, idx: c_int) -> *const c_char {
+     |                                           ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2277:5
+     |
+2277 |     L: *mut lua_State,
+     |     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2301:43
+     |
+2301 | pub unsafe extern "C" fn luaL_checknumber(L: *mut lua_State, idx: c_int) -> lua_Number {
+     |                                           ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2310:44
+     |
+2310 | pub unsafe extern "C" fn luaL_checkinteger(L: *mut lua_State, idx: c_int) -> lua_Integer {
+     |                                            ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2320:5
+     |
+2320 |     L: *mut lua_State,
+     |     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2333:5
+     |
+2333 |     L: *mut lua_State,
+     |     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2345:35
+     |
+2345 | pub unsafe extern "C" fn luaL_ref(L: *mut lua_State, _t: c_int) -> c_int {
+     |                                   ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2357:37
+     |
+2357 | pub unsafe extern "C" fn luaL_unref(L: *mut lua_State, _t: c_int, r: c_int) {
+     |                                     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2365:37
+     |
+2365 | pub unsafe extern "C" fn luaL_error(L: *mut lua_State, s: *const c_char) -> c_int {
+     |                                     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2380:5
+     |
+2380 |     L: *mut lua_State,
+     |     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2394:42
+     |
+2394 | pub unsafe extern "C" fn luaL_loadstring(L: *mut lua_State, s: *const c_char) -> c_int {
+     |                                          ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2409:5
+     |
+2409 |     L: *mut lua_State,
+     |     ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2417:40
+     |
+2417 | pub unsafe extern "C" fn luaL_buffinit(L: *mut lua_State, B: *mut luaL_Buffer) {
+     |                                        ^ help: convert the identifier to snake case: `l`
+
+warning: variable `B` should have a snake case name
+    --> src/lua_compat/mod.rs:2417:59
+     |
+2417 | pub unsafe extern "C" fn luaL_buffinit(L: *mut lua_State, B: *mut luaL_Buffer) {
+     |                                                           ^ help: convert the identifier to snake case: `b`
+
+warning: variable `B` should have a snake case name
+    --> src/lua_compat/mod.rs:2430:42
+     |
+2430 | pub unsafe extern "C" fn luaL_prepbuffer(B: *mut luaL_Buffer) -> *mut c_char {
+     |                                          ^ help: convert the identifier to snake case: `b`
+
+warning: variable `B` should have a snake case name
+    --> src/lua_compat/mod.rs:2442:42
+     |
+2442 | pub unsafe extern "C" fn luaL_addlstring(B: *mut luaL_Buffer, s: *const c_char, len: usize) {
+     |                                          ^ help: convert the identifier to snake case: `b`
+
+warning: variable `B` should have a snake case name
+    --> src/lua_compat/mod.rs:2461:42
+     |
+2461 | pub unsafe extern "C" fn luaL_pushresult(B: *mut luaL_Buffer) {
+     |                                          ^ help: convert the identifier to snake case: `b`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2466:9
+     |
+2466 |     let L = (*B).L;
+     |         ^ help: convert the identifier to snake case: `l`
+
+warning: variable `_L` should have a snake case name
+    --> src/lua_compat/mod.rs:2477:40
+     |
+2477 | pub unsafe extern "C" fn luaL_openlibs(_L: *mut lua_State) {
+     |                                        ^^ help: convert the identifier to snake case: `_l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2482:42
+     |
+2482 | pub unsafe extern "C" fn lua_newuserdata(L: *mut lua_State, sz: usize) -> *mut c_void {
+     |                                          ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2496:41
+     |
+2496 | pub unsafe extern "C" fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c_void {
+     |                                         ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2507:42
+     |
+2507 | pub unsafe extern "C" fn lua_tocfunction(L: *mut lua_State, idx: c_int) -> lua_CFunction {
+     |                                          ^ help: convert the identifier to snake case: `l`
+
+warning: variable `L` should have a snake case name
+    --> src/lua_compat/mod.rs:2518:40
+     |
+2518 | pub unsafe extern "C" fn lua_topointer(L: *mut lua_State, idx: c_int) -> *const c_void {
+     |                                        ^ help: convert the identifier to snake case: `l`
+
+[lua-api] lua_newtable() top=1 stack=[table(0x56273d636cf0)]
+[lua-api] luaL_checkstack(1, too many upvalues) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_checkstack(1) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="skip") top=2 stack=[table(0x56273d636cf0), str("skip")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a5990) top=3 stack=[table(0x56273d636cf0), str("skip"), func#1]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="__unload") top=2 stack=[table(0x56273d636cf0), str("__unload")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a5980) top=3 stack=[table(0x56273d636cf0), str("__unload"), func#2]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_settop(-1) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="_DEBUG") top=2 stack=[table(0x56273d636cf0), str("_DEBUG")]
+[lua-api] lua_pushboolean(1) top=3 stack=[table(0x56273d636cf0), str("_DEBUG"), bool(true)]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="_VERSION") top=2 stack=[table(0x56273d636cf0), str("_VERSION")]
+[lua-api] lua_pushstring(text="LuaSocket 3.0.0") top=3 stack=[table(0x56273d636cf0), str("_VERSION"), str("LuaSocket 3.0.0")]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_newtable() top=2 stack=[table(0x56273d636cf0), table(0x56273d632960)]
+[lua-api] lua_pushboolean(0) top=3 stack=[table(0x56273d636cf0), table(0x56273d632960), bool(false)]
+[lua-api] lua_setfield(-2, __metatable) top=2 stack=[table(0x56273d636cf0), table(0x56273d632960)]
+[lua-api] luaL_checkstack(2, too many upvalues) top=2 stack=[table(0x56273d636cf0), table(0x56273d632960)]
+[lua-api] lua_checkstack(2) top=2 stack=[table(0x56273d636cf0), table(0x56273d632960)]
+[lua-api] lua_pushstring(text="newtry") top=3 stack=[table(0x56273d636cf0), table(0x56273d632960), str("newtry")]
+[lua-api] lua_pushvalue(-2) top=4 stack=[table(0x56273d636cf0), table(0x56273d632960), str("newtry"), table(0x56273d632960)]
+[lua-api] lua_pushcclosure(n=1, f=0x7f36538a8f50) top=4 stack=[table(0x56273d636cf0), table(0x56273d632960), str("newtry"), func#3]
+[lua-api] lua_settable(-4) top=2 stack=[table(0x56273d636cf0), table(0x56273d632960)]
+[lua-api] lua_pushstring(text="protect") top=3 stack=[table(0x56273d636cf0), table(0x56273d632960), str("protect")]
+[lua-api] lua_pushvalue(-2) top=4 stack=[table(0x56273d636cf0), table(0x56273d632960), str("protect"), table(0x56273d632960)]
+[lua-api] lua_pushcclosure(n=1, f=0x7f36538a8f00) top=4 stack=[table(0x56273d636cf0), table(0x56273d632960), str("protect"), func#4]
+[lua-api] lua_settable(-4) top=2 stack=[table(0x56273d636cf0), table(0x56273d632960)]
+[lua-api] lua_settop(-2) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] luaL_checkstack(1, too many upvalues) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_checkstack(1) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="gettime") top=2 stack=[table(0x56273d636cf0), str("gettime")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a5b50) top=3 stack=[table(0x56273d636cf0), str("gettime"), func#5]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="sleep") top=2 stack=[table(0x56273d636cf0), str("sleep")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a5aa0) top=3 stack=[table(0x56273d636cf0), str("sleep"), func#6]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_settop(-1) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="dns") top=2 stack=[table(0x56273d636cf0), str("dns")]
+[lua-api] lua_newtable() top=3 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20)]
+[lua-api] luaL_checkstack(1, too many upvalues) top=3 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20)]
+[lua-api] lua_checkstack(1) top=3 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20)]
+[lua-api] lua_pushstring(text="toip") top=4 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20), str("toip")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a8620) top=5 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20), str("toip"), func#7]
+[lua-api] lua_settable(-3) top=3 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20)]
+[lua-api] lua_pushstring(text="getaddrinfo") top=4 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20), str("getaddrinfo")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a8350) top=5 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20), str("getaddrinfo"), func#8]
+[lua-api] lua_settable(-3) top=3 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20)]
+[lua-api] lua_pushstring(text="tohostname") top=4 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20), str("tohostname")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a86f0) top=5 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20), str("tohostname"), func#9]
+[lua-api] lua_settable(-3) top=3 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20)]
+[lua-api] lua_pushstring(text="getnameinfo") top=4 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20), str("getnameinfo")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a8000) top=5 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20), str("getnameinfo"), func#10]
+[lua-api] lua_settable(-3) top=3 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20)]
+[lua-api] lua_pushstring(text="gethostname") top=4 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20), str("gethostname")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a85b0) top=5 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20), str("gethostname"), func#11]
+[lua-api] lua_settable(-3) top=3 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20)]
+[lua-api] lua_settop(-1) top=3 stack=[table(0x56273d636cf0), str("dns"), table(0x56273d81cb20)]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_newtable() top=2 stack=[table(0x56273d636cf0), table(0x56273d80fd70)]
+[lua-api] luaL_newmetatable(tcp{master}) top=2 stack=[table(0x56273d636cf0), table(0x56273d80fd70)]
+[lua-api] lua_pushstring(text="__index") top=3 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index")]
+[lua-api] lua_newtable() top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="class") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("class")]
+[lua-api] lua_pushstring(text="tcp{master}") top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("class"), str("tcp{master}")]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="__gc") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("__gc")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9df0) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("__gc"), func#12]
+[lua-api] lua_settable(-5) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="__tostring") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("__tostring")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a69c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("__tostring"), func#13]
+[lua-api] lua_settable(-5) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="accept") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("accept")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa290) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("accept"), func#14]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="bind") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("bind")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9cd0) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("bind"), func#15]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="close") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("close")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9df0) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("close"), func#16]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="connect") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("connect")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa180) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("connect"), func#17]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="dirty") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("dirty")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa140) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("dirty"), func#18]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="getfamily") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("getfamily")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa3c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("getfamily"), func#19]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="getfd") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("getfd")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9db0) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("getfd"), func#20]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="getoption") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("getoption")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa100) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("getoption"), func#21]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="getpeername") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("getpeername")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa0c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("getpeername"), func#22]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="getsockname") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("getsockname")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa080) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("getsockname"), func#23]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="getstats") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("getstats")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa050) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("getstats"), func#24]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="setstats") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("setstats")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa020) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("setstats"), func#25]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="listen") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("listen")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9f70) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("listen"), func#26]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="receive") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("receive")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9f40) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("receive"), func#27]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="send") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("send")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9f10) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("send"), func#28]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="setfd") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("setfd")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9ed0) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("setfd"), func#29]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="setoption") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("setoption")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9e90) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("setoption"), func#30]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="setpeername") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("setpeername")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa180) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("setpeername"), func#31]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="setsockname") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("setsockname")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9cd0) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("setsockname"), func#32]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="settimeout") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("settimeout")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9e60) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("settimeout"), func#33]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="gettimeout") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("gettimeout")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9e30) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("gettimeout"), func#34]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_pushstring(text="shutdown") top=5 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("shutdown")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9c70) top=6 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0), str("shutdown"), func#35]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("__index"), table(0x56273d825ac0)]
+[lua-api] lua_settable(-3) top=2 stack=[table(0x56273d636cf0), table(0x56273d80fd70)]
+[lua-api] lua_settop(-2) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_newtable() top=2 stack=[table(0x56273d636cf0), table(0x56273d774c10)]
+[lua-api] luaL_newmetatable(tcp{client}) top=2 stack=[table(0x56273d636cf0), table(0x56273d774c10)]
+[lua-api] lua_pushstring(text="__index") top=3 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index")]
+[lua-api] lua_newtable() top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="class") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("class")]
+[lua-api] lua_pushstring(text="tcp{client}") top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("class"), str("tcp{client}")]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="__gc") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("__gc")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9df0) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("__gc"), func#36]
+[lua-api] lua_settable(-5) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="__tostring") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("__tostring")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a69c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("__tostring"), func#37]
+[lua-api] lua_settable(-5) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="accept") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("accept")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa290) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("accept"), func#38]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="bind") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("bind")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9cd0) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("bind"), func#39]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="close") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("close")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9df0) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("close"), func#40]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="connect") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("connect")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa180) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("connect"), func#41]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="dirty") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("dirty")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa140) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("dirty"), func#42]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="getfamily") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("getfamily")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa3c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("getfamily"), func#43]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="getfd") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("getfd")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9db0) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("getfd"), func#44]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="getoption") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("getoption")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa100) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("getoption"), func#45]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="getpeername") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("getpeername")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa0c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("getpeername"), func#46]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="getsockname") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("getsockname")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa080) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("getsockname"), func#47]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="getstats") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("getstats")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa050) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("getstats"), func#48]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="setstats") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("setstats")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa020) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("setstats"), func#49]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="listen") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("listen")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9f70) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("listen"), func#50]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="receive") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("receive")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9f40) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("receive"), func#51]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="send") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("send")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9f10) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("send"), func#52]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="setfd") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("setfd")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9ed0) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("setfd"), func#53]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="setoption") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("setoption")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9e90) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("setoption"), func#54]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="setpeername") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("setpeername")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa180) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("setpeername"), func#55]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="setsockname") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("setsockname")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9cd0) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("setsockname"), func#56]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="settimeout") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("settimeout")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9e60) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("settimeout"), func#57]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="gettimeout") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("gettimeout")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9e30) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("gettimeout"), func#58]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_pushstring(text="shutdown") top=5 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("shutdown")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9c70) top=6 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940), str("shutdown"), func#59]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("__index"), table(0x56273d81a940)]
+[lua-api] lua_settable(-3) top=2 stack=[table(0x56273d636cf0), table(0x56273d774c10)]
+[lua-api] lua_settop(-2) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_newtable() top=2 stack=[table(0x56273d636cf0), table(0x56273d6c2810)]
+[lua-api] luaL_newmetatable(tcp{server}) top=2 stack=[table(0x56273d636cf0), table(0x56273d6c2810)]
+[lua-api] lua_pushstring(text="__index") top=3 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index")]
+[lua-api] lua_newtable() top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="class") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("class")]
+[lua-api] lua_pushstring(text="tcp{server}") top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("class"), str("tcp{server}")]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="__gc") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("__gc")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9df0) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("__gc"), func#60]
+[lua-api] lua_settable(-5) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="__tostring") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("__tostring")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a69c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("__tostring"), func#61]
+[lua-api] lua_settable(-5) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="accept") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("accept")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa290) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("accept"), func#62]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="bind") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("bind")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9cd0) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("bind"), func#63]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="close") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("close")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9df0) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("close"), func#64]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="connect") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("connect")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa180) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("connect"), func#65]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="dirty") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("dirty")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa140) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("dirty"), func#66]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="getfamily") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("getfamily")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa3c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("getfamily"), func#67]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="getfd") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("getfd")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9db0) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("getfd"), func#68]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="getoption") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("getoption")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa100) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("getoption"), func#69]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="getpeername") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("getpeername")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa0c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("getpeername"), func#70]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="getsockname") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("getsockname")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa080) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("getsockname"), func#71]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="getstats") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("getstats")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa050) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("getstats"), func#72]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="setstats") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("setstats")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa020) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("setstats"), func#73]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="listen") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("listen")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9f70) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("listen"), func#74]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="receive") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("receive")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9f40) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("receive"), func#75]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="send") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("send")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9f10) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("send"), func#76]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="setfd") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("setfd")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9ed0) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("setfd"), func#77]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="setoption") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("setoption")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9e90) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("setoption"), func#78]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="setpeername") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("setpeername")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa180) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("setpeername"), func#79]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="setsockname") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("setsockname")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9cd0) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("setsockname"), func#80]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="settimeout") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("settimeout")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9e60) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("settimeout"), func#81]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="gettimeout") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("gettimeout")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9e30) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("gettimeout"), func#82]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_pushstring(text="shutdown") top=5 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("shutdown")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9c70) top=6 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90), str("shutdown"), func#83]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("__index"), table(0x56273d778f90)]
+[lua-api] lua_settable(-3) top=2 stack=[table(0x56273d636cf0), table(0x56273d6c2810)]
+[lua-api] lua_settop(-2) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_getfield(-10000, tcp{master}) top=2 stack=[table(0x56273d636cf0), table(0x56273d80fd70)]
+[lua-api] lua_pushstring(text="tcp{any}") top=3 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("tcp{any}")]
+[lua-api] lua_pushboolean(1) top=4 stack=[table(0x56273d636cf0), table(0x56273d80fd70), str("tcp{any}"), bool(true)]
+[lua-api] lua_settable(-3) top=2 stack=[table(0x56273d636cf0), table(0x56273d80fd70)]
+[lua-api] lua_settop(-2) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_getfield(-10000, tcp{client}) top=2 stack=[table(0x56273d636cf0), table(0x56273d774c10)]
+[lua-api] lua_pushstring(text="tcp{any}") top=3 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("tcp{any}")]
+[lua-api] lua_pushboolean(1) top=4 stack=[table(0x56273d636cf0), table(0x56273d774c10), str("tcp{any}"), bool(true)]
+[lua-api] lua_settable(-3) top=2 stack=[table(0x56273d636cf0), table(0x56273d774c10)]
+[lua-api] lua_settop(-2) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_getfield(-10000, tcp{server}) top=2 stack=[table(0x56273d636cf0), table(0x56273d6c2810)]
+[lua-api] lua_pushstring(text="tcp{any}") top=3 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("tcp{any}")]
+[lua-api] lua_pushboolean(1) top=4 stack=[table(0x56273d636cf0), table(0x56273d6c2810), str("tcp{any}"), bool(true)]
+[lua-api] lua_settable(-3) top=2 stack=[table(0x56273d636cf0), table(0x56273d6c2810)]
+[lua-api] lua_settop(-2) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] luaL_checkstack(1, too many upvalues) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_checkstack(1) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="tcp") top=2 stack=[table(0x56273d636cf0), str("tcp")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9c60) top=3 stack=[table(0x56273d636cf0), str("tcp"), func#84]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="tcp4") top=2 stack=[table(0x56273d636cf0), str("tcp4")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9c50) top=3 stack=[table(0x56273d636cf0), str("tcp4"), func#85]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="tcp6") top=2 stack=[table(0x56273d636cf0), str("tcp6")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9c40) top=3 stack=[table(0x56273d636cf0), str("tcp6"), func#86]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="connect") top=2 stack=[table(0x56273d636cf0), str("connect")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9920) top=3 stack=[table(0x56273d636cf0), str("connect"), func#87]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_settop(-1) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_newtable() top=2 stack=[table(0x56273d636cf0), table(0x56273d7693c0)]
+[lua-api] luaL_newmetatable(udp{connected}) top=2 stack=[table(0x56273d636cf0), table(0x56273d7693c0)]
+[lua-api] lua_pushstring(text="__index") top=3 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index")]
+[lua-api] lua_newtable() top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="class") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("class")]
+[lua-api] lua_pushstring(text="udp{connected}") top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("class"), str("udp{connected}")]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="__gc") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("__gc")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538ab160) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("__gc"), func#88]
+[lua-api] lua_settable(-5) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="__tostring") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("__tostring")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a69c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("__tostring"), func#89]
+[lua-api] lua_settable(-5) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="close") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("close")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538ab160) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("close"), func#90]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="dirty") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("dirty")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538ab130) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("dirty"), func#91]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="getfamily") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("getfamily")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538ab1a0) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("getfamily"), func#92]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="getfd") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("getfd")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa6c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("getfd"), func#93]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="getpeername") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("getpeername")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538ab100) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("getpeername"), func#94]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="getsockname") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("getsockname")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538ab0d0) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("getsockname"), func#95]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="receive") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("receive")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aaf10) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("receive"), func#96]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="receivefrom") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("receivefrom")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aac40) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("receivefrom"), func#97]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="send") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("send")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aab30) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("send"), func#98]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="sendto") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("sendto")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa900) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("sendto"), func#99]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="setfd") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("setfd")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa8c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("setfd"), func#100]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="setoption") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("setoption")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa880) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("setoption"), func#101]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="getoption") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("getoption")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa840) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("getoption"), func#102]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="setpeername") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("setpeername")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa700) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("setpeername"), func#103]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="setsockname") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("setsockname")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa5f0) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("setsockname"), func#104]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="settimeout") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("settimeout")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa5c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("settimeout"), func#105]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_pushstring(text="gettimeout") top=5 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("gettimeout")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa590) top=6 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310), str("gettimeout"), func#106]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("__index"), table(0x56273d80f310)]
+[lua-api] lua_settable(-3) top=2 stack=[table(0x56273d636cf0), table(0x56273d7693c0)]
+[lua-api] lua_settop(-2) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_newtable() top=2 stack=[table(0x56273d636cf0), table(0x56273d7def50)]
+[lua-api] luaL_newmetatable(udp{unconnected}) top=2 stack=[table(0x56273d636cf0), table(0x56273d7def50)]
+[lua-api] lua_pushstring(text="__index") top=3 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index")]
+[lua-api] lua_newtable() top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="class") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("class")]
+[lua-api] lua_pushstring(text="udp{unconnected}") top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("class"), str("udp{unconnected}")]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="__gc") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("__gc")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538ab160) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("__gc"), func#107]
+[lua-api] lua_settable(-5) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="__tostring") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("__tostring")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a69c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("__tostring"), func#108]
+[lua-api] lua_settable(-5) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="close") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("close")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538ab160) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("close"), func#109]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="dirty") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("dirty")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538ab130) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("dirty"), func#110]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="getfamily") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("getfamily")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538ab1a0) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("getfamily"), func#111]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="getfd") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("getfd")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa6c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("getfd"), func#112]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="getpeername") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("getpeername")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538ab100) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("getpeername"), func#113]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="getsockname") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("getsockname")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538ab0d0) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("getsockname"), func#114]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="receive") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("receive")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aaf10) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("receive"), func#115]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="receivefrom") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("receivefrom")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aac40) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("receivefrom"), func#116]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="send") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("send")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aab30) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("send"), func#117]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="sendto") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("sendto")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa900) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("sendto"), func#118]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="setfd") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("setfd")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa8c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("setfd"), func#119]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="setoption") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("setoption")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa880) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("setoption"), func#120]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="getoption") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("getoption")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa840) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("getoption"), func#121]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="setpeername") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("setpeername")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa700) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("setpeername"), func#122]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="setsockname") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("setsockname")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa5f0) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("setsockname"), func#123]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="settimeout") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("settimeout")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa5c0) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("settimeout"), func#124]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_pushstring(text="gettimeout") top=5 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("gettimeout")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa590) top=6 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0), str("gettimeout"), func#125]
+[lua-api] lua_settable(-3) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("__index"), table(0x56273d7b47d0)]
+[lua-api] lua_settable(-3) top=2 stack=[table(0x56273d636cf0), table(0x56273d7def50)]
+[lua-api] lua_settop(-2) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_getfield(-10000, udp{connected}) top=2 stack=[table(0x56273d636cf0), table(0x56273d7693c0)]
+[lua-api] lua_pushstring(text="udp{any}") top=3 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("udp{any}")]
+[lua-api] lua_pushboolean(1) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("udp{any}"), bool(true)]
+[lua-api] lua_settable(-3) top=2 stack=[table(0x56273d636cf0), table(0x56273d7693c0)]
+[lua-api] lua_settop(-2) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_getfield(-10000, udp{unconnected}) top=2 stack=[table(0x56273d636cf0), table(0x56273d7def50)]
+[lua-api] lua_pushstring(text="udp{any}") top=3 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("udp{any}")]
+[lua-api] lua_pushboolean(1) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("udp{any}"), bool(true)]
+[lua-api] lua_settable(-3) top=2 stack=[table(0x56273d636cf0), table(0x56273d7def50)]
+[lua-api] lua_settop(-2) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_getfield(-10000, udp{connected}) top=2 stack=[table(0x56273d636cf0), table(0x56273d7693c0)]
+[lua-api] lua_pushstring(text="select{able}") top=3 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("select{able}")]
+[lua-api] lua_pushboolean(1) top=4 stack=[table(0x56273d636cf0), table(0x56273d7693c0), str("select{able}"), bool(true)]
+[lua-api] lua_settable(-3) top=2 stack=[table(0x56273d636cf0), table(0x56273d7693c0)]
+[lua-api] lua_settop(-2) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_getfield(-10000, udp{unconnected}) top=2 stack=[table(0x56273d636cf0), table(0x56273d7def50)]
+[lua-api] lua_pushstring(text="select{able}") top=3 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("select{able}")]
+[lua-api] lua_pushboolean(1) top=4 stack=[table(0x56273d636cf0), table(0x56273d7def50), str("select{able}"), bool(true)]
+[lua-api] lua_settable(-3) top=2 stack=[table(0x56273d636cf0), table(0x56273d7def50)]
+[lua-api] lua_settop(-2) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] luaL_checkstack(1, too many upvalues) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_checkstack(1) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="udp") top=2 stack=[table(0x56273d636cf0), str("udp")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538ab200) top=3 stack=[table(0x56273d636cf0), str("udp"), func#126]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="udp4") top=2 stack=[table(0x56273d636cf0), str("udp4")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa580) top=3 stack=[table(0x56273d636cf0), str("udp4"), func#127]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="udp6") top=2 stack=[table(0x56273d636cf0), str("udp6")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538aa570) top=3 stack=[table(0x56273d636cf0), str("udp6"), func#128]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_settop(-1) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushlstring(len=13, text="_DATAGRAMSIZE") top=2 stack=[table(0x56273d636cf0), str("_DATAGRAMSIZE")]
+[lua-api] lua_pushinteger(8192) top=3 stack=[table(0x56273d636cf0), str("_DATAGRAMSIZE"), int(8192)]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="_SETSIZE") top=2 stack=[table(0x56273d636cf0), str("_SETSIZE")]
+[lua-api] lua_pushinteger(1024) top=3 stack=[table(0x56273d636cf0), str("_SETSIZE"), int(1024)]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="_SOCKETINVALID") top=2 stack=[table(0x56273d636cf0), str("_SOCKETINVALID")]
+[lua-api] lua_pushinteger(-1) top=3 stack=[table(0x56273d636cf0), str("_SOCKETINVALID"), int(-1)]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] luaL_checkstack(1, too many upvalues) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_checkstack(1) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_pushstring(text="select") top=2 stack=[table(0x56273d636cf0), str("select")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a9500) top=3 stack=[table(0x56273d636cf0), str("select"), func#129]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_settop(-1) top=1 stack=[table(0x56273d636cf0)]
+[lua-api] lua_newtable() top=1 stack=[table(0x56273d76c700)]
+[lua-api] luaL_checkstack(1, too many upvalues) top=1 stack=[table(0x56273d76c700)]
+[lua-api] lua_checkstack(1) top=1 stack=[table(0x56273d76c700)]
+[lua-api] lua_pushstring(text="dot") top=2 stack=[table(0x56273d76c700), str("dot")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f365389fa70) top=3 stack=[table(0x56273d76c700), str("dot"), func#168]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d76c700)]
+[lua-api] lua_pushstring(text="b64") top=2 stack=[table(0x56273d76c700), str("b64")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a03a0) top=3 stack=[table(0x56273d76c700), str("b64"), func#169]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d76c700)]
+[lua-api] lua_pushstring(text="eol") top=2 stack=[table(0x56273d76c700), str("eol")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f365389fef0) top=3 stack=[table(0x56273d76c700), str("eol"), func#170]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d76c700)]
+[lua-api] lua_pushstring(text="qp") top=2 stack=[table(0x56273d76c700), str("qp")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a0170) top=3 stack=[table(0x56273d76c700), str("qp"), func#171]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d76c700)]
+[lua-api] lua_pushstring(text="qpwrp") top=2 stack=[table(0x56273d76c700), str("qpwrp")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f365389f8d0) top=3 stack=[table(0x56273d76c700), str("qpwrp"), func#172]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d76c700)]
+[lua-api] lua_pushstring(text="unb64") top=2 stack=[table(0x56273d76c700), str("unb64")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a0700) top=3 stack=[table(0x56273d76c700), str("unb64"), func#173]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d76c700)]
+[lua-api] lua_pushstring(text="unqp") top=2 stack=[table(0x56273d76c700), str("unqp")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f365389fda0) top=3 stack=[table(0x56273d76c700), str("unqp"), func#174]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d76c700)]
+[lua-api] lua_pushstring(text="wrp") top=2 stack=[table(0x56273d76c700), str("wrp")]
+[lua-api] lua_pushcclosure(n=0, f=0x7f365389f730) top=3 stack=[table(0x56273d76c700), str("wrp"), func#175]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d76c700)]
+[lua-api] lua_settop(-1) top=1 stack=[table(0x56273d76c700)]
+[lua-api] lua_pushstring(text="_VERSION") top=2 stack=[table(0x56273d76c700), str("_VERSION")]
+[lua-api] lua_pushstring(text="MIME 1.0.3") top=3 stack=[table(0x56273d76c700), str("_VERSION"), str("MIME 1.0.3")]
+[lua-api] lua_settable(-3) top=1 stack=[table(0x56273d76c700)]
+init order: [("socket", "__init@socket"), ("socket.headers", "__init@socket.headers"), ("ssl.https", "__init@ssl.https"), ("ltn12", "__init@ltn12"), ("mime", "__init@mime"), ("socket.url", "__init@socket.url"), ("socket.http", "__init@socket.http")]
+[lua-cfunc] -> newtry 0x7f36538a8f50 nargs=0 top=0 stack=[]
+[lua-api] lua_settop(1) top=1 stack=[nil]
+[lua-api] lua_type(1) top=1 stack=[nil]
+[lua-api] lua_pushcclosure(n=0, f=0x7f36538a8ef0) top=2 stack=[nil, func#202]
+[lua-api] lua_pushvalue(-10003) top=3 stack=[nil, func#202, table(0x56273d632960)]
+[lua-api] lua_insert(-2) top=3 stack=[nil, table(0x56273d632960), func#202]
+[lua-api] lua_pushcclosure(n=2, f=0x7f36538a8fc0) top=2 stack=[nil, func#203]
+[lua-cfunc] <- newtry 0x7f36538a8f50 nret=1 top=2 stack=[nil, func#203]
+init socket returned [LuaValue.Table(LuaTable {table: {source: <closure@76>, udp: LuaValue.Function(LuaFunction {handle: 137}), _SETSIZE: LuaValue.Int(1024), newtry: LuaValue.Function(LuaFunction {handle: 132}), connect4: <function@1>, sinkt: LuaTable {table: {keep-open: <closure@64>, close-when-done: <closure@60>, default: <closure@64>}, metamethods: {}}, _DEBUG: LuaValue.Bool(true), udp6: LuaValue.Function(LuaFunction {handle: 148}), sourcet: LuaTable {table: {by-length: <closure@68>, until-closed: <closure@72>, default: <closure@72>}, metamethods: {}}, dns: LuaValue.Table(LuaTable {table: {gethostname: LuaValue.Function(LuaFunction {handle: 139}), getnameinfo: LuaValue.Function(LuaFunction {handle: 142}), getaddrinfo: LuaValue.Function(LuaFunction {handle: 143}), tohostname: LuaValue.Function(LuaFunction {handle: 140}), toip: LuaValue.Function(LuaFunction {handle: 141})}, metamethods: {}}), tcp: LuaValue.Function(LuaFunction {handle: 134}), udp4: LuaValue.Function(LuaFunction {handle: 136}), select: LuaValue.Function(LuaFunction {handle: 145}), connect6: <function@2>, _VERSION: LuaValue.String(LuaSocket 3.0.0), connect: LuaValue.Function(LuaFunction {handle: 135}), tcp6: LuaValue.Function(LuaFunction {handle: 144}), gettime: LuaValue.Function(LuaFunction {handle: 130}), skip: LuaValue.Function(LuaFunction {handle: 133}), sleep: LuaValue.Function(LuaFunction {handle: 131}), bind: <function@3>, BLOCKSIZE: 2048, __unload: LuaValue.Function(LuaFunction {handle: 138}), protect: LuaValue.Function(LuaFunction {handle: 146}), _DATAGRAMSIZE: LuaValue.Int(8192), try: <native function>, tcp4: LuaValue.Function(LuaFunction {handle: 147}), choose: <function@4>, _SOCKETINVALID: LuaValue.Int(-1), sink: <closure@76>}, metamethods: {}})]
+init socket.headers returned [LuaValue.Table(LuaTable {table: {canonic: LuaTable {table: {allow: Allow, content-description: Content-Description, host: Host, proxy-authenticate: Proxy-Authenticate, pragma: Pragma, cc: Cc, resent-message-id: Resent-Message-ID, etag: ETag, if-match: If-Match, remote-mta: Remote-MTA, location: Location, message-id: Message-ID, retry-after: Retry-After, authorization: Authorization, will-retry-until: Will-Retry-Until, expect: Expect, if-modified-since: If-Modified-Since, if-unmodified-since: If-Unmodified-Since, content-disposition: Content-Disposition, date: Date, arrival-date: Arrival-Date, diagnostic-code: Diagnostic-Code, original-envelope-id: Original-Envelope-ID, resent-date: Resent-Date, sender: Sender, warning: Warning, return-path: Return-Path, range: Range, cookie: Cookie, accept-language: Accept-Language, accept-ranges: Accept-Ranges, content-length: Content-Length, age: Age, content-type: Content-Type, if-range: If-Range, expires: Expires, resent-reply-to: Resent-Reply-To, resent-sender: Resent-Sender, keywords: Keywords, upgrade: Upgrade, via: Via, www-authenticate: WWW-Authenticate, from: From, referer: Referer, content-language: Content-Language, reply-to: Reply-To, alternate-recipient: Alternate-Recipient, accept: Accept, proxy-authorization: Proxy-Authorization, bcc: Bcc, action: Action, smtp-remote-recipient: SMTP-Remote-Recipient, original-recipient: Original-Recipient, final-log-id: Final-Log-ID, content-md5: Content-MD5, content-encoding: Content-Encoding, connection: Connection, content-id: Content-ID, max-forwards: Max-Forwards, mime-version: MIME-Version, subject: Subject, if-none-match: If-None-Match, resent-to: Resent-To, trailer: Trailer, x-mailer: X-Mailer, resent-from: Resent-From, comments: Comments, resent-bcc: Resent-Bcc, accept-charset: Accept-Charset, content-transfer-encoding: Content-Transfer-Encoding, last-attempt-date: Last-Attempt-Date, references: References, reporting-mta: Reporting-MTA, to: To, user-agent: User-Agent, final-recipient: Final-Recipient, content-range: Content-Range, last-modified: Last-Modified, server: Server, cache-control: Cache-Control, dsn-gateway: DSN-Gateway, in-reply-to: In-Reply-To, resent-cc: Resent-Cc, transfer-encoding: Transfer-Encoding, content-location: Content-Location, received: Received, accept-encoding: Accept-Encoding, received-from-mta: Received-From-MTA, status: Status, te: TE, vary: Vary}, metamethods: {}}}, metamethods: {}})]
+init ssl.https returned [LuaValue.Nil]
+init ltn12 returned [LuaValue.Table(LuaTable {table: {_VERSION: LTN12 1.0.3, source: LuaTable {table: {table: <function@15>, error: <function@11>, simplify: <function@13>, string: <function@14>, file: <function@12>, cat: <function@18>, rewind: <function@16>, chain: <function@17>, empty: <function@10>}, metamethods: {}}, sink: LuaTable {table: {table: <function@19>, simplify: <function@20>, error: <function@23>, file: <function@21>, null: <function@22>, chain: <function@24>}, metamethods: {}}, filter: LuaTable {table: {chain: <function@9>, cycle: <function@8>}, metamethods: {}}, pump: LuaTable {table: {all: <function@26>, step: <function@25>}, metamethods: {}}, BLOCKSIZE: 2048}, metamethods: {}})]
+init mime returned [LuaValue.Table(LuaTable {table: {qp: LuaValue.Function(LuaFunction {handle: 182}), wrap: <closure@125>, b64: LuaValue.Function(LuaFunction {handle: 177}), qpwrp: LuaValue.Function(LuaFunction {handle: 181}), unb64: LuaValue.Function(LuaFunction {handle: 180}), normalize: <function@28>, decode: <closure@125>, stuff: <function@29>, dot: LuaValue.Function(LuaFunction {handle: 183}), encodet: LuaTable {table: {base64: <closure@126>, quoted-printable: <closure@127>}, metamethods: {}}, decodet: LuaTable {table: {base64: <closure@128>, quoted-printable: <closure@129>}, metamethods: {}}, encode: <closure@125>, eol: LuaValue.Function(LuaFunction {handle: 178}), unqp: LuaValue.Function(LuaFunction {handle: 179}), _VERSION: LuaValue.String(MIME 1.0.3), wrapt: LuaTable {table: {quoted-printable: <closure@131>, text: <closure@130>, default: <closure@130>, base64: <closure@130>}, metamethods: {}}, wrp: LuaValue.Function(LuaFunction {handle: 176})}, metamethods: {}})]
+🔥 JIT: Hot loop detected at func 142 ip 16 - starting trace recording!
+🔍 JIT: Scanning trace inputs for specialization...
+🔍 JIT: Found array in reg 14
+🔬 JIT: Specializing trace input reg 14 (Array(Type { kind: Int, span: Span { start_line: 0, start_col: 0, end_line: 0, end_col: 0 } }))
+🗑️  JIT: Removing specialization tracking for reg 14 (being overwritten)
+🛑 JIT: stop_recording called, recording=true, specialized_regs=0
+🏁 JIT: Finalizing trace - reboxing 0 specialized values, dropping 0 leaked values
+⚠️  JIT: Runtime error: Trace aborted: unsupported index operation
+init socket.url returned [LuaValue.Table(LuaTable {table: {absolute: <function@35>, build_path: <function@37>, parse_path: <function@36>, escape: <function@31>, unescape: <function@32>, build: <function@34>, parse: <function@33>, _VERSION: URL 1.0.3}, metamethods: {}})]
+init socket.http returned [LuaValue.Table(LuaTable {table: {request: <native function>, schemes: LuaTable {table: {https: LuaTable {table: {port: 443, create: <closure@169>}, metamethods: {}}, http: LuaTable {table: {port: 80, create: <closure@168>}, metamethods: {}}}, metamethods: {}}, TIMEOUT: 60, USERAGENT: LuaValue.String(LuaSocket 3.0.0), open: <function@39>, genericform: <closure@187>}, metamethods: {}})]
+luasocket core loaded
+_DATAGRAMSIZE = LuaValue.Int(8192)
+_SETSIZE = LuaValue.Int(1024)
+[lua-cfunc] -> <anonymous> 0x7f36538a8fc0 nargs=2 top=2 stack=[str("/"), str("invalid path 'nil'")]
+[lua-api] lua_toboolean(1) top=2 stack=[str("/"), str("invalid path 'nil'")]
+[lua-api] lua_type(1) top=2 stack=[str("/"), str("invalid path 'nil'")]
+[lua-api] lua_gettop() top=2 stack=[str("/"), str("invalid path 'nil'")]
+[lua-cfunc] <- <anonymous> 0x7f36538a8fc0 nret=2 top=2 stack=[str("/"), str("invalid path 'nil'")]
+[lua-cfunc] -> tcp 0x7f36538a9c60 nargs=0 top=0 stack=[]
+[lua-api] lua_newuserdata(8320) top=1 stack=[ud#0]
+[lua-api] lua_getfield(-10000, tcp{master}) top=2 stack=[ud#0, table(0x56273d80fd70)]
+[lua-api] lua_setmetatable(-2) top=1 stack=[ud#0]
+[lua-cfunc] <- tcp 0x7f36538a9c60 nret=1 top=1 stack=[ud#0]
+[lua-cfunc] -> <anonymous> 0x7f36538a8fc0 nargs=1 top=1 stack=[ud#0]
+[lua-api] lua_toboolean(1) top=1 stack=[ud#0]
+[lua-api] lua_type(1) top=1 stack=[ud#0]
+[lua-api] lua_gettop() top=1 stack=[ud#0]
+[lua-cfunc] <- <anonymous> 0x7f36538a8fc0 nret=1 top=1 stack=[ud#0]
+[lua-cfunc] -> newtry 0x7f36538a8f50 nargs=1 top=1 stack=[func#305]
+[lua-api] lua_settop(1) top=1 stack=[func#305]
+[lua-api] lua_type(1) top=1 stack=[func#305]
+[lua-api] lua_pushvalue(-10003) top=2 stack=[func#305, table(0x56273d632960)]
+[lua-api] lua_insert(-2) top=2 stack=[table(0x56273d632960), func#305]
+[lua-api] lua_pushcclosure(n=2, f=0x7f36538a8fc0) top=1 stack=[func#306]
+[lua-cfunc] <- newtry 0x7f36538a8f50 nret=1 top=1 stack=[func#306]
+[lua-cfunc] -> settimeout 0x7f36538a9e60 nargs=2 top=2 stack=[ud#0, int(60)]
+[lua-api] lua_getmetatable(1) top=3 stack=[ud#0, int(60), table(0x56273d80fd70)]
+[lua-api] lua_pushstring(text="tcp{any}") top=4 stack=[ud#0, int(60), table(0x56273d80fd70), str("tcp{any}")]
+[lua-api] lua_gettable(-2) top=4 stack=[ud#0, int(60), table(0x56273d80fd70), bool(true)]
+[lua-api] lua_type(-1) top=4 stack=[ud#0, int(60), table(0x56273d80fd70), bool(true)]
+[lua-api] lua_settop(-3) top=2 stack=[ud#0, int(60)]
+[lua-api] lua_touserdata(1) top=2 stack=[ud#0, int(60)]
+[lua-api] lua_type(2) top=2 stack=[ud#0, int(60)]
+[lua-api] lua_tonumber(2) top=2 stack=[ud#0, int(60)]
+[lua-api] lua_type(3) top=2 stack=[ud#0, int(60)]
+[lua-api] luaL_optlstring(3) top=2 stack=[ud#0, int(60)]
+[lua-api] lua_pushnumber(1) top=3 stack=[ud#0, int(60), num(1)]
+[lua-cfunc] <- settimeout 0x7f36538a9e60 nret=1 top=3 stack=[ud#0, int(60), num(1)]
+[lua-cfunc] -> <anonymous> 0x7f36538a8fc0 nargs=1 top=1 stack=[num(1)]
+[lua-api] lua_toboolean(1) top=1 stack=[num(1)]
+[lua-api] lua_type(1) top=1 stack=[num(1)]
+[lua-api] lua_gettop() top=1 stack=[num(1)]
+[lua-cfunc] <- <anonymous> 0x7f36538a8fc0 nret=1 top=1 stack=[num(1)]
+[lua-cfunc] -> connect 0x7f36538aa180 nargs=3 top=3 stack=[ud#0, str("example.com"), int(80)]
+[lua-api] lua_getmetatable(1) top=4 stack=[ud#0, str("example.com"), int(80), table(0x56273d80fd70)]
+[lua-api] lua_pushstring(text="tcp{any}") top=5 stack=[ud#0, str("example.com"), int(80), table(0x56273d80fd70), str("tcp{any}")]
+[lua-api] lua_gettable(-2) top=5 stack=[ud#0, str("example.com"), int(80), table(0x56273d80fd70), bool(true)]
+[lua-api] lua_type(-1) top=5 stack=[ud#0, str("example.com"), int(80), table(0x56273d80fd70), bool(true)]
+[lua-api] lua_settop(-3) top=3 stack=[ud#0, str("example.com"), int(80)]
+[lua-api] lua_touserdata(1) top=3 stack=[ud#0, str("example.com"), int(80)]
+[lua-api] lua_tolstring(2) top=3 stack=[ud#0, str("example.com"), int(80)]
+[lua-api] luaL_checklstring(2) top=3 stack=[ud#0, str("example.com"), int(80)]
+[lua-api] lua_tolstring(3) top=3 stack=[ud#0, str("example.com"), int(80)]
+[lua-api] luaL_checklstring(3) top=3 stack=[ud#0, str("example.com"), int(80)]
+[lua-api] lua_getfield(-10000, tcp{client}) top=4 stack=[ud#0, str("example.com"), int(80), table(0x56273d774c10)]
+[lua-api] lua_setmetatable(1) top=3 stack=[ud#0, str("example.com"), int(80)]
+[lua-api] lua_pushnil() top=4 stack=[ud#0, str("example.com"), int(80), nil]
+[lua-api] lua_pushstring(text="temporary failure in name resolution") top=5 stack=[ud#0, str("example.com"), int(80), nil, str("temporary failure in name resolution")]
+[lua-cfunc] <- connect 0x7f36538aa180 nret=2 top=5 stack=[ud#0, str("example.com"), int(80), nil, str("temporary failure in name resolution")]
+[lua-cfunc] -> <anonymous> 0x7f36538a8fc0 nargs=1 top=2 stack=[nil, str("temporary failure in name resolution")]
+[lua-api] lua_toboolean(1) top=2 stack=[nil, str("temporary failure in name resolution")]
+[lua-api] lua_type(1) top=2 stack=[nil, str("temporary failure in name resolution")]
+[lua-api] lua_pushvalue(-10004) top=3 stack=[nil, str("temporary failure in name resolution"), func#305]
+[lua-cfunc] -> close 0x7f36538a9df0 nargs=1 top=1 stack=[ud#0]
+[lua-api] lua_getmetatable(1) top=2 stack=[ud#0, table(0x56273d774c10)]
+[lua-api] lua_pushstring(text="tcp{any}") top=3 stack=[ud#0, table(0x56273d774c10), str("tcp{any}")]
+[lua-api] lua_gettable(-2) top=3 stack=[ud#0, table(0x56273d774c10), bool(true)]
+[lua-api] lua_type(-1) top=3 stack=[ud#0, table(0x56273d774c10), bool(true)]
+[lua-api] lua_settop(-3) top=1 stack=[ud#0]
+[lua-api] lua_touserdata(1) top=1 stack=[ud#0]
+[lua-api] lua_pushnumber(1) top=2 stack=[ud#0, num(1)]
+[lua-cfunc] <- close 0x7f36538a9df0 nret=1 top=2 stack=[ud#0, num(1)]
+[lua-api] lua_call(0, 0) top=1 stack=[ud#0]
+[lua-api] lua_settop(2) top=2 stack=[ud#0, nil]
+[lua-api] lua_newtable() top=3 stack=[ud#0, nil, table(0x56273d641040)]
+[lua-api] lua_pushvalue(-2) top=4 stack=[ud#0, nil, table(0x56273d641040), nil]
+[lua-api] lua_rawseti(-2, 1) top=3 stack=[ud#0, nil, table(0x56273d641040)]
+[lua-api] lua_pushvalue(-10003) top=4 stack=[ud#0, nil, table(0x56273d641040), table(0x56273d632960)]
+[lua-api] lua_setmetatable(-2) top=3 stack=[ud#0, nil, table(0x56273d641040)]
+[lua-api] lua_error() top=2 stack=[ud#0, nil]
+[lua-cfunc] <- <anonymous> 0x7f36538a8fc0 nret=0 top=2 stack=[ud#0, nil]
+http.request returned: [LuaValue.Nil, LuaValue.String(Runtime error at line 252 in socket.http.open: table(0x56273d641040)
+Stack trace:
+  [0] __script (line 8)
+  [1] socket.http.request (line 539)
+  [2] <lambda@189> (line 530)
+  [3] <lambda@188> (line 520)
+  [4] <lambda@186> (line 465)
+  [5] socket.http.open (line 252)
+)] (type array)
+http.request status = LuaValue.Nil (code LuaValue.String(Runtime error at line 252 in socket.http.open: table(0x56273d641040)
+Stack trace:
+  [0] __script (line 8)
+  [1] socket.http.request (line 539)
+  [2] <lambda@189> (line 530)
+  [3] <lambda@188> (line 520)
+  [4] <lambda@186> (line 465)
+  [5] socket.http.open (line 252)
+))
+LuaValue.Nil

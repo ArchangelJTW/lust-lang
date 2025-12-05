@@ -1,0 +1,351 @@
+-- Auto-transpiled from Lua module 'socket.smtp'
+use coroutine as coroutine
+use string as string
+use os as os
+use socket as socket
+use socket.tp as socket_tp
+use ltn12 as ltn12
+use socket.headers as socket_headers
+use mime as mime
+use lua as lua
+local __lua_ret: Array<LuaValue> = []
+local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>
+    return items
+end
+local __lua_force_array = function(val: unknown): Array<LuaValue>
+    if val is Array<LuaValue> then
+        return val
+    end
+    return [lua.to_value(val)]
+end
+local __lua_table_from_varargs = function(items: Array<LuaValue>): LuaTable
+    local t = lua.table()
+    local idx: int = 0
+    while idx < items:len() do
+        local v = items:get(idx)
+        if v:is_some() then
+            t[idx + 1] = lua.unwrap(v:unwrap())
+        end
+        idx = idx + 1
+    end
+    return t
+end
+local __lua_truthy = function(val: unknown): bool
+    return lua.is_truthy(val)
+end
+local __lua_first = function(val: unknown): unknown
+    if val is Array<LuaValue> then
+        local first = val:get(0)
+        if first:is_some() then
+            return first:unwrap()
+        end
+        return lua.nil
+    end
+    if val is LuaValue then
+        return val
+    end
+    return val
+end
+local __lua_nth = function(val: unknown, idx: int): unknown
+    if val is Array<LuaValue> then
+        local item = val:get(idx)
+        if item:is_some() then
+            return item:unwrap()
+        end
+        return lua.nil
+    end
+    if idx == 0 then
+        if val is LuaValue then
+            return val
+        end
+        return val
+    end
+    return lua.nil
+end
+local __lua_join = function(prefix: Array<LuaValue>, tail: unknown): Array<LuaValue>
+    local arr = __lua_force_array(tail)
+    local idx: int = 0
+    while idx < arr:len() do
+        local v = arr:get(idx)
+        if v:is_some() then
+            prefix:push(v:unwrap())
+        end
+        idx = idx + 1
+    end
+    return prefix
+end
+local __lua_and = function(a: unknown, b: unknown): unknown
+    if __lua_truthy(a) then
+        return b
+    end
+    return a
+end
+local __lua_or = function(a: unknown, b: unknown): unknown
+    if __lua_truthy(a) then
+        return a
+    end
+    return b
+end
+local assert = function(cond: LuaValue, msg: LuaValue): LuaValue
+    if __lua_truthy(cond) then
+        return cond
+    end
+    error(msg or "assertion failed")
+end
+local _G: Map<unknown, unknown> = {}
+_G["assert"] = lua.to_value(assert)
+_G["error"] = lua.to_value(error)
+_G["ipairs"] = lua.to_value(ipairs)
+_G["pairs"] = lua.to_value(pairs)
+_G["setmetatable"] = lua.to_value(setmetatable)
+_G["select"] = lua.to_value(select)
+_G["unpack"] = lua.to_value(unpack)
+_G["tostring"] = lua.to_value(tostring)
+_G["tonumber"] = lua.to_value(tonumber)
+_G["type"] = lua.to_value(type)
+local type_ = type
+_G["string"] = lua.to_value(string)
+local module_ = _G["module"]
+local base = _G
+local coroutine = __lua_first(coroutine)
+local string = __lua_first(string)
+local math = __lua_first(lua.nil)
+local os = __lua_first(os)
+local socket = __lua_first(socket)
+local tp = __lua_first(socket_tp)
+local ltn12 = __lua_first(ltn12)
+local headers = __lua_first(socket_headers)
+local mime = __lua_first(mime)
+socket.smtp = lua.table()
+local _M = socket.smtp
+-----------------------------------------------------------------------------
+-- Program constants
+-----------------------------------------------------------------------------
+-- timeout for connection
+_M.TIMEOUT = lua.to_value(60
+)
+-- default server used to send e-mails
+_M.SERVER = lua.to_value("localhost"
+)
+-- default port
+_M.PORT = lua.to_value(25
+)
+-- domain used in HELO command and default sendmail
+-- If we are under a CGI, try to get from environment
+_M.DOMAIN = __lua_or(__lua_first(os.getenv(lua.to_value("SERVER_NAME"))), lua.to_value("localhost"
+))
+-- default time zone (means we don't know)
+_M.ZONE = lua.to_value("-0000"
+)
+local metat = (function()
+    local __shared___index_0 = lua.table()
+    return LuaTable { table = { ["__index"] = __shared___index_0 }, metamethods = { __index = __shared___index_0 } }
+end)()
+pub function metat_greet(self: LuaValue, domain: LuaValue): Array<LuaValue>
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("EHLO"), __lua_or(domain, _M.DOMAIN)))))
+    return __lua_force_array(lua.socket_skip(lua.to_value(1), self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2.."))))))
+end
+metat.__index.greet = metat_greet
+pub function metat_mail(self: LuaValue, from: LuaValue): Array<LuaValue>
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("MAIL"), lua.op_concat(lua.to_value("FROM:" ), from)))))
+    return __lua_force_array(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
+end
+metat.__index.mail = metat_mail
+pub function metat_rcpt(self: LuaValue, to: LuaValue): Array<LuaValue>
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("RCPT"), lua.op_concat(lua.to_value("TO:" ), to)))))
+    return __lua_force_array(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
+end
+metat.__index.rcpt = metat_rcpt
+pub function metat_data(self: LuaValue, src: LuaValue, step: LuaValue): Array<LuaValue>
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("DATA")))))
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("3..")))))
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "source", src, step))))
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "send", lua.to_value("\r\n.\r\n")))))
+    return __lua_force_array(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
+end
+metat.__index.data = metat_data
+pub function metat_quit(self: LuaValue): Array<LuaValue>
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("QUIT")))))
+    return __lua_force_array(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
+end
+metat.__index.quit = metat_quit
+pub function metat_close(self: LuaValue): Array<LuaValue>
+    return __lua_force_array(__lua_first(lua.call_method(self.tp, "close")))
+end
+metat.__index.close = metat_close
+pub function metat_login(self: LuaValue, user: LuaValue, password: LuaValue): Array<LuaValue>
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("AUTH"), lua.to_value("LOGIN")))))
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("3..")))))
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "send", lua.op_concat(__lua_first(mime.b64(user)), lua.to_value("\r\n"))))))
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("3..")))))
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "send", lua.op_concat(__lua_first(mime.b64(password)), lua.to_value("\r\n"))))))
+    return __lua_force_array(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
+end
+metat.__index.login = metat_login
+pub function metat_plain(self: LuaValue, user: LuaValue, password: LuaValue): Array<LuaValue>
+    local auth = lua.op_concat(lua.to_value("PLAIN " ), __lua_first(mime.b64(lua.op_concat(lua.to_value("\0" ), lua.op_concat(user, lua.op_concat(lua.to_value("\0" ), password))))))
+    __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("AUTH"), auth))))
+    return __lua_force_array(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
+end
+metat.__index.plain = metat_plain
+pub function metat_auth(self: LuaValue, user: LuaValue, password: LuaValue, ext: LuaValue): Array<LuaValue>
+    if __lua_truthy(__lua_or(not __lua_truthy(user), not __lua_truthy(password))) then
+        return __lua_pack([lua.to_value(lua.to_value(1 ))])
+    end
+    if __lua_truthy(__lua_first(string.find(ext, lua.to_value("AUTH[^\n]+LOGIN")))) then
+        return __lua_force_array(__lua_first(lua.call_method(self, "login", user, password)))
+    elseif __lua_truthy(__lua_first(string.find(ext, lua.to_value("AUTH[^\n]+PLAIN")))) then
+        return __lua_force_array(__lua_first(lua.call_method(self, "plain", user, password)))
+    else
+        __lua_first(self.try(lua.nil, lua.to_value("authentication not supported")))
+    end
+end
+metat.__index.auth = metat_auth
+pub function metat_send(self: LuaValue, mailt: LuaValue): Array<LuaValue>
+    __lua_first(__lua_first(lua.call_method(self, "mail", mailt.from)))
+    if __lua_truthy(lua.op_eq(__lua_first(base["type"](mailt.rcpt)), lua.to_value("table" ))) then
+        for i, v in __lua_first(base.ipairs(mailt.rcpt)) do
+            __lua_first(__lua_first(lua.call_method(self, "rcpt", v)))
+        end
+    else
+        __lua_first(__lua_first(lua.call_method(self, "rcpt", mailt.rcpt)))
+    end
+    __lua_first(__lua_first(lua.call_method(self, "data", __lua_first(ltn12.source.chain(mailt.source, mime.stuff())), mailt.step)))
+end
+metat.__index.send = metat_send
+pub function open(server: LuaValue, port: LuaValue, create: LuaValue): Array<LuaValue>
+    local tp = __lua_first(socket.try(tp.connect(__lua_or(server, _M.SERVER), __lua_or(port, _M.PORT), _M.TIMEOUT, create)))
+    local s = __lua_first(base.setmetatable(lua.table_from_entries([("tp", tp)]), metat))
+    -- make sure tp is closed if we get an exception
+    s.try = __lua_first(socket.newtry(function(): Array<LuaValue>
+        __lua_first(__lua_first(lua.call_method(s, "close")))
+    end))
+    return __lua_pack([lua.to_value(s)])
+end
+_M.open = open
+local lower_headers = function(headers: LuaValue): Array<LuaValue>
+    local lower = lua.table()
+    for i, v in __lua_first(base.pairs(__lua_or(headers, lower))) do
+        lower[__lua_first(string.lower(i))] = v
+    end
+    return __lua_pack([lua.to_value(lower)])
+end
+local seqno = lua.to_value(0
+)
+local newboundary = function(): Array<LuaValue>
+    seqno = lua.op_add(seqno, lua.to_value(1
+))
+    return __lua_force_array(string.format(lua.to_value('%s%05d==%05u'), __lua_first(os.date(lua.to_value('%d%m%Y%H%M%S'))), __lua_first(random(lua.to_value(0), lua.to_value(99999))), seqno))
+end
+local send_message
+local send_headers = function(tosend: LuaValue): Array<LuaValue>
+    local canonic = headers.canonic
+    local h = lua.to_value("\r\n"
+)
+    for f, v in __lua_first(base.pairs(tosend)) do
+        h = lua.op_concat(((__lua_or(canonic[f], f))), lua.op_concat(lua.to_value(': ' ), lua.op_concat(v, lua.op_concat(lua.to_value("\r\n" ), h))))
+    end
+    __lua_first(coroutine.yield(h))
+end
+local send_multipart = function(mesgt: LuaValue): Array<LuaValue>
+    local bd = __lua_first(newboundary())
+    local headers = __lua_first(lower_headers(__lua_or(mesgt.headers, lua.table())))
+    headers[lua.to_value('content-type')] = __lua_or(headers[lua.to_value('content-type')], lua.to_value('multipart/mixed'
+))
+    headers[lua.to_value('content-type')] = lua.op_concat(headers[lua.to_value('content-type')], lua.op_concat(lua.to_value(        '; boundary="' ), lua.op_concat(bd, lua.to_value('"'
+))))
+    __lua_first(send_headers(headers))
+    if __lua_truthy(mesgt.body.preamble) then
+        __lua_first(coroutine.yield(mesgt.body.preamble))
+        __lua_first(coroutine.yield(lua.to_value("\r\n")))
+    end
+    for i, m in __lua_first(base.ipairs(mesgt.body)) do
+        __lua_first(coroutine.yield(lua.op_concat(lua.to_value("\r\n--" ), lua.op_concat(bd, lua.to_value("\r\n")))))
+        __lua_first(send_message(m))
+    end
+    __lua_first(-- send last boundary
+    coroutine.yield(lua.op_concat(lua.to_value("\r\n--" ), lua.op_concat(bd, lua.to_value("--\r\n\r\n")))))
+    if __lua_truthy(mesgt.body.epilogue) then
+        __lua_first(coroutine.yield(mesgt.body.epilogue))
+        __lua_first(coroutine.yield(lua.to_value("\r\n")))
+    end
+end
+local send_source = function(mesgt: LuaValue): Array<LuaValue>
+    local headers = __lua_first(lower_headers(__lua_or(mesgt.headers, lua.table())))
+    headers[lua.to_value('content-type')] = __lua_or(headers[lua.to_value('content-type')], lua.to_value(        'text/plain; charset="iso-8859-1"'
+))
+    __lua_first(send_headers(headers))
+    while __lua_truthy(lua.to_value(true)) do
+        local chunk, err
+        local __lua_ret = mesgt.body()
+        chunk = __lua_nth(__lua_ret, 0)
+        err = __lua_nth(__lua_ret, 1)
+        if __lua_truthy(err) then
+            __lua_first(coroutine.yield(lua.nil, err))
+        elseif __lua_truthy(chunk) then
+            __lua_first(coroutine.yield(chunk))
+        else
+        end
+    end
+end
+local send_string = function(mesgt: LuaValue): Array<LuaValue>
+    local headers = __lua_first(lower_headers(__lua_or(mesgt.headers, lua.table())))
+    headers[lua.to_value('content-type')] = __lua_or(headers[lua.to_value('content-type')], lua.to_value(        'text/plain; charset="iso-8859-1"'
+))
+    __lua_first(send_headers(headers))
+    __lua_first(-- send body from string
+    coroutine.yield(mesgt.body))
+end
+send_message = function(mesgt: LuaValue): Array<LuaValue>
+    if __lua_truthy(lua.op_eq(__lua_first(base["type"](mesgt.body)), lua.to_value("table" ))) then
+        __lua_first(send_multipart(mesgt))
+    elseif __lua_truthy(lua.op_eq(__lua_first(base["type"](mesgt.body)), lua.to_value("function" ))) then
+        __lua_first(send_source(mesgt))
+    else
+        __lua_first(send_string(mesgt))
+    end
+end
+local adjust_headers = function(mesgt: LuaValue): Array<LuaValue>
+    local lower = __lua_first(lower_headers(mesgt.headers))
+    lower[lua.to_value("date")] = __lua_or(lower[lua.to_value("date")], lua.op_concat(__lua_first(os.date(lua.to_value("!%a, %d %b %Y %H:%M:%S "))), ((__lua_or(mesgt.zone, _M.ZONE)))))
+    lower[lua.to_value("x-mailer")] = __lua_or(lower[lua.to_value("x-mailer")], socket._VERSION)
+    -- this can't be overriden
+    lower[lua.to_value("mime-version")] = lua.to_value("1.0"
+)
+    return __lua_pack([lua.to_value(lower)])
+end
+pub function message(mesgt: LuaValue): Array<LuaValue>
+    mesgt.headers = __lua_first(adjust_headers(mesgt))
+    local co = __lua_first(coroutine.create(function(): Array<LuaValue>
+        __lua_first(send_message(mesgt))
+    end))
+    return __lua_pack([lua.to_value(function(): Array<LuaValue>
+        local ret, a, b
+        local __lua_ret = coroutine.resume(co)
+        ret = __lua_nth(__lua_ret, 0)
+        a = __lua_nth(__lua_ret, 1)
+        b = __lua_nth(__lua_ret, 2)
+        if __lua_truthy(ret) then
+            local __lua_ret: Array<LuaValue> = [lua.to_value(a)]
+            return __lua_join(__lua_ret, [lua.to_value(b)])
+        else
+            local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+            return __lua_join(__lua_ret, [lua.to_value(a)])
+        end
+    end)])
+end
+_M.message = message
+---------------------------------------------------------------------------
+-- High level SMTP API
+-----------------------------------------------------------------------------
+_M.send = __lua_first(lua.socket_protect(function(mailt: LuaValue): Array<LuaValue>
+    local s = __lua_first(_M.open(mailt.server, mailt.port, mailt.create))
+    local ext = __lua_first(__lua_first(lua.call_method(s, "greet", mailt.domain)))
+    __lua_first(__lua_first(lua.call_method(s, "auth", mailt.user, mailt.password, ext)))
+    __lua_first(__lua_first(lua.call_method(s, "send", mailt)))
+    __lua_first(__lua_first(lua.call_method(s, "quit")))
+    return __lua_force_array(__lua_first(lua.call_method(s, "close")))
+end))
+pub const smtp: LuaValue = socket.smtp
+return __lua_pack([lua.to_value(_M)])

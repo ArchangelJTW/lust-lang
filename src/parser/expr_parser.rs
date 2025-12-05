@@ -471,7 +471,7 @@ impl Parser {
                 ExprKind::Literal(Literal::Bool(false))
             }
 
-            TokenKind::Identifier => {
+            TokenKind::Identifier | TokenKind::Type => {
                 let name = self.expect_identifier()?;
                 if self.check(TokenKind::LeftBrace) {
                     return self.parse_struct_literal(name);

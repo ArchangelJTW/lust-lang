@@ -755,9 +755,22 @@ fn dump_externs(filename: &str) {
             process::exit(1);
         }
     };
-    if resolution.rust().is_empty() {
-        println!("No Rust dependencies configured; nothing to dump.");
+    if resolution.rust().is_empty() && resolution.lua().is_empty() {
+        println!("No external dependencies configured; nothing to dump.");
         return;
+    }
+
+    if !resolution.lua().is_empty() {
+        let names = resolution
+            .lua()
+            .iter()
+            .map(|dep| dep.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "Lua dependencies detected ({}) — Lua extern dumping is not implemented yet.",
+            names
+        );
     }
 
     let output_root = project_dir.join("externs");

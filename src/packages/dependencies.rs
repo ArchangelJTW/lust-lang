@@ -4,15 +4,19 @@ use super::{
 };
 use crate::config::{DependencyKind, LustConfig};
 use std::{
+    collections::HashSet,
+    fs,
     io,
     path::{Path, PathBuf},
 };
+use object::{File, Object, ObjectSymbol};
 use thiserror::Error;
 
 #[derive(Debug, Default, Clone)]
 pub struct DependencyResolution {
     lust: Vec<ResolvedLustDependency>,
     rust: Vec<ResolvedRustDependency>,
+    lua: Vec<ResolvedLuaDependency>,
 }
 
 impl DependencyResolution {
@@ -22,6 +26,10 @@ impl DependencyResolution {
 
     pub fn rust(&self) -> &[ResolvedRustDependency] {
         &self.rust
+    }
+
+    pub fn lua(&self) -> &[ResolvedLuaDependency] {
+        &self.lua
     }
 }
 
@@ -42,6 +50,27 @@ pub struct ResolvedRustDependency {
     pub externs_override: Option<PathBuf>,
     pub cache_stub_dir: Option<PathBuf>,
     pub version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedLuaDependency {
+    pub name: String,
+    pub library_path: PathBuf,
+    pub luaopen_symbols: Vec<String>,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum DetectedKind {
+    Lust,
+    Rust,
+    Lua { luaopen_symbols: Vec<String> },
+}
+
+#[derive(Default)]
+struct LibrarySignature {
+    luaopen_symbols: Vec<String>,
+    has_lust_extension: bool,
 }
 
 #[derive(Debug, Error)]
@@ -65,6 +94,20 @@ pub enum DependencyResolutionError {
         #[source]
         source: ManifestError,
     },
+    #[error("failed to read library '{path}': {source}")]
+    LibraryIo {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to inspect library '{path}': {source}")]
+    LibraryInspect {
+        path: PathBuf,
+        #[source]
+        source: object::read::Error,
+    },
+    #[error("dependency '{name}' at {path} is a shared library but its kind could not be detected")]
+    UnknownLibraryKind { name: String, path: PathBuf },
 }
 
 pub fn resolve_dependencies(
@@ -103,13 +146,17 @@ pub fn resolve_dependencies(
             });
         }
 
-        let kind = match spec.kind() {
-            Some(kind) => kind,
+        let detected = match spec.kind() {
+            Some(DependencyKind::Lust) => DetectedKind::Lust,
+            Some(DependencyKind::Rust) => DetectedKind::Rust,
+            Some(DependencyKind::Lua) => DetectedKind::Lua {
+                luaopen_symbols: detect_luaopen_symbols(&root_dir)?,
+            },
             None => detect_kind(spec.name(), &root_dir)?,
         };
 
-        match kind {
-            DependencyKind::Lust => {
+        match detected {
+            DetectedKind::Lust => {
                 let module_root = resolve_module_root(&root_dir);
                 let root_module = detect_root_module(&module_root, spec.name());
                 let sanitized = sanitize_dependency_name(&name);
@@ -125,7 +172,7 @@ pub fn resolve_dependencies(
                     root_module,
                 });
             }
-            DependencyKind::Rust => {
+            DetectedKind::Rust => {
                 let externs_override = spec
                     .externs()
                     .map(|value| resolve_optional_path(&root_dir, value));
@@ -144,23 +191,47 @@ pub fn resolve_dependencies(
                     version,
                 });
             }
+            DetectedKind::Lua { luaopen_symbols } => {
+                resolution.lua.push(ResolvedLuaDependency {
+                    name,
+                    library_path: root_dir,
+                    luaopen_symbols,
+                    version,
+                });
+            }
         }
     }
 
     Ok(resolution)
 }
 
-fn detect_kind(name: &str, root: &Path) -> Result<DependencyKind, DependencyResolutionError> {
+fn detect_kind(name: &str, root: &Path) -> Result<DetectedKind, DependencyResolutionError> {
+    if root.is_file() {
+        let signature = inspect_library(root)?;
+        let luaopen_symbols = signature.luaopen_symbols;
+        let has_lust_register = signature.has_lust_extension;
+        return if !luaopen_symbols.is_empty() {
+            Ok(DetectedKind::Lua { luaopen_symbols })
+        } else if has_lust_register {
+            Ok(DetectedKind::Rust)
+        } else {
+            Err(DependencyResolutionError::UnknownLibraryKind {
+                name: name.to_string(),
+                path: root.to_path_buf(),
+            })
+        };
+    }
+
     match PackageManifest::discover(root) {
         Ok(manifest) => match manifest.kind() {
-            ManifestKind::Lust => Ok(DependencyKind::Lust),
-            ManifestKind::Cargo => Ok(DependencyKind::Rust),
+            ManifestKind::Lust => Ok(DetectedKind::Lust),
+            ManifestKind::Cargo => Ok(DetectedKind::Rust),
         },
         Err(ManifestError::NotFound(_)) => {
             if root.join("Cargo.toml").exists() {
-                Ok(DependencyKind::Rust)
+                Ok(DetectedKind::Rust)
             } else {
-                Ok(DependencyKind::Lust)
+                Ok(DetectedKind::Lust)
             }
         }
         Err(err) => Err(DependencyResolutionError::Manifest {
@@ -168,6 +239,58 @@ fn detect_kind(name: &str, root: &Path) -> Result<DependencyKind, DependencyReso
             source: err,
         }),
     }
+}
+
+fn detect_luaopen_symbols(root: &Path) -> Result<Vec<String>, DependencyResolutionError> {
+    if !root.is_file() {
+        return Ok(Vec::new());
+    }
+    let signature = inspect_library(root)?;
+    Ok(signature.luaopen_symbols)
+}
+
+fn detect_lust_extension_symbol(root: &Path) -> Result<bool, DependencyResolutionError> {
+    if !root.is_file() {
+        return Ok(false);
+    }
+    let signature = inspect_library(root)?;
+    Ok(signature.has_lust_extension)
+}
+
+fn inspect_library(path: &Path) -> Result<LibrarySignature, DependencyResolutionError> {
+    let bytes = fs::read(path).map_err(|source| DependencyResolutionError::LibraryIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let file = File::parse(&*bytes).map_err(|source| {
+        DependencyResolutionError::LibraryInspect {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+
+    let mut signature = LibrarySignature::default();
+    let mut lua_syms: HashSet<String> = HashSet::new();
+
+    for symbol in file.symbols().chain(file.dynamic_symbols()) {
+        if !symbol.is_definition() {
+            continue;
+        }
+        let Ok(raw_name) = symbol.name() else {
+            continue;
+        };
+        let name = raw_name.trim_start_matches('_');
+        if name == "lust_extension_register" {
+            signature.has_lust_extension = true;
+        }
+        if let Some(stripped) = name.strip_prefix("luaopen_") {
+            lua_syms.insert(format!("luaopen_{stripped}"));
+        }
+    }
+
+    signature.luaopen_symbols = lua_syms.into_iter().collect();
+    signature.luaopen_symbols.sort();
+    Ok(signature)
 }
 
 fn resolve_dependency_path(project_dir: &Path, raw: &str) -> PathBuf {

@@ -32,6 +32,7 @@ pub enum ConfigError {
 pub enum DependencyKind {
     Lust,
     Rust,
+    Lua,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +209,7 @@ impl LustConfig {
                         Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
                             "lust" => Some(DependencyKind::Lust),
                             "rust" => Some(DependencyKind::Rust),
+                            "lua" | "lua51" | "lua_compat" => Some(DependencyKind::Lua),
                             other => {
                                 return Err(ConfigError::UnknownDependencyKind(
                                     name.clone(),

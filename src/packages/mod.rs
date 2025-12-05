@@ -26,8 +26,8 @@ pub use credentials::{
     CredentialsError,
 };
 pub use dependencies::{
-    resolve_dependencies, DependencyResolution, DependencyResolutionError, ResolvedLustDependency,
-    ResolvedRustDependency,
+    resolve_dependencies, DependencyResolution, DependencyResolutionError, ResolvedLuaDependency,
+    ResolvedLustDependency, ResolvedRustDependency,
 };
 pub use manifest::{ManifestError, ManifestKind, PackageManifest, PackageSection};
 pub use registry::{

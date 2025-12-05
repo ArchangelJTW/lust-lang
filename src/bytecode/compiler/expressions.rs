@@ -65,13 +65,30 @@ impl Compiler {
                 }
 
                 if let Some(runtime_name) = self
-                    .extern_function_aliases
+                    .extern_value_aliases
                     .get(&lookup_name)
                     .cloned()
-                    .or_else(|| self.extern_function_aliases.get(name).cloned())
+                    .or_else(|| self.extern_value_aliases.get(name).cloned())
                 {
                     let reg = self.allocate_register();
                     let name_idx = self.add_string_constant(&runtime_name);
+                    self.emit(Instruction::LoadGlobal(reg, name_idx), 0);
+                    return Ok(reg);
+                }
+
+                let module_alias = self
+                    .current_module
+                    .clone()
+                    .or_else(|| self.entry_module.clone())
+                    .and_then(|module| {
+                        self.imports_by_module
+                            .get(&module)
+                            .and_then(|imports| imports.module_aliases.get(name))
+                            .cloned()
+                    });
+                if let Some(real_module) = module_alias {
+                    let reg = self.allocate_register();
+                    let name_idx = self.add_string_constant(&real_module);
                     self.emit(Instruction::LoadGlobal(reg, name_idx), 0);
                     return Ok(reg);
                 }
@@ -119,10 +136,13 @@ impl Compiler {
                             .and_then(|module| self.imports_by_module.get(module))
                             .map_or(false, |imports| {
                                 imports.module_aliases.contains_key(type_name)
+                                    && !self.is_module_level_identifier(type_name)
                             });
-                        if (Self::looks_like_type_name(type_name) || is_module_alias)
-                            && self.resolve_local(type_name).is_err()
-                        {
+                        let is_local = self.resolve_local(type_name).is_ok();
+                        let treat_as_static_dispatch =
+                            !is_local && (Self::looks_like_type_name(type_name) || is_module_alias);
+
+                        if treat_as_static_dispatch {
                             let mut candidates = Vec::new();
                             let mut alias_candidate = format!("{}.{}", type_name, field);
                             if let Some(module) = &self.current_module {
@@ -140,9 +160,8 @@ impl Compiler {
                                 candidates.push(resolved_candidate);
                             }
 
-                            for static_method_name in candidates {
-                                if let Some(&func_idx) =
-                                    self.function_table.get(&static_method_name)
+                            for static_method_name in &candidates {
+                                if let Some(&func_idx) = self.function_table.get(static_method_name)
                                 {
                                     let func_reg = self.allocate_register();
                                     let const_idx = self.add_constant(Value::Function(func_idx));
@@ -167,34 +186,63 @@ impl Compiler {
                                 }
                             }
 
-                            let enum_name_idx = self.add_string_constant(type_name);
-                            let variant_idx = self.add_string_constant(field);
-                            if args.is_empty() {
-                                let result_reg = self.allocate_register();
-                                self.emit(
-                                    Instruction::NewEnumUnit(
-                                        result_reg,
-                                        enum_name_idx,
-                                        variant_idx,
-                                    ),
-                                    0,
-                                );
-                                return Ok(result_reg);
-                            } else {
-                                let arg_refs: Vec<&Expr> = args.iter().collect();
-                                let first_value_reg = self.place_exprs_consecutive(&arg_refs)?;
-                                let result_reg = self.allocate_register();
-                                self.emit(
-                                    Instruction::NewEnumVariant(
-                                        result_reg,
-                                        enum_name_idx,
-                                        variant_idx,
-                                        first_value_reg,
-                                        args.len() as u8,
-                                    ),
-                                    0,
-                                );
-                                return Ok(result_reg);
+                            for static_method_name in &candidates {
+                                if let Some(runtime_name) =
+                                    self.extern_value_aliases.get(static_method_name).cloned()
+                                {
+                                    let func_reg = self.allocate_register();
+                                    let name_idx = self.add_string_constant(&runtime_name);
+                                    self.emit(Instruction::LoadGlobal(func_reg, name_idx), 0);
+                                    let first_arg_reg = if args.is_empty() {
+                                        0
+                                    } else {
+                                        let arg_refs: Vec<&Expr> = args.iter().collect();
+                                        self.place_exprs_consecutive(&arg_refs)?
+                                    };
+                                    let result_reg = self.allocate_register();
+                                    self.emit(
+                                        Instruction::Call(
+                                            func_reg,
+                                            first_arg_reg,
+                                            args.len() as u8,
+                                            result_reg,
+                                        ),
+                                        0,
+                                    );
+                                    return Ok(result_reg);
+                                }
+                            }
+
+                            if Self::looks_like_type_name(type_name) {
+                                let enum_name_idx = self.add_string_constant(type_name);
+                                let variant_idx = self.add_string_constant(field);
+                                if args.is_empty() {
+                                    let result_reg = self.allocate_register();
+                                    self.emit(
+                                        Instruction::NewEnumUnit(
+                                            result_reg,
+                                            enum_name_idx,
+                                            variant_idx,
+                                        ),
+                                        0,
+                                    );
+                                    return Ok(result_reg);
+                                } else {
+                                    let arg_refs: Vec<&Expr> = args.iter().collect();
+                                    let first_value_reg = self.place_exprs_consecutive(&arg_refs)?;
+                                    let result_reg = self.allocate_register();
+                                    self.emit(
+                                        Instruction::NewEnumVariant(
+                                            result_reg,
+                                            enum_name_idx,
+                                            variant_idx,
+                                            first_value_reg,
+                                            args.len() as u8,
+                                        ),
+                                        0,
+                                    );
+                                    return Ok(result_reg);
+                                }
                             }
                         }
                     }
@@ -217,6 +265,8 @@ impl Compiler {
                     Instruction::Call(func_reg, first_arg_reg, args.len() as u8, result_reg),
                     0,
                 );
+                // Reset next_register to reclaim temporary registers used for this call
+                self.next_register = result_reg + 1;
                 Ok(result_reg)
             }
 
@@ -268,6 +318,8 @@ impl Compiler {
                     );
                     result_reg
                 };
+                // Reset next_register to reclaim temporary registers
+                self.next_register = result_reg + 1;
                 Ok(result_reg)
             }
 
@@ -401,7 +453,9 @@ impl Compiler {
                 self.emit(Instruction::LoadNil(result_reg), 0);
                 for stmt in stmts {
                     if let StmtKind::Expr(expr) = &stmt.kind {
-                        self.free_register(result_reg);
+                        if self.next_register > result_reg {
+                            self.free_register(result_reg);
+                        }
                         result_reg = self.compile_expr(expr)?;
                     } else {
                         self.compile_stmt(stmt)?;
@@ -456,7 +510,6 @@ impl Compiler {
 
                 let body_reg = self.compile_expr(body)?;
                 self.emit(Instruction::Return(body_reg), 0);
-                self.free_register(body_reg);
                 self.functions[lambda_func_idx].set_register_count(self.max_register + 1);
                 self.scopes = saved_scopes;
                 self.current_function = saved_func_idx;
@@ -720,9 +773,8 @@ impl Compiler {
                 self.free_register(result_reg);
             }
 
-            if self.next_register < reserved_next {
-                self.next_register = reserved_next;
-            }
+            // Unconditionally reset to free temporaries from nested calls
+            self.next_register = reserved_next;
         }
 
         Ok(first_dest)
@@ -764,6 +816,14 @@ impl Compiler {
                     }
                 } else if self.is_module_level_identifier(name) {
                     self.emit_store_module_global(name, value_reg);
+                } else if self.is_initializer_context() {
+                    self.emit_store_module_global(name, value_reg);
+                    if let Some(module) = self.module_scope_name() {
+                        self.module_locals
+                            .entry(module.to_string())
+                            .or_default()
+                            .insert(name.clone());
+                    }
                 } else {
                     return Err(LustError::CompileError(format!(
                         "Undefined variable: {}",

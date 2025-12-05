@@ -1,0 +1,24 @@
+-- Auto-generated stub for Lua module 'socket.core'
+
+pub extern
+    function socket.core.__unload(LuaValue): LuaValue
+    function socket.core.connect(LuaValue): LuaValue
+    function socket.core.gettime(LuaValue): LuaValue
+    function socket.core.newtry(LuaValue): LuaValue
+    function socket.core.protect(LuaValue): LuaValue
+    function socket.core.select(LuaValue): LuaValue
+    function socket.core.skip(LuaValue): LuaValue
+    function socket.core.sleep(LuaValue): LuaValue
+    function socket.core.tcp(LuaValue): LuaValue
+    function socket.core.tcp4(LuaValue): LuaValue
+    function socket.core.tcp6(LuaValue): LuaValue
+    function socket.core.udp(LuaValue): LuaValue
+    function socket.core.udp4(LuaValue): LuaValue
+    function socket.core.udp6(LuaValue): LuaValue
+    const socket.core._DATAGRAMSIZE: LuaValue
+    const socket.core._DEBUG: LuaValue
+    const socket.core._SETSIZE: LuaValue
+    const socket.core._SOCKETINVALID: LuaValue
+    const socket.core._VERSION: LuaValue
+    const socket.core.dns: LuaValue
+end

@@ -963,6 +963,27 @@ mod tests {
     }
 
     #[test]
+    fn module_locals_are_visible_in_functions() {
+        let _guard = serial_guard();
+        let source = r#"
+            local factors: Array<int> = []
+
+            pub function touch()
+                factors:push(1)
+            end
+
+            pub function main()
+                touch()
+            end
+
+            main()
+        "#;
+
+        let mut program = build_program(source);
+        program.run_entry_script().expect("run entry script");
+    }
+
+    #[test]
     fn struct_instance_supports_mixed_field_types() {
         let _guard = serial_guard();
         let source = r#"

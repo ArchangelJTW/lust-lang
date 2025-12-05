@@ -1,0 +1,323 @@
+-- Auto-transpiled from Lua module 'socket'
+use string as string
+use socket.core as socket_core
+use lua as lua
+local __lua_ret: Array<LuaValue> = []
+local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>
+    return items
+end
+local __lua_force_array = function(val: unknown): Array<LuaValue>
+    if val is Array<LuaValue> then
+        return val
+    end
+    return [lua.to_value(val)]
+end
+local __lua_table_from_varargs = function(items: Array<LuaValue>): LuaTable
+    local t = lua.table()
+    local idx: int = 0
+    while idx < items:len() do
+        local v = items:get(idx)
+        if v:is_some() then
+            t[idx + 1] = lua.unwrap(v:unwrap())
+        end
+        idx = idx + 1
+    end
+    return t
+end
+local __lua_truthy = function(val: unknown): bool
+    return lua.is_truthy(val)
+end
+local __lua_first = function(val: unknown): unknown
+    if val is Array<LuaValue> then
+        local first = val:get(0)
+        if first:is_some() then
+            return first:unwrap()
+        end
+        return lua.nil
+    end
+    if val is LuaValue then
+        return val
+    end
+    return val
+end
+local __lua_nth = function(val: unknown, idx: int): unknown
+    if val is Array<LuaValue> then
+        local item = val:get(idx)
+        if item:is_some() then
+            return item:unwrap()
+        end
+        return lua.nil
+    end
+    if idx == 0 then
+        if val is LuaValue then
+            return val
+        end
+        return val
+    end
+    return lua.nil
+end
+local __lua_join = function(prefix: Array<LuaValue>, tail: unknown): Array<LuaValue>
+    local arr = __lua_force_array(tail)
+    local idx: int = 0
+    while idx < arr:len() do
+        local v = arr:get(idx)
+        if v:is_some() then
+            prefix:push(v:unwrap())
+        end
+        idx = idx + 1
+    end
+    return prefix
+end
+local __lua_and = function(a: unknown, b: unknown): unknown
+    if __lua_truthy(a) then
+        return b
+    end
+    return a
+end
+local __lua_or = function(a: unknown, b: unknown): unknown
+    if __lua_truthy(a) then
+        return a
+    end
+    return b
+end
+local assert = function(cond: LuaValue, msg: LuaValue): LuaValue
+    if __lua_truthy(cond) then
+        return cond
+    end
+    error(msg or "assertion failed")
+end
+local _G: Map<unknown, unknown> = {}
+_G["assert"] = lua.to_value(assert)
+_G["error"] = lua.to_value(error)
+_G["ipairs"] = lua.to_value(ipairs)
+_G["pairs"] = lua.to_value(pairs)
+_G["setmetatable"] = lua.to_value(setmetatable)
+_G["select"] = lua.to_value(select)
+_G["unpack"] = lua.to_value(unpack)
+_G["tostring"] = lua.to_value(tostring)
+_G["tonumber"] = lua.to_value(tonumber)
+_G["type"] = lua.to_value(type)
+local type_ = type
+_G["string"] = lua.to_value(string)
+local module_ = _G["module"]
+local base = _G
+local string = __lua_first(string)
+local math = __lua_first(lua.nil)
+local socket = __lua_first(socket_core)
+local _M = socket
+pub function connect4(address: LuaValue, port: LuaValue, laddress: LuaValue, lport: LuaValue): Array<LuaValue>
+    return __lua_force_array(socket.connect(address, port, laddress, lport, lua.to_value("inet")))
+end
+_M.connect4 = connect4
+pub function connect6(address: LuaValue, port: LuaValue, laddress: LuaValue, lport: LuaValue): Array<LuaValue>
+    return __lua_force_array(socket.connect(address, port, laddress, lport, lua.to_value("inet6")))
+end
+_M.connect6 = connect6
+pub function bind(host: LuaValue, port: LuaValue, backlog: LuaValue): Array<LuaValue>
+    if __lua_truthy(lua.op_eq(host, lua.to_value("*" ))) then
+        host = lua.to_value("0.0.0.0" )
+    end
+    local addrinfo, err
+    local __lua_ret = socket.dns.getaddrinfo(host)
+    addrinfo = __lua_nth(__lua_ret, 0)
+    err = __lua_nth(__lua_ret, 1)
+    if __lua_truthy(not __lua_truthy(addrinfo)) then
+        local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+        return __lua_join(__lua_ret, [lua.to_value(err)])
+    end
+    local sock, res
+    err = lua.to_value("no info on address"
+)
+    for i, alt in __lua_first(base.ipairs(addrinfo)) do
+        if __lua_truthy(lua.op_eq(alt.family, lua.to_value("inet" ))) then
+            __lua_ret = socket.tcp4()
+            sock = __lua_nth(__lua_ret, 0)
+            err = __lua_nth(__lua_ret, 1)
+        else
+            __lua_ret = socket.tcp6()
+            sock = __lua_nth(__lua_ret, 0)
+            err = __lua_nth(__lua_ret, 1)
+        end
+        if __lua_truthy(not __lua_truthy(sock)) then
+            local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+            return __lua_join(__lua_ret, [lua.to_value(err)])
+        end
+        __lua_first(__lua_first(lua.call_method(sock, "setoption", lua.to_value("reuseaddr"), lua.to_value(true))))
+        __lua_ret = __lua_first(lua.call_method(sock, "bind", alt.addr, port))
+        res = __lua_nth(__lua_ret, 0)
+        err = __lua_nth(__lua_ret, 1)
+        if __lua_truthy(not __lua_truthy(res)) then
+            __lua_first(__lua_first(lua.call_method(sock, "close")))
+        else
+            __lua_ret = __lua_first(lua.call_method(sock, "listen", backlog))
+            res = __lua_nth(__lua_ret, 0)
+            err = __lua_nth(__lua_ret, 1)
+            if __lua_truthy(not __lua_truthy(res)) then
+                __lua_first(__lua_first(lua.call_method(sock, "close")))
+            else
+                return __lua_pack([lua.to_value(sock)])
+            end
+        end
+    end
+    local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+    return __lua_join(__lua_ret, [lua.to_value(err)])
+end
+_M.bind = bind
+_M.try = __lua_first(_M.newtry())
+pub function choose(table: LuaValue): Array<LuaValue>
+    return __lua_pack([lua.to_value(function(name: LuaValue, opt1: LuaValue, opt2: LuaValue): Array<LuaValue>
+        if __lua_truthy(lua.op_ne(__lua_first(base["type"](name)), lua.to_value("string" ))) then
+            name, opt1, opt2 = lua.to_value("default"), name, opt1
+        end
+        local f = table[__lua_or(name, lua.to_value("nil"))]
+        if __lua_truthy(not __lua_truthy(f)) then
+            __lua_first(base.error(lua.op_concat(lua.to_value("unknown key ("), lua.op_concat(__lua_first(base.tostring(name)), lua.to_value(")"))), lua.to_value(3)))
+        else
+            return __lua_force_array(f(opt1, opt2))
+        end
+    end)])
+end
+_M.choose = choose
+local sourcet, sinkt = lua.table(), lua.table()
+_M.sourcet = sourcet
+_M.sinkt = sinkt
+_M.BLOCKSIZE = lua.to_value(2048
+)
+sinkt[lua.to_value("close-when-done")] = function(sock: LuaValue): Array<LuaValue>
+    return __lua_force_array(base.setmetatable(lua.table_from_entries([("getfd", function(): Array<LuaValue>
+        return __lua_force_array(__lua_first(lua.call_method(sock, "getfd")))
+    end), ("dirty", function(): Array<LuaValue>
+        return __lua_force_array(__lua_first(lua.call_method(sock, "dirty")))
+    end)]), LuaTable { table = { ["__call"] = function(self: LuaValue, chunk: LuaValue, err: LuaValue): Array<LuaValue>
+        if __lua_truthy(not __lua_truthy(chunk)) then
+            __lua_first(__lua_first(lua.call_method(sock, "close")))
+            return __lua_pack([lua.to_value(lua.to_value(1
+))])
+        else
+            return __lua_force_array(__lua_first(lua.call_method(sock, "send", chunk)))
+        end
+    end }, metamethods = { __call = function(self: LuaValue, chunk: LuaValue, err: LuaValue): Array<LuaValue>
+        if __lua_truthy(not __lua_truthy(chunk)) then
+            __lua_first(__lua_first(lua.call_method(sock, "close")))
+            return __lua_pack([lua.to_value(lua.to_value(1
+))])
+        else
+            return __lua_force_array(__lua_first(lua.call_method(sock, "send", chunk)))
+        end
+    end } }))
+end
+sinkt[lua.to_value("keep-open")] = function(sock: LuaValue): Array<LuaValue>
+    return __lua_force_array(base.setmetatable(lua.table_from_entries([("getfd", function(): Array<LuaValue>
+        return __lua_force_array(__lua_first(lua.call_method(sock, "getfd")))
+    end), ("dirty", function(): Array<LuaValue>
+        return __lua_force_array(__lua_first(lua.call_method(sock, "dirty")))
+    end)]), LuaTable { table = { ["__call"] = function(self: LuaValue, chunk: LuaValue, err: LuaValue): Array<LuaValue>
+        if __lua_truthy(chunk) then
+            return __lua_force_array(__lua_first(lua.call_method(sock, "send", chunk)))
+        else
+            return __lua_pack([lua.to_value(lua.to_value(1 ))])
+        end
+    end }, metamethods = { __call = function(self: LuaValue, chunk: LuaValue, err: LuaValue): Array<LuaValue>
+        if __lua_truthy(chunk) then
+            return __lua_force_array(__lua_first(lua.call_method(sock, "send", chunk)))
+        else
+            return __lua_pack([lua.to_value(lua.to_value(1 ))])
+        end
+    end } }))
+end
+sinkt[lua.to_value("default")] = sinkt[lua.to_value("keep-open")]
+_M.sink = __lua_first(_M.choose(sinkt))
+sourcet[lua.to_value("by-length")] = function(sock: LuaValue, length: LuaValue): Array<LuaValue>
+    return __lua_force_array(base.setmetatable(lua.table_from_entries([("getfd", function(): Array<LuaValue>
+        return __lua_force_array(__lua_first(lua.call_method(sock, "getfd")))
+    end), ("dirty", function(): Array<LuaValue>
+        return __lua_force_array(__lua_first(lua.call_method(sock, "dirty")))
+    end)]), LuaTable { table = { ["__call"] = function(): Array<LuaValue>
+        if __lua_truthy(lua.op_le(length, lua.to_value(0 ))) then
+            return __lua_pack([lua.to_value(lua.nil)])
+        end
+        local size = __lua_first(lua.unwrap(socket.BLOCKSIZE):min(lua.unwrap(length)))
+        local chunk, err
+        local __lua_ret = __lua_first(lua.call_method(sock, "receive", size))
+        chunk = __lua_nth(__lua_ret, 0)
+        err = __lua_nth(__lua_ret, 1)
+        if __lua_truthy(err) then
+            local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+            return __lua_join(__lua_ret, [lua.to_value(err)])
+        end
+        length = lua.op_sub(length, __lua_first(string.len(chunk)))
+        return __lua_pack([lua.to_value(chunk)])
+    end }, metamethods = { __call = function(): Array<LuaValue>
+        if __lua_truthy(lua.op_le(length, lua.to_value(0 ))) then
+            return __lua_pack([lua.to_value(lua.nil)])
+        end
+        local size = __lua_first(lua.unwrap(socket.BLOCKSIZE):min(lua.unwrap(length)))
+        local chunk, err
+        local __lua_ret = __lua_first(lua.call_method(sock, "receive", size))
+        chunk = __lua_nth(__lua_ret, 0)
+        err = __lua_nth(__lua_ret, 1)
+        if __lua_truthy(err) then
+            local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+            return __lua_join(__lua_ret, [lua.to_value(err)])
+        end
+        length = lua.op_sub(length, __lua_first(string.len(chunk)))
+        return __lua_pack([lua.to_value(chunk)])
+    end } }))
+end
+sourcet[lua.to_value("until-closed")] = function(sock: LuaValue): Array<LuaValue>
+    local done
+    return __lua_force_array(base.setmetatable(lua.table_from_entries([("getfd", function(): Array<LuaValue>
+        return __lua_force_array(__lua_first(lua.call_method(sock, "getfd")))
+    end), ("dirty", function(): Array<LuaValue>
+        return __lua_force_array(__lua_first(lua.call_method(sock, "dirty")))
+    end)]), LuaTable { table = { ["__call"] = function(): Array<LuaValue>
+        if __lua_truthy(done) then
+            return __lua_pack([lua.to_value(lua.nil)])
+        end
+        local chunk, err, partial
+        local __lua_ret = __lua_first(lua.call_method(sock, "receive", socket.BLOCKSIZE))
+        chunk = __lua_nth(__lua_ret, 0)
+        err = __lua_nth(__lua_ret, 1)
+        partial = __lua_nth(__lua_ret, 2)
+        if __lua_truthy(not __lua_truthy(err)) then
+            return __lua_pack([lua.to_value(chunk)])
+        elseif __lua_truthy(lua.op_eq(err, lua.to_value("closed" ))) then
+            __lua_first(__lua_first(lua.call_method(sock, "close")))
+            done = lua.to_value(1
+)
+            return __lua_pack([lua.to_value(partial)])
+        else
+            local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+            return __lua_join(__lua_ret, [lua.to_value(err)])
+        end
+    end }, metamethods = { __call = function(): Array<LuaValue>
+        if __lua_truthy(done) then
+            return __lua_pack([lua.to_value(lua.nil)])
+        end
+        local chunk, err, partial
+        local __lua_ret = __lua_first(lua.call_method(sock, "receive", socket.BLOCKSIZE))
+        chunk = __lua_nth(__lua_ret, 0)
+        err = __lua_nth(__lua_ret, 1)
+        partial = __lua_nth(__lua_ret, 2)
+        if __lua_truthy(not __lua_truthy(err)) then
+            return __lua_pack([lua.to_value(chunk)])
+        elseif __lua_truthy(lua.op_eq(err, lua.to_value("closed" ))) then
+            __lua_first(__lua_first(lua.call_method(sock, "close")))
+            done = lua.to_value(1
+)
+            return __lua_pack([lua.to_value(partial)])
+        else
+            local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+            return __lua_join(__lua_ret, [lua.to_value(err)])
+        end
+    end } }))
+end
+sourcet[lua.to_value("default")] = sourcet[lua.to_value("until-closed")]
+_M.source = __lua_first(_M.choose(sourcet))
+pub const BLOCKSIZE: LuaValue = _M.BLOCKSIZE
+pub const sink: LuaValue = _M.sink
+pub const sinkt: LuaValue = _M.sinkt
+pub const source: LuaValue = _M.source
+pub const sourcet: LuaValue = _M.sourcet
+pub const try: LuaValue = _M.try
+return __lua_pack([lua.to_value(_M)])

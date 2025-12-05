@@ -1,0 +1,11 @@
+[settings]
+stdlib_modules = ["string"]
+jit = false
+
+[dependencies]
+# LuaSocket C core built for Lua 5.1
+luasocket_core = { path = "/home/joshw/.luarocks/lib64/lua/5.1/socket/core.so", kind = "lua" }
+# LuaSocket mime C core
+mime_core = { path = "/home/joshw/.luarocks/lib64/lua/5.1/mime/core.so", kind = "lua" }
+# Pure-Lua modules that sit alongside the C core - will be auto-transpiled from luarocks
+luasocket_lua = { path = "/home/joshw/.luarocks/share/lua/5.1", kind = "lua" }

@@ -1,5 +1,10 @@
 #![cfg(feature = "std")]
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+use lust::lua_compat::{
+    lua_to_lust, render_table_stub, trace_luaopen, transpile::transpile_lua_stub, LuaModuleSpec,
+    LuaValue,
+};
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 use lust::packages::{
     build_package_archive, clear_credentials, collect_rust_dependency_artifacts, credentials_file,
     load_credentials, load_prepared_rust_dependencies, prepare_rust_dependencies,
@@ -121,6 +126,52 @@ fn print_help(program: &str) {
         "    {} -d script.lust                  Disassemble script.lust",
         program
     );
+}
+
+fn write_placeholder_lua_stub(
+    output_root: &Path,
+    luaopen_symbol: &str,
+    dep_name: &str,
+) -> Result<Option<PathBuf>, io::Error> {
+    let module_name = luaopen_symbol
+        .strip_prefix("luaopen_")
+        .unwrap_or(luaopen_symbol)
+        .replace('_', ".");
+    if module_name.is_empty() {
+        return Ok(None);
+    }
+    let relative_path = module_name.replace('.', "/") + ".lust";
+    let destination = output_root.join(&relative_path);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let contents = format!(
+        "-- Placeholder extern stub for Lua module '{module}' from dependency '{dep}'.\n-- TODO: replace with traced API surface.\n\npub extern\nend\n",
+        module = module_name,
+        dep = dep_name
+    );
+    fs::write(&destination, contents)?;
+    Ok(Some(PathBuf::from(relative_path)))
+}
+
+fn write_lua_stub(
+    output_root: &Path,
+    module_name: &str,
+    contents: &str,
+) -> Result<PathBuf, io::Error> {
+    let relative_path = module_name.replace('.', "/") + ".lust";
+    let destination = output_root.join(&relative_path);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&destination, contents)?;
+    Ok(PathBuf::from(relative_path))
+}
+
+fn lua_module_name(path: &Path) -> String {
+    path.with_extension("")
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, ".")
 }
 
 fn print_version() {
@@ -755,12 +806,14 @@ fn dump_externs(filename: &str) {
             process::exit(1);
         }
     };
-    if resolution.rust().is_empty() {
-        println!("No Rust dependencies configured; nothing to dump.");
+    if resolution.rust().is_empty() && resolution.lua().is_empty() {
+        println!("No external dependencies configured; nothing to dump.");
         return;
     }
 
     let output_root = project_dir.join("externs");
+
+    let mut wrote_any = false;
     if let Err(e) = fs::create_dir_all(&output_root) {
         eprintln!(
             "Error creating extern output directory '{}': {}",
@@ -770,7 +823,167 @@ fn dump_externs(filename: &str) {
         process::exit(1);
     }
 
-    let mut wrote_any = false;
+    for dep in resolution.lua() {
+        let mut any_stub = false;
+        if !dep.luaopen_symbols.is_empty() && dep.library_path.is_file() {
+            let spec = LuaModuleSpec::new(dep.library_path.clone(), dep.luaopen_symbols.clone());
+            match trace_luaopen(&spec) {
+                Ok(traces) => {
+                    for result in traces {
+                        if let Some(handle) = result.returns.iter().find_map(|v| match v {
+                            LuaValue::Table(h) => Some(h.clone()),
+                            _ => None,
+                        }) {
+                            let stub = render_table_stub(&result.module, &handle);
+                            match write_lua_stub(&output_root, &result.module, &stub) {
+                                Ok(path) => {
+                                    println!(
+                                        "Wrote Lua traced extern stub for '{}' ({}) -> {}",
+                                        dep.name,
+                                        result.module,
+                                        output_root.join(path).display()
+                                    );
+                                    any_stub = true;
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "Failed to write traced Lua stub for '{}' ({}): {}",
+                                        dep.name, result.module, err
+                                    );
+                                }
+                            }
+                        } else {
+                            match write_placeholder_lua_stub(
+                                &output_root,
+                                &format!("luaopen_{}", result.module.replace('.', "_")),
+                                &dep.name,
+                            ) {
+                                Ok(Some(path)) => {
+                                    println!(
+                                        "Lua module '{}' did not return a table; wrote placeholder extern stub -> {}",
+                                        result.module,
+                                        output_root.join(&path).display()
+                                    );
+                                    any_stub = true;
+                                }
+                                Ok(None) => {}
+                                Err(err) => eprintln!(
+                                    "Failed to write placeholder stub for '{}' ({}): {}",
+                                    dep.name, result.module, err
+                                ),
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Failed to trace luaopen_* for '{}': {}; falling back to placeholders",
+                        dep.name, err
+                    );
+                    for symbol in &dep.luaopen_symbols {
+                        match write_placeholder_lua_stub(&output_root, symbol, &dep.name) {
+                            Ok(Some(stub_path)) => {
+                                println!(
+                                    "Wrote Lua placeholder extern stub for '{}' -> {}",
+                                    dep.name,
+                                    stub_path.display()
+                                );
+                                any_stub = true;
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                eprintln!(
+                                    "Failed to write Lua placeholder stub for '{}' symbol '{}': {}",
+                                    dep.name, symbol, err
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for symbol in &dep.luaopen_symbols {
+                match write_placeholder_lua_stub(&output_root, symbol, &dep.name) {
+                    Ok(Some(stub_path)) => {
+                        println!(
+                            "Wrote Lua placeholder extern stub for '{}' -> {}",
+                            dep.name,
+                            stub_path.display()
+                        );
+                        any_stub = true;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        eprintln!(
+                            "Failed to write Lua placeholder stub for '{}' symbol '{}': {}",
+                            dep.name, symbol, err
+                        );
+                    }
+                }
+            }
+        }
+        for lua_file in &dep.lua_files {
+            let full_path = dep.library_path.join(lua_file);
+            match fs::read_to_string(&full_path) {
+                Ok(content) => {
+                    let module_name = lua_module_name(lua_file);
+                    match transpile_lua_stub(&content, &module_name) {
+                        Ok(stub) => {
+                            let destination = output_root.join(lua_file).with_extension("lust");
+                            if let Some(parent) = destination.parent() {
+                                if let Err(err) = fs::create_dir_all(parent) {
+                                    eprintln!(
+                                        "Failed to create stub directory '{}': {}",
+                                        parent.display(),
+                                        err
+                                    );
+                                    continue;
+                                }
+                            }
+                            if let Err(err) = fs::write(&destination, stub) {
+                                eprintln!(
+                                    "Failed to write Lua transpiled stub '{}': {}",
+                                    destination.display(),
+                                    err
+                                );
+                                continue;
+                            }
+                            println!(
+                                "Wrote Lua transpiled stub for '{}' -> {}",
+                                dep.name,
+                                destination.display()
+                            );
+                            any_stub = true;
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "Failed to transpile Lua file '{}' from '{}': {}",
+                                full_path.display(),
+                                dep.name,
+                                err
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Failed to read Lua file '{}' for '{}': {}",
+                        full_path.display(),
+                        dep.name,
+                        err
+                    );
+                }
+            }
+        }
+        if !any_stub {
+            println!(
+                "Lua dependency '{}' detected but no luaopen_* symbols or Lua sources were exported; skipping stub generation",
+                dep.name
+            );
+        }
+        wrote_any |= any_stub;
+    }
+
     for dep in resolution.rust() {
         let (build, stubs) = match collect_rust_dependency_artifacts(dep) {
             Ok(result) => result,
@@ -911,10 +1124,71 @@ fn run_file(filename: &str, disassemble: bool) {
                 process::exit(1);
             }
         };
-    for init in init_funcs {
-        if let Err(e) = vm.call(&init, vec![]) {
-            print_error_with_context(&source, filename, &e);
-            process::exit(1);
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+    {
+        for dep in dependency_resolution.lua() {
+            if dep.luaopen_symbols.is_empty() {
+                continue;
+            }
+            let spec = LuaModuleSpec::new(dep.library_path.clone(), dep.luaopen_symbols.clone());
+            match trace_luaopen(&spec) {
+                Ok(results) => {
+                    for result in results {
+                        for value in &result.returns {
+                            if let LuaValue::Table(handle) = value {
+                                if let Ok(table_val) = lua_to_lust(value, &vm, result.state.clone())
+                                {
+                                    vm.set_global(&result.module, table_val);
+                                }
+                                for (key, val) in handle.borrow().entries.iter() {
+                                    if let LuaValue::String(name) = key {
+                                        if let Ok(converted) =
+                                            lua_to_lust(val, &vm, result.state.clone())
+                                        {
+                                            vm.set_global(
+                                                format!("{}.{}", result.module, name),
+                                                converted,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Warning: failed to load Lua dependency '{}': {}",
+                        dep.name, err
+                    );
+                }
+            }
+        }
+    }
+    //eprintln!("init order: {:?}", init_funcs);
+    for (module_path, init) in init_funcs {
+        match vm.call(&init, vec![]) {
+            Ok(val) => {
+                let display_val = format!("{}", val);
+                //eprintln!("init {module_path} returned {display_val}");
+                // Lua's `require()` only observes a single return value from a module loader.
+                // Our Lua->Lust transpiler represents returns as `Array<LuaValue>` to preserve
+                // multi-return semantics, but module values should behave like Lua modules:
+                // export a single value (usually a table).
+                let module_value = match val {
+                    lust::bytecode::Value::Array(arr) => arr
+                        .borrow()
+                        .get(0)
+                        .cloned()
+                        .unwrap_or(lust::bytecode::Value::Nil),
+                    other => other,
+                };
+                vm.set_global(module_path, module_value);
+            }
+            Err(e) => {
+                print_error_with_context(&source, filename, &e);
+                process::exit(1);
+            }
         }
     }
 
@@ -937,11 +1211,13 @@ fn compile_program(
     (
         Vec<lust::bytecode::Function>,
         Vec<(String, String)>,
-        Vec<String>,
+        Vec<(String, String)>,
         hashbrown::HashMap<String, lust::ast::StructDef>,
     ),
     lust::LustError,
 > {
+    use hashbrown::{HashMap, HashSet};
+
     let entry_path = Path::new(entry_filename);
     let entry_dir = entry_path.parent().unwrap_or_else(|| Path::new("."));
     let mut loader = ModuleLoader::new(entry_dir.to_path_buf());
@@ -974,8 +1250,61 @@ fn compile_program(
             }
         }
     }
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+    if let Some(resolution) = deps {
+        let extern_root = entry_dir.join("externs");
+        if extern_root.exists() {
+            let mut prefixes: HashSet<String> = HashSet::new();
+            for dep in resolution.lua() {
+                for symbol in &dep.luaopen_symbols {
+                    let module = symbol
+                        .strip_prefix("luaopen_")
+                        .unwrap_or(symbol)
+                        .replace('_', ".");
+                    if let Some(prefix) = module.split('.').next() {
+                        prefixes.insert(prefix.to_string());
+                    }
+                }
+                for lua_file in &dep.lua_files {
+                    let module = lua_module_name(lua_file);
+                    if let Some(prefix) = module.split('.').next() {
+                        prefixes.insert(prefix.to_string());
+                    }
+                }
+            }
+
+            if let Ok(entries) = fs::read_dir(&extern_root) {
+                for entry in entries.flatten() {
+                    match entry.file_type() {
+                        Ok(ft) if ft.is_dir() => {
+                            if let Some(prefix) = entry.file_name().to_str() {
+                                prefixes.insert(prefix.to_string());
+                            }
+                        }
+                        Ok(ft) if ft.is_file() => {
+                            if entry.path().extension().and_then(|e| e.to_str()) == Some("lust") {
+                                if let Some(stem) =
+                                    entry.path().file_stem().and_then(|s| s.to_str())
+                                {
+                                    prefixes.insert(stem.to_string());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            for prefix in prefixes {
+                // Extern stubs are written under externs/<prefix>/...; register both the
+                // bare extern root (for top-level modules) and the nested directory so
+                // nested modules resolve to externs/<prefix>/... as well.
+                loader.add_module_root(prefix.clone(), extern_root.clone(), None);
+                loader.add_module_root(prefix.clone(), extern_root.join(&prefix), None);
+            }
+        }
+    }
     let program = loader.load_program_from_entry(entry_filename)?;
-    use hashbrown::HashMap;
     let mut imports_map: HashMap<String, lust::modules::ModuleImports> = HashMap::new();
     for m in &program.modules {
         imports_map.insert(m.path.clone(), m.imports.clone());
@@ -1006,11 +1335,17 @@ fn compile_program(
     compiler.set_function_signatures(function_signatures);
     let functions = compiler.compile_module(&wrapped_items)?;
     let trait_impls = compiler.get_trait_impls().to_vec();
-    let mut init_funcs: Vec<String> = Vec::new();
+    let mut init_funcs: Vec<(String, String)> = Vec::new();
     for m in &program.modules {
         if m.path != program.entry_module {
             if let Some(init) = &m.init_function {
-                init_funcs.push(init.clone());
+                let init_name = m
+                    .imports
+                    .function_aliases
+                    .get(init)
+                    .cloned()
+                    .unwrap_or_else(|| init.clone());
+                init_funcs.push((m.path.clone(), init_name));
             }
         }
     }
@@ -1028,8 +1363,11 @@ fn print_error_with_context(source: &str, filename: &str, error: &lust::LustErro
             line,
             column,
             message,
-            module: _,
+            module,
         } => {
+            if let Some(module) = module {
+                eprintln!("{DIM}in module: {module}{RESET}");
+            }
             eprintln!("{RED}{BOLD}error{RESET}: {message}");
             print_source_snippet(source, filename, *line, Some(*column));
         }
@@ -1038,8 +1376,11 @@ fn print_error_with_context(source: &str, filename: &str, error: &lust::LustErro
             line,
             column,
             message,
-            module: _,
+            module,
         } => {
+            if let Some(module) = module {
+                eprintln!("{DIM}in module: {module}{RESET}");
+            }
             eprintln!("{RED}{BOLD}error{RESET}: {message}");
             print_source_snippet(source, filename, *line, Some(*column));
         }
@@ -1052,8 +1393,11 @@ fn print_error_with_context(source: &str, filename: &str, error: &lust::LustErro
             message,
             line,
             column,
-            module: _,
+            module,
         } => {
+            if let Some(module) = module {
+                eprintln!("{DIM}in module: {module}{RESET}");
+            }
             eprintln!("{RED}{BOLD}type error{RESET}: {message}");
             print_source_snippet(source, filename, *line, Some(*column));
         }
@@ -1066,8 +1410,11 @@ fn print_error_with_context(source: &str, filename: &str, error: &lust::LustErro
             message,
             line,
             column,
-            module: _,
+            module,
         } => {
+            if let Some(module) = module {
+                eprintln!("{DIM}in module: {module}{RESET}");
+            }
             eprintln!("{RED}{BOLD}compile error{RESET}: {message}");
             print_source_snippet(source, filename, *line, Some(*column));
         }

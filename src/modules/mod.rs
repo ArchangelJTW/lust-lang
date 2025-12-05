@@ -3,6 +3,7 @@ use crate::{
     error::{LustError, Result},
     lexer::Lexer,
     parser::Parser,
+    Span,
 };
 use alloc::{format, string::String, vec, vec::Vec};
 use hashbrown::{HashMap, HashSet};
@@ -167,9 +168,18 @@ impl ModuleLoader {
         let source = if let Some(src) = self.source_overrides.get(&file) {
             src.clone()
         } else {
-            fs::read_to_string(&file).map_err(|e| {
-                LustError::Unknown(format!("Failed to read module '{}': {}", file.display(), e))
-            })?
+            match fs::read_to_string(&file) {
+                Ok(src) => src,
+                Err(e) => {
+                    // For non-entry modules, allow missing files and create stub
+                    if !is_entry && e.kind() == std::io::ErrorKind::NotFound {
+                        #[cfg(feature = "std")]
+                        eprintln!("[WARNING] Module '{}' not found, using nil stub", module_path);
+                        return Ok(self.create_nil_stub_module(module_path));
+                    }
+                    return Err(LustError::Unknown(format!("Failed to read module '{}': {}", file.display(), e)));
+                }
+            }
         };
         let mut lexer = Lexer::new(&source);
         let tokens = lexer
@@ -183,6 +193,8 @@ impl ModuleLoader {
         let mut exports = ModuleExports::default();
         let mut new_items: Vec<Item> = Vec::new();
         let mut init_function: Option<String> = None;
+        let mut pending_init_stmts: Vec<crate::ast::Stmt> = Vec::new();
+        let mut pending_init_span: Option<Span> = None;
         for item in items.drain(..) {
             match &item.kind {
                 ItemKind::Function(func) => {
@@ -248,19 +260,10 @@ impl ModuleLoader {
                     if is_entry {
                         new_items.push(Item::new(ItemKind::Script(stmts.clone()), item.span));
                     } else {
-                        let init_name = format!("__init@{}", module_path);
-                        let func = FunctionDef {
-                            name: init_name.clone(),
-                            type_params: vec![],
-                            trait_bounds: vec![],
-                            params: vec![],
-                            return_type: None,
-                            body: stmts.clone(),
-                            is_method: false,
-                            visibility: Visibility::Private,
-                        };
-                        new_items.push(Item::new(ItemKind::Function(func), item.span));
-                        init_function = Some(init_name);
+                        if pending_init_span.is_none() {
+                            pending_init_span = Some(item.span);
+                        }
+                        pending_init_stmts.extend(stmts.iter().cloned());
                     }
                 }
 
@@ -304,6 +307,50 @@ impl ModuleLoader {
                                     return_type: return_type.clone(),
                                 });
                             }
+
+                            crate::ast::ExternItem::Const { name, ty } => {
+                                let qualified = if name.contains('.') {
+                                    name.clone()
+                                } else {
+                                    format!("{}.{}", module_path, name)
+                                };
+                                exports.functions.insert(
+                                    self.simple_name(&qualified).to_string(),
+                                    qualified.clone(),
+                                );
+                                imports.function_aliases.insert(
+                                    self.simple_name(&qualified).to_string(),
+                                    qualified.clone(),
+                                );
+                                rewritten.push(crate::ast::ExternItem::Const {
+                                    name: qualified,
+                                    ty: ty.clone(),
+                                });
+                            }
+
+                            crate::ast::ExternItem::Struct(def) => {
+                                let mut def = def.clone();
+                                if !def.name.contains('.') && !def.name.contains("::") {
+                                    def.name = format!("{}.{}", module_path, def.name);
+                                }
+                                exports.types.insert(
+                                    self.simple_name(&def.name).to_string(),
+                                    def.name.clone(),
+                                );
+                                rewritten.push(crate::ast::ExternItem::Struct(def));
+                            }
+
+                            crate::ast::ExternItem::Enum(def) => {
+                                let mut def = def.clone();
+                                if !def.name.contains('.') && !def.name.contains("::") {
+                                    def.name = format!("{}.{}", module_path, def.name);
+                                }
+                                exports.types.insert(
+                                    self.simple_name(&def.name).to_string(),
+                                    def.name.clone(),
+                                );
+                                rewritten.push(crate::ast::ExternItem::Enum(def));
+                            }
                         }
                     }
                     new_items.push(Item::new(
@@ -319,6 +366,25 @@ impl ModuleLoader {
                     new_items.push(item);
                 }
             }
+        }
+
+        if !is_entry && !pending_init_stmts.is_empty() {
+            let init_name = format!("__init@{}", module_path);
+            let func = FunctionDef {
+                name: init_name.clone(),
+                type_params: vec![],
+                trait_bounds: vec![],
+                params: vec![],
+                return_type: None,
+                body: pending_init_stmts,
+                is_method: false,
+                visibility: Visibility::Private,
+            };
+            let span = pending_init_span.unwrap_or_else(Span::dummy);
+            // Place module init first so the compiler can observe module-level locals
+            // (e.g. transpiler prelude helpers) before compiling functions that reference them.
+            new_items.insert(0, Item::new(ItemKind::Function(func), span));
+            init_function = Some(init_name);
         }
 
         Ok(LoadedModule {
@@ -491,6 +557,39 @@ impl ModuleLoader {
         }
 
         Ok(())
+    }
+
+    fn create_nil_stub_module(&self, module_path: &str) -> LoadedModule {
+        // Create a stub module that exports lua.nil for missing optional modules
+        let stub_item = Item {
+            kind: ItemKind::Const {
+                name: module_path.split('.').last().unwrap_or(module_path).to_string(),
+                ty: crate::ast::Type {
+                    kind: crate::ast::TypeKind::Named("LuaValue".to_string()),
+                    span: Span::new(0, 0, 0, 0),
+                },
+                value: crate::ast::Expr {
+                    kind: crate::ast::ExprKind::FieldAccess {
+                        object: Box::new(crate::ast::Expr {
+                            kind: crate::ast::ExprKind::Identifier("lua".to_string()),
+                            span: Span::new(0, 0, 0, 0),
+                        }),
+                        field: "nil".to_string(),
+                    },
+                    span: Span::new(0, 0, 0, 0),
+                },
+            },
+            span: Span::new(0, 0, 0, 0),
+        };
+
+        LoadedModule {
+            path: module_path.to_string(),
+            items: vec![stub_item],
+            imports: ModuleImports::default(),
+            exports: ModuleExports::default(),
+            init_function: None,
+            source_path: PathBuf::from(format!("<stub:{}>", module_path)),
+        }
     }
 
     fn attach_module_to_error(error: LustError, module_path: &str) -> LustError {
@@ -746,5 +845,77 @@ impl ModuleLoader {
             modules,
             entry_module,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("{prefix}_{nanos}"));
+        dir
+    }
+
+    #[test]
+    fn merges_multiple_script_chunks_into_single_init() {
+        let dir = unique_temp_dir("lust_module_loader_test");
+        fs::create_dir_all(&dir).unwrap();
+        let entry_path = dir.join("main.lust");
+        let module_path = dir.join("m.lust");
+
+        fs::write(&entry_path, "use m as m\n").unwrap();
+
+        // Interleaved script + declarations; parser will produce multiple ItemKind::Script chunks.
+        fs::write(
+            &module_path,
+            r#"
+local a: int = 1
+
+pub function f(): int
+    return a
+end
+
+local b: int = 2
+
+pub function g(): int
+    return b
+end
+
+local c: int = a + b
+"#,
+        )
+        .unwrap();
+
+        let mut loader = ModuleLoader::new(dir.clone());
+        let program = loader
+            .load_program_from_entry(entry_path.to_str().unwrap())
+            .unwrap();
+
+        let module = program.modules.iter().find(|m| m.path == "m").unwrap();
+        assert_eq!(module.init_function.as_deref(), Some("__init@m"));
+
+        let init_functions: Vec<&FunctionDef> = module
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::Function(f) if f.name == "__init@m" => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(init_functions.len(), 1);
+        assert_eq!(init_functions[0].body.len(), 3);
+
+        // Best-effort cleanup.
+        let _ = fs::remove_file(entry_path);
+        let _ = fs::remove_file(module_path);
+        let _ = fs::remove_dir(dir);
     }
 }

@@ -24,6 +24,7 @@ pub struct TypeEnv {
     type_aliases: HashMap<String, (Vec<String>, Type)>,
     impls: Vec<ImplBlock>,
     builtin_types: HashSet<String>,
+    constants: HashMap<String, Type>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,7 +42,7 @@ impl fmt::Display for FunctionSignature {
             .map(|param| param.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        write!(f, "function({}) -> {}", params, self.return_type)
+        write!(f, "function({}): {}", params, self.return_type)
     }
 }
 
@@ -69,6 +70,7 @@ impl TypeEnv {
             type_aliases: HashMap::new(),
             impls: Vec::new(),
             builtin_types: HashSet::new(),
+            constants: HashMap::new(),
         };
         env.register_builtins(config);
         env
@@ -79,6 +81,12 @@ impl TypeEnv {
         self.register_builtin_type("Task");
         self.register_builtin_type("TaskStatus");
         self.register_builtin_type("TaskInfo");
+        self.register_builtin_type("Iterator");
+        self.register_builtin_type("LuaValue");
+        self.register_builtin_type("LuaTable");
+        self.register_builtin_type("LuaFunction");
+        self.register_builtin_type("LuaUserdata");
+        self.register_builtin_type("LuaThread");
         let task_status_type = Type::new(TypeKind::Named("TaskStatus".to_string()), dummy_span);
         let unknown_type = Type::new(TypeKind::Unknown, dummy_span);
         let option_unknown_type =
@@ -124,10 +132,124 @@ impl TypeEnv {
         };
         self.structs
             .insert("TaskInfo".to_string(), task_info_struct);
+        self.structs.insert(
+            "LuaTable".to_string(),
+            StructDef {
+                name: "LuaTable".to_string(),
+                type_params: vec![],
+                trait_bounds: vec![],
+                fields: vec![
+                    StructField {
+                        name: "table".to_string(),
+                        ty: Type::new(
+                            TypeKind::Map(
+                                Box::new(Type::new(
+                                    TypeKind::Named("LuaValue".to_string()),
+                                    dummy_span,
+                                )),
+                                Box::new(Type::new(
+                                    TypeKind::Named("LuaValue".to_string()),
+                                    dummy_span,
+                                )),
+                            ),
+                            dummy_span,
+                        ),
+                        visibility: Visibility::Public,
+                        ownership: FieldOwnership::Strong,
+                        weak_target: None,
+                    },
+                    StructField {
+                        name: "metamethods".to_string(),
+                        ty: Type::new(
+                            TypeKind::Map(
+                                Box::new(Type::new(TypeKind::String, dummy_span)),
+                                Box::new(Type::new(
+                                    TypeKind::Named("LuaValue".to_string()),
+                                    dummy_span,
+                                )),
+                            ),
+                            dummy_span,
+                        ),
+                        visibility: Visibility::Public,
+                        ownership: FieldOwnership::Strong,
+                        weak_target: None,
+                    },
+                ],
+                visibility: Visibility::Public,
+            },
+        );
+        for name in ["LuaFunction", "LuaThread"] {
+            self.structs.insert(
+                name.to_string(),
+                StructDef {
+                    name: name.to_string(),
+                    type_params: vec![],
+                    trait_bounds: vec![],
+                    fields: vec![StructField {
+                        name: "handle".to_string(),
+                        ty: Type::new(TypeKind::Int, dummy_span),
+                        visibility: Visibility::Public,
+                        ownership: FieldOwnership::Strong,
+                        weak_target: None,
+                    }],
+                    visibility: Visibility::Public,
+                },
+            );
+        }
+        self.structs.insert(
+            "LuaUserdata".to_string(),
+            StructDef {
+                name: "LuaUserdata".to_string(),
+                type_params: vec![],
+                trait_bounds: vec![],
+                fields: vec![
+                    StructField {
+                        name: "handle".to_string(),
+                        ty: Type::new(TypeKind::Int, dummy_span),
+                        visibility: Visibility::Public,
+                        ownership: FieldOwnership::Strong,
+                        weak_target: None,
+                    },
+                    StructField {
+                        name: "ptr".to_string(),
+                        ty: Type::new(TypeKind::Int, dummy_span),
+                        visibility: Visibility::Public,
+                        ownership: FieldOwnership::Strong,
+                        weak_target: None,
+                    },
+                    StructField {
+                        name: "state".to_string(),
+                        ty: Type::new(TypeKind::Int, dummy_span),
+                        visibility: Visibility::Public,
+                        ownership: FieldOwnership::Strong,
+                        weak_target: None,
+                    },
+                    StructField {
+                        name: "metamethods".to_string(),
+                        ty: Type::new(
+                            TypeKind::Map(
+                                Box::new(Type::new(TypeKind::String, dummy_span)),
+                                Box::new(Type::new(
+                                    TypeKind::Named("LuaValue".to_string()),
+                                    dummy_span,
+                                )),
+                            ),
+                            dummy_span,
+                        ),
+                        visibility: Visibility::Public,
+                        ownership: FieldOwnership::Strong,
+                        weak_target: None,
+                    },
+                ],
+                visibility: Visibility::Public,
+            },
+        );
         self.register_builtin_function_slice(builtins::base_functions(), dummy_span);
         self.register_builtin_function_slice(builtins::task_functions(), dummy_span);
+        self.register_builtin_function_slice(builtins::lua_functions(), dummy_span);
         if let Some(global_scope) = self.scopes.first_mut() {
             global_scope.insert("task".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+            global_scope.insert("lua".to_string(), Type::new(TypeKind::Unknown, dummy_span));
         }
 
         let task_status_enum = EnumDef {
@@ -164,12 +286,82 @@ impl TypeEnv {
         };
         self.enums
             .insert("TaskStatus".to_string(), task_status_enum);
+        let lua_value_enum = EnumDef {
+            name: "LuaValue".to_string(),
+            type_params: vec![],
+            trait_bounds: vec![],
+            variants: vec![
+                EnumVariant {
+                    name: "Nil".to_string(),
+                    fields: None,
+                },
+                EnumVariant {
+                    name: "Bool".to_string(),
+                    fields: Some(vec![Type::new(TypeKind::Bool, dummy_span)]),
+                },
+                EnumVariant {
+                    name: "Int".to_string(),
+                    fields: Some(vec![Type::new(TypeKind::Int, dummy_span)]),
+                },
+                EnumVariant {
+                    name: "Float".to_string(),
+                    fields: Some(vec![Type::new(TypeKind::Float, dummy_span)]),
+                },
+                EnumVariant {
+                    name: "String".to_string(),
+                    fields: Some(vec![Type::new(TypeKind::String, dummy_span)]),
+                },
+                EnumVariant {
+                    name: "Table".to_string(),
+                    fields: Some(vec![Type::new(
+                        TypeKind::Named("LuaTable".to_string()),
+                        dummy_span,
+                    )]),
+                },
+                EnumVariant {
+                    name: "Function".to_string(),
+                    fields: Some(vec![Type::new(
+                        TypeKind::Named("LuaFunction".to_string()),
+                        dummy_span,
+                    )]),
+                },
+                EnumVariant {
+                    name: "Userdata".to_string(),
+                    fields: Some(vec![Type::new(
+                        TypeKind::Named("LuaUserdata".to_string()),
+                        dummy_span,
+                    )]),
+                },
+                EnumVariant {
+                    name: "Thread".to_string(),
+                    fields: Some(vec![Type::new(
+                        TypeKind::Named("LuaThread".to_string()),
+                        dummy_span,
+                    )]),
+                },
+                EnumVariant {
+                    name: "LightUserdata".to_string(),
+                    fields: Some(vec![Type::new(TypeKind::Unknown, dummy_span)]),
+                },
+            ],
+            visibility: Visibility::Public,
+        };
+        self.enums.insert("LuaValue".to_string(), lua_value_enum);
         if config.is_module_enabled("io") {
             if let Some(global_scope) = self.scopes.first_mut() {
                 global_scope.insert("io".to_string(), Type::new(TypeKind::Unknown, dummy_span));
             }
 
             self.register_builtin_function_slice(builtins::io_functions(), dummy_span);
+        }
+
+        if config.is_module_enabled("string") {
+            if let Some(global_scope) = self.scopes.first_mut() {
+                global_scope
+                    .insert("string".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+            }
+
+            self.register_builtin_function_slice(builtins::string_functions(), dummy_span);
         }
 
         if config.is_module_enabled("os") {
@@ -289,6 +481,14 @@ impl TypeEnv {
             where_clause: vec![],
         };
         self.impls.push(string_to_string_impl);
+        let luavalue_to_string_impl = ImplBlock {
+            type_params: vec![],
+            trait_name: Some("ToString".to_string()),
+            target_type: Type::new(TypeKind::Named("LuaValue".to_string()), dummy_span),
+            methods: vec![],
+            where_clause: vec![],
+        };
+        self.impls.push(luavalue_to_string_impl);
     }
 
     fn register_builtin_type(&mut self, name: &str) {
@@ -338,6 +538,28 @@ impl TypeEnv {
         if let Some(refinement_scope) = self.refinements.last_mut() {
             refinement_scope.insert(name, refined_type);
         }
+    }
+
+    pub fn register_constant(&mut self, name: String, ty: Type) -> Result<()> {
+        if let Some(existing) = self.constants.get(&name) {
+            if existing != &ty {
+                return Err(LustError::TypeError {
+                    message: format!(
+                        "Constant '{}' is already defined with a different type",
+                        name
+                    ),
+                });
+            }
+
+            return Ok(());
+        }
+
+        self.constants.insert(name, ty);
+        Ok(())
+    }
+
+    pub fn lookup_constant(&self, name: &str) -> Option<Type> {
+        self.constants.get(name).cloned()
     }
 
     pub fn record_generic_instance(

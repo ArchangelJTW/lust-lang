@@ -14,6 +14,8 @@ pub mod error;
 pub mod ffi;
 pub mod jit;
 mod lazy;
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+pub mod lua_compat;
 pub mod lexer;
 pub mod modules;
 pub mod number;
@@ -52,8 +54,8 @@ pub use packages::{
     CredentialsError, DependencyResolution, DependencyResolutionError, DownloadedArchive,
     LoadedRustModule, LocalBuildOutput, LocalModuleError, ManifestError, PackageArchive,
     PackageDetails, PackageKind, PackageManager, PackageManifest, PackageSpecifier, PackageSummary,
-    PackageVersionInfo, PublishResponse, RegistryClient, RegistryError, ResolvedLustDependency,
-    ResolvedRustDependency, SearchParameters, StubFile, DEFAULT_BASE_URL,
+    PackageVersionInfo, PublishResponse, RegistryClient, RegistryError, ResolvedLuaDependency,
+    ResolvedLustDependency, ResolvedRustDependency, SearchParameters, StubFile, DEFAULT_BASE_URL,
 };
 pub use parser::Parser;
 pub use typechecker::{FunctionSignature, TypeChecker, TypeCollection};

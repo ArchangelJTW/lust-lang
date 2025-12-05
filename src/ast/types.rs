@@ -93,7 +93,7 @@ impl fmt::Display for TypeKind {
                     .map(|p| p.to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
-                write!(f, "function({}) -> {}", params, return_type)
+                write!(f, "function({}): {}", params, return_type)
             }
 
             TypeKind::Tuple(elements) => {

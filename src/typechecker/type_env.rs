@@ -41,7 +41,7 @@ impl fmt::Display for FunctionSignature {
             .map(|param| param.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        write!(f, "function({}) -> {}", params, self.return_type)
+        write!(f, "function({}): {}", params, self.return_type)
     }
 }
 

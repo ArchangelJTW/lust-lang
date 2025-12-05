@@ -1,0 +1,12 @@
+struct Thing
+  x: int
+end
+
+local obj = Thing { x = 1 }
+
+local map: Map<unknown, unknown> = {
+  [obj] = "hello"
+}
+
+print(map:get(obj))
+

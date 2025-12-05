@@ -1,25 +1,25 @@
 use super::corelib::string_key;
-use crate::bytecode::{NativeCallResult, Value, ValueKey};
+use super::VM;
+use crate::bytecode::{NativeCallResult, Value};
 use crate::config::LustConfig;
 use crate::LustInt;
-use hashbrown::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-pub fn create_stdlib(config: &LustConfig) -> Vec<(&'static str, Value)> {
+pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)> {
     let mut stdlib = vec![
         ("print", create_print_fn()),
         ("println", create_println_fn()),
         ("type", create_type_fn()),
     ];
     if config.is_module_enabled("io") {
-        stdlib.push(("io", create_io_module()));
+        stdlib.push(("io", create_io_module(vm)));
     }
 
     if config.is_module_enabled("os") {
-        stdlib.push(("os", create_os_module()));
+        stdlib.push(("os", create_os_module(vm)));
     }
 
     stdlib
@@ -81,18 +81,19 @@ fn create_type_fn() -> Value {
     }))
 }
 
-fn create_io_module() -> Value {
-    let mut entries: HashMap<ValueKey, Value> = HashMap::new();
-    entries.insert(string_key("read_file"), create_io_read_file_fn());
-    entries.insert(
-        string_key("read_file_bytes"),
-        create_io_read_file_bytes_fn(),
-    );
-    entries.insert(string_key("write_file"), create_io_write_file_fn());
-    entries.insert(string_key("read_stdin"), create_io_read_stdin_fn());
-    entries.insert(string_key("read_line"), create_io_read_line_fn());
-    entries.insert(string_key("write_stdout"), create_io_write_stdout_fn());
-    Value::map(entries)
+fn create_io_module(vm: &VM) -> Value {
+    let entries = [
+        (string_key("read_file"), create_io_read_file_fn()),
+        (
+            string_key("read_file_bytes"),
+            create_io_read_file_bytes_fn(),
+        ),
+        (string_key("write_file"), create_io_write_file_fn()),
+        (string_key("read_stdin"), create_io_read_stdin_fn()),
+        (string_key("read_line"), create_io_read_line_fn()),
+        (string_key("write_stdout"), create_io_write_stdout_fn()),
+    ];
+    vm.map_with_entries(entries)
 }
 
 fn create_io_read_file_fn() -> Value {
@@ -240,16 +241,17 @@ fn create_io_write_stdout_fn() -> Value {
     }))
 }
 
-fn create_os_module() -> Value {
-    let mut entries: HashMap<ValueKey, Value> = HashMap::new();
-    entries.insert(string_key("time"), create_os_time_fn());
-    entries.insert(string_key("sleep"), create_os_sleep_fn());
-    entries.insert(string_key("create_file"), create_os_create_file_fn());
-    entries.insert(string_key("create_dir"), create_os_create_dir_fn());
-    entries.insert(string_key("remove_file"), create_os_remove_file_fn());
-    entries.insert(string_key("remove_dir"), create_os_remove_dir_fn());
-    entries.insert(string_key("rename"), create_os_rename_fn());
-    Value::map(entries)
+fn create_os_module(vm: &VM) -> Value {
+    let entries = [
+        (string_key("time"), create_os_time_fn()),
+        (string_key("sleep"), create_os_sleep_fn()),
+        (string_key("create_file"), create_os_create_file_fn()),
+        (string_key("create_dir"), create_os_create_dir_fn()),
+        (string_key("remove_file"), create_os_remove_file_fn()),
+        (string_key("remove_dir"), create_os_remove_dir_fn()),
+        (string_key("rename"), create_os_rename_fn()),
+    ];
+    vm.map_with_entries(entries)
 }
 
 fn create_os_time_fn() -> Value {

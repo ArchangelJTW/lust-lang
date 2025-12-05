@@ -1,11 +1,10 @@
 use super::conversions::{FromLustValue, FunctionArgs, IntoTypedValue};
 use super::program::{ensure_return_type, normalize_global_name, EmbeddedProgram};
 use crate::ast::{Type, TypeKind};
-use crate::bytecode::{FieldStorage, StructLayout, Value, ValueKey};
+use crate::bytecode::{FieldStorage, LustMap, StructLayout, Value, ValueKey};
 use crate::number::{LustFloat, LustInt};
 use crate::typechecker::FunctionSignature;
 use crate::{LustError, Result};
-use hashbrown::HashMap;
 use std::cell::{Ref, RefCell, RefMut};
 use std::ops::Deref;
 use std::rc::Rc;
@@ -687,11 +686,11 @@ impl ArrayHandle {
 
 #[derive(Clone)]
 pub struct MapHandle {
-    inner: Rc<RefCell<HashMap<ValueKey, Value>>>,
+    inner: Rc<RefCell<LustMap>>,
 }
 
 impl MapHandle {
-    pub(crate) fn from_rc(inner: Rc<RefCell<HashMap<ValueKey, Value>>>) -> Self {
+    pub(crate) fn from_rc(inner: Rc<RefCell<LustMap>>) -> Self {
         Self { inner }
     }
 
@@ -703,11 +702,11 @@ impl MapHandle {
         self.len() == 0
     }
 
-    pub fn borrow(&self) -> Ref<'_, HashMap<ValueKey, Value>> {
+    pub fn borrow(&self) -> Ref<'_, LustMap> {
         self.inner.borrow()
     }
 
-    pub fn borrow_mut(&self) -> RefMut<'_, HashMap<ValueKey, Value>> {
+    pub fn borrow_mut(&self) -> RefMut<'_, LustMap> {
         self.inner.borrow_mut()
     }
 
@@ -730,11 +729,14 @@ impl MapHandle {
         }
         let lookup = key.clone();
         let map = self.inner.borrow();
-        Some(ValueRef::borrowed(Ref::map(map, move |values| {
-            values
-                .get(&lookup)
-                .expect("lookup key should be present after contains_key")
-        })))
+        Some(ValueRef::borrowed(Ref::map(
+            map,
+            move |values: &LustMap| {
+                values
+                    .get(&lookup)
+                    .expect("lookup key should be present after contains_key")
+            },
+        )))
     }
 
     pub fn insert<K>(&self, key: K, value: Value) -> Option<Value>
@@ -751,12 +753,12 @@ impl MapHandle {
         self.inner.borrow_mut().remove(&key.into())
     }
 
-    pub fn with_ref<R>(&self, f: impl FnOnce(&HashMap<ValueKey, Value>) -> R) -> R {
+    pub fn with_ref<R>(&self, f: impl FnOnce(&LustMap) -> R) -> R {
         let map = self.inner.borrow();
         f(&map)
     }
 
-    pub fn with_mut<R>(&self, f: impl FnOnce(&mut HashMap<ValueKey, Value>) -> R) -> R {
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut LustMap) -> R) -> R {
         let mut map = self.inner.borrow_mut();
         f(&mut map)
     }

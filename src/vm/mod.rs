@@ -27,7 +27,7 @@ pub(super) use alloc::{
     vec::Vec,
 };
 use core::cell::RefCell;
-use hashbrown::HashMap;
+use hashbrown::{DefaultHashBuilder, HashMap};
 mod api;
 mod execution;
 mod tasks;
@@ -150,11 +150,14 @@ where
 
 pub(super) const TO_STRING_TRAIT: &str = "ToString";
 pub(super) const TO_STRING_METHOD: &str = "to_string";
+pub(super) const HASH_KEY_TRAIT: &str = "HashKey";
+pub(super) const HASH_KEY_METHOD: &str = "to_hashkey";
 pub struct VM {
     pub(super) jit: JitState,
     pub(super) functions: Vec<Function>,
     pub(super) natives: HashMap<String, Value>,
     pub(super) globals: HashMap<String, Value>,
+    pub(super) map_hasher: DefaultHashBuilder,
     pub(super) call_stack: Vec<CallFrame>,
     pub(super) max_stack_depth: usize,
     pub(super) pending_return_value: Option<Value>,

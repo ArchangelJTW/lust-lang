@@ -1,11 +1,13 @@
 use super::*;
 use crate::ast::Type;
+use crate::bytecode::{LustMap, ValueKey};
 use crate::config::LustConfig;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::result::Result as CoreResult;
 use core::{array, mem};
+use hashbrown::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct NativeExportParam {
@@ -84,6 +86,7 @@ impl VM {
             functions: Vec::new(),
             natives: HashMap::new(),
             globals: HashMap::new(),
+            map_hasher: DefaultHashBuilder::default(),
             call_stack: Vec::new(),
             max_stack_depth: 1000,
             pending_return_value: None,
@@ -113,21 +116,30 @@ impl VM {
             .insert(("string".to_string(), "ToString".to_string()), true);
         vm.trait_impls
             .insert(("bool".to_string(), "ToString".to_string()), true);
-        vm.trait_impls
-            .insert(("int".to_string(), "Hashable".to_string()), true);
-        vm.trait_impls
-            .insert(("float".to_string(), "Hashable".to_string()), true);
-        vm.trait_impls
-            .insert(("string".to_string(), "Hashable".to_string()), true);
-        vm.trait_impls
-            .insert(("bool".to_string(), "Hashable".to_string()), true);
         super::corelib::install_core_builtins(&mut vm);
         #[cfg(feature = "std")]
-        for (name, func) in super::stdlib::create_stdlib(config) {
+        for (name, func) in super::stdlib::create_stdlib(config, &vm) {
             vm.register_native(name, func);
         }
 
         vm
+    }
+
+    pub(super) fn new_map(&self) -> LustMap {
+        HashMap::with_hasher(self.map_hasher.clone())
+    }
+
+    pub(super) fn map_with_entries(
+        &self,
+        entries: impl IntoIterator<Item = (ValueKey, Value)>,
+    ) -> Value {
+        let mut map = self.new_map();
+        map.extend(entries);
+        Value::map(map)
+    }
+
+    pub(super) fn new_map_value(&self) -> Value {
+        Value::map(self.new_map())
     }
 
     pub(super) fn observe_value(&mut self, value: &Value) {

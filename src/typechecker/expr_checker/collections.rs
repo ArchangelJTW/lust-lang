@@ -177,12 +177,6 @@ impl TypeChecker {
             } else {
                 self.check_expr(key_expr)?
             };
-            if !allow_mixed_keys && !self.env.type_implements_trait(&raw_key_type, "Hashable") {
-                return Err(self.type_error(format!(
-                    "Map key type '{}' must implement Hashable trait",
-                    raw_key_type
-                )));
-            }
             let canonical_key = self.canonicalize_type(&raw_key_type);
 
             let raw_value_type = if let Some(hint) = value_hint {

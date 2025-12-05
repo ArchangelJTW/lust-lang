@@ -17,7 +17,7 @@ use core::cell::RefCell;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::{ptr, slice, str};
-use hashbrown::HashMap;
+use hashbrown::{DefaultHashBuilder, HashMap};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TaskHandle(pub u64);
 impl TaskHandle {
@@ -27,137 +27,243 @@ impl TaskHandle {
 }
 
 #[derive(Clone, Debug)]
-pub enum ValueKey {
-    Int(LustInt),
-    Float(LustFloat),
-    String(Rc<String>),
-    Bool(bool),
+pub struct ValueKey {
+    original: Value,
+    hashed: Value,
 }
 
 impl ValueKey {
-    pub fn from_value(value: &Value) -> Option<Self> {
-        match value {
-            Value::Int(i) => Some(ValueKey::Int(*i)),
-            Value::Float(f) => Some(ValueKey::Float(*f)),
-            Value::String(s) => Some(ValueKey::String(s.clone())),
-            Value::Bool(b) => Some(ValueKey::Bool(*b)),
-            _ => None,
+    pub fn from_value(value: &Value) -> Self {
+        ValueKey {
+            original: value.clone(),
+            hashed: value.clone(),
         }
+    }
+
+    pub fn with_hashed(original: Value, hashed: Value) -> Self {
+        ValueKey { original, hashed }
     }
 
     pub fn string<S>(value: S) -> Self
     where
         S: Into<String>,
     {
-        ValueKey::String(Rc::new(value.into()))
+        ValueKey::from(Value::String(Rc::new(value.into())))
     }
 
     pub fn to_value(&self) -> Value {
-        match self {
-            ValueKey::Int(i) => Value::Int(*i),
-            ValueKey::Float(f) => Value::Float(*f),
-            ValueKey::String(s) => Value::String(s.clone()),
-            ValueKey::Bool(b) => Value::Bool(*b),
-        }
+        self.original.clone()
     }
 }
 
 impl PartialEq for ValueKey {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (ValueKey::Int(a), ValueKey::Int(b)) => a == b,
-            (ValueKey::Float(a), ValueKey::Float(b)) => {
-                if float_is_nan(*a) && float_is_nan(*b) {
-                    true
-                } else {
-                    a == b
-                }
-            }
-
-            (ValueKey::String(a), ValueKey::String(b)) => a == b,
-            (ValueKey::Bool(a), ValueKey::Bool(b)) => a == b,
-            _ => false,
-        }
+        value_key_eq(&self.hashed, &other.hashed)
     }
 }
 
 impl Eq for ValueKey {}
 impl Hash for ValueKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            ValueKey::Int(i) => {
-                0u8.hash(state);
-                i.hash(state);
-            }
-
-            ValueKey::Float(f) => {
-                1u8.hash(state);
-                if float_is_nan(*f) {
-                    u64::MAX.hash(state);
-                } else {
-                    float_to_hash_bits(*f).hash(state);
-                }
-            }
-
-            ValueKey::String(s) => {
-                2u8.hash(state);
-                s.hash(state);
-            }
-
-            ValueKey::Bool(b) => {
-                3u8.hash(state);
-                b.hash(state);
-            }
-        }
+        hash_value_for_key(&self.hashed, state);
     }
 }
 
 impl fmt::Display for ValueKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ValueKey::Int(i) => write!(f, "{}", i),
-            ValueKey::Float(fl) => write!(f, "{}", fl),
-            ValueKey::String(s) => write!(f, "{}", s),
-            ValueKey::Bool(b) => write!(f, "{}", b),
+        write!(f, "{}", self.original)
+    }
+}
+
+impl From<Value> for ValueKey {
+    fn from(value: Value) -> Self {
+        ValueKey {
+            original: value.clone(),
+            hashed: value,
         }
     }
 }
 
 impl From<LustInt> for ValueKey {
     fn from(value: LustInt) -> Self {
-        ValueKey::Int(value)
+        ValueKey::from(Value::Int(value))
     }
 }
 
 impl From<LustFloat> for ValueKey {
     fn from(value: LustFloat) -> Self {
-        ValueKey::Float(value)
+        ValueKey::from(Value::Float(value))
     }
 }
 
 impl From<bool> for ValueKey {
     fn from(value: bool) -> Self {
-        ValueKey::Bool(value)
+        ValueKey::from(Value::Bool(value))
     }
 }
 
 impl From<String> for ValueKey {
     fn from(value: String) -> Self {
-        ValueKey::String(Rc::new(value))
+        ValueKey::from(Value::String(Rc::new(value)))
     }
 }
 
 impl From<&str> for ValueKey {
     fn from(value: &str) -> Self {
-        ValueKey::String(Rc::new(value.to_owned()))
+        ValueKey::from(Value::String(Rc::new(value.to_owned())))
     }
 }
 
 impl From<Rc<String>> for ValueKey {
     fn from(value: Rc<String>) -> Self {
-        ValueKey::String(value)
+        ValueKey::from(Value::String(value))
     }
 }
+
+fn value_key_eq(left: &Value, right: &Value) -> bool {
+    use Value::*;
+    match (left, right) {
+        (Nil, Nil) => true,
+        (Bool(a), Bool(b)) => a == b,
+        (Int(a), Int(b)) => a == b,
+        (Float(a), Float(b)) => {
+            if float_is_nan(*a) && float_is_nan(*b) {
+                true
+            } else {
+                a == b
+            }
+        }
+        (String(a), String(b)) => a == b,
+        (Array(a), Array(b)) => Rc::ptr_eq(a, b),
+        (Tuple(a), Tuple(b)) => Rc::ptr_eq(a, b),
+        (Map(a), Map(b)) => Rc::ptr_eq(a, b),
+        (Struct { fields: f1, .. }, Struct { fields: f2, .. }) => Rc::ptr_eq(f1, f2),
+        (WeakStruct(a), WeakStruct(b)) => Weak::ptr_eq(a.fields(), b.fields()),
+        (
+            Enum {
+                enum_name: n1,
+                variant: v1,
+                values: vals1,
+            },
+            Enum {
+                enum_name: n2,
+                variant: v2,
+                values: vals2,
+            },
+        ) => n1 == n2 && v1 == v2 && values_ptr_eq(vals1, vals2),
+        (Function(a), Function(b)) => a == b,
+        (NativeFunction(a), NativeFunction(b)) => Rc::ptr_eq(a, b),
+        (
+            Closure {
+                function_idx: f1,
+                upvalues: u1,
+            },
+            Closure {
+                function_idx: f2,
+                upvalues: u2,
+            },
+        ) => f1 == f2 && Rc::ptr_eq(u1, u2),
+        (Iterator(a), Iterator(b)) => Rc::ptr_eq(a, b),
+        (Task(a), Task(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn hash_value_for_key<H: Hasher>(value: &Value, state: &mut H) {
+    use Value::*;
+    match value {
+        Nil => {
+            0u8.hash(state);
+        }
+        Bool(b) => {
+            1u8.hash(state);
+            b.hash(state);
+        }
+        Int(i) => {
+            2u8.hash(state);
+            i.hash(state);
+        }
+        Float(f) => {
+            3u8.hash(state);
+            if float_is_nan(*f) {
+                u64::MAX.hash(state);
+            } else {
+                float_to_hash_bits(*f).hash(state);
+            }
+        }
+        String(s) => {
+            4u8.hash(state);
+            s.hash(state);
+        }
+        Array(arr) => {
+            5u8.hash(state);
+            (Rc::as_ptr(arr) as usize).hash(state);
+        }
+        Tuple(tuple) => {
+            6u8.hash(state);
+            (Rc::as_ptr(tuple) as usize).hash(state);
+        }
+        Map(map) => {
+            7u8.hash(state);
+            (Rc::as_ptr(map) as usize).hash(state);
+        }
+        Struct { fields, .. } => {
+            8u8.hash(state);
+            (Rc::as_ptr(fields) as usize).hash(state);
+        }
+        WeakStruct(weak) => {
+            9u8.hash(state);
+            (weak.fields_ptr() as usize).hash(state);
+        }
+        Enum {
+            enum_name,
+            variant,
+            values,
+        } => {
+            10u8.hash(state);
+            enum_name.hash(state);
+            variant.hash(state);
+            values
+                .as_ref()
+                .map(|rc| Rc::as_ptr(rc) as usize)
+                .hash(state);
+        }
+        Function(idx) => {
+            11u8.hash(state);
+            idx.hash(state);
+        }
+        NativeFunction(func) => {
+            12u8.hash(state);
+            (Rc::as_ptr(func) as *const () as usize).hash(state);
+        }
+        Closure {
+            function_idx,
+            upvalues,
+        } => {
+            13u8.hash(state);
+            function_idx.hash(state);
+            (Rc::as_ptr(upvalues) as usize).hash(state);
+        }
+        Iterator(iter) => {
+            14u8.hash(state);
+            (Rc::as_ptr(iter) as usize).hash(state);
+        }
+        Task(handle) => {
+            15u8.hash(state);
+            handle.hash(state);
+        }
+    }
+}
+
+fn values_ptr_eq(left: &Option<Rc<Vec<Value>>>, right: &Option<Rc<Vec<Value>>>) -> bool {
+    match (left, right) {
+        (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+pub type LustMap = HashMap<ValueKey, Value, DefaultHashBuilder>;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,7 +512,7 @@ pub enum Value {
     String(Rc<String>),
     Array(Rc<RefCell<Vec<Value>>>),
     Tuple(Rc<Vec<Value>>),
-    Map(Rc<RefCell<HashMap<ValueKey, Value>>>),
+    Map(Rc<RefCell<LustMap>>),
     Struct {
         name: String,
         layout: Rc<StructLayout>,
@@ -454,6 +560,14 @@ impl WeakStructRef {
 
     pub fn struct_name(&self) -> &str {
         &self.name
+    }
+
+    pub(crate) fn fields(&self) -> &Weak<RefCell<Vec<Value>>> {
+        &self.fields
+    }
+
+    pub(crate) fn fields_ptr(&self) -> *const RefCell<Vec<Value>> {
+        self.fields.as_ptr()
     }
 }
 
@@ -662,7 +776,7 @@ impl Value {
         }
     }
 
-    pub fn as_map(&self) -> Option<HashMap<ValueKey, Value>> {
+    pub fn as_map(&self) -> Option<LustMap> {
         match self {
             Value::Map(map) => Some(map.borrow().clone()),
             _ => None,
@@ -734,7 +848,7 @@ impl Value {
         }
     }
 
-    pub fn map(entries: HashMap<ValueKey, Value>) -> Self {
+    pub fn map(entries: LustMap) -> Self {
         Value::Map(Rc::new(RefCell::new(entries)))
     }
 
@@ -2260,7 +2374,7 @@ pub unsafe extern "C" fn jit_set_field_safe(
         },
         Value::Map(map) => {
             use crate::bytecode::ValueKey;
-            let key = ValueKey::String(Rc::new(field_name.to_string()));
+            let key = ValueKey::from(field_name.to_string());
             map.borrow_mut().insert(key, value);
             1
         }

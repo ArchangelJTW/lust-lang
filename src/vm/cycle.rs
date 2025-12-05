@@ -1,5 +1,5 @@
 use crate::bytecode::value::IteratorState;
-use crate::bytecode::{Value, ValueKey};
+use crate::bytecode::{LustMap, Value};
 use crate::vm::task::TaskInstance;
 use crate::vm::CallFrame;
 use crate::vm::TaskSignal;
@@ -24,7 +24,7 @@ struct ContainerEntry {
 
 enum ContainerKind {
     Array(Weak<RefCell<Vec<Value>>>),
-    Map(Weak<RefCell<HashMap<ValueKey, Value>>>),
+    Map(Weak<RefCell<LustMap>>),
     Struct(Weak<RefCell<Vec<Value>>>),
     Iterator(Weak<RefCell<IteratorState>>),
 }
@@ -231,11 +231,7 @@ impl CycleCollector {
         }
     }
 
-    fn mark_map(
-        &mut self,
-        rc: &Rc<RefCell<HashMap<ValueKey, Value>>>,
-        visited: &mut HashSet<usize>,
-    ) {
+    fn mark_map(&mut self, rc: &Rc<RefCell<LustMap>>, visited: &mut HashSet<usize>) {
         let ptr = Rc::as_ptr(rc) as usize;
         let entry = self
             .containers
@@ -332,7 +328,7 @@ impl CycleCollector {
         }
     }
 
-    fn register_map(&mut self, rc: &Rc<RefCell<HashMap<ValueKey, Value>>>) -> bool {
+    fn register_map(&mut self, rc: &Rc<RefCell<LustMap>>) -> bool {
         let ptr = Rc::as_ptr(rc) as usize;
         match self.containers.entry(ptr) {
             Entry::Vacant(entry) => {

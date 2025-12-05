@@ -7,18 +7,17 @@ use alloc::rc::Rc;
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
-use hashbrown::HashMap;
 
 pub(super) fn install_core_builtins(vm: &mut VM) {
-    for (name, value) in core_entries() {
+    for (name, value) in core_entries(vm) {
         vm.register_native(name, value);
     }
 }
 
-pub(super) fn core_entries() -> Vec<(&'static str, Value)> {
+pub(super) fn core_entries(vm: &VM) -> Vec<(&'static str, Value)> {
     vec![
         ("tostring", create_tostring_fn()),
-        ("task", create_task_module()),
+        ("task", create_task_module(vm)),
     ]
 }
 
@@ -35,22 +34,23 @@ pub(super) fn create_tostring_fn() -> Value {
     }))
 }
 
-pub(super) fn create_task_module() -> Value {
-    let mut entries: HashMap<ValueKey, Value> = HashMap::new();
-    entries.insert(string_key("run"), create_task_run_fn());
-    entries.insert(string_key("create"), create_task_create_fn());
-    entries.insert(string_key("status"), create_task_status_fn());
-    entries.insert(string_key("info"), create_task_info_fn());
-    entries.insert(string_key("resume"), create_task_resume_fn());
-    entries.insert(string_key("yield"), create_task_yield_fn());
-    entries.insert(string_key("stop"), create_task_stop_fn());
-    entries.insert(string_key("restart"), create_task_restart_fn());
-    entries.insert(string_key("current"), create_task_current_fn());
-    Value::map(entries)
+pub(super) fn create_task_module(vm: &VM) -> Value {
+    let entries = [
+        (string_key("run"), create_task_run_fn()),
+        (string_key("create"), create_task_create_fn()),
+        (string_key("status"), create_task_status_fn()),
+        (string_key("info"), create_task_info_fn()),
+        (string_key("resume"), create_task_resume_fn()),
+        (string_key("yield"), create_task_yield_fn()),
+        (string_key("stop"), create_task_stop_fn()),
+        (string_key("restart"), create_task_restart_fn()),
+        (string_key("current"), create_task_current_fn()),
+    ];
+    vm.map_with_entries(entries)
 }
 
 pub(super) fn string_key(name: &str) -> ValueKey {
-    ValueKey::String(Rc::new(name.to_string()))
+    ValueKey::from(name.to_string())
 }
 
 fn create_task_run_fn() -> Value {

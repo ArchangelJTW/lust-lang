@@ -1,4 +1,5 @@
 use super::*;
+use crate::bytecode::ValueKey;
 use core::{array, ptr};
 impl VM {
     pub(super) fn push_current_vm(&mut self) {
@@ -715,7 +716,7 @@ impl VM {
                 }
 
                 Instruction::NewMap(dest) => {
-                    self.set_register(dest, Value::map(HashMap::new()))?;
+                    self.set_register(dest, self.new_map_value())?;
                 }
 
                 Instruction::NewStruct(
@@ -846,7 +847,7 @@ impl VM {
                             .unwrap_or(Value::Nil),
                         Value::Map(map) => {
                             use crate::bytecode::ValueKey;
-                            let key = ValueKey::String(field_name.clone());
+                            let key = ValueKey::from(field_name.clone());
                             map.borrow().get(&key).cloned().unwrap_or(Value::Nil)
                         }
 
@@ -883,7 +884,7 @@ impl VM {
 
                         Value::Map(map) => {
                             use crate::bytecode::ValueKey;
-                            let key = ValueKey::String(field_name.clone());
+                            let key = ValueKey::from(field_name.clone());
                             map.borrow_mut().insert(key, value);
                         }
 
@@ -925,8 +926,8 @@ impl VM {
                 }
 
                 Instruction::GetIndex(dest, array_reg, index_reg) => {
-                    let collection = self.get_register(array_reg)?;
-                    let index = self.get_register(index_reg)?;
+                    let collection = self.get_register(array_reg)?.clone();
+                    let index = self.get_register(index_reg)?.clone();
                     let result = match collection {
                         Value::Array(arr) => {
                             let idx = index.as_int().ok_or_else(|| LustError::RuntimeError {
@@ -947,15 +948,7 @@ impl VM {
                         }
 
                         Value::Map(map) => {
-                            use crate::bytecode::ValueKey;
-                            let key = ValueKey::from_value(index).ok_or_else(|| {
-                                LustError::RuntimeError {
-                                    message: format!(
-                                        "Cannot use {:?} as map key (not hashable)",
-                                        index
-                                    ),
-                                }
-                            })?;
+                            let key = self.make_hash_key(&index)?;
                             map.borrow().get(&key).cloned().unwrap_or(Value::Nil)
                         }
 
@@ -1137,8 +1130,8 @@ impl VM {
                 }
 
                 Instruction::SetIndex(collection_reg, index_reg, value_reg) => {
-                    let collection = self.get_register(collection_reg)?;
-                    let index = self.get_register(index_reg)?;
+                    let collection = self.get_register(collection_reg)?.clone();
+                    let index = self.get_register(index_reg)?.clone();
                     let value = self.get_register(value_reg)?.clone();
                     match collection {
                         Value::Array(arr) => {
@@ -1160,15 +1153,7 @@ impl VM {
                         }
 
                         Value::Map(map) => {
-                            use crate::bytecode::ValueKey;
-                            let key = ValueKey::from_value(index).ok_or_else(|| {
-                                LustError::RuntimeError {
-                                    message: format!(
-                                        "Cannot use {:?} as map key (not hashable)",
-                                        index
-                                    ),
-                                }
-                            })?;
+                            let key = self.make_hash_key(&index)?;
                             map.borrow_mut().insert(key, value);
                         }
 
@@ -1334,6 +1319,59 @@ impl VM {
         }
 
         false
+    }
+
+    fn value_trait_name(&self, value: &Value) -> String {
+        match value {
+            Value::Int(_) => "int".to_string(),
+            Value::Float(_) => "float".to_string(),
+            Value::String(_) => "string".to_string(),
+            Value::Bool(_) => "bool".to_string(),
+            Value::Nil => "nil".to_string(),
+            Value::Array(_) => "Array".to_string(),
+            Value::Tuple(_) => "Tuple".to_string(),
+            Value::Map(_) => "Map".to_string(),
+            Value::Struct { name, .. } => name.clone(),
+            Value::WeakStruct(weak) => weak.struct_name().to_string(),
+            Value::Enum { enum_name, .. } => enum_name.clone(),
+            Value::Function(_) | Value::NativeFunction(_) | Value::Closure { .. } => {
+                "function".to_string()
+            }
+            Value::Iterator(_) => "Iterator".to_string(),
+            Value::Task(_) => "task".to_string(),
+        }
+    }
+
+    fn invoke_hashkey(&mut self, value: &Value, type_name: &str) -> Result<Value> {
+        let mut candidates = vec![format!("{}:{}", type_name, HASH_KEY_METHOD)];
+        if let Some(last) = type_name.rsplit('.').next() {
+            if last != type_name {
+                candidates.push(format!("{}:{}", last, HASH_KEY_METHOD));
+            }
+        }
+
+        for candidate in candidates {
+            if let Some(idx) = self.functions.iter().position(|f| f.name == candidate) {
+                return self.call_value(&Value::Function(idx), vec![value.clone()]);
+            }
+        }
+
+        Err(LustError::RuntimeError {
+            message: format!(
+                "HashKey trait declared but method '{}' not found for type '{}'",
+                HASH_KEY_METHOD, type_name
+            ),
+        })
+    }
+
+    pub(super) fn make_hash_key(&mut self, value: &Value) -> Result<ValueKey> {
+        let type_name = self.value_trait_name(value);
+        if self.type_has_hashkey(&type_name) {
+            let hashed = self.invoke_hashkey(value, &type_name)?;
+            Ok(ValueKey::with_hashed(value.clone(), hashed))
+        } else {
+            Ok(ValueKey::from_value(value))
+        }
     }
 
     fn match_function_type(&self, value: &Value, type_name: &str) -> Option<bool> {

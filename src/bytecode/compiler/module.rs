@@ -79,8 +79,7 @@ impl Compiler {
                                         method.params.len() as u8,
                                         has_self,
                                     );
-                                    self.function_table
-                                        .insert(mangled_name.clone(), func_idx);
+                                    self.function_table.insert(mangled_name.clone(), func_idx);
                                     self.functions.push(function);
                                     self.assign_signature_by_name(func_idx, &mangled_name);
                                 }
@@ -163,8 +162,7 @@ impl Compiler {
                         };
                         let function =
                             Function::new(&mangled_name, method.params.len() as u8, has_self);
-                        self.function_table
-                            .insert(mangled_name.clone(), func_idx);
+                        self.function_table.insert(mangled_name.clone(), func_idx);
                         self.functions.push(function);
                         self.assign_signature_by_name(func_idx, &mangled_name);
                     }

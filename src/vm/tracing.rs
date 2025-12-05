@@ -91,6 +91,29 @@ impl VM {
         false
     }
 
+    pub(super) fn type_has_hashkey(&self, type_name: &str) -> bool {
+        let mut candidates = vec![type_name];
+        if let Some(last) = type_name.rsplit('.').next() {
+            if last != type_name {
+                candidates.push(last);
+            }
+        }
+
+        for candidate in candidates {
+            let key = (candidate.to_string(), HASH_KEY_TRAIT.to_string());
+            if self.trait_impls.contains_key(&key) {
+                return true;
+            }
+
+            let mangled = format!("{}:{}", candidate, HASH_KEY_METHOD);
+            if self.functions.iter().any(|f| f.name == mangled) {
+                return true;
+            }
+        }
+
+        false
+    }
+
     pub(super) fn struct_cache_key(value: &Value) -> Option<usize> {
         if let Value::Struct { fields, .. } = value {
             Some(Rc::as_ptr(fields) as usize)

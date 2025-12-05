@@ -828,14 +828,7 @@ impl VM {
                             });
                         }
 
-                        let key = ValueKey::from_value(&args[0]).ok_or_else(|| {
-                            LustError::RuntimeError {
-                                message: format!(
-                                    "Cannot use {:?} as map key (not hashable)",
-                                    args[0]
-                                ),
-                            }
-                        })?;
+                        let key = self.make_hash_key(&args[0])?;
                         match map.borrow().get(&key) {
                             Some(value) => Ok(Value::some(value.clone())),
                             None => Ok(Value::none()),
@@ -849,14 +842,7 @@ impl VM {
                             });
                         }
 
-                        let key = ValueKey::from_value(&args[0]).ok_or_else(|| {
-                            LustError::RuntimeError {
-                                message: format!(
-                                    "Cannot use {:?} as map key (not hashable)",
-                                    args[0]
-                                ),
-                            }
-                        })?;
+                        let key = self.make_hash_key(&args[0])?;
                         let value = args[1].clone();
                         map.borrow_mut().insert(key, value);
                         Ok(Value::Nil)
@@ -869,14 +855,7 @@ impl VM {
                             });
                         }
 
-                        let key = ValueKey::from_value(&args[0]).ok_or_else(|| {
-                            LustError::RuntimeError {
-                                message: format!(
-                                    "Cannot use {:?} as map key (not hashable)",
-                                    args[0]
-                                ),
-                            }
-                        })?;
+                        let key = self.make_hash_key(&args[0])?;
                         Ok(Value::Bool(map.borrow().contains_key(&key)))
                     }
 
@@ -887,14 +866,7 @@ impl VM {
                             });
                         }
 
-                        let key = ValueKey::from_value(&args[0]).ok_or_else(|| {
-                            LustError::RuntimeError {
-                                message: format!(
-                                    "Cannot use {:?} as map key (not hashable)",
-                                    args[0]
-                                ),
-                            }
-                        })?;
+                        let key = self.make_hash_key(&args[0])?;
                         match map.borrow_mut().remove(&key) {
                             Some(value) => Ok(Value::some(value)),
                             None => Ok(Value::none()),

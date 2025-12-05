@@ -11,8 +11,8 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use hashbrown::{HashMap, HashSet};
 use core::fmt;
+use hashbrown::{HashMap, HashSet};
 pub struct TypeEnv {
     scopes: Vec<HashMap<String, Type>>,
     refinements: Vec<HashMap<String, Type>>,
@@ -240,55 +240,23 @@ impl TypeEnv {
             visibility: Visibility::Public,
         };
         self.traits.insert("ToString".to_string(), to_string_trait);
-        let hashable_trait = TraitDef {
-            name: "Hashable".to_string(),
+        let hash_key_trait = TraitDef {
+            name: "HashKey".to_string(),
             type_params: vec![],
             methods: vec![TraitMethod {
-                name: "hash".to_string(),
+                name: "to_hashkey".to_string(),
                 type_params: vec![],
                 params: vec![FunctionParam {
                     name: "self".to_string(),
                     ty: Type::new(TypeKind::Unknown, dummy_span),
                     is_self: true,
                 }],
-                return_type: Some(Type::new(TypeKind::Int, dummy_span)),
+                return_type: Some(Type::new(TypeKind::Unknown, dummy_span)),
                 default_impl: None,
             }],
             visibility: Visibility::Public,
         };
-        self.traits.insert("Hashable".to_string(), hashable_trait);
-        let int_hashable_impl = ImplBlock {
-            type_params: vec![],
-            trait_name: Some("Hashable".to_string()),
-            target_type: Type::new(TypeKind::Int, dummy_span),
-            methods: vec![],
-            where_clause: vec![],
-        };
-        self.impls.push(int_hashable_impl);
-        let float_hashable_impl = ImplBlock {
-            type_params: vec![],
-            trait_name: Some("Hashable".to_string()),
-            target_type: Type::new(TypeKind::Float, dummy_span),
-            methods: vec![],
-            where_clause: vec![],
-        };
-        self.impls.push(float_hashable_impl);
-        let bool_hashable_impl = ImplBlock {
-            type_params: vec![],
-            trait_name: Some("Hashable".to_string()),
-            target_type: Type::new(TypeKind::Bool, dummy_span),
-            methods: vec![],
-            where_clause: vec![],
-        };
-        self.impls.push(bool_hashable_impl);
-        let string_hashable_impl = ImplBlock {
-            type_params: vec![],
-            trait_name: Some("Hashable".to_string()),
-            target_type: Type::new(TypeKind::String, dummy_span),
-            methods: vec![],
-            where_clause: vec![],
-        };
-        self.impls.push(string_hashable_impl);
+        self.traits.insert("HashKey".to_string(), hash_key_trait);
         let int_to_string_impl = ImplBlock {
             type_params: vec![],
             trait_name: Some("ToString".to_string()),

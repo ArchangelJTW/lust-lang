@@ -1195,10 +1195,6 @@ fn ensure_child_table(parent: &LuaTableHandle, key: &str) -> LuaTableHandle {
     }
 }
 
-fn push_string(state: &mut LuaState, s: &str) {
-    state.push(LuaValue::String(s.to_string()));
-}
-
 fn cache_cstring<'a>(state: &'a mut LuaState, s: String) -> *const c_char {
     let owned = CString::new(s).unwrap_or_else(|_| CString::new("").unwrap());
     state.string_cache.push(owned);
@@ -2549,7 +2545,7 @@ pub unsafe extern "C" fn luaL_register(
 
         // Ensure table is on the stack, creating nested globals for dotted names.
         let target_handle = if let Some(module) = &name {
-            let mut segments: Vec<&str> = module.split('.').collect();
+            let segments: Vec<&str> = module.split('.').collect();
             if segments.is_empty() {
                 lua_newtable(L);
                 ensure_table_at(state, -1)

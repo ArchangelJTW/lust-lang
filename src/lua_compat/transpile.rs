@@ -451,7 +451,6 @@ const VARARGS_NAME: &str = "__varargs";
 struct WrapperSig {
     params: Vec<String>,
     args: Vec<String>,
-    return_count: usize,
 }
 
 impl Emitter {
@@ -1206,10 +1205,6 @@ impl Emitter {
         }
     }
 
-    fn emit_prefix(&mut self, prefix: &Prefix) -> String {
-        self.emit_prefix_mode(prefix, true)
-    }
-
     fn emit_prefix_mode(&mut self, prefix: &Prefix, wrap_calls: bool) -> String {
         match prefix {
             Prefix::Expression(expr) => self.emit_expr_mode(expr, wrap_calls),
@@ -1317,10 +1312,6 @@ impl Emitter {
             }
             &_ => head,
         }
-    }
-
-    fn emit_args(&mut self, args: &FunctionArgs) -> String {
-        self.emit_args_mode(args, true)
     }
 
     fn emit_args_mode(&mut self, args: &FunctionArgs, _wrap_calls: bool) -> String {
@@ -1633,7 +1624,6 @@ impl Emitter {
             WrapperSig {
                 params,
                 args,
-                return_count: 1,
             }
         })
     }

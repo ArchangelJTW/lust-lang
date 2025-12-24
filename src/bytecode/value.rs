@@ -1437,7 +1437,7 @@ pub unsafe extern "C" fn jit_new_array_safe(
     element_count: usize,
     out_ptr: *mut Value,
 ) -> u8 {
-    let call_num = JIT_NEW_ARRAY_COUNTER.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    let _call_num = JIT_NEW_ARRAY_COUNTER.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     // jit::log(|| format!("jit_new_array_safe call #{}: ENTER - elements_ptr={:?}, count={}, out_ptr={:?}", call_num, elements_ptr, element_count, out_ptr));
 
     if out_ptr.is_null() {

@@ -746,7 +746,7 @@ impl TypeChecker {
             let callee_type = self.check_expr(callee)?;
             match &callee_type.kind {
                 TypeKind::Function { params, return_type } => {
-                    let mut expected_params = params.clone();
+                    let expected_params = params.clone();
                     if args.len() != expected_params.len() {
                         return Err(self.type_error_at(
                             format!(

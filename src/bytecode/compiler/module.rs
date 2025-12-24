@@ -266,13 +266,6 @@ impl Compiler {
         names
     }
 
-    pub(super) fn is_module_init_function(
-        func_def: &crate::ast::FunctionDef,
-        module: &str,
-    ) -> bool {
-        func_def.name == format!("__init@{}", module)
-    }
-
     pub(super) fn module_scope_name(&self) -> Option<&str> {
         if let Some(module) = &self.current_module {
             Some(module.as_str())

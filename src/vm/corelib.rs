@@ -705,7 +705,7 @@ fn create_lua_module(vm: &VM) -> Value {
                                                             if let Some(cfunc) = func.cfunc {
                                                                 // Register the C function by creating a NativeFunction wrapper
                                                                 let state_ptr_copy = state;
-                                                                let cfunc_name = func.name.clone();
+                                                                let _cfunc_name = func.name.clone();
                                                                 let cfunc_upvalues = func.upvalues.clone();
 
                                                                 let native = Value::NativeFunction(alloc::rc::Rc::new(move |args: &[Value]| {
@@ -774,7 +774,7 @@ fn create_lua_module(vm: &VM) -> Value {
                                                                 }));
 
                                                                 // Register and return the native function
-                                                                let handle = crate::lua_compat::register_lust_function(native.clone());
+                                                                let _handle = crate::lua_compat::register_lust_function(native.clone());
                                                                 return Some(native);
                                                             }
                                                         }
@@ -1450,8 +1450,6 @@ fn lua_op_binary<F>(a: Value, b: Value, op: F) -> Value
 where
     F: Fn(crate::lua_compat::LuaValue, crate::lua_compat::LuaValue) -> crate::lua_compat::LuaValue,
 {
-    use crate::lua_compat::LuaValue;
-
     let lua_a = value_to_rust_luavalue(&a);
     let lua_b = value_to_rust_luavalue(&b);
     let result = op(lua_a, lua_b);

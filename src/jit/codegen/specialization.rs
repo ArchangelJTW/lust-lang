@@ -131,15 +131,7 @@ impl JitCompiler {
         self.specialized_values.insert(
             specialized_id,
             SpecializedValue {
-                layout: SpecializedLayout::Vec {
-                    element_layout: Box::new(SpecializedLayout::Scalar {
-                        size: core::mem::size_of::<LustInt>(),
-                        align: core::mem::align_of::<LustInt>(),
-                    }),
-                    element_size: core::mem::size_of::<LustInt>(),
-                },
                 stack_offset,
-                source_reg: Some(source_reg),
             },
         );
 

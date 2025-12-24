@@ -33,10 +33,7 @@ mod specialization;
 /// Tracks a specialized value in the JIT trace
 #[derive(Debug, Clone)]
 pub(super) struct SpecializedValue {
-    pub layout: SpecializedLayout,
     pub stack_offset: i32,
-    /// Original register it came from (for debugging)
-    pub source_reg: Option<u8>,
 }
 
 pub struct JitCompiler {

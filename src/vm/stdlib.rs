@@ -1,6 +1,6 @@
 use super::corelib::{string_key, unwrap_lua_value};
 use super::VM;
-use crate::bytecode::value::{LustMap, ValueKey};
+use crate::bytecode::value::ValueKey;
 use crate::bytecode::{NativeCallResult, Value};
 use crate::config::LustConfig;
 use crate::lua_compat::register_lust_function;
@@ -546,19 +546,6 @@ fn create_string_module(vm: &VM) -> Value {
     vm.map_with_entries(entries)
 }
 
-fn create_table_module(vm: &VM) -> Value {
-    let entries = [
-        (string_key("insert"), create_table_insert_fn()),
-        (string_key("remove"), create_table_remove_fn()),
-        (string_key("concat"), create_table_concat_fn()),
-        (string_key("unpack"), create_table_unpack_fn()),
-        (string_key("pack"), create_table_pack_fn()),
-        (string_key("sort"), create_table_sort_fn()),
-        (string_key("maxn"), create_table_maxn_fn()),
-    ];
-    vm.map_with_entries(entries)
-}
-
 fn create_string_len_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
         let input = args.get(0).cloned().unwrap_or(Value::Nil);
@@ -909,126 +896,6 @@ fn read_sequence(data: &TableData) -> Vec<Value> {
     }
 }
 
-fn write_sequence(data: &TableData, seq: &[Value]) {
-    match data {
-        TableData::Array(val) => {
-            if let Value::Array(arr) = val {
-                let mut borrow = arr.borrow_mut();
-                borrow.clear();
-                borrow.extend_from_slice(seq);
-            }
-        }
-        TableData::Map(val) => {
-            if let Value::Map(map_rc) = val {
-                let mut map = map_rc.borrow_mut();
-            let mut idx: LustInt = 1;
-            loop {
-                let key = ValueKey::from_value(&Value::Int(idx));
-                if map.remove(&key).is_some() {
-                    idx += 1;
-                } else {
-                    break;
-                }
-            }
-            for (i, val) in seq.iter().enumerate() {
-                let key = ValueKey::from_value(&Value::Int((i as LustInt) + 1));
-                map.insert(key, val.clone());
-            }
-            }
-        }
-    }
-}
-
-fn create_table_insert_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
-        if args.len() < 2 {
-            return Err("table.insert expects table and value (and optional position)".to_string());
-        }
-        let table_val = unwrap_lua_value(args[0].clone());
-        let Some(data) = table_data(&table_val) else {
-            return Err("table.insert expects a table/array value".to_string());
-        };
-        let mut seq = read_sequence(&data);
-        let (pos, value) = if args.len() == 2 {
-            (seq.len() as LustInt + 1, unwrap_lua_value(args[1].clone()))
-        } else {
-            let p = unwrap_lua_value(args[1].clone())
-                .as_int()
-                .unwrap_or(seq.len() as LustInt + 1);
-            (p.max(1), unwrap_lua_value(args[2].clone()))
-        };
-        let idx = (pos - 1) as usize;
-        if idx > seq.len() {
-            seq.push(value);
-        } else {
-            seq.insert(idx, value);
-        }
-        write_sequence(&data, &seq);
-        Ok(NativeCallResult::Return(lua_nil()))
-    }))
-}
-
-fn create_table_remove_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
-        if args.is_empty() {
-            return Err("table.remove expects a table/array".to_string());
-        }
-        let table_val = unwrap_lua_value(args[0].clone());
-        let Some(data) = table_data(&table_val) else {
-            return Err("table.remove expects a table/array".to_string());
-        };
-        let seq = read_sequence(&data);
-        if seq.is_empty() {
-            return Ok(NativeCallResult::Return(lua_nil()));
-        }
-        let pos = args
-            .get(1)
-            .and_then(|v| unwrap_lua_value(v.clone()).as_int())
-            .unwrap_or(seq.len() as LustInt);
-        let idx = ((pos - 1).max(0) as usize).min(seq.len().saturating_sub(1));
-        let mut new_seq = seq.clone();
-        let removed = new_seq.remove(idx);
-        write_sequence(&data, &new_seq);
-        Ok(NativeCallResult::Return(removed))
-    }))
-}
-
-fn create_table_concat_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
-        if args.is_empty() {
-            return Err("table.concat expects at least a table/array".to_string());
-        }
-        let table_val = unwrap_lua_value(args[0].clone());
-        let Some(data) = table_data(&table_val) else {
-            return Err("table.concat expects a table/array".to_string());
-        };
-        let seq = read_sequence(&data);
-        let sep = args
-            .get(1)
-            .map(|v| unwrap_lua_value(v.clone()).to_string())
-            .unwrap_or_else(|| "".to_string());
-        let start = args
-            .get(2)
-            .and_then(|v| unwrap_lua_value(v.clone()).as_int())
-            .unwrap_or(1);
-        let end = args
-            .get(3)
-            .and_then(|v| unwrap_lua_value(v.clone()).as_int())
-            .unwrap_or(seq.len() as LustInt);
-        let start_idx = (start - 1).max(0) as usize;
-        let end_idx = end.max(0) as usize;
-        let mut pieces: Vec<String> = Vec::new();
-        for (i, val) in seq.iter().enumerate() {
-            if i < start_idx || i >= end_idx {
-                continue;
-            }
-            let raw = unwrap_lua_value(val.clone());
-            pieces.push(format!("{}", raw));
-        }
-        Ok(NativeCallResult::Return(Value::string(pieces.join(&sep))))
-    }))
-}
-
 pub(crate) fn create_table_unpack_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
         if args.is_empty() {
@@ -1057,177 +924,6 @@ pub(crate) fn create_table_unpack_fn() -> Value {
             values.push(val.clone());
         }
         return_lua_values(values)
-    }))
-}
-
-fn create_table_pack_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
-        let mut map = LustMap::new();
-        for (i, arg) in args.iter().enumerate() {
-            let key = ValueKey::from_value(&Value::Int((i as LustInt) + 1));
-            map.insert(key, unwrap_lua_value(arg.clone()));
-        }
-        map.insert(ValueKey::string("n"), Value::Int(args.len() as LustInt));
-        Ok(NativeCallResult::Return(Value::map(map)))
-    }))
-}
-
-fn create_table_sort_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
-        if args.is_empty() {
-            return Err("table.sort expects a table/array".to_string());
-        }
-        let table_val = unwrap_lua_value(args[0].clone());
-        let Some(data) = table_data(&table_val) else {
-            return Err("table.sort expects a table/array".to_string());
-        };
-        let mut seq = read_sequence(&data);
-        seq.sort_by(|a, b| {
-            let la = format!("{}", unwrap_lua_value(a.clone()));
-            let lb = format!("{}", unwrap_lua_value(b.clone()));
-            la.cmp(&lb)
-        });
-        write_sequence(&data, &seq);
-        Ok(NativeCallResult::Return(lua_nil()))
-    }))
-}
-
-fn create_table_maxn_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
-        if args.is_empty() {
-            return Err("table.maxn expects a table".to_string());
-        }
-        let table_val = unwrap_lua_value(args[0].clone());
-        let Some(data) = table_data(&table_val) else {
-            return Err("table.maxn expects a table".to_string());
-        };
-        let mut max_idx: LustInt = 0;
-        match data {
-            TableData::Array(val) => {
-                if let Some(len) = val.array_len() {
-                    max_idx = len as LustInt;
-                }
-            }
-            TableData::Map(val) => {
-                if let Some(map) = val.as_map() {
-                    for key in map.keys() {
-                        if let Value::Int(i) = key.to_value() {
-                            if i > max_idx && i > 0 {
-                                max_idx = i;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(NativeCallResult::Return(Value::Int(max_idx)))
-    }))
-}
-
-fn create_math_module(vm: &VM) -> Value {
-    let entries = [
-        (string_key("abs"), create_math_abs_fn()),
-        (string_key("max"), create_math_max_fn()),
-        (string_key("min"), create_math_min_fn()),
-        (string_key("mod"), create_math_mod_fn()),
-        (string_key("random"), create_math_random_fn()),
-        (string_key("randomseed"), create_math_randomseed_fn()),
-    ];
-    vm.map_with_entries(entries)
-}
-
-fn create_math_abs_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
-        let value = unwrap_lua_value(args.get(0).cloned().unwrap_or(Value::Nil));
-        let num = coerce_float(&value).ok_or_else(|| "math.abs expects a number".to_string())?;
-        let result = if matches!(value, Value::Int(_)) {
-            Value::Int(num.abs() as LustInt)
-        } else {
-            Value::Float(num.abs())
-        };
-        Ok(NativeCallResult::Return(result))
-    }))
-}
-
-fn create_math_min_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
-        if args.is_empty() {
-            return Err("math.min requires at least one argument".to_string());
-        }
-        let first_raw = unwrap_lua_value(args[0].clone());
-        let mut best = coerce_float(&first_raw)
-            .ok_or_else(|| "math.min arguments must be numbers".to_string())?;
-        let mut all_int = matches!(first_raw, Value::Int(_));
-        for arg in args.iter().skip(1) {
-            let raw = unwrap_lua_value(arg.clone());
-            let num = coerce_float(&raw)
-                .ok_or_else(|| "math.min arguments must be numbers".to_string())?;
-            if num < best {
-                best = num;
-                all_int = matches!(raw, Value::Int(_));
-            } else if !matches!(raw, Value::Int(_)) {
-                all_int = false;
-            }
-        }
-        let value = if all_int {
-            Value::Int(best as LustInt)
-        } else {
-            Value::Float(best)
-        };
-        Ok(NativeCallResult::Return(value))
-    }))
-}
-
-fn create_math_max_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
-        if args.is_empty() {
-            return Err("math.max requires at least one argument".to_string());
-        }
-        let first_raw = unwrap_lua_value(args[0].clone());
-        let mut best = coerce_float(&first_raw)
-            .ok_or_else(|| "math.max arguments must be numbers".to_string())?;
-        let mut all_int = matches!(first_raw, Value::Int(_));
-        for arg in args.iter().skip(1) {
-            let raw = unwrap_lua_value(arg.clone());
-            let num = coerce_float(&raw)
-                .ok_or_else(|| "math.max arguments must be numbers".to_string())?;
-            if num > best {
-                best = num;
-                all_int = matches!(raw, Value::Int(_));
-            } else if !matches!(raw, Value::Int(_)) {
-                all_int = false;
-            }
-        }
-        let value = if all_int {
-            Value::Int(best as LustInt)
-        } else {
-            Value::Float(best)
-        };
-        Ok(NativeCallResult::Return(value))
-    }))
-}
-
-fn create_math_mod_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
-        if args.len() < 2 {
-            return Err("math.mod expects two numbers".to_string());
-        }
-        let a = unwrap_lua_value(args[0].clone());
-        let b = unwrap_lua_value(args[1].clone());
-        let result = if let (Some(x), Some(y)) = (coerce_int(&a), coerce_int(&b)) {
-            if y == 0 {
-                return Err("math.mod divisor must not be zero".to_string());
-            }
-            Value::Int(x % y)
-        } else {
-            let x = coerce_float(&a).ok_or_else(|| "math.mod expects numbers".to_string())?;
-            let y = coerce_float(&b).ok_or_else(|| "math.mod expects numbers".to_string())?;
-            if y == 0.0 {
-                return Err("math.mod divisor must not be zero".to_string());
-            }
-            Value::Float(x % y)
-        };
-        Ok(NativeCallResult::Return(result))
     }))
 }
 
@@ -1270,15 +966,6 @@ fn create_math_randomseed_fn() -> Value {
         *mutex.lock().map_err(|e| e.to_string())? = StdRng::seed_from_u64(seed);
         Ok(NativeCallResult::Return(Value::Nil))
     }))
-}
-
-fn coerce_float(value: &Value) -> Option<f64> {
-    match value {
-        Value::Int(i) => Some(*i as f64),
-        Value::Float(f) => Some(*f),
-        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-        _ => None,
-    }
 }
 
 fn coerce_int(value: &Value) -> Option<LustInt> {

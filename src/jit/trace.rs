@@ -449,7 +449,7 @@ impl TraceRecorder {
                     // Check if elem_type is already a full Array type (stored in register_types)
                     // vs just the element type
                     use crate::ast::{Span, Type};
-                    let (array_type, actual_elem_type) =
+                    let (array_type, _actual_elem_type) =
                         if matches!(elem_type, crate::ast::TypeKind::Array(_)) {
                             // Already a full array type - use it directly
                             (elem_type.clone(), elem_type.clone())

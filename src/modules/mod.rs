@@ -840,43 +840,6 @@ impl ModuleLoader {
         Ok(())
     }
 
-    fn create_nil_stub_module(&self, module_path: &str) -> LoadedModule {
-        // Create a stub module that exports lua.nil for missing optional modules
-        let stub_item = Item {
-            kind: ItemKind::Const {
-                name: module_path
-                    .split('.')
-                    .last()
-                    .unwrap_or(module_path)
-                    .to_string(),
-                ty: crate::ast::Type {
-                    kind: crate::ast::TypeKind::Named("LuaValue".to_string()),
-                    span: Span::new(0, 0, 0, 0),
-                },
-                value: crate::ast::Expr {
-                    kind: crate::ast::ExprKind::FieldAccess {
-                        object: Box::new(crate::ast::Expr {
-                            kind: crate::ast::ExprKind::Identifier("lua".to_string()),
-                            span: Span::new(0, 0, 0, 0),
-                        }),
-                        field: "nil".to_string(),
-                    },
-                    span: Span::new(0, 0, 0, 0),
-                },
-            },
-            span: Span::new(0, 0, 0, 0),
-        };
-
-        LoadedModule {
-            path: module_path.to_string(),
-            items: vec![stub_item],
-            imports: ModuleImports::default(),
-            exports: ModuleExports::default(),
-            init_function: None,
-            source_path: PathBuf::from(format!("<stub:{}>", module_path)),
-        }
-    }
-
     fn attach_module_to_error(error: LustError, module_path: &str) -> LustError {
         match error {
             LustError::LexerError {

@@ -1182,7 +1182,7 @@ fn run_file(filename: &str, disassemble: bool) {
     for (module_path, init) in init_funcs {
         match vm.call(&init, vec![]) {
             Ok(val) => {
-                let display_val = format!("{}", val);
+                let _display_val = format!("{}", val);
                 //eprintln!("init {module_path} returned {display_val}");
                 // Lua's `require()` only observes a single return value from a module loader.
                 // Our Lua->Lust transpiler represents returns as `Array<LuaValue>` to preserve

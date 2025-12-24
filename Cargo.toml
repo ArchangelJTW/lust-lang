@@ -4,9 +4,16 @@ exclude = ["examples/rust-extension/extensions/**"]
 
 [package]
 name = "lust-rs"
-version = "3.3.9"
+version = "3.3.10"
 edition = "2021"
-include = ["src/**", "include/**", "Cargo.toml", "README.md", "LICENSE"]
+include = [
+  "src/**",
+  "include/**",
+  "build.rs",
+  "Cargo.toml",
+  "README.md",
+  "LICENSE",
+]
 license-file = "LICENSE"
 readme = "README.md"
 keywords = [
@@ -41,7 +48,14 @@ std = [
 ]
 libloading = ["std", "dep:libloading"]
 dirs = ["std", "dep:dirs"]
-packages = ["std", "libloading", "dirs", "dep:serde_json", "dep:object", "dep:full_moon"]
+packages = [
+  "std",
+  "libloading",
+  "dirs",
+  "dep:serde_json",
+  "dep:object",
+  "dep:full_moon",
+]
 lualua = ["std", "dep:full_moon"]
 
 [[bin]]
@@ -68,7 +82,11 @@ lust-macros = { path = "crates/lust-macros", version = "0.1.0", optional = true 
 regex = "1.11.1"
 rand = "0.8.5"
 serde_json = { version = "1.0.128", optional = true, features = ["std"] }
-object = { version = "0.36.4", default-features = false, features = ["std", "read_core", "read"], optional = true }
+object = { version = "0.36.4", default-features = false, features = [
+  "std",
+  "read_core",
+  "read",
+], optional = true }
 full_moon = { version = "0.18.1", optional = true }
 
 [build-dependencies]

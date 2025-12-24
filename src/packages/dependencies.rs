@@ -9,7 +9,6 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
 };
-use object::{File, Object, ObjectSymbol};
 use thiserror::Error;
 
 #[derive(Debug, Default, Clone)]

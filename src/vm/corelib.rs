@@ -172,7 +172,10 @@ fn setmetatable_value(table: Value, meta: Value) -> Result<Value, String> {
         let mut meta_pairs: Vec<(ValueKey, Value)> = if let Some(map) = meta.as_map() {
             map.into_iter().collect()
         } else if let Some(Value::Map(map)) = meta.struct_get_field("table") {
-            map.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            map.borrow()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
         } else {
             Vec::new()
         };
@@ -223,12 +226,7 @@ fn collect_map_pairs(value: &Value) -> Vec<(ValueKey, Value)> {
     } else if let Some(arr) = value.as_array() {
         arr.into_iter()
             .enumerate()
-            .map(|(i, v)| {
-                (
-                    ValueKey::from_value(&Value::Int((i as i64) + 1)),
-                    v.clone(),
-                )
-            })
+            .map(|(i, v)| (ValueKey::from_value(&Value::Int((i as i64) + 1)), v.clone()))
             .collect()
     } else {
         Vec::new()
@@ -240,9 +238,9 @@ fn create_pairs_fn() -> Value {
         let target = unwrap_lua_value(args.get(0).cloned().unwrap_or(Value::Nil));
         let items = collect_map_pairs(&target);
         let iter = IteratorState::MapPairs { items, index: 0 };
-        Ok(NativeCallResult::Return(Value::Iterator(Rc::new(RefCell::new(
-            iter,
-        )))))
+        Ok(NativeCallResult::Return(Value::Iterator(Rc::new(
+            RefCell::new(iter),
+        ))))
     }))
 }
 
@@ -252,20 +250,15 @@ fn create_ipairs_fn() -> Value {
         let items = if let Some(arr) = target.as_array() {
             arr.into_iter()
                 .enumerate()
-                .map(|(i, v)| {
-                    (
-                        ValueKey::from_value(&Value::Int((i as i64) + 1)),
-                        v.clone(),
-                    )
-                })
+                .map(|(i, v)| (ValueKey::from_value(&Value::Int((i as i64) + 1)), v.clone()))
                 .collect()
         } else {
             collect_map_pairs(&target)
         };
         let iter = IteratorState::MapPairs { items, index: 0 };
-        Ok(NativeCallResult::Return(Value::Iterator(Rc::new(RefCell::new(
-            iter,
-        )))))
+        Ok(NativeCallResult::Return(Value::Iterator(Rc::new(
+            RefCell::new(iter),
+        ))))
     }))
 }
 
@@ -318,7 +311,9 @@ fn create_lua_module(vm: &VM) -> Value {
                     if let Some(value) = vm.get_global(name) {
                         Ok(NativeCallResult::Return(value))
                     } else {
-                        Ok(NativeCallResult::Return(Value::enum_unit("LuaValue", "Nil")))
+                        Ok(NativeCallResult::Return(Value::enum_unit(
+                            "LuaValue", "Nil",
+                        )))
                     }
                 })
             })),
@@ -437,7 +432,9 @@ fn create_lua_module(vm: &VM) -> Value {
                 }
                 let table = args[0].clone();
                 let meta = args[1].clone();
-                VM::with_current(|_vm| setmetatable_value(table, meta).map(NativeCallResult::Return))
+                VM::with_current(|_vm| {
+                    setmetatable_value(table, meta).map(NativeCallResult::Return)
+                })
             })),
         ),
         (
@@ -661,9 +658,11 @@ fn create_lua_module(vm: &VM) -> Value {
                         if name == "LuaUserdata" {
                             // For userdata, look up metatable from Lua state registry
                             // Get userdata ID and state pointer, then look up the method
-                            let id_opt = unwrapped_obj.struct_get_field("handle")
+                            let id_opt = unwrapped_obj
+                                .struct_get_field("handle")
                                 .and_then(|id_val| id_val.as_int());
-                            let state_ptr_opt = unwrapped_obj.struct_get_field("state")
+                            let state_ptr_opt = unwrapped_obj
+                                .struct_get_field("state")
                                 .and_then(|state_val| state_val.as_int());
 
                             match (id_opt, state_ptr_opt) {
@@ -712,7 +711,7 @@ fn create_lua_module(vm: &VM) -> Value {
                                                                 let native = Value::NativeFunction(alloc::rc::Rc::new(move |args: &[Value]| {
                                                                     use crate::vm::VM;
                                                                     VM::with_current(|vm| {
-                                                                        unsafe {
+                                                                        // unsafe {
                                                                             if state_ptr_copy.is_null() {
                                                                                 return Err("null lua_State pointer".to_string());
                                                                             }
@@ -770,7 +769,7 @@ fn create_lua_module(vm: &VM) -> Value {
                                                                                 }
                                                                                 Err(e) => Err(e),
                                                                             }
-                                                                        }
+                                                                        // }
                                                                     })
                                                                 }));
 
@@ -982,13 +981,15 @@ fn create_lua_module(vm: &VM) -> Value {
                     let metamethods = vm.new_map_value();
 
                     // Return LuaTable struct
-                    let lua_table = vm.instantiate_struct(
-                        "LuaTable",
-                        vec![
-                            (Rc::new("table".to_string()), table_map),
-                            (Rc::new("metamethods".to_string()), metamethods),
-                        ],
-                    ).map_err(|e| e.to_string())?;
+                    let lua_table = vm
+                        .instantiate_struct(
+                            "LuaTable",
+                            vec![
+                                (Rc::new("table".to_string()), table_map),
+                                (Rc::new("metamethods".to_string()), metamethods),
+                            ],
+                        )
+                        .map_err(|e| e.to_string())?;
 
                     Ok(NativeCallResult::Return(lua_table))
                 })
@@ -1045,10 +1046,7 @@ fn to_lua_value(vm: &mut VM, value: Value) -> Result<Value, String> {
             let lua_fn = vm
                 .instantiate_struct(
                     "LuaFunction",
-                    vec![(
-                        Rc::new("handle".to_string()),
-                        Value::Int(handle as i64),
-                    )],
+                    vec![(Rc::new("handle".to_string()), Value::Int(handle as i64))],
                 )
                 .map_err(|e| e.to_string())?;
             Value::enum_variant("LuaValue", "Function", vec![lua_fn])
@@ -1076,8 +1074,9 @@ fn resolve_callable_for_pcall(value: Value) -> Result<Value, String> {
                 .and_then(|v| v.as_int())
                 .map(|v| v as usize)
                 .ok_or_else(|| "LuaFunction missing handle".to_string())?;
-            return crate::lua_compat::lookup_lust_function(handle)
-                .ok_or_else(|| format!("LuaFunction handle {} was not registered with VM", handle));
+            return crate::lua_compat::lookup_lust_function(handle).ok_or_else(|| {
+                format!("LuaFunction handle {} was not registered with VM", handle)
+            });
         }
     }
     Ok(value)
@@ -1098,10 +1097,7 @@ fn create_lua_socket_protect_fn() -> Value {
                     Ok(value) => {
                         #[cfg(feature = "std")]
                         if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() {
-                            eprintln!(
-                                "[lua-socket] protect ok -> {:?}",
-                                value.type_of()
-                            );
+                            eprintln!("[lua-socket] protect ok -> {:?}", value.type_of());
                         }
                         let packed = match value {
                             Value::Array(_) => value,
@@ -1115,8 +1111,7 @@ fn create_lua_socket_protect_fn() -> Value {
                         if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() {
                             eprintln!("[lua-socket] protect err -> {}", msg);
                         }
-                        let packed =
-                            pack_lua_values(vm, vec![Value::Nil, Value::string(msg)])?;
+                        let packed = pack_lua_values(vm, vec![Value::Nil, Value::string(msg)])?;
                         #[cfg(feature = "std")]
                         if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() {
                             eprintln!("[lua-socket] protect err ret = {}", packed);
@@ -1471,7 +1466,10 @@ fn lua_op_concat(a: Value, b: Value) -> Value {
         Value::Nil => String::new(), // Treat nil as empty string, like Lua
         other => {
             #[cfg(feature = "std")]
-            eprintln!("[WARN] lua_op_concat: cannot concatenate {:?}, treating as empty string", other);
+            eprintln!(
+                "[WARN] lua_op_concat: cannot concatenate {:?}, treating as empty string",
+                other
+            );
             String::new()
         }
     };
@@ -1482,11 +1480,18 @@ fn lua_op_concat(a: Value, b: Value) -> Value {
         Value::Nil => String::new(), // Treat nil as empty string, like Lua
         other => {
             #[cfg(feature = "std")]
-            eprintln!("[WARN] lua_op_concat: cannot concatenate {:?}, treating as empty string", other);
+            eprintln!(
+                "[WARN] lua_op_concat: cannot concatenate {:?}, treating as empty string",
+                other
+            );
             String::new()
         }
     };
-    Value::enum_variant("LuaValue", "String", vec![Value::String(Rc::new(a_str + &b_str))])
+    Value::enum_variant(
+        "LuaValue",
+        "String",
+        vec![Value::String(Rc::new(a_str + &b_str))],
+    )
 }
 
 fn value_to_rust_luavalue(v: &Value) -> crate::lua_compat::LuaValue {
@@ -1508,7 +1513,9 @@ fn rust_luavalue_to_value(lv: crate::lua_compat::LuaValue) -> Value {
         LuaValue::Bool(b) => Value::enum_variant("LuaValue", "Bool", vec![Value::Bool(b)]),
         LuaValue::Int(i) => Value::enum_variant("LuaValue", "Int", vec![Value::Int(i)]),
         LuaValue::Float(f) => Value::enum_variant("LuaValue", "Float", vec![Value::Float(f)]),
-        LuaValue::String(s) => Value::enum_variant("LuaValue", "String", vec![Value::String(Rc::new(s))]),
+        LuaValue::String(s) => {
+            Value::enum_variant("LuaValue", "String", vec![Value::String(Rc::new(s))])
+        }
         _ => Value::enum_unit("LuaValue", "Nil"),
     }
 }

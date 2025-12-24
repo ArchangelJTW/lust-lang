@@ -14,8 +14,6 @@ pub mod error;
 pub mod ffi;
 pub mod jit;
 mod lazy;
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-pub mod lua_compat;
 pub mod lexer;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod lua_compat;

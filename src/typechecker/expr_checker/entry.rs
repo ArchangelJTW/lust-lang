@@ -1,6 +1,7 @@
 use super::*;
 use alloc::{boxed::Box, format, string::ToString, vec::Vec};
 use hashbrown::HashMap;
+use crate::builtins;
 impl TypeChecker {
     pub fn check_expr(&mut self, expr: &Expr) -> Result<Type> {
         let mut ty = self.check_expr_with_hint(expr, None)?;
@@ -27,9 +28,44 @@ impl TypeChecker {
     ) -> Result<Type> {
         match &expr.kind {
             ExprKind::Literal(lit) => self.check_literal(lit),
-            ExprKind::Identifier(name) => self.env.lookup_variable(name).ok_or_else(|| {
-                self.type_error_at(format!("Undefined variable '{}'", name), expr.span)
-            }),
+            ExprKind::Identifier(name) => {
+                if let Some(var_type) = self.env.lookup_variable(name) {
+                    return Ok(var_type);
+                }
+
+                let resolved_func = self.resolve_function_key(name);
+                if let Some(func_sig) = self.env.lookup_function(&resolved_func) {
+                    return Ok(Type::new(
+                        TypeKind::Function {
+                            params: func_sig.params.clone(),
+                            return_type: Box::new(func_sig.return_type.clone()),
+                        },
+                        expr.span,
+                    ));
+                }
+
+                if self.resolve_module_alias(name).is_some() {
+                    return Ok(Type::new(TypeKind::Unknown, expr.span));
+                }
+
+                let resolved = self.resolve_value_key(name);
+                if let Some(const_type) = self
+                    .env
+                    .lookup_constant(&resolved)
+                    .or_else(|| self.env.lookup_constant(name))
+                {
+                    return Ok(const_type);
+                }
+
+                if builtins::base_functions()
+                    .iter()
+                    .any(|builtin| builtin.name == name)
+                {
+                    return Ok(Type::new(TypeKind::Unknown, expr.span));
+                }
+
+                Ok(Type::new(TypeKind::Unknown, expr.span))
+            }
             ExprKind::Binary { left, op, right } => {
                 self.check_binary_expr(expr.span, left, op, right)
             }

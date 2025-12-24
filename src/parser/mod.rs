@@ -144,8 +144,21 @@ impl Parser {
     }
 
     fn expect_identifier(&mut self) -> Result<String> {
-        let token = self.consume(TokenKind::Identifier, "Expected identifier")?;
-        Ok(token.lexeme.clone())
+        if self.check(TokenKind::Identifier) || self.check(TokenKind::Type) {
+            let token = self.advance().clone();
+            Ok(token.lexeme.clone())
+        } else {
+            let token = self.current_token().clone();
+            Err(LustError::ParserError {
+                line: token.line,
+                column: token.column,
+                message: format!(
+                    "Expected identifier (got {:?}, expected Identifier)",
+                    token.kind
+                ),
+                module: None,
+            })
+        }
     }
 
     fn make_span(&self, start_token: &Token, end_token: &Token) -> Span {

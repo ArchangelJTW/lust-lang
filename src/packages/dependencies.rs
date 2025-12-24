@@ -3,10 +3,10 @@ use super::{
     PackageManager,
 };
 use crate::config::{DependencyKind, LustConfig};
+use object::{File, Object, ObjectSymbol};
 use std::{
     collections::HashSet,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
 };
 use object::{File, Object, ObjectSymbol};
@@ -58,13 +58,17 @@ pub struct ResolvedLuaDependency {
     pub library_path: PathBuf,
     pub luaopen_symbols: Vec<String>,
     pub version: Option<String>,
+    pub lua_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 enum DetectedKind {
     Lust,
     Rust,
-    Lua { luaopen_symbols: Vec<String> },
+    Lua {
+        luaopen_symbols: Vec<String>,
+        lua_files: Vec<PathBuf>,
+    },
 }
 
 #[derive(Default)]
@@ -106,7 +110,9 @@ pub enum DependencyResolutionError {
         #[source]
         source: object::read::Error,
     },
-    #[error("dependency '{name}' at {path} is a shared library but its kind could not be detected")]
+    #[error(
+        "dependency '{name}' at {path} is a shared library but its kind could not be detected"
+    )]
     UnknownLibraryKind { name: String, path: PathBuf },
 }
 
@@ -151,6 +157,7 @@ pub fn resolve_dependencies(
             Some(DependencyKind::Rust) => DetectedKind::Rust,
             Some(DependencyKind::Lua) => DetectedKind::Lua {
                 luaopen_symbols: detect_luaopen_symbols(&root_dir)?,
+                lua_files: collect_lua_files(&root_dir),
             },
             None => detect_kind(spec.name(), &root_dir)?,
         };
@@ -191,12 +198,16 @@ pub fn resolve_dependencies(
                     version,
                 });
             }
-            DetectedKind::Lua { luaopen_symbols } => {
+            DetectedKind::Lua {
+                luaopen_symbols,
+                lua_files,
+            } => {
                 resolution.lua.push(ResolvedLuaDependency {
                     name,
                     library_path: root_dir,
                     luaopen_symbols,
                     version,
+                    lua_files,
                 });
             }
         }
@@ -211,7 +222,10 @@ fn detect_kind(name: &str, root: &Path) -> Result<DetectedKind, DependencyResolu
         let luaopen_symbols = signature.luaopen_symbols;
         let has_lust_register = signature.has_lust_extension;
         return if !luaopen_symbols.is_empty() {
-            Ok(DetectedKind::Lua { luaopen_symbols })
+            Ok(DetectedKind::Lua {
+                luaopen_symbols,
+                lua_files: Vec::new(),
+            })
         } else if has_lust_register {
             Ok(DetectedKind::Rust)
         } else {
@@ -230,6 +244,11 @@ fn detect_kind(name: &str, root: &Path) -> Result<DetectedKind, DependencyResolu
         Err(ManifestError::NotFound(_)) => {
             if root.join("Cargo.toml").exists() {
                 Ok(DetectedKind::Rust)
+            } else if has_lua_files(root) {
+                Ok(DetectedKind::Lua {
+                    luaopen_symbols: Vec::new(),
+                    lua_files: collect_lua_files(root),
+                })
             } else {
                 Ok(DetectedKind::Lust)
             }
@@ -249,6 +268,7 @@ fn detect_luaopen_symbols(root: &Path) -> Result<Vec<String>, DependencyResoluti
     Ok(signature.luaopen_symbols)
 }
 
+#[allow(dead_code)]
 fn detect_lust_extension_symbol(root: &Path) -> Result<bool, DependencyResolutionError> {
     if !root.is_file() {
         return Ok(false);
@@ -262,12 +282,11 @@ fn inspect_library(path: &Path) -> Result<LibrarySignature, DependencyResolution
         path: path.to_path_buf(),
         source,
     })?;
-    let file = File::parse(&*bytes).map_err(|source| {
-        DependencyResolutionError::LibraryInspect {
+    let file =
+        File::parse(&*bytes).map_err(|source| DependencyResolutionError::LibraryInspect {
             path: path.to_path_buf(),
             source,
-        }
-    })?;
+        })?;
 
     let mut signature = LibrarySignature::default();
     let mut lua_syms: HashSet<String> = HashSet::new();
@@ -291,6 +310,31 @@ fn inspect_library(path: &Path) -> Result<LibrarySignature, DependencyResolution
     signature.luaopen_symbols = lua_syms.into_iter().collect();
     signature.luaopen_symbols.sort();
     Ok(signature)
+}
+
+fn has_lua_files(root: &Path) -> bool {
+    collect_lua_files(root).len() > 0
+}
+
+fn collect_lua_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_lua_files_recursive(root, root, &mut files);
+    files
+}
+
+fn collect_lua_files_recursive(base: &Path, current: &Path, files: &mut Vec<PathBuf>) {
+    if let Ok(read_dir) = fs::read_dir(current) {
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_lua_files_recursive(base, &path, files);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("lua") {
+                if let Ok(relative) = path.strip_prefix(base) {
+                    files.push(relative.to_path_buf());
+                }
+            }
+        }
+    }
 }
 
 fn resolve_dependency_path(project_dir: &Path, raw: &str) -> PathBuf {

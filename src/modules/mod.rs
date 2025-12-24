@@ -3,6 +3,7 @@ use crate::{
     error::{LustError, Result},
     lexer::Lexer,
     parser::Parser,
+    Span,
 };
 use alloc::{format, string::String, vec, vec::Vec};
 use hashbrown::{HashMap, HashSet};
@@ -167,9 +168,25 @@ impl ModuleLoader {
         let source = if let Some(src) = self.source_overrides.get(&file) {
             src.clone()
         } else {
-            fs::read_to_string(&file).map_err(|e| {
-                LustError::Unknown(format!("Failed to read module '{}': {}", file.display(), e))
-            })?
+            match fs::read_to_string(&file) {
+                Ok(src) => src,
+                Err(e) => {
+                    // For non-entry modules, allow missing files and create stub
+                    if !is_entry && e.kind() == std::io::ErrorKind::NotFound {
+                        #[cfg(feature = "std")]
+                        eprintln!(
+                            "[WARNING] Module '{}' not found, but present in code",
+                            module_path
+                        );
+                        //return Ok(self.create_nil_stub_module(module_path));
+                    }
+                    return Err(LustError::Unknown(format!(
+                        "Failed to read module '{}': {}",
+                        file.display(),
+                        e
+                    )));
+                }
+            }
         };
         let mut lexer = Lexer::new(&source);
         let tokens = lexer
@@ -183,6 +200,8 @@ impl ModuleLoader {
         let mut exports = ModuleExports::default();
         let mut new_items: Vec<Item> = Vec::new();
         let mut init_function: Option<String> = None;
+        let mut pending_init_stmts: Vec<crate::ast::Stmt> = Vec::new();
+        let mut pending_init_span: Option<Span> = None;
         for item in items.drain(..) {
             match &item.kind {
                 ItemKind::Function(func) => {
@@ -248,19 +267,10 @@ impl ModuleLoader {
                     if is_entry {
                         new_items.push(Item::new(ItemKind::Script(stmts.clone()), item.span));
                     } else {
-                        let init_name = format!("__init@{}", module_path);
-                        let func = FunctionDef {
-                            name: init_name.clone(),
-                            type_params: vec![],
-                            trait_bounds: vec![],
-                            params: vec![],
-                            return_type: None,
-                            body: stmts.clone(),
-                            is_method: false,
-                            visibility: Visibility::Private,
-                        };
-                        new_items.push(Item::new(ItemKind::Function(func), item.span));
-                        init_function = Some(init_name);
+                        if pending_init_span.is_none() {
+                            pending_init_span = Some(item.span);
+                        }
+                        pending_init_stmts.extend(stmts.iter().cloned());
                     }
                 }
 
@@ -304,6 +314,50 @@ impl ModuleLoader {
                                     return_type: return_type.clone(),
                                 });
                             }
+
+                            crate::ast::ExternItem::Const { name, ty } => {
+                                let qualified = if name.contains('.') {
+                                    name.clone()
+                                } else {
+                                    format!("{}.{}", module_path, name)
+                                };
+                                exports.functions.insert(
+                                    self.simple_name(&qualified).to_string(),
+                                    qualified.clone(),
+                                );
+                                imports.function_aliases.insert(
+                                    self.simple_name(&qualified).to_string(),
+                                    qualified.clone(),
+                                );
+                                rewritten.push(crate::ast::ExternItem::Const {
+                                    name: qualified,
+                                    ty: ty.clone(),
+                                });
+                            }
+
+                            crate::ast::ExternItem::Struct(def) => {
+                                let mut def = def.clone();
+                                if !def.name.contains('.') && !def.name.contains("::") {
+                                    def.name = format!("{}.{}", module_path, def.name);
+                                }
+                                exports.types.insert(
+                                    self.simple_name(&def.name).to_string(),
+                                    def.name.clone(),
+                                );
+                                rewritten.push(crate::ast::ExternItem::Struct(def));
+                            }
+
+                            crate::ast::ExternItem::Enum(def) => {
+                                let mut def = def.clone();
+                                if !def.name.contains('.') && !def.name.contains("::") {
+                                    def.name = format!("{}.{}", module_path, def.name);
+                                }
+                                exports.types.insert(
+                                    self.simple_name(&def.name).to_string(),
+                                    def.name.clone(),
+                                );
+                                rewritten.push(crate::ast::ExternItem::Enum(def));
+                            }
                         }
                     }
                     new_items.push(Item::new(
@@ -321,6 +375,25 @@ impl ModuleLoader {
             }
         }
 
+        if !is_entry && !pending_init_stmts.is_empty() {
+            let init_name = format!("__init@{}", module_path);
+            let func = FunctionDef {
+                name: init_name.clone(),
+                type_params: vec![],
+                trait_bounds: vec![],
+                params: vec![],
+                return_type: None,
+                body: pending_init_stmts,
+                is_method: false,
+                visibility: Visibility::Private,
+            };
+            let span = pending_init_span.unwrap_or_else(Span::dummy);
+            // Place module init first so the compiler can observe module-level locals
+            // (e.g. transpiler prelude helpers) before compiling functions that reference them.
+            new_items.insert(0, Item::new(ItemKind::Function(func), span));
+            init_function = Some(init_name);
+        }
+
         Ok(LoadedModule {
             path: module_path.to_string(),
             items: new_items,
@@ -334,12 +407,286 @@ impl ModuleLoader {
     fn collect_dependencies(&self, items: &[Item]) -> Vec<String> {
         let mut deps = HashSet::new();
         for item in items {
-            if let ItemKind::Use { public: _, tree } = &item.kind {
-                self.collect_deps_from_use(tree, &mut deps);
+            match &item.kind {
+                ItemKind::Use { public: _, tree } => {
+                    self.collect_deps_from_use(tree, &mut deps);
+                }
+                ItemKind::Script(stmts) => {
+                    for stmt in stmts {
+                        self.collect_deps_from_lua_require_stmt(stmt, &mut deps);
+                    }
+                }
+                ItemKind::Function(func) => {
+                    for stmt in &func.body {
+                        self.collect_deps_from_lua_require_stmt(stmt, &mut deps);
+                    }
+                }
+                ItemKind::Const { value, .. } | ItemKind::Static { value, .. } => {
+                    self.collect_deps_from_lua_require_expr(value, &mut deps);
+                }
+                ItemKind::Impl(impl_block) => {
+                    for method in &impl_block.methods {
+                        for stmt in &method.body {
+                            self.collect_deps_from_lua_require_stmt(stmt, &mut deps);
+                        }
+                    }
+                }
+                ItemKind::Trait(trait_def) => {
+                    for method in &trait_def.methods {
+                        if let Some(default_impl) = &method.default_impl {
+                            for stmt in default_impl {
+                                self.collect_deps_from_lua_require_stmt(stmt, &mut deps);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
         deps.into_iter().collect()
+    }
+
+    fn collect_deps_from_lua_require_stmt(
+        &self,
+        stmt: &crate::ast::Stmt,
+        deps: &mut HashSet<String>,
+    ) {
+        use crate::ast::StmtKind;
+        match &stmt.kind {
+            StmtKind::Local { initializer, .. } => {
+                if let Some(values) = initializer {
+                    for expr in values {
+                        self.collect_deps_from_lua_require_expr(expr, deps);
+                    }
+                }
+            }
+            StmtKind::Assign { targets, values } => {
+                for expr in targets {
+                    self.collect_deps_from_lua_require_expr(expr, deps);
+                }
+                for expr in values {
+                    self.collect_deps_from_lua_require_expr(expr, deps);
+                }
+            }
+            StmtKind::CompoundAssign { target, value, .. } => {
+                self.collect_deps_from_lua_require_expr(target, deps);
+                self.collect_deps_from_lua_require_expr(value, deps);
+            }
+            StmtKind::Expr(expr) => self.collect_deps_from_lua_require_expr(expr, deps),
+            StmtKind::If {
+                condition,
+                then_block,
+                elseif_branches,
+                else_block,
+            } => {
+                self.collect_deps_from_lua_require_expr(condition, deps);
+                for stmt in then_block {
+                    self.collect_deps_from_lua_require_stmt(stmt, deps);
+                }
+                for (cond, block) in elseif_branches {
+                    self.collect_deps_from_lua_require_expr(cond, deps);
+                    for stmt in block {
+                        self.collect_deps_from_lua_require_stmt(stmt, deps);
+                    }
+                }
+                if let Some(block) = else_block {
+                    for stmt in block {
+                        self.collect_deps_from_lua_require_stmt(stmt, deps);
+                    }
+                }
+            }
+            StmtKind::While { condition, body } => {
+                self.collect_deps_from_lua_require_expr(condition, deps);
+                for stmt in body {
+                    self.collect_deps_from_lua_require_stmt(stmt, deps);
+                }
+            }
+            StmtKind::ForNumeric {
+                start,
+                end,
+                step,
+                body,
+                ..
+            } => {
+                self.collect_deps_from_lua_require_expr(start, deps);
+                self.collect_deps_from_lua_require_expr(end, deps);
+                if let Some(step) = step {
+                    self.collect_deps_from_lua_require_expr(step, deps);
+                }
+                for stmt in body {
+                    self.collect_deps_from_lua_require_stmt(stmt, deps);
+                }
+            }
+            StmtKind::ForIn { iterator, body, .. } => {
+                self.collect_deps_from_lua_require_expr(iterator, deps);
+                for stmt in body {
+                    self.collect_deps_from_lua_require_stmt(stmt, deps);
+                }
+            }
+            StmtKind::Return(values) => {
+                for expr in values {
+                    self.collect_deps_from_lua_require_expr(expr, deps);
+                }
+            }
+            StmtKind::Block(stmts) => {
+                for stmt in stmts {
+                    self.collect_deps_from_lua_require_stmt(stmt, deps);
+                }
+            }
+            StmtKind::Break | StmtKind::Continue => {}
+        }
+    }
+
+    fn collect_deps_from_lua_require_expr(
+        &self,
+        expr: &crate::ast::Expr,
+        deps: &mut HashSet<String>,
+    ) {
+        use crate::ast::{ExprKind, Literal};
+        match &expr.kind {
+            ExprKind::Call { callee, args } => {
+                if self.is_lua_require_callee(callee) {
+                    if let Some(name) = args
+                        .get(0)
+                        .and_then(|arg| self.extract_lua_require_name(arg))
+                    {
+                        if !Self::is_lua_builtin_module_name(&name) {
+                            // `lua.require()` calls originate from transpiled Lua stubs. Unlike
+                            // Lust `use` imports, these should only pull in modules that we can
+                            // actually locate in the current module roots (extern stubs, on-disk
+                            // modules, or source overrides). This prevents optional Lua requires
+                            // (e.g. `ssl.https`) from becoming hard compile-time dependencies.
+                            let file = self.file_for_module_path(&name);
+                            if self.module_source_known(&name, &file) {
+                                deps.insert(name);
+                            }
+                        }
+                    }
+                }
+                self.collect_deps_from_lua_require_expr(callee, deps);
+                for arg in args {
+                    self.collect_deps_from_lua_require_expr(arg, deps);
+                }
+            }
+            ExprKind::MethodCall { receiver, args, .. } => {
+                self.collect_deps_from_lua_require_expr(receiver, deps);
+                for arg in args {
+                    self.collect_deps_from_lua_require_expr(arg, deps);
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.collect_deps_from_lua_require_expr(left, deps);
+                self.collect_deps_from_lua_require_expr(right, deps);
+            }
+            ExprKind::Unary { operand, .. } => {
+                self.collect_deps_from_lua_require_expr(operand, deps)
+            }
+            ExprKind::FieldAccess { object, .. } => {
+                self.collect_deps_from_lua_require_expr(object, deps)
+            }
+            ExprKind::Index { object, index } => {
+                self.collect_deps_from_lua_require_expr(object, deps);
+                self.collect_deps_from_lua_require_expr(index, deps);
+            }
+            ExprKind::Array(elements) | ExprKind::Tuple(elements) => {
+                for element in elements {
+                    self.collect_deps_from_lua_require_expr(element, deps);
+                }
+            }
+            ExprKind::Map(entries) => {
+                for (k, v) in entries {
+                    self.collect_deps_from_lua_require_expr(k, deps);
+                    self.collect_deps_from_lua_require_expr(v, deps);
+                }
+            }
+            ExprKind::StructLiteral { fields, .. } => {
+                for field in fields {
+                    self.collect_deps_from_lua_require_expr(&field.value, deps);
+                }
+            }
+            ExprKind::EnumConstructor { args, .. } => {
+                for arg in args {
+                    self.collect_deps_from_lua_require_expr(arg, deps);
+                }
+            }
+            ExprKind::Lambda { body, .. } => self.collect_deps_from_lua_require_expr(body, deps),
+            ExprKind::Paren(inner) => self.collect_deps_from_lua_require_expr(inner, deps),
+            ExprKind::Cast { expr, .. } => self.collect_deps_from_lua_require_expr(expr, deps),
+            ExprKind::TypeCheck { expr, .. } => self.collect_deps_from_lua_require_expr(expr, deps),
+            ExprKind::IsPattern { expr, .. } => self.collect_deps_from_lua_require_expr(expr, deps),
+            ExprKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.collect_deps_from_lua_require_expr(condition, deps);
+                self.collect_deps_from_lua_require_expr(then_branch, deps);
+                if let Some(other) = else_branch {
+                    self.collect_deps_from_lua_require_expr(other, deps);
+                }
+            }
+            ExprKind::Block(stmts) => {
+                for stmt in stmts {
+                    self.collect_deps_from_lua_require_stmt(stmt, deps);
+                }
+            }
+            ExprKind::Return(values) => {
+                for value in values {
+                    self.collect_deps_from_lua_require_expr(value, deps);
+                }
+            }
+            ExprKind::Range { start, end, .. } => {
+                self.collect_deps_from_lua_require_expr(start, deps);
+                self.collect_deps_from_lua_require_expr(end, deps);
+            }
+            ExprKind::Literal(Literal::String(_))
+            | ExprKind::Literal(_)
+            | ExprKind::Identifier(_) => {}
+        }
+    }
+
+    fn is_lua_builtin_module_name(name: &str) -> bool {
+        matches!(
+            name,
+            "math" | "table" | "string" | "io" | "os" | "package" | "coroutine" | "debug" | "utf8"
+        )
+    }
+
+    fn is_lua_require_callee(&self, callee: &crate::ast::Expr) -> bool {
+        use crate::ast::ExprKind;
+        match &callee.kind {
+            ExprKind::Identifier(name) => name == "require",
+            ExprKind::FieldAccess { object, field } => {
+                field == "require"
+                    && matches!(&object.kind, ExprKind::Identifier(name) if name == "lua")
+            }
+            _ => false,
+        }
+    }
+
+    fn extract_lua_require_name(&self, expr: &crate::ast::Expr) -> Option<String> {
+        use crate::ast::{ExprKind, Literal};
+        match &expr.kind {
+            ExprKind::Literal(Literal::String(s)) => Some(s.clone()),
+            ExprKind::Call { callee, args } if self.is_lua_to_value_callee(callee) => {
+                args.get(0).and_then(|arg| match &arg.kind {
+                    ExprKind::Literal(Literal::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn is_lua_to_value_callee(&self, callee: &crate::ast::Expr) -> bool {
+        use crate::ast::ExprKind;
+        matches!(
+            &callee.kind,
+            ExprKind::FieldAccess { object, field }
+                if field == "to_value"
+                    && matches!(&object.kind, ExprKind::Identifier(name) if name == "lua")
+        )
     }
 
     fn finalize_module(&mut self, module: &mut LoadedModule) -> Result<()> {
@@ -491,6 +838,43 @@ impl ModuleLoader {
         }
 
         Ok(())
+    }
+
+    fn create_nil_stub_module(&self, module_path: &str) -> LoadedModule {
+        // Create a stub module that exports lua.nil for missing optional modules
+        let stub_item = Item {
+            kind: ItemKind::Const {
+                name: module_path
+                    .split('.')
+                    .last()
+                    .unwrap_or(module_path)
+                    .to_string(),
+                ty: crate::ast::Type {
+                    kind: crate::ast::TypeKind::Named("LuaValue".to_string()),
+                    span: Span::new(0, 0, 0, 0),
+                },
+                value: crate::ast::Expr {
+                    kind: crate::ast::ExprKind::FieldAccess {
+                        object: Box::new(crate::ast::Expr {
+                            kind: crate::ast::ExprKind::Identifier("lua".to_string()),
+                            span: Span::new(0, 0, 0, 0),
+                        }),
+                        field: "nil".to_string(),
+                    },
+                    span: Span::new(0, 0, 0, 0),
+                },
+            },
+            span: Span::new(0, 0, 0, 0),
+        };
+
+        LoadedModule {
+            path: module_path.to_string(),
+            items: vec![stub_item],
+            imports: ModuleImports::default(),
+            exports: ModuleExports::default(),
+            init_function: None,
+            source_path: PathBuf::from(format!("<stub:{}>", module_path)),
+        }
     }
 
     fn attach_module_to_error(error: LustError, module_path: &str) -> LustError {
@@ -746,5 +1130,114 @@ impl ModuleLoader {
             modules,
             entry_module,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("{prefix}_{nanos}"));
+        dir
+    }
+
+    #[test]
+    fn merges_multiple_script_chunks_into_single_init() {
+        let dir = unique_temp_dir("lust_module_loader_test");
+        fs::create_dir_all(&dir).unwrap();
+        let entry_path = dir.join("main.lust");
+        let module_path = dir.join("m.lust");
+
+        fs::write(&entry_path, "use m as m\n").unwrap();
+
+        // Interleaved script + declarations; parser will produce multiple ItemKind::Script chunks.
+        fs::write(
+            &module_path,
+            r#"
+local a: int = 1
+
+pub function f(): int
+    return a
+end
+
+local b: int = 2
+
+pub function g(): int
+    return b
+end
+
+local c: int = a + b
+"#,
+        )
+        .unwrap();
+
+        let mut loader = ModuleLoader::new(dir.clone());
+        let program = loader
+            .load_program_from_entry(entry_path.to_str().unwrap())
+            .unwrap();
+
+        let module = program.modules.iter().find(|m| m.path == "m").unwrap();
+        assert_eq!(module.init_function.as_deref(), Some("__init@m"));
+
+        let init_functions: Vec<&FunctionDef> = module
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                ItemKind::Function(f) if f.name == "__init@m" => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(init_functions.len(), 1);
+        assert_eq!(init_functions[0].body.len(), 3);
+
+        // Best-effort cleanup.
+        let _ = fs::remove_file(entry_path);
+        let _ = fs::remove_file(module_path);
+        let _ = fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn lua_require_does_not_force_missing_modules_as_dependencies() {
+        let dir = unique_temp_dir("lust_module_loader_lua_require_missing");
+        fs::create_dir_all(&dir).unwrap();
+        let entry_path = dir.join("main.lust");
+        let module_path = dir.join("a.lust");
+
+        fs::write(&entry_path, "use a as a\n").unwrap();
+
+        // `lua.require("missing.module")` appears inside a closure (so it should remain optional).
+        // The module loader must not try to resolve it as a hard on-disk dependency.
+        fs::write(
+            &module_path,
+            r#"
+use lua as lua
+
+local f = function(): unknown
+    return lua.require("missing.module")
+end
+"#,
+        )
+        .unwrap();
+
+        let mut loader = ModuleLoader::new(dir.clone());
+        let program = loader
+            .load_program_from_entry(entry_path.to_str().unwrap())
+            .unwrap();
+
+        assert!(program.modules.iter().any(|m| m.path == "a"));
+        assert!(!program.modules.iter().any(|m| m.path == "missing.module"));
+
+        // Best-effort cleanup.
+        let _ = fs::remove_file(entry_path);
+        let _ = fs::remove_file(module_path);
+        let _ = fs::remove_dir(dir);
     }
 }

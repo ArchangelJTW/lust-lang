@@ -756,6 +756,22 @@ fn float_methods() -> Vec<BuiltinMethod> {
         ),
         method(
             TypeExpr::Float,
+            "min",
+            "Return the smaller of two numbers",
+            &["other"],
+            vec![TypeExpr::Float],
+            TypeExpr::Float,
+        ),
+        method(
+            TypeExpr::Float,
+            "max",
+            "Return the larger of two numbers",
+            &["other"],
+            vec![TypeExpr::Float],
+            TypeExpr::Float,
+        ),
+        method(
+            TypeExpr::Float,
             "clamp",
             "Clamp the float between a minimum and maximum value",
             &["min", "max"],
@@ -785,10 +801,95 @@ fn int_methods() -> Vec<BuiltinMethod> {
         ),
         method(
             TypeExpr::Int,
+            "min",
+            "Return the smaller of two integers",
+            &["other"],
+            vec![TypeExpr::Int],
+            TypeExpr::Int,
+        ),
+        method(
+            TypeExpr::Int,
+            "max",
+            "Return the larger of two integers",
+            &["other"],
+            vec![TypeExpr::Int],
+            TypeExpr::Int,
+        ),
+        method(
+            TypeExpr::Int,
             "clamp",
             "Clamp the integer between a minimum and maximum value",
             &["min", "max"],
             vec![TypeExpr::Int, TypeExpr::Int],
+            TypeExpr::Int,
+        ),
+    ]
+}
+
+fn lua_table_methods() -> Vec<BuiltinMethod> {
+    vec![
+        method(
+            TypeExpr::Named("LuaTable"),
+            "len",
+            "Return the length of the array portion (1-based contiguous keys)",
+            &[],
+            vec![],
+            TypeExpr::Int,
+        ),
+        method(
+            TypeExpr::Named("LuaTable"),
+            "push",
+            "Append a value to the array portion",
+            &["value"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unit,
+        ),
+        method(
+            TypeExpr::Named("LuaTable"),
+            "insert",
+            "Insert a value into the array portion at a position",
+            &["pos", "value"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unit,
+        ),
+        method(
+            TypeExpr::Named("LuaTable"),
+            "remove",
+            "Remove a value from the array portion at a position",
+            &["pos"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        method(
+            TypeExpr::Named("LuaTable"),
+            "concat",
+            "Concatenate array elements into a string",
+            &["sep", "i", "j"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::String,
+        ),
+        method(
+            TypeExpr::Named("LuaTable"),
+            "unpack",
+            "Unpack array elements as multiple returns",
+            &["i", "j"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        method(
+            TypeExpr::Named("LuaTable"),
+            "sort",
+            "Sort the array portion",
+            &["comp"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unit,
+        ),
+        method(
+            TypeExpr::Named("LuaTable"),
+            "maxn",
+            "Find the largest positive numeric index",
+            &[],
+            vec![],
             TypeExpr::Int,
         ),
     ]
@@ -834,10 +935,102 @@ fn build_base_functions() -> Vec<BuiltinFunction> {
             },
             param_names: &["value"],
         },
+        BuiltinFunction {
+            name: "error",
+            description: "Raise a runtime error",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown],
+                return_type: TypeExpr::Unknown,
+            },
+            param_names: &["message"],
+        },
+        BuiltinFunction {
+            name: "assert",
+            description: "Assert a condition or raise an error",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown, TypeExpr::Unknown],
+                return_type: TypeExpr::Unknown,
+            },
+            param_names: &["cond", "message"],
+        },
+        BuiltinFunction {
+            name: "tonumber",
+            description: "Convert a value to a number",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown, TypeExpr::Unknown],
+                return_type: TypeExpr::Unknown,
+            },
+            param_names: &["value", "base"],
+        },
+        BuiltinFunction {
+            name: "pairs",
+            description: "Iterate over key/value pairs",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown],
+                return_type: TypeExpr::Named("Iterator"),
+            },
+            param_names: &["table"],
+        },
+        BuiltinFunction {
+            name: "ipairs",
+            description: "Iterate over array elements with indices",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown],
+                return_type: TypeExpr::Named("Iterator"),
+            },
+            param_names: &["array"],
+        },
+        BuiltinFunction {
+            name: "select",
+            description: "Return arguments starting at an index or the argument count",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown, TypeExpr::Unknown],
+                return_type: TypeExpr::Unknown,
+            },
+            param_names: &["index_or_hash", "..."],
+        },
+        BuiltinFunction {
+            name: "random",
+            description: "Generate a random number in an optional range",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown, TypeExpr::Unknown],
+                return_type: TypeExpr::Unknown,
+            },
+            param_names: &["m", "n"],
+        },
+        BuiltinFunction {
+            name: "randomseed",
+            description: "Seed the random number generator",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown],
+                return_type: TypeExpr::Unit,
+            },
+            param_names: &["seed"],
+        },
+        BuiltinFunction {
+            name: "unpack",
+            description: "Unpack array elements into multiple returns",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
+                return_type: TypeExpr::Unknown,
+            },
+            param_names: &["table", "i", "j"],
+        },
+        BuiltinFunction {
+            name: "setmetatable",
+            description: "Assign a metatable to a Lua table value",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown, TypeExpr::Unknown],
+                return_type: TypeExpr::Unknown,
+            },
+            param_names: &["table", "meta"],
+        },
     ]
 }
 
+static STRING_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 static TASK_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+static LUA_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 
 fn build_task_functions() -> Vec<BuiltinFunction> {
     vec![
@@ -921,6 +1114,161 @@ fn build_task_functions() -> Vec<BuiltinFunction> {
                 return_type: TypeExpr::Option(Box::new(TypeExpr::Named("Task"))),
             },
             param_names: &[],
+        },
+    ]
+}
+
+fn build_lua_functions() -> Vec<BuiltinFunction> {
+    vec![
+        BuiltinFunction {
+            name: "lua.to_value",
+            description: "Wrap a Lust value in LuaValue",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown],
+                return_type: TypeExpr::Named("LuaValue"),
+            },
+            param_names: &["value"],
+        },
+        BuiltinFunction {
+            name: "lua.require",
+            description: "Lua-style module resolver (loads from already-initialized globals when available)",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown],
+                return_type: TypeExpr::Unknown,
+            },
+            param_names: &["name"],
+        },
+        BuiltinFunction {
+            name: "lua.table",
+            description: "Create an empty Lua-style table",
+            signature: BuiltinSignature {
+                params: vec![],
+                return_type: TypeExpr::Named("LuaTable"),
+            },
+            param_names: &[],
+        },
+        BuiltinFunction {
+            name: "lua.setmetatable",
+            description: "Set the metatable for a Lua table value",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Named("LuaValue"), TypeExpr::Named("LuaValue")],
+                return_type: TypeExpr::Named("LuaValue"),
+            },
+            param_names: &["table", "meta"],
+        },
+        BuiltinFunction {
+            name: "lua.getmetatable",
+            description: "Get the metatable for a Lua table value",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Named("LuaValue")],
+                return_type: TypeExpr::Named("LuaValue"),
+            },
+            param_names: &["table"],
+        },
+        BuiltinFunction {
+            name: "lua.unwrap",
+            description: "Extract a raw Lust value from a LuaValue wrapper",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown],
+                return_type: TypeExpr::Unknown,
+            },
+            param_names: &["value"],
+        },
+    ]
+}
+
+fn build_string_functions() -> Vec<BuiltinFunction> {
+    vec![
+        BuiltinFunction {
+            name: "string.len",
+            description: "Return the length of a string",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown],
+                return_type: TypeExpr::Int,
+            },
+            param_names: &["s"],
+        },
+        BuiltinFunction {
+            name: "string.lower",
+            description: "Lowercase a string",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown],
+                return_type: TypeExpr::String,
+            },
+            param_names: &["s"],
+        },
+        BuiltinFunction {
+            name: "string.upper",
+            description: "Uppercase a string",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown],
+                return_type: TypeExpr::String,
+            },
+            param_names: &["s"],
+        },
+        BuiltinFunction {
+            name: "string.sub",
+            description: "Extract a substring using Lua-style indices",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
+                return_type: TypeExpr::String,
+            },
+            param_names: &["s", "i", "j"],
+        },
+        BuiltinFunction {
+            name: "string.byte",
+            description: "Return byte values from a string slice",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
+                return_type: TypeExpr::Unknown,
+            },
+            param_names: &["s", "i", "j"],
+        },
+        BuiltinFunction {
+            name: "string.char",
+            description: "Create a string from numeric bytes",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown],
+                return_type: TypeExpr::String,
+            },
+            param_names: &["byte"],
+        },
+        BuiltinFunction {
+            name: "string.find",
+            description: "Find a pattern within a string",
+            signature: BuiltinSignature {
+                params: vec![
+                    TypeExpr::Unknown,
+                    TypeExpr::Unknown,
+                    TypeExpr::Unknown,
+                    TypeExpr::Unknown,
+                ],
+                return_type: TypeExpr::Unknown,
+            },
+            param_names: &["s", "pattern", "init", "plain"],
+        },
+        BuiltinFunction {
+            name: "string.gsub",
+            description: "Globally substitute occurrences of a pattern",
+            signature: BuiltinSignature {
+                params: vec![
+                    TypeExpr::Unknown,
+                    TypeExpr::Unknown,
+                    TypeExpr::Unknown,
+                    TypeExpr::Unknown,
+                ],
+                return_type: TypeExpr::Unknown,
+            },
+            param_names: &["s", "pattern", "repl", "n"],
+        },
+        BuiltinFunction {
+            name: "string.format",
+            description: "Format values according to a pattern",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown],
+                return_type: TypeExpr::String,
+            },
+            param_names: &["fmt"],
         },
     ]
 }
@@ -1075,6 +1423,7 @@ fn build_builtin_methods() -> Vec<BuiltinMethod> {
     methods.extend(string_methods());
     methods.extend(array_methods());
     methods.extend(map_methods());
+    methods.extend(lua_table_methods());
     methods.extend(iterator_methods());
     methods.extend(option_methods());
     methods.extend(result_methods());
@@ -1087,8 +1436,16 @@ pub fn base_functions() -> &'static [BuiltinFunction] {
     BASE_FUNCTIONS.get_or_init(build_base_functions).as_slice()
 }
 
+pub fn string_functions() -> &'static [BuiltinFunction] {
+    STRING_FUNCTIONS.get_or_init(build_string_functions).as_slice()
+}
+
 pub fn task_functions() -> &'static [BuiltinFunction] {
     TASK_FUNCTIONS.get_or_init(build_task_functions).as_slice()
+}
+
+pub fn lua_functions() -> &'static [BuiltinFunction] {
+    LUA_FUNCTIONS.get_or_init(build_lua_functions).as_slice()
 }
 
 pub fn io_functions() -> &'static [BuiltinFunction] {
@@ -1174,10 +1531,11 @@ static BUILTINS_DATABASE: StaticOnceCell<BuiltinsDatabase> = StaticOnceCell::new
 
 fn build_builtins_database() -> BuiltinsDatabase {
     let mut modules: BTreeMap<&'static str, BuiltinModule> = BTreeMap::new();
-    let module_specs: [(&'static str, &'static str, &'static [BuiltinFunction]); 3] = [
+    let module_specs: [(&'static str, &'static str, &'static [BuiltinFunction]); 4] = [
         ("task", "task runtime module", task_functions()),
         ("io", "io file & console module", io_functions()),
         ("os", "os filesystem module", os_functions()),
+        ("string", "string compatibility module", string_functions()),
     ];
     for (name, description, functions) in module_specs {
         let mut module_funcs: Vec<&'static BuiltinFunction> = functions.iter().collect();

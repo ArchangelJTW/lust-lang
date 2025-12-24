@@ -125,11 +125,11 @@ impl VM {
         vm
     }
 
-    pub(super) fn new_map(&self) -> LustMap {
+    pub(crate) fn new_map(&self) -> LustMap {
         HashMap::with_hasher(self.map_hasher.clone())
     }
 
-    pub(super) fn map_with_entries(
+    pub(crate) fn map_with_entries(
         &self,
         entries: impl IntoIterator<Item = (ValueKey, Value)>,
     ) -> Value {
@@ -138,7 +138,7 @@ impl VM {
         Value::map(map)
     }
 
-    pub(super) fn new_map_value(&self) -> Value {
+    pub(crate) fn new_map_value(&self) -> Value {
         Value::map(self.new_map())
     }
 

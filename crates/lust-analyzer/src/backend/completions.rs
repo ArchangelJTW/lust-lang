@@ -392,6 +392,27 @@ pub(crate) fn identifier_completions(
                                 Some("extern".to_string()),
                             );
                         }
+                        ExternItem::Const { name, .. } => {
+                            push_item(
+                                name.clone(),
+                                CompletionItemKind::CONSTANT,
+                                Some("extern const".to_string()),
+                            );
+                        }
+                        ExternItem::Struct(def) => {
+                            push_item(
+                                simple_type_name(&def.name).to_string(),
+                                CompletionItemKind::STRUCT,
+                                Some("extern struct".to_string()),
+                            );
+                        }
+                        ExternItem::Enum(def) => {
+                            push_item(
+                                simple_type_name(&def.name).to_string(),
+                                CompletionItemKind::ENUM,
+                                Some("extern enum".to_string()),
+                            );
+                        }
                     }
                 }
             }

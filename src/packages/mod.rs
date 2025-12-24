@@ -516,6 +516,7 @@ pub fn stub_files_from_exports(
         entry.type_stub.struct_defs.extend(stub.struct_defs.clone());
         entry.type_stub.enum_defs.extend(stub.enum_defs.clone());
         entry.type_stub.trait_defs.extend(stub.trait_defs.clone());
+        entry.type_stub.const_defs.extend(stub.const_defs.clone());
     }
 
     for export in exports {
@@ -571,6 +572,11 @@ pub fn stub_files_from_exports(
         );
         append_defs(
             &combined_entry.type_stub.trait_defs,
+            &mut contents,
+            &mut wrote_type,
+        );
+        append_defs(
+            &combined_entry.type_stub.const_defs,
             &mut contents,
             &mut wrote_type,
         );

@@ -14,48 +14,57 @@ impl Compiler {
                     if let Some(type_ann) = &binding.type_annotation {
                         self.register_type(reg, type_ann.kind.clone());
                     }
-
-                    if let Some(scope) = self.scopes.last_mut() {
-                        scope.locals.insert(binding.name.clone(), (reg, *mutable));
-                    }
-
                     binding_regs.push((binding.name.clone(), reg));
                 }
+
+                let sync_module_local =
+                    self.is_initializer_context() && self.current_scope_is_top_level();
+                let module_scope = if sync_module_local {
+                    self.module_scope_name().map(|s| s.to_string())
+                } else {
+                    None
+                };
 
                 if let Some(values) = initializer {
                     if bindings.len() == 1 && values.len() == 1 {
                         let value_reg = self.compile_expr(&values[0])?;
-                        let (name, target_reg) = &binding_regs[0];
+                        let (_name, target_reg) = &binding_regs[0];
                         if value_reg != *target_reg {
                             self.emit(Instruction::Move(*target_reg, value_reg), 0);
                         }
-
-                        if self.should_sync_module_local(name) {
-                            self.emit_store_module_global(name, *target_reg);
-                        }
-
                         self.free_register(value_reg);
                     } else {
                         let tuple_reg = self.compile_exprs_to_tuple(values)?;
-                        for (index, (name, target_reg)) in binding_regs.iter().enumerate() {
+                        for (index, (_name, target_reg)) in binding_regs.iter().enumerate() {
                             let value_reg = self.allocate_register();
                             self.emit(Instruction::TupleGet(value_reg, tuple_reg, index as u8), 0);
                             self.emit(Instruction::Move(*target_reg, value_reg), 0);
-                            if self.should_sync_module_local(name) {
-                                self.emit_store_module_global(name, *target_reg);
-                            }
-
                             self.free_register(value_reg);
                         }
 
                         self.free_register(tuple_reg);
                     }
                 } else {
-                    for (name, target_reg) in &binding_regs {
+                    for (_name, target_reg) in &binding_regs {
                         self.emit(Instruction::LoadNil(*target_reg), 0);
-                        if self.should_sync_module_local(name) {
-                            self.emit_store_module_global(name, *target_reg);
+                    }
+                }
+
+                if let Some(scope) = self.scopes.last_mut() {
+                    for (name, reg) in &binding_regs {
+                        scope.locals.insert(name.clone(), (*reg, *mutable));
+                    }
+                }
+
+                if let Some(module) = module_scope {
+                    {
+                        let locals_entry = self.module_locals.entry(module.clone()).or_default();
+                        for (name, _) in &binding_regs {
+                            locals_entry.insert(name.clone());
                         }
+                    }
+                    for (name, reg) in &binding_regs {
+                        self.emit_store_module_global(name, *reg);
                     }
                 }
             }
@@ -240,6 +249,9 @@ impl Compiler {
                 self.compile_for_in_loop(variables, iterator, body)?;
             }
         }
+
+        // Reset temporary registers after each statement to prevent accumulation
+        self.reset_temp_registers();
 
         Ok(())
     }

@@ -120,8 +120,63 @@ impl From<Rc<String>> for ValueKey {
     }
 }
 
+/// Helper function to unwrap LuaValue enums for key comparison
+fn unwrap_lua_value_for_key(value: &Value) -> Value {
+    if let Value::Enum {
+        enum_name,
+        variant,
+        values,
+    } = value
+    {
+        if enum_name == "LuaValue" {
+            return match variant.as_str() {
+                "Nil" => Value::Nil,
+                "Bool" => values
+                    .as_ref()
+                    .and_then(|v| v.get(0))
+                    .cloned()
+                    .unwrap_or(Value::Bool(false)),
+                "Int" | "Number" => values
+                    .as_ref()
+                    .and_then(|v| v.get(0))
+                    .cloned()
+                    .unwrap_or(Value::Int(0)),
+                "String" => values
+                    .as_ref()
+                    .and_then(|v| v.get(0))
+                    .cloned()
+                    .unwrap_or(Value::String(Rc::new(String::new()))),
+                "Table" => values
+                    .as_ref()
+                    .and_then(|v| v.get(0))
+                    .cloned()
+                    .unwrap_or(Value::Nil),
+                "Function" => values
+                    .as_ref()
+                    .and_then(|v| v.get(0))
+                    .cloned()
+                    .unwrap_or(Value::Nil),
+                _ => value.clone(),
+            };
+        }
+    }
+    value.clone()
+}
+
 fn value_key_eq(left: &Value, right: &Value) -> bool {
     use Value::*;
+
+    // Check if either side is a LuaValue enum and unwrap if needed
+    let is_lua_value_left = matches!(left, Enum { enum_name, .. } if enum_name == "LuaValue");
+    let is_lua_value_right = matches!(right, Enum { enum_name, .. } if enum_name == "LuaValue");
+
+    // If either side is a LuaValue, unwrap both and compare
+    if is_lua_value_left || is_lua_value_right {
+        let unwrapped_left = unwrap_lua_value_for_key(left);
+        let unwrapped_right = unwrap_lua_value_for_key(right);
+        return value_key_eq(&unwrapped_left, &unwrapped_right);
+    }
+
     match (left, right) {
         (Nil, Nil) => true,
         (Bool(a), Bool(b)) => a == b,
@@ -171,6 +226,13 @@ fn value_key_eq(left: &Value, right: &Value) -> bool {
 
 fn hash_value_for_key<H: Hasher>(value: &Value, state: &mut H) {
     use Value::*;
+
+    // Check if this is a LuaValue enum and unwrap it for consistent hashing
+    if matches!(value, Enum { enum_name, .. } if enum_name == "LuaValue") {
+        let unwrapped = unwrap_lua_value_for_key(value);
+        return hash_value_for_key(&unwrapped, state);
+    }
+
     match value {
         Nil => {
             0u8.hash(state);

@@ -37,7 +37,7 @@ pub struct Compiler {
     pub(super) entry_module: Option<String>,
     pub(super) module_locals: HashMap<String, HashSet<String>>,
     pub(super) current_function_name: Option<String>,
-    pub(super) extern_function_aliases: HashMap<String, String>,
+    pub(super) extern_value_aliases: HashMap<String, String>,
     pub(super) stdlib_symbols: HashSet<String>,
     option_coercions: HashMap<String, HashSet<Span>>,
     function_signatures: HashMap<String, FunctionSignature>,
@@ -74,7 +74,7 @@ impl Compiler {
             entry_module: None,
             module_locals: HashMap::new(),
             current_function_name: None,
-            extern_function_aliases: HashMap::new(),
+            extern_value_aliases: HashMap::new(),
             stdlib_symbols: HashSet::new(),
             option_coercions: HashMap::new(),
             function_signatures: HashMap::new(),
@@ -98,13 +98,28 @@ impl Compiler {
     pub fn configure_stdlib(&mut self, config: &LustConfig) {
         self.stdlib_symbols.clear();
         self.stdlib_symbols.extend(
-            ["print", "println", "type", "tostring", "task"]
+            [
+                "print",
+                "println",
+                "type",
+                "tostring",
+                "unpack",
+                "select",
+                "task",
+                "lua",
+                "error",
+                "assert",
+                "tonumber",
+                "pairs",
+                "ipairs",
+                "setmetatable",
+            ]
                 .into_iter()
                 .map(String::from),
         );
         for module in config.enabled_modules() {
             match module {
-                "io" | "os" => {
+                "io" | "os" | "string" | "math" | "table" => {
                     self.stdlib_symbols.insert(module.to_string());
                 }
 
@@ -172,9 +187,9 @@ impl Compiler {
         })
     }
 
-    pub(super) fn record_extern_function(&mut self, name: &str) {
+    pub(super) fn record_extern_value(&mut self, name: &str) {
         let runtime_name = name.to_string();
-        self.extern_function_aliases
+        self.extern_value_aliases
             .entry(runtime_name.clone())
             .or_insert(runtime_name.clone());
         let module_name = self
@@ -184,7 +199,7 @@ impl Compiler {
         if let Some(module) = module_name {
             if !name.contains('.') {
                 let qualified = format!("{}.{}", module, name);
-                self.extern_function_aliases
+                self.extern_value_aliases
                     .entry(qualified)
                     .or_insert(runtime_name);
             }
@@ -318,6 +333,11 @@ impl Compiler {
                 | "Task"
                 | "TaskStatus"
                 | "TaskInfo"
+                | "LuaValue"
+                | "LuaTable"
+                | "LuaFunction"
+                | "LuaUserdata"
+                | "LuaThread"
         )
     }
 

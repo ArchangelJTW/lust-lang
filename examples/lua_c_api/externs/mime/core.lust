@@ -1,0 +1,13 @@
+-- Auto-generated stub for Lua module 'mime.core'
+
+pub extern
+    function mime.core.b64(LuaValue): LuaValue
+    function mime.core.dot(LuaValue): LuaValue
+    function mime.core.eol(LuaValue): LuaValue
+    function mime.core.qp(LuaValue): LuaValue
+    function mime.core.qpwrp(LuaValue): LuaValue
+    function mime.core.unb64(LuaValue): LuaValue
+    function mime.core.unqp(LuaValue): LuaValue
+    function mime.core.wrp(LuaValue): LuaValue
+    const mime.core._VERSION: LuaValue
+end

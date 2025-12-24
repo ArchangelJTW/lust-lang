@@ -10,6 +10,16 @@ use core::cell::RefCell;
 use hashbrown::{hash_map::Entry, HashMap, HashSet};
 const COLLECT_INTERVAL: usize = 512;
 const REGISTRATION_THRESHOLD: usize = 256;
+
+type VisitKey = (u8, usize);
+const VISIT_ARRAY: u8 = 1;
+const VISIT_MAP: u8 = 2;
+const VISIT_STRUCT: u8 = 3;
+const VISIT_ITERATOR: u8 = 4;
+const VISIT_ENUM_VALUES: u8 = 5;
+const VISIT_TUPLE_VALUES: u8 = 6;
+const VISIT_CLOSURE_UPVALUES: u8 = 7;
+
 #[derive(Default)]
 pub struct CycleCollector {
     containers: HashMap<usize, ContainerEntry>,
@@ -101,12 +111,12 @@ impl CycleCollector {
             return;
         }
 
-        let mut visited: HashSet<usize> = HashSet::new();
+        let mut visited: HashSet<VisitKey> = HashSet::new();
         self.mark_roots(vm, &mut visited);
         self.sweep();
     }
 
-    fn mark_roots(&mut self, vm: &VM, visited: &mut HashSet<usize>) {
+    fn mark_roots(&mut self, vm: &VM, visited: &mut HashSet<VisitKey>) {
         for value in vm.globals.values() {
             self.mark_value(value, visited);
         }
@@ -132,14 +142,14 @@ impl CycleCollector {
         }
     }
 
-    fn mark_task_signal(&mut self, signal: &TaskSignal, visited: &mut HashSet<usize>) {
+    fn mark_task_signal(&mut self, signal: &TaskSignal, visited: &mut HashSet<VisitKey>) {
         match signal {
             TaskSignal::Yield { value, .. } => self.mark_value(value, visited),
             TaskSignal::Stop { value } => self.mark_value(value, visited),
         }
     }
 
-    fn mark_frame(&mut self, frame: &CallFrame, visited: &mut HashSet<usize>) {
+    fn mark_frame(&mut self, frame: &CallFrame, visited: &mut HashSet<VisitKey>) {
         for value in frame.registers.iter() {
             self.mark_value(value, visited);
         }
@@ -149,7 +159,7 @@ impl CycleCollector {
         }
     }
 
-    fn mark_task(&mut self, task: &TaskInstance, visited: &mut HashSet<usize>) {
+    fn mark_task(&mut self, task: &TaskInstance, visited: &mut HashSet<VisitKey>) {
         for frame in &task.call_stack {
             self.mark_frame(frame, visited);
         }
@@ -170,45 +180,62 @@ impl CycleCollector {
         }
     }
 
-    fn mark_value(&mut self, value: &Value, visited: &mut HashSet<usize>) {
-        self.register_value(value);
-        match value {
-            Value::Array(rc) => self.mark_array(rc, visited),
-            Value::Map(rc) => self.mark_map(rc, visited),
-            Value::Struct { fields, .. } => self.mark_struct(fields, visited),
-            Value::Enum {
-                values: Some(rc), ..
-            } => {
-                for item in rc.iter() {
-                    self.mark_value(item, visited);
+    fn mark_value(&mut self, value: &Value, visited: &mut HashSet<VisitKey>) {
+        // Marking can walk extremely cyclic graphs (Lua modules tend to be self-referential).
+        // Use an explicit stack instead of recursion to avoid Rust stack overflows.
+        let mut stack: Vec<Value> = vec![value.clone()];
+        while let Some(value) = stack.pop() {
+            self.register_value(&value);
+            match &value {
+                Value::Array(rc) => self.mark_array(rc, visited, &mut stack),
+                Value::Map(rc) => self.mark_map(rc, visited, &mut stack),
+                Value::Struct { fields, .. } => self.mark_struct(fields, visited, &mut stack),
+                Value::Enum {
+                    values: Some(rc), ..
+                } => {
+                    let ptr = Rc::as_ptr(rc) as usize;
+                    if !visited.insert((VISIT_ENUM_VALUES, ptr)) {
+                        continue;
+                    }
+                    stack.extend(rc.iter().cloned());
                 }
-            }
 
-            Value::Tuple(values) => {
-                for item in values.iter() {
-                    self.mark_value(item, visited);
+                Value::Tuple(values) => {
+                    let ptr = Rc::as_ptr(values) as usize;
+                    if !visited.insert((VISIT_TUPLE_VALUES, ptr)) {
+                        continue;
+                    }
+                    stack.extend(values.iter().cloned());
                 }
-            }
 
-            Value::Iterator(rc) => self.mark_iterator(rc, visited),
-            Value::Closure { upvalues, .. } => {
-                for up in upvalues.iter() {
-                    let captured = up.get();
-                    self.mark_value(&captured, visited);
+                Value::Iterator(rc) => self.mark_iterator(rc, visited, &mut stack),
+                Value::Closure { upvalues, .. } => {
+                    let ptr = Rc::as_ptr(upvalues) as usize;
+                    if !visited.insert((VISIT_CLOSURE_UPVALUES, ptr)) {
+                        continue;
+                    }
+                    for up in upvalues.iter() {
+                        stack.push(up.get());
+                    }
                 }
-            }
 
-            Value::WeakStruct(weak) => {
-                if let Some(strong) = weak.upgrade() {
-                    self.mark_value(&strong, visited);
+                Value::WeakStruct(weak) => {
+                    if let Some(strong) = weak.upgrade() {
+                        stack.push(strong);
+                    }
                 }
-            }
 
-            _ => {}
+                _ => {}
+            }
         }
     }
 
-    fn mark_array(&mut self, rc: &Rc<RefCell<Vec<Value>>>, visited: &mut HashSet<usize>) {
+    fn mark_array(
+        &mut self,
+        rc: &Rc<RefCell<Vec<Value>>>,
+        visited: &mut HashSet<VisitKey>,
+        stack: &mut Vec<Value>,
+    ) {
         let ptr = Rc::as_ptr(rc) as usize;
         let entry = self
             .containers
@@ -218,20 +245,23 @@ impl CycleCollector {
                 marked: false,
             });
         entry.kind = ContainerKind::Array(Rc::downgrade(rc));
-        if !visited.insert(ptr) {
+        if !visited.insert((VISIT_ARRAY, ptr)) {
             entry.marked = true;
             return;
         }
 
         entry.marked = true;
         if let Ok(borrowed) = rc.try_borrow() {
-            for value in borrowed.iter() {
-                self.mark_value(value, visited);
-            }
+            stack.extend(borrowed.iter().cloned());
         }
     }
 
-    fn mark_map(&mut self, rc: &Rc<RefCell<LustMap>>, visited: &mut HashSet<usize>) {
+    fn mark_map(
+        &mut self,
+        rc: &Rc<RefCell<LustMap>>,
+        visited: &mut HashSet<VisitKey>,
+        stack: &mut Vec<Value>,
+    ) {
         let ptr = Rc::as_ptr(rc) as usize;
         let entry = self
             .containers
@@ -241,20 +271,27 @@ impl CycleCollector {
                 marked: false,
             });
         entry.kind = ContainerKind::Map(Rc::downgrade(rc));
-        if !visited.insert(ptr) {
+        if !visited.insert((VISIT_MAP, ptr)) {
             entry.marked = true;
             return;
         }
 
         entry.marked = true;
         if let Ok(borrowed) = rc.try_borrow() {
-            for value in borrowed.values() {
-                self.mark_value(value, visited);
+            // Mark both keys and values: keys can contain containers too.
+            for (key, value) in borrowed.iter() {
+                stack.push(key.to_value());
+                stack.push(value.clone());
             }
         }
     }
 
-    fn mark_struct(&mut self, fields: &Rc<RefCell<Vec<Value>>>, visited: &mut HashSet<usize>) {
+    fn mark_struct(
+        &mut self,
+        fields: &Rc<RefCell<Vec<Value>>>,
+        visited: &mut HashSet<VisitKey>,
+        stack: &mut Vec<Value>,
+    ) {
         let ptr = Rc::as_ptr(fields) as usize;
         let entry = self
             .containers
@@ -264,20 +301,23 @@ impl CycleCollector {
                 marked: false,
             });
         entry.kind = ContainerKind::Struct(Rc::downgrade(fields));
-        if !visited.insert(ptr) {
+        if !visited.insert((VISIT_STRUCT, ptr)) {
             entry.marked = true;
             return;
         }
 
         entry.marked = true;
         if let Ok(borrowed) = fields.try_borrow() {
-            for value in borrowed.iter() {
-                self.mark_value(value, visited);
-            }
+            stack.extend(borrowed.iter().cloned());
         }
     }
 
-    fn mark_iterator(&mut self, rc: &Rc<RefCell<IteratorState>>, visited: &mut HashSet<usize>) {
+    fn mark_iterator(
+        &mut self,
+        rc: &Rc<RefCell<IteratorState>>,
+        visited: &mut HashSet<VisitKey>,
+        stack: &mut Vec<Value>,
+    ) {
         let ptr = Rc::as_ptr(rc) as usize;
         let entry = self
             .containers
@@ -287,7 +327,7 @@ impl CycleCollector {
                 marked: false,
             });
         entry.kind = ContainerKind::Iterator(Rc::downgrade(rc));
-        if !visited.insert(ptr) {
+        if !visited.insert((VISIT_ITERATOR, ptr)) {
             entry.marked = true;
             return;
         }
@@ -296,14 +336,13 @@ impl CycleCollector {
         if let Ok(borrowed) = rc.try_borrow() {
             match &*borrowed {
                 IteratorState::Array { items, .. } => {
-                    for value in items {
-                        self.mark_value(value, visited);
-                    }
+                    stack.extend(items.iter().cloned());
                 }
 
                 IteratorState::MapPairs { items, .. } => {
-                    for (_key, value) in items {
-                        self.mark_value(value, visited);
+                    for (key, value) in items {
+                        stack.push(key.to_value());
+                        stack.push(value.clone());
                     }
                 }
             }

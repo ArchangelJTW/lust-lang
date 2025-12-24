@@ -2,6 +2,56 @@ use super::*;
 use crate::bytecode::ValueKey;
 use core::{array, ptr};
 impl VM {
+    fn lua_table_map(value: &Value) -> Option<Value> {
+        if let Value::Enum {
+            enum_name,
+            variant,
+            values,
+        } = value
+        {
+            if enum_name == "LuaValue" && variant == "Table" {
+                if let Some(inner) = values.as_ref().and_then(|vals| vals.get(0)) {
+                    if let Some(map) = inner.struct_get_field("table") {
+                        return Some(map);
+                    }
+                }
+            }
+        }
+
+        if let Value::Struct { name, .. } = value {
+            if name == "LuaTable" {
+                if let Some(map) = value.struct_get_field("table") {
+                    return Some(map);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn lua_table_key_value(value: &Value) -> Value {
+        if let Value::Enum {
+            enum_name,
+            variant,
+            values,
+        } = value
+        {
+            if enum_name == "LuaValue" {
+                return match variant.as_str() {
+                    "Nil" => Value::Nil,
+                    "Bool" | "Int" | "Float" | "String" | "Table" | "Function" | "LightUserdata"
+                    | "Userdata" | "Thread" => values
+                        .as_ref()
+                        .and_then(|v| v.get(0))
+                        .cloned()
+                        .unwrap_or(Value::Nil),
+                    _ => value.clone(),
+                };
+            }
+        }
+        value.clone()
+    }
+
     pub(super) fn push_current_vm(&mut self) {
         let ptr = self as *mut VM;
         crate::vm::push_vm_ptr(ptr);
@@ -579,7 +629,77 @@ impl VM {
                 }
 
                 Instruction::Call(func_reg, first_arg, arg_count, dest_reg) => {
-                    let func_value = self.get_register(func_reg)?.clone();
+                    let mut func_value = self.get_register(func_reg)?.clone();
+                    // if let Value::Enum { enum_name, variant, .. } = &func_value {
+                    //     if enum_name == "LuaValue" && variant == "Table" {
+                    //         eprintln!("DEBUG: Instruction::Call with LuaValue.Table");
+                    //     }
+                    // }
+
+                    // Check if this is a table/userdata with __call metamethod (Lua compat)
+                    let needs_call_value = {
+                        let mut check_value = &func_value;
+                        // Unwrap LuaValue enum if needed
+                        if let Value::Enum { enum_name, variant, values } = &func_value {
+                            if enum_name == "LuaValue" && (variant == "Table" || variant == "Userdata") {
+                                if let Some(inner) = values.as_ref().and_then(|v| v.get(0)) {
+                                    check_value = inner;
+                                }
+                            }
+                        }
+                        // Check if it's a LuaTable/LuaUserdata struct with metamethods
+                        if let Value::Struct { name, .. } = check_value {
+                            (name == "LuaTable" || name == "LuaUserdata") &&
+                            check_value.struct_get_field("metamethods").is_some()
+                        } else {
+                            false
+                        }
+                    };
+
+                    if needs_call_value {
+                        // eprintln!("DEBUG Instruction::Call: Delegating to call_value for table/userdata");
+                        // Delegate to call_value which handles __call metamethods
+                        let mut args = Vec::new();
+                        for i in 0..arg_count {
+                            args.push(self.get_register(first_arg + i)?.clone());
+                        }
+                        let result = self.call_value(&func_value, args)?;
+                        self.set_register(dest_reg, result)?;
+                        continue;
+                    } else {
+                        // Check what type we're actually dealing with
+                        if let Value::Enum { enum_name, variant, .. } = &func_value {
+                            if enum_name == "LuaValue" && (variant == "Table" || variant == "Userdata") {
+                                eprintln!("DEBUG Instruction::Call: Have LuaValue.{} but needs_call_value=false", variant);
+                            }
+                        }
+                    }
+
+                    loop {
+                        let handle = match &func_value {
+                            Value::Enum {
+                                enum_name,
+                                variant,
+                                values,
+                            } if enum_name == "LuaValue" && variant == "Function" => values
+                                .as_ref()
+                                .and_then(|vals| vals.get(0))
+                                .and_then(|v| v.struct_get_field("handle"))
+                                .and_then(|v| v.as_int())
+                                .map(|i| i as usize),
+                            _ => None,
+                        };
+                        let Some(handle) = handle else { break };
+                        let inner = crate::lua_compat::lookup_lust_function(handle).ok_or_else(|| {
+                            LustError::RuntimeError {
+                                message: format!(
+                                    "LuaValue function handle {} was not registered with VM",
+                                    handle
+                                ),
+                            }
+                        })?;
+                        func_value = inner;
+                    }
                     match func_value {
                         Value::Function(func_idx) => {
                             let mut args = Vec::new();
@@ -841,24 +961,34 @@ impl VM {
                         .ok_or_else(|| LustError::RuntimeError {
                             message: "Field name must be a string".to_string(),
                         })?;
-                    let value = match object {
-                        Value::Struct { .. } => object
-                            .struct_get_field_rc(&field_name)
-                            .unwrap_or(Value::Nil),
-                        Value::Map(map) => {
-                            use crate::bytecode::ValueKey;
-                            let key = ValueKey::from(field_name.clone());
-                            map.borrow().get(&key).cloned().unwrap_or(Value::Nil)
+                    let value = if let Some(map_val) = Self::lua_table_map(object) {
+                        if let Value::Map(map) = map_val {
+                            let raw_key_value = Value::String(field_name.clone());
+                            let key = self.make_hash_key(&Self::lua_table_key_value(&raw_key_value))?;
+                            let borrowed = map.borrow();
+                            borrowed.get(&key).cloned().unwrap_or(Value::Nil)
+                        } else {
+                            Value::Nil
                         }
+                    } else {
+                        match object {
+                            Value::Struct { .. } => object
+                                .struct_get_field_rc(&field_name)
+                                .unwrap_or(Value::Nil),
+                            Value::Map(map) => {
+                                let key = ValueKey::from(field_name.clone());
+                                map.borrow().get(&key).cloned().unwrap_or(Value::Nil)
+                            }
 
-                        _ => {
-                            return Err(LustError::RuntimeError {
-                                message: format!(
-                                    "Cannot get field '{}' from {:?}",
-                                    field_name.as_str(),
-                                    object
-                                ),
-                            })
+                            _ => {
+                                return Err(LustError::RuntimeError {
+                                    message: format!(
+                                        "Cannot get field '{}' from {:?}",
+                                        field_name.as_str(),
+                                        object
+                                    ),
+                                })
+                            }
                         }
                     };
                     self.set_register(dest, value)?;
@@ -874,28 +1004,43 @@ impl VM {
                             message: "Field name must be a string".to_string(),
                         })?;
                     let mut invalidate_key: Option<usize> = None;
-                    match object {
-                        Value::Struct { .. } => {
-                            invalidate_key = Self::struct_cache_key(object);
-                            object
-                                .struct_set_field_rc(&field_name, value)
-                                .map_err(|message| LustError::RuntimeError { message })?;
-                        }
-
-                        Value::Map(map) => {
-                            use crate::bytecode::ValueKey;
-                            let key = ValueKey::from(field_name.clone());
+                    if let Some(map_val) = Self::lua_table_map(object) {
+                        if let Value::Map(map) = map_val {
+                            let raw_key_value = Value::String(field_name.clone());
+                            let key = self.make_hash_key(&Self::lua_table_key_value(&raw_key_value))?;
                             map.borrow_mut().insert(key, value);
-                        }
-
-                        _ => {
+                        } else {
                             return Err(LustError::RuntimeError {
                                 message: format!(
                                     "Cannot set field '{}' on {:?}",
                                     field_name.as_str(),
                                     object
                                 ),
-                            })
+                            });
+                        }
+                    } else {
+                        match object {
+                            Value::Struct { .. } => {
+                                invalidate_key = Self::struct_cache_key(object);
+                                object
+                                    .struct_set_field_rc(&field_name, value)
+                                    .map_err(|message| LustError::RuntimeError { message })?;
+                            }
+
+                            Value::Map(map) => {
+                                let key = ValueKey::from(field_name.clone());
+                                map.borrow_mut().insert(key, value);
+                            }
+
+                            _ => {
+                                return Err(LustError::RuntimeError {
+                                    message: format!(
+                                        "Cannot set field '{}' on {:?}",
+                                        field_name.as_str(),
+                                        object
+                                    ),
+                                })
+                            }
                         }
                     }
 
@@ -928,34 +1073,46 @@ impl VM {
                 Instruction::GetIndex(dest, array_reg, index_reg) => {
                     let collection = self.get_register(array_reg)?.clone();
                     let index = self.get_register(index_reg)?.clone();
-                    let result = match collection {
-                        Value::Array(arr) => {
-                            let idx = index.as_int().ok_or_else(|| LustError::RuntimeError {
-                                message: "Array index must be an integer".to_string(),
-                            })?;
-                            let borrowed = arr.borrow();
-                            if idx < 0 || idx as usize >= borrowed.len() {
-                                return Err(LustError::RuntimeError {
-                                    message: format!(
-                                        "Array index {} out of bounds (length: {})",
-                                        idx,
-                                        borrowed.len()
-                                    ),
-                                });
-                            }
-
-                            borrowed[idx as usize].clone()
-                        }
-
-                        Value::Map(map) => {
-                            let key = self.make_hash_key(&index)?;
-                            map.borrow().get(&key).cloned().unwrap_or(Value::Nil)
-                        }
-
-                        _ => {
+                    let result = if let Some(map_val) = Self::lua_table_map(&collection) {
+                        if let Value::Map(map) = map_val {
+                            let raw_key = self.make_hash_key(&Self::lua_table_key_value(&index))?;
+                            let borrowed = map.borrow();
+                            borrowed.get(&raw_key).cloned().unwrap_or(Value::Nil)
+                        } else {
                             return Err(LustError::RuntimeError {
                                 message: format!("Cannot index {:?}", collection.type_of()),
-                            })
+                            });
+                        }
+                    } else {
+                        match collection {
+                            Value::Array(arr) => {
+                                let idx = index.as_int().ok_or_else(|| LustError::RuntimeError {
+                                    message: "Array index must be an integer".to_string(),
+                                })?;
+                                let borrowed = arr.borrow();
+                                if idx < 0 || idx as usize >= borrowed.len() {
+                                    return Err(LustError::RuntimeError {
+                                        message: format!(
+                                            "Array index {} out of bounds (length: {})",
+                                            idx,
+                                            borrowed.len()
+                                        ),
+                                    });
+                                }
+
+                                borrowed[idx as usize].clone()
+                            }
+
+                            Value::Map(map) => {
+                                let key = self.make_hash_key(&index)?;
+                                map.borrow().get(&key).cloned().unwrap_or(Value::Nil)
+                            }
+
+                            _ => {
+                                return Err(LustError::RuntimeError {
+                                    message: format!("Cannot index {:?}", collection.type_of()),
+                                })
+                            }
                         }
                     };
                     self.set_register(dest, result)?;
@@ -1133,34 +1290,45 @@ impl VM {
                     let collection = self.get_register(collection_reg)?.clone();
                     let index = self.get_register(index_reg)?.clone();
                     let value = self.get_register(value_reg)?.clone();
-                    match collection {
-                        Value::Array(arr) => {
-                            let idx = index.as_int().ok_or_else(|| LustError::RuntimeError {
-                                message: "Array index must be an integer".to_string(),
-                            })?;
-                            let mut borrowed = arr.borrow_mut();
-                            if idx < 0 || idx as usize >= borrowed.len() {
-                                return Err(LustError::RuntimeError {
-                                    message: format!(
-                                        "Array index {} out of bounds (length: {})",
-                                        idx,
-                                        borrowed.len()
-                                    ),
-                                });
-                            }
-
-                            borrowed[idx as usize] = value;
-                        }
-
-                        Value::Map(map) => {
-                            let key = self.make_hash_key(&index)?;
+                    if let Some(map_val) = Self::lua_table_map(&collection) {
+                        if let Value::Map(map) = map_val {
+                            let key = self.make_hash_key(&Self::lua_table_key_value(&index))?;
                             map.borrow_mut().insert(key, value);
-                        }
-
-                        _ => {
+                        } else {
                             return Err(LustError::RuntimeError {
                                 message: format!("Cannot index {:?}", collection.type_of()),
-                            })
+                            });
+                        }
+                    } else {
+                        match collection {
+                            Value::Array(arr) => {
+                                let idx = index.as_int().ok_or_else(|| LustError::RuntimeError {
+                                    message: "Array index must be an integer".to_string(),
+                                })?;
+                                let mut borrowed = arr.borrow_mut();
+                                if idx < 0 || idx as usize >= borrowed.len() {
+                                    return Err(LustError::RuntimeError {
+                                        message: format!(
+                                            "Array index {} out of bounds (length: {})",
+                                            idx,
+                                            borrowed.len()
+                                        ),
+                                    });
+                                }
+
+                                borrowed[idx as usize] = value;
+                            }
+
+                            Value::Map(map) => {
+                                let key = self.make_hash_key(&index)?;
+                                map.borrow_mut().insert(key, value);
+                            }
+
+                            _ => {
+                                return Err(LustError::RuntimeError {
+                                    message: format!("Cannot index {:?}", collection.type_of()),
+                                })
+                            }
                         }
                     }
                 }
@@ -1432,6 +1600,35 @@ impl VM {
         dest: Register,
         outcome: NativeCallResult,
     ) -> Result<()> {
+        #[cfg(feature = "std")]
+        if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() {
+            if let NativeCallResult::Return(value) = &outcome {
+                if let Value::Array(arr) = value {
+                    let borrowed = arr.borrow();
+                    let interesting = borrowed.len() > 1
+                        && matches!(
+                            borrowed.get(0),
+                            Some(Value::Enum { enum_name, variant, .. })
+                                if enum_name == "LuaValue" && variant == "Nil"
+                        );
+                    if interesting {
+                        let func_name = self
+                            .call_stack
+                            .last()
+                            .and_then(|frame| self.functions.get(frame.function_idx))
+                            .map(|f| f.name.as_str())
+                            .unwrap_or("<unknown>");
+                        eprintln!(
+                            "[lua-socket] native return in {} dest=R{} len={} value={}",
+                            func_name,
+                            dest,
+                            borrowed.len(),
+                            value
+                        );
+                    }
+                }
+            }
+        }
         match outcome {
             NativeCallResult::Return(value) => self.set_register(dest, value),
             NativeCallResult::Yield(value) => {
@@ -1471,8 +1668,100 @@ impl VM {
 
     #[inline(never)]
     pub fn call_value(&mut self, func: &Value, args: Vec<Value>) -> Result<Value> {
+        // Lua compatibility: honor __call metamethod on Lua tables/userdata.
+        // Lua semantics: if value has metatable.__call, calling it invokes that function with the
+        // receiver as the first argument.
+        let mut args = args;
+        let maybe_lua_call = {
+            let mut current = func;
+            let mut receiver_wrapped = func.clone();
+
+            if let Value::Struct { name, .. } = func {
+                if name == "LuaTable" {
+                    receiver_wrapped = Value::enum_variant("LuaValue", "Table", vec![func.clone()]);
+                } else if name == "LuaUserdata" {
+                    receiver_wrapped =
+                        Value::enum_variant("LuaValue", "Userdata", vec![func.clone()]);
+                }
+            }
+
+            if let Value::Enum {
+                enum_name,
+                variant,
+                values,
+            } = func
+            {
+                if enum_name == "LuaValue" && (variant == "Table" || variant == "Userdata") {
+                    if let Some(inner) = values.as_ref().and_then(|vals| vals.get(0)) {
+                        current = inner;
+                    }
+                }
+            }
+
+            if let Value::Struct { name, .. } = current {
+                if name == "LuaTable" || name == "LuaUserdata" {
+                    if let Some(Value::Map(meta_rc)) = current.struct_get_field("metamethods") {
+                        meta_rc
+                            .borrow()
+                            .get(&ValueKey::string("__call".to_string()))
+                            .cloned()
+                            .map(|callable| (callable, receiver_wrapped))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some((callable, receiver)) = maybe_lua_call {
+            // eprintln!("DEBUG: __call metamethod found, invoking with receiver");
+            let mut call_args = Vec::with_capacity(args.len() + 1);
+            call_args.push(receiver);
+            call_args.append(&mut args);
+            return self.call_value(&callable, call_args);
+        } else {
+            // if let Value::Struct { name, .. } = func {
+            //     if name == "LuaTable" || name == "LuaUserdata" {
+            //         eprintln!("DEBUG: Calling LuaTable/Userdata but no __call found in metamethods");
+            //     }
+            // }
+        }
+
         match func {
+            Value::Enum {
+                enum_name,
+                variant,
+                values,
+            } if enum_name == "LuaValue" && variant == "Function" => {
+                let handle = values
+                    .as_ref()
+                    .and_then(|vals| vals.get(0))
+                    .and_then(|v| v.struct_get_field("handle"))
+                    .and_then(|v| v.as_int())
+                    .map(|i| i as usize)
+                    .ok_or_else(|| LustError::RuntimeError {
+                        message: "LuaValue function missing handle".to_string(),
+                    })?;
+                let inner = crate::lua_compat::lookup_lust_function(handle).ok_or_else(|| {
+                    LustError::RuntimeError {
+                        message: format!(
+                            "LuaValue function handle {} was not registered with VM",
+                            handle
+                        ),
+                    }
+                })?;
+                return self.call_value(&inner, args);
+            }
             Value::Function(func_idx) => {
+                let saved_pending_return_value = self.pending_return_value.clone();
+                let saved_pending_return_dest = self.pending_return_dest;
+                let saved_pending_task_signal = self.pending_task_signal.clone();
+                let saved_last_task_signal = self.last_task_signal.clone();
+
                 let mut frame = CallFrame {
                     function_idx: *func_idx,
                     ip: 0,
@@ -1491,13 +1780,31 @@ impl VM {
                 self.call_until_depth = Some(stack_depth_before);
                 let run_result = self.run();
                 self.call_until_depth = previous_target;
-                run_result
+                match run_result {
+                    Ok(value) => Ok(value),
+                    Err(err) => {
+                        let annotated = self.annotate_runtime_error(err);
+                        while self.call_stack.len() > stack_depth_before {
+                            self.call_stack.pop();
+                        }
+                        self.pending_return_value = saved_pending_return_value;
+                        self.pending_return_dest = saved_pending_return_dest;
+                        self.pending_task_signal = saved_pending_task_signal;
+                        self.last_task_signal = saved_last_task_signal;
+                        Err(annotated)
+                    }
+                }
             }
 
             Value::Closure {
                 function_idx: func_idx,
                 upvalues,
             } => {
+                let saved_pending_return_value = self.pending_return_value.clone();
+                let saved_pending_return_dest = self.pending_return_dest;
+                let saved_pending_task_signal = self.pending_task_signal.clone();
+                let saved_last_task_signal = self.last_task_signal.clone();
+
                 let upvalue_values: Vec<Value> = upvalues.iter().map(|uv| uv.get()).collect();
                 let mut frame = CallFrame {
                     function_idx: *func_idx,
@@ -1517,7 +1824,20 @@ impl VM {
                 self.call_until_depth = Some(stack_depth_before);
                 let run_result = self.run();
                 self.call_until_depth = previous_target;
-                run_result
+                match run_result {
+                    Ok(value) => Ok(value),
+                    Err(err) => {
+                        let annotated = self.annotate_runtime_error(err);
+                        while self.call_stack.len() > stack_depth_before {
+                            self.call_stack.pop();
+                        }
+                        self.pending_return_value = saved_pending_return_value;
+                        self.pending_return_dest = saved_pending_return_dest;
+                        self.pending_task_signal = saved_pending_task_signal;
+                        self.last_task_signal = saved_last_task_signal;
+                        Err(annotated)
+                    }
+                }
             }
 
             Value::NativeFunction(native_fn) => {

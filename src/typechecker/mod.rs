@@ -464,6 +464,24 @@ impl TypeChecker {
         name.to_string()
     }
 
+    pub fn resolve_value_key(&self, name: &str) -> String {
+        if name.contains('.') || name.contains(':') {
+            return name.to_string();
+        }
+
+        if let Some(module) = &self.current_module {
+            if let Some(imports) = self.imports_by_module.get(module) {
+                if let Some(fq) = imports.function_aliases.get(name) {
+                    return fq.clone();
+                }
+            }
+
+            return format!("{}.{}", module, name);
+        }
+
+        name.to_string()
+    }
+
     pub fn resolve_module_alias(&self, alias: &str) -> Option<String> {
         if let Some(module) = &self.current_module {
             if let Some(imports) = self.imports_by_module.get(module) {
@@ -524,6 +542,12 @@ impl TypeChecker {
         signature.return_type = self.canonicalize_type(&signature.return_type);
         let canonical = self.resolve_type_key(&name);
         self.env.register_or_update_function(canonical, signature)
+    }
+
+    pub fn register_external_constant(&mut self, name: String, ty: Type) -> Result<()> {
+        let canonical_ty = self.canonicalize_type(&ty);
+        let canonical_name = self.resolve_value_key(&name);
+        self.env.register_constant(canonical_name, canonical_ty)
     }
 
     pub fn register_external_impl(&mut self, mut impl_block: ImplBlock) -> Result<()> {
@@ -703,6 +727,25 @@ impl TypeChecker {
                 )?;
             }
 
+            ItemKind::Extern { items, .. } => {
+                for ext in items {
+                    match ext {
+                        ExternItem::Struct(def) => {
+                            self.register_external_struct(def.clone())?;
+                        }
+                        ExternItem::Enum(def) => {
+                            self.register_external_enum(def.clone())?;
+                        }
+                        ExternItem::Const { name, ty } => {
+                            let key = self.resolve_value_key(name);
+                            self.env
+                                .register_constant(key, self.canonicalize_type(ty))?;
+                        }
+                        ExternItem::Function { .. } => {}
+                    }
+                }
+            }
+
             _ => {}
         }
 
@@ -793,6 +836,16 @@ impl TypeChecker {
         }
 
         if matches!(expected.kind, TypeKind::Infer) || matches!(actual.kind, TypeKind::Infer) {
+            return Ok(());
+        }
+
+        if self.is_lua_multi_return(expected) || self.is_lua_multi_return(actual) {
+            return Ok(());
+        }
+
+        if matches!(&expected.kind, TypeKind::Named(name) if name == "LuaValue")
+            || matches!(&actual.kind, TypeKind::Named(name) if name == "LuaValue")
+        {
             return Ok(());
         }
 
@@ -1104,6 +1157,14 @@ impl TypeChecker {
         }
 
         self.unify(expected, actual)
+    }
+
+    fn is_lua_multi_return(&self, ty: &Type) -> bool {
+        if let TypeKind::Array(inner) = &ty.kind {
+            return matches!(inner.kind, TypeKind::Unknown)
+                || matches!(&inner.kind, TypeKind::Named(name) if name == "LuaValue");
+        }
+        false
     }
 
     fn record_short_circuit_info(&mut self, span: Span, info: &ShortCircuitInfo) {

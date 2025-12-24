@@ -1,0 +1,163 @@
+-- Auto-transpiled from Lua module 'mime'
+local __lua_ret: Array<LuaValue> = []
+local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>
+    return items
+end
+local __lua_force_array = function(val: unknown): Array<LuaValue>
+    if val is Array<LuaValue> then
+        return val
+    end
+    return [lua.to_value(val)]
+end
+local __lua_table_from_varargs = function(items: Array<LuaValue>): LuaTable
+    local t = lua.table()
+    local idx: int = 0
+    while idx < items:len() do
+        local v = items:get(idx)
+        if v:is_some() then
+            t[idx + 1] = lua.unwrap(v:unwrap())
+        end
+        idx = idx + 1
+    end
+    return t
+end
+local __lua_truthy = function(val: unknown): bool
+    return lua.is_truthy(val)
+end
+local __lua_first = function(val: unknown): unknown
+    if val is Array<LuaValue> then
+        local first = val:get(0)
+        if first:is_some() then
+            return first:unwrap()
+        end
+        return lua.nil
+    end
+    if val is LuaValue then
+        return val
+    end
+    return val
+end
+local __lua_nth = function(val: unknown, idx: int): unknown
+    if val is Array<LuaValue> then
+        local item = val:get(idx)
+        if item:is_some() then
+            return item:unwrap()
+        end
+        return lua.nil
+    end
+    if idx == 0 then
+        if val is LuaValue then
+            return val
+        end
+        return val
+    end
+    return lua.nil
+end
+local __lua_join = function(prefix: Array<LuaValue>, tail: unknown): Array<LuaValue>
+    local arr = __lua_force_array(tail)
+    local idx: int = 0
+    while idx < arr:len() do
+        local v = arr:get(idx)
+        if v:is_some() then
+            prefix:push(v:unwrap())
+        end
+        idx = idx + 1
+    end
+    return prefix
+end
+local __lua_and = function(a: unknown, b: unknown): unknown
+    if __lua_truthy(a) then
+        return b
+    end
+    return a
+end
+local __lua_or = function(a: unknown, b: unknown): unknown
+    if __lua_truthy(a) then
+        return a
+    end
+    return b
+end
+local assert = function(cond: LuaValue, msg: LuaValue): LuaValue
+    if __lua_truthy(cond) then
+        return cond
+    end
+    error(msg or "assertion failed")
+end
+local _G: Map<unknown, unknown> = {}
+_G["assert"] = lua.to_value(assert)
+_G["error"] = lua.to_value(error)
+_G["ipairs"] = lua.to_value(ipairs)
+_G["pairs"] = lua.to_value(pairs)
+_G["setmetatable"] = lua.to_value(setmetatable)
+_G["select"] = lua.to_value(select)
+_G["unpack"] = lua.to_value(unpack)
+_G["tostring"] = lua.to_value(tostring)
+_G["tonumber"] = lua.to_value(tonumber)
+_G["type"] = lua.to_value(type)
+local type_ = type
+_G["string"] = lua.to_value(string)
+local module_ = _G["module"]
+local base = _G
+local ltn12 = __lua_first(lua.require("ltn12"))
+local mime = __lua_first(lua.require("mime.core"))
+local _M = mime
+local encodet, decodet, wrapt = lua.table(), lua.table(), lua.table()
+_M.encodet = encodet
+_M.decodet = decodet
+_M.wrapt = wrapt
+local choose = function(table: LuaValue): Array<LuaValue>
+    return __lua_pack([lua.to_value(function(name: LuaValue, opt1: LuaValue, opt2: LuaValue): Array<LuaValue>
+        if __lua_truthy(lua.op_ne(__lua_first(base["type"](name)), lua.to_value("string" ))) then
+            name, opt1, opt2 = lua.to_value("default"), name, opt1
+        end
+        local f = table[__lua_or(name, lua.to_value("nil"))]
+        if __lua_truthy(not __lua_truthy(f)) then
+            __lua_first(base.error(lua.op_concat(lua.to_value("unknown key (" ), lua.op_concat(__lua_first(base.tostring(name)), lua.to_value(")"))), lua.to_value(3)))
+        else
+            return __lua_force_array(f(opt1, opt2))
+        end
+    end)])
+end
+-- define the encoding filters
+encodet[lua.to_value('base64')] = function(): Array<LuaValue>
+    return __lua_force_array(ltn12.filter.cycle(_M.b64, lua.to_value("")))
+end
+encodet[lua.to_value('quoted-printable')] = function(mode: LuaValue): Array<LuaValue>
+    return __lua_force_array(ltn12.filter.cycle(_M.qp, lua.to_value(""), __lua_or(__lua_and(((lua.op_eq(mode, lua.to_value("binary")))), lua.to_value("=0D=0A" )), lua.to_value("\r\n"))))
+end
+-- define the decoding filters
+decodet[lua.to_value('base64')] = function(): Array<LuaValue>
+    return __lua_force_array(ltn12.filter.cycle(_M.unb64, lua.to_value("")))
+end
+decodet[lua.to_value('quoted-printable')] = function(): Array<LuaValue>
+    return __lua_force_array(ltn12.filter.cycle(_M.unqp, lua.to_value("")))
+end
+-- define the line-wrap filters
+wrapt[lua.to_value('text')] = function(length: LuaValue): Array<LuaValue>
+    length = __lua_or(length, lua.to_value(76
+))
+    return __lua_force_array(ltn12.filter.cycle(_M.wrp, length, length))
+end
+wrapt[lua.to_value('base64')] = wrapt[lua.to_value('text')]
+wrapt[lua.to_value('default')] = wrapt[lua.to_value('text')]
+wrapt[lua.to_value('quoted-printable')] = function(): Array<LuaValue>
+    return __lua_force_array(ltn12.filter.cycle(_M.qpwrp, lua.to_value(76), lua.to_value(76)))
+end
+-- function that choose the encoding, decoding or wrap algorithm
+_M.encode = __lua_first(choose(encodet))
+_M.decode = __lua_first(choose(decodet))
+_M.wrap = __lua_first(choose(wrapt))
+pub function normalize(marker: LuaValue): Array<LuaValue>
+    return __lua_force_array(ltn12.filter.cycle(_M.eol, lua.to_value(0), marker))
+end
+_M.normalize = normalize
+pub function stuff(): Array<LuaValue>
+    return __lua_force_array(ltn12.filter.cycle(_M.dot, lua.to_value(2)))
+end
+_M.stuff = stuff
+pub const decode: LuaValue = _M.decode
+pub const decodet: LuaValue = _M.decodet
+pub const encodet: LuaValue = _M.encodet
+pub const wrap: LuaValue = _M.wrap
+pub const wrapt: LuaValue = _M.wrapt
+return __lua_pack([lua.to_value(_M)])

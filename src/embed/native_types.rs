@@ -16,6 +16,7 @@ pub struct ExternRegistry {
     traits: Vec<TraitDef>,
     impls: Vec<ImplBlock>,
     functions: Vec<FunctionDef>,
+    constants: Vec<(String, Type)>,
 }
 
 impl ExternRegistry {
@@ -48,12 +49,18 @@ impl ExternRegistry {
         self
     }
 
+    pub fn add_const(&mut self, name: impl Into<String>, ty: Type) -> &mut Self {
+        self.constants.push((name.into(), ty));
+        self
+    }
+
     pub fn extend(&mut self, other: &ExternRegistry) {
         self.structs.extend(other.structs.iter().cloned());
         self.enums.extend(other.enums.iter().cloned());
         self.traits.extend(other.traits.iter().cloned());
         self.impls.extend(other.impls.iter().cloned());
         self.functions.extend(other.functions.iter().cloned());
+        self.constants.extend(other.constants.iter().cloned());
     }
 
     pub fn register_with_typechecker(&self, checker: &mut TypeChecker) -> Result<()> {
@@ -71,6 +78,9 @@ impl ExternRegistry {
         }
         for impl_block in &self.impls {
             checker.register_external_impl(impl_block.clone())?;
+        }
+        for (name, ty) in &self.constants {
+            checker.register_external_constant(name.clone(), ty.clone())?;
         }
         Ok(())
     }
@@ -97,6 +107,7 @@ impl ExternRegistry {
             && self.enums.is_empty()
             && self.traits.is_empty()
             && self.impls.is_empty()
+            && self.constants.is_empty()
         {
             return;
         }
@@ -140,6 +151,18 @@ impl ExternRegistry {
                 entry.trait_defs.push(format_trait_def(name, &canonical));
             }
         }
+        for (name, ty) in &self.constants {
+            let canonical_name = canonicalize_simple_name(name, prefix);
+            if let Some((module, short)) = module_and_name(&canonical_name) {
+                let entry = modules.entry(module.clone()).or_insert_with(|| ModuleStub {
+                    module,
+                    ..ModuleStub::default()
+                });
+                entry
+                    .const_defs
+                    .push(format_const_def(short, &canonicalize_type(ty, prefix)));
+            }
+        }
         for def in &self.impls {
             let canonical = canonicalize_impl(def, prefix);
             if let Some(module) = impl_module(&canonical) {
@@ -167,11 +190,15 @@ pub struct ModuleStub {
     pub struct_defs: Vec<String>,
     pub enum_defs: Vec<String>,
     pub trait_defs: Vec<String>,
+    pub const_defs: Vec<String>,
 }
 
 impl ModuleStub {
     pub fn is_empty(&self) -> bool {
-        self.struct_defs.is_empty() && self.enum_defs.is_empty() && self.trait_defs.is_empty()
+        self.struct_defs.is_empty()
+            && self.enum_defs.is_empty()
+            && self.trait_defs.is_empty()
+            && self.const_defs.is_empty()
     }
 }
 
@@ -641,6 +668,16 @@ fn format_trait_def(name: String, def: &TraitDef) -> String {
         out.push('\n');
     }
     out.push_str("end\n");
+    out
+}
+
+fn format_const_def(name: String, ty: &Type) -> String {
+    let mut out = String::new();
+    out.push_str("pub const ");
+    out.push_str(&name);
+    out.push_str(": ");
+    out.push_str(&format_type(ty));
+    out.push('\n');
     out
 }
 

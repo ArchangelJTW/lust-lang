@@ -1,7 +1,4 @@
 -- Auto-transpiled from Lua module 'mime'
-use ltn12 as ltn12
-use mime.core as mime_core
-use lua as lua
 local __lua_ret: Array<LuaValue> = []
 local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>
     return items
@@ -101,8 +98,8 @@ local type_ = type
 _G["string"] = lua.to_value(string)
 local module_ = _G["module"]
 local base = _G
-local ltn12 = __lua_first(ltn12)
-local mime = __lua_first(mime_core)
+local ltn12 = __lua_first(lua.require("ltn12"))
+local mime = __lua_first(lua.require("mime.core"))
 local _M = mime
 local encodet, decodet, wrapt = lua.table(), lua.table(), lua.table()
 _M.encodet = encodet

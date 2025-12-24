@@ -305,6 +305,25 @@ fn create_lua_module(vm: &VM) -> Value {
     let entries = [
         (string_key("nil"), Value::enum_unit("LuaValue", "Nil")),
         (
+            string_key("require"),
+            Value::NativeFunction(Rc::new(|args: &[Value]| {
+                if args.len() != 1 {
+                    return Err("lua.require(name) requires 1 argument".to_string());
+                }
+                let name = unwrap_lua_value(args[0].clone());
+                let Some(name) = name.as_string() else {
+                    return Err("lua.require(name) requires a string module name".to_string());
+                };
+                VM::with_current(|vm| {
+                    if let Some(value) = vm.get_global(name) {
+                        Ok(NativeCallResult::Return(value))
+                    } else {
+                        Ok(NativeCallResult::Return(Value::enum_unit("LuaValue", "Nil")))
+                    }
+                })
+            })),
+        ),
+        (
             string_key("table"),
             Value::NativeFunction(Rc::new(|_| {
                 VM::with_current(|vm| {

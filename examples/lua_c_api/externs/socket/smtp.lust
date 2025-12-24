@@ -1,13 +1,4 @@
 -- Auto-transpiled from Lua module 'socket.smtp'
-use coroutine as coroutine
-use string as string
-use os as os
-use socket as socket
-use socket.tp as socket_tp
-use ltn12 as ltn12
-use socket.headers as socket_headers
-use mime as mime
-use lua as lua
 local __lua_ret: Array<LuaValue> = []
 local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>
     return items
@@ -107,15 +98,15 @@ local type_ = type
 _G["string"] = lua.to_value(string)
 local module_ = _G["module"]
 local base = _G
-local coroutine = __lua_first(coroutine)
-local string = __lua_first(string)
+local coroutine = __lua_first(lua.require("coroutine"))
+local string = __lua_first(lua.require("string"))
 local math = __lua_first(lua.nil)
-local os = __lua_first(os)
-local socket = __lua_first(socket)
-local tp = __lua_first(socket_tp)
-local ltn12 = __lua_first(ltn12)
-local headers = __lua_first(socket_headers)
-local mime = __lua_first(mime)
+local os = __lua_first(lua.require("os"))
+local socket = __lua_first(lua.require("socket"))
+local tp = __lua_first(lua.require("socket.tp"))
+local ltn12 = __lua_first(lua.require("ltn12"))
+local headers = __lua_first(lua.require("socket.headers"))
+local mime = __lua_first(lua.require("mime"))
 socket.smtp = lua.table()
 local _M = socket.smtp
 -----------------------------------------------------------------------------

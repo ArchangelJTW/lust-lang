@@ -1,10 +1,4 @@
 -- Auto-transpiled from Lua module 'socket.ftp'
-use string as string
-use socket as socket
-use socket.url as socket_url
-use socket.tp as socket_tp
-use ltn12 as ltn12
-use lua as lua
 local __lua_ret: Array<LuaValue> = []
 local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>
     return items
@@ -105,12 +99,12 @@ _G["string"] = lua.to_value(string)
 local module_ = _G["module"]
 local base = _G
 local table = __lua_first(lua.nil)
-local string = __lua_first(string)
+local string = __lua_first(lua.require("string"))
 local math = __lua_first(lua.nil)
-local socket = __lua_first(socket)
-local url = __lua_first(socket_url)
-local tp = __lua_first(socket_tp)
-local ltn12 = __lua_first(ltn12)
+local socket = __lua_first(lua.require("socket"))
+local url = __lua_first(lua.require("socket.url"))
+local tp = __lua_first(lua.require("socket.tp"))
+local ltn12 = __lua_first(lua.require("ltn12"))
 socket.ftp = lua.table()
 local _M = socket.ftp
 -----------------------------------------------------------------------------

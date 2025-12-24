@@ -1,6 +1,4 @@
 -- Auto-transpiled from Lua module 'ltn12'
-use string as string
-use lua as lua
 local __lua_ret: Array<LuaValue> = []
 local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>
     return items
@@ -99,7 +97,7 @@ _G["type"] = lua.to_value(type)
 local type_ = type
 _G["string"] = lua.to_value(string)
 local module_ = _G["module"]
-local string = __lua_first(string)
+local string = __lua_first(lua.require("string"))
 local table = __lua_first(lua.nil)
 local unpack = __lua_or(unpack, unpack)
 local base = _G

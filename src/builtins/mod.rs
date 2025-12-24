@@ -1130,6 +1130,15 @@ fn build_lua_functions() -> Vec<BuiltinFunction> {
             param_names: &["value"],
         },
         BuiltinFunction {
+            name: "lua.require",
+            description: "Lua-style module resolver (loads from already-initialized globals when available)",
+            signature: BuiltinSignature {
+                params: vec![TypeExpr::Unknown],
+                return_type: TypeExpr::Unknown,
+            },
+            param_names: &["name"],
+        },
+        BuiltinFunction {
             name: "lua.table",
             description: "Create an empty Lua-style table",
             signature: BuiltinSignature {

@@ -1,12 +1,4 @@
 -- Auto-transpiled from Lua module 'socket.http'
-use socket as socket
-use socket.url as socket_url
-use ltn12 as ltn12
-use mime as mime
-use string as string
-use socket.headers as socket_headers
-use ssl.https as ssl_https
-use lua as lua
 local __lua_ret: Array<LuaValue> = []
 local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>
     return items
@@ -105,12 +97,12 @@ _G["type"] = lua.to_value(type)
 local type_ = type
 _G["string"] = lua.to_value(string)
 local module_ = _G["module"]
-local socket = __lua_first(socket)
-local url = __lua_first(socket_url)
-local ltn12 = __lua_first(ltn12)
-local mime = __lua_first(mime)
-local string = __lua_first(string)
-local headers = __lua_first(socket_headers)
+local socket = __lua_first(lua.require("socket"))
+local url = __lua_first(lua.require("socket.url"))
+local ltn12 = __lua_first(lua.require("ltn12"))
+local mime = __lua_first(lua.require("mime"))
+local string = __lua_first(lua.require("string"))
+local headers = __lua_first(lua.require("socket.headers"))
 local base = _G
 local table = __lua_first(lua.nil)
 socket.http = lua.table()
@@ -128,7 +120,7 @@ local SCHEMES = lua.table_from_entries([("http", lua.table_from_entries([("port"
     return __lua_pack([lua.to_value(socket.tcp)])
 end)])), ("https", lua.table_from_entries([("port", lua.to_value(443
 )), ("create", function(t: LuaValue): Array<LuaValue>
-    local https = __lua_first(assert(__lua_first(ssl_https), lua.to_value('LuaSocket: LuaSec not found')))
+    local https = __lua_first(assert(__lua_first(lua.require("ssl.https")), lua.to_value('LuaSocket: LuaSec not found')))
     local tcp = __lua_first(assert(https.tcp, lua.to_value('LuaSocket: Function tcp() not available from LuaSec')))
     return __lua_force_array(tcp(t))
 end)]))])

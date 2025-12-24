@@ -1,8 +1,4 @@
 -- Auto-transpiled from Lua module 'socket.tp'
-use string as string
-use socket as socket
-use ltn12 as ltn12
-use lua as lua
 local __lua_ret: Array<LuaValue> = []
 local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>
     return items
@@ -102,9 +98,9 @@ local type_ = type
 _G["string"] = lua.to_value(string)
 local module_ = _G["module"]
 local base = _G
-local string = __lua_first(string)
-local socket = __lua_first(socket)
-local ltn12 = __lua_first(ltn12)
+local string = __lua_first(lua.require("string"))
+local socket = __lua_first(lua.require("socket"))
+local ltn12 = __lua_first(lua.require("ltn12"))
 socket.tp = lua.table()
 local _M = socket.tp
 -----------------------------------------------------------------------------

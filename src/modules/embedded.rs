@@ -114,12 +114,265 @@ fn build_dependency_map(
 fn collect_dependencies(module: &LoadedModule, module_names: &HashSet<String>) -> Vec<String> {
     let mut deps = HashSet::new();
     for item in &module.items {
-        if let ItemKind::Use { public: _, tree } = &item.kind {
-            collect_deps_from_use(tree, module_names, &mut deps);
+        match &item.kind {
+            ItemKind::Use { public: _, tree } => {
+                collect_deps_from_use(tree, module_names, &mut deps);
+            }
+            ItemKind::Script(stmts) => {
+                for stmt in stmts {
+                    collect_deps_from_lua_require_stmt(stmt, &mut deps);
+                }
+            }
+            ItemKind::Function(func) => {
+                for stmt in &func.body {
+                    collect_deps_from_lua_require_stmt(stmt, &mut deps);
+                }
+            }
+            ItemKind::Const { value, .. } | ItemKind::Static { value, .. } => {
+                collect_deps_from_lua_require_expr(value, &mut deps);
+            }
+            ItemKind::Impl(impl_block) => {
+                for method in &impl_block.methods {
+                    for stmt in &method.body {
+                        collect_deps_from_lua_require_stmt(stmt, &mut deps);
+                    }
+                }
+            }
+            ItemKind::Trait(trait_def) => {
+                for method in &trait_def.methods {
+                    if let Some(default_impl) = &method.default_impl {
+                        for stmt in default_impl {
+                            collect_deps_from_lua_require_stmt(stmt, &mut deps);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
     deps.into_iter().collect()
+}
+
+fn collect_deps_from_lua_require_stmt(stmt: &crate::ast::Stmt, deps: &mut HashSet<String>) {
+    use crate::ast::StmtKind;
+    match &stmt.kind {
+        StmtKind::Local { initializer, .. } => {
+            if let Some(values) = initializer {
+                for expr in values {
+                    collect_deps_from_lua_require_expr(expr, deps);
+                }
+            }
+        }
+        StmtKind::Assign { targets, values } => {
+            for expr in targets {
+                collect_deps_from_lua_require_expr(expr, deps);
+            }
+            for expr in values {
+                collect_deps_from_lua_require_expr(expr, deps);
+            }
+        }
+        StmtKind::CompoundAssign { target, value, .. } => {
+            collect_deps_from_lua_require_expr(target, deps);
+            collect_deps_from_lua_require_expr(value, deps);
+        }
+        StmtKind::Expr(expr) => collect_deps_from_lua_require_expr(expr, deps),
+        StmtKind::If {
+            condition,
+            then_block,
+            elseif_branches,
+            else_block,
+        } => {
+            collect_deps_from_lua_require_expr(condition, deps);
+            for stmt in then_block {
+                collect_deps_from_lua_require_stmt(stmt, deps);
+            }
+            for (cond, block) in elseif_branches {
+                collect_deps_from_lua_require_expr(cond, deps);
+                for stmt in block {
+                    collect_deps_from_lua_require_stmt(stmt, deps);
+                }
+            }
+            if let Some(block) = else_block {
+                for stmt in block {
+                    collect_deps_from_lua_require_stmt(stmt, deps);
+                }
+            }
+        }
+        StmtKind::While { condition, body } => {
+            collect_deps_from_lua_require_expr(condition, deps);
+            for stmt in body {
+                collect_deps_from_lua_require_stmt(stmt, deps);
+            }
+        }
+        StmtKind::ForNumeric {
+            start, end, step, body, ..
+        } => {
+            collect_deps_from_lua_require_expr(start, deps);
+            collect_deps_from_lua_require_expr(end, deps);
+            if let Some(step) = step {
+                collect_deps_from_lua_require_expr(step, deps);
+            }
+            for stmt in body {
+                collect_deps_from_lua_require_stmt(stmt, deps);
+            }
+        }
+        StmtKind::ForIn { iterator, body, .. } => {
+            collect_deps_from_lua_require_expr(iterator, deps);
+            for stmt in body {
+                collect_deps_from_lua_require_stmt(stmt, deps);
+            }
+        }
+        StmtKind::Return(values) => {
+            for expr in values {
+                collect_deps_from_lua_require_expr(expr, deps);
+            }
+        }
+        StmtKind::Block(stmts) => {
+            for stmt in stmts {
+                collect_deps_from_lua_require_stmt(stmt, deps);
+            }
+        }
+        StmtKind::Break | StmtKind::Continue => {}
+    }
+}
+
+fn collect_deps_from_lua_require_expr(expr: &crate::ast::Expr, deps: &mut HashSet<String>) {
+    use crate::ast::{ExprKind, Literal};
+    match &expr.kind {
+        ExprKind::Call { callee, args } => {
+            if is_lua_require_callee(callee) {
+                if let Some(name) = args.get(0).and_then(extract_lua_require_name) {
+                    if !is_lua_builtin_module_name(&name) {
+                        deps.insert(name);
+                    }
+                }
+            }
+            collect_deps_from_lua_require_expr(callee, deps);
+            for arg in args {
+                collect_deps_from_lua_require_expr(arg, deps);
+            }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            collect_deps_from_lua_require_expr(receiver, deps);
+            for arg in args {
+                collect_deps_from_lua_require_expr(arg, deps);
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_deps_from_lua_require_expr(left, deps);
+            collect_deps_from_lua_require_expr(right, deps);
+        }
+        ExprKind::Unary { operand, .. } => collect_deps_from_lua_require_expr(operand, deps),
+        ExprKind::FieldAccess { object, .. } => collect_deps_from_lua_require_expr(object, deps),
+        ExprKind::Index { object, index } => {
+            collect_deps_from_lua_require_expr(object, deps);
+            collect_deps_from_lua_require_expr(index, deps);
+        }
+        ExprKind::Array(elements) | ExprKind::Tuple(elements) => {
+            for element in elements {
+                collect_deps_from_lua_require_expr(element, deps);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for (k, v) in entries {
+                collect_deps_from_lua_require_expr(k, deps);
+                collect_deps_from_lua_require_expr(v, deps);
+            }
+        }
+        ExprKind::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_deps_from_lua_require_expr(&field.value, deps);
+            }
+        }
+        ExprKind::EnumConstructor { args, .. } => {
+            for arg in args {
+                collect_deps_from_lua_require_expr(arg, deps);
+            }
+        }
+        ExprKind::Lambda { body, .. } => collect_deps_from_lua_require_expr(body, deps),
+        ExprKind::Paren(inner) => collect_deps_from_lua_require_expr(inner, deps),
+        ExprKind::Cast { expr, .. } => collect_deps_from_lua_require_expr(expr, deps),
+        ExprKind::TypeCheck { expr, .. } => collect_deps_from_lua_require_expr(expr, deps),
+        ExprKind::IsPattern { expr, .. } => collect_deps_from_lua_require_expr(expr, deps),
+        ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_deps_from_lua_require_expr(condition, deps);
+            collect_deps_from_lua_require_expr(then_branch, deps);
+            if let Some(other) = else_branch {
+                collect_deps_from_lua_require_expr(other, deps);
+            }
+        }
+        ExprKind::Block(stmts) => {
+            for stmt in stmts {
+                collect_deps_from_lua_require_stmt(stmt, deps);
+            }
+        }
+        ExprKind::Return(values) => {
+            for value in values {
+                collect_deps_from_lua_require_expr(value, deps);
+            }
+        }
+        ExprKind::Range { start, end, .. } => {
+            collect_deps_from_lua_require_expr(start, deps);
+            collect_deps_from_lua_require_expr(end, deps);
+        }
+        ExprKind::Literal(Literal::String(_))
+        | ExprKind::Literal(_)
+        | ExprKind::Identifier(_) => {}
+    }
+}
+
+fn is_lua_builtin_module_name(name: &str) -> bool {
+    matches!(
+        name,
+        "math"
+            | "table"
+            | "string"
+            | "io"
+            | "os"
+            | "package"
+            | "coroutine"
+            | "debug"
+            | "utf8"
+    )
+}
+
+fn is_lua_require_callee(callee: &crate::ast::Expr) -> bool {
+    use crate::ast::ExprKind;
+    match &callee.kind {
+        ExprKind::Identifier(name) => name == "require",
+        ExprKind::FieldAccess { object, field } => {
+            field == "require" && matches!(&object.kind, ExprKind::Identifier(name) if name == "lua")
+        }
+        _ => false,
+    }
+}
+
+fn extract_lua_require_name(expr: &crate::ast::Expr) -> Option<String> {
+    use crate::ast::{ExprKind, Literal};
+    match &expr.kind {
+        ExprKind::Literal(Literal::String(s)) => Some(s.clone()),
+        ExprKind::Call { callee, args } if is_lua_to_value_callee(callee) => args
+            .get(0)
+            .and_then(|arg| match &arg.kind {
+                ExprKind::Literal(Literal::String(s)) => Some(s.clone()),
+                _ => None,
+            }),
+        _ => None,
+    }
+}
+
+fn is_lua_to_value_callee(callee: &crate::ast::Expr) -> bool {
+    use crate::ast::ExprKind;
+    matches!(
+        &callee.kind,
+        ExprKind::FieldAccess { object, field }
+            if field == "to_value" && matches!(&object.kind, ExprKind::Identifier(name) if name == "lua")
+    )
 }
 
 fn collect_deps_from_use(

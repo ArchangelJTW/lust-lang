@@ -93,8 +93,8 @@ fn expr_segments(expr: &Expression) -> Option<Vec<String>> {
 }
 
 /// Transpile a Lua 5.1 module into Lust source code.
-/// This attempts to mirror the Lua module as closely as possible while mapping `require`
-/// to static `use` imports and exporting members discovered in a trailing `return { ... }`.
+/// This attempts to mirror the Lua module as closely as possible while mapping Lua `require`
+/// to `lua.require(...)` calls and exporting members discovered in a trailing `return { ... }`.
 pub fn transpile_lua_stub(source: &str, module_name: &str) -> Result<String, String> {
     let ast = parse(source).map_err(|e| format!("failed to parse Lua: {e}"))?;
     let block = ast.nodes();
@@ -108,12 +108,9 @@ pub fn transpile_lua_stub(source: &str, module_name: &str) -> Result<String, Str
 #[derive(Default)]
 struct Analyzer {
     module_name: String,
-    requires: Vec<(String, String)>, // (module_path, alias) - top-level requires to hoist
-    runtime_requires: BTreeSet<String>, // Modules that need runtime loading (in functions)
     exports: Vec<String>,
     module_decl: Option<ModuleDecl>,
     module_tables: Vec<String>,
-    function_depth: usize, // Track if we're inside a function
 }
 
 #[derive(Debug, Clone)]
@@ -269,15 +266,11 @@ impl Analyzer {
                 }
                 Value::Var(var) => {
                     if let full_moon::ast::Var::Expression(var_expr) = var {
-                        let head = match var_expr.prefix() {
-                            Prefix::Name(tok) => Some(tok.to_string()),
-                            _ => None,
-                        };
-                        let call = var_expr.suffixes().find_map(|s| match s {
-                            Suffix::Call(c) => Some(c),
-                            _ => None,
-                        });
-                        self.analyze_call(head.as_deref(), call);
+                        for suffix in var_expr.suffixes() {
+                            if let Suffix::Index(Index::Brackets { expression, .. }) = suffix {
+                                self.analyze_expr(expression);
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -340,52 +333,12 @@ impl Analyzer {
             Prefix::Name(tok) => Some(tok.to_string()),
             _ => None,
         };
-        self.analyze_call(
-            head.as_deref(),
-            call.suffixes().find_map(|s| match s {
-                Suffix::Call(c) => Some(c),
-                _ => None,
-            }),
-        );
+        let _ = head;
         for suffix in call.suffixes() {
             if let Suffix::Call(full_moon::ast::Call::AnonymousCall(args)) = suffix {
                 if let FunctionArgs::Parentheses { arguments, .. } = args {
                     for expr in arguments.iter() {
                         self.analyze_expr(expr);
-                    }
-                }
-            }
-        }
-    }
-
-    fn analyze_call(&mut self, head: Option<&str>, call: Option<&full_moon::ast::Call>) {
-        if head != Some("require") {
-            return;
-        }
-        if let Some(full_moon::ast::Call::AnonymousCall(FunctionArgs::Parentheses {
-            arguments,
-            ..
-        })) = call
-        {
-            if let Some(Expression::Value { value, .. }) = arguments.iter().next() {
-                if let Value::String(token) = &**value {
-                    let module_path = token
-                        .to_string()
-                        .trim_matches(|c| c == '"' || c == '\'')
-                        .to_string();
-                    if module_path == "math" || module_path == "table" {
-                        return;
-                    }
-
-                    // If we're inside a function, this is a runtime require
-                    if self.function_depth > 0 {
-                        self.runtime_requires.insert(module_path);
-                    } else {
-                        // Top-level require - hoist to use statement
-                        let alias = module_path.replace('.', "_");
-                        if !self.requires.iter().any(|(m, _)| m == &module_path) {
-                            self.requires.push((module_path, alias));
-                        }
                     }
                 }
             }
@@ -559,15 +512,8 @@ impl Emitter {
                 module = self.module
             ),
         );
-        for (module, alias) in self.analyzer.requires.iter().rev() {
-            self.lines.insert(
-                1,
-                format!("use {module} as {alias}", module = module, alias = alias),
-            );
-        }
-        let insert_at = 1 + self.analyzer.requires.len();
+        let insert_at = 1;
         let prelude = vec![
-            "use lua as lua".to_string(),
             "local __lua_ret: Array<LuaValue> = []".to_string(),
             "local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>".to_string(),
             "    return items".to_string(),
@@ -1196,11 +1142,6 @@ impl Emitter {
                     inner.indent = self.indent + 1;
                     inner.emit_block(body.block());
                     let body_src = inner.lines.join("\n");
-                    for (module, alias) in inner.analyzer.requires {
-                        if !self.analyzer.requires.iter().any(|(m, _)| m == &module) {
-                            self.analyzer.requires.push((module, alias));
-                        }
-                    }
                     let indent = "    ".repeat(self.indent);
                     format!("function({params}): Array<LuaValue>\n{body_src}\n{indent}end")
                 }
@@ -1321,7 +1262,8 @@ impl Emitter {
             full_moon::ast::Call::AnonymousCall(args) => {
                 if head == "require" {
                     if let FunctionArgs::Parentheses { arguments, .. } = args {
-                        if let Some(Expression::Value { value, .. }) = arguments.iter().next() {
+                        let first = arguments.iter().next();
+                        if let Some(Expression::Value { value, .. }) = first {
                             if let Value::String(tok) = &**value {
                                 let module = tok
                                     .to_string()
@@ -1330,25 +1272,14 @@ impl Emitter {
                                 if module == "math" || module == "table" {
                                     return "lua.nil".to_string();
                                 }
-                                let alias = self
-                                    .analyzer
-                                    .requires
-                                    .iter()
-                                    .find(|(m, _)| m == &module)
-                                    .map(|(_, a)| a.clone())
-                                    .unwrap_or_else(|| module.replace('.', "_"));
-                                if !self
-                                    .analyzer
-                                    .requires
-                                    .iter()
-                                    .any(|(m, _)| m == &module)
-                                {
-                                    self.analyzer.requires.push((module.clone(), alias.clone()));
-                                }
-                                return alias;
+                                return format!("lua.require({})", tok.to_string());
                             }
                         }
+                        if let Some(expr) = first {
+                            return format!("lua.require({})", self.emit_expr_mode(expr, wrap_calls));
+                        }
                     }
+                    return "lua.nil".to_string();
                 }
                 if let Some(rewritten) = self.rewrite_compat_call(&head, args, wrap_calls) {
                     return rewritten;

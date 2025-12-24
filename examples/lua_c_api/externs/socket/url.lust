@@ -1,7 +1,4 @@
 -- Auto-transpiled from Lua module 'socket.url'
-use string as string
-use socket as socket
-use lua as lua
 local __lua_ret: Array<LuaValue> = []
 local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>
     return items
@@ -100,10 +97,10 @@ _G["type"] = lua.to_value(type)
 local type_ = type
 _G["string"] = lua.to_value(string)
 local module_ = _G["module"]
-local string = __lua_first(string)
+local string = __lua_first(lua.require("string"))
 local base = _G
 local table = __lua_first(lua.nil)
-local socket = __lua_first(socket)
+local socket = __lua_first(lua.require("socket"))
 socket.url = lua.table()
 local _M = socket.url
 -----------------------------------------------------------------------------

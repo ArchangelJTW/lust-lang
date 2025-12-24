@@ -1,7 +1,4 @@
 -- Auto-transpiled from Lua module 'socket'
-use string as string
-use socket.core as socket_core
-use lua as lua
 local __lua_ret: Array<LuaValue> = []
 local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>
     return items
@@ -101,9 +98,9 @@ local type_ = type
 _G["string"] = lua.to_value(string)
 local module_ = _G["module"]
 local base = _G
-local string = __lua_first(string)
+local string = __lua_first(lua.require("string"))
 local math = __lua_first(lua.nil)
-local socket = __lua_first(socket_core)
+local socket = __lua_first(lua.require("socket.core"))
 local _M = socket
 pub function connect4(address: LuaValue, port: LuaValue, laddress: LuaValue, lport: LuaValue): Array<LuaValue>
     return __lua_force_array(socket.connect(address, port, laddress, lport, lua.to_value("inet")))

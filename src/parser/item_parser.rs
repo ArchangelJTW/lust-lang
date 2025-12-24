@@ -208,43 +208,77 @@ impl Parser {
                     TokenKind::End
                 };
                 while !self.check(terminator) && !self.is_at_end() {
-                    self.consume(TokenKind::Function, "Expected 'function' in extern block")?;
-                    let mut name = self.expect_identifier()?;
-                    loop {
-                        if self.check(TokenKind::Colon) {
+                    match self.peek_kind() {
+                        TokenKind::Function => {
                             self.advance();
-                            let part = self.expect_identifier()?;
-                            name.push(':');
-                            name.push_str(&part);
-                        } else if self.check(TokenKind::Dot) {
-                            self.advance();
-                            let part = self.expect_identifier()?;
-                            name.push('.');
-                            name.push_str(&part);
-                        } else {
-                            break;
-                        }
-                    }
-                    self.consume(TokenKind::LeftParen, "Expected '(' after function name")?;
-                    let mut params = Vec::new();
-                    if !self.check(TokenKind::RightParen) {
-                        params.push(self.parse_type()?);
-                        while self.match_token(&[TokenKind::Comma]) {
-                            params.push(self.parse_type()?);
-                        }
-                    }
+                            let mut name = self.expect_identifier()?;
+                            loop {
+                                if self.check(TokenKind::Colon) {
+                                    self.advance();
+                                    let part = self.expect_identifier()?;
+                                    name.push(':');
+                                    name.push_str(&part);
+                                } else if self.check(TokenKind::Dot) {
+                                    self.advance();
+                                    let part = self.expect_identifier()?;
+                                    name.push('.');
+                                    name.push_str(&part);
+                                } else {
+                                    break;
+                                }
+                            }
+                            self.consume(TokenKind::LeftParen, "Expected '(' after function name")?;
+                            let mut params = Vec::new();
+                            if !self.check(TokenKind::RightParen) {
+                                params.push(self.parse_type()?);
+                                while self.match_token(&[TokenKind::Comma]) {
+                                    params.push(self.parse_type()?);
+                                }
+                            }
 
-                    self.consume(TokenKind::RightParen, "Expected ')' after parameters")?;
-                    let return_type = if self.match_token(&[TokenKind::Colon]) {
-                        Some(self.parse_type()?)
-                    } else {
-                        None
-                    };
-                    items.push(ExternItem::Function {
-                        name,
-                        params,
-                        return_type,
-                    });
+                            self.consume(TokenKind::RightParen, "Expected ')' after parameters")?;
+                            let return_type = if self.match_token(&[TokenKind::Colon]) {
+                                Some(self.parse_type()?)
+                            } else {
+                                None
+                            };
+                            items.push(ExternItem::Function {
+                                name,
+                                params,
+                                return_type,
+                            });
+                        }
+
+                        TokenKind::Const => {
+                            self.advance();
+                            let mut name = self.expect_identifier()?;
+                            while self.check(TokenKind::Dot) {
+                                self.advance();
+                                let part = self.expect_identifier()?;
+                                name.push('.');
+                                name.push_str(&part);
+                            }
+                            self.consume(TokenKind::Colon, "Expected ':' after const name")?;
+                            let ty = self.parse_type()?;
+                            items.push(ExternItem::Const { name, ty });
+                        }
+
+                        TokenKind::Struct => {
+                            let struct_def = self.parse_struct(Visibility::Public)?;
+                            items.push(ExternItem::Struct(struct_def));
+                        }
+
+                        TokenKind::Enum => {
+                            let enum_def = self.parse_enum(Visibility::Public)?;
+                            items.push(ExternItem::Enum(enum_def));
+                        }
+
+                        _ => {
+                            return Err(self.error(
+                                "Expected 'function', 'const', 'struct', or 'enum' in extern block",
+                            ));
+                        }
+                    }
                 }
 
                 if uses_braces {

@@ -14,15 +14,26 @@ impl Compiler {
     }
 
     pub(super) fn next_local_slot(&mut self) -> Register {
-        let reg = (self.max_local_register_index() + 1).max(0) as u8;
-        if self.next_register <= reg {
-            self.next_register = reg + 1;
+        let base = (self.max_local_register_index() + 1).max(0) as u8;
+        if self.next_register < base {
+            self.next_register = base;
         }
-
+        let reg = self.next_register;
+        self.next_register = self.next_register.saturating_add(1);
         if reg > self.max_register {
             self.max_register = reg;
         }
-
+        if reg == 255 {
+            eprintln!("Register overflow diagnostics:");
+            eprintln!("  Current function has {} scopes", self.scopes.len());
+            eprintln!("  Max local register index: {}", self.max_local_register_index());
+            eprintln!("  Next register: {}", self.next_register);
+            eprintln!("  Max register: {}", self.max_register);
+            for (i, scope) in self.scopes.iter().enumerate() {
+                eprintln!("  Scope {}: {} locals", i, scope.locals.len());
+            }
+            panic!("Register overflow (max 255 registers per function)");
+        }
         reg
     }
 
@@ -74,6 +85,21 @@ impl Compiler {
         }
 
         if reg == 255 {
+            eprintln!("Register overflow diagnostics (allocate_register):");
+            eprintln!("  Current function index: {}", self.current_function);
+            eprintln!("  Function name: {}", self.functions.get(self.current_function)
+                .map(|f| f.name.clone())
+                .unwrap_or_else(|| "<anonymous>".to_string()));
+            eprintln!("  Current function has {} scopes", self.scopes.len());
+            eprintln!("  Max local register index: {}", self.max_local_register_index());
+            eprintln!("  Next register: {}", self.next_register);
+            eprintln!("  Max register: {}", self.max_register);
+            for (i, scope) in self.scopes.iter().enumerate() {
+                eprintln!("  Scope {}: {} locals", i, scope.locals.len());
+                for (name, &(reg, _)) in &scope.locals {
+                    eprintln!("    {} -> R{}", name, reg);
+                }
+            }
             panic!("Register overflow (max 255 registers per function)");
         }
 

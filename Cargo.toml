@@ -24,6 +24,7 @@ categories = [
 ]
 description = "A WIP Lua-like scripting language implemented in Rust, designed for embedding and rapid scripting with a strong type system, with trace-based JIT."
 homepage = "https://lust-lang.dev/"
+build = "build.rs"
 
 [lib]
 name = "lust"
@@ -40,7 +41,8 @@ std = [
 ]
 libloading = ["std", "dep:libloading"]
 dirs = ["std", "dep:dirs"]
-packages = ["std", "libloading", "dirs", "dep:serde_json", "dep:object"]
+packages = ["std", "libloading", "dirs", "dep:serde_json", "dep:object", "dep:full_moon"]
+lualua = ["std", "dep:full_moon"]
 
 [[bin]]
 name = "lust"
@@ -63,8 +65,11 @@ hashbrown = { version = "0.16.0", default-features = false, features = [
 ] }
 libm = { version = "0.2.8", default-features = false }
 lust-macros = { path = "crates/lust-macros", version = "0.1.0", optional = true }
+regex = "1.11.1"
+rand = "0.8.5"
 serde_json = { version = "1.0.128", optional = true, features = ["std"] }
 object = { version = "0.36.4", default-features = false, features = ["std", "read_core", "read"], optional = true }
+full_moon = { version = "0.18.1", optional = true }
 
 [build-dependencies]
 dynasm = "4.0.1"

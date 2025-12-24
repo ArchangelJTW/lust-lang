@@ -1,0 +1,480 @@
+-- Auto-transpiled from Lua module 'ltn12'
+local __lua_ret: Array<LuaValue> = []
+local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>
+    return items
+end
+local __lua_force_array = function(val: unknown): Array<LuaValue>
+    if val is Array<LuaValue> then
+        return val
+    end
+    return [lua.to_value(val)]
+end
+local __lua_table_from_varargs = function(items: Array<LuaValue>): LuaTable
+    local t = lua.table()
+    local idx: int = 0
+    while idx < items:len() do
+        local v = items:get(idx)
+        if v:is_some() then
+            t[idx + 1] = lua.unwrap(v:unwrap())
+        end
+        idx = idx + 1
+    end
+    return t
+end
+local __lua_truthy = function(val: unknown): bool
+    return lua.is_truthy(val)
+end
+local __lua_first = function(val: unknown): unknown
+    if val is Array<LuaValue> then
+        local first = val:get(0)
+        if first:is_some() then
+            return first:unwrap()
+        end
+        return lua.nil
+    end
+    if val is LuaValue then
+        return val
+    end
+    return val
+end
+local __lua_nth = function(val: unknown, idx: int): unknown
+    if val is Array<LuaValue> then
+        local item = val:get(idx)
+        if item:is_some() then
+            return item:unwrap()
+        end
+        return lua.nil
+    end
+    if idx == 0 then
+        if val is LuaValue then
+            return val
+        end
+        return val
+    end
+    return lua.nil
+end
+local __lua_join = function(prefix: Array<LuaValue>, tail: unknown): Array<LuaValue>
+    local arr = __lua_force_array(tail)
+    local idx: int = 0
+    while idx < arr:len() do
+        local v = arr:get(idx)
+        if v:is_some() then
+            prefix:push(v:unwrap())
+        end
+        idx = idx + 1
+    end
+    return prefix
+end
+local __lua_and = function(a: unknown, b: unknown): unknown
+    if __lua_truthy(a) then
+        return b
+    end
+    return a
+end
+local __lua_or = function(a: unknown, b: unknown): unknown
+    if __lua_truthy(a) then
+        return a
+    end
+    return b
+end
+local assert = function(cond: LuaValue, msg: LuaValue): LuaValue
+    if __lua_truthy(cond) then
+        return cond
+    end
+    error(msg or "assertion failed")
+end
+local _G: Map<unknown, unknown> = {}
+_G["assert"] = lua.to_value(assert)
+_G["error"] = lua.to_value(error)
+_G["ipairs"] = lua.to_value(ipairs)
+_G["pairs"] = lua.to_value(pairs)
+_G["setmetatable"] = lua.to_value(setmetatable)
+_G["select"] = lua.to_value(select)
+_G["unpack"] = lua.to_value(unpack)
+_G["tostring"] = lua.to_value(tostring)
+_G["tonumber"] = lua.to_value(tonumber)
+_G["type"] = lua.to_value(type)
+local type_ = type
+_G["string"] = lua.to_value(string)
+local module_ = _G["module"]
+local string = __lua_first(lua.require("string"))
+local table = __lua_first(lua.nil)
+local unpack = __lua_or(unpack, unpack)
+local base = _G
+local select = select
+local _M = lua.table()
+if __lua_truthy(module_) then
+    ltn12 = _M  -- luacheck: ignore
+end
+local filter, source, sink, pump = lua.table(), lua.table(), lua.table(), lua.table()
+_M.filter = filter
+_M.source = source
+_M.sink = sink
+_M.pump = pump
+-- 2048 seems to be better in windows...
+_M.BLOCKSIZE = lua.to_value(2048
+)
+_M._VERSION = lua.to_value("LTN12 1.0.3"
+)
+pub function filter_cycle(low: LuaValue, ctx: LuaValue, extra: LuaValue): Array<LuaValue>
+    __lua_first(base.assert(low))
+    return __lua_pack([lua.to_value(function(chunk: LuaValue): Array<LuaValue>
+        local ret
+        __lua_ret = low(ctx, chunk, extra)
+        ret = __lua_nth(__lua_ret, 0)
+        ctx = __lua_nth(__lua_ret, 1)
+        return __lua_pack([lua.to_value(ret)])
+    end)])
+end
+filter.cycle = filter_cycle
+pub function filter_chain(__varargs: Array<LuaValue>): Array<LuaValue>
+    local arg = __lua_table_from_varargs(__varargs)
+    local n = __lua_first(select(lua.to_value('#'), __varargs))
+    local top, index = lua.to_value(1), lua.to_value(1
+)
+    local retry = lua.to_value(""
+)
+    return __lua_pack([lua.to_value(function(chunk: LuaValue): Array<LuaValue>
+        retry = __lua_and(chunk, retry)
+        while __lua_truthy(lua.to_value(true)) do
+            if __lua_truthy(lua.op_eq(index, top)) then
+                chunk = __lua_first(arg[index](chunk))
+                if __lua_truthy(__lua_or(lua.op_eq(chunk, lua.to_value("" )), lua.op_eq(top, n))) then
+                    return __lua_pack([lua.to_value(chunk)])
+                elseif __lua_truthy(chunk) then
+                    index = lua.op_add(index, lua.to_value(1
+))
+                else
+                    top = lua.op_add(top, lua.to_value(1
+))
+                    index = top
+                end
+            else
+                chunk = __lua_first(arg[index](__lua_or(chunk, lua.to_value(""))))
+                if __lua_truthy(lua.op_eq(chunk, lua.to_value("" ))) then
+                    index = lua.op_sub(index, lua.to_value(1
+))
+                    chunk = retry
+                elseif __lua_truthy(chunk) then
+                    if __lua_truthy(lua.op_eq(index, n)) then
+                        return __lua_pack([lua.to_value(chunk)])
+                    else
+                        index = lua.op_add(index, lua.to_value(1 ))
+                    end
+                else
+                    __lua_first(base.error(lua.to_value("filter returned inappropriate nil")))
+                end
+            end
+        end
+    end)])
+end
+filter.chain = filter_chain
+local empty = function(): Array<LuaValue>
+    return __lua_pack([lua.to_value(lua.nil)])
+end
+pub function source_empty(): Array<LuaValue>
+    return __lua_pack([lua.to_value(empty)])
+end
+source.empty = source_empty
+pub function source_error(err: LuaValue): Array<LuaValue>
+    return __lua_pack([lua.to_value(function(): Array<LuaValue>
+        local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+        return __lua_join(__lua_ret, [lua.to_value(err)])
+    end)])
+end
+source.error = source_error
+pub function source_file(handle: LuaValue, io_err: LuaValue): Array<LuaValue>
+    if __lua_truthy(handle) then
+        return __lua_pack([lua.to_value(function(): Array<LuaValue>
+            local chunk = __lua_first(__lua_first(lua.call_method(handle, "read", _M.BLOCKSIZE)))
+            if __lua_truthy(not __lua_truthy(chunk)) then
+                __lua_first(__lua_first(lua.call_method(handle, "close")))
+            end
+            return __lua_pack([lua.to_value(chunk)])
+        end)])
+    else
+        return __lua_force_array(source.error(__lua_or(io_err, lua.to_value("unable to open file"))))
+    end
+end
+source.file = source_file
+pub function source_simplify(src: LuaValue): Array<LuaValue>
+    __lua_first(base.assert(src))
+    return __lua_pack([lua.to_value(function(): Array<LuaValue>
+        local chunk, err_or_new
+        local __lua_ret = src()
+        chunk = __lua_nth(__lua_ret, 0)
+        err_or_new = __lua_nth(__lua_ret, 1)
+        src = __lua_or(err_or_new, src)
+        if __lua_truthy(not __lua_truthy(chunk)) then
+            local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+            return __lua_join(__lua_ret, [lua.to_value(err_or_new)])
+        else
+            return __lua_pack([lua.to_value(chunk)])
+        end
+    end)])
+end
+source.simplify = source_simplify
+pub function source_string(s: LuaValue): Array<LuaValue>
+    if __lua_truthy(s) then
+        local i = lua.to_value(1
+)
+        return __lua_pack([lua.to_value(function(): Array<LuaValue>
+            local chunk = __lua_first(string.sub(s, i, lua.op_sub(lua.op_add(i, _M.BLOCKSIZE), lua.to_value(1))))
+            i = lua.op_add(i, _M.BLOCKSIZE)
+            if __lua_truthy(lua.op_ne(chunk, lua.to_value("" ))) then
+                return __lua_pack([lua.to_value(chunk)])
+            else
+                return __lua_pack([lua.to_value(lua.nil)])
+            end
+        end)])
+    else
+        return __lua_force_array(source.empty())
+    end
+end
+source.string = source_string
+pub function source_table(t: LuaValue): Array<LuaValue>
+    __lua_first(base.assert(lua.op_eq(lua.to_value('table' ), __lua_first(type_(t)))))
+    local i = lua.to_value(0
+)
+    return __lua_pack([lua.to_value(function(): Array<LuaValue>
+        i = lua.op_add(i, lua.to_value(1
+))
+        return __lua_pack([lua.to_value(t[i])])
+    end)])
+end
+source.table = source_table
+pub function source_rewind(src: LuaValue): Array<LuaValue>
+    __lua_first(base.assert(src))
+    local t = lua.table()
+    return __lua_pack([lua.to_value(function(chunk: LuaValue): Array<LuaValue>
+        if __lua_truthy(not __lua_truthy(chunk)) then
+            chunk = __lua_first(t:remove(lua.nil))
+            if __lua_truthy(not __lua_truthy(chunk)) then
+                return __lua_force_array(src())
+            else
+                return __lua_pack([lua.to_value(chunk)])
+            end
+        else
+            __lua_first(t:push(chunk))
+        end
+    end)])
+end
+source.rewind = source_rewind
+pub function source_chain(src: LuaValue, f: LuaValue, __varargs: Array<LuaValue>): Array<LuaValue>
+    if __lua_truthy(__lua_first(__varargs)) then
+        f = __lua_first(filter.chain(f, __varargs))
+    end
+    __lua_first(base.assert(__lua_and(src, f)))
+    local last_in, last_out = lua.to_value(""), lua.to_value(""
+)
+    local state = lua.to_value("feeding"
+)
+    local err
+    return __lua_pack([lua.to_value(function(): Array<LuaValue>
+        if __lua_truthy(not __lua_truthy(last_out)) then
+            __lua_first(base.error(lua.to_value('source is empty!'), lua.to_value(2)))
+        end
+        while __lua_truthy(lua.to_value(true)) do
+            if __lua_truthy(lua.op_eq(state, lua.to_value("feeding" ))) then
+                __lua_ret = src()
+                last_in = __lua_nth(__lua_ret, 0)
+                err = __lua_nth(__lua_ret, 1)
+                if __lua_truthy(err) then
+                    local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+                    return __lua_join(__lua_ret, [lua.to_value(err)])
+                end
+                last_out = __lua_first(f(last_in))
+                if __lua_truthy(not __lua_truthy(last_out)) then
+                    if __lua_truthy(last_in) then
+                        __lua_first(base.error(lua.to_value('filter returned inappropriate nil')))
+                    else
+                        return __lua_pack([lua.to_value(lua.nil)])
+                    end
+                elseif __lua_truthy(lua.op_ne(last_out, lua.to_value("" ))) then
+                    state = lua.to_value("eating"
+)
+                    if __lua_truthy(last_in) then
+                        last_in = lua.to_value("" )
+                    end
+                    return __lua_pack([lua.to_value(last_out)])
+                end
+            else
+                last_out = __lua_first(f(last_in))
+                if __lua_truthy(lua.op_eq(last_out, lua.to_value("" ))) then
+                    if __lua_truthy(lua.op_eq(last_in, lua.to_value("" ))) then
+                        state = lua.to_value("feeding"
+)
+                    else
+                        __lua_first(base.error(lua.to_value('filter returned ""')))
+                    end
+                elseif __lua_truthy(not __lua_truthy(last_out)) then
+                    if __lua_truthy(last_in) then
+                        __lua_first(base.error(lua.to_value('filter returned inappropriate nil')))
+                    else
+                        return __lua_pack([lua.to_value(lua.nil)])
+                    end
+                else
+                    return __lua_pack([lua.to_value(last_out)])
+                end
+            end
+        end
+    end)])
+end
+source.chain = source_chain
+pub function source_cat(__varargs: Array<LuaValue>): Array<LuaValue>
+    local arg = __lua_table_from_varargs(__varargs)
+    local src = __lua_first(arg:remove(lua.to_value(1)))
+    return __lua_pack([lua.to_value(function(): Array<LuaValue>
+        while __lua_truthy(src) do
+            local chunk, err
+            local __lua_ret = src()
+            chunk = __lua_nth(__lua_ret, 0)
+            err = __lua_nth(__lua_ret, 1)
+            if __lua_truthy(chunk) then
+                return __lua_pack([lua.to_value(chunk)])
+            end
+            if __lua_truthy(err) then
+                local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+                return __lua_join(__lua_ret, [lua.to_value(err)])
+            end
+            src = __lua_first(arg:remove(lua.to_value(1)))
+        end
+    end)])
+end
+source.cat = source_cat
+pub function sink_table(t: LuaValue): Array<LuaValue>
+    t = __lua_or(t, lua.table())
+    local f = function(chunk: LuaValue, err: LuaValue): Array<LuaValue>
+        if __lua_truthy(chunk) then
+            __lua_first(t:push(chunk))
+        end
+        return __lua_pack([lua.to_value(lua.to_value(1
+))])
+    end
+    local __lua_ret: Array<LuaValue> = [lua.to_value(f)]
+    return __lua_join(__lua_ret, [lua.to_value(t)])
+end
+sink.table = sink_table
+pub function sink_simplify(snk: LuaValue): Array<LuaValue>
+    __lua_first(base.assert(snk))
+    return __lua_pack([lua.to_value(function(chunk: LuaValue, err: LuaValue): Array<LuaValue>
+        local ret, err_or_new
+        local __lua_ret = snk(chunk, err)
+        ret = __lua_nth(__lua_ret, 0)
+        err_or_new = __lua_nth(__lua_ret, 1)
+        if __lua_truthy(not __lua_truthy(ret)) then
+            local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+            return __lua_join(__lua_ret, [lua.to_value(err_or_new)])
+        end
+        snk = __lua_or(err_or_new, snk)
+        return __lua_pack([lua.to_value(lua.to_value(1
+))])
+    end)])
+end
+sink.simplify = sink_simplify
+pub function sink_file(handle: LuaValue, io_err: LuaValue): Array<LuaValue>
+    if __lua_truthy(handle) then
+        return __lua_pack([lua.to_value(function(chunk: LuaValue, err: LuaValue): Array<LuaValue>
+            if __lua_truthy(not __lua_truthy(chunk)) then
+                __lua_first(__lua_first(lua.call_method(handle, "close")))
+                return __lua_pack([lua.to_value(lua.to_value(1
+))])
+            else
+                return __lua_force_array(__lua_first(lua.call_method(handle, "write", chunk)))
+            end
+        end)])
+    else
+        return __lua_force_array(sink.error(__lua_or(io_err, lua.to_value("unable to open file"))))
+    end
+end
+sink.file = sink_file
+local null = function(): Array<LuaValue>
+    return __lua_pack([lua.to_value(lua.to_value(1
+))])
+end
+pub function sink_null(): Array<LuaValue>
+    return __lua_pack([lua.to_value(null)])
+end
+sink.null = sink_null
+pub function sink_error(err: LuaValue): Array<LuaValue>
+    return __lua_pack([lua.to_value(function(): Array<LuaValue>
+        local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+        return __lua_join(__lua_ret, [lua.to_value(err)])
+    end)])
+end
+sink.error = sink_error
+pub function sink_chain(f: LuaValue, snk: LuaValue, __varargs: Array<LuaValue>): Array<LuaValue>
+    if __lua_truthy(__lua_first(__varargs)) then
+        local args = lua.table_from_entries([(1, f), (2, snk), (3, __lua_first(__varargs))])
+        snk = __lua_first(args:remove((args):len()))
+        f = __lua_first(filter.chain(unpack(args)))
+    end
+    __lua_first(base.assert(__lua_and(f, snk)))
+    return __lua_pack([lua.to_value(function(chunk: LuaValue, err: LuaValue): Array<LuaValue>
+        if __lua_truthy(lua.op_ne(chunk, lua.to_value("" ))) then
+            local filtered = __lua_first(f(chunk))
+            local done = __lua_and(chunk, lua.to_value(""
+))
+            while __lua_truthy(lua.to_value(true)) do
+                local ret, snkerr
+                local __lua_ret = snk(filtered, err)
+                ret = __lua_nth(__lua_ret, 0)
+                snkerr = __lua_nth(__lua_ret, 1)
+                if __lua_truthy(not __lua_truthy(ret)) then
+                    local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+                    return __lua_join(__lua_ret, [lua.to_value(snkerr)])
+                end
+                if __lua_truthy(lua.op_eq(filtered, done)) then
+                    return __lua_pack([lua.to_value(lua.to_value(1 ))])
+                end
+                filtered = __lua_first(f(done))
+            end
+        else
+            return __lua_pack([lua.to_value(lua.to_value(1 ))])
+        end
+    end)])
+end
+sink.chain = sink_chain
+pub function pump_step(src: LuaValue, snk: LuaValue): Array<LuaValue>
+    local chunk, src_err
+    local __lua_ret = src()
+    chunk = __lua_nth(__lua_ret, 0)
+    src_err = __lua_nth(__lua_ret, 1)
+    local ret, snk_err
+    local __lua_ret = snk(chunk, src_err)
+    ret = __lua_nth(__lua_ret, 0)
+    snk_err = __lua_nth(__lua_ret, 1)
+    if __lua_truthy(__lua_and(chunk, ret)) then
+        return __lua_pack([lua.to_value(lua.to_value(1
+))])
+    else
+        local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+        return __lua_join(__lua_ret, [lua.to_value(__lua_or(src_err, snk_err))])
+    end
+end
+pump.step = pump_step
+pub function pump_all(src: LuaValue, snk: LuaValue, step: LuaValue): Array<LuaValue>
+    __lua_first(base.assert(__lua_and(src, snk)))
+    step = __lua_or(step, pump.step)
+    while __lua_truthy(lua.to_value(true)) do
+        local ret, err
+        local __lua_ret = step(src, snk)
+        ret = __lua_nth(__lua_ret, 0)
+        err = __lua_nth(__lua_ret, 1)
+        if __lua_truthy(not __lua_truthy(ret)) then
+            if __lua_truthy(err) then
+                local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+                return __lua_join(__lua_ret, [lua.to_value(err)])
+            else
+                return __lua_pack([lua.to_value(lua.to_value(1 ))])
+            end
+        end
+    end
+end
+pump.all = pump_all
+pub const _VERSION: LuaValue = _M._VERSION
+pub const filter: LuaValue = _M.filter
+pub const pump: LuaValue = _M.pump
+pub const sink: LuaValue = _M.sink
+pub const source: LuaValue = _M.source
+return __lua_pack([lua.to_value(_M)])

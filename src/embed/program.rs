@@ -909,11 +909,17 @@ fn compile_in_memory(
     compiler.set_function_signatures(signatures.clone());
     let functions = compiler.compile_module(&wrapped_items)?;
     let trait_impls = compiler.get_trait_impls().to_vec();
-    let mut init_funcs = Vec::new();
+    let mut init_funcs: Vec<(String, String)> = Vec::new();
     for module in &program.modules {
         if module.path != program.entry_module {
             if let Some(init) = &module.init_function {
-                init_funcs.push(init.clone());
+                let init_name = module
+                    .imports
+                    .function_aliases
+                    .get(init)
+                    .cloned()
+                    .unwrap_or_else(|| init.clone());
+                init_funcs.push((module.path.clone(), init_name));
             }
         }
     }
@@ -941,8 +947,9 @@ fn compile_in_memory(
         vm.register_trait_impl(type_name, trait_name);
     }
 
-    for init in init_funcs {
-        vm.call(&init, Vec::new())?;
+    for (module_path, init) in init_funcs {
+        let value = vm.call(&init, Vec::new())?;
+        vm.set_global(module_path, value);
     }
 
     Ok(EmbeddedProgram {

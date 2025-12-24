@@ -1,5 +1,7 @@
 use super::*;
+use crate::bytecode::{LustMap, ValueKey};
 use crate::vm::task::TaskKind;
+use crate::LustInt;
 use alloc::{format, string::ToString};
 use core::{array, cell::RefCell, mem};
 impl VM {
@@ -370,6 +372,75 @@ impl VM {
         method_name: &str,
         args: Vec<Value>,
     ) -> Result<Value> {
+        #[cfg(feature = "std")]
+        if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() && method_name == "settimeout" {
+            match object {
+                Value::Enum {
+                    enum_name,
+                    variant,
+                    ..
+                } => {
+                    eprintln!(
+                        "[lua-socket] CallMethod enum={} variant={} method={}",
+                        enum_name, variant, method_name
+                    );
+                }
+                other => {
+                    eprintln!(
+                        "[lua-socket] CallMethod type={:?} method={}",
+                        other.type_of(),
+                        method_name
+                    );
+                }
+            }
+        }
+
+        if let Value::Enum {
+            enum_name,
+            variant,
+            ..
+        } = object
+        {
+            if enum_name == "LuaValue" && variant == "Userdata" {
+                if let Some(result) = self.try_call_lua_dynamic_method(object, method_name, &args)?
+                {
+                    return Ok(result);
+                }
+                #[cfg(feature = "std")]
+                if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() {
+                    let indexer = self.lua_index_metamethod(object);
+                    eprintln!(
+                        "[lua-socket] userdata missing method '{}' indexer={:?} userdata={:?}",
+                        method_name,
+                        indexer.as_ref().map(|v| v.type_of()),
+                        object
+                    );
+                }
+            }
+        }
+
+        if let Value::Struct { name, .. } = object {
+            if name == "LuaTable" {
+                if let Some(result) = self.try_call_lua_dynamic_method(object, method_name, &args)?
+                {
+                    return Ok(result);
+                }
+            }
+        }
+
+        if let Value::Enum {
+            enum_name,
+            variant,
+            values,
+        } = object
+        {
+            if enum_name == "LuaValue" && variant == "Table" {
+                if let Some(inner) = values.as_ref().and_then(|vals| vals.get(0)) {
+                    return self.call_builtin_method(inner, method_name, args);
+                }
+            }
+        }
+
         if let Value::Struct {
             name: struct_name, ..
         } = object
@@ -404,6 +475,159 @@ impl VM {
         }
 
         match object {
+            Value::Struct { name, .. } if name == "LuaTable" => {
+                let Some(map_rc) = lua_table_map_rc(object) else {
+                    return Err(LustError::RuntimeError {
+                        message: "LuaTable is missing 'table' map field".to_string(),
+                    });
+                };
+                match method_name {
+                    "len" => {
+                        if !args.is_empty() {
+                            return Err(LustError::RuntimeError {
+                                message: "len() takes no arguments".to_string(),
+                            });
+                        }
+                        let seq = lua_table_read_sequence(&map_rc.borrow());
+                        Ok(Value::Int(seq.len() as LustInt))
+                    }
+                    "push" => {
+                        if args.len() != 1 {
+                            return Err(LustError::RuntimeError {
+                                message: "push() requires 1 argument (value)".to_string(),
+                            });
+                        }
+                        let value = super::corelib::unwrap_lua_value(args[0].clone());
+                        let mut map = map_rc.borrow_mut();
+                        let len = lua_table_sequence_len(&map);
+                        let key = ValueKey::from_value(&Value::Int((len as LustInt) + 1));
+                        map.insert(key, value);
+                        Ok(Value::Nil)
+                    }
+                    "insert" => {
+                        if args.len() != 2 {
+                            return Err(LustError::RuntimeError {
+                                message: "insert() requires 2 arguments (pos, value)".to_string(),
+                            });
+                        }
+                        let pos_raw = super::corelib::unwrap_lua_value(args[0].clone());
+                        let pos = pos_raw.as_int().unwrap_or(0).max(1) as usize;
+                        let value = super::corelib::unwrap_lua_value(args[1].clone());
+                        let mut seq = lua_table_read_sequence(&map_rc.borrow());
+                        let idx = pos.saturating_sub(1);
+                        if idx > seq.len() {
+                            seq.push(value);
+                        } else {
+                            seq.insert(idx, value);
+                        }
+                        lua_table_write_sequence(&map_rc, &seq);
+                        Ok(Value::Nil)
+                    }
+                    "remove" => {
+                        if args.len() != 1 {
+                            return Err(LustError::RuntimeError {
+                                message: "remove() requires 1 argument (pos)".to_string(),
+                            });
+                        }
+                        let pos_raw = super::corelib::unwrap_lua_value(args[0].clone());
+                        let mut seq = lua_table_read_sequence(&map_rc.borrow());
+                        if seq.is_empty() {
+                            return Ok(Value::Nil);
+                        }
+                        let pos = pos_raw.as_int().unwrap_or(seq.len() as LustInt);
+                        let idx =
+                            ((pos - 1).max(0) as usize).min(seq.len().saturating_sub(1));
+                        let removed = seq.remove(idx);
+                        lua_table_write_sequence(&map_rc, &seq);
+                        Ok(removed)
+                    }
+                    "concat" => {
+                        if args.len() != 3 {
+                            return Err(LustError::RuntimeError {
+                                message: "concat() requires 3 arguments (sep, i, j)".to_string(),
+                            });
+                        }
+                        let sep_raw = super::corelib::unwrap_lua_value(args[0].clone());
+                        let sep = sep_raw.as_string().unwrap_or_default();
+                        let seq = lua_table_read_sequence(&map_rc.borrow());
+                        let start = super::corelib::unwrap_lua_value(args[1].clone())
+                            .as_int()
+                            .unwrap_or(1);
+                        let end = super::corelib::unwrap_lua_value(args[2].clone())
+                            .as_int()
+                            .unwrap_or(seq.len() as LustInt);
+                        let start_idx = (start - 1).max(0) as usize;
+                        let end_idx = end.max(0) as usize;
+                        let mut pieces: Vec<String> = Vec::new();
+                        for (i, val) in seq.iter().enumerate() {
+                            if i < start_idx || i >= end_idx {
+                                continue;
+                            }
+                            let raw = super::corelib::unwrap_lua_value(val.clone());
+                            pieces.push(format!("{}", raw));
+                        }
+                        Ok(Value::string(pieces.join(&sep)))
+                    }
+                    "unpack" => {
+                        if args.len() != 2 {
+                            return Err(LustError::RuntimeError {
+                                message: "unpack() requires 2 arguments (i, j)".to_string(),
+                            });
+                        }
+                        let unpack = super::stdlib::create_table_unpack_fn();
+                        let Value::NativeFunction(func) = unpack else {
+                            return Err(LustError::RuntimeError {
+                                message: "unpack() builtin is not a native function".to_string(),
+                            });
+                        };
+                        let call_args = vec![object.clone(), args[0].clone(), args[1].clone()];
+                        match func(&call_args).map_err(|e| LustError::RuntimeError { message: e })? {
+                            NativeCallResult::Return(value) => Ok(value),
+                            NativeCallResult::Yield(_) => Err(LustError::RuntimeError {
+                                message: "unpack() unexpectedly yielded".to_string(),
+                            }),
+                            NativeCallResult::Stop(_) => Err(LustError::RuntimeError {
+                                message: "unpack() unexpectedly stopped execution".to_string(),
+                            }),
+                        }
+                    }
+                    "sort" => {
+                        if args.len() != 1 {
+                            return Err(LustError::RuntimeError {
+                                message: "sort() requires 1 argument (comp)".to_string(),
+                            });
+                        }
+                        let mut seq = lua_table_read_sequence(&map_rc.borrow());
+                        seq.sort_by(|a, b| {
+                            let la = format!("{}", super::corelib::unwrap_lua_value(a.clone()));
+                            let lb = format!("{}", super::corelib::unwrap_lua_value(b.clone()));
+                            la.cmp(&lb)
+                        });
+                        lua_table_write_sequence(&map_rc, &seq);
+                        Ok(Value::Nil)
+                    }
+                    "maxn" => {
+                        if !args.is_empty() {
+                            return Err(LustError::RuntimeError {
+                                message: "maxn() takes no arguments".to_string(),
+                            });
+                        }
+                        let map = map_rc.borrow();
+                        let mut max_idx: LustInt = 0;
+                        for key in map.keys() {
+                            if let Value::Int(i) = key.to_value() {
+                                if i > max_idx && i > 0 {
+                                    max_idx = i;
+                                }
+                            }
+                        }
+                        Ok(Value::Int(max_idx))
+                    }
+                    _ => Err(LustError::RuntimeError {
+                        message: format!("LuaTable has no method '{}'", method_name),
+                    }),
+                }
+            }
             Value::Enum {
                 enum_name,
                 variant,
@@ -988,6 +1212,36 @@ impl VM {
                     Ok(Value::Float(float_abs(*f)))
                 }
 
+                "min" => {
+                    if args.len() != 1 {
+                        return Err(LustError::RuntimeError {
+                            message: "min() requires 1 argument (other)".to_string(),
+                        });
+                    }
+                    let other = args[0]
+                        .as_float()
+                        .or_else(|| args[0].as_int().map(float_from_int))
+                        .ok_or_else(|| LustError::RuntimeError {
+                            message: "min() other must be a number".to_string(),
+                        })?;
+                    Ok(Value::Float(f.min(other)))
+                }
+
+                "max" => {
+                    if args.len() != 1 {
+                        return Err(LustError::RuntimeError {
+                            message: "max() requires 1 argument (other)".to_string(),
+                        });
+                    }
+                    let other = args[0]
+                        .as_float()
+                        .or_else(|| args[0].as_int().map(float_from_int))
+                        .ok_or_else(|| LustError::RuntimeError {
+                            message: "max() other must be a number".to_string(),
+                        })?;
+                    Ok(Value::Float(f.max(other)))
+                }
+
                 "clamp" => {
                     if args.len() != 2 {
                         return Err(LustError::RuntimeError {
@@ -1035,6 +1289,40 @@ impl VM {
                     Ok(Value::Int(i.abs()))
                 }
 
+                "min" => {
+                    if args.len() != 1 {
+                        return Err(LustError::RuntimeError {
+                            message: "min() requires 1 argument (other)".to_string(),
+                        });
+                    }
+                    if let Some(other) = args[0].as_int() {
+                        return Ok(Value::Int((*i).min(other)));
+                    }
+                    if let Some(other) = args[0].as_float() {
+                        return Ok(Value::Float(float_from_int(*i).min(other)));
+                    }
+                    Err(LustError::RuntimeError {
+                        message: "min() other must be a number".to_string(),
+                    })
+                }
+
+                "max" => {
+                    if args.len() != 1 {
+                        return Err(LustError::RuntimeError {
+                            message: "max() requires 1 argument (other)".to_string(),
+                        });
+                    }
+                    if let Some(other) = args[0].as_int() {
+                        return Ok(Value::Int((*i).max(other)));
+                    }
+                    if let Some(other) = args[0].as_float() {
+                        return Ok(Value::Float(float_from_int(*i).max(other)));
+                    }
+                    Err(LustError::RuntimeError {
+                        message: "max() other must be a number".to_string(),
+                    })
+                }
+
                 "clamp" => {
                     if args.len() != 2 {
                         return Err(LustError::RuntimeError {
@@ -1069,5 +1357,182 @@ impl VM {
                 ),
             }),
         }
+    }
+
+    fn try_call_lua_dynamic_method(
+        &mut self,
+        receiver: &Value,
+        method_name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>> {
+        let key = Value::string(method_name.to_string());
+        let method = self.lua_resolve_index(receiver, &key, 8)?;
+        if matches!(method, Value::Nil) {
+            return Ok(None);
+        }
+
+        let mut call_args = Vec::with_capacity(1 + args.len());
+        call_args.push(receiver.clone());
+        call_args.extend_from_slice(args);
+        let result = self.call_value(&method, call_args)?;
+        Ok(Some(result))
+    }
+
+    fn lua_resolve_index(&mut self, receiver: &Value, key: &Value, depth: usize) -> Result<Value> {
+        if depth == 0 {
+            return Ok(Value::Nil);
+        }
+
+        if let Some(direct) = self.lua_direct_index(receiver, key) {
+            if !matches!(direct, Value::Nil) {
+                return Ok(direct);
+            }
+        }
+
+        let Some(indexer) = self.lua_index_metamethod(receiver) else {
+            return Ok(Value::Nil);
+        };
+        if matches!(indexer, Value::Nil) {
+            return Ok(Value::Nil);
+        }
+
+        let is_callable = matches!(
+            indexer,
+            Value::Function(_) | Value::Closure { .. } | Value::NativeFunction(_)
+        ) || matches!(
+            &indexer,
+            Value::Enum {
+                enum_name,
+                variant,
+                ..
+            } if enum_name == "LuaValue" && variant == "Function"
+        );
+
+        if is_callable {
+            self.call_value(&indexer, vec![receiver.clone(), key.clone()])
+        } else {
+            self.lua_resolve_index(&indexer, key, depth - 1)
+        }
+    }
+
+    fn lua_direct_index(&self, receiver: &Value, key: &Value) -> Option<Value> {
+        if let Value::Enum {
+            enum_name,
+            variant,
+            values,
+        } = receiver
+        {
+            if enum_name == "LuaValue" && variant == "Table" {
+                if let Some(inner) = values.as_ref().and_then(|vals| vals.get(0)) {
+                    return self.lua_direct_index(inner, key);
+                }
+            }
+        }
+
+        match receiver {
+            Value::Struct { name, .. } if name == "LuaTable" => {
+                let Some(Value::Map(map_rc)) = receiver.struct_get_field("table") else {
+                    return None;
+                };
+                let raw_key = super::corelib::unwrap_lua_value(key.clone());
+                let lookup_key = ValueKey::from_value(&raw_key);
+                let value = map_rc.borrow().get(&lookup_key).cloned();
+                value
+            }
+            Value::Map(map_rc) => {
+                let raw_key = super::corelib::unwrap_lua_value(key.clone());
+                let lookup_key = ValueKey::from_value(&raw_key);
+                let value = map_rc.borrow().get(&lookup_key).cloned();
+                value
+            }
+            _ => None,
+        }
+    }
+
+    fn lua_index_metamethod(&self, receiver: &Value) -> Option<Value> {
+        if let Value::Enum {
+            enum_name,
+            variant,
+            values,
+        } = receiver
+        {
+            if enum_name == "LuaValue" && variant == "Table" {
+                if let Some(inner) = values.as_ref().and_then(|vals| vals.get(0)) {
+                    return self.lua_index_metamethod(inner);
+                }
+            }
+            if enum_name == "LuaValue" && variant == "Userdata" {
+                if let Some(inner) = values.as_ref().and_then(|vals| vals.get(0)) {
+                    return self.lua_index_metamethod(inner);
+                }
+            }
+        }
+
+        let Value::Struct { name, .. } = receiver else {
+            return None;
+        };
+        let Some(Value::Map(meta_rc)) = receiver.struct_get_field("metamethods") else {
+            return None;
+        };
+        if name != "LuaTable" && name != "LuaUserdata" {
+            return None;
+        }
+        let value = meta_rc
+            .borrow()
+            .get(&ValueKey::string("__index".to_string()))
+            .cloned();
+        value
+    }
+}
+
+fn lua_table_map_rc(table: &Value) -> Option<Rc<RefCell<LustMap>>> {
+    match table.struct_get_field("table") {
+        Some(Value::Map(map_rc)) => Some(map_rc),
+        _ => None,
+    }
+}
+
+fn lua_table_sequence_len(map: &LustMap) -> usize {
+    let mut idx: LustInt = 1;
+    loop {
+        let key = ValueKey::from_value(&Value::Int(idx));
+        if map.contains_key(&key) {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    (idx - 1) as usize
+}
+
+fn lua_table_read_sequence(map: &LustMap) -> Vec<Value> {
+    let mut seq: Vec<Value> = Vec::new();
+    let mut idx: LustInt = 1;
+    loop {
+        let key = ValueKey::from_value(&Value::Int(idx));
+        if let Some(val) = map.get(&key) {
+            seq.push(val.clone());
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    seq
+}
+
+fn lua_table_write_sequence(map_rc: &Rc<RefCell<LustMap>>, seq: &[Value]) {
+    let mut map = map_rc.borrow_mut();
+    let mut idx: LustInt = 1;
+    loop {
+        let key = ValueKey::from_value(&Value::Int(idx));
+        if map.remove(&key).is_some() {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    for (i, val) in seq.iter().enumerate() {
+        let key = ValueKey::from_value(&Value::Int((i as LustInt) + 1));
+        map.insert(key, val.clone());
     }
 }

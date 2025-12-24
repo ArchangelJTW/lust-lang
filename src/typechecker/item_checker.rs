@@ -113,23 +113,8 @@ impl TypeChecker {
                         let expr_type = self.check_expr(expr)?;
                         self.unify(&return_type, &expr_type)?;
                     }
-
-                    _ => {
-                        if return_type.kind != TypeKind::Unit {
-                            return Err(self.type_error(format!(
-                                "Function '{}' is declared to return '{}', but body implicitly returns unit",
-                                func.name, return_type
-                            )));
-                        }
-                    }
+                    _ => {}
                 }
-            }
-        } else {
-            if return_type.kind != TypeKind::Unit {
-                return Err(self.type_error(format!(
-                    "Function '{}' is declared to return '{}', but has empty body",
-                    func.name, return_type
-                )));
             }
         }
 
@@ -332,6 +317,14 @@ impl TypeChecker {
                             }
                         }
                     }
+                }
+
+                ExternItem::Const { name, ty } => {
+                    self.register_external_constant(name.clone(), ty.clone())?;
+                }
+
+                ExternItem::Struct(_) | ExternItem::Enum(_) => {
+                    // Type definitions are registered earlier during collection.
                 }
             }
         }

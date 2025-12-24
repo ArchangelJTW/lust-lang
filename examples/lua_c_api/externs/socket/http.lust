@@ -1,0 +1,571 @@
+-- Auto-transpiled from Lua module 'socket.http'
+local __lua_ret: Array<LuaValue> = []
+local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>
+    return items
+end
+local __lua_force_array = function(val: unknown): Array<LuaValue>
+    if val is Array<LuaValue> then
+        return val
+    end
+    return [lua.to_value(val)]
+end
+local __lua_table_from_varargs = function(items: Array<LuaValue>): LuaTable
+    local t = lua.table()
+    local idx: int = 0
+    while idx < items:len() do
+        local v = items:get(idx)
+        if v:is_some() then
+            t[idx + 1] = lua.unwrap(v:unwrap())
+        end
+        idx = idx + 1
+    end
+    return t
+end
+local __lua_truthy = function(val: unknown): bool
+    return lua.is_truthy(val)
+end
+local __lua_first = function(val: unknown): unknown
+    if val is Array<LuaValue> then
+        local first = val:get(0)
+        if first:is_some() then
+            return first:unwrap()
+        end
+        return lua.nil
+    end
+    if val is LuaValue then
+        return val
+    end
+    return val
+end
+local __lua_nth = function(val: unknown, idx: int): unknown
+    if val is Array<LuaValue> then
+        local item = val:get(idx)
+        if item:is_some() then
+            return item:unwrap()
+        end
+        return lua.nil
+    end
+    if idx == 0 then
+        if val is LuaValue then
+            return val
+        end
+        return val
+    end
+    return lua.nil
+end
+local __lua_join = function(prefix: Array<LuaValue>, tail: unknown): Array<LuaValue>
+    local arr = __lua_force_array(tail)
+    local idx: int = 0
+    while idx < arr:len() do
+        local v = arr:get(idx)
+        if v:is_some() then
+            prefix:push(v:unwrap())
+        end
+        idx = idx + 1
+    end
+    return prefix
+end
+local __lua_and = function(a: unknown, b: unknown): unknown
+    if __lua_truthy(a) then
+        return b
+    end
+    return a
+end
+local __lua_or = function(a: unknown, b: unknown): unknown
+    if __lua_truthy(a) then
+        return a
+    end
+    return b
+end
+local assert = function(cond: LuaValue, msg: LuaValue): LuaValue
+    if __lua_truthy(cond) then
+        return cond
+    end
+    error(msg or "assertion failed")
+end
+local _G: Map<unknown, unknown> = {}
+_G["assert"] = lua.to_value(assert)
+_G["error"] = lua.to_value(error)
+_G["ipairs"] = lua.to_value(ipairs)
+_G["pairs"] = lua.to_value(pairs)
+_G["setmetatable"] = lua.to_value(setmetatable)
+_G["select"] = lua.to_value(select)
+_G["unpack"] = lua.to_value(unpack)
+_G["tostring"] = lua.to_value(tostring)
+_G["tonumber"] = lua.to_value(tonumber)
+_G["type"] = lua.to_value(type)
+local type_ = type
+_G["string"] = lua.to_value(string)
+local module_ = _G["module"]
+local socket = __lua_first(lua.require("socket"))
+local url = __lua_first(lua.require("socket.url"))
+local ltn12 = __lua_first(lua.require("ltn12"))
+local mime = __lua_first(lua.require("mime"))
+local string = __lua_first(lua.require("string"))
+local headers = __lua_first(lua.require("socket.headers"))
+local base = _G
+local table = __lua_first(lua.nil)
+socket.http = lua.table()
+local _M = socket.http
+-----------------------------------------------------------------------------
+-- Program constants
+-----------------------------------------------------------------------------
+-- connection timeout in seconds
+_M.TIMEOUT = lua.to_value(60
+)
+-- user agent field sent in request
+_M.USERAGENT = socket._VERSION
+local SCHEMES = lua.table_from_entries([("http", lua.table_from_entries([("port", lua.to_value(80
+)), ("create", function(t: LuaValue): Array<LuaValue>
+    return __lua_pack([lua.to_value(socket.tcp)])
+end)])), ("https", lua.table_from_entries([("port", lua.to_value(443
+)), ("create", function(t: LuaValue): Array<LuaValue>
+    local https = __lua_first(assert(__lua_first(lua.require("ssl.https")), lua.to_value('LuaSocket: LuaSec not found')))
+    local tcp = __lua_first(assert(https.tcp, lua.to_value('LuaSocket: Function tcp() not available from LuaSec')))
+    return __lua_force_array(tcp(t))
+end)]))])
+local receiveheaders = function(sock: LuaValue, headers: LuaValue): Array<LuaValue>
+    local line, name, value, err
+    headers = __lua_or(headers, lua.table())
+    __lua_ret = __lua_first(lua.call_method(sock, "receive"))
+    -- get first line
+    line = __lua_nth(__lua_ret, 0)
+    err = __lua_nth(__lua_ret, 1)
+    if __lua_truthy(err) then
+        local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+        return __lua_join(__lua_ret, [lua.to_value(err)])
+    end
+    while __lua_truthy(lua.op_ne(line, lua.to_value("" ))) do
+        __lua_ret = lua.socket_skip(lua.to_value(2), string.find(line, lua.to_value("^(.-):%s*(.*)")))
+        -- get field-name and value
+        name = __lua_nth(__lua_ret, 0)
+        value = __lua_nth(__lua_ret, 1)
+        if __lua_truthy(not __lua_truthy(((__lua_and(name, value))))) then
+            local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+            return __lua_join(__lua_ret, [lua.to_value(lua.to_value("malformed reponse headers" ))])
+        end
+        name = __lua_first(string.lower(name))
+        __lua_ret = __lua_first(lua.call_method(sock, "receive"))
+        -- get next line (value might be folded)
+        line = __lua_nth(__lua_ret, 0)
+        err = __lua_nth(__lua_ret, 1)
+        if __lua_truthy(err) then
+            local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+            return __lua_join(__lua_ret, [lua.to_value(err)])
+        end
+        while __lua_truthy(__lua_first(string.find(line, lua.to_value("^%s")))) do
+            value = lua.op_concat(value, line)
+            line = __lua_first(__lua_first(lua.call_method(sock, "receive")))
+            if __lua_truthy(err) then
+                local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+                return __lua_join(__lua_ret, [lua.to_value(err)])
+            end
+        end
+        if __lua_truthy(headers[name]) then
+            headers[name] = lua.op_concat(headers[name], lua.op_concat(lua.to_value(", " ), value))
+        else
+            headers[name] = value
+        end
+    end
+    return __lua_pack([lua.to_value(headers)])
+end
+-----------------------------------------------------------------------------
+-- Extra sources and sinks
+-----------------------------------------------------------------------------
+socket.sourcet[lua.to_value("http-chunked")] = function(sock: LuaValue, headers: LuaValue): Array<LuaValue>
+    return __lua_force_array(base.setmetatable(lua.table_from_entries([("getfd", function(): Array<LuaValue>
+        return __lua_force_array(__lua_first(lua.call_method(sock, "getfd")))
+    end), ("dirty", function(): Array<LuaValue>
+        return __lua_force_array(__lua_first(lua.call_method(sock, "dirty")))
+    end)]), LuaTable { table = { ["__call"] = function(): Array<LuaValue>
+        local line, err
+        local __lua_ret = __lua_first(lua.call_method(sock, "receive"))
+        line = __lua_nth(__lua_ret, 0)
+        err = __lua_nth(__lua_ret, 1)
+        if __lua_truthy(err) then
+            local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+            return __lua_join(__lua_ret, [lua.to_value(err)])
+        end
+        local size = __lua_first(base.tonumber(__lua_first(string.gsub(line, lua.to_value(";.*"), lua.to_value(""))), lua.to_value(16)))
+        if __lua_truthy(not __lua_truthy(size)) then
+            local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+            return __lua_join(__lua_ret, [lua.to_value(lua.to_value("invalid chunk size" ))])
+        end
+        if __lua_truthy(lua.op_gt(size, lua.to_value(0 ))) then
+            local chunk, err, _
+            local __lua_ret = __lua_first(lua.call_method(sock, "receive", size))
+            chunk = __lua_nth(__lua_ret, 0)
+            err = __lua_nth(__lua_ret, 1)
+            _ = __lua_nth(__lua_ret, 2)
+            if __lua_truthy(chunk) then
+                __lua_first(__lua_first(lua.call_method(sock, "receive")))
+            end
+            local __lua_ret: Array<LuaValue> = [lua.to_value(chunk)]
+            return __lua_join(__lua_ret, [lua.to_value(err)])
+        else
+            __lua_ret = receiveheaders(sock, headers)
+            -- if it was, read trailers into headers table
+                headers = __lua_nth(__lua_ret, 0)
+            err = __lua_nth(__lua_ret, 1)
+            if __lua_truthy(not __lua_truthy(headers)) then
+                local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+                return __lua_join(__lua_ret, [lua.to_value(err)])
+            end
+        end
+    end }, metamethods = { __call = function(): Array<LuaValue>
+        local line, err
+        local __lua_ret = __lua_first(lua.call_method(sock, "receive"))
+        line = __lua_nth(__lua_ret, 0)
+        err = __lua_nth(__lua_ret, 1)
+        if __lua_truthy(err) then
+            local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+            return __lua_join(__lua_ret, [lua.to_value(err)])
+        end
+        local size = __lua_first(base.tonumber(__lua_first(string.gsub(line, lua.to_value(";.*"), lua.to_value(""))), lua.to_value(16)))
+        if __lua_truthy(not __lua_truthy(size)) then
+            local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+            return __lua_join(__lua_ret, [lua.to_value(lua.to_value("invalid chunk size" ))])
+        end
+        if __lua_truthy(lua.op_gt(size, lua.to_value(0 ))) then
+            local chunk, err, _
+            local __lua_ret = __lua_first(lua.call_method(sock, "receive", size))
+            chunk = __lua_nth(__lua_ret, 0)
+            err = __lua_nth(__lua_ret, 1)
+            _ = __lua_nth(__lua_ret, 2)
+            if __lua_truthy(chunk) then
+                __lua_first(__lua_first(lua.call_method(sock, "receive")))
+            end
+            local __lua_ret: Array<LuaValue> = [lua.to_value(chunk)]
+            return __lua_join(__lua_ret, [lua.to_value(err)])
+        else
+            __lua_ret = receiveheaders(sock, headers)
+            -- if it was, read trailers into headers table
+                headers = __lua_nth(__lua_ret, 0)
+            err = __lua_nth(__lua_ret, 1)
+            if __lua_truthy(not __lua_truthy(headers)) then
+                local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+                return __lua_join(__lua_ret, [lua.to_value(err)])
+            end
+        end
+    end } }))
+end
+socket.sinkt[lua.to_value("http-chunked")] = function(sock: LuaValue): Array<LuaValue>
+    return __lua_force_array(base.setmetatable(lua.table_from_entries([("getfd", function(): Array<LuaValue>
+        return __lua_force_array(__lua_first(lua.call_method(sock, "getfd")))
+    end), ("dirty", function(): Array<LuaValue>
+        return __lua_force_array(__lua_first(lua.call_method(sock, "dirty")))
+    end)]), LuaTable { table = { ["__call"] = function(self: LuaValue, chunk: LuaValue, err: LuaValue): Array<LuaValue>
+        if __lua_truthy(not __lua_truthy(chunk)) then
+            return __lua_force_array(__lua_first(lua.call_method(sock, "send", lua.to_value("0\r\n\r\n"))))
+        end
+        local size = __lua_first(string.format(lua.to_value("%X\r\n"), string.len(chunk)))
+        return __lua_force_array(__lua_first(lua.call_method(sock, "send", lua.op_concat(size, lua.op_concat(chunk, lua.to_value("\r\n"))))))
+    end }, metamethods = { __call = function(self: LuaValue, chunk: LuaValue, err: LuaValue): Array<LuaValue>
+        if __lua_truthy(not __lua_truthy(chunk)) then
+            return __lua_force_array(__lua_first(lua.call_method(sock, "send", lua.to_value("0\r\n\r\n"))))
+        end
+        local size = __lua_first(string.format(lua.to_value("%X\r\n"), string.len(chunk)))
+        return __lua_force_array(__lua_first(lua.call_method(sock, "send", lua.op_concat(size, lua.op_concat(chunk, lua.to_value("\r\n"))))))
+    end } }))
+end
+local metat = (function()
+    local __shared___index_0 = lua.table()
+    return LuaTable { table = { ["__index"] = __shared___index_0 }, metamethods = { __index = __shared___index_0 } }
+end)()
+pub function open(host: LuaValue, port: LuaValue, create: LuaValue): Array<LuaValue>
+    local c = __lua_first(socket.try(create()))
+    local h = __lua_first(base.setmetatable(lua.table_from_entries([("c", c)]), metat))
+    -- create finalized try
+    h.try = __lua_first(socket.newtry(function(): Array<LuaValue>
+        __lua_first(__lua_first(lua.call_method(h, "close")))
+    end))
+    __lua_first(-- set timeout before connecting
+    h.try(__lua_first(lua.call_method(c, "settimeout", _M.TIMEOUT))))
+    __lua_first(h.try(__lua_first(lua.call_method(c, "connect", host, port))))
+    return __lua_pack([lua.to_value(h)])
+end
+_M.open = open
+pub function metat_sendrequestline(self: LuaValue, method: LuaValue, uri: LuaValue): Array<LuaValue>
+    local reqline = __lua_first(string.format(lua.to_value("%s %s HTTP/1.1\r\n"), __lua_or(method, lua.to_value("GET")), uri))
+    return __lua_force_array(self.try(__lua_first(lua.call_method(self.c, "send", reqline))))
+end
+metat.__index.sendrequestline = metat_sendrequestline
+pub function metat_sendheaders(self: LuaValue, tosend: LuaValue): Array<LuaValue>
+    local canonic = headers.canonic
+    local h = lua.to_value("\r\n"
+)
+    for f, v in __lua_first(base.pairs(tosend)) do
+        h = lua.op_concat(((__lua_or(canonic[f], f))), lua.op_concat(lua.to_value(": " ), lua.op_concat(v, lua.op_concat(lua.to_value("\r\n" ), h))))
+    end
+    __lua_first(self.try(__lua_first(lua.call_method(self.c, "send", h))))
+    return __lua_pack([lua.to_value(lua.to_value(1
+))])
+end
+metat.__index.sendheaders = metat_sendheaders
+pub function metat_sendbody(self: LuaValue, headers: LuaValue, source: LuaValue, step: LuaValue): Array<LuaValue>
+    source = __lua_or(source, __lua_first(ltn12.source.empty()))
+    step = __lua_or(step, ltn12.pump.step)
+    local mode = lua.to_value("http-chunked"
+)
+    if __lua_truthy(headers[lua.to_value("content-length")]) then
+        mode = lua.to_value("keep-open" )
+    end
+    return __lua_force_array(self.try(ltn12.pump.all(source, __lua_first(socket.sink(mode, self.c)), step)))
+end
+metat.__index.sendbody = metat_sendbody
+pub function metat_receivestatusline(self: LuaValue): Array<LuaValue>
+    local status, ec
+    local __lua_ret = self.try(__lua_first(lua.call_method(self.c, "receive", lua.to_value(5))))
+    status = __lua_nth(__lua_ret, 0)
+    ec = __lua_nth(__lua_ret, 1)
+    if __lua_truthy(lua.op_ne(status, lua.to_value("HTTP/" ))) then
+        if __lua_truthy(lua.op_eq(ec, lua.to_value("timeout" ))) then
+            return __lua_pack([lua.to_value(lua.to_value(408
+))])
+        end
+        local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+        return __lua_join(__lua_ret, [lua.to_value(status)])
+    end
+    -- otherwise proceed reading a status line
+    status = __lua_first(self.try(__lua_first(lua.call_method(self.c, "receive", lua.to_value("*l"), status))))
+    local code = __lua_first(lua.socket_skip(lua.to_value(2), string.find(status, lua.to_value("HTTP/%d*%.%d* (%d%d%d)"))))
+    return __lua_force_array(self.try(__lua_first(base.tonumber(code)), status))
+end
+metat.__index.receivestatusline = metat_receivestatusline
+pub function metat_receiveheaders(self: LuaValue): Array<LuaValue>
+    return __lua_force_array(self.try(receiveheaders(self.c)))
+end
+metat.__index.receiveheaders = metat_receiveheaders
+pub function metat_receivebody(self: LuaValue, headers: LuaValue, sink: LuaValue, step: LuaValue): Array<LuaValue>
+    sink = __lua_or(sink, __lua_first(ltn12.sink.null()))
+    step = __lua_or(step, ltn12.pump.step)
+    local length = __lua_first(base.tonumber(headers[lua.to_value("content-length")]))
+    local t = headers[lua.to_value("transfer-encoding")]
+    local mode = lua.to_value("default" -- connection close
+)
+    if __lua_truthy(__lua_and(t, lua.op_ne(t, lua.to_value("identity" )))) then
+        mode = lua.to_value("http-chunked"
+)
+    elseif __lua_truthy(__lua_first(base.tonumber(headers[lua.to_value("content-length")]))) then
+        mode = lua.to_value("by-length" )
+    end
+    return __lua_force_array(self.try(ltn12.pump.all(__lua_first(socket.source(mode, self.c, length)), sink, step)))
+end
+metat.__index.receivebody = metat_receivebody
+pub function metat_receive09body(self: LuaValue, status: LuaValue, sink: LuaValue, step: LuaValue): Array<LuaValue>
+    local source = __lua_first(ltn12.source.rewind(socket.source(lua.to_value("until-closed"), self.c)))
+    __lua_first(source(status))
+    return __lua_force_array(self.try(ltn12.pump.all(source, sink, step)))
+end
+metat.__index.receive09body = metat_receive09body
+pub function metat_close(self: LuaValue): Array<LuaValue>
+    return __lua_force_array(__lua_first(lua.call_method(self.c, "close")))
+end
+metat.__index.close = metat_close
+local adjusturi = function(reqt: LuaValue): Array<LuaValue>
+    local u = reqt
+    if __lua_truthy(__lua_and(not __lua_truthy(reqt.proxy), not __lua_truthy(_M.PROXY))) then
+        u = lua.table_from_entries([("path", __lua_first(socket.try(reqt.path, lua.to_value("invalid path 'nil'")))), ("params", reqt.params), ("query", reqt.query), ("fragment", reqt.fragment)])
+    end
+    return __lua_force_array(url.build(u))
+end
+local adjustproxy = function(reqt: LuaValue): Array<LuaValue>
+    local proxy = __lua_or(reqt.proxy, _M.PROXY)
+    if __lua_truthy(proxy) then
+        proxy = __lua_first(url.parse(proxy))
+        local __lua_ret: Array<LuaValue> = [lua.to_value(proxy.host)]
+        return __lua_join(__lua_ret, [lua.to_value(__lua_or(proxy.port, lua.to_value(3128
+)))])
+    else
+        local __lua_ret: Array<LuaValue> = [lua.to_value(reqt.host)]
+        return __lua_join(__lua_ret, [lua.to_value(reqt.port)])
+    end
+end
+local adjustheaders = function(reqt: LuaValue): Array<LuaValue>
+    local host = reqt.host
+    local port = __lua_first(tostring(reqt.port))
+    if __lua_truthy(lua.op_ne(port, __lua_first(tostring(SCHEMES[reqt.scheme].port)))) then
+        host = lua.op_concat(host, lua.op_concat(lua.to_value(':' ), port))
+    end
+    local lower = lua.table_from_entries([(lua.to_value("user-agent"), _M.USERAGENT), (lua.to_value("host"), host), (lua.to_value("connection"), lua.to_value("close, TE")), (lua.to_value("te"), lua.to_value("trailers"
+))])
+    if __lua_truthy(__lua_and(reqt.user, reqt.password)) then
+        lower[lua.to_value("authorization")] = lua.op_concat(lua.to_value(            "Basic " ), ((__lua_first(mime.b64(lua.op_concat(reqt.user, lua.op_concat(lua.to_value(":" ), __lua_first(url.unescape(reqt.password)))))))))
+    end
+    local proxy = __lua_or(reqt.proxy, _M.PROXY)
+    if __lua_truthy(proxy) then
+        proxy = __lua_first(url.parse(proxy))
+        if __lua_truthy(__lua_and(proxy.user, proxy.password)) then
+            lower[lua.to_value("proxy-authorization")] = lua.op_concat(lua.to_value(                "Basic " ), ((__lua_first(mime.b64(lua.op_concat(proxy.user, lua.op_concat(lua.to_value(":" ), proxy.password)))))))
+        end
+    end
+    for i, v in __lua_first(base.pairs(__lua_or(reqt.headers, lower))) do
+        lower[__lua_first(string.lower(i))] = v
+    end
+    return __lua_pack([lua.to_value(lower)])
+end
+local default = lua.table_from_entries([("path", lua.to_value("/"
+)), ("scheme", lua.to_value("http"
+))])
+local adjustrequest = function(reqt: LuaValue): Array<LuaValue>
+    local nreqt = __lua_or(__lua_and(reqt.url, __lua_first(url.parse(reqt.url, default))), lua.table())
+    for i, v in __lua_first(base.pairs(reqt)) do
+        nreqt[i] = v
+    end
+    local schemedefs, host, port, method = SCHEMES[nreqt.scheme], nreqt.host, nreqt.port, nreqt.method
+    if __lua_truthy(not __lua_truthy(nreqt.create)) then
+        nreqt.create = __lua_first(schemedefs.create(nreqt))
+    end
+    if __lua_truthy(not __lua_truthy(((__lua_and(port, lua.op_ne(port, lua.to_value(''))))))) then
+        nreqt.port = schemedefs.port
+    end
+    if __lua_truthy(not __lua_truthy(((__lua_and(method, lua.op_ne(method, lua.to_value(''))))))) then
+        nreqt.method = lua.to_value('GET' )
+    end
+    if __lua_truthy(not __lua_truthy(((__lua_and(host, lua.op_ne(host, lua.to_value(""))))))) then
+        __lua_first(socket.try(lua.nil, lua.op_concat(lua.to_value("invalid host '" ), lua.op_concat(__lua_first(base.tostring(nreqt.host)), lua.to_value("'")))))
+    end
+    -- compute uri if user hasn't overriden
+    nreqt.uri = __lua_or(reqt.uri, __lua_first(adjusturi(nreqt)))
+    -- adjust headers in request
+    nreqt.headers = __lua_first(adjustheaders(nreqt))
+    if __lua_truthy(__lua_and(__lua_and(nreqt.source, not __lua_truthy(nreqt.headers[lua.to_value("content-length")])), not __lua_truthy(nreqt.headers[lua.to_value("transfer-encoding")]))) then
+        nreqt.headers[lua.to_value("transfer-encoding")] = lua.to_value("chunked"
+)
+    end
+    __lua_ret = adjustproxy(nreqt)
+    -- ajust host and port if there is a proxy
+    nreqt.host = __lua_nth(__lua_ret, 0)
+    nreqt.port = __lua_nth(__lua_ret, 1)
+    return __lua_pack([lua.to_value(nreqt)])
+end
+local shouldredirect = function(reqt: LuaValue, code: LuaValue, headers: LuaValue): Array<LuaValue>
+    local location = headers.location
+    if __lua_truthy(not __lua_truthy(location)) then
+        return __lua_pack([lua.to_value(lua.to_value(false))])
+    end
+    location = __lua_first(string.gsub(location, lua.to_value("%s"), lua.to_value("")))
+    if __lua_truthy(lua.op_eq(location, lua.to_value("" ))) then
+        return __lua_pack([lua.to_value(lua.to_value(false))])
+    end
+    local scheme = __lua_first(url.parse(location)).scheme
+    if __lua_truthy(__lua_and(scheme, ((not __lua_truthy(SCHEMES[scheme]))))) then
+        return __lua_pack([lua.to_value(lua.to_value(false))])
+    end
+    if __lua_truthy(__lua_and(((lua.op_eq(lua.to_value('https' ), reqt.scheme))), ((lua.op_ne(lua.to_value('https' ), scheme))))) then
+        return __lua_pack([lua.to_value(lua.to_value(false))])
+    end
+    return __lua_pack([lua.to_value(__lua_and(__lua_and(__lua_and(((lua.op_ne(reqt.redirect, lua.to_value(false)))), ((__lua_or(__lua_or(__lua_or(lua.op_eq(code, lua.to_value(301 )), lua.op_eq(code, lua.to_value(302 ))), lua.op_eq(code, lua.to_value(303 ))), lua.op_eq(code, lua.to_value(307)))))), ((__lua_or(__lua_or(not __lua_truthy(reqt.method), lua.op_eq(reqt.method, lua.to_value("GET" ))), lua.op_eq(reqt.method, lua.to_value("HEAD")))))), ((__lua_or(((lua.op_eq(lua.to_value(false), reqt.maxredirects))), ((lua.op_lt(((__lua_or(reqt.nredirects, lua.to_value(0)))), ((__lua_or(reqt.maxredirects, lua.to_value(5))))))))))))])
+end
+local shouldreceivebody = function(reqt: LuaValue, code: LuaValue): Array<LuaValue>
+    if __lua_truthy(lua.op_eq(reqt.method, lua.to_value("HEAD" ))) then
+        return __lua_pack([lua.to_value(lua.nil)])
+    end
+    if __lua_truthy(__lua_or(lua.op_eq(code, lua.to_value(204 )), lua.op_eq(code, lua.to_value(304 )))) then
+        return __lua_pack([lua.to_value(lua.nil)])
+    end
+    if __lua_truthy(__lua_and(lua.op_ge(code, lua.to_value(100 )), lua.op_lt(code, lua.to_value(200 )))) then
+        return __lua_pack([lua.to_value(lua.nil)])
+    end
+    return __lua_pack([lua.to_value(lua.to_value(1
+))])
+end
+local trequest, tredirect
+tredirect = function(reqt: LuaValue, location: LuaValue): Array<LuaValue>
+    local newurl = __lua_first(url.absolute(reqt.url, location))
+    if __lua_truthy(lua.op_ne(__lua_first(url.parse(newurl)).scheme, reqt.scheme)) then
+        reqt.port = lua.nil
+        reqt.create = lua.nil
+    end
+    local result, code, headers, status
+    local __lua_ret = trequest(lua.table_from_entries([("url", newurl), ("source", reqt.source), ("sink", reqt.sink), ("headers", reqt.headers), ("proxy", reqt.proxy), ("maxredirects", reqt.maxredirects), ("nredirects", lua.op_add(((__lua_or(reqt.nredirects, lua.to_value(0)))), lua.to_value(1))), ("create", reqt.create)]))
+    result = __lua_nth(__lua_ret, 0)
+    code = __lua_nth(__lua_ret, 1)
+    headers = __lua_nth(__lua_ret, 2)
+    status = __lua_nth(__lua_ret, 3)
+    -- pass location header back as a hint we redirected
+    headers = __lua_or(headers, lua.table())
+    headers.location = __lua_or(headers.location, location)
+    local __lua_ret: Array<LuaValue> = [lua.to_value(result), lua.to_value(code), lua.to_value(headers)]
+    return __lua_join(__lua_ret, [lua.to_value(status)])
+end
+trequest = function(reqt: LuaValue): Array<LuaValue>
+    local nreqt = __lua_first(adjustrequest(reqt))
+    local h = __lua_first(_M.open(nreqt.host, nreqt.port, nreqt.create))
+    __lua_first(__lua_first(lua.call_method(-- send request line and headers
+    h, "sendrequestline", nreqt.method, nreqt.uri)))
+    __lua_first(__lua_first(lua.call_method(h, "sendheaders", nreqt.headers)))
+    if __lua_truthy(nreqt.source) then
+        __lua_first(__lua_first(lua.call_method(h, "sendbody", nreqt.headers, nreqt.source, nreqt.step)))
+    end
+    local code, status
+    local __lua_ret = __lua_first(lua.call_method(h, "receivestatusline"))
+    code = __lua_nth(__lua_ret, 0)
+    status = __lua_nth(__lua_ret, 1)
+    if __lua_truthy(not __lua_truthy(code)) then
+        __lua_first(__lua_first(lua.call_method(h, "receive09body", status, nreqt.sink, nreqt.step)))
+        local __lua_ret: Array<LuaValue> = [lua.to_value(lua.to_value(1))]
+        return __lua_join(__lua_ret, [lua.to_value(lua.to_value(200
+))])
+    elseif __lua_truthy(lua.op_eq(code, lua.to_value(408 ))) then
+        local __lua_ret: Array<LuaValue> = [lua.to_value(lua.to_value(1))]
+        return __lua_join(__lua_ret, [lua.to_value(code)])
+    end
+    local headers
+    while __lua_truthy(lua.op_eq(code, lua.to_value(100 ))) do
+        __lua_first(__lua_first(lua.call_method(h, "receiveheaders")))
+        __lua_ret = __lua_first(lua.call_method(h, "receivestatusline"))
+        code = __lua_nth(__lua_ret, 0)
+        status = __lua_nth(__lua_ret, 1)
+    end
+    headers = __lua_first(__lua_first(lua.call_method(h, "receiveheaders")))
+    if __lua_truthy(__lua_and(__lua_first(shouldredirect(nreqt, code, headers)), not __lua_truthy(nreqt.source))) then
+        __lua_first(__lua_first(lua.call_method(h, "close")))
+        return __lua_force_array(tredirect(reqt, headers.location))
+    end
+    if __lua_truthy(__lua_first(shouldreceivebody(nreqt, code))) then
+        __lua_first(__lua_first(lua.call_method(h, "receivebody", headers, nreqt.sink, nreqt.step)))
+    end
+    __lua_first(__lua_first(lua.call_method(h, "close")))
+    local __lua_ret: Array<LuaValue> = [lua.to_value(lua.to_value(1)), lua.to_value(code), lua.to_value(headers)]
+    return __lua_join(__lua_ret, [lua.to_value(status)])
+end
+local genericform = function(u: LuaValue, b: LuaValue): Array<LuaValue>
+    local t = lua.table()
+    local reqt = lua.table_from_entries([("url", u), ("sink", __lua_first(ltn12.sink.table(t))), ("target", t)])
+    if __lua_truthy(b) then
+        reqt.source = __lua_first(ltn12.source.string(b))
+        reqt.headers = lua.table_from_entries([(lua.to_value("content-length"), __lua_first(string.len(b))), (lua.to_value("content-type"), lua.to_value("application/x-www-form-urlencoded"
+))])
+        reqt.method = lua.to_value("POST"
+)
+    end
+    return __lua_pack([lua.to_value(reqt)])
+end
+_M.genericform = genericform
+local srequest = function(u: LuaValue, b: LuaValue): Array<LuaValue>
+    local reqt = __lua_first(genericform(u, b))
+    local _, code, headers, status
+    local __lua_ret = trequest(reqt)
+    _ = __lua_nth(__lua_ret, 0)
+    code = __lua_nth(__lua_ret, 1)
+    headers = __lua_nth(__lua_ret, 2)
+    status = __lua_nth(__lua_ret, 3)
+    local __lua_ret: Array<LuaValue> = [lua.to_value(__lua_first(reqt.target:concat("", lua.nil, lua.nil))), lua.to_value(code), lua.to_value(headers)]
+    return __lua_join(__lua_ret, [lua.to_value(status)])
+end
+_M.request = __lua_first(lua.socket_protect(function(reqt: LuaValue, body: LuaValue): Array<LuaValue>
+    if __lua_truthy(lua.op_eq(__lua_first(base["type"](reqt)), lua.to_value("string" ))) then
+        return __lua_force_array(srequest(reqt, body))
+    else
+        return __lua_force_array(trequest(reqt))
+    end
+end))
+_M.schemes = SCHEMES
+pub const genericform: LuaValue = _M.genericform
+pub const http: LuaValue = socket.http
+pub function request(reqt: LuaValue, body: LuaValue): Array<LuaValue>
+    return _M.request(reqt, body)
+end
+pub const schemes: LuaValue = _M.schemes
+return __lua_pack([lua.to_value(_M)])

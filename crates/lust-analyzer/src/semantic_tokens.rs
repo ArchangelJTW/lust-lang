@@ -249,18 +249,44 @@ fn collect_tokens_from_item(
         }
 
         ItemKind::Extern { items, .. } => {
-            for ExternItem::Function {
-                params,
-                return_type,
-                ..
-            } in items
-            {
-                for ty in params {
-                    collect_tokens_from_type(ty, text, line_offsets, tokens, seen);
-                }
+            for ext in items {
+                match ext {
+                    ExternItem::Function {
+                        params,
+                        return_type,
+                        ..
+                    } => {
+                        for ty in params {
+                            collect_tokens_from_type(ty, text, line_offsets, tokens, seen);
+                        }
 
-                if let Some(ret) = return_type {
-                    collect_tokens_from_type(ret, text, line_offsets, tokens, seen);
+                        if let Some(ret) = return_type {
+                            collect_tokens_from_type(ret, text, line_offsets, tokens, seen);
+                        }
+                    }
+
+                    ExternItem::Const { ty, .. } => {
+                        collect_tokens_from_type(ty, text, line_offsets, tokens, seen);
+                    }
+
+                    ExternItem::Struct(def) => {
+                        for field in &def.fields {
+                            collect_tokens_from_type(&field.ty, text, line_offsets, tokens, seen);
+                            if let Some(target) = &field.weak_target {
+                                collect_tokens_from_type(target, text, line_offsets, tokens, seen);
+                            }
+                        }
+                    }
+
+                    ExternItem::Enum(def) => {
+                        for variant in &def.variants {
+                            if let Some(fields) = &variant.fields {
+                                for ty in fields {
+                                    collect_tokens_from_type(ty, text, line_offsets, tokens, seen);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

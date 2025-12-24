@@ -186,17 +186,17 @@ impl TypeChecker {
             };
             let canonical_value = self.canonicalize_type(&raw_value_type);
 
-            if let Some(existing_key) = &inferred_key_type {
-                if !allow_mixed_keys {
-                    self.unify(existing_key, &canonical_key)?;
+            if let Some(existing_key) = &mut inferred_key_type {
+                if !allow_mixed_keys && self.unify(existing_key, &canonical_key).is_err() {
+                    *existing_key = Type::new(TypeKind::Unknown, Self::dummy_span());
                 }
             } else {
                 inferred_key_type = Some(canonical_key.clone());
             }
 
-            if let Some(existing_value) = &inferred_value_type {
-                if !allow_mixed_values {
-                    self.unify(existing_value, &canonical_value)?;
+            if let Some(existing_value) = &mut inferred_value_type {
+                if !allow_mixed_values && self.unify(existing_value, &canonical_value).is_err() {
+                    *existing_value = Type::new(TypeKind::Unknown, Self::dummy_span());
                 }
             } else {
                 inferred_value_type = Some(canonical_value.clone());

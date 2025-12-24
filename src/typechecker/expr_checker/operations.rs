@@ -44,6 +44,9 @@ impl TypeChecker {
             | BinaryOp::Div
             | BinaryOp::Mod
             | BinaryOp::Pow => {
+                if self.is_dynamic_numeric(&left_type) || self.is_dynamic_numeric(&right_type) {
+                    return Ok(Type::new(TypeKind::Unknown, span));
+                }
                 if matches!(left_type.kind, TypeKind::Int | TypeKind::Float)
                     && matches!(right_type.kind, TypeKind::Int | TypeKind::Float)
                 {
@@ -73,6 +76,8 @@ impl TypeChecker {
             | BinaryOp::Ge => {
                 if matches!(left_type.kind, TypeKind::Unknown)
                     || matches!(right_type.kind, TypeKind::Unknown)
+                    || matches!(&left_type.kind, TypeKind::Named(name) if name == "LuaValue")
+                    || matches!(&right_type.kind, TypeKind::Named(name) if name == "LuaValue")
                 {
                     return Ok(Type::new(TypeKind::Bool, span));
                 }
@@ -88,7 +93,13 @@ impl TypeChecker {
             }
 
             BinaryOp::Concat => {
-                if !self.env.type_implements_trait(&left_type, "ToString") {
+                if self.concat_operand_is_dynamic(&left_type)
+                    || self.concat_operand_is_dynamic(&right_type)
+                {
+                    return Ok(Type::new(TypeKind::String, span));
+                }
+
+                if !self.concat_operand_implements_to_string(&left_type) {
                     return Err(self.type_error_at(
                         format!(
                             "Left operand of `..` must implement ToString trait, got '{}'",
@@ -98,7 +109,7 @@ impl TypeChecker {
                     ));
                 }
 
-                if !self.env.type_implements_trait(&right_type, "ToString") {
+                if !self.concat_operand_implements_to_string(&right_type) {
                     return Err(self.type_error_at(
                         format!(
                             "Right operand of `..` must implement ToString trait, got '{}'",
@@ -120,6 +131,33 @@ impl TypeChecker {
             BinaryOp::And | BinaryOp::Or => {
                 unreachable!("short-circuit operators handled earlier in check_binary_expr")
             }
+        }
+    }
+
+    fn concat_operand_is_dynamic(&self, ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::Unknown => true,
+            TypeKind::Named(name) if name == "LuaValue" => true,
+            TypeKind::Union(types) => types.iter().any(|t| self.concat_operand_is_dynamic(t)),
+            _ => false,
+        }
+    }
+
+    fn is_dynamic_numeric(&self, ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::Unknown => true,
+            TypeKind::Named(name) if name == "LuaValue" => true,
+            TypeKind::Union(types) => types.iter().any(|t| self.is_dynamic_numeric(t)),
+            _ => false,
+        }
+    }
+
+    fn concat_operand_implements_to_string(&self, ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::Union(types) => types
+                .iter()
+                .all(|t| self.concat_operand_implements_to_string(t)),
+            _ => self.env.type_implements_trait(ty, "ToString"),
         }
     }
 
@@ -406,7 +444,17 @@ impl TypeChecker {
                 }
 
                 if let Some((resolved_name, sig)) = static_candidate {
-                    if args.len() != sig.params.len() {
+                    let allow_varargs = sig.params.len() == 1
+                        && matches!(sig.params[0].kind, TypeKind::Unknown)
+                        && !args.is_empty();
+                    let allow_optional = args.len() < sig.params.len()
+                        && !args.is_empty()
+                        && sig.params[args.len()..]
+                            .iter()
+                            .all(|param| matches!(param.kind, TypeKind::Unknown));
+                    if args.len() > sig.params.len() && !allow_varargs
+                        || (args.len() < sig.params.len() && !allow_optional && !allow_varargs)
+                    {
                         return Err(self.type_error_at(
                             format!(
                                 "Static method '{}' expects {} arguments, got {}",
@@ -418,7 +466,11 @@ impl TypeChecker {
                         ));
                     }
 
-                    for (i, (arg, expected_type)) in args.iter().zip(sig.params.iter()).enumerate()
+                    for (i, (arg, expected_type)) in args
+                        .iter()
+                        .zip(sig.params.iter())
+                        .take(sig.params.len().min(args.len()))
+                        .enumerate()
                     {
                         let arg_type = self.check_expr(arg)?;
                         self.unify(expected_type, &arg_type).map_err(|_| {
@@ -433,6 +485,10 @@ impl TypeChecker {
                                 arg.span,
                             )
                         })?;
+                    }
+
+                    if allow_varargs || allow_optional {
+                        return Ok(sig.return_type);
                     }
 
                     return Ok(sig.return_type);
@@ -550,19 +606,51 @@ impl TypeChecker {
                     return_type,
                 } = &var_type.kind
                 {
-                    if args.len() != param_types.len() {
-                        return Err(self.type_error_at(
-                            format!(
-                                "Lambda '{}' expects {} arguments, got {}",
-                                name,
-                                param_types.len(),
-                                args.len()
-                            ),
-                            span,
-                        ));
+                    let mut expected_params = param_types.clone();
+                    if args.len() != expected_params.len() {
+                        if args.len() > expected_params.len() {
+                            if let Some(last) = expected_params.last().cloned() {
+                                let last_allows_varargs = matches!(last.kind, TypeKind::Unknown)
+                                    || matches!(&last.kind, TypeKind::Named(name) if name == "LuaValue");
+                                if last_allows_varargs {
+                                    while expected_params.len() < args.len() {
+                                        expected_params.push(last.clone());
+                                    }
+                                } else {
+                                    return Err(self.type_error_at(
+                                        format!(
+                                            "Lambda '{}' expects {} arguments, got {}",
+                                            name,
+                                            param_types.len(),
+                                            args.len()
+                                        ),
+                                        span,
+                                    ));
+                                }
+                            }
+                        } else {
+                            let missing = &expected_params[args.len()..];
+                            let missing_optional = missing.iter().all(|p| {
+                                matches!(p.kind, TypeKind::Unknown)
+                                    || matches!(&p.kind, TypeKind::Named(name) if name == "LuaValue")
+                            });
+                            if missing_optional {
+                                expected_params.truncate(args.len());
+                            } else {
+                                return Err(self.type_error_at(
+                                    format!(
+                                        "Lambda '{}' expects {} arguments, got {}",
+                                        name,
+                                        param_types.len(),
+                                        args.len()
+                                    ),
+                                    span,
+                                ));
+                            }
+                        }
                     }
 
-                    for (i, (arg, expected_type)) in args.iter().zip(param_types.iter()).enumerate()
+                    for (i, (arg, expected_type)) in args.iter().zip(expected_params.iter()).enumerate()
                     {
                         let arg_type = self.check_expr(arg)?;
                         self.unify(expected_type, &arg_type).map_err(|_| {
@@ -584,26 +672,59 @@ impl TypeChecker {
             }
 
             let resolved = self.resolve_function_key(name);
-            let sig = self
-                .env
-                .lookup_function(&resolved)
-                .ok_or_else(|| {
-                    self.type_error_at(format!("Undefined function '{}'", name), callee.span)
-                })?
-                .clone();
-            if args.len() != sig.params.len() {
-                return Err(self.type_error_at(
-                    format!(
-                        "Function '{}' expects {} arguments, got {}",
-                        name,
-                        sig.params.len(),
-                        args.len()
-                    ),
-                    callee.span,
-                ));
+            let sig_opt = self.env.lookup_function(&resolved).cloned();
+            if sig_opt.is_none() {
+                for arg in args {
+                    self.check_expr(arg)?;
+                }
+                return Ok(Type::new(TypeKind::Unknown, span));
+            }
+            let sig = sig_opt.unwrap();
+            let mut expected_params = sig.params.clone();
+            if args.len() != expected_params.len() {
+                if args.len() > expected_params.len() {
+                    if let Some(last) = expected_params.last().cloned() {
+                        let last_allows_varargs = matches!(last.kind, TypeKind::Unknown)
+                            || matches!(&last.kind, TypeKind::Named(name) if name == "LuaValue");
+                        if last_allows_varargs {
+                            while expected_params.len() < args.len() {
+                                expected_params.push(last.clone());
+                            }
+                        } else {
+                            return Err(self.type_error_at(
+                                format!(
+                                    "Function '{}' expects {} arguments, got {}",
+                                    name,
+                                    sig.params.len(),
+                                    args.len()
+                                ),
+                                callee.span,
+                            ));
+                        }
+                    }
+                } else {
+                    let missing = &expected_params[args.len()..];
+                    let missing_optional = missing.iter().all(|p| {
+                        matches!(p.kind, TypeKind::Unknown)
+                            || matches!(&p.kind, TypeKind::Named(name) if name == "LuaValue")
+                    });
+                    if missing_optional {
+                        expected_params.truncate(args.len());
+                    } else {
+                        return Err(self.type_error_at(
+                            format!(
+                                "Function '{}' expects {} arguments, got {}",
+                                name,
+                                sig.params.len(),
+                                args.len()
+                            ),
+                            callee.span,
+                        ));
+                    }
+                }
             }
 
-            for (i, (arg, expected_type)) in args.iter().zip(sig.params.iter()).enumerate() {
+            for (i, (arg, expected_type)) in args.iter().zip(expected_params.iter()).enumerate() {
                 let arg_type = self.check_expr(arg)?;
                 self.unify_with_bounds(expected_type, &arg_type)
                     .map_err(|_| {
@@ -622,10 +743,60 @@ impl TypeChecker {
 
             Ok(sig.return_type)
         } else {
-            Err(self.type_error_at(
-                "Only direct function/lambda calls are supported".to_string(),
-                span,
-            ))
+            let callee_type = self.check_expr(callee)?;
+            match &callee_type.kind {
+                TypeKind::Function { params, return_type } => {
+                    let mut expected_params = params.clone();
+                    if args.len() != expected_params.len() {
+                        return Err(self.type_error_at(
+                            format!(
+                                "Function expects {} arguments, got {}",
+                                expected_params.len(),
+                                args.len()
+                            ),
+                            span,
+                        ));
+                    }
+
+                    for (i, (arg, expected_type)) in args.iter().zip(expected_params.iter()).enumerate()
+                    {
+                        let arg_type = self.check_expr(arg)?;
+                        self.unify_with_bounds(expected_type, &arg_type)
+                            .map_err(|_| {
+                                self.type_error_at(
+                                    format!(
+                                        "Argument {}: expected '{}', got '{}'",
+                                        i + 1,
+                                        expected_type,
+                                        arg_type
+                                    ),
+                                    arg.span,
+                                )
+                            })?;
+                    }
+
+                    Ok((**return_type).clone())
+                }
+
+                TypeKind::Unknown => {
+                    for arg in args {
+                        self.check_expr(arg)?;
+                    }
+                    Ok(Type::new(TypeKind::Unknown, Self::dummy_span()))
+                }
+
+                TypeKind::Named(name) if name == "LuaValue" => {
+                    for arg in args {
+                        self.check_expr(arg)?;
+                    }
+                    Ok(Type::new(TypeKind::Unknown, Self::dummy_span()))
+                }
+
+                _ => Err(self.type_error_at(
+                    format!("Cannot call expression of type '{}'", callee_type),
+                    span,
+                )),
+            }
         }
     }
 
@@ -637,6 +808,14 @@ impl TypeChecker {
     ) -> Result<Type> {
         let receiver_type = self.check_expr(receiver)?;
         let span = Self::dummy_span();
+        if matches!(receiver_type.kind, TypeKind::Unknown)
+            || matches!(&receiver_type.kind, TypeKind::Named(name) if name == "LuaValue")
+        {
+            for arg in args {
+                self.check_expr(arg)?;
+            }
+            return Ok(Type::new(TypeKind::Unknown, span));
+        }
         match &receiver_type.kind {
             TypeKind::String => match method {
                 "len" => {
@@ -767,6 +946,14 @@ impl TypeChecker {
                     }
 
                     return Ok(Type::new(TypeKind::Option(elem_type.clone()), span));
+                }
+
+                "iter" => {
+                    if !args.is_empty() {
+                        return Err(self.type_error("iter() takes no arguments".to_string()));
+                    }
+
+                    return Ok(Type::new(TypeKind::Named("Iterator".to_string()), span));
                 }
 
                 "slice" => {
@@ -1147,6 +1334,15 @@ impl TypeChecker {
                     return Ok(Type::new(TypeKind::Float, span));
                 }
 
+                "min" | "max" => {
+                    if args.len() != 1 {
+                        return Err(self.type_error(format!("{}() requires 1 argument", method)));
+                    }
+
+                    self.check_expr(&args[0])?;
+                    return Ok(Type::new(TypeKind::Float, span));
+                }
+
                 "clamp" => {
                     if args.len() != 2 {
                         return Err(
@@ -1180,6 +1376,15 @@ impl TypeChecker {
                     return Ok(Type::new(TypeKind::Int, span));
                 }
 
+                "min" | "max" => {
+                    if args.len() != 1 {
+                        return Err(self.type_error(format!("{}() requires 1 argument", method)));
+                    }
+
+                    self.check_expr(&args[0])?;
+                    return Ok(Type::new(TypeKind::Int, span));
+                }
+
                 "clamp" => {
                     if args.len() != 2 {
                         return Err(
@@ -1195,6 +1400,73 @@ impl TypeChecker {
                 }
 
                 _ => {}
+            },
+            TypeKind::Named(type_name) if type_name == "LuaTable" => match method {
+                "len" | "maxn" => {
+                    if !args.is_empty() {
+                        return Err(self.type_error(format!("{}() takes no arguments", method)));
+                    }
+
+                    return Ok(Type::new(TypeKind::Int, span));
+                }
+                "push" => {
+                    if args.len() != 1 {
+                        return Err(self.type_error("push() requires 1 argument".to_string()));
+                    }
+
+                    self.check_expr(&args[0])?;
+                    return Ok(Type::new(TypeKind::Unit, span));
+                }
+                "insert" => {
+                    if args.len() != 2 {
+                        return Err(self.type_error("insert() requires 2 arguments".to_string()));
+                    }
+
+                    self.check_expr(&args[0])?;
+                    self.check_expr(&args[1])?;
+                    return Ok(Type::new(TypeKind::Unit, span));
+                }
+                "remove" => {
+                    if args.len() != 1 {
+                        return Err(self.type_error("remove() requires 1 argument".to_string()));
+                    }
+
+                    self.check_expr(&args[0])?;
+                    return Ok(Type::new(TypeKind::Unknown, span));
+                }
+                "concat" => {
+                    if args.len() != 3 {
+                        return Err(self.type_error("concat() requires 3 arguments".to_string()));
+                    }
+
+                    self.check_expr(&args[0])?;
+                    self.check_expr(&args[1])?;
+                    self.check_expr(&args[2])?;
+                    return Ok(Type::new(TypeKind::String, span));
+                }
+                "unpack" => {
+                    if args.len() != 2 {
+                        return Err(self.type_error("unpack() requires 2 arguments".to_string()));
+                    }
+
+                    self.check_expr(&args[0])?;
+                    self.check_expr(&args[1])?;
+                    return Ok(Type::new(TypeKind::Unknown, span));
+                }
+                "sort" => {
+                    if args.len() != 1 {
+                        return Err(self.type_error("sort() requires 1 argument".to_string()));
+                    }
+
+                    self.check_expr(&args[0])?;
+                    return Ok(Type::new(TypeKind::Unit, span));
+                }
+                _ => {
+                    return Err(self.type_error(format!(
+                        "LuaTable has no method '{}'",
+                        method
+                    )));
+                }
             },
             TypeKind::Named(type_name) => {
                 if let Some(method_def) = self.env.lookup_method(type_name.as_str(), method) {
@@ -1357,6 +1629,22 @@ impl TypeChecker {
         }
 
         let object_type = self.check_expr(object)?;
+        if matches!(object_type.kind, TypeKind::Unknown)
+            || matches!(&object_type.kind, TypeKind::Named(name) if name == "LuaValue" || name == "LuaTable")
+        {
+            return Ok(Type::new(TypeKind::Unknown, span));
+        }
+        if let TypeKind::Union(types) = &object_type.kind {
+            if types.iter().any(|t| {
+                matches!(t.kind, TypeKind::Unknown)
+                    || matches!(&t.kind, TypeKind::Named(name) if name == "LuaValue" || name == "LuaTable")
+            }) {
+                return Ok(Type::new(TypeKind::Unknown, span));
+            }
+        }
+        if let TypeKind::Map(_, value_type) = &object_type.kind {
+            return Ok(value_type.as_ref().clone());
+        }
         let type_name = match &object_type.kind {
             TypeKind::Named(name) => name.clone(),
             _ => {
@@ -1379,6 +1667,19 @@ impl TypeChecker {
     pub fn check_index_expr(&mut self, object: &Expr, index: &Expr) -> Result<Type> {
         let object_type = self.check_expr(object)?;
         let index_type = self.check_expr(index)?;
+        if matches!(object_type.kind, TypeKind::Unknown)
+            || matches!(&object_type.kind, TypeKind::Named(name) if name == "LuaValue" || name == "LuaTable")
+        {
+            return Ok(Type::new(TypeKind::Unknown, Self::dummy_span()));
+        }
+        if let TypeKind::Union(types) = &object_type.kind {
+            if types.iter().any(|t| {
+                matches!(t.kind, TypeKind::Unknown)
+                    || matches!(&t.kind, TypeKind::Named(name) if name == "LuaValue" || name == "LuaTable")
+            }) {
+                return Ok(Type::new(TypeKind::Unknown, Self::dummy_span()));
+            }
+        }
         match &object_type.kind {
             TypeKind::Array(elem_type) => {
                 self.unify(&Type::new(TypeKind::Int, Self::dummy_span()), &index_type)?;
@@ -1387,10 +1688,7 @@ impl TypeChecker {
 
             TypeKind::Map(key_type, value_type) => {
                 self.unify(key_type.as_ref(), &index_type)?;
-                Ok(Type::new(
-                    TypeKind::Option(Box::new(value_type.as_ref().clone())),
-                    Self::dummy_span(),
-                ))
+                Ok(value_type.as_ref().clone())
             }
 
             _ => Err(self.type_error(format!("Cannot index type '{}'", object_type))),

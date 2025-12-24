@@ -175,4 +175,10 @@ pub enum ExternItem {
         params: Vec<Type>,
         return_type: Option<Type>,
     },
+    Const {
+        name: String,
+        ty: Type,
+    },
+    Struct(StructDef),
+    Enum(EnumDef),
 }

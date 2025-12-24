@@ -10,25 +10,17 @@ impl Compiler {
                     for ni in items {
                         match &ni.kind {
                             ItemKind::Script(stmts) => {
-                                script_stmts.extend_from_slice(stmts);
-                                {
+                                if let Some(module) = self.module_scope_name() {
                                     let locals_entry =
-                                        self.module_locals.entry(name.clone()).or_default();
-                                    for local in Self::collect_top_level_locals(stmts) {
-                                        locals_entry.insert(local);
+                                        self.module_locals.entry(module.to_string()).or_default();
+                                    for name in Self::collect_top_level_locals(stmts) {
+                                        locals_entry.insert(name);
                                     }
                                 }
+                                script_stmts.extend_from_slice(stmts);
                             }
 
                             ItemKind::Function(func_def) => {
-                                if Self::is_module_init_function(func_def, name) {
-                                    let locals_entry =
-                                        self.module_locals.entry(name.clone()).or_default();
-                                    for local in Self::collect_top_level_locals(&func_def.body) {
-                                        locals_entry.insert(local);
-                                    }
-                                }
-
                                 let func_idx = self.functions.len();
                                 let function = Function::new(
                                     &func_def.name,
@@ -88,9 +80,11 @@ impl Compiler {
                             ItemKind::Extern { items, .. } => {
                                 for ext in items {
                                     match ext {
-                                        ExternItem::Function { name, .. } => {
-                                            self.record_extern_function(name);
+                                        ExternItem::Function { name, .. }
+                                        | ExternItem::Const { name, .. } => {
+                                            self.record_extern_value(name);
                                         }
+                                        ExternItem::Struct(_) | ExternItem::Enum(_) => {}
                                     }
                                 }
                             }
@@ -107,15 +101,14 @@ impl Compiler {
                 }
 
                 ItemKind::Script(stmts) => {
-                    script_stmts.extend_from_slice(stmts);
-                    let module_key = self
-                        .entry_module
-                        .clone()
-                        .unwrap_or_else(|| "__root".to_string());
-                    let locals_entry = self.module_locals.entry(module_key).or_default();
-                    for local in Self::collect_top_level_locals(stmts) {
-                        locals_entry.insert(local);
+                    if let Some(module) = self.module_scope_name() {
+                        let locals_entry =
+                            self.module_locals.entry(module.to_string()).or_default();
+                        for name in Self::collect_top_level_locals(stmts) {
+                            locals_entry.insert(name);
+                        }
                     }
+                    script_stmts.extend_from_slice(stmts);
                 }
 
                 ItemKind::Function(func_def) => {
@@ -171,9 +164,10 @@ impl Compiler {
                 ItemKind::Extern { items, .. } => {
                     for ext in items {
                         match ext {
-                            ExternItem::Function { name, .. } => {
-                                self.record_extern_function(name);
+                            ExternItem::Function { name, .. } | ExternItem::Const { name, .. } => {
+                                self.record_extern_value(name);
                             }
+                            ExternItem::Struct(_) | ExternItem::Enum(_) => {}
                         }
                     }
                 }

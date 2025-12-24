@@ -141,15 +141,6 @@ impl TypeChecker {
                     )));
                 }
             }
-        } else {
-            for binding in bindings {
-                if binding.type_annotation.is_none() {
-                    return Err(self.type_error(format!(
-                        "Variable '{}' must have either a type annotation or an initializer",
-                        binding.name
-                    )));
-                }
-            }
         }
 
         for (index, binding) in bindings.iter().enumerate() {
@@ -174,7 +165,7 @@ impl TypeChecker {
 
                 (Some(ann), None) => ann,
                 (None, Some(inf)) => inf,
-                (None, None) => unreachable!(),
+                (None, None) => Type::new(TypeKind::Unknown, Self::dummy_span()),
             };
             let generics_map = if initializer.is_some() {
                 if binding_count == 1 && expr_types.len() == 1 {
@@ -274,6 +265,22 @@ impl TypeChecker {
                             }
                         }
                     }
+                }
+            }
+
+            if let TypeKind::Option(inner) = &target_type.kind {
+                if !matches!(value_type.kind, TypeKind::Option(_))
+                    && self.types_compatible(inner, &value_type)
+                {
+                    self.unify(inner, &value_type)?;
+                    continue;
+                }
+            }
+
+            if let TypeKind::Named(name) = &target_type.kind {
+                if name == "LuaValue" {
+                    // LuaValue can hold any primitive; allow without tightening types here.
+                    continue;
                 }
             }
 
@@ -527,14 +534,14 @@ impl TypeChecker {
     ) -> Result<()> {
         let start_type = self.check_expr(start)?;
         let end_type = self.check_expr(end)?;
-        if !matches!(start_type.kind, TypeKind::Int | TypeKind::Float) {
+        if !self.allows_numeric_iter(&start_type) {
             return Err(self.type_error(format!(
                 "For loop start value must be numeric, got {}",
                 start_type
             )));
         }
 
-        if !matches!(end_type.kind, TypeKind::Int | TypeKind::Float) {
+        if !self.allows_numeric_iter(&end_type) {
             return Err(self.type_error(format!(
                 "For loop end value must be numeric, got {}",
                 end_type
@@ -543,7 +550,7 @@ impl TypeChecker {
 
         if let Some(step_expr) = step {
             let step_type = self.check_expr(step_expr)?;
-            if !matches!(step_type.kind, TypeKind::Int | TypeKind::Float) {
+            if !self.allows_numeric_iter(&step_type) {
                 return Err(self.type_error(format!(
                     "For loop step value must be numeric, got {}",
                     step_type
@@ -564,6 +571,16 @@ impl TypeChecker {
         self.env.pop_scope();
         self.in_loop = prev_in_loop;
         Ok(())
+    }
+
+    fn allows_numeric_iter(&self, ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::Int | TypeKind::Float => true,
+            TypeKind::Unknown => true,
+            TypeKind::Named(name) if name == "LuaValue" => true,
+            TypeKind::Union(types) => types.iter().all(|t| self.allows_numeric_iter(t)),
+            _ => false,
+        }
     }
 
     fn check_for_in_stmt(
@@ -630,6 +647,38 @@ impl TypeChecker {
         }
 
         match &iterator_type.kind {
+            TypeKind::Named(name) if name == "Iterator" => {
+                let prev_in_loop = self.in_loop;
+                self.in_loop = true;
+                self.env.push_scope();
+                for var in variables {
+                    self.env
+                        .declare_variable(var.clone(), Type::new(TypeKind::Unknown, Self::dummy_span()))?;
+                }
+                for stmt in body {
+                    self.check_stmt(stmt)?;
+                }
+                self.env.pop_scope();
+                self.in_loop = prev_in_loop;
+                Ok(())
+            }
+
+            TypeKind::Unknown => {
+                let prev_in_loop = self.in_loop;
+                self.in_loop = true;
+                self.env.push_scope();
+                for var in variables {
+                    self.env
+                        .declare_variable(var.clone(), Type::new(TypeKind::Unknown, Self::dummy_span()))?;
+                }
+                for stmt in body {
+                    self.check_stmt(stmt)?;
+                }
+                self.env.pop_scope();
+                self.in_loop = prev_in_loop;
+                Ok(())
+            }
+
             TypeKind::Array(elem_type) => {
                 if variables.len() != 1 {
                     return Err(self.type_error(format!(

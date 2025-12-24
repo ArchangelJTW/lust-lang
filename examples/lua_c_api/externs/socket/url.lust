@@ -1,0 +1,389 @@
+-- Auto-transpiled from Lua module 'socket.url'
+local __lua_ret: Array<LuaValue> = []
+local __lua_pack = function(items: Array<LuaValue>): Array<LuaValue>
+    return items
+end
+local __lua_force_array = function(val: unknown): Array<LuaValue>
+    if val is Array<LuaValue> then
+        return val
+    end
+    return [lua.to_value(val)]
+end
+local __lua_table_from_varargs = function(items: Array<LuaValue>): LuaTable
+    local t = lua.table()
+    local idx: int = 0
+    while idx < items:len() do
+        local v = items:get(idx)
+        if v:is_some() then
+            t[idx + 1] = lua.unwrap(v:unwrap())
+        end
+        idx = idx + 1
+    end
+    return t
+end
+local __lua_truthy = function(val: unknown): bool
+    return lua.is_truthy(val)
+end
+local __lua_first = function(val: unknown): unknown
+    if val is Array<LuaValue> then
+        local first = val:get(0)
+        if first:is_some() then
+            return first:unwrap()
+        end
+        return lua.nil
+    end
+    if val is LuaValue then
+        return val
+    end
+    return val
+end
+local __lua_nth = function(val: unknown, idx: int): unknown
+    if val is Array<LuaValue> then
+        local item = val:get(idx)
+        if item:is_some() then
+            return item:unwrap()
+        end
+        return lua.nil
+    end
+    if idx == 0 then
+        if val is LuaValue then
+            return val
+        end
+        return val
+    end
+    return lua.nil
+end
+local __lua_join = function(prefix: Array<LuaValue>, tail: unknown): Array<LuaValue>
+    local arr = __lua_force_array(tail)
+    local idx: int = 0
+    while idx < arr:len() do
+        local v = arr:get(idx)
+        if v:is_some() then
+            prefix:push(v:unwrap())
+        end
+        idx = idx + 1
+    end
+    return prefix
+end
+local __lua_and = function(a: unknown, b: unknown): unknown
+    if __lua_truthy(a) then
+        return b
+    end
+    return a
+end
+local __lua_or = function(a: unknown, b: unknown): unknown
+    if __lua_truthy(a) then
+        return a
+    end
+    return b
+end
+local assert = function(cond: LuaValue, msg: LuaValue): LuaValue
+    if __lua_truthy(cond) then
+        return cond
+    end
+    error(msg or "assertion failed")
+end
+local _G: Map<unknown, unknown> = {}
+_G["assert"] = lua.to_value(assert)
+_G["error"] = lua.to_value(error)
+_G["ipairs"] = lua.to_value(ipairs)
+_G["pairs"] = lua.to_value(pairs)
+_G["setmetatable"] = lua.to_value(setmetatable)
+_G["select"] = lua.to_value(select)
+_G["unpack"] = lua.to_value(unpack)
+_G["tostring"] = lua.to_value(tostring)
+_G["tonumber"] = lua.to_value(tonumber)
+_G["type"] = lua.to_value(type)
+local type_ = type
+_G["string"] = lua.to_value(string)
+local module_ = _G["module"]
+local string = __lua_first(lua.require("string"))
+local base = _G
+local table = __lua_first(lua.nil)
+local socket = __lua_first(lua.require("socket"))
+socket.url = lua.table()
+local _M = socket.url
+-----------------------------------------------------------------------------
+-- Module version
+-----------------------------------------------------------------------------
+_M._VERSION = lua.to_value("URL 1.0.3"
+)
+pub function escape(s: LuaValue): Array<LuaValue>
+    return __lua_pack([lua.to_value(((__lua_first(string.gsub(s, lua.to_value("([^A-Za-z0-9_])"), function(c: LuaValue): Array<LuaValue>
+        return __lua_force_array(string.format(lua.to_value("%%%02x"), string.byte(c)))
+    end)))))])
+end
+_M.escape = escape
+local make_set = function(t: LuaValue): Array<LuaValue>
+    local s = lua.table()
+    for i, v in __lua_first(base.ipairs(t)) do
+        s[t[i]] = lua.to_value(1
+)
+    end
+    return __lua_pack([lua.to_value(s)])
+end
+local segment_set = __lua_first(make_set(lua.table_from_entries([(1, lua.to_value(    "-")), (2, lua.to_value("_")), (3, lua.to_value(".")), (4, lua.to_value("!")), (5, lua.to_value("~")), (6, lua.to_value("*")), (7, lua.to_value("'")), (8, lua.to_value("(")), (9, lua.to_value(    ")")), (10, lua.to_value(":")), (11, lua.to_value("@")), (12, lua.to_value("&")), (13, lua.to_value("=")), (14, lua.to_value("+")), (15, lua.to_value("$")), (16, lua.to_value(","))])))
+local protect_segment = function(s: LuaValue): Array<LuaValue>
+    return __lua_force_array(string.gsub(s, lua.to_value("([^A-Za-z0-9_])"), function(c: LuaValue): Array<LuaValue>
+        if __lua_truthy(segment_set[c]) then
+            return __lua_pack([lua.to_value(c)])
+        else
+            return __lua_force_array(string.format(lua.to_value("%%%02X"), string.byte(c)))
+        end
+    end))
+end
+pub function unescape(s: LuaValue): Array<LuaValue>
+    return __lua_pack([lua.to_value(((__lua_first(string.gsub(s, lua.to_value("%%(%x%x)"), function(hex: LuaValue): Array<LuaValue>
+        return __lua_force_array(string.char(base.tonumber(hex, lua.to_value(16))))
+    end)))))])
+end
+_M.unescape = unescape
+local remove_dot_components = function(path: LuaValue): Array<LuaValue>
+    local marker = __lua_first(string.char(lua.to_value(1)))
+    while true do
+        local was = path
+        path = __lua_first(__lua_first(string.gsub(path, lua.to_value('//'), lua.op_concat(lua.to_value('/'), lua.op_concat(marker, lua.to_value('/'))), lua.to_value(1))))
+        if __lua_truthy(lua.op_eq(path, was)) then
+            break
+        end
+    end
+    while true do
+        local was = path
+        path = __lua_first(__lua_first(string.gsub(path, lua.to_value('/%./'), lua.to_value('/'), lua.to_value(1))))
+        if __lua_truthy(lua.op_eq(path, was)) then
+            break
+        end
+    end
+    while true do
+        local was = path
+        path = __lua_first(__lua_first(string.gsub(path, lua.to_value('[^/]+/%.%./([^/]+)'), lua.to_value('%1'), lua.to_value(1))))
+        if __lua_truthy(lua.op_eq(path, was)) then
+            break
+        end
+    end
+    path = __lua_first(__lua_first(string.gsub(path, lua.to_value('[^/]+/%.%./*$'), lua.to_value(''))))
+    path = __lua_first(__lua_first(string.gsub(path, lua.to_value('/%.%.$'), lua.to_value('/'))))
+    path = __lua_first(__lua_first(string.gsub(path, lua.to_value('/%.$'), lua.to_value('/'))))
+    path = __lua_first(__lua_first(string.gsub(path, lua.to_value('^/%.%./'), lua.to_value('/'))))
+    path = __lua_first(__lua_first(string.gsub(path, marker, lua.to_value(''))))
+    return __lua_pack([lua.to_value(path)])
+end
+local absolute_path = function(base_path: LuaValue, relative_path: LuaValue): Array<LuaValue>
+    if __lua_truthy(lua.op_eq(__lua_first(string.sub(relative_path, lua.to_value(1), lua.to_value(1))), lua.to_value("/" ))) then
+        return __lua_force_array(remove_dot_components(relative_path))
+    end
+    base_path = __lua_first(__lua_first(string.gsub(base_path, lua.to_value("[^/]*$"), lua.to_value(""))))
+    if __lua_truthy(not __lua_truthy(__lua_first(__lua_first(string.find(base_path, '/$' ))))) then
+        base_path = lua.op_concat(base_path, lua.to_value('/' ))
+    end
+    local path = lua.op_concat(base_path, relative_path)
+    path = __lua_first(remove_dot_components(path))
+    return __lua_pack([lua.to_value(path)])
+end
+pub function parse(url: LuaValue, default: LuaValue): Array<LuaValue>
+    local parsed = lua.table()
+    for i, v in __lua_first(base.pairs(__lua_or(default, parsed))) do
+        parsed[i] = v
+    end
+    if __lua_truthy(__lua_or(not __lua_truthy(url), lua.op_eq(url, lua.to_value("" )))) then
+        local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
+        return __lua_join(__lua_ret, [lua.to_value(lua.to_value("invalid url" ))])
+    end
+    -- remove whitespace
+    -- url = string.gsub(url, "%s", "")
+    -- get scheme
+    url = __lua_first(string.gsub(url, lua.to_value("^([%w][%w%+%-%.]*)%:"), function(s: LuaValue): Array<LuaValue>
+        parsed.scheme = s
+        return __lua_pack([lua.to_value(lua.to_value("" ))])
+    end))
+    -- get authority
+    url = __lua_first(string.gsub(url, lua.to_value("^//([^/]*)"), function(n: LuaValue): Array<LuaValue>
+        parsed.authority = n
+        return __lua_pack([lua.to_value(lua.to_value(""
+))])
+    end))
+    -- get fragment
+    url = __lua_first(string.gsub(url, lua.to_value("#(.*)$"), function(f: LuaValue): Array<LuaValue>
+        parsed.fragment = f
+        return __lua_pack([lua.to_value(lua.to_value(""
+))])
+    end))
+    -- get query string
+    url = __lua_first(string.gsub(url, lua.to_value("%?(.*)"), function(q: LuaValue): Array<LuaValue>
+        parsed.query = q
+        return __lua_pack([lua.to_value(lua.to_value(""
+))])
+    end))
+    -- get params
+    url = __lua_first(string.gsub(url, lua.to_value("%;(.*)"), function(p: LuaValue): Array<LuaValue>
+        parsed.params = p
+        return __lua_pack([lua.to_value(lua.to_value(""
+))])
+    end))
+    if __lua_truthy(lua.op_ne(url, lua.to_value("" ))) then
+        parsed.path = url
+    end
+    local authority = parsed.authority
+    if __lua_truthy(not __lua_truthy(authority)) then
+        return __lua_pack([lua.to_value(parsed)])
+    end
+    authority = __lua_first(string.gsub(authority, lua.to_value("^([^@]*)@"), function(u: LuaValue): Array<LuaValue>
+        parsed.userinfo = u
+        return __lua_pack([lua.to_value(lua.to_value("" ))])
+    end))
+    authority = __lua_first(string.gsub(authority, lua.to_value(":([^:%]]*)$"), function(p: LuaValue): Array<LuaValue>
+        parsed.port = p
+        return __lua_pack([lua.to_value(lua.to_value("" ))])
+    end))
+    if __lua_truthy(lua.op_ne(authority, lua.to_value("" ))) then
+        -- IPv6?
+        parsed.host = __lua_or(__lua_first(string["match"](authority, lua.to_value("^%[(.+)%]$"))), authority)
+    end
+    local userinfo = parsed.userinfo
+    if __lua_truthy(not __lua_truthy(userinfo)) then
+        return __lua_pack([lua.to_value(parsed)])
+    end
+    userinfo = __lua_first(string.gsub(userinfo, lua.to_value(":([^:]*)$"), function(p: LuaValue): Array<LuaValue>
+        parsed.password = p
+        return __lua_pack([lua.to_value(lua.to_value("" ))])
+    end))
+    parsed.user = userinfo
+    return __lua_pack([lua.to_value(parsed)])
+end
+_M.parse = parse
+pub function build(parsed: LuaValue): Array<LuaValue>
+    local url = __lua_or(parsed.path, lua.to_value(""
+))
+    if __lua_truthy(parsed.params) then
+        url = lua.op_concat(url, lua.op_concat(lua.to_value(";" ), parsed.params))
+    end
+    if __lua_truthy(parsed.query) then
+        url = lua.op_concat(url, lua.op_concat(lua.to_value("?" ), parsed.query))
+    end
+    local authority = parsed.authority
+    if __lua_truthy(parsed.host) then
+        authority = parsed.host
+        if __lua_truthy(__lua_first(string.find(authority, lua.to_value(":")))) then
+            authority = lua.op_concat(lua.to_value("[" ), lua.op_concat(authority, lua.to_value("]"
+)))
+        end
+        if __lua_truthy(parsed.port) then
+            authority = lua.op_concat(authority, lua.op_concat(lua.to_value(":" ), __lua_first(base.tostring(parsed.port))))
+        end
+        local userinfo = parsed.userinfo
+        if __lua_truthy(parsed.user) then
+            userinfo = parsed.user
+            if __lua_truthy(parsed.password) then
+                userinfo = lua.op_concat(userinfo, lua.op_concat(lua.to_value(":" ), parsed.password))
+            end
+        end
+        if __lua_truthy(userinfo) then
+            authority = lua.op_concat(userinfo, lua.op_concat(lua.to_value("@" ), authority))
+        end
+    end
+    if __lua_truthy(authority) then
+        url = lua.op_concat(lua.to_value("//" ), lua.op_concat(authority, url))
+    end
+    if __lua_truthy(parsed.scheme) then
+        url = lua.op_concat(parsed.scheme, lua.op_concat(lua.to_value(":" ), url))
+    end
+    if __lua_truthy(parsed.fragment) then
+        url = lua.op_concat(url, lua.op_concat(lua.to_value("#" ), parsed.fragment))
+    end
+    return __lua_pack([lua.to_value(url)])
+end
+_M.build = build
+pub function absolute(base_url: LuaValue, relative_url: LuaValue): Array<LuaValue>
+    local base_parsed
+    if __lua_truthy(lua.op_eq(__lua_first(base["type"](base_url)), lua.to_value("table" ))) then
+        base_parsed = base_url
+        base_url = __lua_first(_M.build(base_parsed))
+    else
+        base_parsed = __lua_first(_M.parse(base_url))
+    end
+    local result
+    local relative_parsed = __lua_first(_M.parse(relative_url))
+    if __lua_truthy(not __lua_truthy(base_parsed)) then
+        result = relative_url
+    elseif __lua_truthy(not __lua_truthy(relative_parsed)) then
+        result = base_url
+    elseif __lua_truthy(relative_parsed.scheme) then
+        result = relative_url
+    else
+        relative_parsed.scheme = base_parsed.scheme
+        if __lua_truthy(not __lua_truthy(relative_parsed.authority)) then
+            relative_parsed.authority = base_parsed.authority
+            if __lua_truthy(not __lua_truthy(relative_parsed.path)) then
+                relative_parsed.path = base_parsed.path
+                if __lua_truthy(not __lua_truthy(relative_parsed.params)) then
+                    relative_parsed.params = base_parsed.params
+                    if __lua_truthy(not __lua_truthy(relative_parsed.query)) then
+                        relative_parsed.query = base_parsed.query
+                    end
+                end
+            else
+                relative_parsed.path = __lua_first(absolute_path(__lua_or(base_parsed.path, lua.to_value("")), relative_parsed.path))
+            end
+        end
+        result = __lua_first(_M.build(relative_parsed))
+    end
+    return __lua_force_array(remove_dot_components(result))
+end
+_M.absolute = absolute
+pub function parse_path(path: LuaValue): Array<LuaValue>
+    local parsed = lua.table()
+    path = __lua_or(path, lua.to_value(""
+))
+    __lua_first(--path = string.gsub(path, "%s", "")
+    string.gsub(path, lua.to_value("([^/]+)"), function(s: LuaValue): Array<LuaValue>
+        __lua_first(parsed:push(s))
+    end))
+    for i = lua.to_value(1), (parsed):len(), 1 do
+        parsed[i] = __lua_first(_M.unescape(parsed[i]))
+    end
+    if __lua_truthy(lua.op_eq(__lua_first(string.sub(path, lua.to_value(1), lua.to_value(1))), lua.to_value("/" ))) then
+        parsed.is_absolute = lua.to_value(1 )
+    end
+    if __lua_truthy(lua.op_eq(__lua_first(string.sub(path, lua.op_neg(lua.to_value(1)), lua.op_neg(lua.to_value(1)))), lua.to_value("/" ))) then
+        parsed.is_directory = lua.to_value(1 )
+    end
+    return __lua_pack([lua.to_value(parsed)])
+end
+_M.parse_path = parse_path
+pub function build_path(parsed: LuaValue, unsafe_: LuaValue): Array<LuaValue>
+    local path = lua.to_value(""
+)
+    local n = (parsed):len()
+    if __lua_truthy(unsafe_) then
+        for i = lua.to_value(1), lua.op_sub(n, lua.to_value(1 )), 1 do
+            path = lua.op_concat(path, parsed[i])
+            path = lua.op_concat(path, lua.to_value("/"
+))
+        end
+        if __lua_truthy(lua.op_gt(n, lua.to_value(0 ))) then
+            path = lua.op_concat(path, parsed[n])
+            if __lua_truthy(parsed.is_directory) then
+                path = lua.op_concat(path, lua.to_value("/" ))
+            end
+        end
+    else
+        for i = lua.to_value(1), lua.op_sub(n, lua.to_value(1 )), 1 do
+            path = lua.op_concat(path, __lua_first(protect_segment(parsed[i])))
+            path = lua.op_concat(path, lua.to_value("/"
+))
+        end
+        if __lua_truthy(lua.op_gt(n, lua.to_value(0 ))) then
+            path = lua.op_concat(path, __lua_first(protect_segment(parsed[n])))
+            if __lua_truthy(parsed.is_directory) then
+                path = lua.op_concat(path, lua.to_value("/" ))
+            end
+        end
+    end
+    if __lua_truthy(parsed.is_absolute) then
+        path = lua.op_concat(lua.to_value("/" ), path)
+    end
+    return __lua_pack([lua.to_value(path)])
+end
+_M.build_path = build_path
+pub const url: LuaValue = socket.url
+return __lua_pack([lua.to_value(_M)])

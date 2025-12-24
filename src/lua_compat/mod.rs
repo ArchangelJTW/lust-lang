@@ -1,3 +1,4 @@
+#![allow(non_snake_case, non_camel_case_types)]
 //! Lua 5.1 C API compatibility scaffolding.
 //! This module will host the runtime bridge and tracing that drive extern stub generation.
 
@@ -554,7 +555,8 @@ fn register_lua_closure(
                 if let Some(handle) = f.lust_handle {
                     // Call through the Lust function registry
                     if let Some(lust_func) = lookup_lust_function(handle) {
-                        let lust_args: Result<Vec<Value>, String> = lua_args.iter()
+                        let lust_args: Result<Vec<Value>, String> = lua_args
+                            .iter()
                             .map(|v| lua_to_lust(v, vm, Some(state_cell.clone())))
                             .collect();
 
@@ -569,13 +571,22 @@ fn register_lua_closure(
                                         };
 
                                         // Convert back to Lust values
-                                        let lust_results: Result<Vec<Value>, String> = results.iter()
+                                        let lust_results: Result<Vec<Value>, String> = results
+                                            .iter()
                                             .map(|v| lua_to_lust(v, vm, Some(state_cell.clone())))
                                             .collect();
 
                                         match lust_results {
-                                            Ok(vals) if vals.len() == 1 => Ok(crate::bytecode::value::NativeCallResult::Return(vals[0].clone())),
-                                            Ok(vals) if vals.is_empty() => Ok(crate::bytecode::value::NativeCallResult::Return(Value::Nil)),
+                                            Ok(vals) if vals.len() == 1 => Ok(
+                                                crate::bytecode::value::NativeCallResult::Return(
+                                                    vals[0].clone(),
+                                                ),
+                                            ),
+                                            Ok(vals) if vals.is_empty() => Ok(
+                                                crate::bytecode::value::NativeCallResult::Return(
+                                                    Value::Nil,
+                                                ),
+                                            ),
                                             Ok(vals) => {
                                                 let arr = Rc::new(RefCell::new(vals));
                                                 Ok(crate::bytecode::value::NativeCallResult::Return(Value::Array(arr)))
@@ -691,9 +702,13 @@ fn lua_to_lust_cached(
         }
         LuaValue::Userdata(data) => {
             let metamethods_value = vm.new_map_value();
-            let userdata_meta = state
-                .as_ref()
-                .and_then(|cell| cell.borrow().state.userdata_metamethods.get(&data.id).cloned());
+            let userdata_meta = state.as_ref().and_then(|cell| {
+                cell.borrow()
+                    .state
+                    .userdata_metamethods
+                    .get(&data.id)
+                    .cloned()
+            });
             if let Some(meta) = userdata_meta {
                 for (name, meta_value) in meta {
                     let converted =
@@ -777,7 +792,10 @@ fn lua_table_to_struct_cached(
             "LuaTable",
             vec![
                 (Rc::new("table".to_string()), table_value.clone()),
-                (Rc::new("metamethods".to_string()), metamethods_value.clone()),
+                (
+                    Rc::new("metamethods".to_string()),
+                    metamethods_value.clone(),
+                ),
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -790,12 +808,8 @@ fn lua_table_to_struct_cached(
             // Table keys should behave like Lua keys (string/number/bool, etc.). Using the LuaValue
             // wrapper enum directly as a key is problematic because enum keys currently compare by
             // payload-pointer identity. Unwrap keys into their raw underlying values instead.
-            let key_val = unwrap_lua_value_for_key(lua_to_lust_cached(
-                key,
-                vm,
-                state.clone(),
-                table_cache,
-            )?);
+            let key_val =
+                unwrap_lua_value_for_key(lua_to_lust_cached(key, vm, state.clone(), table_cache)?);
             let value_val = lua_to_lust_cached(value, vm, state.clone(), table_cache)?;
             table_value
                 .map_set(ValueKey::from(key_val), value_val)
@@ -1308,10 +1322,7 @@ pub fn trace_luaopen(spec: &LuaModuleSpec) -> Result<Vec<LuaOpenResult>, String>
             let shared_state: Rc<RefCell<Box<lua_State>>> =
                 Rc::new(RefCell::new(Box::from_raw(state_ptr)));
             let mut boxed = shared_state.borrow_mut();
-            boxed
-                .state
-                .libraries
-                .push(library.clone());
+            boxed.state.libraries.push(library.clone());
             let mut returns = Vec::new();
             let count = if ret_count < 0 { 0 } else { ret_count as usize };
             for _ in 0..count {
@@ -1688,7 +1699,9 @@ pub unsafe extern "C" fn lua_tointeger(L: *mut lua_State, idx: c_int) -> lua_Int
         match value_at(state, idx) {
             Some(LuaValue::Int(i)) => i,
             Some(LuaValue::Float(f)) => f as lua_Integer,
-            Some(LuaValue::String(s)) => parse_lua_number(&s).map(|v| v as lua_Integer).unwrap_or(0),
+            Some(LuaValue::String(s)) => {
+                parse_lua_number(&s).map(|v| v as lua_Integer).unwrap_or(0)
+            }
             _ => 0,
         }
     } else {
@@ -2407,10 +2420,7 @@ pub unsafe extern "C" fn lua_pcall(
         }
 
         state.stack.truncate(base_len);
-        state.record_call(
-            "lua_pcall",
-            vec![nargs.to_string(), nresults.to_string()],
-        );
+        state.record_call("lua_pcall", vec![nargs.to_string(), nresults.to_string()]);
 
         if let Some(err) = error_obj {
             state.push(err);
@@ -2985,7 +2995,10 @@ mod tests {
             lua_replace(L, -1);
             assert_eq!(lua_gettop(L), 2);
             let state = state_from_ptr(L).unwrap();
-            assert!(matches!(state.stack.as_slice(), [LuaValue::Int(1), LuaValue::Int(2)]));
+            assert!(matches!(
+                state.stack.as_slice(),
+                [LuaValue::Int(1), LuaValue::Int(2)]
+            ));
             lua_close(L);
         }
     }
@@ -3001,7 +3014,10 @@ mod tests {
             lua_replace(L, 1);
             assert_eq!(lua_gettop(L), 2);
             let state = state_from_ptr(L).unwrap();
-            assert!(matches!(state.stack.as_slice(), [LuaValue::Int(3), LuaValue::Int(2)]));
+            assert!(matches!(
+                state.stack.as_slice(),
+                [LuaValue::Int(3), LuaValue::Int(2)]
+            ));
             lua_close(L);
         }
     }
@@ -3014,7 +3030,11 @@ mod tests {
             let mut b: luaL_Buffer = core::mem::zeroed();
             luaL_buffinit(L, &mut b as *mut luaL_Buffer);
             let prefix = b"HTTP/\0";
-            luaL_addlstring(&mut b as *mut luaL_Buffer, prefix.as_ptr() as *const c_char, 5);
+            luaL_addlstring(
+                &mut b as *mut luaL_Buffer,
+                prefix.as_ptr() as *const c_char,
+                5,
+            );
 
             let p = luaL_prepbuffer(&mut b as *mut luaL_Buffer) as *mut u8;
             assert!(!p.is_null());
@@ -3062,7 +3082,11 @@ pub unsafe extern "C" fn lua_newuserdata(L: *mut lua_State, sz: usize) -> *mut c
         let mut blob: Box<[usize]> = vec![0usize; words].into_boxed_slice();
         let ptr = blob.as_mut_ptr() as *mut c_void;
         state.userdata_storage.insert(id, (blob, sz));
-        state.push(LuaValue::Userdata(LuaUserdata { id, data: ptr, state: L }));
+        state.push(LuaValue::Userdata(LuaUserdata {
+            id,
+            data: ptr,
+            state: L,
+        }));
         state.record_call("lua_newuserdata", vec![sz.to_string()]);
         return ptr;
     }

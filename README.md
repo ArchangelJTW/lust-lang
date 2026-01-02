@@ -52,6 +52,13 @@ fn main() -> lust::Result<()> {
 }
 ```
 
+If you register native APIs with export metadata (via `VM::register_exported_native` / `VM::record_exported_native`, or the embedding helpers like `EmbeddedProgram::register_typed_native`),
+you can write Lust-readable extern stubs to disk from your embedder:
+
+```rust
+let _ = program.dump_externs_to_dir("externs");
+```
+
 The `is` helper works the way you expect:
 
 ```lust

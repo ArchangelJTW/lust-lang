@@ -7,6 +7,7 @@ use crate::ast::{Span, Type, TypeKind};
 use crate::bytecode::Value;
 use crate::number::{LustFloat, LustInt};
 use crate::{LustError, Result};
+use std::any::TypeId;
 use std::rc::Rc;
 
 fn struct_field_type_error(field: &str, expected: &str, actual: &Value) -> LustError {
@@ -422,6 +423,20 @@ impl FromLustValue for Value {
 
     fn type_description() -> &'static str {
         "Value"
+    }
+}
+
+impl IntoLustValue for () {
+    fn into_value(self) -> Value {
+        Value::Nil
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        matches!(ty.kind, TypeKind::Unit | TypeKind::Unknown)
+    }
+
+    fn type_description() -> &'static str {
+        "unit"
     }
 }
 
@@ -906,27 +921,25 @@ impl FromLustValue for () {
     }
 }
 
-impl FunctionArgs for () {
-    fn into_values(self) -> Vec<Value> {
-        Vec::new()
-    }
-
-    fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
-        ensure_arity(function_name, params, 0)
-    }
-}
-
 impl<T> FunctionArgs for T
 where
-    T: IntoLustValue,
+    T: IntoLustValue + 'static,
 {
     fn into_values(self) -> Vec<Value> {
-        vec![self.into_value()]
+        if TypeId::of::<T>() == TypeId::of::<()>() {
+            Vec::new()
+        } else {
+            vec![self.into_value()]
+        }
     }
 
     fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
-        ensure_arity(function_name, params, 1)?;
-        ensure_arg_type::<T>(function_name, params, 0)
+        if TypeId::of::<T>() == TypeId::of::<()>() {
+            ensure_arity(function_name, params, 0)
+        } else {
+            ensure_arity(function_name, params, 1)?;
+            ensure_arg_type::<T>(function_name, params, 0)
+        }
     }
 }
 

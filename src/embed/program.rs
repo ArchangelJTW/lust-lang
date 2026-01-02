@@ -14,11 +14,12 @@ use crate::ast::{
 use crate::bytecode::{Compiler, NativeCallResult, Value};
 use crate::modules::{ModuleImports, ModuleLoader};
 use crate::typechecker::{FunctionSignature, TypeChecker};
-use crate::vm::VM;
+use crate::vm::{NativeExport, NativeExportParam, VM};
 use crate::{LustConfig, LustError, Result};
 use hashbrown::HashMap;
 use std::cell::RefCell;
 use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::task::{Context, Poll};
@@ -204,6 +205,10 @@ impl EmbeddedProgram {
 
     pub fn vm_mut(&mut self) -> &mut VM {
         &mut self.vm
+    }
+
+    pub fn dump_externs_to_dir(&self, output_root: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
+        self.vm.dump_externs_to_dir(output_root)
     }
 
     pub(crate) fn vm(&self) -> &VM {
@@ -591,6 +596,8 @@ impl EmbeddedProgram {
         }
 
         ensure_return_type::<R>(name, &signature.return_type)?;
+        self.vm
+            .record_exported_native(native_export_from_signature(&canonical, &signature));
         let handler = move |values: &[Value]| -> std::result::Result<NativeCallResult, String> {
             let args = Args::from_values(values)?;
             let result = func(args)?;
@@ -613,6 +620,8 @@ impl EmbeddedProgram {
     {
         let (canonical, signature) = self.resolve_signature(name)?;
         let signature = signature.clone();
+        self.vm
+            .record_exported_native(native_export_from_signature(&canonical, &signature));
         if !Args::matches_signature(&signature.params) {
             return Err(LustError::TypeError {
                 message: format!(
@@ -665,6 +674,8 @@ impl EmbeddedProgram {
     {
         let (canonical, signature) = self.resolve_signature(name)?;
         let signature = signature.clone();
+        self.vm
+            .record_exported_native(native_export_from_signature(&canonical, &signature));
         if !Args::matches_signature(&signature.params) {
             return Err(LustError::TypeError {
                 message: format!(
@@ -708,6 +719,8 @@ impl EmbeddedProgram {
     {
         let (canonical, signature) = self.resolve_signature(name)?;
         let signature = signature.clone();
+        self.vm
+            .record_exported_native(native_export_from_signature(&canonical, &signature));
         if !Args::matches_signature(&signature.params) {
             return Err(LustError::TypeError {
                 message: format!(
@@ -996,4 +1009,28 @@ pub(crate) fn ensure_return_type<R: FromLustValue>(function_name: &str, ty: &Typ
             R::type_description()
         ),
     })
+}
+
+fn normalize_extern_type_string(mut ty: String) -> String {
+    if ty.starts_with("function(") && ty.ends_with(": ()") {
+        ty.truncate(ty.len().saturating_sub(4));
+    }
+    ty
+}
+
+fn native_export_from_signature(canonical_name: &str, signature: &FunctionSignature) -> NativeExport {
+    let name = canonical_name.replace("::", ".");
+    let params = signature
+        .params
+        .iter()
+        .enumerate()
+        .map(|(idx, ty)| {
+            NativeExportParam::new(
+                format!("arg{idx}"),
+                normalize_extern_type_string(ty.to_string()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let return_type = normalize_extern_type_string(signature.return_type.to_string());
+    NativeExport::new(name, params, return_type)
 }

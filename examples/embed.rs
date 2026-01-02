@@ -290,5 +290,12 @@ fn main() -> lust::Result<()> {
         }
     }
 
+    if let Ok(dir) = std::env::var("LUST_DUMP_EXTERNS") {
+        let written = program
+            .dump_externs_to_dir(&dir)
+            .map_err(|err| lust::LustError::Unknown(format!("dump externs: {err}")))?;
+        println!("Wrote {} extern stub file(s) under {}", written.len(), dir);
+    }
+
     Ok(())
 }

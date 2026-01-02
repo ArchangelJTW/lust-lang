@@ -21,3 +21,7 @@ echo ""
 
 echo "==Rhai=="
 time rhai-run ./benchmarks/"$benchmark_name"/benchmark.rhai
+echo ""
+
+echo "==Wren=="
+time wren_cli ./benchmarks/"$benchmark_name"/benchmark.wren

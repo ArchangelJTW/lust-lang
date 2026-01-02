@@ -315,11 +315,7 @@ impl VM {
         self.current_export_prefix().map(|s| s.to_string())
     }
 
-    pub fn register_exported_native<F>(&mut self, export: NativeExport, func: F)
-    where
-        F: Fn(&[Value]) -> CoreResult<NativeCallResult, String> + 'static,
-    {
-        let mut export = export;
+    fn canonicalize_export_name(&self, export: &mut NativeExport) {
         if let Some(prefix) = self.current_export_prefix() {
             let needs_prefix = match export.name.strip_prefix(prefix) {
                 Some(rest) => {
@@ -339,8 +335,28 @@ impl VM {
                 };
             }
         }
-        let name = export.name.clone();
+    }
+
+    fn push_export_metadata(&mut self, export: NativeExport) {
+        if self.exported_natives.iter().any(|existing| existing.name == export.name) {
+            return;
+        }
         self.exported_natives.push(export);
+    }
+
+    pub fn record_exported_native(&mut self, mut export: NativeExport) {
+        self.canonicalize_export_name(&mut export);
+        self.push_export_metadata(export);
+    }
+
+    pub fn register_exported_native<F>(&mut self, export: NativeExport, func: F)
+    where
+        F: Fn(&[Value]) -> CoreResult<NativeCallResult, String> + 'static,
+    {
+        let mut export = export;
+        self.canonicalize_export_name(&mut export);
+        let name = export.name.clone();
+        self.push_export_metadata(export);
         let native = Value::NativeFunction(Rc::new(func));
         self.register_native(name, native);
     }
@@ -350,6 +366,10 @@ impl VM {
             return;
         }
         self.exported_type_stubs.extend(stubs);
+    }
+
+    pub fn exported_type_stubs(&self) -> &[ModuleStub] {
+        &self.exported_type_stubs
     }
 
     pub fn take_type_stubs(&mut self) -> Vec<ModuleStub> {
@@ -367,6 +387,27 @@ impl VM {
     pub fn clear_native_functions(&mut self) {
         self.natives.clear();
         self.exported_type_stubs.clear();
+    }
+
+    #[cfg(feature = "std")]
+    pub fn dump_externs_to_dir(
+        &self,
+        output_root: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<Vec<std::path::PathBuf>> {
+        self.dump_externs_to_dir_with_options(
+            output_root,
+            &crate::externs::DumpExternsOptions::default(),
+        )
+    }
+
+    #[cfg(feature = "std")]
+    pub fn dump_externs_to_dir_with_options(
+        &self,
+        output_root: impl AsRef<std::path::Path>,
+        options: &crate::externs::DumpExternsOptions,
+    ) -> std::io::Result<Vec<std::path::PathBuf>> {
+        let files = crate::externs::extern_files_from_vm(self, options);
+        crate::externs::write_extern_files(output_root, &files)
     }
 
     pub fn get_global(&self, name: &str) -> Option<Value> {

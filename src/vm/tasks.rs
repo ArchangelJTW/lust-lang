@@ -234,6 +234,144 @@ impl VM {
         Ok(handle)
     }
 
+    pub fn spawn_tick_task(&mut self, function_name: &str) -> Result<TaskHandle> {
+        let canonical = if function_name.contains("::") {
+            function_name.replace("::", ".")
+        } else {
+            function_name.to_string()
+        };
+        let func_idx = self
+            .functions
+            .iter()
+            .position(|f| f.name == canonical)
+            .ok_or_else(|| LustError::RuntimeError {
+                message: format!("Function not found: {}", function_name),
+            })?;
+
+        let yield_fn = self
+            .globals
+            .get("task")
+            .cloned()
+            .and_then(|task| match task {
+                Value::Map(map) => map
+                    .borrow()
+                    .get(&ValueKey::string("yield".to_string()))
+                    .cloned(),
+                _ => None,
+            })
+            .ok_or_else(|| LustError::RuntimeError {
+                message: "Missing corelib 'task.yield' (task module not installed?)".to_string(),
+            })?;
+
+        if !matches!(yield_fn, Value::NativeFunction(_)) {
+            return Err(LustError::RuntimeError {
+                message: "corelib 'task.yield' is not a native function".to_string(),
+            });
+        }
+
+        let wrapper_name = format!("__jit_tick_driver_{}", func_idx);
+        let wrapper_idx = match self.functions.iter().position(|f| f.name == wrapper_name) {
+            Some(existing) => existing,
+            None => {
+                let target = &self.functions[func_idx];
+                let arg_count = target.param_count;
+
+                let mut wrapper = Function::new(wrapper_name, 0, false);
+
+                let resume_reg: Register = 0;
+                let tick_fn_reg: Register = 1;
+                let yield_fn_reg: Register = 2;
+                let idx_reg: Register = 3;
+                let arg_base: Register = 4;
+                let result_reg: Register = arg_base.saturating_add(arg_count);
+
+                let required_registers = (result_reg as u16 + 1).min(256) as u8;
+                wrapper.set_register_count(required_registers);
+
+                let tick_const = wrapper.chunk.add_constant(Value::Function(func_idx));
+                let yield_const = wrapper.chunk.add_constant(yield_fn);
+                let mut index_consts = Vec::new();
+                if arg_count > 1 {
+                    for i in 0..(arg_count as i64) {
+                        index_consts.push(wrapper.chunk.add_constant(Value::Int(i)));
+                    }
+                }
+
+                wrapper
+                    .chunk
+                    .emit(Instruction::LoadConst(tick_fn_reg, tick_const), 0);
+                wrapper
+                    .chunk
+                    .emit(Instruction::LoadConst(yield_fn_reg, yield_const), 0);
+
+                // Prime the task so the host can immediately supply the first tick's argument via resume().
+                wrapper
+                    .chunk
+                    .emit(Instruction::Call(yield_fn_reg, 0, 0, resume_reg), 0);
+
+                let loop_start = wrapper.chunk.instructions.len();
+
+                match arg_count {
+                    0 => {
+                        wrapper
+                            .chunk
+                            .emit(Instruction::Call(tick_fn_reg, 0, 0, result_reg), 0);
+                    }
+                    1 => {
+                        wrapper.chunk.emit(
+                            Instruction::Call(tick_fn_reg, resume_reg, 1, result_reg),
+                            0,
+                        );
+                    }
+                    _ => {
+                        // For N>1, expect resume() to pass an Array of arguments.
+                        for (i, const_idx) in index_consts.iter().enumerate() {
+                            wrapper
+                                .chunk
+                                .emit(Instruction::LoadConst(idx_reg, *const_idx), 0);
+                            wrapper.chunk.emit(
+                                Instruction::GetIndex(arg_base + i as u8, resume_reg, idx_reg),
+                                0,
+                            );
+                        }
+                        wrapper.chunk.emit(
+                            Instruction::Call(tick_fn_reg, arg_base, arg_count, result_reg),
+                            0,
+                        );
+                    }
+                }
+
+                // Yield the on_tick() result back to the host; resume() will write the next tick arg into resume_reg.
+                wrapper.chunk.emit(
+                    Instruction::Call(yield_fn_reg, result_reg, 1, resume_reg),
+                    0,
+                );
+
+                let jump_idx = wrapper.chunk.emit(Instruction::Jump(0), 0);
+                wrapper.chunk.patch_jump(jump_idx, loop_start);
+
+                let new_idx = self.functions.len();
+                self.functions.push(wrapper);
+                new_idx
+            }
+        };
+
+        self.spawn_task_value(Value::Function(wrapper_idx), Vec::new())
+    }
+
+    pub fn tick_task(&mut self, handle: TaskHandle, resume_value: Value) -> Result<Value> {
+        self.resume_task_handle(handle, Some(resume_value))?;
+        let task = self.get_task_instance(handle)?;
+        match task.state {
+            TaskState::Yielded => Ok(task.last_yield.clone().unwrap_or(Value::Nil)),
+            TaskState::Completed | TaskState::Stopped => Ok(task.last_result.clone().unwrap_or(Value::Nil)),
+            TaskState::Ready | TaskState::Running => Ok(Value::Nil),
+            TaskState::Failed => Err(task.error.clone().unwrap_or_else(|| LustError::RuntimeError {
+                message: "Task failed".to_string(),
+            })),
+        }
+    }
+
     pub fn resume_task_handle(
         &mut self,
         handle: TaskHandle,

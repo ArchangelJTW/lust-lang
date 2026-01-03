@@ -167,6 +167,13 @@ impl VM {
                         });
 
                         if result == 0 {
+                            if self.current_task.is_some() && self.pending_task_signal.is_some() {
+                                if let Some(frame) = self.call_stack.last_mut() {
+                                    frame.ip = ip_before_execution.saturating_sub(1);
+                                }
+                                continue;
+                            }
+
                             if let Some(frame) = self.call_stack.last_mut() {
                                 frame.ip = loop_start_ip;
                             }

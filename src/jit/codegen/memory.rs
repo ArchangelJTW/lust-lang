@@ -389,6 +389,7 @@ impl JitCompiler {
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
         let first_arg_offset = (first_arg as i32) * (mem::size_of::<Value>() as i32);
         let arg_count_i32 = arg_count as i32;
+        let exit_label = self.current_exit_label();
         extern "C" {
             fn jit_call_native_safe(
                 vm_ptr: *mut crate::VM,
@@ -409,8 +410,16 @@ impl JitCompiler {
             ; lea r9, [r12 + dest_offset]
             ; mov rax, QWORD jit_call_native_safe as _
             ; call rax
+            ; cmp al, BYTE 2
+            ; je >native_yield
+            ; cmp al, BYTE 3
+            ; je >native_yield
             ; test al, al
             ; jz >fail
+            ; jmp >native_ok
+            ; native_yield:
+            ; jmp => exit_label
+            ; native_ok:
         );
 
         Ok(())

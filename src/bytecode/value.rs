@@ -1964,14 +1964,51 @@ pub unsafe extern "C" fn jit_call_native_safe(
             1
         }
 
-        NativeCallResult::Yield(_) => {
-            jit::log(|| "jit_call_native_safe: native attempted to yield".to_string());
-            0
+        NativeCallResult::Yield(value) => {
+            let vm = &mut *vm_ptr;
+            if vm.current_task.is_none() {
+                jit::log(|| "jit_call_native_safe: native attempted to yield outside a task".to_string());
+                return 0;
+            }
+
+            let dest_reg = vm.call_stack.last().and_then(|frame| {
+                let base = frame.registers.as_ptr() as usize;
+                let out_ptr = out as usize;
+                let value_size = core::mem::size_of::<Value>();
+                let end = base + value_size * frame.registers.len();
+                if out_ptr < base || out_ptr >= end {
+                    return None;
+                }
+                let offset = out_ptr - base;
+                if offset % value_size != 0 {
+                    return None;
+                }
+                let reg = offset / value_size;
+                if reg > u8::MAX as usize {
+                    return None;
+                }
+                Some(reg as u8)
+            });
+            let Some(dest_reg) = dest_reg else {
+                jit::log(|| "jit_call_native_safe: could not compute dest register for yield".to_string());
+                return 0;
+            };
+
+            ptr::write(out, Value::Nil);
+            vm.pending_task_signal = Some(crate::vm::TaskSignal::Yield { dest: dest_reg, value });
+            2
         }
 
-        NativeCallResult::Stop(_) => {
-            jit::log(|| "jit_call_native_safe: native attempted to stop".to_string());
-            0
+        NativeCallResult::Stop(value) => {
+            let vm = &mut *vm_ptr;
+            if vm.current_task.is_none() {
+                jit::log(|| "jit_call_native_safe: native attempted to stop outside a task".to_string());
+                return 0;
+            }
+
+            ptr::write(out, Value::Nil);
+            vm.pending_task_signal = Some(crate::vm::TaskSignal::Stop { value });
+            3
         }
     }
 }

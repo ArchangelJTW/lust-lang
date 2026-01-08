@@ -29,10 +29,7 @@ impl BudgetState {
         if let Some(limit) = self.gas.limit {
             if self.gas.used > limit {
                 return Err(LustError::RuntimeError {
-                    message: format!(
-                        "Out of gas (limit: {}, used: {})",
-                        limit, self.gas.used
-                    ),
+                    message: format!("Out of gas (limit: {}, used: {})", limit, self.gas.used),
                 });
             }
         }
@@ -186,7 +183,11 @@ impl VM {
         self.budgets.try_charge_value_vec(element_count)
     }
 
-    pub(crate) fn try_charge_memory_vec_growth<T>(&mut self, old_cap: usize, new_cap: usize) -> bool {
+    pub(crate) fn try_charge_memory_vec_growth<T>(
+        &mut self,
+        old_cap: usize,
+        new_cap: usize,
+    ) -> bool {
         self.budgets.try_charge_vec_growth::<T>(old_cap, new_cap)
     }
 }
@@ -211,7 +212,7 @@ mod tests {
             .entry_module("main")
             .compile()?;
 
-        program.vm_mut().set_gas_budget(10);
+        program.vm_mut().set_gas_budget(30);
         program.vm_mut().reset_gas_counter();
         let err = program.call_raw("main.spin", vec![]).unwrap_err();
         match err {

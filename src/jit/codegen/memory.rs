@@ -296,6 +296,7 @@ impl JitCompiler {
 
         extern "C" {
             fn jit_new_array_safe(
+                vm_ptr: *mut crate::VM,
                 elements_ptr: *const Value,
                 element_count: usize,
                 out: *mut Value,
@@ -304,9 +305,10 @@ impl JitCompiler {
 
         // r12 is callee-saved per System V ABI, so we don't need to save it
         dynasm!(self.ops
-            ; lea rdi, [r12 + first_elem_offset]    // elements_ptr (ignored if count == 0)
-            ; mov rsi, QWORD count_usize as _        // element_count
-            ; lea rdx, [r12 + dest_offset]           // out_ptr
+            ; mov rdi, r13                           // vm_ptr
+            ; lea rsi, [r12 + first_elem_offset]     // elements_ptr (ignored if count == 0)
+            ; mov rdx, QWORD count_usize as _        // element_count
+            ; lea rcx, [r12 + dest_offset]           // out_ptr
             ; mov rax, QWORD jit_new_array_safe as _
             ; call rax
             ; test al, al
@@ -321,13 +323,18 @@ impl JitCompiler {
         let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
 
         extern "C" {
-            fn jit_array_push_safe(array_ptr: *const Value, value_ptr: *const Value) -> u8;
+            fn jit_array_push_safe(
+                vm_ptr: *mut crate::VM,
+                array_ptr: *const Value,
+                value_ptr: *const Value,
+            ) -> u8;
         }
 
         // Guards have already verified the type, so directly call the helper
         dynasm!(self.ops
-            ; lea rdi, [r12 + array_offset]
-            ; lea rsi, [r12 + value_offset]
+            ; mov rdi, r13
+            ; lea rsi, [r12 + array_offset]
+            ; lea rdx, [r12 + value_offset]
             ; mov rax, QWORD jit_array_push_safe as _
             ; call rax
             ; test al, al
@@ -627,6 +634,7 @@ impl JitCompiler {
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
         extern "C" {
             fn jit_new_enum_unit_safe(
+                vm_ptr: *mut crate::VM,
                 enum_name_ptr: *const u8,
                 enum_name_len: usize,
                 variant_name_ptr: *const u8,
@@ -641,11 +649,12 @@ impl JitCompiler {
         let variant_name_ptr = variant_name_box.as_ptr();
         let variant_name_len = variant_name_box.len();
         dynasm!(self.ops
-            ; mov rdi, QWORD enum_name_ptr as _
-            ; mov rsi, QWORD enum_name_len as _
-            ; mov rdx, QWORD variant_name_ptr as _
-            ; mov rcx, QWORD variant_name_len as _
-            ; lea r8, [r12 + dest_offset]
+            ; mov rdi, r13
+            ; mov rsi, QWORD enum_name_ptr as _
+            ; mov rdx, QWORD enum_name_len as _
+            ; mov rcx, QWORD variant_name_ptr as _
+            ; mov r8, QWORD variant_name_len as _
+            ; lea r9, [r12 + dest_offset]
             ; mov rax, QWORD jit_new_enum_unit_safe as _
             ; call rax
             ; test al, al
@@ -664,6 +673,7 @@ impl JitCompiler {
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
         extern "C" {
             fn jit_new_enum_variant_safe(
+                vm_ptr: *mut crate::VM,
                 enum_name_ptr: *const u8,
                 enum_name_len: usize,
                 variant_name_ptr: *const u8,
@@ -688,18 +698,20 @@ impl JitCompiler {
             (0, 0)
         };
         dynasm!(self.ops
-            ; mov rdi, QWORD enum_name_ptr as _
-            ; mov rsi, QWORD enum_name_len as _
-            ; mov rdx, QWORD variant_name_ptr as _
-            ; mov rcx, QWORD variant_name_len as _
-            ; lea r8, [r12 + first_value_offset]
-            ; mov r9, QWORD value_count as _
-            ; sub rsp, 16
-            ; lea rax, [r12 + dest_offset]
+            ; mov rdi, r13
+            ; mov rsi, QWORD enum_name_ptr as _
+            ; mov rdx, QWORD enum_name_len as _
+            ; mov rcx, QWORD variant_name_ptr as _
+            ; mov r8, QWORD variant_name_len as _
+            ; lea r9, [r12 + first_value_offset]
+            ; sub rsp, 32
+            ; mov rax, QWORD value_count as _
             ; mov [rsp], rax
+            ; lea rax, [r12 + dest_offset]
+            ; mov [rsp + 8], rax
             ; mov rax, QWORD jit_new_enum_variant_safe as _
             ; call rax
-            ; add rsp, 16
+            ; add rsp, 32
             ; test al, al
             ; jz >fail
         );

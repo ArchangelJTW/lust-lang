@@ -124,13 +124,19 @@ impl JitCompiler {
         let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
         extern "C" {
-            fn jit_concat_safe(left: *const Value, right: *const Value, out: *mut Value) -> u8;
+            fn jit_concat_safe(
+                vm_ptr: *mut crate::VM,
+                left: *const Value,
+                right: *const Value,
+                out: *mut Value,
+            ) -> u8;
         }
 
         dynasm!(self.ops
-            ; lea rdi, [r12 + lhs_offset]
-            ; lea rsi, [r12 + rhs_offset]
-            ; lea rdx, [r12 + dest_offset]
+            ; mov rdi, r13
+            ; lea rsi, [r12 + lhs_offset]
+            ; lea rdx, [r12 + rhs_offset]
+            ; lea rcx, [r12 + dest_offset]
             ; mov rax, QWORD jit_concat_safe as _
             ; call rax
             ; test al, al

@@ -151,6 +151,18 @@ impl VM {
                             )
                         });
 
+                        let trace_gas_cost = self
+                            .jit
+                            .get_trace(trace_id)
+                            .map(|t| {
+                                let cost = t.trace.ops.len()
+                                    + t.trace.preamble.len()
+                                    + t.trace.postamble.len();
+                                core::cmp::max(1, cost) as u64
+                            })
+                            .unwrap_or(1);
+                        self.budgets.charge_gas(trace_gas_cost)?;
+
                         // Capture RSP before and after to detect stack leaks
                         let rsp_before: usize;
                         unsafe { std::arch::asm!("mov {}, rsp", out(reg) rsp_before) };
@@ -197,6 +209,17 @@ impl VM {
                                 let registers_ptr = frame.registers.as_mut_ptr();
                                 let side_entry = self.jit.get_trace(side_trace_id).map(|t| t.entry);
                                 if let Some(side_entry_fn) = side_entry {
+                                    let side_trace_gas_cost = self
+                                        .jit
+                                        .get_trace(side_trace_id)
+                                        .map(|t| {
+                                            let cost = t.trace.ops.len()
+                                                + t.trace.preamble.len()
+                                                + t.trace.postamble.len();
+                                            core::cmp::max(1, cost) as u64
+                                        })
+                                        .unwrap_or(1);
+                                    self.budgets.charge_gas(side_trace_gas_cost)?;
                                     let side_result =
                                         side_entry_fn(registers_ptr, self as *mut VM, ptr::null());
                                     if side_result == 0 {
@@ -371,6 +394,7 @@ impl VM {
                 }
             }
 
+            self.budgets.charge_gas(1)?;
             match instruction {
                 Instruction::LoadNil(dest) => {
                     self.set_register(dest, Value::Nil)?;
@@ -797,7 +821,9 @@ impl VM {
                 }
 
                 Instruction::NewArray(dest, first_elem, count) => {
-                    let mut elements = Vec::new();
+                    let element_count = count as usize;
+                    self.budgets.charge_value_vec(element_count)?;
+                    let mut elements = Vec::with_capacity(element_count);
                     for i in 0..count {
                         elements.push(self.get_register(first_elem + i)?.clone());
                     }
@@ -806,9 +832,20 @@ impl VM {
                 }
 
                 Instruction::TupleNew(dest, first_elem, count) => {
-                    let mut elements = Vec::new();
+                    let mut parts = Vec::with_capacity(count as usize);
+                    let mut total_elements: usize = 0;
                     for offset in 0..(count as usize) {
                         let value = self.get_register(first_elem + offset as u8)?.clone();
+                        total_elements = total_elements.saturating_add(match &value {
+                            Value::Tuple(existing) => existing.len(),
+                            _ => 1,
+                        });
+                        parts.push(value);
+                    }
+
+                    self.budgets.charge_value_vec(total_elements)?;
+                    let mut elements = Vec::with_capacity(total_elements);
+                    for value in parts {
                         if let Value::Tuple(existing) = value {
                             elements.extend(existing.iter().cloned());
                         } else {
@@ -853,6 +890,7 @@ impl VM {
                     first_field,
                     field_count,
                 ) => {
+                    self.budgets.charge_value_vec(field_count as usize)?;
                     let func = &self.functions[self.call_stack.last().unwrap().function_idx];
                     let struct_name = func.chunk.constants[name_idx as usize]
                         .as_string()
@@ -900,6 +938,7 @@ impl VM {
                     first_value,
                     value_count,
                 ) => {
+                    self.budgets.charge_value_vec(value_count as usize)?;
                     let func = &self.functions[self.call_stack.last().unwrap().function_idx];
                     let enum_name = func.chunk.constants[enum_name_idx as usize]
                         .as_string()
@@ -913,7 +952,7 @@ impl VM {
                             message: "Variant name must be a string".to_string(),
                         })?
                         .to_string();
-                    let mut values = Vec::new();
+                    let mut values = Vec::with_capacity(value_count as usize);
                     for i in 0..value_count {
                         values.push(self.get_register(first_value + i)?.clone());
                     }
@@ -1002,7 +1041,7 @@ impl VM {
                 }
 
                 Instruction::SetField(obj_reg, field_idx, value_reg) => {
-                    let object = self.get_register(obj_reg)?;
+                    let object = self.get_register(obj_reg)?.clone();
                     let value = self.get_register(value_reg)?.clone();
                     let func = &self.functions[self.call_stack.last().unwrap().function_idx];
                     let field_name = func.chunk.constants[field_idx as usize]
@@ -1011,10 +1050,14 @@ impl VM {
                             message: "Field name must be a string".to_string(),
                         })?;
                     let mut invalidate_key: Option<usize> = None;
-                    if let Some(map_val) = Self::lua_table_map(object) {
+                    if let Some(map_val) = Self::lua_table_map(&object) {
                         if let Value::Map(map) = map_val {
                             let raw_key_value = Value::String(field_name.clone());
                             let key = self.make_hash_key(&Self::lua_table_key_value(&raw_key_value))?;
+                            if self.budgets.mem_budget_enabled() && !map.borrow().contains_key(&key)
+                            {
+                                self.budgets.charge_map_entry_estimate()?;
+                            }
                             map.borrow_mut().insert(key, value);
                         } else {
                             return Err(LustError::RuntimeError {
@@ -1026,9 +1069,9 @@ impl VM {
                             });
                         }
                     } else {
-                        match object {
+                        match &object {
                             Value::Struct { .. } => {
-                                invalidate_key = Self::struct_cache_key(object);
+                                invalidate_key = Self::struct_cache_key(&object);
                                 object
                                     .struct_set_field_rc(&field_name, value)
                                     .map_err(|message| LustError::RuntimeError { message })?;
@@ -1036,6 +1079,11 @@ impl VM {
 
                             Value::Map(map) => {
                                 let key = ValueKey::from(field_name.clone());
+                                if self.budgets.mem_budget_enabled()
+                                    && !map.borrow().contains_key(&key)
+                                {
+                                    self.budgets.charge_map_entry_estimate()?;
+                                }
                                 map.borrow_mut().insert(key, value);
                             }
 
@@ -1070,7 +1118,9 @@ impl VM {
                     };
                     let left_str = self.value_to_string_for_concat(&left)?;
                     let right_str = self.value_to_string_for_concat(&right)?;
-                    let mut combined = String::with_capacity(left_str.len() + right_str.len());
+                    let cap = left_str.len().saturating_add(right_str.len());
+                    self.budgets.charge_mem_bytes(cap)?;
+                    let mut combined = String::with_capacity(cap);
                     combined.push_str(left_str.as_ref());
                     combined.push_str(right_str.as_ref());
                     let result = Value::string(combined);
@@ -1238,7 +1288,9 @@ impl VM {
 
                 Instruction::Closure(dest, func_idx, first_upvalue_reg, upvalue_count) => {
                     use crate::bytecode::Upvalue;
-                    let mut upvalues = Vec::new();
+                    self.budgets
+                        .charge_upvalues_estimate(upvalue_count as usize)?;
+                    let mut upvalues = Vec::with_capacity(upvalue_count as usize);
                     for i in 0..upvalue_count {
                         let value = self.get_register(first_upvalue_reg + i)?.clone();
                         upvalues.push(Upvalue::new(value));
@@ -1300,6 +1352,10 @@ impl VM {
                     if let Some(map_val) = Self::lua_table_map(&collection) {
                         if let Value::Map(map) = map_val {
                             let key = self.make_hash_key(&Self::lua_table_key_value(&index))?;
+                            if self.budgets.mem_budget_enabled() && !map.borrow().contains_key(&key)
+                            {
+                                self.budgets.charge_map_entry_estimate()?;
+                            }
                             map.borrow_mut().insert(key, value);
                         } else {
                             return Err(LustError::RuntimeError {
@@ -1328,6 +1384,11 @@ impl VM {
 
                             Value::Map(map) => {
                                 let key = self.make_hash_key(&index)?;
+                                if self.budgets.mem_budget_enabled()
+                                    && !map.borrow().contains_key(&key)
+                                {
+                                    self.budgets.charge_map_entry_estimate()?;
+                                }
                                 map.borrow_mut().insert(key, value);
                             }
 

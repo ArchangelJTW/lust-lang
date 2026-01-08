@@ -207,6 +207,50 @@ impl EmbeddedProgram {
         &mut self.vm
     }
 
+    pub fn set_gas_budget(&mut self, limit: u64) {
+        self.vm.set_gas_budget(limit);
+    }
+
+    pub fn clear_gas_budget(&mut self) {
+        self.vm.clear_gas_budget();
+    }
+
+    pub fn reset_gas_counter(&mut self) {
+        self.vm.reset_gas_counter();
+    }
+
+    pub fn gas_used(&self) -> u64 {
+        self.vm.gas_used()
+    }
+
+    pub fn gas_remaining(&self) -> Option<u64> {
+        self.vm.gas_remaining()
+    }
+
+    pub fn set_memory_budget_bytes(&mut self, limit_bytes: usize) {
+        self.vm.set_memory_budget_bytes(limit_bytes);
+    }
+
+    pub fn set_memory_budget_kb(&mut self, limit_kb: u64) {
+        self.vm.set_memory_budget_kb(limit_kb);
+    }
+
+    pub fn clear_memory_budget(&mut self) {
+        self.vm.clear_memory_budget();
+    }
+
+    pub fn reset_memory_counter(&mut self) {
+        self.vm.reset_memory_counter();
+    }
+
+    pub fn memory_used_bytes(&self) -> usize {
+        self.vm.memory_used_bytes()
+    }
+
+    pub fn memory_remaining_bytes(&self) -> Option<usize> {
+        self.vm.memory_remaining_bytes()
+    }
+
     pub fn dump_externs_to_dir(&self, output_root: impl AsRef<Path>) -> io::Result<Vec<PathBuf>> {
         self.vm.dump_externs_to_dir(output_root)
     }

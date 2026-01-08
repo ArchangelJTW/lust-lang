@@ -1,9 +1,11 @@
 mod corelib;
+mod budget;
 mod cycle;
 #[cfg(feature = "std")]
 pub mod stdlib;
 mod task;
 pub(super) use self::task::{TaskId, TaskInstance, TaskManager, TaskState};
+use self::budget::BudgetState;
 pub(super) use crate::ast::{FieldOwnership, StructDef};
 pub(super) use crate::bytecode::{
     FieldStorage, Function, Instruction, NativeCallResult, Register, StructLayout, TaskHandle,
@@ -154,6 +156,7 @@ pub(super) const HASH_KEY_TRAIT: &str = "HashKey";
 pub(super) const HASH_KEY_METHOD: &str = "to_hashkey";
 pub struct VM {
     pub(super) jit: JitState,
+    pub(super) budgets: BudgetState,
     pub(super) functions: Vec<Function>,
     pub(super) natives: HashMap<String, Value>,
     pub(super) globals: HashMap<String, Value>,

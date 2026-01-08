@@ -83,6 +83,7 @@ impl VM {
     pub fn with_config(config: &LustConfig) -> Self {
         let mut vm = Self {
             jit: JitState::new(),
+            budgets: BudgetState::default(),
             functions: Vec::new(),
             natives: HashMap::new(),
             globals: HashMap::new(),

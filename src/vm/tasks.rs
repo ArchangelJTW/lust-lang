@@ -639,6 +639,9 @@ impl VM {
                         let mut map = map_rc.borrow_mut();
                         let len = lua_table_sequence_len(&map);
                         let key = ValueKey::from_value(&Value::Int((len as LustInt) + 1));
+                        if self.budgets.mem_budget_enabled() && !map.contains_key(&key) {
+                            self.budgets.charge_map_entry_estimate()?;
+                        }
                         map.insert(key, value);
                         Ok(Value::Nil)
                     }
@@ -927,7 +930,16 @@ impl VM {
                         });
                     }
 
-                    arr.borrow_mut().push(args[0].clone());
+                    let mut borrowed = arr.borrow_mut();
+                    if self.budgets.mem_budget_enabled() {
+                        let len = borrowed.len();
+                        let cap = borrowed.capacity();
+                        if len == cap {
+                            let new_cap = if cap == 0 { 4 } else { cap.saturating_mul(2) };
+                            self.budgets.charge_vec_growth::<Value>(cap, new_cap)?;
+                        }
+                    }
+                    borrowed.push(args[0].clone());
                     Ok(Value::Nil)
                 }
 
@@ -948,7 +960,8 @@ impl VM {
 
                     let func = &args[0];
                     let borrowed = arr.borrow();
-                    let mut result = Vec::new();
+                    self.budgets.charge_value_vec(borrowed.len())?;
+                    let mut result = Vec::with_capacity(borrowed.len());
                     for elem in borrowed.iter() {
                         let mapped_value = self.call_value(func, vec![elem.clone()])?;
                         result.push(mapped_value);
@@ -966,7 +979,8 @@ impl VM {
 
                     let func = &args[0];
                     let borrowed = arr.borrow();
-                    let mut result = Vec::new();
+                    self.budgets.charge_value_vec(borrowed.len())?;
+                    let mut result = Vec::with_capacity(borrowed.len());
                     for elem in borrowed.iter() {
                         let keep = self.call_value(func, vec![elem.clone()])?;
                         if keep.is_truthy() {
@@ -1206,6 +1220,9 @@ impl VM {
 
                         let key = self.make_hash_key(&args[0])?;
                         let value = args[1].clone();
+                        if self.budgets.mem_budget_enabled() && !map.borrow().contains_key(&key) {
+                            self.budgets.charge_map_entry_estimate()?;
+                        }
                         map.borrow_mut().insert(key, value);
                         Ok(Value::Nil)
                     }

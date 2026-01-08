@@ -1433,6 +1433,7 @@ static JIT_NEW_ARRAY_COUNTER: core::sync::atomic::AtomicUsize =
 #[cfg(feature = "std")]
 #[no_mangle]
 pub unsafe extern "C" fn jit_new_array_safe(
+    vm_ptr: *mut VM,
     elements_ptr: *const Value,
     element_count: usize,
     out_ptr: *mut Value,
@@ -1443,6 +1444,13 @@ pub unsafe extern "C" fn jit_new_array_safe(
     if out_ptr.is_null() {
         // jit::log(|| "jit_new_array_safe: out_ptr is null".to_string());
         return 0;
+    }
+
+    if !vm_ptr.is_null() {
+        let vm = &mut *vm_ptr;
+        if !vm.try_charge_memory_value_vec(element_count) {
+            return 0;
+        }
     }
 
     // jit::log(|| format!("jit_new_array_safe #{}: about to create Vec", call_num));
@@ -1469,6 +1477,7 @@ pub unsafe extern "C" fn jit_new_array_safe(
 #[cfg(feature = "std")]
 #[no_mangle]
 pub unsafe extern "C" fn jit_array_push_safe(
+    vm_ptr: *mut VM,
     array_ptr: *const Value,
     value_ptr: *const Value,
 ) -> u8 {
@@ -1483,7 +1492,19 @@ pub unsafe extern "C" fn jit_array_push_safe(
         Value::Array(arr) => {
             // Use unchecked borrow for maximum performance
             let cell_ptr = arr.as_ptr();
-            (*cell_ptr).push(value.clone());
+            let vec_ref = &mut *cell_ptr;
+            if !vm_ptr.is_null() {
+                let vm = &mut *vm_ptr;
+                let len = vec_ref.len();
+                let cap = vec_ref.capacity();
+                if len == cap {
+                    let new_cap = if cap == 0 { 4 } else { cap.saturating_mul(2) };
+                    if !vm.try_charge_memory_vec_growth::<Value>(cap, new_cap) {
+                        return 0;
+                    }
+                }
+            }
+            vec_ref.push(value.clone());
             1
         }
         _ => 0,
@@ -1724,6 +1745,7 @@ pub unsafe extern "C" fn jit_set_field_strong_safe(
 #[cfg(feature = "std")]
 #[no_mangle]
 pub unsafe extern "C" fn jit_concat_safe(
+    vm_ptr: *mut VM,
     left_value_ptr: *const Value,
     right_value_ptr: *const Value,
     out: *mut Value,
@@ -1734,26 +1756,30 @@ pub unsafe extern "C" fn jit_concat_safe(
 
     let left = &*left_value_ptr;
     let right = &*right_value_ptr;
-    const NO_VM_ERROR: &str = "task API requires a running VM";
-    let left_str = match VM::with_current(|vm| {
+    let (left_str, right_str) = if !vm_ptr.is_null() {
+        let vm = &mut *vm_ptr;
         let left_copy = left.clone();
-        vm.value_to_string_for_concat(&left_copy)
-            .map_err(|err| err.to_string())
-    }) {
-        Ok(rc) => rc,
-        Err(err) if err == NO_VM_ERROR => Rc::new(left.to_string()),
-        Err(_) => return 0,
-    };
-    let right_str = match VM::with_current(|vm| {
         let right_copy = right.clone();
-        vm.value_to_string_for_concat(&right_copy)
-            .map_err(|err| err.to_string())
-    }) {
-        Ok(rc) => rc,
-        Err(err) if err == NO_VM_ERROR => Rc::new(right.to_string()),
-        Err(_) => return 0,
+        let left_str = match vm.value_to_string_for_concat(&left_copy) {
+            Ok(rc) => rc,
+            Err(_) => return 0,
+        };
+        let right_str = match vm.value_to_string_for_concat(&right_copy) {
+            Ok(rc) => rc,
+            Err(_) => return 0,
+        };
+        (left_str, right_str)
+    } else {
+        (Rc::new(left.to_string()), Rc::new(right.to_string()))
     };
-    let mut combined = String::with_capacity(left_str.len() + right_str.len());
+    let cap = left_str.len().saturating_add(right_str.len());
+    if !vm_ptr.is_null() {
+        let vm = &mut *vm_ptr;
+        if !vm.try_charge_memory_bytes(cap) {
+            return 0;
+        }
+    }
+    let mut combined = String::with_capacity(cap);
     combined.push_str(left_str.as_ref());
     combined.push_str(right_str.as_ref());
     let result = Value::string(combined);
@@ -2111,6 +2137,7 @@ pub unsafe extern "C" fn jit_value_is_truthy(value_ptr: *const Value) -> u8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn jit_new_enum_unit_safe(
+    vm_ptr: *mut VM,
     enum_name_ptr: *const u8,
     enum_name_len: usize,
     variant_name_ptr: *const u8,
@@ -2123,14 +2150,25 @@ pub unsafe extern "C" fn jit_new_enum_unit_safe(
 
     let enum_name_slice = slice::from_raw_parts(enum_name_ptr, enum_name_len);
     let variant_name_slice = slice::from_raw_parts(variant_name_ptr, variant_name_len);
-    let enum_name = match str::from_utf8(enum_name_slice) {
-        Ok(s) => s.to_string(),
+    let enum_name_str = match str::from_utf8(enum_name_slice) {
+        Ok(s) => s,
         Err(_) => return 0,
     };
-    let variant_name = match str::from_utf8(variant_name_slice) {
-        Ok(s) => s.to_string(),
+    let variant_name_str = match str::from_utf8(variant_name_slice) {
+        Ok(s) => s,
         Err(_) => return 0,
     };
+
+    if !vm_ptr.is_null() {
+        let vm = &mut *vm_ptr;
+        let bytes = enum_name_len.saturating_add(variant_name_len);
+        if !vm.try_charge_memory_bytes(bytes) {
+            return 0;
+        }
+    }
+
+    let enum_name = enum_name_str.to_string();
+    let variant_name = variant_name_str.to_string();
     let value = Value::enum_unit(enum_name, variant_name);
     ptr::write(out, value);
     1
@@ -2138,6 +2176,7 @@ pub unsafe extern "C" fn jit_new_enum_unit_safe(
 
 #[no_mangle]
 pub unsafe extern "C" fn jit_new_enum_variant_safe(
+    vm_ptr: *mut VM,
     enum_name_ptr: *const u8,
     enum_name_len: usize,
     variant_name_ptr: *const u8,
@@ -2156,14 +2195,28 @@ pub unsafe extern "C" fn jit_new_enum_variant_safe(
 
     let enum_name_slice = slice::from_raw_parts(enum_name_ptr, enum_name_len);
     let variant_name_slice = slice::from_raw_parts(variant_name_ptr, variant_name_len);
-    let enum_name = match str::from_utf8(enum_name_slice) {
-        Ok(s) => s.to_string(),
+    let enum_name_str = match str::from_utf8(enum_name_slice) {
+        Ok(s) => s,
         Err(_) => return 0,
     };
-    let variant_name = match str::from_utf8(variant_name_slice) {
-        Ok(s) => s.to_string(),
+    let variant_name_str = match str::from_utf8(variant_name_slice) {
+        Ok(s) => s,
         Err(_) => return 0,
     };
+
+    if !vm_ptr.is_null() {
+        let vm = &mut *vm_ptr;
+        let name_bytes = enum_name_len.saturating_add(variant_name_len);
+        if !vm.try_charge_memory_bytes(name_bytes) {
+            return 0;
+        }
+        if !vm.try_charge_memory_value_vec(value_count) {
+            return 0;
+        }
+    }
+
+    let enum_name = enum_name_str.to_string();
+    let variant_name = variant_name_str.to_string();
     let mut values = Vec::with_capacity(value_count);
     for i in 0..value_count {
         let value = &*values_ptr.add(i);

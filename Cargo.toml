@@ -4,7 +4,7 @@ exclude = ["examples/rust-extension/extensions/**"]
 
 [package]
 name = "lust-rs"
-version = "3.3.10"
+version = "3.4.10"
 edition = "2021"
 include = [
   "src/**",
@@ -48,13 +48,7 @@ std = [
 ]
 libloading = ["std", "dep:libloading"]
 dirs = ["std", "dep:dirs"]
-packages = [
-  "std",
-  "libloading",
-  "dirs",
-  "dep:serde_json",
-  "dep:object",
-]
+packages = ["std", "libloading", "dirs", "dep:serde_json", "dep:object"]
 lua_transpile = ["std", "dep:full_moon"]
 
 [[bin]]

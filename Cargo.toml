@@ -54,9 +54,8 @@ packages = [
   "dirs",
   "dep:serde_json",
   "dep:object",
-  "dep:full_moon",
 ]
-lualua = ["std", "dep:full_moon"]
+lua_transpile = ["std", "dep:full_moon"]
 
 [[bin]]
 name = "lust"

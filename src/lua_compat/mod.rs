@@ -25,6 +25,7 @@ thread_local! {
     static LUST_FN_REGISTRY: StdRefCell<HashMap<usize, Value>> = StdRefCell::new(HashMap::new());
 }
 
+#[cfg(feature = "lua_transpile")]
 pub mod transpile;
 
 static NEXT_LUA_FUNCTION_ID: AtomicUsize = AtomicUsize::new(1);

@@ -1,9 +1,10 @@
 #![cfg(feature = "std")]
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 use lust::lua_compat::{
-    lua_to_lust, render_table_stub, trace_luaopen, transpile::transpile_lua_stub, LuaModuleSpec,
-    LuaValue,
+    lua_to_lust, render_table_stub, trace_luaopen, LuaModuleSpec, LuaValue,
 };
+#[cfg(all(feature = "packages", feature = "lua_transpile", not(target_arch = "wasm32")))]
+use lust::lua_compat::transpile::transpile_lua_stub;
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 use lust::packages::{
     build_package_archive, clear_credentials, collect_rust_dependency_artifacts, credentials_file,
@@ -937,55 +938,66 @@ fn dump_externs(filename: &str) {
         }
         for lua_file in &dep.lua_files {
             let full_path = dep.library_path.join(lua_file);
-            match fs::read_to_string(&full_path) {
-                Ok(content) => {
-                    let module_name = lua_module_name(lua_file);
-                    match transpile_lua_stub(&content, &module_name) {
-                        Ok(stub) => {
-                            let destination = output_root.join(lua_file).with_extension("lust");
-                            if let Some(parent) = destination.parent() {
-                                if let Err(err) = fs::create_dir_all(parent) {
+            #[cfg(feature = "lua_transpile")]
+            {
+                match fs::read_to_string(&full_path) {
+                    Ok(content) => {
+                        let module_name = lua_module_name(lua_file);
+                        match transpile_lua_stub(&content, &module_name) {
+                            Ok(stub) => {
+                                let destination = output_root.join(lua_file).with_extension("lust");
+                                if let Some(parent) = destination.parent() {
+                                    if let Err(err) = fs::create_dir_all(parent) {
+                                        eprintln!(
+                                            "Failed to create stub directory '{}': {}",
+                                            parent.display(),
+                                            err
+                                        );
+                                        continue;
+                                    }
+                                }
+                                if let Err(err) = fs::write(&destination, stub) {
                                     eprintln!(
-                                        "Failed to create stub directory '{}': {}",
-                                        parent.display(),
+                                        "Failed to write Lua transpiled stub '{}': {}",
+                                        destination.display(),
                                         err
                                     );
                                     continue;
                                 }
+                                println!(
+                                    "Wrote Lua transpiled stub for '{}' -> {}",
+                                    dep.name,
+                                    destination.display()
+                                );
+                                any_stub = true;
                             }
-                            if let Err(err) = fs::write(&destination, stub) {
+                            Err(err) => {
                                 eprintln!(
-                                    "Failed to write Lua transpiled stub '{}': {}",
-                                    destination.display(),
+                                    "Failed to transpile Lua file '{}' from '{}': {}",
+                                    full_path.display(),
+                                    dep.name,
                                     err
                                 );
-                                continue;
                             }
-                            println!(
-                                "Wrote Lua transpiled stub for '{}' -> {}",
-                                dep.name,
-                                destination.display()
-                            );
-                            any_stub = true;
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "Failed to transpile Lua file '{}' from '{}': {}",
-                                full_path.display(),
-                                dep.name,
-                                err
-                            );
                         }
                     }
+                    Err(err) => {
+                        eprintln!(
+                            "Failed to read Lua file '{}' for '{}': {}",
+                            full_path.display(),
+                            dep.name,
+                            err
+                        );
+                    }
                 }
-                Err(err) => {
-                    eprintln!(
-                        "Failed to read Lua file '{}' for '{}': {}",
-                        full_path.display(),
-                        dep.name,
-                        err
-                    );
-                }
+            }
+            #[cfg(not(feature = "lua_transpile"))]
+            {
+                eprintln!(
+                    "Skipping Lua transpilation for '{}' from '{}'; recompile with --features lua_transpile to enable.",
+                    full_path.display(),
+                    dep.name
+                );
             }
         }
         if !any_stub {

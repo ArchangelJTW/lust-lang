@@ -1,7 +1,8 @@
 use lust::embed::LustStructView as _;
 use lust::{
     struct_field, ArrayHandle, AsyncDriver, AsyncTaskQueue, EmbeddedProgram, FromLustValue,
-    FunctionHandle, LustStructView, MapHandle, StringRef, StructHandle, StructInstance, Value,
+    FunctionHandle, LustStructView, MapHandle, NativeExport, NativeExportParam, StringRef,
+    StructHandle, StructInstance, Value,
 };
 
 #[derive(LustStructView)]
@@ -110,6 +111,12 @@ fn main() -> lust::Result<()> {
         "host_scale",
         |value: i64| -> std::result::Result<i64, String> { Ok(value * 10) },
     )?;
+
+    program.vm_mut().record_exported_native(NativeExport::new(
+        "main.host_scale",
+        vec![NativeExportParam::new("value", "int")],
+        "int",
+    ));
 
     let initial_scale = program
         .get_typed_global::<i64>("main.SCALE_FACTOR")?
@@ -230,6 +237,12 @@ fn main() -> lust::Result<()> {
     let queue = AsyncTaskQueue::<FunctionHandle, lust::LustInt>::new();
     program
         .register_async_task_queue::<FunctionHandle, lust::LustInt>("fetch_value", queue.clone())?;
+
+    program.vm_mut().record_exported_native(NativeExport::new(
+        "main.fetch_value",
+        vec![NativeExportParam::new("callback", "function(int)")],
+        "Task",
+    ));
 
     // Simulate Lust calling the native async function
     let lust_task = program.call_raw("main.get_async_value", Vec::new())?;

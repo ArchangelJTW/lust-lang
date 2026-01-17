@@ -1326,11 +1326,22 @@ impl TypeChecker {
                     return Ok(Type::new(TypeKind::Int, span));
                 }
 
-                "floor" | "ceil" | "round" | "sqrt" | "abs" => {
+                "floor" | "ceil" | "round" | "sqrt" | "abs" | "sin" | "cos" | "tan" | "asin"
+                | "acos" | "atan" => {
                     if !args.is_empty() {
                         return Err(self.type_error(format!("{}() takes no arguments", method)));
                     }
 
+                    return Ok(Type::new(TypeKind::Float, span));
+                }
+
+                "atan2" => {
+                    if args.len() != 1 {
+                        return Err(self.type_error("atan2() requires 1 argument".to_string()));
+                    }
+
+                    let other_type = self.check_expr(&args[0])?;
+                    self.unify(&Type::new(TypeKind::Float, span), &other_type)?;
                     return Ok(Type::new(TypeKind::Float, span));
                 }
 

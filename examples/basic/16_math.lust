@@ -12,6 +12,15 @@ println(y:sqrt())            -- Outputs: 4
 local z: float = -5.5
 println(z:abs())             -- Outputs: 5.5
 
+local t: float = 1.0
+println(t:sin())             -- Outputs: 0.8414709848
+println(t:cos())             -- Outputs: 0.5403023059
+println(t:tan())             -- Outputs: 1.5574077247
+println(t:asin())            -- Outputs: 1.5707963268
+println(t:acos())            -- Outputs: 0
+println(t:atan())            -- Outputs: 0.7853981634
+println(t:atan2(1.0))        -- Outputs: 0.7853981634
+
 local w: float = 7.5
 println(w:clamp(0.0, 10.0))  -- Outputs: 7.5
 println(w:clamp(0.0, 5.0))   -- Outputs: 5
@@ -24,4 +33,3 @@ local b: int = 75
 println(b:clamp(0, 100))     -- Outputs: 75
 println(b:clamp(0, 50))      -- Outputs: 50
  
-

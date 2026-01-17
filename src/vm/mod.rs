@@ -17,7 +17,8 @@ pub(super) use crate::jit::{
     JitCompiler, JitState, TraceOptimizer, TraceRecorder, MAX_TRACE_LENGTH,
 };
 pub(super) use crate::number::{
-    float_abs, float_ceil, float_clamp, float_floor, float_from_int, float_round, float_sqrt,
+    float_abs, float_acos, float_asin, float_atan, float_atan2, float_ceil, float_clamp,
+    float_cos, float_floor, float_from_int, float_round, float_sin, float_sqrt, float_tan,
     int_from_float, int_from_usize, LustFloat,
 };
 pub(super) use crate::{LustError, Result};

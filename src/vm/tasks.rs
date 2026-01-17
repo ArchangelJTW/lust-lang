@@ -1367,6 +1367,78 @@ impl VM {
                     Ok(Value::Float(float_abs(*f)))
                 }
 
+                "sin" => {
+                    if !args.is_empty() {
+                        return Err(LustError::RuntimeError {
+                            message: "sin() takes no arguments".to_string(),
+                        });
+                    }
+
+                    Ok(Value::Float(float_sin(*f)))
+                }
+
+                "cos" => {
+                    if !args.is_empty() {
+                        return Err(LustError::RuntimeError {
+                            message: "cos() takes no arguments".to_string(),
+                        });
+                    }
+
+                    Ok(Value::Float(float_cos(*f)))
+                }
+
+                "tan" => {
+                    if !args.is_empty() {
+                        return Err(LustError::RuntimeError {
+                            message: "tan() takes no arguments".to_string(),
+                        });
+                    }
+
+                    Ok(Value::Float(float_tan(*f)))
+                }
+
+                "asin" => {
+                    if !args.is_empty() {
+                        return Err(LustError::RuntimeError {
+                            message: "asin() takes no arguments".to_string(),
+                        });
+                    }
+
+                    Ok(Value::Float(float_asin(*f)))
+                }
+
+                "acos" => {
+                    if !args.is_empty() {
+                        return Err(LustError::RuntimeError {
+                            message: "acos() takes no arguments".to_string(),
+                        });
+                    }
+
+                    Ok(Value::Float(float_acos(*f)))
+                }
+
+                "atan" => {
+                    if !args.is_empty() {
+                        return Err(LustError::RuntimeError {
+                            message: "atan() takes no arguments".to_string(),
+                        });
+                    }
+
+                    Ok(Value::Float(float_atan(*f)))
+                }
+
+                "atan2" => {
+                    if args.len() != 1 {
+                        return Err(LustError::RuntimeError {
+                            message: "atan2() requires 1 argument (other)".to_string(),
+                        });
+                    }
+                    let other = args[0].as_float().ok_or_else(|| LustError::RuntimeError {
+                        message: "atan2() other must be a number".to_string(),
+                    })?;
+                    Ok(Value::Float(float_atan2(*f, other)))
+                }
+
                 "min" => {
                     if args.len() != 1 {
                         return Err(LustError::RuntimeError {

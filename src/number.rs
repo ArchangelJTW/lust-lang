@@ -111,6 +111,90 @@ pub fn float_sqrt(value: LustFloat) -> LustFloat {
 }
 
 #[inline]
+pub fn float_sin(value: LustFloat) -> LustFloat {
+    #[cfg(feature = "std")]
+    {
+        value.sin()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        libm::sinf(value)
+    }
+}
+
+#[inline]
+pub fn float_cos(value: LustFloat) -> LustFloat {
+    #[cfg(feature = "std")]
+    {
+        value.cos()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        libm::cosf(value)
+    }
+}
+
+#[inline]
+pub fn float_tan(value: LustFloat) -> LustFloat {
+    #[cfg(feature = "std")]
+    {
+        value.tan()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        libm::tanf(value)
+    }
+}
+
+#[inline]
+pub fn float_asin(value: LustFloat) -> LustFloat {
+    #[cfg(feature = "std")]
+    {
+        value.asin()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        libm::asinf(value)
+    }
+}
+
+#[inline]
+pub fn float_acos(value: LustFloat) -> LustFloat {
+    #[cfg(feature = "std")]
+    {
+        value.acos()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        libm::acosf(value)
+    }
+}
+
+#[inline]
+pub fn float_atan(value: LustFloat) -> LustFloat {
+    #[cfg(feature = "std")]
+    {
+        value.atan()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        libm::atanf(value)
+    }
+}
+
+#[inline]
+pub fn float_atan2(y: LustFloat, x: LustFloat) -> LustFloat {
+    #[cfg(feature = "std")]
+    {
+        y.atan2(x)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        libm::atan2f(y, x)
+    }
+}
+
+#[inline]
 pub fn float_clamp(value: LustFloat, min: LustFloat, max: LustFloat) -> LustFloat {
     if value < min {
         min

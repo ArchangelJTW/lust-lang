@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "lust-analyzer"
-version = "0.4.23"
+version = "0.4.25"
 dependencies = [
  "hashbrown 0.16.1",
  "lust-rs",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "lust-rs"
-version = "3.4.10"
+version = "3.4.11"
 dependencies = [
  "console_error_panic_hook",
  "dirs",

@@ -3,7 +3,7 @@
 use lust::lua_compat::{
     lua_to_lust, render_table_stub, trace_luaopen, LuaModuleSpec, LuaValue,
 };
-#[cfg(all(feature = "packages", feature = "lua_transpile", not(target_arch = "wasm32")))]
+#[cfg(feature = "lua_transpile")]
 use lust::lua_compat::transpile::transpile_lua_stub;
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 use lust::packages::{
@@ -31,6 +31,40 @@ fn main() {
     if args.len() < 2 {
         print_usage(&args[0]);
         process::exit(1);
+    }
+
+    // Collect all paths from --transpile / --tr flags before dispatching.
+    // Each flag consumes subsequent non-flag arguments as paths, so both
+    //   lust --transpile .
+    //   lust --tr a.lua b.lua   (shell-expanded glob)
+    //   lust --tr a.lua --tr b.lua
+    // all work as expected.
+    let mut transpile_paths: Vec<String> = Vec::new();
+    {
+        let mut i = 1usize;
+        while i < args.len() {
+            if args[i] == "--transpile" || args[i] == "--tr" {
+                i += 1;
+                while i < args.len() && !args[i].starts_with('-') {
+                    transpile_paths.push(args[i].clone());
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    if !transpile_paths.is_empty() {
+        #[cfg(feature = "lua_transpile")]
+        {
+            transpile_lua_files(&transpile_paths);
+            return;
+        }
+        #[cfg(not(feature = "lua_transpile"))]
+        {
+            eprintln!("Warning: --transpile requires the lua_transpile feature; recompile with --features lua_transpile to enable.");
+            process::exit(1);
+        }
     }
 
     match args[1].as_str() {
@@ -110,6 +144,17 @@ fn print_help(program: &str) {
         "    {} --dump-externs <script.lust>    Create extern stubs for rust library modules",
         program
     );
+    #[cfg(feature = "lua_transpile")]
+    {
+        println!(
+            "    {} --transpile, --tr <path> [...]  Transpile Lua file(s) or directories to Lust",
+            program
+        );
+        println!("        Accepts files, directories (recursive), and shell-expanded globs.");
+        println!("        Hidden dirs and node_modules are skipped automatically.");
+        println!("        e.g.  {} --transpile src/lua/", program);
+        println!("              {} --tr a.lua b.lua --tr c.lua", program);
+    }
     #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
     {
         println!(
@@ -177,6 +222,96 @@ fn lua_module_name(path: &Path) -> String {
 
 fn print_version() {
     println!("Lust v{} - https://lust-lang.dev", VERSION);
+}
+
+/// Recursively collect all `.lua` files under `dir`, skipping hidden directories
+/// (names starting with `.`) and `node_modules`.
+#[cfg(feature = "lua_transpile")]
+fn collect_lua_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("Warning: could not read directory '{}': {}", dir.display(), err);
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if path.is_dir() {
+            if name.starts_with('.') || name == "node_modules" {
+                continue;
+            }
+            collect_lua_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("lua") {
+            out.push(path);
+        }
+    }
+}
+
+#[cfg(feature = "lua_transpile")]
+fn transpile_lua_files(paths: &[String]) {
+    if paths.is_empty() {
+        eprintln!("Warning: --transpile requires at least one file or directory argument");
+        process::exit(1);
+    }
+
+    let mut lua_files: Vec<PathBuf> = Vec::new();
+    for raw in paths {
+        let path = PathBuf::from(raw);
+        if path.is_dir() {
+            collect_lua_files(&path, &mut lua_files);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("lua") {
+            lua_files.push(path);
+        } else {
+            eprintln!("Warning: '{}' is not a .lua file or directory; skipping", raw);
+        }
+    }
+
+    if lua_files.is_empty() {
+        eprintln!("Warning: no .lua files found in the given paths");
+        return;
+    }
+
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    for lua_path in &lua_files {
+        let content = match fs::read_to_string(lua_path) {
+            Ok(c) => c,
+            Err(err) => {
+                eprintln!("Warning: could not read '{}': {}", lua_path.display(), err);
+                failed += 1;
+                continue;
+            }
+        };
+        let module_name = lua_module_name(&lua_path.with_extension(""));
+        match transpile_lua_stub(&content, &module_name) {
+            Ok(stub) => {
+                let dest = lua_path.with_extension("lust");
+                if let Err(err) = fs::write(&dest, stub) {
+                    eprintln!("Warning: could not write '{}': {}", dest.display(), err);
+                    failed += 1;
+                } else {
+                    println!("{} -> {}", lua_path.display(), dest.display());
+                    ok += 1;
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "Warning: transpilation failed for '{}': {}",
+                    lua_path.display(),
+                    err
+                );
+                failed += 1;
+            }
+        }
+    }
+
+    println!("Transpiled {ok} file(s), {failed} warning(s).");
+    if failed > 0 {
+        process::exit(1);
+    }
 }
 
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]

@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "lust-analyzer"
-version = "0.4.25"
+version = "0.4.26"
 dependencies = [
  "hashbrown 0.16.1",
  "lust-rs",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "lust-rs"
-version = "3.4.11"
+version = "3.4.12"
 dependencies = [
  "console_error_panic_hook",
  "dirs",
@@ -1506,7 +1506,3 @@ name = "zmij"
 version = "1.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "317f17ff091ac4515f17cc7a190d2769a8c9a96d227de5d64b500b01cda8f2cd"
-
-[[patch.unused]]
-name = "crunchy"
-version = "0.2.3"

@@ -137,7 +137,7 @@ impl JitCompiler {
             ; lea rsi, [r12 + lhs_offset]
             ; lea rdx, [r12 + rhs_offset]
             ; lea rcx, [r12 + dest_offset]
-            ; mov rax, QWORD jit_concat_safe as _
+            ; mov rax, QWORD jit_concat_safe as *const () as _
             ; call rax
             ; test al, al
             ; jz >fail

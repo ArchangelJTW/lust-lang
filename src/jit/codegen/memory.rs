@@ -50,7 +50,7 @@ impl JitCompiler {
         dynasm!(self.ops
             ; mov rdi, QWORD src_ptr as _
             ; lea rsi, [r12 + offset]
-            ; mov rax, QWORD jit_move_safe as _
+            ; mov rax, QWORD jit_move_safe as *const () as _
             ; call rax
             ; test al, al
             ; jz >fail
@@ -93,7 +93,7 @@ impl JitCompiler {
             ; call_helper:
             ; lea rdi, [r12 + src_offset]
             ; lea rsi, [r12 + dest_offset]
-            ; mov rax, QWORD jit_move_safe as _
+            ; mov rax, QWORD jit_move_safe as *const () as _
             ; call rax
             ; move_done:
         );
@@ -118,7 +118,7 @@ impl JitCompiler {
             ; lea rdi, [r12 + array_offset]
             ; mov rsi, [r12 + index_offset + 8]
             ; lea rdx, [r12 + dest_offset]
-            ; mov rax, QWORD jit_array_get_safe as _
+            ; mov rax, QWORD jit_array_get_safe as *const () as _
             ; call rax
             ; test al, al
             ; jz >fail
@@ -138,7 +138,7 @@ impl JitCompiler {
             ; cmp al, 5
             ; jne >fail
             ; lea rdi, [r12 + array_offset]
-            ; mov rax, QWORD jit_array_len_safe as _
+            ; mov rax, QWORD jit_array_len_safe as *const () as _
             ; call rax
             ; test rax, rax
             ; js >fail
@@ -178,7 +178,7 @@ impl JitCompiler {
                 ; lea rdi, [r12 + object_offset]
                 ; mov rsi, QWORD index as _
                 ; lea rdx, [r12 + dest_offset]
-                ; mov rax, QWORD jit_get_field_indexed_safe as _
+                ; mov rax, QWORD jit_get_field_indexed_safe as *const () as _
                 ; call rax
                 ; test al, al
                 ; jz >fail
@@ -192,7 +192,7 @@ impl JitCompiler {
                 ; mov rsi, QWORD field_name_ptr as _
                 ; mov rdx, QWORD field_name_len as _
                 ; lea rcx, [r12 + dest_offset]
-                ; mov rax, QWORD jit_get_field_safe as _
+                ; mov rax, QWORD jit_get_field_safe as *const () as _
                 ; call rax
                 ; test al, al
                 ; jz >fail
@@ -240,7 +240,7 @@ impl JitCompiler {
                     ; lea rdi, [r12 + object_offset]
                     ; mov rsi, QWORD index as _
                     ; lea rdx, [r12 + value_offset]
-                    ; mov rax, QWORD jit_set_field_indexed_safe as _
+                    ; mov rax, QWORD jit_set_field_indexed_safe as *const () as _
                     ; call rax
                     ; test al, al
                     ; jz >fail
@@ -258,7 +258,7 @@ impl JitCompiler {
                     ; lea rdi, [r12 + object_offset]
                     ; mov rsi, QWORD index as _
                     ; lea rdx, [r12 + value_offset]
-                    ; mov rax, QWORD jit_set_field_strong_safe as _
+                    ; mov rax, QWORD jit_set_field_strong_safe as *const () as _
                     ; call rax
                     ; test al, al
                     ; jz >fail
@@ -273,7 +273,7 @@ impl JitCompiler {
                 ; mov rsi, QWORD field_name_ptr as _
                 ; mov rdx, QWORD field_name_len as _
                 ; lea rcx, [r12 + value_offset]
-                ; mov rax, QWORD jit_set_field_safe as _
+                ; mov rax, QWORD jit_set_field_safe as *const () as _
                 ; call rax
                 ; test al, al
                 ; jz >fail
@@ -309,7 +309,7 @@ impl JitCompiler {
             ; lea rsi, [r12 + first_elem_offset]     // elements_ptr (ignored if count == 0)
             ; mov rdx, QWORD count_usize as _        // element_count
             ; lea rcx, [r12 + dest_offset]           // out_ptr
-            ; mov rax, QWORD jit_new_array_safe as _
+            ; mov rax, QWORD jit_new_array_safe as *const () as _
             ; call rax
             ; test al, al
             ; jz >fail
@@ -335,7 +335,7 @@ impl JitCompiler {
             ; mov rdi, r13
             ; lea rsi, [r12 + array_offset]
             ; lea rdx, [r12 + value_offset]
-            ; mov rax, QWORD jit_array_push_safe as _
+            ; mov rax, QWORD jit_array_push_safe as *const () as _
             ; call rax
             ; test al, al
             ; jz >fail
@@ -355,7 +355,7 @@ impl JitCompiler {
         dynasm!(self.ops
             ; lea rdi, [r12 + enum_offset]
             ; lea rsi, [r12 + dest_offset]
-            ; mov rax, QWORD jit_enum_is_some_safe as _
+            ; mov rax, QWORD jit_enum_is_some_safe as *const () as _
             ; call rax
             ; test al, al
             ; jz >fail
@@ -375,7 +375,7 @@ impl JitCompiler {
         dynasm!(self.ops
             ; lea rdi, [r12 + enum_offset]
             ; lea rsi, [r12 + dest_offset]
-            ; mov rax, QWORD jit_enum_unwrap_safe as _
+            ; mov rax, QWORD jit_enum_unwrap_safe as *const () as _
             ; call rax
             ; test al, al
             ; jz >fail
@@ -415,7 +415,7 @@ impl JitCompiler {
             ; lea rcx, [r12 + first_arg_offset]
             ; mov r8, DWORD arg_count_i32
             ; lea r9, [r12 + dest_offset]
-            ; mov rax, QWORD jit_call_native_safe as _
+            ; mov rax, QWORD jit_call_native_safe as *const () as _
             ; call rax
             ; cmp al, BYTE 2
             ; je >native_yield
@@ -464,7 +464,7 @@ impl JitCompiler {
             ; lea rdx, [r12 + first_arg_offset]
             ; mov ecx, DWORD arg_count_i32
             ; mov r8d, DWORD dest_i32
-            ; mov rax, QWORD jit_call_function_safe as _
+            ; mov rax, QWORD jit_call_function_safe as *const () as _
             ; call rax
             ; test al, al
             ; jz >fail
@@ -473,7 +473,7 @@ impl JitCompiler {
         if self.inline_depth == 0 {
             dynasm!(self.ops
                 ; mov rdi, r13
-                ; mov rax, QWORD jit_current_registers as _
+                ; mov rax, QWORD jit_current_registers as *const () as _
                 ; call rax
                 ; test rax, rax
                 ; jz >fail
@@ -521,7 +521,7 @@ impl JitCompiler {
             ; sub rsp, 16
             ; mov rax, QWORD dest_i32 as i64
             ; mov [rsp], rax
-            ; mov rax, QWORD jit_call_method_safe as _
+            ; mov rax, QWORD jit_call_method_safe as *const () as _
             ; call rax
             ; add rsp, 16
             ; test al, al
@@ -531,7 +531,7 @@ impl JitCompiler {
         if self.inline_depth == 0 {
             dynasm!(self.ops
                 ; mov rdi, r13
-                ; mov rax, QWORD jit_current_registers as _
+                ; mov rax, QWORD jit_current_registers as *const () as _
                 ; call rax
                 ; test rax, rax
                 ; jz >fail
@@ -606,7 +606,7 @@ impl JitCompiler {
             ; mov [rsp], rax
             ; lea rax, [r12 + dest_offset]
             ; mov [rsp + 8], rax
-            ; mov rax, QWORD jit_new_struct_safe as _
+            ; mov rax, QWORD jit_new_struct_safe as *const () as _
             ; call rax
             ; add rsp, 16
             ; test al, al
@@ -615,7 +615,7 @@ impl JitCompiler {
         if self.inline_depth == 0 {
             dynasm!(self.ops
                 ; mov rdi, r13
-                ; mov rax, QWORD jit_current_registers as _
+                ; mov rax, QWORD jit_current_registers as *const () as _
                 ; call rax
                 ; test rax, rax
                 ; jz >fail
@@ -655,7 +655,7 @@ impl JitCompiler {
             ; mov rcx, QWORD variant_name_ptr as _
             ; mov r8, QWORD variant_name_len as _
             ; lea r9, [r12 + dest_offset]
-            ; mov rax, QWORD jit_new_enum_unit_safe as _
+            ; mov rax, QWORD jit_new_enum_unit_safe as *const () as _
             ; call rax
             ; test al, al
             ; jz >fail
@@ -709,7 +709,7 @@ impl JitCompiler {
             ; mov [rsp], rax
             ; lea rax, [r12 + dest_offset]
             ; mov [rsp + 8], rax
-            ; mov rax, QWORD jit_new_enum_variant_safe as _
+            ; mov rax, QWORD jit_new_enum_variant_safe as *const () as _
             ; call rax
             ; add rsp, 32
             ; test al, al
@@ -748,7 +748,7 @@ impl JitCompiler {
             ; mov rdx, QWORD enum_name_len as _
             ; mov rcx, QWORD variant_name_ptr as _
             ; mov r8, QWORD variant_name_len as _
-            ; mov rax, QWORD jit_is_enum_variant_safe as _
+            ; mov rax, QWORD jit_is_enum_variant_safe as *const () as _
             ; call rax
             ; test al, al
             ; jnz >store_true
@@ -781,7 +781,7 @@ impl JitCompiler {
             ; lea rdi, [r12 + enum_offset]
             ; mov rsi, QWORD index_usize as _
             ; lea rdx, [r12 + dest_offset]
-            ; mov rax, QWORD jit_get_enum_value_safe as _
+            ; mov rax, QWORD jit_get_enum_value_safe as *const () as _
             ; call rax
             ; test al, al
             ; jz >fail

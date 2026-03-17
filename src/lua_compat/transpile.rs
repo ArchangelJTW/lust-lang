@@ -609,7 +609,6 @@ impl Emitter {
             "_G[\"tonumber\"] = lua.to_value(tonumber)".to_string(),
             "_G[\"type\"] = lua.to_value(type)".to_string(),
             "local type_ = type".to_string(),
-            "_G[\"string\"] = lua.to_value(string)".to_string(),
             "local module_ = _G[\"module\"]".to_string(),
         ];
         self.lines

@@ -105,7 +105,7 @@ impl JitCompiler {
             ; mov rdx, QWORD function_idx as _
             ; mov rcx, QWORD upvalues_ptr as _
             ; mov r8d, DWORD reg_index
-            ; mov rax, QWORD jit_guard_function_identity as _
+            ; mov rax, QWORD jit_guard_function_identity as *const () as _
             ; call rax
             ; test al, al
             ; jz >guard_fail
@@ -157,7 +157,7 @@ impl JitCompiler {
             ; lea rdi, [r12 + offset]
             ; mov rsi, QWORD expected_ptr as _
             ; mov edx, DWORD reg_index
-            ; mov rax, QWORD jit_guard_native_function as _
+            ; mov rax, QWORD jit_guard_native_function as *const () as _
             ; call rax
             ; test al, al
             ; jz >guard_fail
@@ -194,7 +194,7 @@ impl JitCompiler {
         }
         dynasm!(self.ops
             ; lea rdi, [r12 + cond_offset]
-            ; mov rax, QWORD jit_value_is_truthy as _
+            ; mov rax, QWORD jit_value_is_truthy as *const () as _
             ; call rax
             ; test al, al
         );

@@ -706,7 +706,7 @@ impl JitCompiler {
                     ; mov r14, [r15 + 8]
                     ; lea rdi, [r14 + src_offset]
                     ; lea rsi, [r12 + dest_offset]
-                    ; mov rax, QWORD jit_move_safe as _
+                    ; mov rax, QWORD jit_move_safe as *const () as _
                     ; call rax
                     ; test al, al
                     ; jz =>inline_fail
@@ -725,7 +725,7 @@ impl JitCompiler {
                     ; mov r14, [r15 + 8]
                     ; lea rdi, [r12 + ret_offset]
                     ; lea rsi, [r14 + dest_offset]
-                    ; mov rax, QWORD jit_move_safe as _
+                    ; mov rax, QWORD jit_move_safe as *const () as _
                     ; call rax
                     ; test al, al
                     ; jz =>inline_fail

@@ -1,5 +1,7 @@
 #[cfg(feature = "std")]
 pub mod codegen;
+#[cfg(all(feature = "rv32", target_arch = "riscv32", not(feature = "std")))]
+pub mod codegen_rv32;
 pub mod optimizer;
 pub mod profiler;
 pub mod specialization;
@@ -8,14 +10,22 @@ use crate::bytecode::Value;
 use crate::VM;
 #[cfg(feature = "std")]
 pub use codegen::JitCompiler;
-#[cfg(not(feature = "std"))]
+#[cfg(all(feature = "rv32", target_arch = "riscv32", not(feature = "std")))]
+pub use codegen_rv32::JitCompiler;
+#[cfg(not(any(
+    feature = "std",
+    all(feature = "rv32", target_arch = "riscv32", not(feature = "std"))
+)))]
 pub struct JitCompiler;
 use alloc::{string::String, vec::Vec};
 use hashbrown::HashMap;
 pub use optimizer::TraceOptimizer;
 pub use profiler::{HotSpot, Profiler};
 pub use trace::{Trace, TraceOp, TraceRecorder};
-#[cfg(not(feature = "std"))]
+#[cfg(not(any(
+    feature = "std",
+    all(feature = "rv32", target_arch = "riscv32", not(feature = "std"))
+)))]
 impl JitCompiler {
     pub fn new() -> Self {
         Self
@@ -29,7 +39,7 @@ impl JitCompiler {
         _hoisted_constants: Vec<(u8, Value)>,
     ) -> crate::Result<CompiledTrace> {
         Err(crate::LustError::RuntimeError {
-            message: "JIT is unavailable without the `std` feature".into(),
+            message: "JIT is unavailable: enable `std` (x86_64) or `rv32` (riscv32)".into(),
         })
     }
 }
@@ -128,7 +138,8 @@ pub struct JitState {
 
 impl JitState {
     pub fn new() -> Self {
-        let enabled = cfg!(all(feature = "std", target_arch = "x86_64"));
+        let enabled = cfg!(all(feature = "std", target_arch = "x86_64"))
+            || cfg!(all(feature = "rv32", target_arch = "riscv32", not(feature = "std")));
         Self {
             profiler: Profiler::new(),
             traces: HashMap::new(),

@@ -1,4 +1,4 @@
-// RV32 JIT codegen — requires the `rv32` feature and target_arch = "riscv32".
+// RV32 JIT codegen — requires the `rv32` feature (which implies `std`) and target_arch = "riscv32".
 //
 // dynasm-rs uses `[base, offset]` syntax for memory references (not the
 // traditional RISC-V `offset(base)` syntax).  Every `dynasm!` invocation

@@ -46,6 +46,11 @@ std = [
   "thiserror/std",
   "dep:lust-macros",
 ]
+# JIT for riscv32 targets. Does not require the `std` lust feature, but
+# dynasmrt itself currently uses std internally, so this still needs a
+# std-capable runtime (e.g. Linux/RISC-V).  Floats require the RV32F
+# extension.
+rv32 = ["dep:dynasmrt"]
 libloading = ["std", "dep:libloading"]
 dirs = ["std", "dep:dirs"]
 packages = ["std", "libloading", "dirs", "dep:serde_json", "dep:object"]

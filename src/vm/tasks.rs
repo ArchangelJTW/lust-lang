@@ -292,7 +292,7 @@ impl VM {
                 let yield_const = wrapper.chunk.add_constant(yield_fn);
                 let mut index_consts = Vec::new();
                 if arg_count > 1 {
-                    for i in 0..(arg_count as i64) {
+                    for i in 0..(arg_count as LustInt) {
                         index_consts.push(wrapper.chunk.add_constant(Value::Int(i)));
                     }
                 }
@@ -460,7 +460,7 @@ impl VM {
     pub fn complete_native_future_task(
         &mut self,
         handle: TaskHandle,
-        outcome: std::result::Result<Value, String>,
+        outcome: core::result::Result<Value, String>,
     ) -> Result<()> {
         let task_id = self.task_id_from_handle(handle)?;
         let mut task = match self.task_manager.detach(task_id) {
@@ -709,6 +709,7 @@ impl VM {
                         }
                         Ok(Value::string(pieces.join(&sep)))
                     }
+                    #[cfg(feature = "std")]
                     "unpack" => {
                         if args.len() != 2 {
                             return Err(LustError::RuntimeError {

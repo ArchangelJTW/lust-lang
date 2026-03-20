@@ -3,9 +3,11 @@ use crate::bytecode::Instruction;
 use crate::bytecode::{Register, Value};
 use crate::LustError;
 use alloc::{
+    boxed::Box,
     format,
     rc::Rc,
     string::{String, ToString},
+    vec,
     vec::Vec,
 };
 use core::fmt;

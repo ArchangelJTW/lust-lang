@@ -3,6 +3,7 @@ use super::VM;
 use crate::bytecode::value::ValueKey;
 use crate::bytecode::{NativeCallResult, Value};
 use crate::config::LustConfig;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::lua_compat::register_lust_function;
 use crate::LustInt;
 use rand::rngs::StdRng;
@@ -1267,6 +1268,7 @@ fn to_lua_value(vm: &VM, value: Value) -> Result<Value, String> {
                 .map_err(|e| e.to_string())?;
             Value::enum_variant("LuaValue", "Table", vec![lua_table])
         }
+        #[cfg(not(target_arch = "wasm32"))]
         Value::Function(_) | Value::Closure { .. } | Value::NativeFunction(_) => {
             let handle = register_lust_function(value.clone());
             let lua_fn = vm

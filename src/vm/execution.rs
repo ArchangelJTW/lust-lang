@@ -163,19 +163,27 @@ impl VM {
                             .unwrap_or(1);
                         self.budgets.charge_gas(trace_gas_cost)?;
 
-                        // Capture RSP before and after to detect stack leaks
+                        // Capture RSP before and after to detect stack leaks (x86_64 only)
+                        #[cfg(target_arch = "x86_64")]
                         let rsp_before: usize;
-                        unsafe { std::arch::asm!("mov {}, rsp", out(reg) rsp_before) };
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp_before) };
 
                         let result = entry_fn(registers_ptr, self as *mut VM, ptr::null());
 
+                        #[cfg(target_arch = "x86_64")]
                         let rsp_after: usize;
-                        unsafe { std::arch::asm!("mov {}, rsp", out(reg) rsp_after) };
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp_after) };
 
+                        #[cfg(target_arch = "x86_64")]
                         let rsp_diff = rsp_after as isize - rsp_before as isize;
                         crate::jit::log(|| {
-                            format!("🎯 JIT: Trace #{} execution result: {} (RSP before: {:x}, after: {:x}, diff: {})",
-                            trace_id.0, result, rsp_before, rsp_after, rsp_diff)
+                            #[cfg(target_arch = "x86_64")]
+                            return format!("🎯 JIT: Trace #{} execution result: {} (RSP before: {:x}, after: {:x}, diff: {})",
+                            trace_id.0, result, rsp_before, rsp_after, rsp_diff);
+                            #[cfg(not(target_arch = "x86_64"))]
+                            return format!("🎯 JIT: Trace #{} execution result: {}", trace_id.0, result);
                         });
 
                         if result == 0 {
@@ -701,11 +709,13 @@ impl VM {
                         // Check what type we're actually dealing with
                         if let Value::Enum { enum_name, variant, .. } = &func_value {
                             if enum_name == "LuaValue" && (variant == "Table" || variant == "Userdata") {
+                                #[cfg(feature = "std")]
                                 eprintln!("DEBUG Instruction::Call: Have LuaValue.{} but needs_call_value=false", variant);
                             }
                         }
                     }
 
+                    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
                     loop {
                         let handle = match &func_value {
                             Value::Enum {
@@ -1800,6 +1810,7 @@ impl VM {
         }
 
         match func {
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             Value::Enum {
                 enum_name,
                 variant,

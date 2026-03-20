@@ -589,7 +589,7 @@ impl TypeChecker {
             } else {
                 format!("{}.{}", type_name, method.name)
             };
-            #[cfg(debug_assertions)]
+            #[cfg(all(debug_assertions, feature = "std"))]
             eprintln!(
                 "register_external_impl canonical method {} (has_self={})",
                 canonical_name, has_self

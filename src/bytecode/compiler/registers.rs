@@ -24,13 +24,16 @@ impl Compiler {
             self.max_register = reg;
         }
         if reg == 255 {
-            eprintln!("Register overflow diagnostics:");
-            eprintln!("  Current function has {} scopes", self.scopes.len());
-            eprintln!("  Max local register index: {}", self.max_local_register_index());
-            eprintln!("  Next register: {}", self.next_register);
-            eprintln!("  Max register: {}", self.max_register);
-            for (i, scope) in self.scopes.iter().enumerate() {
-                eprintln!("  Scope {}: {} locals", i, scope.locals.len());
+            #[cfg(feature = "std")]
+            {
+                eprintln!("Register overflow diagnostics:");
+                eprintln!("  Current function has {} scopes", self.scopes.len());
+                eprintln!("  Max local register index: {}", self.max_local_register_index());
+                eprintln!("  Next register: {}", self.next_register);
+                eprintln!("  Max register: {}", self.max_register);
+                for (i, scope) in self.scopes.iter().enumerate() {
+                    eprintln!("  Scope {}: {} locals", i, scope.locals.len());
+                }
             }
             panic!("Register overflow (max 255 registers per function)");
         }
@@ -85,19 +88,22 @@ impl Compiler {
         }
 
         if reg == 255 {
-            eprintln!("Register overflow diagnostics (allocate_register):");
-            eprintln!("  Current function index: {}", self.current_function);
-            eprintln!("  Function name: {}", self.functions.get(self.current_function)
-                .map(|f| f.name.clone())
-                .unwrap_or_else(|| "<anonymous>".to_string()));
-            eprintln!("  Current function has {} scopes", self.scopes.len());
-            eprintln!("  Max local register index: {}", self.max_local_register_index());
-            eprintln!("  Next register: {}", self.next_register);
-            eprintln!("  Max register: {}", self.max_register);
-            for (i, scope) in self.scopes.iter().enumerate() {
-                eprintln!("  Scope {}: {} locals", i, scope.locals.len());
-                for (name, &(reg, _)) in &scope.locals {
-                    eprintln!("    {} -> R{}", name, reg);
+            #[cfg(feature = "std")]
+            {
+                eprintln!("Register overflow diagnostics (allocate_register):");
+                eprintln!("  Current function index: {}", self.current_function);
+                eprintln!("  Function name: {}", self.functions.get(self.current_function)
+                    .map(|f| f.name.clone())
+                    .unwrap_or_else(|| "<anonymous>".to_string()));
+                eprintln!("  Current function has {} scopes", self.scopes.len());
+                eprintln!("  Max local register index: {}", self.max_local_register_index());
+                eprintln!("  Next register: {}", self.next_register);
+                eprintln!("  Max register: {}", self.max_register);
+                for (i, scope) in self.scopes.iter().enumerate() {
+                    eprintln!("  Scope {}: {} locals", i, scope.locals.len());
+                    for (name, &(reg, _)) in &scope.locals {
+                        eprintln!("    {} -> R{}", name, reg);
+                    }
                 }
             }
             panic!("Register overflow (max 255 registers per function)");

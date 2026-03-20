@@ -106,6 +106,7 @@ impl VM {
             cycle_collector: cycle::CycleCollector::new(),
             exported_natives: Vec::new(),
             export_prefix_stack: Vec::new(),
+            #[cfg(feature = "std")]
             exported_type_stubs: Vec::new(),
         };
         vm.jit.enabled = vm.jit.enabled && config.jit_enabled();
@@ -362,6 +363,7 @@ impl VM {
         self.register_native(name, native);
     }
 
+    #[cfg(feature = "std")]
     pub fn register_type_stubs(&mut self, stubs: Vec<ModuleStub>) {
         if stubs.is_empty() {
             return;
@@ -369,10 +371,12 @@ impl VM {
         self.exported_type_stubs.extend(stubs);
     }
 
+    #[cfg(feature = "std")]
     pub fn exported_type_stubs(&self) -> &[ModuleStub] {
         &self.exported_type_stubs
     }
 
+    #[cfg(feature = "std")]
     pub fn take_type_stubs(&mut self) -> Vec<ModuleStub> {
         mem::take(&mut self.exported_type_stubs)
     }
@@ -387,6 +391,7 @@ impl VM {
 
     pub fn clear_native_functions(&mut self) {
         self.natives.clear();
+        #[cfg(feature = "std")]
         self.exported_type_stubs.clear();
     }
 

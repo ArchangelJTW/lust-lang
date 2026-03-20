@@ -5,6 +5,7 @@ use crate::vm::CallFrame;
 use crate::vm::TaskSignal;
 use crate::vm::VM;
 use alloc::rc::{Rc, Weak};
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use hashbrown::{hash_map::Entry, HashMap, HashSet};

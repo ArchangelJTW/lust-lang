@@ -11,6 +11,7 @@ pub(super) use crate::bytecode::{
     FieldStorage, Function, Instruction, NativeCallResult, Register, StructLayout, TaskHandle,
     Value,
 };
+#[cfg(feature = "std")]
 pub(super) use crate::embed::native_types::ModuleStub;
 pub(super) use crate::error::StackFrame;
 pub(super) use crate::jit::{
@@ -180,6 +181,7 @@ pub struct VM {
     pub(super) cycle_collector: cycle::CycleCollector,
     pub(super) exported_natives: Vec<NativeExport>,
     pub(super) export_prefix_stack: Vec<String>,
+    #[cfg(feature = "std")]
     pub(super) exported_type_stubs: Vec<ModuleStub>,
 }
 

@@ -2,10 +2,11 @@ use super::task::{TaskInstance, TaskKind, TaskState};
 use super::VM;
 use crate::bytecode::value::IteratorState;
 use crate::bytecode::{NativeCallResult, Value, ValueKey};
+use crate::number::{LustFloat, LustInt};
 use crate::LustError;
 use alloc::format;
 use alloc::rc::Rc;
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -17,19 +18,24 @@ pub(super) fn install_core_builtins(vm: &mut VM) {
 }
 
 pub(super) fn core_entries(vm: &VM) -> Vec<(&'static str, Value)> {
-    vec![
+    let mut entries = vec![
         ("error", create_error_fn()),
         ("assert", create_assert_fn()),
         ("tostring", create_tostring_fn()),
         ("tonumber", create_tonumber_fn()),
         ("setmetatable", create_setmetatable_fn()),
-        ("unpack", super::stdlib::create_table_unpack_fn()),
-        ("select", super::stdlib::create_select_fn()),
         ("pairs", create_pairs_fn()),
         ("ipairs", create_ipairs_fn()),
         ("task", create_task_module(vm)),
-        ("lua", create_lua_module(vm)),
-    ]
+    ];
+    #[cfg(feature = "std")]
+    {
+        entries.push(("unpack", super::stdlib::create_table_unpack_fn()));
+        entries.push(("select", super::stdlib::create_select_fn()));
+    }
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    entries.push(("lua", create_lua_module(vm)));
+    entries
 }
 
 fn lua_truthy(value: &Value) -> bool {
@@ -59,6 +65,7 @@ pub(super) fn unwrap_lua_value(value: Value) -> Value {
                         .and_then(|v| v.as_int())
                         .map(|i| i as usize);
                     if let Some(handle) = handle {
+                        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
                         if let Some(func) = crate::lua_compat::lookup_lust_function(handle) {
                             return func;
                         }
@@ -134,14 +141,14 @@ fn create_tonumber_fn() -> Value {
             Value::Bool(b) => Value::Int(if b { 1 } else { 0 }),
             Value::String(s) => {
                 if let Some(base) = base {
-                    if let Ok(parsed) = i64::from_str_radix(s.as_str(), base) {
+                    if let Ok(parsed) = LustInt::from_str_radix(s.as_str(), base) {
                         Value::Int(parsed)
                     } else {
                         Value::Nil
                     }
-                } else if let Ok(i) = s.as_str().parse::<i64>() {
+                } else if let Ok(i) = s.as_str().parse::<LustInt>() {
                     Value::Int(i)
-                } else if let Ok(f) = s.as_str().parse::<f64>() {
+                } else if let Ok(f) = s.as_str().parse::<LustFloat>() {
                     Value::Float(f)
                 } else {
                     Value::Nil
@@ -165,8 +172,11 @@ fn setmetatable_value(table: Value, meta: Value) -> Result<Value, String> {
 
         // Store the full metatable for getmetatable() and copy all metamethod entries (keys starting with "__")
         // into the fast lookup map used by the VM.
-        let meta_lua = VM::with_current(|vm| to_lua_value(vm, meta.clone()))?;
-        metamethods.insert(ValueKey::string(META_KEY.to_string()), meta_lua);
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        let meta_stored = VM::with_current(|vm| to_lua_value(vm, meta.clone()))?;
+        #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+        let meta_stored = meta.clone();
+        metamethods.insert(ValueKey::string(META_KEY.to_string()), meta_stored);
 
         // Extract metamethods from the metatable - check both 'table' and 'metamethods' fields
         let mut meta_pairs: Vec<(ValueKey, Value)> = if let Some(map) = meta.as_map() {
@@ -198,8 +208,11 @@ fn setmetatable_value(table: Value, meta: Value) -> Result<Value, String> {
             if !key_str.starts_with("__") {
                 continue;
             }
-            let value_lua = VM::with_current(|vm| to_lua_value(vm, value))?;
-            metamethods.insert(ValueKey::string(key_str), value_lua);
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+            let value_stored = VM::with_current(|vm| to_lua_value(vm, value))?;
+            #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+            let value_stored = value;
+            metamethods.insert(ValueKey::string(key_str), value_stored);
         }
         Ok(table)
     } else {
@@ -226,7 +239,7 @@ fn collect_map_pairs(value: &Value) -> Vec<(ValueKey, Value)> {
     } else if let Some(arr) = value.as_array() {
         arr.into_iter()
             .enumerate()
-            .map(|(i, v)| (ValueKey::from_value(&Value::Int((i as i64) + 1)), v.clone()))
+            .map(|(i, v)| (ValueKey::from_value(&Value::Int((i as LustInt) + 1)), v.clone()))
             .collect()
     } else {
         Vec::new()
@@ -250,7 +263,7 @@ fn create_ipairs_fn() -> Value {
         let items = if let Some(arr) = target.as_array() {
             arr.into_iter()
                 .enumerate()
-                .map(|(i, v)| (ValueKey::from_value(&Value::Int((i as i64) + 1)), v.clone()))
+                .map(|(i, v)| (ValueKey::from_value(&Value::Int((i as LustInt) + 1)), v.clone()))
                 .collect()
         } else {
             collect_map_pairs(&target)
@@ -294,6 +307,7 @@ pub(super) fn string_key(name: &str) -> ValueKey {
     ValueKey::from(name.to_string())
 }
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn create_lua_module(vm: &VM) -> Value {
     let entries = [
         (string_key("nil"), Value::enum_unit("LuaValue", "Nil")),
@@ -999,6 +1013,7 @@ fn create_lua_module(vm: &VM) -> Value {
     vm.map_with_entries(entries)
 }
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn pack_lua_values(vm: &mut VM, values: Vec<Value>) -> Result<Value, String> {
     let mut packed = Vec::with_capacity(values.len());
     for value in values {
@@ -1007,6 +1022,7 @@ fn pack_lua_values(vm: &mut VM, values: Vec<Value>) -> Result<Value, String> {
     Ok(Value::array(packed))
 }
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn to_lua_value(vm: &mut VM, value: Value) -> Result<Value, String> {
     Ok(match value.clone() {
         Value::Enum { enum_name, .. } if enum_name == "LuaValue" => value,
@@ -1059,6 +1075,7 @@ fn to_lua_value(vm: &mut VM, value: Value) -> Result<Value, String> {
     })
 }
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn lua_value_error_message(err: LustError) -> String {
     match err {
         LustError::RuntimeError { message } => message,
@@ -1066,6 +1083,7 @@ fn lua_value_error_message(err: LustError) -> String {
     }
 }
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn resolve_callable_for_pcall(value: Value) -> Result<Value, String> {
     if let Value::Struct { name, .. } = &value {
         if name == "LuaFunction" {
@@ -1082,6 +1100,7 @@ fn resolve_callable_for_pcall(value: Value) -> Result<Value, String> {
     Ok(value)
 }
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn create_lua_socket_protect_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
         let func = args.get(0).cloned().unwrap_or(Value::Nil);
@@ -1125,6 +1144,7 @@ fn create_lua_socket_protect_fn() -> Value {
     }))
 }
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn create_lua_socket_skip_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
         let count = unwrap_lua_value(args.get(0).cloned().unwrap_or(Value::Nil));
@@ -1156,6 +1176,7 @@ fn create_lua_socket_skip_fn() -> Value {
     }))
 }
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn create_lua_socket_newtry_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
         let finalizer = args.get(0).cloned();
@@ -1200,6 +1221,7 @@ fn create_lua_socket_newtry_fn() -> Value {
     }))
 }
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn create_lua_socket_try_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
         let first = unwrap_lua_value(args.get(0).cloned().unwrap_or(Value::Nil));
@@ -1446,6 +1468,7 @@ fn lua_op_neg(a: Value) -> Value {
     }
 }
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn lua_op_binary<F>(a: Value, b: Value, op: F) -> Value
 where
     F: Fn(crate::lua_compat::LuaValue, crate::lua_compat::LuaValue) -> crate::lua_compat::LuaValue,
@@ -1492,6 +1515,7 @@ fn lua_op_concat(a: Value, b: Value) -> Value {
     )
 }
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn value_to_rust_luavalue(v: &Value) -> crate::lua_compat::LuaValue {
     use crate::lua_compat::LuaValue;
     match unwrap_lua_value(v.clone()) {
@@ -1504,6 +1528,7 @@ fn value_to_rust_luavalue(v: &Value) -> crate::lua_compat::LuaValue {
     }
 }
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn rust_luavalue_to_value(lv: crate::lua_compat::LuaValue) -> Value {
     use crate::lua_compat::LuaValue;
     match lv {

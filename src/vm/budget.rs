@@ -99,6 +99,7 @@ impl BudgetState {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(super) fn try_charge_vec_growth<T>(&mut self, old_cap: usize, new_cap: usize) -> bool {
         if new_cap <= old_cap {
             return true;
@@ -183,6 +184,7 @@ impl VM {
         self.budgets.try_charge_value_vec(element_count)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn try_charge_memory_vec_growth<T>(
         &mut self,
         old_cap: usize,

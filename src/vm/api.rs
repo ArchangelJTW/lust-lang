@@ -300,11 +300,13 @@ impl VM {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn push_export_prefix(&mut self, crate_name: &str) {
         let sanitized = crate_name.replace('-', "_");
         self.export_prefix_stack.push(sanitized);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn pop_export_prefix(&mut self) {
         self.export_prefix_stack.pop();
     }

@@ -1462,6 +1462,7 @@ fn build_task_info_value(vm: &VM, task: &TaskInstance) -> Result<Value, LustErro
 }
 
 // Helper functions for LuaValue operations
+#[allow(dead_code)]
 fn lua_op_neg(a: Value) -> Value {
     match unwrap_lua_value(a.clone()) {
         Value::Int(x) => Value::enum_variant("LuaValue", "Int", vec![Value::Int(-x)]),
@@ -1481,6 +1482,7 @@ where
     rust_luavalue_to_value(result)
 }
 
+#[allow(dead_code)]
 fn lua_op_concat(a: Value, b: Value) -> Value {
     let a_str = match unwrap_lua_value(a.clone()) {
         Value::String(s) => s.to_string(),

@@ -419,7 +419,7 @@ impl TraceRecorder {
     /// This should be called right after trace recording starts
     pub fn specialize_trace_inputs(
         &mut self,
-        registers: &[Value; 256],
+        registers: &[Value],
         function: &crate::bytecode::Function,
     ) {
         crate::jit::log(|| format!("🔍 JIT: Scanning trace inputs for specialization..."));
@@ -616,6 +616,7 @@ impl TraceRecorder {
 
     /// Invalidate specialization for a register that's about to be overwritten
     /// The specialized Vec data needs to be dropped since it won't be reboxed
+    #[allow(dead_code)]
     fn invalidate_specialization(&mut self, register: Register) {
         if let Some((specialized_id, layout)) = self.specialized_registers.remove(&register) {
             crate::jit::log(|| {
@@ -745,7 +746,7 @@ impl TraceRecorder {
         &mut self,
         instruction: Instruction,
         current_ip: usize,
-        registers: &[Value; 256],
+        registers: &[Value],
         function: &crate::bytecode::Function,
         function_idx: usize,
         functions: &[crate::bytecode::Function],
@@ -1770,7 +1771,7 @@ impl TraceRecorder {
         &mut self,
         lhs: Register,
         rhs: Register,
-        registers: &[Value; 256],
+        registers: &[Value],
         function: &crate::bytecode::Function,
     ) -> Result<(), LustError> {
         if let Some(ty) = Self::get_value_type(&registers[lhs as usize]) {

@@ -7,6 +7,7 @@ use hashbrown::HashMap;
 pub struct Chunk {
     pub instructions: Vec<Instruction>,
     pub constants: Vec<Value>,
+    #[cfg(feature = "std")]
     pub lines: Vec<usize>,
 }
 
@@ -15,6 +16,7 @@ impl Chunk {
         Self {
             instructions: Vec::new(),
             constants: Vec::new(),
+            #[cfg(feature = "std")]
             lines: Vec::new(),
         }
     }
@@ -22,7 +24,10 @@ impl Chunk {
     pub fn emit(&mut self, instruction: Instruction, line: usize) -> usize {
         let idx = self.instructions.len();
         self.instructions.push(instruction);
+        #[cfg(feature = "std")]
         self.lines.push(line);
+        #[cfg(not(feature = "std"))]
+        let _ = line;
         idx
     }
 
@@ -60,7 +65,10 @@ impl Chunk {
 
         output.push_str("\nInstructions:\n");
         for (i, instruction) in self.instructions.iter().enumerate() {
+            #[cfg(feature = "std")]
             let line = self.lines.get(i).copied().unwrap_or(0);
+            #[cfg(not(feature = "std"))]
+            let line = 0usize;
             output.push_str(&format!("{:04} [L{:03}] {}\n", i, line, instruction));
         }
 

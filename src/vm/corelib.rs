@@ -17,6 +17,7 @@ pub(super) fn install_core_builtins(vm: &mut VM) {
     }
 }
 
+#[cfg_attr(not(feature = "std"), allow(unused_mut))]
 pub(super) fn core_entries(vm: &VM) -> Vec<(&'static str, Value)> {
     let mut entries = vec![
         ("error", create_error_fn()),
@@ -58,18 +59,19 @@ pub(super) fn unwrap_lua_value(value: Value) -> Value {
                     .cloned()
                     .unwrap_or(Value::Bool(false)),
                 "Function" => {
+                    #[cfg(feature = "std")]
                     let handle = values
                         .as_ref()
                         .and_then(|vals| vals.get(0))
                         .and_then(|v| v.struct_get_field("handle"))
                         .and_then(|v| v.as_int())
                         .map(|i| i as usize);
+                    #[cfg(feature = "std")]
                     if let Some(handle) = handle {
-                        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+                        #[cfg(not(target_arch = "wasm32"))]
                         if let Some(func) = crate::lua_compat::lookup_lust_function(handle) {
                             return func;
                         }
-                        #[cfg(feature = "std")]
                         if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() {
                             eprintln!("[lua-socket] unwrap missing handle={}", handle);
                         }
@@ -1491,6 +1493,8 @@ fn lua_op_concat(a: Value, b: Value) -> Value {
                 "[WARN] lua_op_concat: cannot concatenate {:?}, treating as empty string",
                 other
             );
+            #[cfg(not(feature = "std"))]
+            let _ = other;
             String::new()
         }
     };
@@ -1505,6 +1509,8 @@ fn lua_op_concat(a: Value, b: Value) -> Value {
                 "[WARN] lua_op_concat: cannot concatenate {:?}, treating as empty string",
                 other
             );
+            #[cfg(not(feature = "std"))]
+            let _ = other;
             String::new()
         }
     };

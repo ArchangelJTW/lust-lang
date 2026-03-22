@@ -187,7 +187,7 @@ impl Compiler {
         })
     }
 
-    pub(super) fn record_extern_value(&mut self, name: &str) {
+    pub fn record_extern_value(&mut self, name: &str) {
         let runtime_name = name.to_string();
         self.extern_value_aliases
             .entry(runtime_name.clone())

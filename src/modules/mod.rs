@@ -1,11 +1,15 @@
+use crate::ast::Item;
+#[cfg(feature = "std")]
 use crate::{
-    ast::{FunctionDef, Item, ItemKind, UseTree, Visibility},
+    ast::{FunctionDef, ItemKind, UseTree, Visibility},
     error::{LustError, Result},
     lexer::Lexer,
     parser::Parser,
     Span,
 };
-use alloc::{format, string::String, vec, vec::Vec};
+use alloc::{string::String, vec::Vec};
+#[cfg(feature = "std")]
+use alloc::{format, vec};
 use hashbrown::{HashMap, HashSet};
 #[cfg(feature = "std")]
 use std::{

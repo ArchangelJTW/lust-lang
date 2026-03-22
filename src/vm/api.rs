@@ -6,7 +6,7 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::result::Result as CoreResult;
-use core::{array, mem};
+use core::mem;
 use hashbrown::HashMap;
 
 #[derive(Debug, Clone)]
@@ -451,14 +451,6 @@ impl VM {
             .ok_or_else(|| LustError::RuntimeError {
                 message: format!("Function not found: {}", function_name),
             })?;
-        let mut frame = CallFrame {
-            function_idx: func_idx,
-            ip: 0,
-            registers: array::from_fn(|_| Value::Nil),
-            base_register: 0,
-            return_dest: None,
-            upvalues: Vec::new(),
-        };
         let func = &self.functions[func_idx];
         if args.len() != func.param_count as usize {
             return Err(LustError::RuntimeError {
@@ -470,7 +462,9 @@ impl VM {
                 ),
             });
         }
+        let register_count = func.register_count;
 
+        let mut frame = CallFrame::new(func_idx, None, register_count);
         for (i, arg) in args.into_iter().enumerate() {
             frame.registers[i] = arg;
         }

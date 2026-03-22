@@ -1,6 +1,6 @@
 use super::*;
 use crate::bytecode::ValueKey;
-use core::{array, ptr};
+use core::ptr;
 impl VM {
     fn lua_table_map(value: &Value) -> Option<Value> {
         if let Value::Enum {
@@ -668,7 +668,9 @@ impl VM {
                 }
 
                 Instruction::Call(func_reg, first_arg, arg_count, dest_reg) => {
-                    let mut func_value = self.get_register(func_reg)?.clone();
+                    let func_value = self.get_register(func_reg)?.clone();
+                    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+                    let mut func_value = func_value;
                     // if let Value::Enum { enum_name, variant, .. } = &func_value {
                     //     if enum_name == "LuaValue" && variant == "Table" {
                     //         eprintln!("DEBUG: Instruction::Call with LuaValue.Table");
@@ -748,14 +750,8 @@ impl VM {
                                 args.push(self.get_register(first_arg + i)?.clone());
                             }
 
-                            let mut frame = CallFrame {
-                                function_idx: func_idx,
-                                ip: 0,
-                                registers: array::from_fn(|_| Value::Nil),
-                                base_register: 0,
-                                return_dest: Some(dest_reg),
-                                upvalues: Vec::new(),
-                            };
+                            let register_count = self.functions[func_idx].register_count;
+                            let mut frame = CallFrame::new(func_idx, Some(dest_reg), register_count);
                             for (i, arg) in args.into_iter().enumerate() {
                                 frame.registers[i] = arg;
                             }
@@ -774,14 +770,9 @@ impl VM {
 
                             let upvalue_values: Vec<Value> =
                                 upvalues.iter().map(|uv| uv.get()).collect();
-                            let mut frame = CallFrame {
-                                function_idx: func_idx,
-                                ip: 0,
-                                registers: array::from_fn(|_| Value::Nil),
-                                base_register: 0,
-                                return_dest: Some(dest_reg),
-                                upvalues: upvalue_values,
-                            };
+                            let register_count = self.functions[func_idx].register_count;
+                            let mut frame = CallFrame::new(func_idx, Some(dest_reg), register_count);
+                            frame.upvalues = upvalue_values;
                             for (i, arg) in args.into_iter().enumerate() {
                                 frame.registers[i] = arg;
                             }
@@ -1229,14 +1220,8 @@ impl VM {
                         if let Some(func_idx) =
                             self.functions.iter().position(|f| f.name == mangled_name)
                         {
-                            let mut frame = CallFrame {
-                                function_idx: func_idx,
-                                ip: 0,
-                                registers: array::from_fn(|_| Value::Nil),
-                                base_register: 0,
-                                return_dest: Some(dest_reg),
-                                upvalues: Vec::new(),
-                            };
+                            let register_count = self.functions[func_idx].register_count;
+                            let mut frame = CallFrame::new(func_idx, Some(dest_reg), register_count);
                             frame.registers[0] = object.clone();
                             for i in 0..arg_count {
                                 frame.registers[(i + 1) as usize] =
@@ -1841,14 +1826,8 @@ impl VM {
                 let saved_pending_task_signal = self.pending_task_signal.clone();
                 let saved_last_task_signal = self.last_task_signal.clone();
 
-                let mut frame = CallFrame {
-                    function_idx: *func_idx,
-                    ip: 0,
-                    registers: array::from_fn(|_| Value::Nil),
-                    base_register: 0,
-                    return_dest: None,
-                    upvalues: Vec::new(),
-                };
+                let register_count = self.functions[*func_idx].register_count;
+                let mut frame = CallFrame::new(*func_idx, None, register_count);
                 for (i, arg) in args.into_iter().enumerate() {
                     frame.registers[i] = arg;
                 }
@@ -1885,14 +1864,9 @@ impl VM {
                 let saved_last_task_signal = self.last_task_signal.clone();
 
                 let upvalue_values: Vec<Value> = upvalues.iter().map(|uv| uv.get()).collect();
-                let mut frame = CallFrame {
-                    function_idx: *func_idx,
-                    ip: 0,
-                    registers: array::from_fn(|_| Value::Nil),
-                    base_register: 0,
-                    return_dest: None,
-                    upvalues: upvalue_values,
-                };
+                let register_count = self.functions[*func_idx].register_count;
+                let mut frame = CallFrame::new(*func_idx, None, register_count);
+                frame.upvalues = upvalue_values;
                 for (i, arg) in args.into_iter().enumerate() {
                     frame.registers[i] = arg;
                 }

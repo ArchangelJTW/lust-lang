@@ -189,11 +189,34 @@ pub struct VM {
 pub(super) struct CallFrame {
     pub(super) function_idx: usize,
     pub(super) ip: usize,
+    /// In std mode this is a fixed [Value; 256] stored inline in the frame (no extra
+    /// indirection, JIT-compatible raw pointer layout). In no_std mode (no JIT) it is a
+    /// Vec sized to the function's actual register_count, saving the unused slots.
+    #[cfg(feature = "std")]
     pub(super) registers: [Value; 256],
+    #[cfg(not(feature = "std"))]
+    pub(super) registers: Vec<Value>,
     #[allow(dead_code)]
     pub(super) base_register: usize,
     pub(super) return_dest: Option<Register>,
     pub(super) upvalues: Vec<Value>,
+}
+
+impl CallFrame {
+    #[allow(unused_variables)]
+    pub(super) fn new(function_idx: usize, return_dest: Option<Register>, register_count: u8) -> Self {
+        Self {
+            function_idx,
+            ip: 0,
+            #[cfg(feature = "std")]
+            registers: core::array::from_fn(|_| Value::Nil),
+            #[cfg(not(feature = "std"))]
+            registers: alloc::vec![Value::Nil; register_count as usize],
+            base_register: 0,
+            return_dest,
+            upvalues: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

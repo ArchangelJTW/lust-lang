@@ -3,7 +3,7 @@ use crate::bytecode::{LustMap, ValueKey};
 use crate::vm::task::TaskKind;
 use crate::LustInt;
 use alloc::{format, string::ToString};
-use core::{array, cell::RefCell, mem};
+use core::{cell::RefCell, mem};
 impl VM {
     pub(super) fn run_task_internal(
         &mut self,
@@ -158,15 +158,9 @@ impl VM {
                         ),
                     });
                 }
+                let register_count = function.register_count;
 
-                let mut frame = CallFrame {
-                    function_idx: func_idx,
-                    ip: 0,
-                    registers: array::from_fn(|_| Value::Nil),
-                    base_register: 0,
-                    return_dest: None,
-                    upvalues: Vec::new(),
-                };
+                let mut frame = CallFrame::new(func_idx, None, register_count);
                 for (i, arg) in args.into_iter().enumerate() {
                     frame.registers[i] = arg;
                 }
@@ -188,16 +182,11 @@ impl VM {
                         ),
                     });
                 }
+                let register_count = function.register_count;
 
                 let captured: Vec<Value> = upvalues.iter().map(|uv| uv.get()).collect();
-                let mut frame = CallFrame {
-                    function_idx,
-                    ip: 0,
-                    registers: array::from_fn(|_| Value::Nil),
-                    base_register: 0,
-                    return_dest: None,
-                    upvalues: captured,
-                };
+                let mut frame = CallFrame::new(function_idx, None, register_count);
+                frame.upvalues = captured;
                 for (i, arg) in args.into_iter().enumerate() {
                     frame.registers[i] = arg;
                 }

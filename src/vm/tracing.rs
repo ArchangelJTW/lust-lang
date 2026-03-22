@@ -5,7 +5,10 @@ impl VM {
         for frame in &self.call_stack {
             let function = &self.functions[frame.function_idx];
             let ip_index = frame.ip.saturating_sub(1);
+            #[cfg(feature = "std")]
             let line = function.chunk.lines.get(ip_index).copied().unwrap_or(0);
+            #[cfg(not(feature = "std"))]
+            let line = 0usize;
             frames.push(StackFrame::new(function.name.clone(), line, ip_index));
         }
 
@@ -17,8 +20,12 @@ impl VM {
             LustError::RuntimeError { message } => {
                 if let Some(frame) = self.call_stack.last() {
                     let function = &self.functions[frame.function_idx];
+                    #[cfg(feature = "std")]
                     let ip_index = frame.ip.saturating_sub(1);
+                    #[cfg(feature = "std")]
                     let line = function.chunk.lines.get(ip_index).copied().unwrap_or(0);
+                    #[cfg(not(feature = "std"))]
+                    let line = 0usize;
                     let stack_trace = self.build_stack_trace();
                     LustError::RuntimeErrorWithTrace {
                         message,

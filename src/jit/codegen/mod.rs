@@ -43,10 +43,12 @@ pub struct JitCompiler {
     exit_stack: Vec<dynasmrt::DynamicLabel>,
     inline_depth: usize,
     /// Registry for type specializations
+    #[allow(dead_code)]
     pub(super) specialization_registry: SpecializationRegistry,
     /// Track active specialized values in trace
     pub(super) specialized_values: HashMap<usize, SpecializedValue>,
     /// Next ID for specialized values
+    #[allow(dead_code)]
     pub(super) next_specialized_id: usize,
 }
 

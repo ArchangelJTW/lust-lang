@@ -326,6 +326,7 @@ struct DependencyTomlTable {
     externs: Option<String>,
 }
 
+#[allow(dead_code)]
 const fn default_jit_enabled() -> bool {
     true
 }

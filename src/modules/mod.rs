@@ -49,6 +49,7 @@ pub struct Program {
 }
 
 pub use embedded::{build_directory_map, load_program_from_embedded, EmbeddedModule};
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default)]
 struct ImportResolution {
     import_value: bool,

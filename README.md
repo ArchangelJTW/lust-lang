@@ -93,7 +93,7 @@ A complete example lives in `examples/c-ffi`.
 
 ## Things considered more in the stable territory:
  - std interpreter
- - std JIT (Optimizations are rare, error cases are rare under normal use)
+ - std JIT (Many optimizations are WIP, error cases are rare under normal use)
  - no_std interpreter
 
 ## Other things WIP:

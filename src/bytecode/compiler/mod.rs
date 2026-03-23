@@ -136,6 +136,10 @@ impl Compiler {
         self.function_signatures = signatures;
     }
 
+    pub fn take_function_signatures(&mut self) -> HashMap<String, FunctionSignature> {
+        core::mem::take(&mut self.function_signatures)
+    }
+
     pub(super) fn is_stdlib_symbol(&self, name: &str) -> bool {
         self.stdlib_symbols.contains(name)
     }

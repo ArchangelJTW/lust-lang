@@ -59,7 +59,7 @@ you can write Lust-readable extern stubs to disk from your embedder:
 let _ = program.dump_externs_to_dir("externs");
 ```
 
-The `is` helper works the way you expect:
+The `is` helper works intuitively:
 
 ```lust
 if status is Complete(value) then
@@ -67,7 +67,7 @@ if status is Complete(value) then
 end
 ```
 
-## Embedding in C
+## Embedding in C (WIP)
 
 The crate ships with a C header at `include/lust_ffi.h` exposing a minimal ABI so native hosts
 can compile and call Lust code. Build the shared library with
@@ -89,3 +89,20 @@ int main(void) {
 ```
 
 A complete example lives in `examples/c-ffi`.
+
+
+## Things considered more in the stable territory:
+ - std interpreter
+ - std JIT (Optimizations are rare, error cases are rare under normal use)
+ - no_std interpreter
+
+## Other things WIP:
+ - tree-sitter (Missing a few highlight scenarios)
+ - vsc-extension (Haven't touched this in a while)
+ - lust-analyzer (Still useful, but missing a lot of useful errors)
+ - Package system
+
+The language is still heavily WIP in general, absolute stability is not guaranteed.
+
+# License
+License for the language/interpreter is currently PolyForm Noncommercial License 1.0.0.  Once I am comfortable with the state of the language core it will be moved to MIT/GPLv3 (Undecided).

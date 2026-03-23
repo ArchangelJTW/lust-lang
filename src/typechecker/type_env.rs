@@ -625,12 +625,24 @@ impl TypeEnv {
         self.functions.clone()
     }
 
+    pub fn take_function_signatures(&mut self) -> HashMap<String, FunctionSignature> {
+        core::mem::take(&mut self.functions)
+    }
+
     pub fn struct_definitions(&self) -> HashMap<String, StructDef> {
         self.structs.clone()
     }
 
+    pub fn take_struct_definitions(&mut self) -> HashMap<String, StructDef> {
+        core::mem::take(&mut self.structs)
+    }
+
     pub fn enum_definitions(&self) -> HashMap<String, EnumDef> {
         self.enums.clone()
+    }
+
+    pub fn take_enum_definitions(&mut self) -> HashMap<String, EnumDef> {
+        core::mem::take(&mut self.enums)
     }
 
     pub fn register_struct(&mut self, s: &StructDef) -> Result<()> {

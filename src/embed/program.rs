@@ -928,48 +928,39 @@ fn compile_in_memory(
         .ok_or_else(|| LustError::Unknown("Entry path contained invalid UTF-8".into()))?
         .to_string();
     let program = loader.load_program_from_entry(&entry_path_str)?;
+
+    // Build imports map (small: just alias/path strings, not AST)
     let mut imports_map: HashMap<String, ModuleImports> = HashMap::new();
     for module in &program.modules {
         imports_map.insert(module.path.clone(), module.imports.clone());
     }
 
-    let mut wrapped_items: Vec<Item> = Vec::new();
-    for module in &program.modules {
-        wrapped_items.push(Item::new(
-            ItemKind::Module {
-                name: module.path.clone(),
-                items: module.items.clone(),
-            },
-            Span::new(0, 0, 0, 0),
-        ));
-    }
-
+    // Phase 1: type check while program is still alive (borrows module items)
     let mut typechecker = TypeChecker::with_config(&config);
     typechecker.set_imports_by_module(imports_map.clone());
     extern_registry.register_with_typechecker(&mut typechecker)?;
     typechecker.check_program(&program.modules)?;
     let option_coercions = typechecker.take_option_coercions();
-    let mut struct_defs = typechecker.struct_definitions();
+    // Use take_ to move data out instead of cloning
+    let mut struct_defs = typechecker.take_struct_definitions();
     for def in extern_registry.structs() {
         struct_defs.insert(def.name.clone(), def.clone());
     }
-    let mut enum_defs = typechecker.enum_definitions();
+    let mut enum_defs = typechecker.take_enum_definitions();
     for def in extern_registry.enums() {
         enum_defs.insert(def.name.clone(), def.clone());
     }
-    let mut signatures = typechecker.function_signatures();
-    let mut compiler = Compiler::new();
-    compiler.set_option_coercions(option_coercions);
-    compiler.configure_stdlib(&config);
-    compiler.set_imports_by_module(imports_map);
-    compiler.set_entry_module(program.entry_module.clone());
-    compiler.set_function_signatures(signatures.clone());
-    let functions = compiler.compile_module(&wrapped_items)?;
-    let trait_impls = compiler.get_trait_impls().to_vec();
+    let signatures = typechecker.take_function_signatures();
+    // Typechecker no longer needed — free its memory (expr_types, variable_types, scopes, etc.)
+    drop(typechecker);
+
+    // Phase 2: consume program.modules to build wrapped_items without cloning AST items
+    let program_entry_module = program.entry_module;
     let mut init_funcs: Vec<(String, String)> = Vec::new();
-    for module in &program.modules {
-        if module.path != program.entry_module {
-            if let Some(init) = &module.init_function {
+    let mut wrapped_items: Vec<Item> = Vec::new();
+    for module in program.modules {
+        if module.path != program_entry_module {
+            if let Some(ref init) = module.init_function {
                 let init_name = module
                     .imports
                     .function_aliases
@@ -979,13 +970,33 @@ fn compile_in_memory(
                 init_funcs.push((module.path.clone(), init_name));
             }
         }
+        wrapped_items.push(Item::new(
+            ItemKind::Module {
+                name: module.path,
+                items: module.items,
+            },
+            Span::new(0, 0, 0, 0),
+        ));
     }
 
-    let function_names: Vec<String> = functions.iter().map(|f| f.name.clone()).collect();
-    let entry_script = function_names
+    // Phase 3: compile — move signatures into compiler to avoid a second copy
+    let mut compiler = Compiler::new();
+    compiler.set_option_coercions(option_coercions);
+    compiler.configure_stdlib(&config);
+    compiler.set_imports_by_module(imports_map);
+    compiler.set_entry_module(program_entry_module.clone());
+    compiler.set_function_signatures(signatures);
+    let functions = compiler.compile_module(&wrapped_items)?;
+    let trait_impls = compiler.get_trait_impls().to_vec();
+    // Recover signatures from compiler (avoids keeping two copies alive simultaneously)
+    let mut signatures = compiler.take_function_signatures();
+    // AST no longer needed — free it before setting up the VM
+    drop(wrapped_items);
+
+    let entry_script = functions
         .iter()
-        .find(|name| name.as_str() == "__script")
-        .cloned();
+        .find(|f| f.name == "__script")
+        .map(|f| f.name.clone());
     if let Some(script_name) = &entry_script {
         signatures
             .entry(script_name.clone())
@@ -1015,7 +1026,7 @@ fn compile_in_memory(
         struct_defs,
         enum_defs,
         entry_script,
-        entry_module: program.entry_module,
+        entry_module: program_entry_module,
         async_registry: Rc::new(RefCell::new(AsyncRegistry::new())),
     })
 }

@@ -399,12 +399,24 @@ impl TypeChecker {
         self.env.function_signatures()
     }
 
+    pub fn take_function_signatures(&mut self) -> HashMap<String, type_env::FunctionSignature> {
+        self.env.take_function_signatures()
+    }
+
     pub fn struct_definitions(&self) -> HashMap<String, StructDef> {
         self.env.struct_definitions()
     }
 
+    pub fn take_struct_definitions(&mut self) -> HashMap<String, StructDef> {
+        self.env.take_struct_definitions()
+    }
+
     pub fn enum_definitions(&self) -> HashMap<String, EnumDef> {
         self.env.enum_definitions()
+    }
+
+    pub fn take_enum_definitions(&mut self) -> HashMap<String, EnumDef> {
+        self.env.take_enum_definitions()
     }
 
     fn register_module_init_locals(&mut self, items: &[Item]) -> Result<()> {

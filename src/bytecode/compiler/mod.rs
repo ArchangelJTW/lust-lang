@@ -41,6 +41,7 @@ pub struct Compiler {
     pub(super) stdlib_symbols: HashSet<String>,
     option_coercions: HashMap<String, HashSet<Span>>,
     function_signatures: HashMap<String, FunctionSignature>,
+    minimal_runtime_types: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -78,9 +79,28 @@ impl Compiler {
             stdlib_symbols: HashSet::new(),
             option_coercions: HashMap::new(),
             function_signatures: HashMap::new(),
+            minimal_runtime_types: false,
         };
         compiler.configure_stdlib(&LustConfig::default());
         compiler
+    }
+
+    pub fn set_minimal_runtime_types(&mut self, enabled: bool) {
+        self.minimal_runtime_types = enabled;
+    }
+
+    /// Apply all relevant config settings to the compiler
+    pub fn configure(&mut self, config: &LustConfig) {
+        self.minimal_runtime_types = config.minimal_runtime_types();
+        self.configure_stdlib(config);
+    }
+
+    pub(super) fn new_function(&self, name: impl Into<String>, param_count: u8, is_method: bool) -> Function {
+        if self.minimal_runtime_types {
+            Function::new_minimal(name, param_count, is_method)
+        } else {
+            Function::new(name, param_count, is_method)
+        }
     }
 
     pub fn set_imports_by_module(&mut self, map: HashMap<String, crate::modules::ModuleImports>) {

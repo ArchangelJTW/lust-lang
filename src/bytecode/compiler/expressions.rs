@@ -474,7 +474,7 @@ impl Compiler {
                 let captured_vars = self.analyze_free_variables(body, &params)?;
                 let lambda_func_idx = self.functions.len();
                 let lambda_name = format!("<lambda@{}>", lambda_func_idx);
-                let lambda_func = Function::new(&lambda_name, params.len() as u8, false);
+                let lambda_func = self.new_function(&lambda_name, params.len() as u8, false);
                 self.functions.push(lambda_func);
                 self.try_set_lambda_signature(lambda_func_idx, &params, &return_type);
                 let saved_func_idx = self.current_function;

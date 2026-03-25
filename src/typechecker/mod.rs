@@ -31,6 +31,7 @@ pub struct TypeChecker {
     expr_types_by_module: HashMap<String, HashMap<Span, Type>>,
     variable_types_by_module: HashMap<String, HashMap<Span, Type>>,
     short_circuit_info: HashMap<String, HashMap<Span, ShortCircuitInfo>>,
+    low_memory_mode: bool,
 }
 
 pub struct TypeCollection {
@@ -63,7 +64,13 @@ impl TypeChecker {
             expr_types_by_module: HashMap::new(),
             variable_types_by_module: HashMap::new(),
             short_circuit_info: HashMap::new(),
+            low_memory_mode: config.low_memory_mode(),
         }
+    }
+
+    /// Configure the typechecker with a LustConfig
+    pub fn configure(&mut self, config: &LustConfig) {
+        self.low_memory_mode = config.low_memory_mode();
     }
 
     fn dummy_span() -> Span {
@@ -1180,6 +1187,9 @@ impl TypeChecker {
     }
 
     fn record_short_circuit_info(&mut self, span: Span, info: &ShortCircuitInfo) {
+        if self.low_memory_mode {
+            return; // Skip recording in low memory mode
+        }
         let truthy = info.truthy.as_ref().map(|ty| self.canonicalize_type(ty));
         let falsy = info.falsy.as_ref().map(|ty| self.canonicalize_type(ty));
         let option_inner = info

@@ -49,6 +49,83 @@ pub struct Program {
 }
 
 pub use embedded::{build_directory_map, load_program_from_embedded, EmbeddedModule};
+
+use crate::bytecode::Compiler;
+use crate::typechecker::TypeChecker;
+use crate::vm::VM;
+use crate::LustConfig;
+
+/// Compiles a Program into a VM with memory optimizations.
+/// This is designed for no_std contexts where memory is constrained (e.g., ESP32).
+///
+/// # Arguments
+/// * `program` - The parsed program from `load_program_from_embedded`
+/// * `config` - Configuration with low_memory_mode and minimal_runtime_types options
+///
+/// # Example
+/// ```ignore
+/// let entries = &[EmbeddedModule { module: "main", parent: None, source: Some(source) }];
+/// let program = load_program_from_embedded(entries, "main")?;
+/// let mut config = LustConfig::default();
+/// config.set_low_memory_mode(true);
+/// config.set_minimal_runtime_types(true);
+/// let vm = compile_program_with_config(program, &config)?;
+/// vm.call_function("__script", &[])?;
+/// ```
+pub fn compile_program_with_config(program: Program, config: &LustConfig) -> crate::Result<VM> {
+    // Build imports map
+    let mut imports_map: HashMap<String, ModuleImports> = HashMap::new();
+    for module in &program.modules {
+        imports_map.insert(module.path.clone(), module.imports.clone());
+    }
+
+    // Phase 1: Type check
+    let mut typechecker = TypeChecker::with_config(config);
+    typechecker.set_imports_by_module(imports_map.clone());
+    typechecker.check_program(&program.modules)?;
+    let option_coercions = typechecker.take_option_coercions();
+    let _struct_defs = typechecker.take_struct_definitions();
+    let _enum_defs = typechecker.take_enum_definitions();
+    let signatures = typechecker.take_function_signatures();
+    // Typechecker no longer needed - free its memory
+    drop(typechecker);
+
+    // Phase 2: Build wrapped items
+    let program_entry_module = program.entry_module;
+    let mut wrapped_items: Vec<Item> = Vec::new();
+    for module in program.modules {
+        wrapped_items.push(Item::new(
+            crate::ast::ItemKind::Module {
+                name: module.path,
+                items: module.items,
+            },
+            crate::ast::Span::new(0, 0, 0, 0),
+        ));
+    }
+
+    // Phase 3: Compile
+    let mut compiler = Compiler::new();
+    compiler.set_option_coercions(option_coercions);
+    compiler.configure_stdlib(config);
+    compiler.set_imports_by_module(imports_map);
+    compiler.set_entry_module(program_entry_module.clone());
+    compiler.set_function_signatures(signatures);
+    compiler.set_minimal_runtime_types(config.minimal_runtime_types());
+    let functions = compiler.compile_module(&wrapped_items)?;
+    let trait_impls = compiler.get_trait_impls().to_vec();
+    // AST no longer needed
+    drop(wrapped_items);
+
+    // Phase 4: Create VM
+    let mut vm = VM::with_config(config);
+    vm.load_functions(functions);
+    for (type_name, trait_name) in trait_impls {
+        vm.register_trait_impl(type_name, trait_name);
+    }
+
+    Ok(vm)
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default)]
 struct ImportResolution {

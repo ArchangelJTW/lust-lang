@@ -117,6 +117,20 @@ impl EmbeddedBuilder {
         self
     }
 
+    /// Enable low memory mode for constrained environments (e.g., ESP32).
+    /// Reduces compilation memory by not storing expression/variable type info.
+    pub fn low_memory_mode(mut self) -> Self {
+        self.config.set_low_memory_mode(true);
+        self
+    }
+
+    /// Enable minimal runtime types to reduce memory in compiled functions.
+    /// Strips register type info from Function objects.
+    pub fn minimal_runtime_types(mut self) -> Self {
+        self.config.set_minimal_runtime_types(true);
+        self
+    }
+
     pub fn add_module(
         &mut self,
         module_path: impl Into<String>,
@@ -986,6 +1000,7 @@ fn compile_in_memory(
     compiler.set_imports_by_module(imports_map);
     compiler.set_entry_module(program_entry_module.clone());
     compiler.set_function_signatures(signatures);
+    compiler.set_minimal_runtime_types(config.minimal_runtime_types());
     let functions = compiler.compile_module(&wrapped_items)?;
     let trait_impls = compiler.get_trait_impls().to_vec();
     // Recover signatures from compiler (avoids keeping two copies alive simultaneously)

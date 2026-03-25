@@ -22,7 +22,7 @@ impl Compiler {
 
                             ItemKind::Function(func_def) => {
                                 let func_idx = self.functions.len();
-                                let function = Function::new(
+                                let function = self.new_function(
                                     &func_def.name,
                                     func_def.params.len() as u8,
                                     func_def.is_method,
@@ -66,7 +66,7 @@ impl Compiler {
                                         } else {
                                             format!("{}.{}", type_name, method.name)
                                         };
-                                    let function = Function::new(
+                                    let function = self.new_function(
                                         &mangled_name,
                                         method.params.len() as u8,
                                         has_self,
@@ -113,7 +113,7 @@ impl Compiler {
 
                 ItemKind::Function(func_def) => {
                     let func_idx = self.functions.len();
-                    let function = Function::new(
+                    let function = self.new_function(
                         &func_def.name,
                         func_def.params.len() as u8,
                         func_def.is_method,
@@ -154,7 +154,7 @@ impl Compiler {
                             format!("{}.{}", type_name, method.name)
                         };
                         let function =
-                            Function::new(&mangled_name, method.params.len() as u8, has_self);
+                            self.new_function(&mangled_name, method.params.len() as u8, has_self);
                         self.function_table.insert(mangled_name.clone(), func_idx);
                         self.functions.push(function);
                         self.assign_signature_by_name(func_idx, &mangled_name);
@@ -180,7 +180,7 @@ impl Compiler {
         }
 
         let script_func_idx = self.functions.len();
-        let script_func = Function::new("__script", 0, false);
+        let script_func = self.new_function("__script", 0, false);
         self.function_table
             .insert("__script".to_string(), script_func_idx);
         self.functions.push(script_func);

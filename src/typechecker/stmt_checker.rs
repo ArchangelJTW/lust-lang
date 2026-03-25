@@ -186,7 +186,7 @@ impl TypeChecker {
                 }
             }
 
-            if binding.span.start_line > 0 {
+            if binding.span.start_line > 0 && !self.low_memory_mode {
                 if let Some(module) = &self.current_module {
                     self.variable_types_by_module
                         .entry(module.clone())

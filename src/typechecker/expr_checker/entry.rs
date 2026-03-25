@@ -9,7 +9,7 @@ impl TypeChecker {
             ty.span = expr.span;
         }
 
-        if expr.span.start_line > 0 {
+        if expr.span.start_line > 0 && !self.low_memory_mode {
             if let Some(module) = &self.current_module {
                 self.expr_types_by_module
                     .entry(module.clone())

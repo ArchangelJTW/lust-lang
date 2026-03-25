@@ -85,6 +85,16 @@ impl DependencySpec {
 pub struct LustConfig {
     enabled_modules: HashSet<String>,
     jit_enabled: bool,
+    /// When enabled, minimizes memory usage during compilation by:
+    /// - Not storing expression types and variable types
+    /// - Not storing short-circuit type flow analysis
+    /// - Clearing typechecker data immediately after use
+    /// Intended for constrained no_std environments like ESP32.
+    low_memory_mode: bool,
+    /// When enabled, strips detailed type information from compiled functions:
+    /// - Removes register type info from Function objects
+    /// - Reduces runtime memory at cost of less type safety/debug info
+    minimal_runtime_types: bool,
     #[cfg(feature = "std")]
     dependencies: Vec<DependencySpec>,
 }
@@ -94,6 +104,8 @@ impl Default for LustConfig {
         Self {
             enabled_modules: HashSet::new(),
             jit_enabled: true,
+            low_memory_mode: false,
+            minimal_runtime_types: false,
             #[cfg(feature = "std")]
             dependencies: Vec::new(),
         }
@@ -155,6 +167,34 @@ impl LustConfig {
 
     pub fn set_jit_enabled(&mut self, enabled: bool) {
         self.jit_enabled = enabled;
+    }
+
+    pub fn low_memory_mode(&self) -> bool {
+        self.low_memory_mode
+    }
+
+    pub fn set_low_memory_mode(&mut self, enabled: bool) {
+        self.low_memory_mode = enabled;
+    }
+
+    pub fn minimal_runtime_types(&self) -> bool {
+        self.minimal_runtime_types
+    }
+
+    pub fn set_minimal_runtime_types(&mut self, enabled: bool) {
+        self.minimal_runtime_types = enabled;
+    }
+
+    /// Builder-style method to enable low memory mode
+    pub fn with_low_memory_mode(mut self, enabled: bool) -> Self {
+        self.low_memory_mode = enabled;
+        self
+    }
+
+    /// Builder-style method to enable minimal runtime types
+    pub fn with_minimal_runtime_types(mut self, enabled: bool) -> Self {
+        self.minimal_runtime_types = enabled;
+        self
     }
 
     pub fn with_enabled_modules<I, S>(modules: I) -> Self
@@ -266,6 +306,8 @@ impl LustConfig {
         Ok(Self {
             enabled_modules: modules,
             jit_enabled: jit,
+            low_memory_mode: false,
+            minimal_runtime_types: false,
             dependencies,
         })
     }
@@ -341,6 +383,8 @@ mod tests {
         let cfg = LustConfig::default();
         assert!(cfg.jit_enabled());
         assert!(cfg.enabled_modules().next().is_none());
+        assert!(!cfg.low_memory_mode());
+        assert!(!cfg.minimal_runtime_types());
     }
 
     #[test]

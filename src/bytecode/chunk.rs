@@ -90,6 +90,7 @@ pub struct Function {
     pub is_method: bool,
     pub chunk: Chunk,
     pub upvalues: Vec<(bool, u8)>,
+    /// Only stored when minimal_runtime_types is disabled
     pub register_types: HashMap<u8, TypeKind>,
     pub signature: Option<FunctionSignature>,
 }
@@ -104,6 +105,20 @@ impl Function {
             chunk: Chunk::new(),
             upvalues: Vec::new(),
             register_types: HashMap::new(),
+            signature: None,
+        }
+    }
+
+    /// Creates a new function without register type tracking (saves memory)
+    pub fn new_minimal(name: impl Into<String>, param_count: u8, is_method: bool) -> Self {
+        Self {
+            name: name.into(),
+            param_count,
+            register_count: 0,
+            is_method,
+            chunk: Chunk::new(),
+            upvalues: Vec::new(),
+            register_types: HashMap::new(), // Empty, won't be populated
             signature: None,
         }
     }

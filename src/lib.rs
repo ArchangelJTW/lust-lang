@@ -46,7 +46,10 @@ pub use jit::{JitCompiler, JitState};
 pub use lexer::{Lexer, Token, TokenKind};
 #[cfg(feature = "std")]
 pub use lust_macros::LustStructView;
-pub use modules::{LoadedModule, ModuleImports, ModuleLoader, Program};
+pub use modules::{
+    compile_program_with_config, LoadedModule, ModuleImports, ModuleLoader, Program,
+};
+pub use modules::embedded::{EmbeddedModule, load_program_from_embedded, build_directory_map};
 pub use number::{LustFloat, LustInt};
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 pub use packages::{

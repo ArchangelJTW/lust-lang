@@ -1,14 +1,21 @@
 use alloc::string::String;
 use core::fmt;
+
+/// Memory-efficient token that avoids string allocation for most tokens.
+/// Uses a lightweight representation optimized for embedded systems.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub kind: TokenKind,
+    /// Stores the lexeme. Empty for fixed tokens (keywords, operators).
+    /// Only identifiers, strings, and numbers allocate here.
     pub lexeme: String,
     pub line: usize,
     pub column: usize,
 }
 
 impl Token {
+    /// Create a token with a lexeme (identifiers, strings, numbers)
+    #[inline]
     pub fn new(kind: TokenKind, lexeme: String, line: usize, column: usize) -> Self {
         Self {
             kind,
@@ -16,6 +23,22 @@ impl Token {
             line,
             column,
         }
+    }
+
+    /// Create a token without allocating a lexeme string (for fixed tokens)
+    #[inline]
+    pub fn simple(kind: TokenKind, line: usize, column: usize) -> Self {
+        Self {
+            kind,
+            lexeme: String::new(),
+            line,
+            column,
+        }
+    }
+
+    /// Returns true if this token has a lexeme that was allocated
+    pub fn has_allocated_lexeme(&self) -> bool {
+        !self.lexeme.is_empty()
     }
 }
 

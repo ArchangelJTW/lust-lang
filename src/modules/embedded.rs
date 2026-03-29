@@ -41,19 +41,42 @@ pub fn load_program_from_embedded(
     entries: &[EmbeddedModule<'_>],
     entry_module: &str,
 ) -> Result<Program> {
+    #[cfg(feature = "esp32c6-logging")]
+    log::info!("load_program_from_embedded: starting with {} entries", entries.len());
+
     let mut module_names: HashSet<String> = entries.iter().map(|e| e.module.to_string()).collect();
 
+    #[cfg(feature = "esp32c6-logging")]
+    log::info!("load_program_from_embedded: module names collected");
+
     let mut registry: HashMap<String, LoadedModule> = HashMap::new();
-    for entry in entries {
+    for entry in entries.iter() {
+        #[cfg(feature = "esp32c6-logging")]
+        log::info!("load_program_from_embedded: processing module '{}'", entry.module);
+
         if let Some(source) = entry.source {
+            #[cfg(feature = "esp32c6-logging")]
+            log::info!("  parsing module '{}' ({} bytes)", entry.module, source.len());
+
             let module = parse_module(entry.module, source)?;
+
+            #[cfg(feature = "esp32c6-logging")]
+            log::info!("  parsed module '{}' successfully", entry.module);
+
             registry.insert(entry.module.to_string(), module);
         } else {
             module_names.insert(entry.module.to_string());
         }
     }
 
+    #[cfg(feature = "esp32c6-logging")]
+    log::info!("load_program_from_embedded: building dependency map");
+
     let dependency_map = build_dependency_map(&registry, &module_names);
+
+    #[cfg(feature = "esp32c6-logging")]
+    log::info!("load_program_from_embedded: dependency map built");
+
     let mut ordered = Vec::new();
     let mut visited = HashSet::new();
     let mut stack = HashSet::new();
@@ -68,12 +91,18 @@ pub fn load_program_from_embedded(
         )?;
     }
 
+    #[cfg(feature = "esp32c6-logging")]
+    log::info!("load_program_from_embedded: finalizing {} modules", ordered.len());
+
     for module in ordered {
         finalize_module(&module_names, &mut registry, &module)?;
     }
 
     let mut modules: Vec<LoadedModule> = registry.into_values().collect();
     modules.sort_by(|a, b| a.path.cmp(&b.path));
+
+    #[cfg(feature = "esp32c6-logging")]
+    log::info!("load_program_from_embedded: complete");
 
     Ok(Program {
         modules,
@@ -82,10 +111,32 @@ pub fn load_program_from_embedded(
 }
 
 fn parse_module(module: &str, source: &str) -> Result<LoadedModule> {
-    let mut lexer = Lexer::new(source);
-    let tokens = lexer.tokenize()?;
-    let mut parser = Parser::new(tokens);
+    #[cfg(feature = "esp32c6-logging")]
+    log::info!("parse_module: creating lexer for '{}'", module);
+
+    // Create a string interner for this module
+    // Estimate capacity based on source size
+    let estimated_strings = (source.len() / 20).max(50);
+    let mut interner = crate::intern::Interner::with_capacity(estimated_strings);
+
+    let mut lexer = Lexer::new(source, &mut interner);
+
+    #[cfg(feature = "esp32c6-logging")]
+    log::info!("parse_module: tokenizing...");
+
+    let mut parser = Parser::from_lexer(&mut lexer)?;
+
+    #[cfg(feature = "esp32c6-logging")]
+    {
+        log::info!("parse_module: tokenized {} tokens, parsing...", parser.token_count());
+        log::info!("  string interner: {} unique strings, {} bytes",
+            interner.len(), interner.total_string_bytes());
+    }
+
     let items = parser.parse()?;
+
+    #[cfg(feature = "esp32c6-logging")]
+    log::info!("parse_module: parsed {} items", items.len());
 
     Ok(LoadedModule {
         path: module.to_string(),

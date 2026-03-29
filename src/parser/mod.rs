@@ -5,13 +5,14 @@ mod type_parser;
 use crate::{
     ast::{Item, ItemKind, Span},
     error::{LustError, Result},
-    lexer::{Token, TokenKind},
+    lexer::{Lexer, Token, TokenKind},
 };
 use alloc::{
     format,
     string::{String, ToString},
     vec::Vec,
 };
+
 pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
@@ -22,33 +23,82 @@ impl Parser {
         Self { tokens, current: 0 }
     }
 
+    /// Create a parser from a lexer using streaming tokenization.
+    /// More memory-efficient for embedded targets.
+    pub fn from_lexer(lexer: &mut Lexer<'_>) -> Result<Self> {
+        // Pre-allocate based on source size to avoid repeated reallocations
+        let estimated_tokens = (lexer.source_len() / 6).max(16);
+
+        #[cfg(feature = "esp32c6-logging")]
+        log::info!("Parser::from_lexer: pre-allocating for ~{} tokens", estimated_tokens);
+
+        let mut tokens = Vec::with_capacity(estimated_tokens);
+
+        #[cfg(feature = "esp32c6-logging")]
+        log::info!("Parser::from_lexer: collecting tokens...");
+
+        for token_result in lexer.tokenize_iter() {
+            tokens.push(token_result?);
+        }
+
+        #[cfg(feature = "esp32c6-logging")]
+        {
+            let with_lexeme = tokens.iter().filter(|t| !t.lexeme.is_empty()).count();
+            log::info!("Parser::from_lexer: collected {} tokens ({} with lexemes)", tokens.len(), with_lexeme);
+        }
+
+        // Shrink to actual size to save memory
+        tokens.shrink_to_fit();
+
+        Ok(Self { tokens, current: 0 })
+    }
+
+    /// Returns the number of tokens (for debugging)
+    pub fn token_count(&self) -> usize {
+        self.tokens.len()
+    }
+
     pub fn parse(&mut self) -> Result<Vec<Item>> {
-        let mut items = Vec::new();
+        // Estimate items: roughly 1 item per 20-50 tokens for typical code
+        let estimated_items = (self.tokens.len() / 30).max(8);
+        let mut items = Vec::with_capacity(estimated_items);
+
+        #[cfg(feature = "esp32c6-logging")]
+        log::info!("Parser::parse: starting with capacity for ~{} items", estimated_items);
+
         while !self.is_at_end() {
             if self.is_item_start() {
                 items.push(self.parse_item()?);
             } else {
-                let start_token = self.current_token().clone();
+                let start_line = self.current_token().line;
+                let start_column = self.current_token().column;
+
                 let mut stmts = Vec::new();
                 while !self.is_at_end() && !self.is_item_start() {
                     stmts.push(self.parse_stmt()?);
                 }
 
                 if !stmts.is_empty() {
-                    let end_token = if self.current > 0 {
-                        self.tokens[self.current - 1].clone()
+                    // Get end position without cloning
+                    let (end_line, end_column) = if self.current > 0 {
+                        let prev_token = &self.tokens[self.current - 1];
+                        (prev_token.line, prev_token.column)
                     } else {
-                        self.current_token().clone()
+                        (start_line, start_column)
                     };
+
                     items.push(Item::new(
                         ItemKind::Script(stmts),
-                        self.make_span(&start_token, &end_token),
+                        Span::new(start_line, start_column, end_line, end_column),
                     ));
                 } else {
                     break;
                 }
             }
         }
+
+        #[cfg(feature = "esp32c6-logging")]
+        log::info!("Parser::parse: parsed {} items", items.len());
 
         Ok(items)
     }
@@ -145,10 +195,12 @@ impl Parser {
 
     fn expect_identifier(&mut self) -> Result<String> {
         if self.check(TokenKind::Identifier) || self.check(TokenKind::Type) {
-            let token = self.advance().clone();
-            Ok(token.lexeme.clone())
+            // Avoid cloning the token - just take the lexeme directly
+            let lexeme = self.current_token().lexeme.clone();
+            self.advance();
+            Ok(lexeme)
         } else {
-            let token = self.current_token().clone();
+            let token = self.current_token();
             Err(LustError::ParserError {
                 line: token.line,
                 column: token.column,

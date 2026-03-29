@@ -270,7 +270,8 @@ impl ModuleLoader {
                 }
             }
         };
-        let mut lexer = Lexer::new(&source);
+        let mut interner = crate::intern::Interner::new();
+        let mut lexer = Lexer::new(&source, &mut interner);
         let tokens = lexer
             .tokenize()
             .map_err(|err| Self::attach_module_to_error(err, module_path))?;

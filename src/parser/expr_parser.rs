@@ -14,14 +14,20 @@ use alloc::{
 };
 use core::{matches, unreachable};
 impl Parser {
+    #[inline(never)]
     pub(super) fn parse_expr(&mut self) -> Result<Expr> {
-        self.parse_assignment()
+        #[cfg(feature = "esp32c6-logging")]
+        log::info!("        parse_expr: {:?} at line {}", self.peek_kind(), self.current_token().line);
+
+        Ok(self.parse_assignment()?)
     }
 
+    #[inline(never)]
     fn parse_assignment(&mut self) -> Result<Expr> {
         self.parse_logical_or()
     }
 
+    #[inline(never)]
     fn parse_logical_or(&mut self) -> Result<Expr> {
         let mut expr = self.parse_logical_and()?;
         while self.match_token(&[TokenKind::Or]) {
@@ -41,6 +47,7 @@ impl Parser {
         Ok(expr)
     }
 
+    #[inline(never)]
     fn parse_logical_and(&mut self) -> Result<Expr> {
         let mut expr = self.parse_comparison()?;
         while self.match_token(&[TokenKind::And]) {
@@ -60,6 +67,7 @@ impl Parser {
         Ok(expr)
     }
 
+    #[inline(never)]
     fn parse_comparison(&mut self) -> Result<Expr> {
         let mut expr = self.parse_range()?;
         while self.match_token(&[
@@ -224,6 +232,7 @@ impl Parser {
         self.parse_postfix()
     }
 
+    #[inline(never)]
     fn parse_postfix(&mut self) -> Result<Expr> {
         let mut expr = self.parse_primary()?;
         loop {
@@ -373,6 +382,10 @@ impl Parser {
                 TokenKind::Is => {
                     self.advance();
                     let span = expr.span;
+
+                    #[cfg(feature = "esp32c6-logging")]
+                    log::info!("        parsing 'is' expression");
+
                     let is_pattern = if self.check(TokenKind::Identifier) {
                         self.peek_ahead(1)
                             .map(|t| t.kind == TokenKind::LeftParen)
@@ -381,6 +394,9 @@ impl Parser {
                         false
                     };
                     if is_pattern {
+                        #[cfg(feature = "esp32c6-logging")]
+                        log::info!("        parsing is pattern");
+
                         let pattern = self.parse_pattern()?;
                         expr = Expr::new(
                             ExprKind::IsPattern {
@@ -436,6 +452,7 @@ impl Parser {
         }
     }
 
+    #[inline(never)]
     fn parse_primary(&mut self) -> Result<Expr> {
         let start_token = self.current_token().clone();
         let kind = match self.peek_kind() {
@@ -695,13 +712,19 @@ impl Parser {
         ))
     }
 
+    #[inline(never)]
     pub(super) fn parse_pattern(&mut self) -> Result<Pattern> {
         match self.peek_kind() {
             TokenKind::Identifier => {
                 let name = self.expect_identifier()?;
                 if self.check(TokenKind::LeftParen) {
                     self.advance();
-                    let mut bindings = Vec::new();
+
+                    #[cfg(feature = "esp32c6-logging")]
+                    log::info!("      parsing pattern Some({})", name);
+
+                    // Pre-allocate for typical pattern binding count (1-4 bindings)
+                    let mut bindings = Vec::with_capacity(4);
                     if !self.check(TokenKind::RightParen) {
                         bindings.push(self.parse_pattern()?);
                         while self.match_token(&[TokenKind::Comma]) {
@@ -710,6 +733,10 @@ impl Parser {
                     }
 
                     self.consume(TokenKind::RightParen, "Expected ')' after pattern")?;
+
+                    // Shrink to fit
+                    bindings.shrink_to_fit();
+
                     Ok(Pattern::Enum {
                         enum_name: String::new(),
                         variant: name,

@@ -7,6 +7,7 @@ pub mod ast;
 pub mod builtins;
 pub mod bytecode;
 pub mod config;
+pub mod intern;
 #[cfg(feature = "std")]
 pub mod externs;
 #[cfg(feature = "std")]

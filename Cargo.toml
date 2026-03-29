@@ -56,6 +56,8 @@ libloading = ["std", "dep:libloading"]
 dirs = ["std", "dep:dirs"]
 packages = ["std", "libloading", "dirs", "dep:serde_json", "dep:object"]
 lua_transpile = ["std", "dep:full_moon"]
+# ESP32 debugging support - adds logging via esp-println
+esp32c6-logging = ["dep:esp-println", "dep:log"]
 
 [[bin]]
 name = "lust"
@@ -87,6 +89,12 @@ object = { version = "0.36.4", default-features = false, features = [
   "read",
 ], optional = true }
 full_moon = { version = "0.18.1", optional = true }
+esp-println = { path = "/home/joshw/Desktop/Code/rs/esp-hal/esp-println", optional = true, features = [
+  "esp32c6",
+  "auto",
+  "log-04",
+] }
+log = { version = "0.4", optional = true }
 
 [build-dependencies]
 dynasm = "4.0.1"

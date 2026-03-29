@@ -16,6 +16,7 @@ use alloc::{
     vec::Vec,
 };
 impl Parser {
+    #[inline(never)]
     pub(super) fn parse_item(&mut self) -> Result<Item> {
         let start_token = self.current_token().clone();
         let visibility = if self.match_token(&[TokenKind::Pub]) {
@@ -23,8 +24,15 @@ impl Parser {
         } else {
             Visibility::Private
         };
+
+        #[cfg(feature = "esp32c6-logging")]
+        log::info!("parse_item: parsing {:?} at line {}", self.peek_kind(), start_token.line);
+
         let kind = match self.peek_kind() {
             TokenKind::Function => {
+                #[cfg(feature = "esp32c6-logging")]
+                log::info!("  parsing function");
+
                 let func_def = self.parse_function(visibility)?;
                 ItemKind::Function(func_def)
             }
@@ -344,12 +352,37 @@ impl Parser {
         } else {
             None
         };
-        let mut body = Vec::new();
+
+        #[cfg(feature = "esp32c6-logging")]
+        log::info!("    parsing body for function '{}'", name);
+
+        // Estimate statement count based on remaining tokens
+        let remaining_tokens = self.tokens.len() - self.current;
+        let estimated_stmts = (remaining_tokens / 5).max(4); // Rough estimate: 5 tokens per statement
+        let mut body = Vec::with_capacity(estimated_stmts);
+
+        let mut stmt_count = 0;
         while !self.check(TokenKind::End) && !self.is_at_end() {
+            stmt_count += 1;
+
+            #[cfg(feature = "esp32c6-logging")]
+            {
+                if stmt_count % 10 == 0 {
+                    log::info!("    parsed {} statements", stmt_count);
+                }
+            }
+
             body.push(self.parse_stmt()?);
         }
 
+        #[cfg(feature = "esp32c6-logging")]
+        log::info!("    function '{}' has {} statements", name, stmt_count);
+
         self.consume(TokenKind::End, "Expected 'end' after function body")?;
+
+        // Shrink the body vector to actual size to save memory
+        body.shrink_to_fit();
+
         Ok(FunctionDef {
             name,
             type_params,

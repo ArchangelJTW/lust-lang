@@ -5,9 +5,15 @@ use crate::{
     lexer::TokenKind,
 };
 use alloc::{vec, vec::Vec};
+
 impl Parser {
+    #[inline(never)]
     pub(super) fn parse_stmt(&mut self) -> Result<Stmt> {
         let start_token = self.current_token().clone();
+
+        #[cfg(feature = "esp32c6-logging")]
+        log::info!("      parse_stmt: {:?} at line {}", self.peek_kind(), start_token.line);
+
         let kind = match self.peek_kind() {
             TokenKind::Local => {
                 self.advance();

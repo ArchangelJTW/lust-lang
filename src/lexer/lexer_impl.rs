@@ -1,30 +1,73 @@
 use super::token::{Token, TokenKind};
 use crate::error::{LustError, Result};
+use crate::intern::{Interner, Symbol};
 use alloc::{
     format,
     string::{String, ToString},
     vec::Vec,
 };
-pub struct Lexer {
-    input: Vec<char>,
+
+pub struct Lexer<'a> {
+    input: &'a str,
     position: usize,
     line: usize,
     column: usize,
+    /// String interner for deduplicating identifiers and literals
+    interner: &'a mut Interner,
 }
 
-impl Lexer {
-    pub fn new(input: &str) -> Self {
+/// Streaming token iterator for memory-constrained environments
+pub struct TokenIterator<'lexer, 'a> {
+    lexer: &'lexer mut Lexer<'a>,
+    finished: bool,
+}
+
+impl<'a> Lexer<'a> {
+    /// Create a new lexer with string interning for memory efficiency
+    pub fn new(input: &'a str, interner: &'a mut Interner) -> Self {
         Self {
-            input: input.chars().collect(),
+            input,
             position: 0,
             line: 1,
             column: 1,
+            interner,
         }
     }
 
+    /// Returns the length of the source in bytes
+    pub fn source_len(&self) -> usize {
+        self.input.len()
+    }
+
     pub fn tokenize(&mut self) -> Result<Vec<Token>> {
+        #[cfg(feature = "esp32c6-logging")]
+        {
+            log::info!("Lexer::tokenize: starting for {} bytes", self.input.len());
+        }
+
         let mut tokens = Vec::new();
+        let mut iterations = 0;
+        let max_iterations = self.input.len() * 2; // Safety limit
+
         while !self.is_at_end() {
+            iterations += 1;
+            if iterations > max_iterations {
+                return Err(LustError::LexerError {
+                    line: self.line,
+                    column: self.column,
+                    message: "Tokenization exceeded maximum iterations (possible infinite loop)".to_string(),
+                    module: None,
+                });
+            }
+
+            // Log progress every 100 iterations
+            #[cfg(feature = "esp32c6-logging")]
+            {
+                if iterations % 100 == 0 {
+                    log::info!("Lexer::tokenize: iteration {} at line {}", iterations, self.line);
+                }
+            }
+
             self.skip_whitespace_and_comments()?;
             if self.is_at_end() {
                 break;
@@ -40,140 +83,147 @@ impl Lexer {
             self.line,
             self.column,
         ));
+
+        #[cfg(feature = "esp32c6-logging")]
+        log::info!("Lexer::tokenize: complete, {} tokens in {} iterations", tokens.len(), iterations);
+
         Ok(tokens)
+    }
+
+    /// Returns an iterator over tokens without allocating all tokens upfront.
+    /// More memory-efficient for embedded targets with limited heap.
+    pub fn tokenize_iter(&mut self) -> TokenIterator<'_, 'a> {
+        TokenIterator {
+            lexer: self,
+            finished: false,
+        }
+    }
+
+    /// Advances to the next token (for streaming tokenization)
+    pub fn next_token_streaming(&mut self) -> Result<Option<Token>> {
+        self.skip_whitespace_and_comments()?;
+        if self.is_at_end() {
+            return Ok(None);
+        }
+        let token = self.next_token()?;
+        Ok(Some(token))
     }
 
     fn next_token(&mut self) -> Result<Token> {
         let start_line = self.line;
         let start_column = self.column;
         let ch = self.current_char();
-        let (kind, lexeme) = match ch {
+
+        // Fixed tokens - no string allocation needed
+        match ch {
             '(' => {
                 self.advance();
-                (TokenKind::LeftParen, "(".to_string())
+                return Ok(Token::simple(TokenKind::LeftParen, start_line, start_column));
             }
-
             ')' => {
                 self.advance();
-                (TokenKind::RightParen, ")".to_string())
+                return Ok(Token::simple(TokenKind::RightParen, start_line, start_column));
             }
-
             '{' => {
                 self.advance();
-                (TokenKind::LeftBrace, "{".to_string())
+                return Ok(Token::simple(TokenKind::LeftBrace, start_line, start_column));
             }
-
             '}' => {
                 self.advance();
-                (TokenKind::RightBrace, "}".to_string())
+                return Ok(Token::simple(TokenKind::RightBrace, start_line, start_column));
             }
-
             '[' => {
                 self.advance();
-                (TokenKind::LeftBracket, "[".to_string())
+                return Ok(Token::simple(TokenKind::LeftBracket, start_line, start_column));
             }
-
             ']' => {
                 self.advance();
-                (TokenKind::RightBracket, "]".to_string())
+                return Ok(Token::simple(TokenKind::RightBracket, start_line, start_column));
             }
-
             ',' => {
                 self.advance();
-                (TokenKind::Comma, ",".to_string())
+                return Ok(Token::simple(TokenKind::Comma, start_line, start_column));
             }
-
             ';' => {
                 self.advance();
-                (TokenKind::Semicolon, ";".to_string())
+                return Ok(Token::simple(TokenKind::Semicolon, start_line, start_column));
             }
-
             '%' => {
                 self.advance();
-                (TokenKind::Percent, "%".to_string())
+                return Ok(Token::simple(TokenKind::Percent, start_line, start_column));
             }
-
             '^' => {
                 self.advance();
-                (TokenKind::Caret, "^".to_string())
+                return Ok(Token::simple(TokenKind::Caret, start_line, start_column));
             }
-
             '?' => {
                 self.advance();
-                (TokenKind::Question, "?".to_string())
+                return Ok(Token::simple(TokenKind::Question, start_line, start_column));
             }
-
             '&' => {
                 self.advance();
-                (TokenKind::Ampersand, "&".to_string())
+                return Ok(Token::simple(TokenKind::Ampersand, start_line, start_column));
             }
-
             '|' => {
                 self.advance();
-                (TokenKind::Pipe, "|".to_string())
+                return Ok(Token::simple(TokenKind::Pipe, start_line, start_column));
             }
-
             '+' => {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    (TokenKind::PlusEqual, "+=".to_string())
+                    return Ok(Token::simple(TokenKind::PlusEqual, start_line, start_column));
                 } else {
-                    (TokenKind::Plus, "+".to_string())
+                    return Ok(Token::simple(TokenKind::Plus, start_line, start_column));
                 }
             }
-
             '-' => {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    (TokenKind::MinusEqual, "-=".to_string())
+                    return Ok(Token::simple(TokenKind::MinusEqual, start_line, start_column));
                 } else if self.current_char() == '>' {
                     self.advance();
-                    (TokenKind::Arrow, "->".to_string())
+                    return Ok(Token::simple(TokenKind::Arrow, start_line, start_column));
                 } else {
-                    (TokenKind::Minus, "-".to_string())
+                    return Ok(Token::simple(TokenKind::Minus, start_line, start_column));
                 }
             }
-
             '*' => {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    (TokenKind::StarEqual, "*=".to_string())
+                    return Ok(Token::simple(TokenKind::StarEqual, start_line, start_column));
                 } else {
-                    (TokenKind::Star, "*".to_string())
+                    return Ok(Token::simple(TokenKind::Star, start_line, start_column));
                 }
             }
-
             '/' => {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    (TokenKind::SlashEqual, "/=".to_string())
+                    return Ok(Token::simple(TokenKind::SlashEqual, start_line, start_column));
                 } else {
-                    (TokenKind::Slash, "/".to_string())
+                    return Ok(Token::simple(TokenKind::Slash, start_line, start_column));
                 }
             }
-
             '=' => {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    (TokenKind::DoubleEqual, "==".to_string())
+                    return Ok(Token::simple(TokenKind::DoubleEqual, start_line, start_column));
                 } else if self.current_char() == '>' {
                     self.advance();
-                    (TokenKind::FatArrow, "=>".to_string())
+                    return Ok(Token::simple(TokenKind::FatArrow, start_line, start_column));
                 } else {
-                    (TokenKind::Equal, "=".to_string())
+                    return Ok(Token::simple(TokenKind::Equal, start_line, start_column));
                 }
             }
-
             '~' => {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    (TokenKind::NotEqual, "~=".to_string())
+                    return Ok(Token::simple(TokenKind::NotEqual, start_line, start_column));
                 } else {
                     return Err(LustError::LexerError {
                         line: start_line,
@@ -183,12 +233,11 @@ impl Lexer {
                     });
                 }
             }
-
             '!' => {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    (TokenKind::NotEqual, "!=".to_string())
+                    return Ok(Token::simple(TokenKind::NotEqual, start_line, start_column));
                 } else {
                     return Err(LustError::LexerError {
                         line: start_line,
@@ -198,47 +247,47 @@ impl Lexer {
                     });
                 }
             }
-
             '<' => {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    (TokenKind::LessEqual, "<=".to_string())
+                    return Ok(Token::simple(TokenKind::LessEqual, start_line, start_column));
                 } else {
-                    (TokenKind::Less, "<".to_string())
+                    return Ok(Token::simple(TokenKind::Less, start_line, start_column));
                 }
             }
-
             '>' => {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    (TokenKind::GreaterEqual, ">=".to_string())
+                    return Ok(Token::simple(TokenKind::GreaterEqual, start_line, start_column));
                 } else {
-                    (TokenKind::Greater, ">".to_string())
+                    return Ok(Token::simple(TokenKind::Greater, start_line, start_column));
                 }
             }
-
             ':' => {
                 self.advance();
                 if self.current_char() == ':' {
                     self.advance();
-                    (TokenKind::DoubleColon, "::".to_string())
+                    return Ok(Token::simple(TokenKind::DoubleColon, start_line, start_column));
                 } else {
-                    (TokenKind::Colon, ":".to_string())
+                    return Ok(Token::simple(TokenKind::Colon, start_line, start_column));
                 }
             }
-
             '.' => {
                 self.advance();
                 if self.current_char() == '.' {
                     self.advance();
-                    (TokenKind::DoubleDot, "..".to_string())
+                    return Ok(Token::simple(TokenKind::DoubleDot, start_line, start_column));
                 } else {
-                    (TokenKind::Dot, ".".to_string())
+                    return Ok(Token::simple(TokenKind::Dot, start_line, start_column));
                 }
             }
+            _ => {}
+        }
 
+        // Variable tokens - need string allocation
+        let (kind, lexeme) = match ch {
             '"' | '\'' => self.scan_string()?,
             '0'..='9' => self.scan_number()?,
             'a'..='z' | 'A'..='Z' | '_' => self.scan_identifier()?,
@@ -286,7 +335,11 @@ impl Lexer {
 
         value.push(self.current_char());
         self.advance();
-        Ok((TokenKind::String, value))
+
+        // Intern the string literal to save memory
+        let symbol = self.interner.intern(&value);
+        let interned = self.interner.get(symbol).to_string();
+        Ok((TokenKind::String, interned))
     }
 
     fn scan_number(&mut self) -> Result<(TokenKind, String)> {
@@ -329,7 +382,11 @@ impl Lexer {
         } else {
             TokenKind::Integer
         };
-        Ok((kind, value))
+
+        // Intern numbers to save memory (many repeated literals like 0, 1, 2)
+        let symbol = self.interner.intern(&value);
+        let interned = self.interner.get(symbol).to_string();
+        Ok((kind, interned))
     }
 
     fn scan_identifier(&mut self) -> Result<(TokenKind, String)> {
@@ -342,7 +399,12 @@ impl Lexer {
         }
 
         let kind = TokenKind::keyword(&value).unwrap_or(TokenKind::Identifier);
-        Ok((kind, value))
+
+        // Intern identifiers - this is the big win!
+        // Identifiers like 'local', 'int', 'function' appear many times
+        let symbol = self.interner.intern(&value);
+        let interned = self.interner.get(symbol).to_string();
+        Ok((kind, interned))
     }
 
     fn skip_whitespace_and_comments(&mut self) -> Result<()> {
@@ -419,30 +481,71 @@ impl Lexer {
     }
 
     fn current_char(&self) -> char {
-        if self.is_at_end() {
-            '\0'
-        } else {
-            self.input[self.position]
-        }
+        self.input[self.position..]
+            .chars()
+            .next()
+            .unwrap_or('\0')
     }
 
     fn peek(&self, offset: usize) -> Option<char> {
-        let pos = self.position + offset;
-        if pos < self.input.len() {
-            Some(self.input[pos])
-        } else {
-            None
+        // Optimized: use byte indexing for ASCII (common case)
+        // Fall back to char iteration only for multibyte sequences
+        let bytes = &self.input.as_bytes()[self.position..];
+
+        if offset == 0 {
+            if bytes.is_empty() {
+                return None;
+            }
+            // Fast path for ASCII
+            if bytes[0] < 128 {
+                return Some(bytes[0] as char);
+            }
         }
+
+        // For offset > 0 or multibyte, iterate
+        let mut iter = self.input[self.position..].chars();
+        for _ in 0..offset {
+            iter.next();
+        }
+        iter.next()
     }
 
     fn advance(&mut self) {
-        if !self.is_at_end() {
-            self.position += 1;
+        if let Some(ch) = self.input[self.position..].chars().next() {
+            self.position += ch.len_utf8();
             self.column += 1;
         }
     }
 
     fn is_at_end(&self) -> bool {
         self.position >= self.input.len()
+    }
+}
+
+impl<'lexer, 'a> core::iter::Iterator for TokenIterator<'lexer, 'a> {
+    type Item = Result<Token>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        match self.lexer.next_token_streaming() {
+            Ok(Some(token)) => Some(Ok(token)),
+            Ok(None) => {
+                self.finished = true;
+                // Emit EOF token
+                Some(Ok(Token::new(
+                    TokenKind::Eof,
+                    String::new(),
+                    self.lexer.line,
+                    self.lexer.column,
+                )))
+            }
+            Err(e) => {
+                self.finished = true;
+                Some(Err(e))
+            }
+        }
     }
 }

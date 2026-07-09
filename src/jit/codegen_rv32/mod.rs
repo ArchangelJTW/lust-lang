@@ -24,7 +24,7 @@
 
 pub(super) use super::specialization::{SpecializationRegistry, SpecializedLayout};
 pub(super) use super::trace::{InlineTrace, Operand, SpecializedOpKind, ValueType};
-pub(super) use super::{CompiledTrace, Guard, GuardKind, Trace, TraceId, TraceOp};
+pub(super) use super::{CompiledTrace, Guard, GuardKind, JitData, Trace, TraceId, TraceOp};
 pub(super) use crate::bytecode::{Function, Value, ValueTag};
 pub(super) use crate::jit;
 pub(super) use crate::number::LustInt;
@@ -74,7 +74,7 @@ pub(super) struct SpecializedValue {
 
 pub struct JitCompiler {
     pub(super) ops: Assembler,
-    pub(super) leaked_constants: Vec<*const Value>,
+    pub(super) data: Vec<JitData>,
     fail_stack: Vec<dynasmrt::DynamicLabel>,
     exit_stack: Vec<dynasmrt::DynamicLabel>,
     pub(super) inline_depth: usize,

@@ -5,7 +5,7 @@ impl JitCompiler {
     pub fn new() -> Self {
         Self {
             ops: Assembler::new().unwrap(),
-            leaked_constants: Vec::new(),
+            data: Vec::new(),
             fail_stack: Vec::new(),
             exit_stack: Vec::new(),
             inline_depth: 0,
@@ -27,6 +27,34 @@ impl JitCompiler {
             .exit_stack
             .last()
             .expect("JIT exit label stack is empty")
+    }
+
+    pub(super) fn retain_value(&mut self, value: Value) -> *const Value {
+        let value = Box::new(value);
+        let ptr = value.as_ref() as *const Value;
+        self.data.push(JitData::Value(value));
+        ptr
+    }
+
+    pub(super) fn retain_string(&mut self, value: &str) -> (*const u8, usize) {
+        let value: Box<str> = value.into();
+        let result = (value.as_ptr(), value.len());
+        self.data.push(JitData::String(value));
+        result
+    }
+
+    pub(super) fn retain_string_pointers(&mut self, pointers: Vec<*const u8>) -> *const *const u8 {
+        let pointers = pointers.into_boxed_slice();
+        let ptr = pointers.as_ptr();
+        self.data.push(JitData::StringPointers(pointers));
+        ptr
+    }
+
+    pub(super) fn retain_string_lengths(&mut self, lengths: Vec<usize>) -> *const usize {
+        let lengths = lengths.into_boxed_slice();
+        let ptr = lengths.as_ptr();
+        self.data.push(JitData::StringLengths(lengths));
+        ptr
     }
 
     pub fn compile_trace(
@@ -158,16 +186,16 @@ impl JitCompiler {
                 }
             }
         }
-        Box::leak(Box::new(exec_buffer));
-        let leaked_constants = mem::take(&mut self.leaked_constants);
+        let data = mem::take(&mut self.data);
         Ok(CompiledTrace {
             id: trace_id,
             entry,
+            _executable: exec_buffer,
+            _data: data,
             trace: trace.clone(),
             guards,
             parent,
             side_traces: Vec::new(),
-            leaked_constants,
             hoisted_constants,
         })
     }
@@ -659,6 +687,7 @@ impl JitCompiler {
 
             let value_size = mem::size_of::<Value>() as i32;
             let frame_size = trace.register_count as i32 * value_size;
+            let frame_value_count = trace.register_count as i32;
             let align_adjust = ((16 - (frame_size & 15)) & 15) as i32;
             let metadata_size = 32i32;
             let outer_fail = self.current_fail_label();
@@ -666,6 +695,8 @@ impl JitCompiler {
             let inline_end = self.ops.new_dynamic_label();
             extern "C" {
                 fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
+                fn jit_init_nil(dest: *mut Value) -> u8;
+                fn jit_drop_values(values: *mut Value, len: usize);
             }
 
             // Save inline metadata (frame size, caller registers, previous inline frame).
@@ -695,7 +726,12 @@ impl JitCompiler {
             );
 
             for reg in 0..trace.register_count {
-                self.compile_load_const(reg, &Value::Nil)?;
+                let offset = reg as i32 * value_size;
+                dynasm!(self.ops
+                    ; lea rdi, [r12 + offset]
+                    ; mov rax, QWORD jit_init_nil as *const () as _
+                    ; call rax
+                );
             }
 
             // Copy positional arguments into callee registers.
@@ -731,6 +767,10 @@ impl JitCompiler {
                     ; jz =>inline_fail
                 );
                 dynasm!(self.ops
+                    ; mov rdi, r12
+                    ; mov esi, DWORD frame_value_count
+                    ; mov rax, QWORD jit_drop_values as *const () as _
+                    ; call rax
                     ; add rsp, frame_size
                 );
                 dynasm!(self.ops
@@ -743,6 +783,10 @@ impl JitCompiler {
                 );
             } else {
                 dynasm!(self.ops
+                    ; mov rdi, r12
+                    ; mov esi, DWORD frame_value_count
+                    ; mov rax, QWORD jit_drop_values as *const () as _
+                    ; call rax
                     ; add rsp, frame_size
                 );
                 dynasm!(self.ops
@@ -760,6 +804,10 @@ impl JitCompiler {
 
             dynasm!(self.ops
                 ; => inline_fail
+                ; mov rdi, r12
+                ; mov esi, DWORD frame_value_count
+                ; mov rax, QWORD jit_drop_values as *const () as _
+                ; call rax
                 ; mov eax, DWORD [r15]
                 ; mov rbx, rax
                 ; add rsp, rbx

@@ -146,11 +146,7 @@ impl JitCompiler {
     /// Unbox Array<int> — extract the raw Vec<LustInt> parts onto the JIT stack.
     ///
     /// Calls: `jit_unbox_array_int(array_ptr, out_vec_ptr, out_len, out_cap) -> u8`
-    fn compile_unbox_array_int(
-        &mut self,
-        specialized_id: usize,
-        source_reg: u8,
-    ) -> Result<()> {
+    fn compile_unbox_array_int(&mut self, specialized_id: usize, source_reg: u8) -> Result<()> {
         extern "C" {
             fn jit_unbox_array_int(
                 array_value_ptr: *const Value,
@@ -161,7 +157,8 @@ impl JitCompiler {
         }
 
         let stack_offset = self.allocate_specialized_stack();
-        self.specialized_values.insert(specialized_id, SpecializedValue { stack_offset });
+        self.specialized_values
+            .insert(specialized_id, SpecializedValue { stack_offset });
 
         // a0 = &array_value (source_reg in register array)
         self.emit_addr_in_t2(source_reg, 0);
@@ -190,11 +187,7 @@ impl JitCompiler {
     /// Rebox Array<int> — reconstruct a Value::Array from Vec<LustInt> parts.
     ///
     /// Calls: `jit_rebox_array_int(vec_ptr, vec_len, vec_cap, out_value_ptr) -> u8`
-    fn compile_rebox_array_int(
-        &mut self,
-        dest_reg: u8,
-        specialized_id: usize,
-    ) -> Result<()> {
+    fn compile_rebox_array_int(&mut self, dest_reg: u8, specialized_id: usize) -> Result<()> {
         extern "C" {
             fn jit_rebox_array_int(
                 vec_ptr: *mut LustInt,
@@ -292,13 +285,7 @@ impl JitCompiler {
         // Read len from JIT stack, write as Value::Int into dest_reg.
         // Value layout: tag (u8) at +0, data (i32) at +VALUE_DATA_OFFSET.
         dynasm!(self.ops ; .arch riscv32i ; lw t0, [s0, len_off]);
-        self.emit_addr_in_t2(dest_reg, 0);
-        dynasm!(self.ops
-            ; .arch riscv32i
-            ; li t1, 2              // ValueTag::Int
-            ; sb t1, [t2, 0]
-            ; sw t0, [t2, VALUE_DATA_OFFSET]
-        );
+        self.store_t0_as_int(dest_reg);
 
         Ok(())
     }

@@ -128,12 +128,8 @@ impl JitCompiler {
         let stack_offset = self.allocate_specialized_stack(24, 8);
 
         // Store specialized value info
-        self.specialized_values.insert(
-            specialized_id,
-            SpecializedValue {
-                stack_offset,
-            },
-        );
+        self.specialized_values
+            .insert(specialized_id, SpecializedValue { stack_offset });
 
         // Calculate register address: r12 + (source_reg * 64)
         let reg_offset = (source_reg as i32) * 64;
@@ -303,27 +299,11 @@ impl JitCompiler {
                 })?;
 
         let stack_offset = spec_value.stack_offset;
-        let dest_offset = (dest_reg as i32) * 64;
-
         dynasm!(self.ops
-            // Zero out the entire 64-byte Value structure first
-            ; xor rax, rax
-            ; mov [r12 + dest_offset], rax
-            ; mov [r12 + dest_offset + 8], rax
-            ; mov [r12 + dest_offset + 16], rax
-            ; mov [r12 + dest_offset + 24], rax
-            ; mov [r12 + dest_offset + 32], rax
-            ; mov [r12 + dest_offset + 40], rax
-            ; mov [r12 + dest_offset + 48], rax
-            ; mov [r12 + dest_offset + 56], rax
-
             // Read vec_len from JIT stack
             ; mov rax, [rbp + stack_offset + 8]
-
-            // Store as Value::Int with proper tag
-            ; mov BYTE [r12 + dest_offset], 2 // Tag for Int
-            ; mov [r12 + dest_offset + 8], rax // Length value
         );
+        self.store_from_rax(dest_reg, 2);
 
         Ok(())
     }

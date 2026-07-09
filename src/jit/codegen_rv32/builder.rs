@@ -6,7 +6,7 @@ impl JitCompiler {
     pub fn new() -> Self {
         Self {
             ops: Assembler::new().unwrap(),
-            leaked_constants: Vec::new(),
+            data: Vec::new(),
             fail_stack: Vec::new(),
             exit_stack: Vec::new(),
             inline_depth: 0,
@@ -17,11 +17,45 @@ impl JitCompiler {
     }
 
     pub(super) fn current_fail_label(&self) -> dynasmrt::DynamicLabel {
-        *self.fail_stack.last().expect("JIT fail label stack is empty")
+        *self
+            .fail_stack
+            .last()
+            .expect("JIT fail label stack is empty")
     }
 
     pub(super) fn current_exit_label(&self) -> dynasmrt::DynamicLabel {
-        *self.exit_stack.last().expect("JIT exit label stack is empty")
+        *self
+            .exit_stack
+            .last()
+            .expect("JIT exit label stack is empty")
+    }
+
+    pub(super) fn retain_value(&mut self, value: Value) -> *const Value {
+        let value = Box::new(value);
+        let ptr = value.as_ref() as *const Value;
+        self.data.push(JitData::Value(value));
+        ptr
+    }
+
+    pub(super) fn retain_string(&mut self, value: &str) -> (*const u8, usize) {
+        let value: Box<str> = value.into();
+        let result = (value.as_ptr(), value.len());
+        self.data.push(JitData::String(value));
+        result
+    }
+
+    pub(super) fn retain_string_pointers(&mut self, pointers: Vec<*const u8>) -> *const *const u8 {
+        let pointers = pointers.into_boxed_slice();
+        let ptr = pointers.as_ptr();
+        self.data.push(JitData::StringPointers(pointers));
+        ptr
+    }
+
+    pub(super) fn retain_string_lengths(&mut self, lengths: Vec<usize>) -> *const usize {
+        let lengths = lengths.into_boxed_slice();
+        let ptr = lengths.as_ptr();
+        self.data.push(JitData::StringLengths(lengths));
+        ptr
     }
 
     /// Total frame size (local + saved-registers area), rounded to 16 bytes.
@@ -46,11 +80,11 @@ impl JitCompiler {
         //   [frame_size - 12] s2  (register-array base)
         //   [frame_size - 16] s3  (VM pointer)
         //   [frame_size - 20] s4  (unwind chain)
-        let ra_off  = frame_size - 4;
-        let s0_off  = frame_size - 8;
-        let s2_off  = frame_size - 12;
-        let s3_off  = frame_size - 16;
-        let s4_off  = frame_size - 20;
+        let ra_off = frame_size - 4;
+        let s0_off = frame_size - 8;
+        let s2_off = frame_size - 12;
+        let s3_off = frame_size - 16;
+        let s4_off = frame_size - 20;
 
         let mut guards: Vec<Guard> = Vec::new();
         let mut guard_index: i32 = 0;
@@ -60,12 +94,7 @@ impl JitCompiler {
         self.exit_stack.push(exit_label);
         self.fail_stack.push(fail_label);
 
-        jit::log(|| {
-            format!(
-                "🔧 RV32 JIT: emitting prologue, frame_size={}",
-                frame_size
-            )
-        });
+        jit::log(|| format!("🔧 RV32 JIT: emitting prologue, frame_size={}", frame_size));
 
         // ── Prologue ────────────────────────────────────────────────────────
         // Entry: a0 = *mut Value (regs), a1 = *mut VM, a2 = *const Function
@@ -172,18 +201,16 @@ impl JitCompiler {
         let entry: extern "C" fn(*mut Value, *mut VM, *const Function) -> i32 =
             unsafe { mem::transmute(entry_point) };
 
-        // Keep the buffer alive forever (same strategy as x86_64 backend).
-        Box::leak(Box::new(exec_buf));
-
-        let leaked_constants = mem::take(&mut self.leaked_constants);
+        let data = mem::take(&mut self.data);
         Ok(CompiledTrace {
             id: trace_id,
             entry,
+            _executable: exec_buf,
+            _data: data,
             trace: trace.clone(),
             guards,
             parent,
             side_traces: Vec::new(),
-            leaked_constants,
             hoisted_constants,
         })
     }
@@ -202,19 +229,49 @@ impl JitCompiler {
                 TraceOp::Move { dest, src } => {
                     self.compile_move(*dest, *src)?;
                 }
-                TraceOp::Add { dest, lhs, rhs, lhs_type, rhs_type } => {
+                TraceOp::Add {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                } => {
                     self.compile_add_specialized(*dest, *lhs, *rhs, *lhs_type, *rhs_type)?;
                 }
-                TraceOp::Sub { dest, lhs, rhs, lhs_type, rhs_type } => {
+                TraceOp::Sub {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                } => {
                     self.compile_sub_specialized(*dest, *lhs, *rhs, *lhs_type, *rhs_type)?;
                 }
-                TraceOp::Mul { dest, lhs, rhs, lhs_type, rhs_type } => {
+                TraceOp::Mul {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                } => {
                     self.compile_mul_specialized(*dest, *lhs, *rhs, *lhs_type, *rhs_type)?;
                 }
-                TraceOp::Div { dest, lhs, rhs, lhs_type, rhs_type } => {
+                TraceOp::Div {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                } => {
                     self.compile_div_specialized(*dest, *lhs, *rhs, *lhs_type, *rhs_type)?;
                 }
-                TraceOp::Mod { dest, lhs, rhs, lhs_type, rhs_type } => {
+                TraceOp::Mod {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                } => {
                     self.compile_mod_specialized(*dest, *lhs, *rhs, *lhs_type, *rhs_type)?;
                 }
                 TraceOp::Neg { dest, src } => {
@@ -258,110 +315,220 @@ impl JitCompiler {
                 }
                 TraceOp::GuardNativeFunction { register, function } => {
                     let ptr = function.pointer();
-                    let g = self.compile_guard_native_function(
-                        *register, ptr, *guard_index as usize,
-                    )?;
+                    let g =
+                        self.compile_guard_native_function(*register, ptr, *guard_index as usize)?;
                     guards.push(g);
                     *guard_index += 1;
                 }
-                TraceOp::GuardFunction { register, function_idx } => {
-                    let g = self.compile_guard_function(
-                        *register, *function_idx, *guard_index as usize,
-                    )?;
-                    guards.push(g);
-                    *guard_index += 1;
-                }
-                TraceOp::GuardClosure { register, function_idx, upvalues_ptr } => {
-                    let g = self.compile_guard_closure(
-                        *register, *function_idx, *upvalues_ptr, *guard_index as usize,
-                    )?;
-                    guards.push(g);
-                    *guard_index += 1;
-                }
-                TraceOp::CallNative { dest, callee, function, first_arg, arg_count } => {
-                    let ptr = function.pointer();
-                    self.compile_call_native(*dest, *callee, ptr, *first_arg, *arg_count)?;
-                }
-                TraceOp::CallFunction {
-                    dest, callee, function_idx, first_arg, arg_count,
-                    is_closure, upvalues_ptr,
+                TraceOp::GuardFunction {
+                    register,
+                    function_idx,
                 } => {
-                    self.compile_call_function(
-                        *dest, *callee, *function_idx, *first_arg, *arg_count,
-                        *is_closure, *upvalues_ptr,
-                    )?;
-                }
-                TraceOp::InlineCall { dest, callee, trace } => {
-                    self.compile_inline_call(*dest, *callee, trace, guard_index, guards)?;
-                }
-                TraceOp::CallMethod { dest, object, method_name, first_arg, arg_count } => {
-                    match (method_name.as_str(), *arg_count) {
-                        ("push", 1) => self.compile_array_push(*object, *first_arg)?,
-                        ("is_some", 0) => self.compile_enum_is_some(*dest, *object)?,
-                        ("unwrap", 0) => self.compile_enum_unwrap(*dest, *object)?,
-                        _ => self.compile_call_method(
-                            *dest, *object, method_name, *first_arg, *arg_count,
-                        )?,
-                    }
-                }
-                TraceOp::GetField { dest, object, field_name, field_index, value_type, is_weak } => {
-                    self.compile_get_field(
-                        *dest, *object, field_name, *field_index, *value_type, *is_weak,
-                    )?;
-                }
-                TraceOp::SetField { object, field_name, value, field_index, value_type, is_weak } => {
-                    self.compile_set_field(
-                        *object, field_name, *value, *field_index, *value_type, *is_weak,
-                    )?;
-                }
-                TraceOp::NewArray { dest, first_element, count } => {
-                    self.compile_new_array(*dest, *first_element, *count)?;
-                }
-                TraceOp::NewStruct { dest, struct_name, field_names, field_registers } => {
-                    self.compile_new_struct(*dest, struct_name, field_names, field_registers)?;
-                }
-                TraceOp::NewEnumUnit { dest, enum_name, variant_name } => {
-                    self.compile_new_enum_unit(*dest, enum_name, variant_name)?;
-                }
-                TraceOp::NewEnumVariant { dest, enum_name, variant_name, value_registers } => {
-                    self.compile_new_enum_variant(
-                        *dest, enum_name, variant_name, value_registers,
-                    )?;
-                }
-                TraceOp::IsEnumVariant { dest, value, enum_name, variant_name } => {
-                    self.compile_is_enum_variant(*dest, *value, enum_name, variant_name)?;
-                }
-                TraceOp::GetEnumValue { dest, enum_reg, index } => {
-                    self.compile_get_enum_value(*dest, *enum_reg, *index)?;
-                }
-                TraceOp::Guard { register, expected_type } => {
-                    let g = self.compile_guard(
-                        *register, *expected_type, *guard_index as usize,
-                    )?;
-                    guards.push(g);
-                    *guard_index += 1;
-                }
-                TraceOp::GuardLoopContinue { condition_register, expect_truthy, bailout_ip } => {
-                    let g = self.compile_truth_guard(
-                        *condition_register, *expect_truthy, *bailout_ip,
+                    let g = self.compile_guard_function(
+                        *register,
+                        *function_idx,
                         *guard_index as usize,
                     )?;
                     guards.push(g);
                     *guard_index += 1;
                 }
-                TraceOp::Unbox { specialized_id, source_reg, layout } => {
+                TraceOp::GuardClosure {
+                    register,
+                    function_idx,
+                    upvalues_ptr,
+                } => {
+                    let g = self.compile_guard_closure(
+                        *register,
+                        *function_idx,
+                        *upvalues_ptr,
+                        *guard_index as usize,
+                    )?;
+                    guards.push(g);
+                    *guard_index += 1;
+                }
+                TraceOp::CallNative {
+                    dest,
+                    callee,
+                    function,
+                    first_arg,
+                    arg_count,
+                } => {
+                    let ptr = function.pointer();
+                    self.compile_call_native(*dest, *callee, ptr, *first_arg, *arg_count)?;
+                }
+                TraceOp::CallFunction {
+                    dest,
+                    callee,
+                    function_idx,
+                    first_arg,
+                    arg_count,
+                    is_closure,
+                    upvalues_ptr,
+                } => {
+                    self.compile_call_function(
+                        *dest,
+                        *callee,
+                        *function_idx,
+                        *first_arg,
+                        *arg_count,
+                        *is_closure,
+                        *upvalues_ptr,
+                    )?;
+                }
+                TraceOp::InlineCall {
+                    dest,
+                    callee,
+                    trace,
+                } => {
+                    self.compile_inline_call(*dest, *callee, trace, guard_index, guards)?;
+                }
+                TraceOp::CallMethod {
+                    dest,
+                    object,
+                    method_name,
+                    first_arg,
+                    arg_count,
+                } => match (method_name.as_str(), *arg_count) {
+                    ("push", 1) => self.compile_array_push(*object, *first_arg)?,
+                    ("is_some", 0) => self.compile_enum_is_some(*dest, *object)?,
+                    ("unwrap", 0) => self.compile_enum_unwrap(*dest, *object)?,
+                    _ => self.compile_call_method(
+                        *dest,
+                        *object,
+                        method_name,
+                        *first_arg,
+                        *arg_count,
+                    )?,
+                },
+                TraceOp::GetField {
+                    dest,
+                    object,
+                    field_name,
+                    field_index,
+                    value_type,
+                    is_weak,
+                } => {
+                    self.compile_get_field(
+                        *dest,
+                        *object,
+                        field_name,
+                        *field_index,
+                        *value_type,
+                        *is_weak,
+                    )?;
+                }
+                TraceOp::SetField {
+                    object,
+                    field_name,
+                    value,
+                    field_index,
+                    value_type,
+                    is_weak,
+                } => {
+                    self.compile_set_field(
+                        *object,
+                        field_name,
+                        *value,
+                        *field_index,
+                        *value_type,
+                        *is_weak,
+                    )?;
+                }
+                TraceOp::NewArray {
+                    dest,
+                    first_element,
+                    count,
+                } => {
+                    self.compile_new_array(*dest, *first_element, *count)?;
+                }
+                TraceOp::NewStruct {
+                    dest,
+                    struct_name,
+                    field_names,
+                    field_registers,
+                } => {
+                    self.compile_new_struct(*dest, struct_name, field_names, field_registers)?;
+                }
+                TraceOp::NewEnumUnit {
+                    dest,
+                    enum_name,
+                    variant_name,
+                } => {
+                    self.compile_new_enum_unit(*dest, enum_name, variant_name)?;
+                }
+                TraceOp::NewEnumVariant {
+                    dest,
+                    enum_name,
+                    variant_name,
+                    value_registers,
+                } => {
+                    self.compile_new_enum_variant(*dest, enum_name, variant_name, value_registers)?;
+                }
+                TraceOp::IsEnumVariant {
+                    dest,
+                    value,
+                    enum_name,
+                    variant_name,
+                } => {
+                    self.compile_is_enum_variant(*dest, *value, enum_name, variant_name)?;
+                }
+                TraceOp::GetEnumValue {
+                    dest,
+                    enum_reg,
+                    index,
+                } => {
+                    self.compile_get_enum_value(*dest, *enum_reg, *index)?;
+                }
+                TraceOp::Guard {
+                    register,
+                    expected_type,
+                } => {
+                    let g = self.compile_guard(*register, *expected_type, *guard_index as usize)?;
+                    guards.push(g);
+                    *guard_index += 1;
+                }
+                TraceOp::GuardLoopContinue {
+                    condition_register,
+                    expect_truthy,
+                    bailout_ip,
+                } => {
+                    let g = self.compile_truth_guard(
+                        *condition_register,
+                        *expect_truthy,
+                        *bailout_ip,
+                        *guard_index as usize,
+                    )?;
+                    guards.push(g);
+                    *guard_index += 1;
+                }
+                TraceOp::Unbox {
+                    specialized_id,
+                    source_reg,
+                    layout,
+                } => {
                     self.compile_unbox(*specialized_id, *source_reg, layout)?;
                 }
-                TraceOp::Rebox { dest_reg, specialized_id, layout } => {
+                TraceOp::Rebox {
+                    dest_reg,
+                    specialized_id,
+                    layout,
+                } => {
                     self.compile_rebox(*dest_reg, *specialized_id, layout)?;
                 }
-                TraceOp::DropSpecialized { specialized_id, layout } => {
+                TraceOp::DropSpecialized {
+                    specialized_id,
+                    layout,
+                } => {
                     self.compile_drop_specialized(*specialized_id, layout)?;
                 }
                 TraceOp::SpecializedOp { op, operands } => {
                     self.compile_specialized_op(op, operands)?;
                 }
-                TraceOp::NestedLoopCall { function_idx, loop_start_ip, bailout_ip } => {
+                TraceOp::NestedLoopCall {
+                    function_idx,
+                    loop_start_ip,
+                    bailout_ip,
+                } => {
                     // Nested loop: exit to interpreter so it can be compiled later.
                     let exit_label = self.current_exit_label();
                     let current_guard_index = *guard_index;

@@ -23,25 +23,13 @@ impl JitCompiler {
             ; lw t0, [t2, VALUE_DATA_OFFSET]
             ; beqz t0, >false_result
             ; true_result:
-        );
-        self.emit_addr_in_t2(dest, 0);
-        dynasm!(self.ops
-            ; .arch riscv32i
             ; li t0, 1
-            ; sb t0, [t2, 0]            // tag = Bool
-            ; li t0, 1
-            ; sw t0, [t2, VALUE_DATA_OFFSET]
-            ; j >done
+            ; j >store
             ; false_result:
+            ; li t0, 0
+            ; store:
         );
-        self.emit_addr_in_t2(dest, 0);
-        dynasm!(self.ops
-            ; .arch riscv32i
-            ; li t0, 1
-            ; sb t0, [t2, 0]
-            ; sw zero, [t2, VALUE_DATA_OFFSET]
-            ; done:
-        );
+        self.store_t0_as_bool(dest);
         Ok(())
     }
 
@@ -67,25 +55,13 @@ impl JitCompiler {
             ; lw t0, [t2, VALUE_DATA_OFFSET]
             ; bnez t0, >true_result
             ; false_result:
-        );
-        self.emit_addr_in_t2(dest, 0);
-        dynasm!(self.ops
-            ; .arch riscv32i
-            ; li t0, 1
-            ; sb t0, [t2, 0]
-            ; sw zero, [t2, VALUE_DATA_OFFSET]
-            ; j >done
+            ; li t0, 0
+            ; j >store
             ; true_result:
-        );
-        self.emit_addr_in_t2(dest, 0);
-        dynasm!(self.ops
-            ; .arch riscv32i
             ; li t0, 1
-            ; sb t0, [t2, 0]
-            ; li t0, 1
-            ; sw t0, [t2, VALUE_DATA_OFFSET]
-            ; done:
+            ; store:
         );
+        self.store_t0_as_bool(dest);
         Ok(())
     }
 
@@ -100,25 +76,13 @@ impl JitCompiler {
             ; lw t0, [t2, VALUE_DATA_OFFSET]
             ; beqz t0, >true_result     // Bool(false) → NOT = true
             ; false_result:
-        );
-        self.emit_addr_in_t2(dest, 0);
-        dynasm!(self.ops
-            ; .arch riscv32i
-            ; li t0, 1
-            ; sb t0, [t2, 0]
-            ; sw zero, [t2, VALUE_DATA_OFFSET]
-            ; j >done
+            ; li t0, 0
+            ; j >store
             ; true_result:
-        );
-        self.emit_addr_in_t2(dest, 0);
-        dynasm!(self.ops
-            ; .arch riscv32i
             ; li t0, 1
-            ; sb t0, [t2, 0]
-            ; li t0, 1
-            ; sw t0, [t2, VALUE_DATA_OFFSET]
-            ; done:
+            ; store:
         );
+        self.store_t0_as_bool(dest);
         Ok(())
     }
 

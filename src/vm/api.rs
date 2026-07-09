@@ -5,8 +5,8 @@ use crate::config::LustConfig;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::result::Result as CoreResult;
 use core::mem;
+use core::result::Result as CoreResult;
 use hashbrown::HashMap;
 
 #[derive(Debug, Clone)]
@@ -144,8 +144,12 @@ impl VM {
         Value::map(self.new_map())
     }
 
-    pub(super) fn observe_value(&mut self, value: &Value) {
+    pub(crate) fn observe_value(&mut self, value: &Value) {
         self.cycle_collector.register_value(value);
+    }
+
+    pub(crate) fn observe_value_graph(&mut self, value: &Value) {
+        self.cycle_collector.register_graph(value);
     }
 
     pub(super) fn maybe_collect_cycles(&mut self) {
@@ -168,6 +172,11 @@ impl VM {
     }
 
     pub fn load_functions(&mut self, functions: Vec<Function>) {
+        for function in &functions {
+            for value in &function.chunk.constants {
+                self.observe_value_graph(value);
+            }
+        }
         self.functions = functions;
     }
 
@@ -287,6 +296,7 @@ impl VM {
 
     pub fn register_native(&mut self, name: impl Into<String>, value: Value) {
         let name = name.into();
+        self.observe_value_graph(&value);
         match value {
             Value::NativeFunction(_) => {
                 let cloned = value.clone();
@@ -342,7 +352,11 @@ impl VM {
     }
 
     fn push_export_metadata(&mut self, export: NativeExport) {
-        if self.exported_natives.iter().any(|existing| existing.name == export.name) {
+        if self
+            .exported_natives
+            .iter()
+            .any(|existing| existing.name == export.name)
+        {
             return;
         }
         self.exported_natives.push(export);
@@ -468,13 +482,38 @@ impl VM {
 
         let mut frame = CallFrame::new(func_idx, None, register_count);
         for (i, arg) in args.into_iter().enumerate() {
+            self.observe_value_graph(&arg);
             frame.registers[i] = arg;
         }
 
+        let stack_depth_before = self.call_stack.len();
+        let saved_pending_return_value = self.pending_return_value.clone();
+        let saved_pending_return_dest = self.pending_return_dest;
+        let saved_pending_task_signal = self.pending_task_signal.clone();
+        let saved_last_task_signal = self.last_task_signal.clone();
+        let saved_trace_recorder = self.trace_recorder.take();
+        let saved_side_trace_context = self.side_trace_context.take();
+        let saved_skip_next_trace_record = self.skip_next_trace_record;
+        let saved_call_until_depth = self.call_until_depth;
+        self.skip_next_trace_record = false;
+        self.call_until_depth = Some(stack_depth_before);
         self.call_stack.push(frame);
-        match self.run() {
+        let result = self.run();
+        self.trace_recorder = saved_trace_recorder;
+        self.side_trace_context = saved_side_trace_context;
+        self.skip_next_trace_record = saved_skip_next_trace_record;
+        self.call_until_depth = saved_call_until_depth;
+        match result {
             Ok(v) => Ok(v),
-            Err(e) => Err(self.annotate_runtime_error(e)),
+            Err(e) => {
+                let annotated = self.annotate_runtime_error(e);
+                self.call_stack.truncate(stack_depth_before);
+                self.pending_return_value = saved_pending_return_value;
+                self.pending_return_dest = saved_pending_return_dest;
+                self.pending_task_signal = saved_pending_task_signal;
+                self.last_task_signal = saved_last_task_signal;
+                Err(annotated)
+            }
         }
     }
 
@@ -512,5 +551,44 @@ impl VM {
         task.pending_return_dest = None;
         self.task_manager.attach(task);
         Err(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_public_call_unwinds_its_frame() {
+        let mut failing = Function::new("failing", 0, false);
+        failing.set_register_count(3);
+        let one = failing.chunk.add_constant(Value::Int(1));
+        let zero = failing.chunk.add_constant(Value::Int(0));
+        failing.chunk.emit(Instruction::LoadConst(0, one), 1);
+        failing.chunk.emit(Instruction::LoadConst(1, zero), 1);
+        failing.chunk.emit(Instruction::Div(2, 0, 1), 1);
+        failing.chunk.emit(Instruction::Return(2), 1);
+
+        let mut succeeding = Function::new("succeeding", 0, false);
+        succeeding.set_register_count(1);
+        let result = succeeding.chunk.add_constant(Value::Int(7));
+        succeeding.chunk.emit(Instruction::LoadConst(0, result), 1);
+        succeeding.chunk.emit(Instruction::Return(0), 1);
+
+        let mut vm = VM::new();
+        vm.load_functions(vec![failing, succeeding]);
+        vm.trace_recorder = Some(TraceRecorder::new(99, 7, 32));
+        vm.side_trace_context = Some((crate::jit::TraceId(4), 2));
+        vm.skip_next_trace_record = true;
+
+        assert!(vm.call("failing", Vec::new()).is_err());
+        assert!(vm.call_stack.is_empty());
+        assert!(vm.trace_recorder.is_some());
+        assert_eq!(vm.side_trace_context, Some((crate::jit::TraceId(4), 2)));
+        assert!(vm.skip_next_trace_record);
+        assert!(matches!(
+            vm.call("succeeding", Vec::new()),
+            Ok(Value::Int(7))
+        ));
     }
 }

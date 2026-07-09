@@ -39,8 +39,8 @@ impl VM {
             if enum_name == "LuaValue" {
                 return match variant.as_str() {
                     "Nil" => Value::Nil,
-                    "Bool" | "Int" | "Float" | "String" | "Table" | "Function" | "LightUserdata"
-                    | "Userdata" | "Thread" => values
+                    "Bool" | "Int" | "Float" | "String" | "Table" | "Function"
+                    | "LightUserdata" | "Userdata" | "Thread" => values
                         .as_ref()
                         .and_then(|v| v.get(0))
                         .cloned()
@@ -142,8 +142,7 @@ impl VM {
                 {
                     let frame = self.call_stack.last_mut().unwrap();
                     let registers_ptr = frame.registers.as_mut_ptr();
-                    let entry = self.jit.get_trace(trace_id).map(|t| t.entry);
-                    if let Some(entry_fn) = entry {
+                    if let Some(trace) = self.jit.trace_handle(trace_id) {
                         crate::jit::log(|| {
                             format!(
                                 "▶️  JIT: Executing trace #{} at func {} ip {}",
@@ -151,30 +150,32 @@ impl VM {
                             )
                         });
 
-                        let trace_gas_cost = self
-                            .jit
-                            .get_trace(trace_id)
-                            .map(|t| {
-                                let cost = t.trace.ops.len()
-                                    + t.trace.preamble.len()
-                                    + t.trace.postamble.len();
-                                core::cmp::max(1, cost) as u64
-                            })
-                            .unwrap_or(1);
+                        let trace_gas_cost = {
+                            let cost = trace.trace.ops.len()
+                                + trace.trace.preamble.len()
+                                + trace.trace.postamble.len();
+                            core::cmp::max(1, cost) as u64
+                        };
                         self.budgets.charge_gas(trace_gas_cost)?;
 
                         // Capture RSP before and after to detect stack leaks (x86_64 only)
                         #[cfg(target_arch = "x86_64")]
                         let rsp_before: usize;
                         #[cfg(target_arch = "x86_64")]
-                        unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp_before) };
+                        unsafe {
+                            core::arch::asm!("mov {}, rsp", out(reg) rsp_before)
+                        };
 
-                        let result = entry_fn(registers_ptr, self as *mut VM, ptr::null());
+                        let vm_ptr = self as *mut VM;
+                        let result = trace.execute(registers_ptr, vm_ptr, ptr::null());
+                        drop(trace);
 
                         #[cfg(target_arch = "x86_64")]
                         let rsp_after: usize;
                         #[cfg(target_arch = "x86_64")]
-                        unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp_after) };
+                        unsafe {
+                            core::arch::asm!("mov {}, rsp", out(reg) rsp_after)
+                        };
 
                         #[cfg(target_arch = "x86_64")]
                         let rsp_diff = rsp_after as isize - rsp_before as isize;
@@ -183,7 +184,10 @@ impl VM {
                             return format!("🎯 JIT: Trace #{} execution result: {} (RSP before: {:x}, after: {:x}, diff: {})",
                             trace_id.0, result, rsp_before, rsp_after, rsp_diff);
                             #[cfg(not(target_arch = "x86_64"))]
-                            return format!("🎯 JIT: Trace #{} execution result: {}", trace_id.0, result);
+                            return format!(
+                                "🎯 JIT: Trace #{} execution result: {}",
+                                trace_id.0, result
+                            );
                         });
 
                         if result == 0 {
@@ -215,21 +219,17 @@ impl VM {
                                 });
                                 let frame = self.call_stack.last_mut().unwrap();
                                 let registers_ptr = frame.registers.as_mut_ptr();
-                                let side_entry = self.jit.get_trace(side_trace_id).map(|t| t.entry);
-                                if let Some(side_entry_fn) = side_entry {
-                                    let side_trace_gas_cost = self
-                                        .jit
-                                        .get_trace(side_trace_id)
-                                        .map(|t| {
-                                            let cost = t.trace.ops.len()
-                                                + t.trace.preamble.len()
-                                                + t.trace.postamble.len();
-                                            core::cmp::max(1, cost) as u64
-                                        })
-                                        .unwrap_or(1);
+                                if let Some(side_trace) = self.jit.trace_handle(side_trace_id) {
+                                    let side_trace_gas_cost = {
+                                        let cost = side_trace.trace.ops.len()
+                                            + side_trace.trace.preamble.len()
+                                            + side_trace.trace.postamble.len();
+                                        core::cmp::max(1, cost) as u64
+                                    };
                                     self.budgets.charge_gas(side_trace_gas_cost)?;
+                                    let vm_ptr = self as *mut VM;
                                     let side_result =
-                                        side_entry_fn(registers_ptr, self as *mut VM, ptr::null());
+                                        side_trace.execute(registers_ptr, vm_ptr, ptr::null());
                                     if side_result == 0 {
                                         crate::jit::log(|| {
                                             format!(
@@ -681,8 +681,15 @@ impl VM {
                     let needs_call_value = {
                         let mut check_value = &func_value;
                         // Unwrap LuaValue enum if needed
-                        if let Value::Enum { enum_name, variant, values } = &func_value {
-                            if enum_name == "LuaValue" && (variant == "Table" || variant == "Userdata") {
+                        if let Value::Enum {
+                            enum_name,
+                            variant,
+                            values,
+                        } = &func_value
+                        {
+                            if enum_name == "LuaValue"
+                                && (variant == "Table" || variant == "Userdata")
+                            {
                                 if let Some(inner) = values.as_ref().and_then(|v| v.get(0)) {
                                     check_value = inner;
                                 }
@@ -690,8 +697,8 @@ impl VM {
                         }
                         // Check if it's a LuaTable/LuaUserdata struct with metamethods
                         if let Value::Struct { name, .. } = check_value {
-                            (name == "LuaTable" || name == "LuaUserdata") &&
-                            check_value.struct_get_field("metamethods").is_some()
+                            (name == "LuaTable" || name == "LuaUserdata")
+                                && check_value.struct_get_field("metamethods").is_some()
                         } else {
                             false
                         }
@@ -709,8 +716,13 @@ impl VM {
                         continue;
                     } else {
                         // Check what type we're actually dealing with
-                        if let Value::Enum { enum_name, variant, .. } = &func_value {
-                            if enum_name == "LuaValue" && (variant == "Table" || variant == "Userdata") {
+                        if let Value::Enum {
+                            enum_name, variant, ..
+                        } = &func_value
+                        {
+                            if enum_name == "LuaValue"
+                                && (variant == "Table" || variant == "Userdata")
+                            {
                                 #[cfg(feature = "std")]
                                 eprintln!("DEBUG Instruction::Call: Have LuaValue.{} but needs_call_value=false", variant);
                             }
@@ -733,14 +745,15 @@ impl VM {
                             _ => None,
                         };
                         let Some(handle) = handle else { break };
-                        let inner = crate::lua_compat::lookup_lust_function(handle).ok_or_else(|| {
-                            LustError::RuntimeError {
-                                message: format!(
-                                    "LuaValue function handle {} was not registered with VM",
-                                    handle
-                                ),
-                            }
-                        })?;
+                        let inner =
+                            crate::lua_compat::lookup_lust_function(handle).ok_or_else(|| {
+                                LustError::RuntimeError {
+                                    message: format!(
+                                        "LuaValue function handle {} was not registered with VM",
+                                        handle
+                                    ),
+                                }
+                            })?;
                         func_value = inner;
                     }
                     match func_value {
@@ -751,7 +764,8 @@ impl VM {
                             }
 
                             let register_count = self.functions[func_idx].register_count;
-                            let mut frame = CallFrame::new(func_idx, Some(dest_reg), register_count);
+                            let mut frame =
+                                CallFrame::new(func_idx, Some(dest_reg), register_count);
                             for (i, arg) in args.into_iter().enumerate() {
                                 frame.registers[i] = arg;
                             }
@@ -771,7 +785,8 @@ impl VM {
                             let upvalue_values: Vec<Value> =
                                 upvalues.iter().map(|uv| uv.get()).collect();
                             let register_count = self.functions[func_idx].register_count;
-                            let mut frame = CallFrame::new(func_idx, Some(dest_reg), register_count);
+                            let mut frame =
+                                CallFrame::new(func_idx, Some(dest_reg), register_count);
                             frame.upvalues = upvalue_values;
                             for (i, arg) in args.into_iter().enumerate() {
                                 frame.registers[i] = arg;
@@ -1011,7 +1026,8 @@ impl VM {
                     let value = if let Some(map_val) = Self::lua_table_map(object) {
                         if let Value::Map(map) = map_val {
                             let raw_key_value = Value::String(field_name.clone());
-                            let key = self.make_hash_key(&Self::lua_table_key_value(&raw_key_value))?;
+                            let key =
+                                self.make_hash_key(&Self::lua_table_key_value(&raw_key_value))?;
                             let borrowed = map.borrow();
                             borrowed.get(&key).cloned().unwrap_or(Value::Nil)
                         } else {
@@ -1054,7 +1070,8 @@ impl VM {
                     if let Some(map_val) = Self::lua_table_map(&object) {
                         if let Value::Map(map) = map_val {
                             let raw_key_value = Value::String(field_name.clone());
-                            let key = self.make_hash_key(&Self::lua_table_key_value(&raw_key_value))?;
+                            let key =
+                                self.make_hash_key(&Self::lua_table_key_value(&raw_key_value))?;
                             if self.budgets.mem_budget_enabled() && !map.borrow().contains_key(&key)
                             {
                                 self.budgets.charge_map_entry_estimate()?;
@@ -1144,9 +1161,10 @@ impl VM {
                     } else {
                         match collection {
                             Value::Array(arr) => {
-                                let idx = index.as_int().ok_or_else(|| LustError::RuntimeError {
-                                    message: "Array index must be an integer".to_string(),
-                                })?;
+                                let idx =
+                                    index.as_int().ok_or_else(|| LustError::RuntimeError {
+                                        message: "Array index must be an integer".to_string(),
+                                    })?;
                                 let borrowed = arr.borrow();
                                 if idx < 0 || idx as usize >= borrowed.len() {
                                     return Err(LustError::RuntimeError {
@@ -1221,7 +1239,8 @@ impl VM {
                             self.functions.iter().position(|f| f.name == mangled_name)
                         {
                             let register_count = self.functions[func_idx].register_count;
-                            let mut frame = CallFrame::new(func_idx, Some(dest_reg), register_count);
+                            let mut frame =
+                                CallFrame::new(func_idx, Some(dest_reg), register_count);
                             frame.registers[0] = object.clone();
                             for i in 0..arg_count {
                                 frame.registers[(i + 1) as usize] =
@@ -1360,9 +1379,10 @@ impl VM {
                     } else {
                         match collection {
                             Value::Array(arr) => {
-                                let idx = index.as_int().ok_or_else(|| LustError::RuntimeError {
-                                    message: "Array index must be an integer".to_string(),
-                                })?;
+                                let idx =
+                                    index.as_int().ok_or_else(|| LustError::RuntimeError {
+                                        message: "Array index must be an integer".to_string(),
+                                    })?;
                                 let mut borrowed = arr.borrow_mut();
                                 if idx < 0 || idx as usize >= borrowed.len() {
                                     return Err(LustError::RuntimeError {

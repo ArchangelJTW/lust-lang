@@ -54,6 +54,10 @@ impl ValueKey {
     pub fn to_value(&self) -> Value {
         self.original.clone()
     }
+
+    pub(crate) fn owned_values(&self) -> (&Value, &Value) {
+        (&self.original, &self.hashed)
+    }
 }
 
 impl PartialEq for ValueKey {
@@ -663,6 +667,10 @@ impl Upvalue {
 
     pub fn set(&self, value: Value) {
         *self.value.borrow_mut() = value;
+    }
+
+    pub(crate) fn cell(&self) -> &Rc<RefCell<Value>> {
+        &self.value
     }
 }
 
@@ -1371,6 +1379,81 @@ impl PartialEq for Value {
     }
 }
 
+#[inline]
+unsafe fn replace_value(dest: *mut Value, value: Value) {
+    drop(ptr::replace(dest, value));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_replace_int(dest: *mut Value, value: LustInt) -> u8 {
+    if dest.is_null() {
+        return 0;
+    }
+    replace_value(dest, Value::Int(value));
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_replace_int32(dest: *mut Value, value: i32) -> u8 {
+    jit_replace_int(dest, value as LustInt)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_replace_float_bits(dest: *mut Value, bits: u64) -> u8 {
+    if dest.is_null() {
+        return 0;
+    }
+    #[cfg(feature = "std")]
+    let value = LustFloat::from_bits(bits);
+    #[cfg(not(feature = "std"))]
+    let value = LustFloat::from_bits(bits as u32);
+    replace_value(dest, Value::Float(value));
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_replace_float32_bits(dest: *mut Value, bits: u32) -> u8 {
+    if dest.is_null() {
+        return 0;
+    }
+    replace_value(dest, Value::Float(f32::from_bits(bits) as LustFloat));
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_replace_bool(dest: *mut Value, value: u8) -> u8 {
+    if dest.is_null() {
+        return 0;
+    }
+    replace_value(dest, Value::Bool(value != 0));
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_replace_nil(dest: *mut Value) -> u8 {
+    if dest.is_null() {
+        return 0;
+    }
+    replace_value(dest, Value::Nil);
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_init_nil(dest: *mut Value) -> u8 {
+    if dest.is_null() {
+        return 0;
+    }
+    ptr::write(dest, Value::Nil);
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_drop_values(values: *mut Value, len: usize) {
+    if !values.is_null() && len != 0 {
+        ptr::drop_in_place(slice::from_raw_parts_mut(values, len));
+    }
+}
+
 #[cfg(feature = "std")]
 #[no_mangle]
 pub unsafe extern "C" fn jit_array_get_safe(
@@ -1405,7 +1488,9 @@ pub unsafe extern "C" fn jit_array_get_safe(
         return 0;
     }
 
-    ptr::write(out, borrowed[idx].clone());
+    let value = borrowed[idx].clone();
+    drop(borrowed);
+    replace_value(out, value);
     1
 }
 
@@ -1468,8 +1553,11 @@ pub unsafe extern "C" fn jit_new_array_safe(
 
     // jit::log(|| format!("jit_new_array_safe #{}: about to call Value::array with {} elements", call_num, elements.len()));
     let array_value = Value::array(elements);
+    if !vm_ptr.is_null() {
+        (&mut *vm_ptr).observe_value(&array_value);
+    }
     // jit::log(|| format!("jit_new_array_safe #{}: about to write to out_ptr", call_num));
-    ptr::write(out_ptr, array_value);
+    replace_value(out_ptr, array_value);
     // jit::log(|| format!("jit_new_array_safe #{}: EXIT - success, returning 1", call_num));
     1
 }
@@ -1538,18 +1626,20 @@ pub unsafe extern "C" fn jit_unbox_array_int(
             // Take ownership of the Vec<Value> by swapping with empty vec
             let original_vec = core::mem::replace(vec_ref, Vec::new());
 
-            // Convert Vec<Value> to Vec<LustInt>
-            let mut specialized_vec: Vec<LustInt> = Vec::with_capacity(original_vec.len());
-            for elem in original_vec.into_iter() {
-                match elem {
-                    Value::Int(i) => specialized_vec.push(i),
-                    _ => {
-                        // Type mismatch - restore original data and fail
-                        // This shouldn't happen if types are correct, but be safe
-                        return 0;
-                    }
-                }
+            if original_vec
+                .iter()
+                .any(|value| !matches!(value, Value::Int(_)))
+            {
+                *vec_ref = original_vec;
+                return 0;
             }
+            let mut specialized_vec: Vec<LustInt> = original_vec
+                .into_iter()
+                .map(|value| match value {
+                    Value::Int(value) => value,
+                    _ => unreachable!("array element types were validated above"),
+                })
+                .collect();
 
             // Extract Vec metadata
             let len = specialized_vec.len();
@@ -1609,7 +1699,7 @@ pub unsafe extern "C" fn jit_rebox_array_int(
             // But if it doesn't, create a new array
             let value_vec: Vec<Value> = specialized_vec.into_iter().map(Value::Int).collect();
             let array_value_new = Value::array(value_vec);
-            ptr::write(array_value_ptr, array_value_new);
+            replace_value(array_value_ptr, array_value_new);
             1
         }
     }
@@ -1683,7 +1773,7 @@ pub unsafe extern "C" fn jit_enum_is_some_safe(enum_ptr: *const Value, out_ptr: 
     match enum_value {
         Value::Enum { variant, .. } => {
             let is_some = variant == "Some";
-            ptr::write(out_ptr, Value::Bool(is_some));
+            replace_value(out_ptr, Value::Bool(is_some));
             1
         }
         _ => 0,
@@ -1702,7 +1792,8 @@ pub unsafe extern "C" fn jit_enum_unwrap_safe(enum_ptr: *const Value, out_ptr: *
         Value::Enum {
             values: Some(vals), ..
         } if vals.len() == 1 => {
-            ptr::write(out_ptr, vals[0].clone());
+            let value = vals[0].clone();
+            replace_value(out_ptr, value);
             1
         }
         _ => 0,
@@ -1783,7 +1874,7 @@ pub unsafe extern "C" fn jit_concat_safe(
     combined.push_str(left_str.as_ref());
     combined.push_str(right_str.as_ref());
     let result = Value::string(combined);
-    ptr::write(out, result);
+    replace_value(out, result);
     1
 }
 
@@ -1986,14 +2077,17 @@ pub unsafe extern "C" fn jit_call_native_safe(
 
     match outcome {
         NativeCallResult::Return(value) => {
-            ptr::write(out, value);
+            (&mut *vm_ptr).observe_value_graph(&value);
+            replace_value(out, value);
             1
         }
 
         NativeCallResult::Yield(value) => {
             let vm = &mut *vm_ptr;
             if vm.current_task.is_none() {
-                jit::log(|| "jit_call_native_safe: native attempted to yield outside a task".to_string());
+                jit::log(|| {
+                    "jit_call_native_safe: native attempted to yield outside a task".to_string()
+                });
                 return 0;
             }
 
@@ -2016,23 +2110,32 @@ pub unsafe extern "C" fn jit_call_native_safe(
                 Some(reg as u8)
             });
             let Some(dest_reg) = dest_reg else {
-                jit::log(|| "jit_call_native_safe: could not compute dest register for yield".to_string());
+                jit::log(|| {
+                    "jit_call_native_safe: could not compute dest register for yield".to_string()
+                });
                 return 0;
             };
 
-            ptr::write(out, Value::Nil);
-            vm.pending_task_signal = Some(crate::vm::TaskSignal::Yield { dest: dest_reg, value });
+            replace_value(out, Value::Nil);
+            vm.observe_value_graph(&value);
+            vm.pending_task_signal = Some(crate::vm::TaskSignal::Yield {
+                dest: dest_reg,
+                value,
+            });
             2
         }
 
         NativeCallResult::Stop(value) => {
             let vm = &mut *vm_ptr;
             if vm.current_task.is_none() {
-                jit::log(|| "jit_call_native_safe: native attempted to stop outside a task".to_string());
+                jit::log(|| {
+                    "jit_call_native_safe: native attempted to stop outside a task".to_string()
+                });
                 return 0;
             }
 
-            ptr::write(out, Value::Nil);
+            replace_value(out, Value::Nil);
+            vm.observe_value_graph(&value);
             vm.pending_task_signal = Some(crate::vm::TaskSignal::Stop { value });
             3
         }
@@ -2080,6 +2183,7 @@ pub unsafe extern "C" fn jit_call_function_safe(
 
     match call_result {
         Ok(value) => {
+            vm.observe_value_graph(&value);
             // Get current registers pointer AFTER the call (it may have reallocated)
             let vm = &mut *vm_ptr;
             if let Some(frame) = vm.call_stack.last_mut() {
@@ -2170,7 +2274,7 @@ pub unsafe extern "C" fn jit_new_enum_unit_safe(
     let enum_name = enum_name_str.to_string();
     let variant_name = variant_name_str.to_string();
     let value = Value::enum_unit(enum_name, variant_name);
-    ptr::write(out, value);
+    replace_value(out, value);
     1
 }
 
@@ -2224,7 +2328,7 @@ pub unsafe extern "C" fn jit_new_enum_variant_safe(
     }
 
     let value = Value::enum_variant(enum_name, variant_name, values);
-    ptr::write(out, value);
+    replace_value(out, value);
     1
 }
 
@@ -2271,7 +2375,8 @@ pub unsafe extern "C" fn jit_get_enum_value_safe(
     let enum_value = &*enum_ptr;
     if let Some((_, _, Some(values))) = enum_value.as_enum() {
         if index < values.len() {
-            ptr::write(out, values[index].clone());
+            let value = values[index].clone();
+            replace_value(out, value);
             1
         } else {
             0
@@ -2497,7 +2602,7 @@ pub unsafe extern "C" fn jit_get_field_safe(
         },
         _ => return 0,
     };
-    ptr::write(out, field_value);
+    replace_value(out, field_value);
     1
 }
 
@@ -2548,7 +2653,7 @@ pub unsafe extern "C" fn jit_get_field_indexed_safe(
     let object = &*object_ptr;
     match object.struct_get_field_indexed(field_index) {
         Some(value) => {
-            ptr::write(out, value);
+            replace_value(out, value);
             1
         }
 
@@ -2698,7 +2803,8 @@ pub unsafe extern "C" fn jit_new_struct_safe(
             return 0;
         }
     };
-    ptr::write(out, struct_value);
+    vm.observe_value(&struct_value);
+    replace_value(out, struct_value);
     1
 }
 
@@ -2708,8 +2814,73 @@ pub unsafe extern "C" fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Val
         return 0;
     }
 
-    let src_value = &*src_ptr;
-    let cloned_value = src_value.clone();
-    ptr::write(dest_ptr, cloned_value);
+    let cloned_value = (&*src_ptr).clone();
+    replace_value(dest_ptr, cloned_value);
     1
+}
+
+#[cfg(test)]
+mod jit_replacement_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_helpers_drop_owned_destinations() {
+        let string = Rc::new("owned".to_string());
+        let mut value = Value::String(string.clone());
+        assert_eq!(Rc::strong_count(&string), 2);
+
+        unsafe {
+            assert_eq!(jit_replace_int(&mut value, 42), 1);
+        }
+        assert_eq!(Rc::strong_count(&string), 1);
+        assert!(matches!(value, Value::Int(42)));
+
+        let array = Rc::new(RefCell::new(vec![Value::Int(1)]));
+        value = Value::Array(array.clone());
+        assert_eq!(Rc::strong_count(&array), 2);
+        unsafe {
+            assert_eq!(jit_replace_bool(&mut value, 1), 1);
+        }
+        assert_eq!(Rc::strong_count(&array), 1);
+        assert!(matches!(value, Value::Bool(true)));
+
+        unsafe {
+            assert_eq!(jit_replace_float_bits(&mut value, 1.5f64.to_bits()), 1);
+        }
+        assert!(matches!(value, Value::Float(float) if float == 1.5));
+        unsafe {
+            assert_eq!(jit_replace_nil(&mut value), 1);
+        }
+        assert!(matches!(value, Value::Nil));
+    }
+
+    #[test]
+    fn move_helper_supports_self_move() {
+        let string = Rc::new("self".to_string());
+        let mut value = Value::String(string.clone());
+        let value_ptr = &mut value as *mut Value;
+
+        unsafe {
+            assert_eq!(jit_move_safe(value_ptr, value_ptr), 1);
+        }
+
+        assert_eq!(Rc::strong_count(&string), 2);
+        assert!(matches!(&value, Value::String(value) if Rc::ptr_eq(value, &string)));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn failed_array_specialization_restores_original_values() {
+        let value = Value::array(vec![Value::Int(1), Value::string("not an int")]);
+        let mut data = core::ptr::null_mut();
+        let mut len = 0;
+        let mut cap = 0;
+
+        let result = unsafe { jit_unbox_array_int(&value, &mut data, &mut len, &mut cap) };
+
+        assert_eq!(result, 0);
+        assert_eq!(value.array_len(), Some(2));
+        assert!(matches!(value.array_get(0), Some(Value::Int(1))));
+        assert!(matches!(value.array_get(1), Some(Value::String(_))));
+    }
 }

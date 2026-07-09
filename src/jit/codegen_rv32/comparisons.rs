@@ -79,12 +79,13 @@ impl JitCompiler {
 
     /// Store `t0` as a Bool (tag=1, data=t0) into `regs[vm_reg]`.
     pub(super) fn store_t0_as_bool(&mut self, vm_reg: u8) {
+        extern "C" {
+            fn jit_replace_bool(dest: *mut Value, value: u8) -> u8;
+        }
+        dynasm!(self.ops ; .arch riscv32i ; mv a1, t0);
         self.emit_addr_in_t2(vm_reg, 0);
-        dynasm!(self.ops
-            ; .arch riscv32i
-            ; li t1, 1          // ValueTag::Bool
-            ; sb t1, [t2, 0]
-            ; sw t0, [t2, VALUE_DATA_OFFSET]
-        );
+        dynasm!(self.ops ; .arch riscv32i ; mv a0, t2);
+        self.emit_load_fn_ptr(jit_replace_bool as *const ());
+        self.emit_call_t0();
     }
 }

@@ -1,11 +1,11 @@
 pub(super) use super::specialization::{SpecializationRegistry, SpecializedLayout};
 pub(super) use super::trace::InlineTrace;
 pub(super) use super::trace::ValueType;
-pub(super) use super::{CompiledTrace, Guard, GuardKind, Trace, TraceId, TraceOp};
+pub(super) use super::{CompiledTrace, Guard, GuardKind, JitData, Trace, TraceId, TraceOp};
 pub(super) use crate::bytecode::{Function, Value, ValueTag};
 pub(super) use crate::jit;
 pub(super) use crate::Result;
-pub(super) use alloc::vec::Vec;
+pub(super) use alloc::{boxed::Box, vec::Vec};
 pub(super) use core::mem;
 pub(super) use dynasmrt::{dynasm, x64::Assembler, DynasmApi, DynasmLabelApi};
 use hashbrown::HashMap;
@@ -38,7 +38,7 @@ pub(super) struct SpecializedValue {
 
 pub struct JitCompiler {
     pub(super) ops: Assembler,
-    pub(super) leaked_constants: Vec<*const Value>,
+    pub(super) data: Vec<JitData>,
     fail_stack: Vec<dynasmrt::DynamicLabel>,
     exit_stack: Vec<dynasmrt::DynamicLabel>,
     inline_depth: usize,
@@ -55,5 +55,75 @@ pub struct JitCompiler {
 impl Default for JitCompiler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::rc::Rc;
+
+    #[test]
+    fn retained_strings_and_pointer_arrays_survive_compiler_moves() {
+        let mut compiler = JitCompiler::new();
+        let (first, first_len) = compiler.retain_string("first");
+        let (second, second_len) = compiler.retain_string("second");
+        let pointers = compiler.retain_string_pointers(vec![first, second]);
+        let lengths = compiler.retain_string_lengths(vec![first_len, second_len]);
+
+        let compiler = *Box::new(compiler);
+        let retained_data = compiler.data;
+
+        unsafe {
+            let pointers = core::slice::from_raw_parts(pointers, 2);
+            let lengths = core::slice::from_raw_parts(lengths, 2);
+            assert_eq!(
+                core::slice::from_raw_parts(pointers[0], lengths[0]),
+                b"first"
+            );
+            assert_eq!(
+                core::slice::from_raw_parts(pointers[1], lengths[1]),
+                b"second"
+            );
+        }
+
+        drop(retained_data);
+    }
+
+    #[test]
+    fn generated_scalar_store_drops_previous_value() {
+        let trace = Trace {
+            function_idx: 0,
+            start_ip: 0,
+            preamble: Vec::new(),
+            ops: vec![
+                TraceOp::LoadConst {
+                    dest: 0,
+                    value: Value::Int(7),
+                },
+                TraceOp::NestedLoopCall {
+                    function_idx: 0,
+                    loop_start_ip: 0,
+                    bailout_ip: 0,
+                },
+            ],
+            postamble: Vec::new(),
+            inputs: Vec::new(),
+            outputs: vec![0],
+        };
+        let compiled = JitCompiler::new()
+            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .unwrap();
+        let string = Rc::new("old register value".to_string());
+        let mut registers = vec![Value::String(string.clone())];
+
+        compiled.execute(
+            registers.as_mut_ptr(),
+            core::ptr::null_mut(),
+            core::ptr::null(),
+        );
+
+        assert_eq!(Rc::strong_count(&string), 1);
+        assert!(matches!(registers[0], Value::Int(7)));
     }
 }

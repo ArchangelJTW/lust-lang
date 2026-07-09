@@ -41,25 +41,27 @@ impl JitCompiler {
 
     /// Store `t0` as an integer value (tag=Int=2, data=t0) into `regs[vm_reg]`.
     pub(super) fn store_t0_as_int(&mut self, vm_reg: u8) {
+        extern "C" {
+            fn jit_replace_int32(dest: *mut Value, value: i32) -> u8;
+        }
+        dynasm!(self.ops ; .arch riscv32i ; mv a1, t0);
         self.emit_addr_in_t2(vm_reg, 0);
-        dynasm!(self.ops
-            ; .arch riscv32i
-            ; li t1, 2          // ValueTag::Int
-            ; sb t1, [t2, 0]
-            ; sw t0, [t2, VALUE_DATA_OFFSET]
-        );
+        dynasm!(self.ops ; .arch riscv32i ; mv a0, t2);
+        self.emit_load_fn_ptr(jit_replace_int32 as *const ());
+        self.emit_call_t0();
     }
 
     /// Store `t0` as a float value (tag=Float=3, data stored via fmv) into `regs[vm_reg]`.
     /// `ft0` must hold the f32 value to store; `t0` is used as a temp.
     pub(super) fn store_ft0_as_float(&mut self, vm_reg: u8) {
+        extern "C" {
+            fn jit_replace_float32_bits(dest: *mut Value, bits: u32) -> u8;
+        }
+        dynasm!(self.ops ; .arch riscv32i ; .feature f ; fmv.x.w a1, ft0);
         self.emit_addr_in_t2(vm_reg, 0);
-        dynasm!(self.ops
-            ; .arch riscv32i ; .feature f
-            ; li t0, 3          // ValueTag::Float
-            ; sb t0, [t2, 0]
-            ; fsw ft0, [t2, VALUE_DATA_OFFSET]
-        );
+        dynasm!(self.ops ; .arch riscv32i ; mv a0, t2);
+        self.emit_load_fn_ptr(jit_replace_float32_bits as *const ());
+        self.emit_call_t0();
     }
 
     /// Load the f32 data field of `regs[vm_reg]` into `ft0`.

@@ -1,11 +1,11 @@
-mod corelib;
 mod budget;
+mod corelib;
 mod cycle;
 #[cfg(feature = "std")]
 pub mod stdlib;
 mod task;
-pub(super) use self::task::{TaskId, TaskInstance, TaskManager, TaskState};
 use self::budget::BudgetState;
+pub(super) use self::task::{TaskId, TaskInstance, TaskManager, TaskState};
 pub(super) use crate::ast::{FieldOwnership, StructDef};
 pub(super) use crate::bytecode::{
     FieldStorage, Function, Instruction, NativeCallResult, Register, StructLayout, TaskHandle,
@@ -18,9 +18,9 @@ pub(super) use crate::jit::{
     JitCompiler, JitState, TraceOptimizer, TraceRecorder, MAX_TRACE_LENGTH,
 };
 pub(super) use crate::number::{
-    float_abs, float_acos, float_asin, float_atan, float_atan2, float_ceil, float_clamp,
-    float_cos, float_floor, float_from_int, float_round, float_sin, float_sqrt, float_tan,
-    int_from_float, int_from_usize, LustFloat,
+    float_abs, float_acos, float_asin, float_atan, float_atan2, float_ceil, float_clamp, float_cos,
+    float_floor, float_from_int, float_round, float_sin, float_sqrt, float_tan, int_from_float,
+    int_from_usize, LustFloat,
 };
 pub(super) use crate::{LustError, Result};
 pub(super) use alloc::{
@@ -204,7 +204,11 @@ pub(super) struct CallFrame {
 
 impl CallFrame {
     #[allow(unused_variables)]
-    pub(super) fn new(function_idx: usize, return_dest: Option<Register>, register_count: u8) -> Self {
+    pub(super) fn new(
+        function_idx: usize,
+        return_dest: Option<Register>,
+        register_count: u8,
+    ) -> Self {
         Self {
             function_idx,
             ip: 0,
@@ -233,5 +237,28 @@ pub(super) enum TaskSignal {
 impl Default for VM {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for VM {
+    fn drop(&mut self) {
+        let mut collector = core::mem::take(&mut self.cycle_collector);
+        collector.collect(self);
+
+        // Drop every VM-owned root before the collector itself disappears so
+        // closed Rc cycles are broken during runtime teardown.
+        self.jit.traces.clear();
+        self.functions.clear();
+        self.natives.clear();
+        self.globals.clear();
+        self.call_stack.clear();
+        self.pending_return_value = None;
+        self.pending_task_signal = None;
+        self.last_task_signal = None;
+        self.trace_recorder = None;
+        self.side_trace_context = None;
+        self.task_manager = TaskManager::new();
+
+        collector.collect(self);
     }
 }

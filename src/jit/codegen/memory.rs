@@ -3,47 +3,41 @@ impl JitCompiler {
     pub(super) fn compile_load_const(&mut self, dest: u8, value: &Value) -> Result<()> {
         match value {
             Value::Int(i) => {
-                let offset = (dest as i32) * (mem::size_of::<Value>() as i32);
                 dynasm!(self.ops
-                    ; mov BYTE [r12 + offset], 2
                     ; mov rax, QWORD *i as _
-                    ; mov [r12 + offset + 8], rax
                 );
+                self.store_from_rax(dest, 2);
                 Ok(())
             }
 
             Value::Float(f) => {
-                let offset = (dest as i32) * (mem::size_of::<Value>() as i32);
                 let f_bits = f.to_bits();
                 dynasm!(self.ops
-                    ; mov BYTE [r12 + offset], 3
                     ; mov rax, QWORD f_bits as _
-                    ; mov [r12 + offset + 8], rax
+                    ; movq xmm0, rax
                 );
+                self.store_xmm0_as_float(dest);
                 Ok(())
             }
 
             Value::Bool(b) => {
-                let offset = (dest as i32) * (mem::size_of::<Value>() as i32);
-                let bool_val = if *b { 1i8 } else { 0i8 };
+                let bool_val = if *b { 1i64 } else { 0i64 };
                 dynasm!(self.ops
-                    ; mov BYTE [r12 + offset], 1
-                    ; mov BYTE [r12 + offset + 8], bool_val
+                    ; mov rax, QWORD bool_val
                 );
+                self.store_from_rax(dest, 1);
                 Ok(())
             }
 
-            Value::String(_) => self.copy_leaked_constant(dest, value),
+            Value::String(_) => self.copy_owned_constant(dest, value),
 
-            _ => self.copy_leaked_constant(dest, value),
+            _ => self.copy_owned_constant(dest, value),
         }
     }
 
-    fn copy_leaked_constant(&mut self, dest: u8, value: &Value) -> Result<()> {
+    fn copy_owned_constant(&mut self, dest: u8, value: &Value) -> Result<()> {
         let offset = (dest as i32) * (mem::size_of::<Value>() as i32);
-        let leaked_value = Box::leak(Box::new(value.clone()));
-        let src_ptr = leaked_value as *const Value;
-        self.leaked_constants.push(src_ptr);
+        let src_ptr = self.retain_value(value.clone());
         extern "C" {
             fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
         }
@@ -64,38 +58,11 @@ impl JitCompiler {
         extern "C" {
             fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
         }
-
         dynasm!(self.ops
-            ; mov al, [r12 + src_offset]
-            ; cmp al, 3
-            ; je >fast_copy
-            ; cmp al, 2
-            ; je >fast_copy
-            ; cmp al, 1
-            ; je >fast_copy
-            ; cmp al, 0
-            ; je >fast_copy
-            ; jmp >call_helper
-            ; fast_copy:
-        );
-        let value_size = mem::size_of::<Value>() as i32;
-        let num_qwords = (value_size + 7) / 8;
-        for i in 0..num_qwords {
-            let chunk_offset = i * 8;
-            dynasm!(self.ops
-                ; mov rax, [r12 + src_offset + chunk_offset]
-                ; mov [r12 + dest_offset + chunk_offset], rax
-            );
-        }
-
-        dynasm!(self.ops
-            ; jmp >move_done
-            ; call_helper:
             ; lea rdi, [r12 + src_offset]
             ; lea rsi, [r12 + dest_offset]
             ; mov rax, QWORD jit_move_safe as *const () as _
             ; call rax
-            ; move_done:
         );
         Ok(())
     }
@@ -128,7 +95,6 @@ impl JitCompiler {
 
     pub(super) fn compile_array_len(&mut self, dest: u8, array: u8) -> Result<()> {
         let array_offset = (array as i32) * (mem::size_of::<Value>() as i32);
-        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
         extern "C" {
             fn jit_array_len_safe(array_value: *const Value) -> i64;
         }
@@ -142,9 +108,8 @@ impl JitCompiler {
             ; call rax
             ; test rax, rax
             ; js >fail
-            ; mov BYTE [r12 + dest_offset], 2
-            ; mov [r12 + dest_offset + 8], rax
         );
+        self.store_from_rax(dest, 2);
         Ok(())
     }
 
@@ -184,9 +149,7 @@ impl JitCompiler {
                 ; jz >fail
             );
         } else {
-            let field_name_box = Box::leak(Box::new(field_name.to_string()));
-            let field_name_ptr = field_name_box.as_ptr();
-            let field_name_len = field_name_box.len();
+            let (field_name_ptr, field_name_len) = self.retain_string(field_name);
             dynasm!(self.ops
                 ; lea rdi, [r12 + object_offset]
                 ; mov rsi, QWORD field_name_ptr as _
@@ -265,9 +228,7 @@ impl JitCompiler {
                 );
             }
         } else {
-            let field_name_box = Box::leak(Box::new(field_name.to_string()));
-            let field_name_ptr = field_name_box.as_ptr();
-            let field_name_len = field_name_box.len();
+            let (field_name_ptr, field_name_len) = self.retain_string(field_name);
             dynasm!(self.ops
                 ; lea rdi, [r12 + object_offset]
                 ; mov rsi, QWORD field_name_ptr as _
@@ -506,9 +467,7 @@ impl JitCompiler {
             fn jit_current_registers(vm_ptr: *mut crate::VM) -> *mut Value;
         }
 
-        let method_name_box = Box::leak(Box::new(method_name.to_string()));
-        let method_name_ptr = method_name_box.as_ptr();
-        let method_name_len = method_name_box.len();
+        let (method_name_ptr, method_name_len) = self.retain_string(method_name);
         let first_arg_offset = (first_arg as i32) * (mem::size_of::<Value>() as i32);
         let arg_count_i32 = arg_count as i32;
         dynasm!(self.ops
@@ -563,22 +522,18 @@ impl JitCompiler {
             fn jit_current_registers(vm_ptr: *mut crate::VM) -> *mut Value;
         }
 
-        let struct_name_box = Box::leak(Box::new(struct_name.to_string()));
-        let struct_name_ptr = struct_name_box.as_ptr();
-        let struct_name_len = struct_name_box.len();
+        let (struct_name_ptr, struct_name_len) = self.retain_string(struct_name);
         let field_count = field_names.len();
         let mut field_name_ptrs: Vec<*const u8> = Vec::new();
         let mut field_name_lens: Vec<usize> = Vec::new();
         for field_name in field_names {
-            let field_name_box = Box::leak(Box::new(field_name.to_string()));
-            field_name_ptrs.push(field_name_box.as_ptr());
-            field_name_lens.push(field_name_box.len());
+            let (field_name_ptr, field_name_len) = self.retain_string(field_name);
+            field_name_ptrs.push(field_name_ptr);
+            field_name_lens.push(field_name_len);
         }
 
-        let field_name_ptrs_box = Box::leak(field_name_ptrs.into_boxed_slice());
-        let field_name_lens_box = Box::leak(field_name_lens.into_boxed_slice());
-        let field_name_ptrs_ptr = field_name_ptrs_box.as_ptr();
-        let field_name_lens_ptr = field_name_lens_box.as_ptr();
+        let field_name_ptrs_ptr = self.retain_string_pointers(field_name_ptrs);
+        let field_name_lens_ptr = self.retain_string_lengths(field_name_lens);
         let (has_fields, first_field_offset) = if let Some(first) = field_registers.first() {
             (true, (*first as i32) * (mem::size_of::<Value>() as i32))
         } else {
@@ -642,12 +597,8 @@ impl JitCompiler {
                 out: *mut Value,
             ) -> u8;
         }
-        let enum_name_box = Box::leak(Box::new(enum_name.to_string()));
-        let enum_name_ptr = enum_name_box.as_ptr();
-        let enum_name_len = enum_name_box.len();
-        let variant_name_box = Box::leak(Box::new(variant_name.to_string()));
-        let variant_name_ptr = variant_name_box.as_ptr();
-        let variant_name_len = variant_name_box.len();
+        let (enum_name_ptr, enum_name_len) = self.retain_string(enum_name);
+        let (variant_name_ptr, variant_name_len) = self.retain_string(variant_name);
         dynasm!(self.ops
             ; mov rdi, r13
             ; mov rsi, QWORD enum_name_ptr as _
@@ -683,12 +634,8 @@ impl JitCompiler {
                 out: *mut Value,
             ) -> u8;
         }
-        let enum_name_box = Box::leak(Box::new(enum_name.to_string()));
-        let enum_name_ptr = enum_name_box.as_ptr();
-        let enum_name_len = enum_name_box.len();
-        let variant_name_box = Box::leak(Box::new(variant_name.to_string()));
-        let variant_name_ptr = variant_name_box.as_ptr();
-        let variant_name_len = variant_name_box.len();
+        let (enum_name_ptr, enum_name_len) = self.retain_string(enum_name);
+        let (variant_name_ptr, variant_name_len) = self.retain_string(variant_name);
         let (first_value_offset, value_count) = if let Some(first_reg) = value_registers.first() {
             (
                 (*first_reg as i32) * (mem::size_of::<Value>() as i32),
@@ -725,7 +672,6 @@ impl JitCompiler {
         enum_name: &str,
         variant_name: &str,
     ) -> Result<()> {
-        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
         let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
         extern "C" {
             fn jit_is_enum_variant_safe(
@@ -736,12 +682,8 @@ impl JitCompiler {
                 variant_name_len: usize,
             ) -> u8;
         }
-        let enum_name_box = Box::leak(Box::new(enum_name.to_string()));
-        let enum_name_ptr = enum_name_box.as_ptr();
-        let enum_name_len = enum_name_box.len();
-        let variant_name_box = Box::leak(Box::new(variant_name.to_string()));
-        let variant_name_ptr = variant_name_box.as_ptr();
-        let variant_name_len = variant_name_box.len();
+        let (enum_name_ptr, enum_name_len) = self.retain_string(enum_name);
+        let (variant_name_ptr, variant_name_len) = self.retain_string(variant_name);
         dynasm!(self.ops
             ; lea rdi, [r12 + value_offset]
             ; mov rsi, QWORD enum_name_ptr as _
@@ -750,17 +692,9 @@ impl JitCompiler {
             ; mov r8, QWORD variant_name_len as _
             ; mov rax, QWORD jit_is_enum_variant_safe as *const () as _
             ; call rax
-            ; test al, al
-            ; jnz >store_true
-            ; mov BYTE [r12 + dest_offset], 1
-            ; mov QWORD [r12 + dest_offset + 8], 0
-            ; jmp >store_done
-            ; store_true:
-            ; mov BYTE [r12 + dest_offset], 1
-            ; mov QWORD [r12 + dest_offset + 8], 0
-            ; mov BYTE [r12 + dest_offset + 8], 1
-            ; store_done:
+            ; movzx rax, al
         );
+        self.store_from_rax(dest, 1);
         Ok(())
     }
 

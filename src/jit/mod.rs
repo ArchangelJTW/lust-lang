@@ -17,7 +17,7 @@ pub use codegen_rv32::JitCompiler;
     all(feature = "rv32", target_arch = "riscv32")
 )))]
 pub struct JitCompiler;
-use alloc::{string::String, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
 use hashbrown::HashMap;
 pub use optimizer::TraceOptimizer;
 pub use profiler::{HotSpot, Profiler};
@@ -70,13 +70,39 @@ pub const LOOP_UNROLL_COUNT: usize = 32;
 pub struct TraceId(pub usize);
 pub struct CompiledTrace {
     pub id: TraceId,
-    pub entry: extern "C" fn(*mut Value, *mut VM, *const crate::bytecode::Function) -> i32,
+    entry: extern "C" fn(*mut Value, *mut VM, *const crate::bytecode::Function) -> i32,
+    #[cfg(any(
+        all(feature = "std", not(target_arch = "riscv32")),
+        all(feature = "rv32", target_arch = "riscv32")
+    ))]
+    _executable: dynasmrt::ExecutableBuffer,
+    _data: Vec<JitData>,
     pub trace: Trace,
     pub guards: Vec<Guard>,
     pub parent: Option<TraceId>,
     pub side_traces: Vec<TraceId>,
-    pub leaked_constants: Vec<*const Value>,
     pub hoisted_constants: Vec<(u8, Value)>,
+}
+
+impl CompiledTrace {
+    pub fn execute(
+        &self,
+        registers: *mut Value,
+        vm: *mut VM,
+        function: *const crate::bytecode::Function,
+    ) -> i32 {
+        (self.entry)(registers, vm, function)
+    }
+}
+
+// Generated code embeds pointers into these allocations. Keeping each payload
+// boxed makes those pointers independent of compiler and CompiledTrace moves.
+#[allow(dead_code)]
+pub(super) enum JitData {
+    Value(Box<Value>),
+    String(Box<str>),
+    StringPointers(Box<[*const u8]>),
+    StringLengths(Box<[usize]>),
 }
 
 #[derive(Debug, Clone)]
@@ -130,7 +156,7 @@ pub enum GuardKind {
 
 pub struct JitState {
     pub profiler: Profiler,
-    pub traces: HashMap<TraceId, CompiledTrace>,
+    pub traces: HashMap<TraceId, Rc<CompiledTrace>>,
     pub root_traces: HashMap<(usize, usize), TraceId>,
     next_trace_id: usize,
     pub enabled: bool,
@@ -138,8 +164,11 @@ pub struct JitState {
 
 impl JitState {
     pub fn new() -> Self {
-        let enabled = cfg!(all(feature = "std", not(target_arch = "riscv32"), target_arch = "x86_64"))
-            || cfg!(all(feature = "rv32", target_arch = "riscv32"));
+        let enabled = cfg!(all(
+            feature = "std",
+            not(target_arch = "riscv32"),
+            target_arch = "x86_64"
+        )) || cfg!(all(feature = "rv32", target_arch = "riscv32"));
         Self {
             profiler: Profiler::new(),
             traces: HashMap::new(),
@@ -166,26 +195,30 @@ impl JitState {
     pub fn get_root_trace(&self, func_idx: usize, ip: usize) -> Option<&CompiledTrace> {
         self.root_traces
             .get(&(func_idx, ip))
-            .and_then(|id| self.traces.get(id))
+            .and_then(|id| self.traces.get(id).map(Rc::as_ref))
     }
 
     pub fn get_trace(&self, id: TraceId) -> Option<&CompiledTrace> {
-        self.traces.get(&id)
+        self.traces.get(&id).map(Rc::as_ref)
+    }
+
+    pub fn trace_handle(&self, id: TraceId) -> Option<Rc<CompiledTrace>> {
+        self.traces.get(&id).cloned()
     }
 
     pub fn get_trace_mut(&mut self, id: TraceId) -> Option<&mut CompiledTrace> {
-        self.traces.get_mut(&id)
+        self.traces.get_mut(&id).and_then(Rc::get_mut)
     }
 
     pub fn store_root_trace(&mut self, func_idx: usize, ip: usize, trace: CompiledTrace) {
         let id = trace.id;
         self.root_traces.insert((func_idx, ip), id);
-        self.traces.insert(id, trace);
+        self.traces.insert(id, Rc::new(trace));
     }
 
     pub fn store_side_trace(&mut self, trace: CompiledTrace) {
         let id = trace.id;
-        self.traces.insert(id, trace);
+        self.traces.insert(id, Rc::new(trace));
     }
 }
 

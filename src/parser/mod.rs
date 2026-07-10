@@ -30,7 +30,10 @@ impl Parser {
         let estimated_tokens = (lexer.source_len() / 6).max(16);
 
         #[cfg(feature = "esp32c6-logging")]
-        log::info!("Parser::from_lexer: pre-allocating for ~{} tokens", estimated_tokens);
+        log::info!(
+            "Parser::from_lexer: pre-allocating for ~{} tokens",
+            estimated_tokens
+        );
 
         let mut tokens = Vec::with_capacity(estimated_tokens);
 
@@ -44,7 +47,11 @@ impl Parser {
         #[cfg(feature = "esp32c6-logging")]
         {
             let with_lexeme = tokens.iter().filter(|t| !t.lexeme.is_empty()).count();
-            log::info!("Parser::from_lexer: collected {} tokens ({} with lexemes)", tokens.len(), with_lexeme);
+            log::info!(
+                "Parser::from_lexer: collected {} tokens ({} with lexemes)",
+                tokens.len(),
+                with_lexeme
+            );
         }
 
         // Shrink to actual size to save memory
@@ -64,7 +71,10 @@ impl Parser {
         let mut items = Vec::with_capacity(estimated_items);
 
         #[cfg(feature = "esp32c6-logging")]
-        log::info!("Parser::parse: starting with capacity for ~{} items", estimated_items);
+        log::info!(
+            "Parser::parse: starting with capacity for ~{} items",
+            estimated_items
+        );
 
         while !self.is_at_end() {
             if self.is_item_start() {

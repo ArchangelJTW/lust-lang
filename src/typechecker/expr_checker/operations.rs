@@ -650,7 +650,8 @@ impl TypeChecker {
                         }
                     }
 
-                    for (i, (arg, expected_type)) in args.iter().zip(expected_params.iter()).enumerate()
+                    for (i, (arg, expected_type)) in
+                        args.iter().zip(expected_params.iter()).enumerate()
                     {
                         let arg_type = self.check_expr(arg)?;
                         self.unify(expected_type, &arg_type).map_err(|_| {
@@ -745,7 +746,10 @@ impl TypeChecker {
         } else {
             let callee_type = self.check_expr(callee)?;
             match &callee_type.kind {
-                TypeKind::Function { params, return_type } => {
+                TypeKind::Function {
+                    params,
+                    return_type,
+                } => {
                     let expected_params = params.clone();
                     if args.len() != expected_params.len() {
                         return Err(self.type_error_at(
@@ -758,7 +762,8 @@ impl TypeChecker {
                         ));
                     }
 
-                    for (i, (arg, expected_type)) in args.iter().zip(expected_params.iter()).enumerate()
+                    for (i, (arg, expected_type)) in
+                        args.iter().zip(expected_params.iter()).enumerate()
                     {
                         let arg_type = self.check_expr(arg)?;
                         self.unify_with_bounds(expected_type, &arg_type)
@@ -1473,10 +1478,7 @@ impl TypeChecker {
                     return Ok(Type::new(TypeKind::Unit, span));
                 }
                 _ => {
-                    return Err(self.type_error(format!(
-                        "LuaTable has no method '{}'",
-                        method
-                    )));
+                    return Err(self.type_error(format!("LuaTable has no method '{}'", method)));
                 }
             },
             TypeKind::Named(type_name) => {

@@ -7,9 +7,9 @@ use crate::{
     parser::Parser,
     Span,
 };
-use alloc::{string::String, vec::Vec};
 #[cfg(feature = "std")]
 use alloc::{format, vec};
+use alloc::{string::String, vec::Vec};
 use hashbrown::{HashMap, HashSet};
 #[cfg(feature = "std")]
 use std::{

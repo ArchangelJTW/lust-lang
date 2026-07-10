@@ -118,11 +118,24 @@ impl JitCompiler {
         );
 
         let kind = if is_closure {
-            GuardKind::Closure { register, function_idx, upvalues_ptr }
+            GuardKind::Closure {
+                register,
+                function_idx,
+                upvalues_ptr,
+            }
         } else {
-            GuardKind::Function { register, function_idx }
+            GuardKind::Function {
+                register,
+                function_idx,
+            }
         };
-        Ok(Guard { index: guard_index, bailout_ip: 0, kind, fail_count: 0, side_trace: None })
+        Ok(Guard {
+            index: guard_index,
+            bailout_ip: 0,
+            kind,
+            fail_count: 0,
+            side_trace: None,
+        })
     }
 
     pub(super) fn compile_guard_native_function(
@@ -161,7 +174,10 @@ impl JitCompiler {
         Ok(Guard {
             index: guard_index,
             bailout_ip: 0,
-            kind: GuardKind::NativeFunction { register, expected: expected_ptr },
+            kind: GuardKind::NativeFunction {
+                register,
+                expected: expected_ptr,
+            },
             fail_count: 0,
             side_trace: None,
         })
@@ -205,10 +221,20 @@ impl JitCompiler {
         }
 
         let kind = if expect_truthy {
-            GuardKind::Truthy { register: condition_register }
+            GuardKind::Truthy {
+                register: condition_register,
+            }
         } else {
-            GuardKind::Falsy { register: condition_register }
+            GuardKind::Falsy {
+                register: condition_register,
+            }
         };
-        Ok(Guard { index: guard_index, bailout_ip, kind, fail_count: 0, side_trace: None })
+        Ok(Guard {
+            index: guard_index,
+            bailout_ip,
+            kind,
+            fail_count: 0,
+            side_trace: None,
+        })
     }
 }

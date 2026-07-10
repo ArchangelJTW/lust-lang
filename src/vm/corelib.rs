@@ -241,7 +241,12 @@ fn collect_map_pairs(value: &Value) -> Vec<(ValueKey, Value)> {
     } else if let Some(arr) = value.as_array() {
         arr.into_iter()
             .enumerate()
-            .map(|(i, v)| (ValueKey::from_value(&Value::Int((i as LustInt) + 1)), v.clone()))
+            .map(|(i, v)| {
+                (
+                    ValueKey::from_value(&Value::Int((i as LustInt) + 1)),
+                    v.clone(),
+                )
+            })
             .collect()
     } else {
         Vec::new()
@@ -265,7 +270,12 @@ fn create_ipairs_fn() -> Value {
         let items = if let Some(arr) = target.as_array() {
             arr.into_iter()
                 .enumerate()
-                .map(|(i, v)| (ValueKey::from_value(&Value::Int((i as LustInt) + 1)), v.clone()))
+                .map(|(i, v)| {
+                    (
+                        ValueKey::from_value(&Value::Int((i as LustInt) + 1)),
+                        v.clone(),
+                    )
+                })
                 .collect()
         } else {
             collect_map_pairs(&target)

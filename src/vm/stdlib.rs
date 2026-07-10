@@ -79,7 +79,10 @@ fn create_type_fn() -> Value {
         let value = &args[0];
 
         // Special handling for LuaValue enum - return Lua type names
-        if let Value::Enum { enum_name, variant, .. } = value {
+        if let Value::Enum {
+            enum_name, variant, ..
+        } = value
+        {
             if enum_name == "LuaValue" {
                 let lua_type = match variant.as_str() {
                     "Nil" => "nil",
@@ -143,7 +146,9 @@ pub(crate) fn create_select_fn() -> Value {
         }
         if let Some(s) = selector.as_string() {
             if s == "#" {
-                return Ok(NativeCallResult::Return(Value::Int(values.len() as LustInt)));
+                return Ok(NativeCallResult::Return(
+                    Value::Int(values.len() as LustInt),
+                ));
             } else {
                 return Err("select expects '#' or an index as the first argument".to_string());
             }
@@ -589,9 +594,11 @@ fn create_string_sub_fn() -> Value {
             .get(1)
             .map(|v| unwrap_lua_value(v.clone()).as_int().unwrap_or(1))
             .unwrap_or(1);
-        let end = args
-            .get(2)
-            .map(|v| unwrap_lua_value(v.clone()).as_int().unwrap_or(source.len() as LustInt));
+        let end = args.get(2).map(|v| {
+            unwrap_lua_value(v.clone())
+                .as_int()
+                .unwrap_or(source.len() as LustInt)
+        });
         let (start_idx, end_idx) = normalize_range(start, end, source.len());
         if start_idx >= source.len() || start_idx >= end_idx {
             return Ok(NativeCallResult::Return(Value::string("")));
@@ -779,11 +786,9 @@ fn create_string_gsub_fn() -> Value {
             Other(Value),
         }
         let replacer = match &repl {
-            Value::Enum { enum_name, variant, .. }
-                if enum_name == "LuaValue" && variant == "Function" =>
-            {
-                Replacer::Func(repl.clone())
-            }
+            Value::Enum {
+                enum_name, variant, ..
+            } if enum_name == "LuaValue" && variant == "Function" => Replacer::Func(repl.clone()),
             Value::Function(_) | Value::NativeFunction(_) | Value::Closure { .. } => {
                 Replacer::Func(repl.clone())
             }
@@ -806,27 +811,25 @@ fn create_string_gsub_fn() -> Value {
             output.push_str(&text[last_end..mat.start()]);
             let replacement = match &replacer {
                 Replacer::String(template) => build_template_replacement(template.as_str(), &caps),
-                Replacer::Func(func_val) => {
-                    VM::with_current(|vm| {
-                        let mut call_args = Vec::new();
-                        if caps.len() > 1 {
-                            for idx in 1..caps.len() {
-                                if let Some(c) = caps.get(idx) {
-                                    call_args.push(to_lua_value(vm, Value::string(c.as_str()))?);
-                                } else {
-                                    call_args.push(lua_nil());
-                                }
+                Replacer::Func(func_val) => VM::with_current(|vm| {
+                    let mut call_args = Vec::new();
+                    if caps.len() > 1 {
+                        for idx in 1..caps.len() {
+                            if let Some(c) = caps.get(idx) {
+                                call_args.push(to_lua_value(vm, Value::string(c.as_str()))?);
+                            } else {
+                                call_args.push(lua_nil());
                             }
-                        } else if let Some(m) = caps.get(0) {
-                            call_args.push(to_lua_value(vm, Value::string(m.as_str()))?);
                         }
-                        let result = vm
-                            .call_value(func_val, call_args)
-                            .map_err(|e| e.to_string())?;
-                        let first = unwrap_first_return(result);
-                        Ok(first.to_string())
-                    })?
-                }
+                    } else if let Some(m) = caps.get(0) {
+                        call_args.push(to_lua_value(vm, Value::string(m.as_str()))?);
+                    }
+                    let result = vm
+                        .call_value(func_val, call_args)
+                        .map_err(|e| e.to_string())?;
+                    let first = unwrap_first_return(result);
+                    Ok(first.to_string())
+                })?,
                 Replacer::Other(other) => other.to_string(),
             };
             output.push_str(&replacement);
@@ -933,11 +936,23 @@ fn create_math_random_fn() -> Value {
         let lower = args
             .get(0)
             .map(|v| unwrap_lua_value(v.clone()))
-            .and_then(|v| if matches!(v, Value::Nil) { None } else { Some(v) });
+            .and_then(|v| {
+                if matches!(v, Value::Nil) {
+                    None
+                } else {
+                    Some(v)
+                }
+            });
         let upper = args
             .get(1)
             .map(|v| unwrap_lua_value(v.clone()))
-            .and_then(|v| if matches!(v, Value::Nil) { None } else { Some(v) });
+            .and_then(|v| {
+                if matches!(v, Value::Nil) {
+                    None
+                } else {
+                    Some(v)
+                }
+            });
         let value = with_rng_mut(|rng| match (lower.as_ref(), upper.as_ref()) {
             (None, _) => Value::Float(rng.gen::<f64>()),
             (Some(max), None) => {
@@ -1041,10 +1056,7 @@ fn render_format(fmt: &str, args: &[Value]) -> Result<String, String> {
         } else {
             width_str.parse().ok()
         };
-        let arg = args
-            .get(arg_idx)
-            .cloned()
-            .unwrap_or(Value::Nil);
+        let arg = args.get(arg_idx).cloned().unwrap_or(Value::Nil);
         arg_idx += 1;
         let raw = unwrap_lua_value(arg);
         let formatted = match spec {
@@ -1092,9 +1104,7 @@ fn render_format(fmt: &str, args: &[Value]) -> Result<String, String> {
                     pad_value(format!("{}", num), width, zero_pad)
                 }
             }
-            other => {
-                pad_value(format!("{}", other), width, zero_pad)
-            }
+            other => pad_value(format!("{}", other), width, zero_pad),
         };
         out.push_str(&formatted);
     }
@@ -1135,15 +1145,15 @@ fn normalize_range(start: LustInt, end: Option<LustInt>, len: usize) -> (usize, 
     if s > e {
         return (len, len);
     }
-    (
-        s.saturating_sub(1) as usize,
-        e.max(0) as usize,
-    )
+    (s.saturating_sub(1) as usize, e.max(0) as usize)
 }
 
 fn lua_pattern_to_regex(pattern: &str) -> Result<Regex, String> {
     fn is_regex_meta(ch: char) -> bool {
-        matches!(ch, '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\')
+        matches!(
+            ch,
+            '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+        )
     }
     let mut out = String::new();
     let mut chars = pattern.chars().peekable();
@@ -1158,7 +1168,11 @@ fn lua_pattern_to_regex(pattern: &str) -> Result<Regex, String> {
                         'd' => Some(if in_class { "0-9" } else { "[0-9]" }),
                         'l' => Some(if in_class { "a-z" } else { "[a-z]" }),
                         'u' => Some(if in_class { "A-Z" } else { "[A-Z]" }),
-                        'w' => Some(if in_class { "A-Za-z0-9_" } else { "[A-Za-z0-9_]" }),
+                        'w' => Some(if in_class {
+                            "A-Za-z0-9_"
+                        } else {
+                            "[A-Za-z0-9_]"
+                        }),
                         'x' => Some(if in_class { "A-Fa-f0-9" } else { "[A-Fa-f0-9]" }),
                         's' => Some(if in_class { "\\s" } else { "[\\s]" }),
                         'p' => Some(if in_class { "\\p{P}" } else { "[\\p{P}]" }),

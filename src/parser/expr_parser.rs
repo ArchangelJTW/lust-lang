@@ -17,7 +17,11 @@ impl Parser {
     #[inline(never)]
     pub(super) fn parse_expr(&mut self) -> Result<Expr> {
         #[cfg(feature = "esp32c6-logging")]
-        log::info!("        parse_expr: {:?} at line {}", self.peek_kind(), self.current_token().line);
+        log::info!(
+            "        parse_expr: {:?} at line {}",
+            self.peek_kind(),
+            self.current_token().line
+        );
 
         Ok(self.parse_assignment()?)
     }

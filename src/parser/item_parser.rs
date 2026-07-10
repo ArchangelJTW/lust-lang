@@ -26,7 +26,11 @@ impl Parser {
         };
 
         #[cfg(feature = "esp32c6-logging")]
-        log::info!("parse_item: parsing {:?} at line {}", self.peek_kind(), start_token.line);
+        log::info!(
+            "parse_item: parsing {:?} at line {}",
+            self.peek_kind(),
+            start_token.line
+        );
 
         let kind = match self.peek_kind() {
             TokenKind::Function => {

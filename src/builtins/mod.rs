@@ -1187,7 +1187,8 @@ fn build_lua_functions() -> Vec<BuiltinFunction> {
         },
         BuiltinFunction {
             name: "lua.require",
-            description: "Lua-style module resolver (loads from already-initialized globals when available)",
+            description:
+                "Lua-style module resolver (loads from already-initialized globals when available)",
             signature: BuiltinSignature {
                 params: vec![TypeExpr::Unknown],
                 return_type: TypeExpr::Unknown,
@@ -1493,7 +1494,9 @@ pub fn base_functions() -> &'static [BuiltinFunction] {
 }
 
 pub fn string_functions() -> &'static [BuiltinFunction] {
-    STRING_FUNCTIONS.get_or_init(build_string_functions).as_slice()
+    STRING_FUNCTIONS
+        .get_or_init(build_string_functions)
+        .as_slice()
 }
 
 pub fn task_functions() -> &'static [BuiltinFunction] {

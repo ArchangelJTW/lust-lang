@@ -652,8 +652,10 @@ impl TypeChecker {
                 self.in_loop = true;
                 self.env.push_scope();
                 for var in variables {
-                    self.env
-                        .declare_variable(var.clone(), Type::new(TypeKind::Unknown, Self::dummy_span()))?;
+                    self.env.declare_variable(
+                        var.clone(),
+                        Type::new(TypeKind::Unknown, Self::dummy_span()),
+                    )?;
                 }
                 for stmt in body {
                     self.check_stmt(stmt)?;
@@ -668,8 +670,10 @@ impl TypeChecker {
                 self.in_loop = true;
                 self.env.push_scope();
                 for var in variables {
-                    self.env
-                        .declare_variable(var.clone(), Type::new(TypeKind::Unknown, Self::dummy_span()))?;
+                    self.env.declare_variable(
+                        var.clone(),
+                        Type::new(TypeKind::Unknown, Self::dummy_span()),
+                    )?;
                 }
                 for stmt in body {
                     self.check_stmt(stmt)?;

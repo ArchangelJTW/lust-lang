@@ -1528,6 +1528,12 @@ impl VM {
     }
 
     pub(super) fn value_is_type(&self, value: &Value, type_name: &str) -> bool {
+        // Lua compatibility intentionally treats LuaValue as a dynamic carrier. Transpiled
+        // values may still be represented by their underlying VM value at call boundaries.
+        if type_name == "LuaValue" {
+            return true;
+        }
+
         if type_name
             .split('|')
             .map(str::trim)
@@ -1703,7 +1709,7 @@ impl VM {
         &mut self,
         function_idx: usize,
         return_dest: Option<Register>,
-        args: Vec<Value>,
+        mut args: Vec<Value>,
         upvalues: Vec<Value>,
     ) -> Result<CallFrame> {
         let function = self
@@ -1712,6 +1718,22 @@ impl VM {
             .ok_or_else(|| LustError::RuntimeError {
                 message: format!("Invalid function index {}", function_idx),
             })?;
+        let is_lua_function = function.signature.as_ref().is_some_and(|signature| {
+            let lua_params = signature
+                .params
+                .iter()
+                .all(|ty| matches!(&ty.kind, TypeKind::Named(name) if name == "LuaValue"));
+            let lua_multi_return = matches!(
+                &signature.return_type.kind,
+                TypeKind::Array(inner)
+                    if matches!(&inner.kind, TypeKind::Named(name) if name == "LuaValue")
+            );
+            lua_params && (!signature.params.is_empty() || lua_multi_return)
+        });
+        if is_lua_function {
+            args.resize(function.param_count as usize, Value::Nil);
+            args.truncate(function.param_count as usize);
+        }
         if args.len() != function.param_count as usize {
             return Err(LustError::RuntimeError {
                 message: format!(
@@ -1752,6 +1774,15 @@ impl VM {
     fn validate_function_return(&self, function_idx: usize, value: &Value) -> Result<()> {
         let function = &self.functions[function_idx];
         if let Some(signature) = &function.signature {
+            let is_empty_lua_return = matches!(value, Value::Nil)
+                && matches!(
+                    &signature.return_type.kind,
+                    TypeKind::Array(inner)
+                        if matches!(&inner.kind, TypeKind::Named(name) if name == "LuaValue")
+                );
+            if is_empty_lua_return {
+                return Ok(());
+            }
             if !self.value_matches_type(value, &signature.return_type) {
                 return Err(LustError::RuntimeError {
                     message: format!(

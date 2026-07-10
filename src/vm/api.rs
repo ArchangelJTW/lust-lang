@@ -374,8 +374,47 @@ impl VM {
         let mut export = export;
         self.canonicalize_export_name(&mut export);
         let name = export.name.clone();
+        let params = export.params.clone();
+        let return_type = export.return_type.clone();
         self.push_export_metadata(export);
-        let native = Value::NativeFunction(Rc::new(func));
+        let native = Value::NativeFunction(Rc::new(move |args| {
+            if args.len() != params.len() {
+                return Err(format!(
+                    "Native expects {} arguments, got {}",
+                    params.len(),
+                    args.len()
+                ));
+            }
+            VM::with_current(|vm| {
+                for (index, (value, param)) in args.iter().zip(&params).enumerate() {
+                    if !vm.value_is_type(value, param.ty()) {
+                        return Err(format!(
+                            "Native argument {} expects {}, got {:?}",
+                            index + 1,
+                            param.ty(),
+                            value.type_of()
+                        ));
+                    }
+                }
+
+                let outcome = func(args)?;
+                if let NativeCallResult::Return(value) = &outcome {
+                    let expected = if return_type.trim().is_empty() {
+                        "()"
+                    } else {
+                        return_type.as_str()
+                    };
+                    if !vm.value_is_type(value, expected) {
+                        return Err(format!(
+                            "Native must return {}, got {:?}",
+                            expected,
+                            value.type_of()
+                        ));
+                    }
+                }
+                Ok(outcome)
+            })
+        }));
         self.register_native(name, native);
     }
 
@@ -467,24 +506,7 @@ impl VM {
             .ok_or_else(|| LustError::RuntimeError {
                 message: format!("Function not found: {}", function_name),
             })?;
-        let func = &self.functions[func_idx];
-        if args.len() != func.param_count as usize {
-            return Err(LustError::RuntimeError {
-                message: format!(
-                    "Function {} expects {} arguments, got {}",
-                    function_name,
-                    func.param_count,
-                    args.len()
-                ),
-            });
-        }
-        let register_count = func.register_count;
-
-        let mut frame = CallFrame::new(func_idx, None, register_count);
-        for (i, arg) in args.into_iter().enumerate() {
-            self.observe_value_graph(&arg);
-            frame.registers[i] = arg;
-        }
+        let frame = self.make_call_frame(func_idx, None, args, Vec::new())?;
 
         let stack_depth_before = self.call_stack.len();
         let saved_pending_return_value = self.pending_return_value.clone();
@@ -557,6 +579,115 @@ impl VM {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{Span, TypeKind};
+    use crate::typechecker::FunctionSignature;
+
+    fn typed_function(
+        name: &str,
+        params: Vec<Type>,
+        return_type: Type,
+        returned: Value,
+    ) -> Function {
+        let mut function = Function::new(name, params.len() as u8, false);
+        function.set_register_count((params.len() + 1) as u8);
+        let result = function.chunk.add_constant(returned);
+        function
+            .chunk
+            .emit(Instruction::LoadConst(params.len() as u8, result), 1);
+        function
+            .chunk
+            .emit(Instruction::Return(params.len() as u8), 1);
+        function.set_signature(FunctionSignature {
+            params,
+            return_type,
+            is_method: false,
+        });
+        function
+    }
+
+    fn ty(kind: TypeKind) -> Type {
+        Type::new(kind, Span::dummy())
+    }
+
+    #[test]
+    fn public_calls_validate_argument_types() {
+        let function = typed_function(
+            "typed",
+            vec![ty(TypeKind::Int)],
+            ty(TypeKind::Int),
+            Value::Int(7),
+        );
+        let mut vm = VM::new();
+        vm.load_functions(vec![function]);
+
+        let error = vm.call("typed", vec![Value::Bool(true)]).unwrap_err();
+        assert!(error.to_string().contains("argument 1 expects int"));
+        assert!(matches!(
+            vm.call("typed", vec![Value::Int(1)]),
+            Ok(Value::Int(7))
+        ));
+    }
+
+    #[test]
+    fn call_value_validates_arity_before_building_a_frame() {
+        let function = typed_function(
+            "typed",
+            vec![ty(TypeKind::Int)],
+            ty(TypeKind::Int),
+            Value::Int(7),
+        );
+        let mut vm = VM::new();
+        vm.load_functions(vec![function]);
+
+        let error = vm.call_value(&Value::Function(0), Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("expects 1 arguments, got 0"));
+        assert!(vm.call_stack.is_empty());
+    }
+
+    #[test]
+    fn declared_return_types_are_validated_before_frame_exit() {
+        let function = typed_function(
+            "bad_return",
+            Vec::new(),
+            ty(TypeKind::Int),
+            Value::Bool(true),
+        );
+        let mut vm = VM::new();
+        vm.load_functions(vec![function]);
+
+        let error = vm.call("bad_return", Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("must return int"));
+        assert!(vm.call_stack.is_empty());
+    }
+
+    #[test]
+    fn argument_validation_checks_container_elements() {
+        let function = typed_function(
+            "array_arg",
+            vec![ty(TypeKind::Array(Box::new(ty(TypeKind::Int))))],
+            ty(TypeKind::Int),
+            Value::Int(7),
+        );
+        let mut vm = VM::new();
+        vm.load_functions(vec![function]);
+
+        let error = vm
+            .call("array_arg", vec![Value::array(vec![Value::Bool(true)])])
+            .unwrap_err();
+        assert!(error.to_string().contains("expects Array<int>"));
+    }
+
+    #[test]
+    fn exported_native_results_are_checked_against_metadata() {
+        let mut vm = VM::new();
+        vm.register_exported_native(NativeExport::new("bad_native", Vec::new(), "int"), |_| {
+            Ok(NativeCallResult::Return(Value::Bool(true)))
+        });
+        let native = vm.get_global("bad_native").unwrap();
+
+        let error = vm.call_value(&native, Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("Native must return int"));
+    }
 
     #[test]
     fn failed_public_call_unwinds_its_frame() {
@@ -589,6 +720,56 @@ mod tests {
         assert!(matches!(
             vm.call("succeeding", Vec::new()),
             Ok(Value::Int(7))
+        ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn jit_guard_exit_resumes_at_bailout_ip() {
+        use crate::jit::trace::{Trace, TraceOp};
+        use crate::jit::TraceId;
+
+        let mut function = Function::new("guard_exit", 0, false);
+        function.set_register_count(2);
+        let initial = function.chunk.add_constant(Value::Int(11));
+        let wrong_path = function.chunk.add_constant(Value::Int(22));
+        let bailout_path = function.chunk.add_constant(Value::Int(99));
+        function.chunk.emit(Instruction::LoadBool(0, false), 1);
+        function.chunk.emit(Instruction::LoadConst(1, initial), 1);
+        function.chunk.emit(Instruction::Jump(-3), 1);
+        function
+            .chunk
+            .emit(Instruction::LoadConst(1, wrong_path), 1);
+        function.chunk.emit(Instruction::Return(1), 1);
+        function
+            .chunk
+            .emit(Instruction::LoadConst(1, bailout_path), 1);
+        function.chunk.emit(Instruction::Return(1), 1);
+
+        let trace = Trace {
+            function_idx: 0,
+            start_ip: 0,
+            preamble: Vec::new(),
+            ops: vec![TraceOp::GuardLoopContinue {
+                condition_register: 0,
+                expect_truthy: true,
+                bailout_ip: 5,
+            }],
+            postamble: Vec::new(),
+            inputs: vec![0],
+            outputs: Vec::new(),
+        };
+        let compiled = JitCompiler::new()
+            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .unwrap();
+
+        let mut vm = VM::new();
+        vm.load_functions(vec![function]);
+        vm.jit.store_root_trace(0, 0, compiled);
+
+        assert!(matches!(
+            vm.call("guard_exit", Vec::new()),
+            Ok(Value::Int(99))
         ));
     }
 }

@@ -47,6 +47,7 @@ pub enum Instruction {
     Concat(Register, Register, Register),
     CallMethod(Register, ConstIndex, Register, u8, Register),
     TypeIs(Register, Register, ConstIndex),
+    CheckedCast(Register, ConstIndex),
     LoadUpvalue(Register, u8),
     StoreUpvalue(u8, Register),
     Closure(Register, ConstIndex, Register, u8),
@@ -97,6 +98,7 @@ pub enum OpCode {
     Concat,
     CallMethod,
     TypeIs,
+    CheckedCast,
     LoadUpvalue,
     StoreUpvalue,
     Closure,
@@ -148,9 +150,123 @@ impl Instruction {
             Instruction::Concat(_, _, _) => OpCode::Concat,
             Instruction::CallMethod(_, _, _, _, _) => OpCode::CallMethod,
             Instruction::TypeIs(_, _, _) => OpCode::TypeIs,
+            Instruction::CheckedCast(_, _) => OpCode::CheckedCast,
             Instruction::LoadUpvalue(_, _) => OpCode::LoadUpvalue,
             Instruction::StoreUpvalue(_, _) => OpCode::StoreUpvalue,
             Instruction::Closure(_, _, _, _) => OpCode::Closure,
+        }
+    }
+
+    pub fn defined_register(&self) -> Option<Register> {
+        match *self {
+            Instruction::LoadNil(dest)
+            | Instruction::LoadBool(dest, _)
+            | Instruction::LoadConst(dest, _)
+            | Instruction::LoadGlobal(dest, _)
+            | Instruction::Move(dest, _)
+            | Instruction::Add(dest, _, _)
+            | Instruction::Sub(dest, _, _)
+            | Instruction::Mul(dest, _, _)
+            | Instruction::Div(dest, _, _)
+            | Instruction::Mod(dest, _, _)
+            | Instruction::Neg(dest, _)
+            | Instruction::Eq(dest, _, _)
+            | Instruction::Ne(dest, _, _)
+            | Instruction::Lt(dest, _, _)
+            | Instruction::Le(dest, _, _)
+            | Instruction::Gt(dest, _, _)
+            | Instruction::Ge(dest, _, _)
+            | Instruction::And(dest, _, _)
+            | Instruction::Or(dest, _, _)
+            | Instruction::Not(dest, _)
+            | Instruction::Call(_, _, _, dest)
+            | Instruction::NewArray(dest, _, _)
+            | Instruction::NewMap(dest)
+            | Instruction::NewStruct(dest, _, _, _, _)
+            | Instruction::NewEnumUnit(dest, _, _)
+            | Instruction::NewEnumVariant(dest, _, _, _, _)
+            | Instruction::TupleNew(dest, _, _)
+            | Instruction::TupleGet(dest, _, _)
+            | Instruction::IsEnumVariant(dest, _, _, _)
+            | Instruction::GetEnumValue(dest, _, _)
+            | Instruction::GetField(dest, _, _)
+            | Instruction::GetIndex(dest, _, _)
+            | Instruction::ArrayLen(dest, _)
+            | Instruction::Concat(dest, _, _)
+            | Instruction::CallMethod(_, _, _, _, dest)
+            | Instruction::TypeIs(dest, _, _)
+            | Instruction::LoadUpvalue(dest, _)
+            | Instruction::Closure(dest, _, _, _) => Some(dest),
+            Instruction::StoreGlobal(_, _)
+            | Instruction::Jump(_)
+            | Instruction::JumpIf(_, _)
+            | Instruction::JumpIfNot(_, _)
+            | Instruction::Return(_)
+            | Instruction::SetField(_, _, _)
+            | Instruction::SetIndex(_, _, _)
+            | Instruction::CheckedCast(_, _)
+            | Instruction::StoreUpvalue(_, _) => None,
+        }
+    }
+
+    pub fn reads_register(&self, register: Register) -> bool {
+        let in_range = |first: Register, count: u8| {
+            register >= first && (register as usize) < first as usize + count as usize
+        };
+        match *self {
+            Instruction::Move(_, src)
+            | Instruction::Neg(_, src)
+            | Instruction::Not(_, src)
+            | Instruction::JumpIf(src, _)
+            | Instruction::JumpIfNot(src, _)
+            | Instruction::Return(src)
+            | Instruction::TupleGet(_, src, _)
+            | Instruction::GetEnumValue(_, src, _)
+            | Instruction::ArrayLen(_, src)
+            | Instruction::StoreGlobal(_, src)
+            | Instruction::StoreUpvalue(_, src) => register == src,
+            Instruction::Add(_, lhs, rhs)
+            | Instruction::Sub(_, lhs, rhs)
+            | Instruction::Mul(_, lhs, rhs)
+            | Instruction::Div(_, lhs, rhs)
+            | Instruction::Mod(_, lhs, rhs)
+            | Instruction::Eq(_, lhs, rhs)
+            | Instruction::Ne(_, lhs, rhs)
+            | Instruction::Lt(_, lhs, rhs)
+            | Instruction::Le(_, lhs, rhs)
+            | Instruction::Gt(_, lhs, rhs)
+            | Instruction::Ge(_, lhs, rhs)
+            | Instruction::And(_, lhs, rhs)
+            | Instruction::Or(_, lhs, rhs)
+            | Instruction::GetIndex(_, lhs, rhs)
+            | Instruction::Concat(_, lhs, rhs) => register == lhs || register == rhs,
+            Instruction::SetIndex(collection, index, value) => {
+                register == collection || register == index || register == value
+            }
+            Instruction::SetField(object, _, value) => register == object || register == value,
+            Instruction::IsEnumVariant(_, value, _, _)
+            | Instruction::GetField(_, value, _)
+            | Instruction::TypeIs(_, value, _)
+            | Instruction::CheckedCast(value, _) => register == value,
+            Instruction::Call(function, first, count, _) => {
+                register == function || in_range(first, count)
+            }
+            Instruction::CallMethod(object, _, first, count, _) => {
+                register == object || in_range(first, count)
+            }
+            Instruction::NewArray(_, first, count)
+            | Instruction::TupleNew(_, first, count)
+            | Instruction::Closure(_, _, first, count) => in_range(first, count),
+            Instruction::NewStruct(_, _, _, first, count)
+            | Instruction::NewEnumVariant(_, _, _, first, count) => in_range(first, count),
+            Instruction::LoadNil(_)
+            | Instruction::LoadBool(_, _)
+            | Instruction::LoadConst(_, _)
+            | Instruction::LoadGlobal(_, _)
+            | Instruction::Jump(_)
+            | Instruction::NewMap(_)
+            | Instruction::NewEnumUnit(_, _, _)
+            | Instruction::LoadUpvalue(_, _) => false,
         }
     }
 }
@@ -302,6 +418,10 @@ impl fmt::Display for Instruction {
 
             Instruction::TypeIs(d, val, type_name) => {
                 write!(f, "TypeIs R{}, R{}, K{}", d, val, type_name)
+            }
+
+            Instruction::CheckedCast(value, type_name) => {
+                write!(f, "CheckedCast R{}, K{}", value, type_name)
             }
 
             Instruction::LoadUpvalue(d, idx) => write!(f, "LoadUpvalue R{}, U{}", d, idx),

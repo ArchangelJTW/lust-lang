@@ -114,6 +114,9 @@ impl JitCompiler {
         dynasm!(self.ops
             ; => exit_label
             ; exit:
+            // Postamble helpers may overwrite eax. Preserve the exit reason in
+            // a callee-saved register until specialized state is materialized.
+            ; mov r14d, eax
         );
 
         // Compile postamble (executed once at trace exit)
@@ -129,9 +132,8 @@ impl JitCompiler {
         self.exit_stack.pop();
         self.fail_stack.pop();
 
-        // Set return value to 0 (success) AFTER postamble to avoid clobbering
         dynasm!(self.ops
-            ; xor eax, eax
+            ; mov eax, r14d
         );
 
         dynasm!(self.ops
@@ -270,28 +272,64 @@ impl JitCompiler {
                     self.compile_neg(*dest, *src)?;
                 }
 
-                TraceOp::Lt { dest, lhs, rhs } => {
-                    self.compile_lt(*dest, *lhs, *rhs)?;
+                TraceOp::Lt {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                } => {
+                    self.compile_lt(*dest, *lhs, *rhs, *lhs_type, *rhs_type)?;
                 }
 
-                TraceOp::Le { dest, lhs, rhs } => {
-                    self.compile_le(*dest, *lhs, *rhs)?;
+                TraceOp::Le {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                } => {
+                    self.compile_le(*dest, *lhs, *rhs, *lhs_type, *rhs_type)?;
                 }
 
-                TraceOp::Gt { dest, lhs, rhs } => {
-                    self.compile_gt(*dest, *lhs, *rhs)?;
+                TraceOp::Gt {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                } => {
+                    self.compile_gt(*dest, *lhs, *rhs, *lhs_type, *rhs_type)?;
                 }
 
-                TraceOp::Ge { dest, lhs, rhs } => {
-                    self.compile_ge(*dest, *lhs, *rhs)?;
+                TraceOp::Ge {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                } => {
+                    self.compile_ge(*dest, *lhs, *rhs, *lhs_type, *rhs_type)?;
                 }
 
-                TraceOp::Eq { dest, lhs, rhs } => {
-                    self.compile_eq(*dest, *lhs, *rhs)?;
+                TraceOp::Eq {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                } => {
+                    self.compile_eq(*dest, *lhs, *rhs, *lhs_type, *rhs_type)?;
                 }
 
-                TraceOp::Ne { dest, lhs, rhs } => {
-                    self.compile_ne(*dest, *lhs, *rhs)?;
+                TraceOp::Ne {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                } => {
+                    self.compile_ne(*dest, *lhs, *rhs, *lhs_type, *rhs_type)?;
                 }
 
                 TraceOp::And { dest, lhs, rhs } => {

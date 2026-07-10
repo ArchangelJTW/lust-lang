@@ -277,22 +277,22 @@ impl JitCompiler {
                 TraceOp::Neg { dest, src } => {
                     self.compile_neg(*dest, *src)?;
                 }
-                TraceOp::Lt { dest, lhs, rhs } => {
+                TraceOp::Lt { dest, lhs, rhs, .. } => {
                     self.compile_lt(*dest, *lhs, *rhs)?;
                 }
-                TraceOp::Le { dest, lhs, rhs } => {
+                TraceOp::Le { dest, lhs, rhs, .. } => {
                     self.compile_le(*dest, *lhs, *rhs)?;
                 }
-                TraceOp::Gt { dest, lhs, rhs } => {
+                TraceOp::Gt { dest, lhs, rhs, .. } => {
                     self.compile_gt(*dest, *lhs, *rhs)?;
                 }
-                TraceOp::Ge { dest, lhs, rhs } => {
+                TraceOp::Ge { dest, lhs, rhs, .. } => {
                     self.compile_ge(*dest, *lhs, *rhs)?;
                 }
-                TraceOp::Eq { dest, lhs, rhs } => {
+                TraceOp::Eq { dest, lhs, rhs, .. } => {
                     self.compile_eq(*dest, *lhs, *rhs)?;
                 }
-                TraceOp::Ne { dest, lhs, rhs } => {
+                TraceOp::Ne { dest, lhs, rhs, .. } => {
                     self.compile_ne(*dest, *lhs, *rhs)?;
                 }
                 TraceOp::And { dest, lhs, rhs } => {

@@ -6,7 +6,7 @@ pub mod stdlib;
 mod task;
 use self::budget::BudgetState;
 pub(super) use self::task::{TaskId, TaskInstance, TaskManager, TaskState};
-pub(super) use crate::ast::{FieldOwnership, StructDef};
+pub(super) use crate::ast::{FieldOwnership, StructDef, Type, TypeKind};
 pub(super) use crate::bytecode::{
     FieldStorage, Function, Instruction, NativeCallResult, Register, StructLayout, TaskHandle,
     Value,

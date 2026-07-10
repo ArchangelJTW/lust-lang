@@ -963,6 +963,29 @@ mod tests {
     }
 
     #[test]
+    fn unknown_cast_is_checked_at_runtime() {
+        let _guard = serial_guard();
+        let source = r#"
+            pub function cast_int(value: unknown): int
+                return value as int
+            end
+        "#;
+        let mut program = build_program(source);
+
+        assert!(matches!(
+            program.call_raw("main.cast_int", vec![Value::Int(7)]),
+            Ok(Value::Int(7))
+        ));
+        let error = program
+            .call_raw(
+                "main.cast_int",
+                vec![Value::String(Rc::new("seven".to_string()))],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("Cannot cast value"));
+    }
+
+    #[test]
     fn module_locals_are_visible_in_functions() {
         let _guard = serial_guard();
         let source = r#"
@@ -1334,6 +1357,30 @@ mod tests {
             handle.validate_signature(&program, &mismatched).is_err(),
             "expected signature mismatch"
         );
+    }
+
+    #[test]
+    fn typed_native_results_are_checked_at_runtime() {
+        let _guard = serial_guard();
+        let source = r#"
+            extern
+                function bad_native(): int
+            end
+
+            pub function invoke(): int
+                return bad_native()
+            end
+        "#;
+
+        let mut program = build_program(source);
+        program
+            .register_typed_native::<(), Value, _>("bad_native", |_| Ok(Value::Bool(true)))
+            .expect("register native");
+
+        let error = program.call_raw("main.invoke", Vec::new()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Native 'bad_native' must return int"));
     }
 
     #[test]

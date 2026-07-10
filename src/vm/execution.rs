@@ -247,16 +247,21 @@ impl VM {
                                     }
                                 }
                             } else {
-                                if let Some(trace) = self.jit.get_trace(trace_id) {
-                                    if let Some(g) = trace.guards.get(guard_index) {
-                                        if g.bailout_ip != 0 {
-                                            continue;
-                                        }
+                                let bailout_ip = self
+                                    .jit
+                                    .get_trace(trace_id)
+                                    .and_then(|trace| trace.guards.get(guard_index))
+                                    .map(|guard| guard.bailout_ip);
+
+                                if let Some(bailout_ip) = bailout_ip {
+                                    if let Some(frame) = self.call_stack.last_mut() {
+                                        frame.ip = bailout_ip;
                                     }
                                 }
 
                                 self.handle_guard_failure(trace_id, guard_index, func_idx)?;
                                 self.jit.root_traces.remove(&(func_idx, loop_start_ip));
+                                continue;
                             }
                         } else {
                             crate::jit::log(|| {
@@ -763,13 +768,8 @@ impl VM {
                                 args.push(self.get_register(first_arg + i)?.clone());
                             }
 
-                            let register_count = self.functions[func_idx].register_count;
-                            let mut frame =
-                                CallFrame::new(func_idx, Some(dest_reg), register_count);
-                            for (i, arg) in args.into_iter().enumerate() {
-                                frame.registers[i] = arg;
-                            }
-
+                            let frame =
+                                self.make_call_frame(func_idx, Some(dest_reg), args, Vec::new())?;
                             self.call_stack.push(frame);
                         }
 
@@ -784,14 +784,12 @@ impl VM {
 
                             let upvalue_values: Vec<Value> =
                                 upvalues.iter().map(|uv| uv.get()).collect();
-                            let register_count = self.functions[func_idx].register_count;
-                            let mut frame =
-                                CallFrame::new(func_idx, Some(dest_reg), register_count);
-                            frame.upvalues = upvalue_values;
-                            for (i, arg) in args.into_iter().enumerate() {
-                                frame.registers[i] = arg;
-                            }
-
+                            let frame = self.make_call_frame(
+                                func_idx,
+                                Some(dest_reg),
+                                args,
+                                upvalue_values,
+                            )?;
                             self.call_stack.push(frame);
                         }
 
@@ -826,7 +824,9 @@ impl VM {
                     } else {
                         self.get_register(value_reg)?.clone()
                     };
-                    let return_dest = self.call_stack.last().unwrap().return_dest;
+                    let frame = self.call_stack.last().unwrap();
+                    let return_dest = frame.return_dest;
+                    self.validate_function_return(frame.function_idx, &return_value)?;
                     self.call_stack.pop();
                     if self.call_stack.is_empty() {
                         return Ok(return_value);
@@ -1238,15 +1238,13 @@ impl VM {
                         if let Some(func_idx) =
                             self.functions.iter().position(|f| f.name == mangled_name)
                         {
-                            let register_count = self.functions[func_idx].register_count;
-                            let mut frame =
-                                CallFrame::new(func_idx, Some(dest_reg), register_count);
-                            frame.registers[0] = object.clone();
+                            let mut args = Vec::with_capacity(1 + arg_count as usize);
+                            args.push(object.clone());
                             for i in 0..arg_count {
-                                frame.registers[(i + 1) as usize] =
-                                    self.get_register(first_arg + i)?.clone();
+                                args.push(self.get_register(first_arg + i)?.clone());
                             }
-
+                            let frame =
+                                self.make_call_frame(func_idx, Some(dest_reg), args, Vec::new())?;
                             self.call_stack.push(frame);
                             continue;
                         }
@@ -1428,6 +1426,26 @@ impl VM {
                     let matches = self.value_is_type(&value, &type_name);
                     self.set_register(dest, Value::Bool(matches))?;
                 }
+
+                Instruction::CheckedCast(value_reg, type_name_idx) => {
+                    let value = self.get_register(value_reg)?.clone();
+                    let func = &self.functions[self.call_stack.last().unwrap().function_idx];
+                    let type_name = func.chunk.constants[type_name_idx as usize]
+                        .as_string()
+                        .ok_or_else(|| LustError::RuntimeError {
+                            message: "Cast type name must be a string".to_string(),
+                        })?
+                        .to_string();
+                    if !self.value_is_type(&value, &type_name) {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Cannot cast value of type {:?} to {}",
+                                value.type_of(),
+                                type_name
+                            ),
+                        });
+                    }
+                }
             }
 
             if self.jit.enabled {
@@ -1510,6 +1528,14 @@ impl VM {
     }
 
     pub(super) fn value_is_type(&self, value: &Value, type_name: &str) -> bool {
+        if type_name
+            .split('|')
+            .map(str::trim)
+            .any(|member| member != type_name && self.value_is_type(value, member))
+        {
+            return true;
+        }
+
         if let Some(matches) = self.match_function_type(value, type_name) {
             return matches;
         }
@@ -1528,9 +1554,9 @@ impl VM {
             Value::Enum { enum_name, .. } => enum_name.as_str(),
             Value::Function(_) | Value::NativeFunction(_) | Value::Closure { .. } => "function",
             Value::Iterator(_) => "Iterator",
-            Value::Task(_) => "task",
+            Value::Task(_) => "Task",
         };
-        if value_type_name == type_name {
+        if value_type_name == type_name || (matches!(value, Value::Nil) && type_name == "()") {
             return true;
         }
 
@@ -1546,13 +1572,13 @@ impl VM {
             return true;
         }
 
-        if type_name == "Option"
+        if (type_name == "Option" || type_name.starts_with("Option<"))
             && matches!(value, Value::Enum { enum_name, .. } if enum_name == "Option")
         {
             return true;
         }
 
-        if type_name == "Result"
+        if (type_name == "Result" || type_name.starts_with("Result<"))
             && matches!(value, Value::Enum { enum_name, .. } if enum_name == "Result")
         {
             return true;
@@ -1570,6 +1596,174 @@ impl VM {
         }
 
         false
+    }
+
+    pub(crate) fn value_matches_type(&self, value: &Value, ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::Int => matches!(value, Value::Int(_)),
+            TypeKind::Float => matches!(value, Value::Float(_)),
+            TypeKind::String => matches!(value, Value::String(_)),
+            TypeKind::Bool => matches!(value, Value::Bool(_)),
+            TypeKind::Unit => matches!(value, Value::Nil),
+            TypeKind::Unknown | TypeKind::Generic(_) | TypeKind::Infer => true,
+            TypeKind::Named(expected) => self.value_is_type(value, expected),
+            TypeKind::GenericInstance { name, .. } => self.value_is_type(value, name),
+            TypeKind::Array(element_type) => match value {
+                Value::Array(values) => values
+                    .borrow()
+                    .iter()
+                    .all(|value| self.value_matches_type(value, element_type)),
+                _ => false,
+            },
+            TypeKind::Map(key_type, value_type) => match value {
+                Value::Map(entries) => entries.borrow().iter().all(|(key, value)| {
+                    self.value_matches_type(&key.to_value(), key_type)
+                        && self.value_matches_type(value, value_type)
+                }),
+                _ => false,
+            },
+            TypeKind::Tuple(element_types) => match value {
+                Value::Tuple(values) => {
+                    values.len() == element_types.len()
+                        && values
+                            .iter()
+                            .zip(element_types)
+                            .all(|(value, ty)| self.value_matches_type(value, ty))
+                }
+                _ => false,
+            },
+            TypeKind::Option(inner) => match value {
+                Value::Enum {
+                    enum_name,
+                    variant,
+                    values,
+                } if enum_name == "Option" => match variant.as_str() {
+                    "None" => values.as_ref().map_or(true, |values| values.is_empty()),
+                    "Some" => values.as_ref().is_some_and(|values| {
+                        values.len() == 1 && self.value_matches_type(&values[0], inner)
+                    }),
+                    _ => false,
+                },
+                _ => false,
+            },
+            TypeKind::Result(ok_type, err_type) => match value {
+                Value::Enum {
+                    enum_name,
+                    variant,
+                    values,
+                } if enum_name == "Result" => {
+                    let payload_type = match variant.as_str() {
+                        "Ok" => ok_type,
+                        "Err" => err_type,
+                        _ => return false,
+                    };
+                    values.as_ref().is_some_and(|values| {
+                        values.len() == 1 && self.value_matches_type(&values[0], payload_type)
+                    })
+                }
+                _ => false,
+            },
+            TypeKind::Function {
+                params,
+                return_type,
+            } => match value {
+                Value::Function(index)
+                | Value::Closure {
+                    function_idx: index,
+                    ..
+                } => self
+                    .functions
+                    .get(*index)
+                    .and_then(|function| function.signature.as_ref())
+                    .is_some_and(|signature| {
+                        signature.params == *params && signature.return_type == **return_type
+                    }),
+                Value::NativeFunction(_) => true,
+                _ => false,
+            },
+            TypeKind::Union(types) => types.iter().any(|ty| self.value_matches_type(value, ty)),
+            TypeKind::Trait(name) => {
+                let value_name = self.value_trait_name(value);
+                self.trait_impls
+                    .contains_key(&(value_name, name.to_string()))
+            }
+            TypeKind::TraitBound(names) => {
+                let value_name = self.value_trait_name(value);
+                names.iter().all(|name| {
+                    self.trait_impls
+                        .contains_key(&(value_name.clone(), name.clone()))
+                })
+            }
+            TypeKind::Ref(inner) | TypeKind::MutRef(inner) => self.value_matches_type(value, inner),
+            TypeKind::Pointer { .. } => true,
+        }
+    }
+
+    pub(super) fn make_call_frame(
+        &mut self,
+        function_idx: usize,
+        return_dest: Option<Register>,
+        args: Vec<Value>,
+        upvalues: Vec<Value>,
+    ) -> Result<CallFrame> {
+        let function = self
+            .functions
+            .get(function_idx)
+            .ok_or_else(|| LustError::RuntimeError {
+                message: format!("Invalid function index {}", function_idx),
+            })?;
+        if args.len() != function.param_count as usize {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Function {} expects {} arguments, got {}",
+                    function.name,
+                    function.param_count,
+                    args.len()
+                ),
+            });
+        }
+        if let Some(signature) = &function.signature {
+            if signature.params.len() == args.len() {
+                for (index, (value, ty)) in args.iter().zip(&signature.params).enumerate() {
+                    if !self.value_matches_type(value, ty) {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Function {} argument {} expects {}, got {:?}",
+                                function.name,
+                                index + 1,
+                                ty,
+                                value.type_of()
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut frame = CallFrame::new(function_idx, return_dest, function.register_count);
+        frame.upvalues = upvalues;
+        for (index, arg) in args.into_iter().enumerate() {
+            self.observe_value_graph(&arg);
+            frame.registers[index] = arg;
+        }
+        Ok(frame)
+    }
+
+    fn validate_function_return(&self, function_idx: usize, value: &Value) -> Result<()> {
+        let function = &self.functions[function_idx];
+        if let Some(signature) = &function.signature {
+            if !self.value_matches_type(value, &signature.return_type) {
+                return Err(LustError::RuntimeError {
+                    message: format!(
+                        "Function {} must return {}, got {:?}",
+                        function.name,
+                        signature.return_type,
+                        value.type_of()
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn value_trait_name(&self, value: &Value) -> String {
@@ -1846,11 +2040,7 @@ impl VM {
                 let saved_pending_task_signal = self.pending_task_signal.clone();
                 let saved_last_task_signal = self.last_task_signal.clone();
 
-                let register_count = self.functions[*func_idx].register_count;
-                let mut frame = CallFrame::new(*func_idx, None, register_count);
-                for (i, arg) in args.into_iter().enumerate() {
-                    frame.registers[i] = arg;
-                }
+                let frame = self.make_call_frame(*func_idx, None, args, Vec::new())?;
 
                 let stack_depth_before = self.call_stack.len();
                 self.call_stack.push(frame);
@@ -1884,12 +2074,7 @@ impl VM {
                 let saved_last_task_signal = self.last_task_signal.clone();
 
                 let upvalue_values: Vec<Value> = upvalues.iter().map(|uv| uv.get()).collect();
-                let register_count = self.functions[*func_idx].register_count;
-                let mut frame = CallFrame::new(*func_idx, None, register_count);
-                frame.upvalues = upvalue_values;
-                for (i, arg) in args.into_iter().enumerate() {
-                    frame.registers[i] = arg;
-                }
+                let frame = self.make_call_frame(*func_idx, None, args, upvalue_values)?;
 
                 let stack_depth_before = self.call_stack.len();
                 self.call_stack.push(frame);

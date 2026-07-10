@@ -147,51 +147,14 @@ impl VM {
         args: Vec<Value>,
     ) -> Result<CallFrame> {
         match func {
-            Value::Function(func_idx) => {
-                let function = &self.functions[func_idx];
-                if args.len() != function.param_count as usize {
-                    return Err(LustError::RuntimeError {
-                        message: format!(
-                            "Task entry expects {} arguments, got {}",
-                            function.param_count,
-                            args.len()
-                        ),
-                    });
-                }
-                let register_count = function.register_count;
-
-                let mut frame = CallFrame::new(func_idx, None, register_count);
-                for (i, arg) in args.into_iter().enumerate() {
-                    frame.registers[i] = arg;
-                }
-
-                Ok(frame)
-            }
+            Value::Function(func_idx) => self.make_call_frame(func_idx, None, args, Vec::new()),
 
             Value::Closure {
                 function_idx,
                 upvalues,
             } => {
-                let function = &self.functions[function_idx];
-                if args.len() != function.param_count as usize {
-                    return Err(LustError::RuntimeError {
-                        message: format!(
-                            "Task entry expects {} arguments, got {}",
-                            function.param_count,
-                            args.len()
-                        ),
-                    });
-                }
-                let register_count = function.register_count;
-
                 let captured: Vec<Value> = upvalues.iter().map(|uv| uv.get()).collect();
-                let mut frame = CallFrame::new(function_idx, None, register_count);
-                frame.upvalues = captured;
-                for (i, arg) in args.into_iter().enumerate() {
-                    frame.registers[i] = arg;
-                }
-
-                Ok(frame)
+                self.make_call_frame(function_idx, None, args, captured)
             }
 
             other => Err(LustError::RuntimeError {
@@ -307,10 +270,9 @@ impl VM {
                             .emit(Instruction::Call(tick_fn_reg, 0, 0, result_reg), 0);
                     }
                     1 => {
-                        wrapper.chunk.emit(
-                            Instruction::Call(tick_fn_reg, resume_reg, 1, result_reg),
-                            0,
-                        );
+                        wrapper
+                            .chunk
+                            .emit(Instruction::Call(tick_fn_reg, resume_reg, 1, result_reg), 0);
                     }
                     _ => {
                         // For N>1, expect resume() to pass an Array of arguments.
@@ -353,11 +315,18 @@ impl VM {
         let task = self.get_task_instance(handle)?;
         match task.state {
             TaskState::Yielded => Ok(task.last_yield.clone().unwrap_or(Value::Nil)),
-            TaskState::Completed | TaskState::Stopped => Ok(task.last_result.clone().unwrap_or(Value::Nil)),
+            TaskState::Completed | TaskState::Stopped => {
+                Ok(task.last_result.clone().unwrap_or(Value::Nil))
+            }
             TaskState::Ready | TaskState::Running => Ok(Value::Nil),
-            TaskState::Failed => Err(task.error.clone().unwrap_or_else(|| LustError::RuntimeError {
-                message: "Task failed".to_string(),
-            })),
+            TaskState::Failed => {
+                Err(task
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| LustError::RuntimeError {
+                        message: "Task failed".to_string(),
+                    }))
+            }
         }
     }
 
@@ -503,9 +472,7 @@ impl VM {
         if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() && method_name == "settimeout" {
             match object {
                 Value::Enum {
-                    enum_name,
-                    variant,
-                    ..
+                    enum_name, variant, ..
                 } => {
                     eprintln!(
                         "[lua-socket] CallMethod enum={} variant={} method={}",
@@ -523,13 +490,12 @@ impl VM {
         }
 
         if let Value::Enum {
-            enum_name,
-            variant,
-            ..
+            enum_name, variant, ..
         } = object
         {
             if enum_name == "LuaValue" && variant == "Userdata" {
-                if let Some(result) = self.try_call_lua_dynamic_method(object, method_name, &args)?
+                if let Some(result) =
+                    self.try_call_lua_dynamic_method(object, method_name, &args)?
                 {
                     return Ok(result);
                 }
@@ -548,7 +514,8 @@ impl VM {
 
         if let Value::Struct { name, .. } = object {
             if name == "LuaTable" {
-                if let Some(result) = self.try_call_lua_dynamic_method(object, method_name, &args)?
+                if let Some(result) =
+                    self.try_call_lua_dynamic_method(object, method_name, &args)?
                 {
                     return Ok(result);
                 }
@@ -665,8 +632,7 @@ impl VM {
                             return Ok(Value::Nil);
                         }
                         let pos = pos_raw.as_int().unwrap_or(seq.len() as LustInt);
-                        let idx =
-                            ((pos - 1).max(0) as usize).min(seq.len().saturating_sub(1));
+                        let idx = ((pos - 1).max(0) as usize).min(seq.len().saturating_sub(1));
                         let removed = seq.remove(idx);
                         lua_table_write_sequence(&map_rc, &seq);
                         Ok(removed)
@@ -712,7 +678,9 @@ impl VM {
                             });
                         };
                         let call_args = vec![object.clone(), args[0].clone(), args[1].clone()];
-                        match func(&call_args).map_err(|e| LustError::RuntimeError { message: e })? {
+                        match func(&call_args)
+                            .map_err(|e| LustError::RuntimeError { message: e })?
+                        {
                             NativeCallResult::Return(value) => Ok(value),
                             NativeCallResult::Yield(_) => Err(LustError::RuntimeError {
                                 message: "unpack() unexpectedly yielded".to_string(),

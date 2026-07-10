@@ -114,31 +114,43 @@ pub enum TraceOp {
         dest: Register,
         lhs: Register,
         rhs: Register,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
     },
     Ne {
         dest: Register,
         lhs: Register,
         rhs: Register,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
     },
     Lt {
         dest: Register,
         lhs: Register,
         rhs: Register,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
     },
     Le {
         dest: Register,
         lhs: Register,
         rhs: Register,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
     },
     Gt {
         dest: Register,
         lhs: Register,
         rhs: Register,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
     },
     Ge {
         dest: Register,
         lhs: Register,
         rhs: Register,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
     },
     And {
         dest: Register,
@@ -358,6 +370,7 @@ pub struct TraceRecorder {
     pub trace: Trace,
     max_length: usize,
     recording: bool,
+    finalized: bool,
     guarded_registers: HashSet<Register>,
     inline_stack: Vec<InlineContext>,
     op_count: usize,
@@ -404,6 +417,7 @@ impl TraceRecorder {
             },
             max_length,
             recording: true,
+            finalized: false,
             guarded_registers: HashSet::new(),
             inline_stack: Vec::new(),
             op_count: 0,
@@ -420,7 +434,7 @@ impl TraceRecorder {
     pub fn specialize_trace_inputs(
         &mut self,
         registers: &[Value],
-        function: &crate::bytecode::Function,
+        _function: &crate::bytecode::Function,
     ) {
         crate::jit::log(|| format!("🔍 JIT: Scanning trace inputs for specialization..."));
 
@@ -429,40 +443,19 @@ impl TraceRecorder {
             // Check if this register contains an Array at runtime
             if let Value::Array(ref arr_rc) = registers[reg as usize] {
                 crate::jit::log(|| format!("🔍 JIT: Found array in reg {}", reg));
-                // Try to determine the element type by inspecting the array contents
-                // If we have type info, use it; otherwise infer from first element
-                let element_type = function.register_types.get(&reg).cloned().or_else(|| {
-                    // Try to infer from array contents
-                    let arr = arr_rc.borrow();
-                    if arr.is_empty() {
-                        None
-                    } else {
-                        match &arr[0] {
-                            Value::Int(_) => Some(crate::ast::TypeKind::Int),
-                            Value::Float(_) => Some(crate::ast::TypeKind::Float),
-                            Value::Bool(_) => Some(crate::ast::TypeKind::Bool),
-                            _ => None,
-                        }
-                    }
+                // Selection is speculative; the generated unbox helper validates
+                // every element before the specialized representation is used.
+                let element_type = arr_rc.borrow().first().and_then(|value| match value {
+                    Value::Int(_) => Some(crate::ast::TypeKind::Int),
+                    Value::Float(_) => Some(crate::ast::TypeKind::Float),
+                    Value::Bool(_) => Some(crate::ast::TypeKind::Bool),
+                    _ => None,
                 });
 
                 if let Some(elem_type) = element_type {
-                    // Build the full Array<T> type
-                    // Check if elem_type is already a full Array type (stored in register_types)
-                    // vs just the element type
                     use crate::ast::{Span, Type};
-                    let (array_type, _actual_elem_type) =
-                        if matches!(elem_type, crate::ast::TypeKind::Array(_)) {
-                            // Already a full array type - use it directly
-                            (elem_type.clone(), elem_type.clone())
-                        } else {
-                            // Element type only, wrap in Array
-                            let arr_type = crate::ast::TypeKind::Array(Box::new(Type::new(
-                                elem_type.clone(),
-                                Span::dummy(),
-                            )));
-                            (arr_type, elem_type.clone())
-                        };
+                    let array_type =
+                        crate::ast::TypeKind::Array(Box::new(Type::new(elem_type, Span::dummy())));
 
                     // Check if this array type is specializable
                     if let Some(layout) =
@@ -524,6 +517,10 @@ impl TraceRecorder {
         set.insert(register);
     }
 
+    fn forget_guard(&mut self, register: Register) {
+        self.current_guard_set_mut().remove(&register);
+    }
+
     fn push_op(&mut self, op: TraceOp) {
         self.op_count += 1;
         if let Some(ctx) = self.inline_stack.last_mut() {
@@ -535,6 +532,11 @@ impl TraceRecorder {
 
     /// Finalize the trace by adding postamble operations (rebox all specialized values)
     fn finalize_trace(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+
         crate::jit::log(|| {
             format!(
                 "🏁 JIT: Finalizing trace - reboxing {} specialized values, dropping {} leaked values",
@@ -759,6 +761,17 @@ impl TraceRecorder {
             return Ok(());
         }
 
+        if let Some(dest) = instruction.defined_register() {
+            if instruction.reads_register(dest) {
+                self.stop_recording();
+                return Err(LustError::RuntimeError {
+                    message: "Trace aborted: aliased destination requires pre-execution operands"
+                        .to_string(),
+                });
+            }
+            self.forget_guard(dest);
+        }
+
         let outcome: Result<(), LustError> = match instruction {
             Instruction::LoadConst(dest, _) => {
                 // Rebox specialized value if dest contains one
@@ -775,22 +788,15 @@ impl TraceRecorder {
                 Ok(())
             }
 
-            Instruction::LoadGlobal(dest, _) => {
-                // Remove specialization tracking if dest contains a specialized value
-                self.remove_specialization_tracking(dest);
-
-                if let Some(_ty) = Self::get_value_type(&registers[dest as usize]) {
-                    self.mark_guarded(dest);
-                }
-
-                self.push_op(TraceOp::LoadConst {
-                    dest,
-                    value: registers[dest as usize].clone(),
-                });
-                Ok(())
+            Instruction::LoadGlobal(_, _) | Instruction::StoreGlobal(_, _) => {
+                // Globals can be replaced by Lust or embedding code. Until
+                // traces carry global slots and versions, snapshotting or
+                // omitting these operations would miscompile the loop.
+                self.stop_recording();
+                Err(LustError::RuntimeError {
+                    message: "Trace aborted: global access requires versioning".to_string(),
+                })
             }
-
-            Instruction::StoreGlobal(_, _) => Ok(()),
 
             Instruction::Move(dest, src) => {
                 // If dest contains a specialized value, rebox it first before overwriting
@@ -831,6 +837,7 @@ impl TraceRecorder {
                     lhs_type,
                     rhs_type,
                 });
+                self.mark_guarded(dest);
                 Ok(())
             }
 
@@ -848,6 +855,7 @@ impl TraceRecorder {
                     lhs_type,
                     rhs_type,
                 });
+                self.mark_guarded(dest);
                 Ok(())
             }
 
@@ -864,6 +872,7 @@ impl TraceRecorder {
                     lhs_type,
                     rhs_type,
                 });
+                self.mark_guarded(dest);
                 Ok(())
             }
 
@@ -880,6 +889,7 @@ impl TraceRecorder {
                     lhs_type,
                     rhs_type,
                 });
+                self.mark_guarded(dest);
                 Ok(())
             }
 
@@ -896,41 +906,99 @@ impl TraceRecorder {
                     lhs_type,
                     rhs_type,
                 });
+                self.mark_guarded(dest);
                 Ok(())
             }
 
             Instruction::Neg(dest, src) => {
+                self.numeric_comparison_types(src, src, registers)?;
+                self.add_type_guards(src, src, registers, function)?;
                 self.push_op(TraceOp::Neg { dest, src });
+                self.mark_guarded(dest);
                 Ok(())
             }
 
             Instruction::Eq(dest, lhs, rhs) => {
-                self.push_op(TraceOp::Eq { dest, lhs, rhs });
+                let (lhs_type, rhs_type) = self.scalar_comparison_types(lhs, rhs, registers)?;
+                self.add_type_guards(lhs, rhs, registers, function)?;
+                self.push_op(TraceOp::Eq {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                });
+                self.mark_guarded(dest);
                 Ok(())
             }
 
             Instruction::Ne(dest, lhs, rhs) => {
-                self.push_op(TraceOp::Ne { dest, lhs, rhs });
+                let (lhs_type, rhs_type) = self.scalar_comparison_types(lhs, rhs, registers)?;
+                self.add_type_guards(lhs, rhs, registers, function)?;
+                self.push_op(TraceOp::Ne {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                });
+                self.mark_guarded(dest);
                 Ok(())
             }
 
             Instruction::Lt(dest, lhs, rhs) => {
-                self.push_op(TraceOp::Lt { dest, lhs, rhs });
+                let (lhs_type, rhs_type) = self.numeric_comparison_types(lhs, rhs, registers)?;
+                self.add_type_guards(lhs, rhs, registers, function)?;
+                self.push_op(TraceOp::Lt {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                });
+                self.mark_guarded(dest);
                 Ok(())
             }
 
             Instruction::Le(dest, lhs, rhs) => {
-                self.push_op(TraceOp::Le { dest, lhs, rhs });
+                let (lhs_type, rhs_type) = self.numeric_comparison_types(lhs, rhs, registers)?;
+                self.add_type_guards(lhs, rhs, registers, function)?;
+                self.push_op(TraceOp::Le {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                });
+                self.mark_guarded(dest);
                 Ok(())
             }
 
             Instruction::Gt(dest, lhs, rhs) => {
-                self.push_op(TraceOp::Gt { dest, lhs, rhs });
+                let (lhs_type, rhs_type) = self.numeric_comparison_types(lhs, rhs, registers)?;
+                self.add_type_guards(lhs, rhs, registers, function)?;
+                self.push_op(TraceOp::Gt {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                });
+                self.mark_guarded(dest);
                 Ok(())
             }
 
             Instruction::Ge(dest, lhs, rhs) => {
-                self.push_op(TraceOp::Ge { dest, lhs, rhs });
+                let (lhs_type, rhs_type) = self.numeric_comparison_types(lhs, rhs, registers)?;
+                self.add_type_guards(lhs, rhs, registers, function)?;
+                self.push_op(TraceOp::Ge {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type,
+                    rhs_type,
+                });
+                self.mark_guarded(dest);
                 Ok(())
             }
 
@@ -1011,6 +1079,7 @@ impl TraceRecorder {
                 }
 
                 self.push_op(TraceOp::ArrayLen { dest, array });
+                self.mark_guarded(dest);
                 Ok(())
             }
 
@@ -1493,39 +1562,33 @@ impl TraceRecorder {
                     return Ok(());
                 }
 
-                // Check if we can specialize this array based on element type
-                // register_types contains the element type, not the array type
-                let can_specialize = if let Some(element_type) = function.register_types.get(&dest)
-                {
-                    // Build the full Array type from the element type
-                    use crate::ast::{Span, Type};
-                    let array_type = crate::ast::TypeKind::Array(Box::new(Type::new(
-                        element_type.clone(),
-                        Span::dummy(),
-                    )));
-
-                    // Check if this array type is specializable
-                    self.specialization_registry
-                        .get_specialization(&array_type)
-                        .is_some()
+                let element_type = if count == 0 {
+                    None
                 } else {
-                    false
+                    match &registers[first_elem as usize] {
+                        Value::Int(_) => Some(crate::ast::TypeKind::Int),
+                        Value::Float(_) => Some(crate::ast::TypeKind::Float),
+                        Value::Bool(_) => Some(crate::ast::TypeKind::Bool),
+                        _ => None,
+                    }
                 };
 
-                if can_specialize {
-                    let element_type = function.register_types.get(&dest).unwrap().clone();
-
-                    // Build the full Array type
+                if let Some(element_type) = element_type {
                     use crate::ast::{Span, Type};
                     let array_type = crate::ast::TypeKind::Array(Box::new(Type::new(
                         element_type.clone(),
                         Span::dummy(),
                     )));
 
-                    let layout = self
-                        .specialization_registry
-                        .get_specialization(&array_type)
-                        .unwrap();
+                    let Some(layout) = self.specialization_registry.get_specialization(&array_type)
+                    else {
+                        self.push_op(TraceOp::NewArray {
+                            dest,
+                            first_element: first_elem,
+                            count,
+                        });
+                        return Ok(());
+                    };
 
                     crate::jit::log(|| {
                         format!(
@@ -1534,21 +1597,11 @@ impl TraceRecorder {
                         )
                     });
 
-                    // First create the array normally (for initial values if any)
-                    if count > 0 {
-                        self.push_op(TraceOp::NewArray {
-                            dest,
-                            first_element: first_elem,
-                            count,
-                        });
-                    } else {
-                        // Empty array
-                        self.push_op(TraceOp::NewArray {
-                            dest,
-                            first_element: 0,
-                            count: 0,
-                        });
-                    }
+                    self.push_op(TraceOp::NewArray {
+                        dest,
+                        first_element: first_elem,
+                        count,
+                    });
 
                     // Then unbox it for specialized operations
                     let specialized_id = self.next_specialized_id;
@@ -1772,16 +1825,10 @@ impl TraceRecorder {
         lhs: Register,
         rhs: Register,
         registers: &[Value],
-        function: &crate::bytecode::Function,
+        _function: &crate::bytecode::Function,
     ) -> Result<(), LustError> {
         if let Some(ty) = Self::get_value_type(&registers[lhs as usize]) {
-            let needs_guard = if self.is_guarded(lhs) {
-                false
-            } else if let Some(static_type) = function.register_types.get(&lhs) {
-                !Self::type_kind_matches_value_type(static_type, ty)
-            } else {
-                true
-            };
+            let needs_guard = !self.is_guarded(lhs);
             if needs_guard {
                 self.push_op(TraceOp::Guard {
                     register: lhs,
@@ -1794,13 +1841,7 @@ impl TraceRecorder {
         }
 
         if let Some(ty) = Self::get_value_type(&registers[rhs as usize]) {
-            let needs_guard = if self.is_guarded(rhs) {
-                false
-            } else if let Some(static_type) = function.register_types.get(&rhs) {
-                !Self::type_kind_matches_value_type(static_type, ty)
-            } else {
-                true
-            };
+            let needs_guard = !self.is_guarded(rhs);
             if needs_guard {
                 self.push_op(TraceOp::Guard {
                     register: rhs,
@@ -1815,19 +1856,53 @@ impl TraceRecorder {
         Ok(())
     }
 
-    fn type_kind_matches_value_type(
-        type_kind: &crate::ast::TypeKind,
-        value_type: ValueType,
-    ) -> bool {
-        use crate::ast::TypeKind;
-        match (type_kind, value_type) {
-            (TypeKind::Int, ValueType::Int) => true,
-            (TypeKind::Float, ValueType::Float) => true,
-            (TypeKind::Bool, ValueType::Bool) => true,
-            (TypeKind::String, ValueType::String) => true,
-            (TypeKind::Array(_), ValueType::Array) => true,
-            (TypeKind::Tuple(_), ValueType::Tuple) => true,
-            _ => false,
+    fn numeric_comparison_types(
+        &mut self,
+        lhs: Register,
+        rhs: Register,
+        registers: &[Value],
+    ) -> Result<(ValueType, ValueType), LustError> {
+        let types = (
+            Self::get_value_type(&registers[lhs as usize]),
+            Self::get_value_type(&registers[rhs as usize]),
+        );
+        match types {
+            (
+                Some(lhs_type @ (ValueType::Int | ValueType::Float)),
+                Some(rhs_type @ (ValueType::Int | ValueType::Float)),
+            ) => Ok((lhs_type, rhs_type)),
+            _ => {
+                self.stop_recording();
+                Err(LustError::RuntimeError {
+                    message: "Trace aborted: ordered comparison requires numeric operands"
+                        .to_string(),
+                })
+            }
+        }
+    }
+
+    fn scalar_comparison_types(
+        &mut self,
+        lhs: Register,
+        rhs: Register,
+        registers: &[Value],
+    ) -> Result<(ValueType, ValueType), LustError> {
+        let types = (
+            Self::get_value_type(&registers[lhs as usize]),
+            Self::get_value_type(&registers[rhs as usize]),
+        );
+        match types {
+            (
+                Some(lhs_type @ (ValueType::Int | ValueType::Float | ValueType::Bool)),
+                Some(rhs_type @ (ValueType::Int | ValueType::Float | ValueType::Bool)),
+            ) => Ok((lhs_type, rhs_type)),
+            _ => {
+                self.stop_recording();
+                Err(LustError::RuntimeError {
+                    message: "Trace aborted: equality requires a supported scalar specialization"
+                        .to_string(),
+                })
+            }
         }
     }
 
@@ -1880,5 +1955,180 @@ impl TraceRecorder {
 
     pub fn abort(&mut self) {
         self.stop_recording();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::TypeKind;
+
+    #[test]
+    fn global_access_aborts_recording_instead_of_becoming_a_constant() {
+        let functions = vec![crate::bytecode::Function::new("global_loop", 0, false)];
+        let mut recorder = TraceRecorder::new(0, 0, 32);
+
+        let result = recorder.record_instruction(
+            Instruction::LoadGlobal(0, 0),
+            1,
+            &[],
+            &functions[0],
+            0,
+            &functions,
+        );
+
+        assert!(result.is_err());
+        assert!(!recorder.is_recording());
+        assert!(recorder.trace.ops.is_empty());
+    }
+
+    #[test]
+    fn trace_finalization_only_reboxes_each_specialized_value_once() {
+        let functions = vec![crate::bytecode::Function::new("array_loop", 0, false)];
+        let mut registers = vec![Value::Nil; 256];
+        registers[0] = Value::array(vec![Value::Int(1)]);
+        let mut recorder = TraceRecorder::new(0, 0, 32);
+        recorder.specialize_trace_inputs(&registers, &functions[0]);
+
+        assert!(recorder
+            .record_instruction(
+                Instruction::LoadGlobal(1, 0),
+                1,
+                &registers,
+                &functions[0],
+                0,
+                &functions,
+            )
+            .is_err());
+        let trace = recorder.finish();
+
+        assert_eq!(trace.postamble.len(), 1);
+        assert!(matches!(trace.postamble[0], TraceOp::Rebox { .. }));
+    }
+
+    #[test]
+    fn overwritten_register_requires_a_new_type_guard() {
+        let functions = vec![crate::bytecode::Function::new("overwrite", 0, false)];
+        let mut registers = vec![Value::Nil; 256];
+        let mut recorder = TraceRecorder::new(0, 0, 32);
+
+        registers[0] = Value::Int(1);
+        recorder
+            .record_instruction(
+                Instruction::LoadConst(0, 0),
+                1,
+                &registers,
+                &functions[0],
+                0,
+                &functions,
+            )
+            .unwrap();
+        registers[0] = Value::Float(1.5);
+        registers[1] = Value::Float(1.5);
+        recorder
+            .record_instruction(
+                Instruction::Move(0, 1),
+                2,
+                &registers,
+                &functions[0],
+                0,
+                &functions,
+            )
+            .unwrap();
+        registers[2] = Value::Float(3.0);
+        recorder
+            .record_instruction(
+                Instruction::Add(2, 0, 0),
+                3,
+                &registers,
+                &functions[0],
+                0,
+                &functions,
+            )
+            .unwrap();
+
+        assert!(recorder.trace.ops.iter().any(|op| matches!(
+            op,
+            TraceOp::Guard {
+                register: 0,
+                expected_type: ValueType::Float
+            }
+        )));
+    }
+
+    #[test]
+    fn static_register_type_does_not_replace_a_runtime_guard() {
+        let mut function = crate::bytecode::Function::new("typed", 0, false);
+        function.register_types.insert(0, TypeKind::Int);
+        let functions = vec![function];
+        let mut registers = vec![Value::Nil; 256];
+        registers[0] = Value::Int(2);
+        registers[1] = Value::Int(3);
+        registers[2] = Value::Int(5);
+        let mut recorder = TraceRecorder::new(0, 0, 32);
+
+        recorder
+            .record_instruction(
+                Instruction::Add(2, 0, 1),
+                1,
+                &registers,
+                &functions[0],
+                0,
+                &functions,
+            )
+            .unwrap();
+
+        assert!(recorder
+            .trace
+            .ops
+            .iter()
+            .any(|op| matches!(op, TraceOp::Guard { register: 0, .. })));
+    }
+
+    #[test]
+    fn aliased_arithmetic_aborts_until_inputs_are_recorded_pre_execution() {
+        let functions = vec![crate::bytecode::Function::new("aliased", 0, false)];
+        let registers = vec![Value::Int(2); 256];
+        let mut recorder = TraceRecorder::new(0, 0, 32);
+
+        let result = recorder.record_instruction(
+            Instruction::Add(0, 0, 1),
+            1,
+            &registers,
+            &functions[0],
+            0,
+            &functions,
+        );
+
+        assert!(result.is_err());
+        assert!(!recorder.is_recording());
+        assert!(recorder.trace.ops.is_empty());
+    }
+
+    #[test]
+    fn empty_array_is_not_specialized_from_stale_register_metadata() {
+        let mut function = crate::bytecode::Function::new("empty_array", 0, false);
+        function.register_types.insert(0, TypeKind::Int);
+        let functions = vec![function];
+        let mut registers = vec![Value::Nil; 256];
+        registers[0] = Value::array(Vec::new());
+        let mut recorder = TraceRecorder::new(0, 0, 32);
+
+        recorder
+            .record_instruction(
+                Instruction::NewArray(0, 0, 0),
+                1,
+                &registers,
+                &functions[0],
+                0,
+                &functions,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            recorder.trace.ops.as_slice(),
+            [TraceOp::NewArray { count: 0, .. }]
+        ));
+        assert!(recorder.specialized_registers.is_empty());
     }
 }

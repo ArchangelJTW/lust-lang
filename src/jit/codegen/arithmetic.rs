@@ -332,7 +332,7 @@ impl JitCompiler {
             dynasm!(self.ops
                 ; test rbx, rbx
                 ; jz >fail
-                ; xor rdx, rdx
+                ; cqo
                 ; idiv rbx
             );
             self.store_from_rax(dest, 2);
@@ -394,7 +394,7 @@ impl JitCompiler {
             ; mov rbx, [r12 + rhs_offset + 8]
             ; test rbx, rbx
             ; jz >fail
-            ; xor rdx, rdx
+            ; cqo
             ; idiv rbx
             ; jmp >store_int
             ; float_path:
@@ -444,7 +444,7 @@ impl JitCompiler {
             dynasm!(self.ops
                 ; test rbx, rbx
                 ; jz >fail
-                ; xor rdx, rdx
+                ; cqo
                 ; idiv rbx
                 ; mov rax, rdx
             );
@@ -463,7 +463,7 @@ impl JitCompiler {
             ; mov rbx, [r12 + rhs_offset + 8]
             ; test rbx, rbx
             ; jz >fail
-            ; xor rdx, rdx
+            ; cqo
             ; idiv rbx
             ; mov rax, rdx
         );

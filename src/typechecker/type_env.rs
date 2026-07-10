@@ -357,8 +357,10 @@ impl TypeEnv {
 
         if config.is_module_enabled("string") {
             if let Some(global_scope) = self.scopes.first_mut() {
-                global_scope
-                    .insert("string".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+                global_scope.insert(
+                    "string".to_string(),
+                    Type::new(TypeKind::Unknown, dummy_span),
+                );
             }
 
             self.register_builtin_function_slice(builtins::string_functions(), dummy_span);

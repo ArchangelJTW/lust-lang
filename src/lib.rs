@@ -7,14 +7,14 @@ pub mod ast;
 pub mod builtins;
 pub mod bytecode;
 pub mod config;
-pub mod intern;
-#[cfg(feature = "std")]
-pub mod externs;
 #[cfg(feature = "std")]
 pub mod embed;
 pub mod error;
 #[cfg(feature = "std")]
+pub mod externs;
+#[cfg(feature = "std")]
 pub mod ffi;
+pub mod intern;
 pub mod jit;
 mod lazy;
 pub mod lexer;
@@ -47,10 +47,10 @@ pub use jit::{JitCompiler, JitState};
 pub use lexer::{Lexer, Token, TokenKind};
 #[cfg(feature = "std")]
 pub use lust_macros::LustStructView;
+pub use modules::embedded::{build_directory_map, load_program_from_embedded, EmbeddedModule};
 pub use modules::{
     compile_program_with_config, LoadedModule, ModuleImports, ModuleLoader, Program,
 };
-pub use modules::embedded::{EmbeddedModule, load_program_from_embedded, build_directory_map};
 pub use number::{LustFloat, LustInt};
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 pub use packages::{

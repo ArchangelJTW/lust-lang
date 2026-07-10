@@ -4,8 +4,7 @@ use crate::embed::native_types::ModuleStub;
 use crate::{NativeExport, VM};
 use std::{
     collections::BTreeMap,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -290,4 +289,3 @@ mod tests {
         assert!(contents.contains("function scale(int): int"));
     }
 }
-

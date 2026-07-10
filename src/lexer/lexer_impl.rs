@@ -55,7 +55,8 @@ impl<'a> Lexer<'a> {
                 return Err(LustError::LexerError {
                     line: self.line,
                     column: self.column,
-                    message: "Tokenization exceeded maximum iterations (possible infinite loop)".to_string(),
+                    message: "Tokenization exceeded maximum iterations (possible infinite loop)"
+                        .to_string(),
                     module: None,
                 });
             }
@@ -64,7 +65,11 @@ impl<'a> Lexer<'a> {
             #[cfg(feature = "esp32c6-logging")]
             {
                 if iterations % 100 == 0 {
-                    log::info!("Lexer::tokenize: iteration {} at line {}", iterations, self.line);
+                    log::info!(
+                        "Lexer::tokenize: iteration {} at line {}",
+                        iterations,
+                        self.line
+                    );
                 }
             }
 
@@ -85,7 +90,11 @@ impl<'a> Lexer<'a> {
         ));
 
         #[cfg(feature = "esp32c6-logging")]
-        log::info!("Lexer::tokenize: complete, {} tokens in {} iterations", tokens.len(), iterations);
+        log::info!(
+            "Lexer::tokenize: complete, {} tokens in {} iterations",
+            tokens.len(),
+            iterations
+        );
 
         Ok(tokens)
     }
@@ -118,27 +127,51 @@ impl<'a> Lexer<'a> {
         match ch {
             '(' => {
                 self.advance();
-                return Ok(Token::simple(TokenKind::LeftParen, start_line, start_column));
+                return Ok(Token::simple(
+                    TokenKind::LeftParen,
+                    start_line,
+                    start_column,
+                ));
             }
             ')' => {
                 self.advance();
-                return Ok(Token::simple(TokenKind::RightParen, start_line, start_column));
+                return Ok(Token::simple(
+                    TokenKind::RightParen,
+                    start_line,
+                    start_column,
+                ));
             }
             '{' => {
                 self.advance();
-                return Ok(Token::simple(TokenKind::LeftBrace, start_line, start_column));
+                return Ok(Token::simple(
+                    TokenKind::LeftBrace,
+                    start_line,
+                    start_column,
+                ));
             }
             '}' => {
                 self.advance();
-                return Ok(Token::simple(TokenKind::RightBrace, start_line, start_column));
+                return Ok(Token::simple(
+                    TokenKind::RightBrace,
+                    start_line,
+                    start_column,
+                ));
             }
             '[' => {
                 self.advance();
-                return Ok(Token::simple(TokenKind::LeftBracket, start_line, start_column));
+                return Ok(Token::simple(
+                    TokenKind::LeftBracket,
+                    start_line,
+                    start_column,
+                ));
             }
             ']' => {
                 self.advance();
-                return Ok(Token::simple(TokenKind::RightBracket, start_line, start_column));
+                return Ok(Token::simple(
+                    TokenKind::RightBracket,
+                    start_line,
+                    start_column,
+                ));
             }
             ',' => {
                 self.advance();
@@ -146,7 +179,11 @@ impl<'a> Lexer<'a> {
             }
             ';' => {
                 self.advance();
-                return Ok(Token::simple(TokenKind::Semicolon, start_line, start_column));
+                return Ok(Token::simple(
+                    TokenKind::Semicolon,
+                    start_line,
+                    start_column,
+                ));
             }
             '%' => {
                 self.advance();
@@ -162,7 +199,11 @@ impl<'a> Lexer<'a> {
             }
             '&' => {
                 self.advance();
-                return Ok(Token::simple(TokenKind::Ampersand, start_line, start_column));
+                return Ok(Token::simple(
+                    TokenKind::Ampersand,
+                    start_line,
+                    start_column,
+                ));
             }
             '|' => {
                 self.advance();
@@ -172,7 +213,11 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    return Ok(Token::simple(TokenKind::PlusEqual, start_line, start_column));
+                    return Ok(Token::simple(
+                        TokenKind::PlusEqual,
+                        start_line,
+                        start_column,
+                    ));
                 } else {
                     return Ok(Token::simple(TokenKind::Plus, start_line, start_column));
                 }
@@ -181,7 +226,11 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    return Ok(Token::simple(TokenKind::MinusEqual, start_line, start_column));
+                    return Ok(Token::simple(
+                        TokenKind::MinusEqual,
+                        start_line,
+                        start_column,
+                    ));
                 } else if self.current_char() == '>' {
                     self.advance();
                     return Ok(Token::simple(TokenKind::Arrow, start_line, start_column));
@@ -193,7 +242,11 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    return Ok(Token::simple(TokenKind::StarEqual, start_line, start_column));
+                    return Ok(Token::simple(
+                        TokenKind::StarEqual,
+                        start_line,
+                        start_column,
+                    ));
                 } else {
                     return Ok(Token::simple(TokenKind::Star, start_line, start_column));
                 }
@@ -202,7 +255,11 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    return Ok(Token::simple(TokenKind::SlashEqual, start_line, start_column));
+                    return Ok(Token::simple(
+                        TokenKind::SlashEqual,
+                        start_line,
+                        start_column,
+                    ));
                 } else {
                     return Ok(Token::simple(TokenKind::Slash, start_line, start_column));
                 }
@@ -211,7 +268,11 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    return Ok(Token::simple(TokenKind::DoubleEqual, start_line, start_column));
+                    return Ok(Token::simple(
+                        TokenKind::DoubleEqual,
+                        start_line,
+                        start_column,
+                    ));
                 } else if self.current_char() == '>' {
                     self.advance();
                     return Ok(Token::simple(TokenKind::FatArrow, start_line, start_column));
@@ -251,7 +312,11 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    return Ok(Token::simple(TokenKind::LessEqual, start_line, start_column));
+                    return Ok(Token::simple(
+                        TokenKind::LessEqual,
+                        start_line,
+                        start_column,
+                    ));
                 } else {
                     return Ok(Token::simple(TokenKind::Less, start_line, start_column));
                 }
@@ -260,7 +325,11 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 if self.current_char() == '=' {
                     self.advance();
-                    return Ok(Token::simple(TokenKind::GreaterEqual, start_line, start_column));
+                    return Ok(Token::simple(
+                        TokenKind::GreaterEqual,
+                        start_line,
+                        start_column,
+                    ));
                 } else {
                     return Ok(Token::simple(TokenKind::Greater, start_line, start_column));
                 }
@@ -269,7 +338,11 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 if self.current_char() == ':' {
                     self.advance();
-                    return Ok(Token::simple(TokenKind::DoubleColon, start_line, start_column));
+                    return Ok(Token::simple(
+                        TokenKind::DoubleColon,
+                        start_line,
+                        start_column,
+                    ));
                 } else {
                     return Ok(Token::simple(TokenKind::Colon, start_line, start_column));
                 }
@@ -278,7 +351,11 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 if self.current_char() == '.' {
                     self.advance();
-                    return Ok(Token::simple(TokenKind::DoubleDot, start_line, start_column));
+                    return Ok(Token::simple(
+                        TokenKind::DoubleDot,
+                        start_line,
+                        start_column,
+                    ));
                 } else {
                     return Ok(Token::simple(TokenKind::Dot, start_line, start_column));
                 }
@@ -481,10 +558,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn current_char(&self) -> char {
-        self.input[self.position..]
-            .chars()
-            .next()
-            .unwrap_or('\0')
+        self.input[self.position..].chars().next().unwrap_or('\0')
     }
 
     fn peek(&self, offset: usize) -> Option<char> {

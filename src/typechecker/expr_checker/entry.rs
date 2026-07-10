@@ -1,7 +1,7 @@
 use super::*;
+use crate::builtins;
 use alloc::{boxed::Box, format, string::ToString, vec::Vec};
 use hashbrown::HashMap;
-use crate::builtins;
 impl TypeChecker {
     pub fn check_expr(&mut self, expr: &Expr) -> Result<Type> {
         let mut ty = self.check_expr_with_hint(expr, None)?;

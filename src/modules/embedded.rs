@@ -42,7 +42,10 @@ pub fn load_program_from_embedded(
     entry_module: &str,
 ) -> Result<Program> {
     #[cfg(feature = "esp32c6-logging")]
-    log::info!("load_program_from_embedded: starting with {} entries", entries.len());
+    log::info!(
+        "load_program_from_embedded: starting with {} entries",
+        entries.len()
+    );
 
     let mut module_names: HashSet<String> = entries.iter().map(|e| e.module.to_string()).collect();
 
@@ -52,11 +55,18 @@ pub fn load_program_from_embedded(
     let mut registry: HashMap<String, LoadedModule> = HashMap::new();
     for entry in entries.iter() {
         #[cfg(feature = "esp32c6-logging")]
-        log::info!("load_program_from_embedded: processing module '{}'", entry.module);
+        log::info!(
+            "load_program_from_embedded: processing module '{}'",
+            entry.module
+        );
 
         if let Some(source) = entry.source {
             #[cfg(feature = "esp32c6-logging")]
-            log::info!("  parsing module '{}' ({} bytes)", entry.module, source.len());
+            log::info!(
+                "  parsing module '{}' ({} bytes)",
+                entry.module,
+                source.len()
+            );
 
             let module = parse_module(entry.module, source)?;
 
@@ -92,7 +102,10 @@ pub fn load_program_from_embedded(
     }
 
     #[cfg(feature = "esp32c6-logging")]
-    log::info!("load_program_from_embedded: finalizing {} modules", ordered.len());
+    log::info!(
+        "load_program_from_embedded: finalizing {} modules",
+        ordered.len()
+    );
 
     for module in ordered {
         finalize_module(&module_names, &mut registry, &module)?;
@@ -128,9 +141,15 @@ fn parse_module(module: &str, source: &str) -> Result<LoadedModule> {
 
     #[cfg(feature = "esp32c6-logging")]
     {
-        log::info!("parse_module: tokenized {} tokens, parsing...", parser.token_count());
-        log::info!("  string interner: {} unique strings, {} bytes",
-            interner.len(), interner.total_string_bytes());
+        log::info!(
+            "parse_module: tokenized {} tokens, parsing...",
+            parser.token_count()
+        );
+        log::info!(
+            "  string interner: {} unique strings, {} bytes",
+            interner.len(),
+            interner.total_string_bytes()
+        );
     }
 
     let items = parser.parse()?;
@@ -257,7 +276,11 @@ fn collect_deps_from_lua_require_stmt(stmt: &crate::ast::Stmt, deps: &mut HashSe
             }
         }
         StmtKind::ForNumeric {
-            start, end, step, body, ..
+            start,
+            end,
+            step,
+            body,
+            ..
         } => {
             collect_deps_from_lua_require_expr(start, deps);
             collect_deps_from_lua_require_expr(end, deps);
@@ -371,24 +394,14 @@ fn collect_deps_from_lua_require_expr(expr: &crate::ast::Expr, deps: &mut HashSe
             collect_deps_from_lua_require_expr(start, deps);
             collect_deps_from_lua_require_expr(end, deps);
         }
-        ExprKind::Literal(Literal::String(_))
-        | ExprKind::Literal(_)
-        | ExprKind::Identifier(_) => {}
+        ExprKind::Literal(Literal::String(_)) | ExprKind::Literal(_) | ExprKind::Identifier(_) => {}
     }
 }
 
 fn is_lua_builtin_module_name(name: &str) -> bool {
     matches!(
         name,
-        "math"
-            | "table"
-            | "string"
-            | "io"
-            | "os"
-            | "package"
-            | "coroutine"
-            | "debug"
-            | "utf8"
+        "math" | "table" | "string" | "io" | "os" | "package" | "coroutine" | "debug" | "utf8"
     )
 }
 
@@ -397,7 +410,8 @@ fn is_lua_require_callee(callee: &crate::ast::Expr) -> bool {
     match &callee.kind {
         ExprKind::Identifier(name) => name == "require",
         ExprKind::FieldAccess { object, field } => {
-            field == "require" && matches!(&object.kind, ExprKind::Identifier(name) if name == "lua")
+            field == "require"
+                && matches!(&object.kind, ExprKind::Identifier(name) if name == "lua")
         }
         _ => false,
     }
@@ -407,12 +421,12 @@ fn extract_lua_require_name(expr: &crate::ast::Expr) -> Option<String> {
     use crate::ast::{ExprKind, Literal};
     match &expr.kind {
         ExprKind::Literal(Literal::String(s)) => Some(s.clone()),
-        ExprKind::Call { callee, args } if is_lua_to_value_callee(callee) => args
-            .get(0)
-            .and_then(|arg| match &arg.kind {
+        ExprKind::Call { callee, args } if is_lua_to_value_callee(callee) => {
+            args.get(0).and_then(|arg| match &arg.kind {
                 ExprKind::Literal(Literal::String(s)) => Some(s.clone()),
                 _ => None,
-            }),
+            })
+        }
         _ => None,
     }
 }

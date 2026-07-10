@@ -1,10 +1,8 @@
 #![cfg(feature = "std")]
-#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
-use lust::lua_compat::{
-    lua_to_lust, render_table_stub, trace_luaopen, LuaModuleSpec, LuaValue,
-};
 #[cfg(feature = "lua_transpile")]
 use lust::lua_compat::transpile::transpile_lua_stub;
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+use lust::lua_compat::{lua_to_lust, render_table_stub, trace_luaopen, LuaModuleSpec, LuaValue};
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 use lust::packages::{
     build_package_archive, clear_credentials, collect_rust_dependency_artifacts, credentials_file,
@@ -231,7 +229,11 @@ fn collect_lua_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(err) => {
-            eprintln!("Warning: could not read directory '{}': {}", dir.display(), err);
+            eprintln!(
+                "Warning: could not read directory '{}': {}",
+                dir.display(),
+                err
+            );
             return;
         }
     };
@@ -265,7 +267,10 @@ fn transpile_lua_files(paths: &[String]) {
         } else if path.extension().and_then(|e| e.to_str()) == Some("lua") {
             lua_files.push(path);
         } else {
-            eprintln!("Warning: '{}' is not a .lua file or directory; skipping", raw);
+            eprintln!(
+                "Warning: '{}' is not a .lua file or directory; skipping",
+                raw
+            );
         }
     }
 

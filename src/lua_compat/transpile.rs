@@ -523,7 +523,8 @@ impl Emitter {
             "    end".to_string(),
             "    return [lua.to_value(val)]".to_string(),
             "end".to_string(),
-            "local __lua_table_from_varargs = function(items: Array<LuaValue>): LuaTable".to_string(),
+            "local __lua_table_from_varargs = function(items: Array<LuaValue>): LuaTable"
+                .to_string(),
             "    local t = lua.table()".to_string(),
             "    local idx: int = 0".to_string(),
             "    while idx < items:len() do".to_string(),
@@ -567,7 +568,8 @@ impl Emitter {
             "    end".to_string(),
             "    return lua.nil".to_string(),
             "end".to_string(),
-            "local __lua_join = function(prefix: Array<LuaValue>, tail: unknown): Array<LuaValue>".to_string(),
+            "local __lua_join = function(prefix: Array<LuaValue>, tail: unknown): Array<LuaValue>"
+                .to_string(),
             "    local arr = __lua_force_array(tail)".to_string(),
             "    local idx: int = 0".to_string(),
             "    while idx < arr:len() do".to_string(),
@@ -611,8 +613,7 @@ impl Emitter {
             "local type_ = type".to_string(),
             "local module_ = _G[\"module\"]".to_string(),
         ];
-        self.lines
-            .splice(insert_at..insert_at, prelude.into_iter());
+        self.lines.splice(insert_at..insert_at, prelude.into_iter());
         if let Some(decl) = &self.analyzer.module_decl {
             let alias = decl.name.replace('.', "_");
             self.lines
@@ -768,8 +769,7 @@ impl Emitter {
                                     && !self.exported_functions.contains(&name)
                                 {
                                     let path_expr = self.build_path(&path);
-                                    self
-                                        .export_bindings
+                                    self.export_bindings
                                         .entry(name.clone())
                                         .or_insert(path_expr);
                                     if let Some(sig) = expr_sigs.get(idx).and_then(|s| s.clone()) {
@@ -921,7 +921,10 @@ impl Emitter {
                     format!("[lua.to_value({})]", self.emit_expr(last_expr))
                 };
                 let tmp = "__lua_ret";
-                self.push_line(format!("local {tmp}: Array<LuaValue> = [{}]", prefix_vals.join(", ")));
+                self.push_line(format!(
+                    "local {tmp}: Array<LuaValue> = [{}]",
+                    prefix_vals.join(", ")
+                ));
                 self.push_line(format!("return __lua_join({tmp}, {raw_last})"));
             }
         }
@@ -1031,7 +1034,9 @@ impl Emitter {
         let body_block = func.body().block();
         let _ = exported;
         self.declare_local(&name);
-        self.push_line(format!("local {name} = function({params}): Array<LuaValue>"));
+        self.push_line(format!(
+            "local {name} = function({params}): Array<LuaValue>"
+        ));
         self.indent += 1;
         self.emit_block(body_block);
         self.indent -= 1;
@@ -1090,14 +1095,18 @@ impl Emitter {
                     _ => format!("{left} {op} {right}"),
                 }
             }
-            Expression::UnaryOperator { unop, expression } => {
-                match unop {
-                    UnOp::Minus(_) => format!("lua.op_neg({})", self.emit_expr_mode(expression, wrap_calls)),
-                    UnOp::Not(_) => format!("not __lua_truthy({})", self.emit_expr_mode(expression, wrap_calls)),
-                    UnOp::Hash(_) => format!("({}):len()", self.emit_expr_mode(expression, wrap_calls)),
-                    _ => self.emit_expr_mode(expression, wrap_calls),
-                }
-            }
+            Expression::UnaryOperator { unop, expression } => match unop {
+                UnOp::Minus(_) => format!(
+                    "lua.op_neg({})",
+                    self.emit_expr_mode(expression, wrap_calls)
+                ),
+                UnOp::Not(_) => format!(
+                    "not __lua_truthy({})",
+                    self.emit_expr_mode(expression, wrap_calls)
+                ),
+                UnOp::Hash(_) => format!("({}):len()", self.emit_expr_mode(expression, wrap_calls)),
+                _ => self.emit_expr_mode(expression, wrap_calls),
+            },
             Expression::Parentheses { expression, .. } => {
                 format!("({})", self.emit_expr_mode(expression, wrap_calls))
             }
@@ -1109,7 +1118,7 @@ impl Emitter {
                     } else {
                         num_str
                     }
-                },
+                }
                 Value::String(tok) => {
                     let str_val = tok.to_string();
                     if wrap_calls {
@@ -1117,7 +1126,7 @@ impl Emitter {
                     } else {
                         str_val
                     }
-                },
+                }
                 Value::Symbol(tok) => match tok.token().to_string().as_str() {
                     "nil" => "lua.nil".to_string(),
                     "..." => {
@@ -1127,8 +1136,20 @@ impl Emitter {
                             VARARGS_NAME.to_string()
                         }
                     }
-                    "true" => if wrap_calls { "lua.to_value(true)".to_string() } else { "true".to_string() },
-                    "false" => if wrap_calls { "lua.to_value(false)".to_string() } else { "false".to_string() },
+                    "true" => {
+                        if wrap_calls {
+                            "lua.to_value(true)".to_string()
+                        } else {
+                            "true".to_string()
+                        }
+                    }
+                    "false" => {
+                        if wrap_calls {
+                            "lua.to_value(false)".to_string()
+                        } else {
+                            "false".to_string()
+                        }
+                    }
                     other => other.to_string(),
                 },
                 Value::Var(var) => self.emit_var_mode(var, wrap_calls),
@@ -1151,7 +1172,9 @@ impl Emitter {
                         raw
                     }
                 }
-                Value::ParenthesesExpression(expr) => format!("({})", self.emit_expr_mode(expr, wrap_calls)),
+                Value::ParenthesesExpression(expr) => {
+                    format!("({})", self.emit_expr_mode(expr, wrap_calls))
+                }
                 _ => "lua.nil".to_string(),
             },
             _ => "lua.nil".to_string(),
@@ -1171,7 +1194,11 @@ impl Emitter {
                     match suffix {
                         Suffix::Index(index) => match index {
                             Index::Brackets { expression, .. } => {
-                                out = format!("{}[{}]", out, self.emit_expr_mode(expression, wrap_calls));
+                                out = format!(
+                                    "{}[{}]",
+                                    out,
+                                    self.emit_expr_mode(expression, wrap_calls)
+                                );
                             }
                             Index::Dot { name, .. } => {
                                 let field = name.to_string().trim().to_string();
@@ -1270,7 +1297,10 @@ impl Emitter {
                             }
                         }
                         if let Some(expr) = first {
-                            return format!("lua.require({})", self.emit_expr_mode(expr, wrap_calls));
+                            return format!(
+                                "lua.require({})",
+                                self.emit_expr_mode(expr, wrap_calls)
+                            );
                         }
                     }
                     return "lua.nil".to_string();
@@ -1287,8 +1317,8 @@ impl Emitter {
 
                 // Known string methods that should be called via string module
                 let string_methods = [
-                    "byte", "char", "dump", "find", "format", "gmatch", "gsub",
-                    "len", "lower", "match", "rep", "reverse", "sub", "upper"
+                    "byte", "char", "dump", "find", "format", "gmatch", "gsub", "len", "lower",
+                    "match", "rep", "reverse", "sub", "upper",
                 ];
 
                 // If this is a string method, call it via string module instead of lua.call_method
@@ -1355,12 +1385,36 @@ impl Emitter {
 
         // Known Lua metamethods
         let metamethod_names = [
-            "__call", "__index", "__newindex", "__mode", "__tostring",
-            "__metatable", "__len", "__pairs", "__ipairs", "__gc",
-            "__add", "__sub", "__mul", "__div", "__mod", "__pow",
-            "__unm", "__idiv", "__band", "__bor", "__bxor", "__bnot",
-            "__shl", "__shr", "__concat", "__eq", "__lt", "__le",
-            "__name", "__close"
+            "__call",
+            "__index",
+            "__newindex",
+            "__mode",
+            "__tostring",
+            "__metatable",
+            "__len",
+            "__pairs",
+            "__ipairs",
+            "__gc",
+            "__add",
+            "__sub",
+            "__mul",
+            "__div",
+            "__mod",
+            "__pow",
+            "__unm",
+            "__idiv",
+            "__band",
+            "__bor",
+            "__bxor",
+            "__bnot",
+            "__shl",
+            "__shr",
+            "__concat",
+            "__eq",
+            "__lt",
+            "__le",
+            "__name",
+            "__close",
         ];
 
         for field in fields_vec {
@@ -1372,10 +1426,14 @@ impl Emitter {
                     let value_str = self.emit_expr(value);
 
                     // For metamethods with table values, create a shared reference
-                    let (key_str, final_value_str) = if is_metamethod && matches!(value, Expression::Value { value, .. } if matches!(&**value, Value::TableConstructor(_))) {
+                    let (key_str, final_value_str) = if is_metamethod
+                        && matches!(value, Expression::Value { value, .. } if matches!(&**value, Value::TableConstructor(_)))
+                    {
                         // This is a metamethod with a table literal value - create shared reference
-                        let var_name = format!("__shared_{}_{}", name, shared_metamethod_tables.len());
-                        shared_metamethod_tables.push(format!("local {} = {}", var_name, value_str));
+                        let var_name =
+                            format!("__shared_{}_{}", name, shared_metamethod_tables.len());
+                        shared_metamethod_tables
+                            .push(format!("local {} = {}", var_name, value_str));
                         (format!("\"{}\"", name), var_name.clone())
                     } else {
                         (format!("\"{}\"", name), value_str)
@@ -1396,15 +1454,15 @@ impl Emitter {
                     // Expression key: key can be any expression, value is wrapped
                     entries.push(format!(
                         "({}, {})",
-                        self.emit_expr(key),  // Key expression (might already be wrapped)
-                        self.emit_expr(value) // Value wrapped in LuaValue
+                        self.emit_expr(key), // Key expression (might already be wrapped)
+                        self.emit_expr(value)  // Value wrapped in LuaValue
                     ));
                 }
                 Field::NoKey(value) => {
                     // Array-style field: emit as tuple (plain index, wrapped value)
                     list_index += 1;
                     let expr = self.emit_expr(value);
-                    entries.push(format!("({}, {})", list_index, expr));  // Index as plain int
+                    entries.push(format!("({}, {})", list_index, expr)); // Index as plain int
                 }
                 &_ => {}
             }
@@ -1420,20 +1478,24 @@ impl Emitter {
         } else {
             // Has metamethods - need to inline the map literal
             // Convert entries from tuples to map entries
-            let map_entries: Vec<String> = entries.iter().map(|entry| {
-                // entry is like "(lua.to_value("key"), lua.to_value(value))"
-                // Convert to "[lua.to_value("key")] = lua.to_value(value)"
-                if let Some(content) = entry.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-                    let parts: Vec<&str> = content.splitn(2, ", ").collect();
-                    if parts.len() == 2 {
-                        format!("[{}] = {}", parts[0], parts[1])
+            let map_entries: Vec<String> = entries
+                .iter()
+                .map(|entry| {
+                    // entry is like "(lua.to_value("key"), lua.to_value(value))"
+                    // Convert to "[lua.to_value("key")] = lua.to_value(value)"
+                    if let Some(content) = entry.strip_prefix('(').and_then(|s| s.strip_suffix(')'))
+                    {
+                        let parts: Vec<&str> = content.splitn(2, ", ").collect();
+                        if parts.len() == 2 {
+                            format!("[{}] = {}", parts[0], parts[1])
+                        } else {
+                            entry.clone()
+                        }
                     } else {
                         entry.clone()
                     }
-                } else {
-                    entry.clone()
-                }
-            }).collect();
+                })
+                .collect();
 
             let table_literal = if map_entries.is_empty() {
                 "{}".to_string()
@@ -1442,12 +1504,18 @@ impl Emitter {
             };
 
             let metamethods_literal = format!("{{ {} }}", metamethods.join(", "));
-            let lua_table = format!("LuaTable {{ table = {}, metamethods = {} }}", table_literal, metamethods_literal);
+            let lua_table = format!(
+                "LuaTable {{ table = {}, metamethods = {} }}",
+                table_literal, metamethods_literal
+            );
 
             // If we have shared metamethod tables, wrap in IIFE to create them first
             if !shared_metamethod_tables.is_empty() {
                 let var_decls = shared_metamethod_tables.join("\n    ");
-                format!("(function()\n    {}\n    return {}\nend)()", var_decls, lua_table)
+                format!(
+                    "(function()\n    {}\n    return {}\nend)()",
+                    var_decls, lua_table
+                )
             } else {
                 lua_table
             }
@@ -1478,7 +1546,10 @@ impl Emitter {
                 if rendered.len() == 2 {
                     Some(format!("{receiver}:push({})", rendered[1]))
                 } else {
-                    Some(format!("{receiver}:insert({}, {})", rendered[1], rendered[2]))
+                    Some(format!(
+                        "{receiver}:insert({}, {})",
+                        rendered[1], rendered[2]
+                    ))
                 }
             }
             "table.remove" => {
@@ -1494,7 +1565,10 @@ impl Emitter {
                     return Some(format!("{head}()"));
                 }
                 let receiver = rendered[0].clone();
-                let sep = rendered.get(1).cloned().unwrap_or_else(|| "\"\"".to_string());
+                let sep = rendered
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(|| "\"\"".to_string());
                 let i = rendered.get(2).cloned().unwrap_or_else(|| nil.clone());
                 let j = rendered.get(3).cloned().unwrap_or_else(|| nil.clone());
                 Some(format!("{receiver}:concat({sep}, {i}, {j})"))
@@ -1620,10 +1694,7 @@ impl Emitter {
     fn extract_function_sig(&self, expr: &Expression) -> Option<WrapperSig> {
         self.find_function_body(expr).map(|body| {
             let (params, args) = self.emit_function_params(body);
-            WrapperSig {
-                params,
-                args,
-            }
+            WrapperSig { params, args }
         })
     }
 
@@ -1653,8 +1724,9 @@ impl Emitter {
                                 }
                             }
                             Field::ExpressionKey { key, value, .. } => {
-                                if let Some(body) =
-                                    self.find_function_body(key).or_else(|| self.find_function_body(value))
+                                if let Some(body) = self
+                                    .find_function_body(key)
+                                    .or_else(|| self.find_function_body(value))
                                 {
                                     return Some(body);
                                 }
@@ -1672,19 +1744,16 @@ impl Emitter {
                 Value::ParenthesesExpression(inner) => self.find_function_body(inner),
                 _ => None,
             },
-            Expression::BinaryOperator { lhs, rhs, .. } => {
-                self.find_function_body(lhs).or_else(|| self.find_function_body(rhs))
-            }
+            Expression::BinaryOperator { lhs, rhs, .. } => self
+                .find_function_body(lhs)
+                .or_else(|| self.find_function_body(rhs)),
             Expression::UnaryOperator { expression, .. } => self.find_function_body(expression),
             Expression::Parentheses { expression, .. } => self.find_function_body(expression),
             _ => None,
         }
     }
 
-    fn find_function_body_in_prefix<'a>(
-        &'a self,
-        prefix: &'a Prefix,
-    ) -> Option<&'a FunctionBody> {
+    fn find_function_body_in_prefix<'a>(&'a self, prefix: &'a Prefix) -> Option<&'a FunctionBody> {
         match prefix {
             Prefix::Expression(expr) => self.find_function_body(expr),
             _ => None,
@@ -1697,7 +1766,9 @@ impl Emitter {
     ) -> Option<&'a FunctionBody> {
         match call {
             full_moon::ast::Call::AnonymousCall(args) => self.find_function_body_in_args(args),
-            full_moon::ast::Call::MethodCall(method) => self.find_function_body_in_args(method.args()),
+            full_moon::ast::Call::MethodCall(method) => {
+                self.find_function_body_in_args(method.args())
+            }
             &_ => None,
         }
     }
@@ -1724,8 +1795,9 @@ impl Emitter {
                             }
                         }
                         Field::ExpressionKey { key, value, .. } => {
-                            if let Some(body) =
-                                self.find_function_body(key).or_else(|| self.find_function_body(value))
+                            if let Some(body) = self
+                                .find_function_body(key)
+                                .or_else(|| self.find_function_body(value))
                             {
                                 return Some(body);
                             }

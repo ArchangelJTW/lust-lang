@@ -629,6 +629,82 @@ mod tests {
     }
 
     #[test]
+    fn lua_value_arguments_accept_underlying_vm_values() {
+        let function = typed_function(
+            "lua_arg",
+            vec![ty(TypeKind::Named("LuaValue".to_string()))],
+            ty(TypeKind::Int),
+            Value::Int(7),
+        );
+        let lua_table = Value::Struct {
+            name: "LuaTable".to_string(),
+            layout: Rc::new(StructLayout::new(
+                "LuaTable".to_string(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )),
+            fields: Rc::new(RefCell::new(Vec::new())),
+        };
+        let mut vm = VM::new();
+        vm.load_functions(vec![function]);
+
+        assert!(matches!(
+            vm.call("lua_arg", vec![lua_table]),
+            Ok(Value::Int(7))
+        ));
+    }
+
+    #[test]
+    fn lua_functions_apply_lua_arity_rules() {
+        let lua_value = ty(TypeKind::Named("LuaValue".to_string()));
+        let function = typed_function(
+            "lua_function",
+            vec![lua_value.clone(), lua_value.clone()],
+            lua_value,
+            Value::Int(1),
+        );
+        let mut vm = VM::new();
+        vm.load_functions(vec![function]);
+
+        assert!(vm.call("lua_function", vec![Value::Int(1)]).is_ok());
+        assert!(vm
+            .call(
+                "lua_function",
+                vec![Value::Int(1), Value::Int(2), Value::Int(3)]
+            )
+            .is_ok());
+
+        let zero_arg = typed_function(
+            "zero_arg_lua_function",
+            Vec::new(),
+            ty(TypeKind::Array(Box::new(ty(TypeKind::Named(
+                "LuaValue".to_string(),
+            ))))),
+            Value::array(Vec::new()),
+        );
+        vm.load_functions(vec![zero_arg]);
+        assert!(vm
+            .call("zero_arg_lua_function", vec![Value::Int(1)])
+            .is_ok());
+
+        let empty_return = typed_function(
+            "empty_lua_return",
+            Vec::new(),
+            ty(TypeKind::Array(Box::new(ty(TypeKind::Named(
+                "LuaValue".to_string(),
+            ))))),
+            Value::Nil,
+        );
+        vm.load_functions(vec![empty_return]);
+        assert!(matches!(
+            vm.call("empty_lua_return", Vec::new()),
+            Ok(Value::Nil)
+        ));
+    }
+
+    #[test]
     fn call_value_validates_arity_before_building_a_frame() {
         let function = typed_function(
             "typed",

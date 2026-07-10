@@ -1,7 +1,7 @@
 use crate::ast::Item;
 #[cfg(feature = "std")]
 use crate::{
-    ast::{FunctionDef, ItemKind, UseTree, Visibility},
+    ast::{FunctionDef, ItemKind, Type, TypeKind, UseTree, Visibility},
     error::{LustError, Result},
     lexer::Lexer,
     parser::Parser,
@@ -465,7 +465,8 @@ impl ModuleLoader {
                 type_params: vec![],
                 trait_bounds: vec![],
                 params: vec![],
-                return_type: None,
+                // Module initializers may return a Lua module value for the loader to publish.
+                return_type: Some(Type::new(TypeKind::Unknown, Span::dummy())),
                 body: pending_init_stmts,
                 is_method: false,
                 visibility: Visibility::Private,
@@ -1243,6 +1244,10 @@ local c: int = a + b
             .collect();
         assert_eq!(init_functions.len(), 1);
         assert_eq!(init_functions[0].body.len(), 3);
+        assert!(matches!(
+            init_functions[0].return_type.as_ref().map(|ty| &ty.kind),
+            Some(TypeKind::Unknown)
+        ));
 
         // Best-effort cleanup.
         let _ = fs::remove_file(entry_path);

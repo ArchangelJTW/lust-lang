@@ -206,9 +206,11 @@ impl Compiler {
             }
         }
 
+        // An omitted lambda return annotation is inferred by the typechecker; it does not
+        // declare unit. The compiler does not retain that per-expression inference here.
         let return_type = return_type
             .clone()
-            .unwrap_or_else(|| Type::new(TypeKind::Unit, Span::dummy()));
+            .unwrap_or_else(|| Type::new(TypeKind::Unknown, Span::dummy()));
         Some(FunctionSignature {
             params: param_types,
             return_type,
@@ -408,5 +410,24 @@ impl Compiler {
 impl Default for Compiler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_lambda_return_type_is_dynamic_at_runtime() {
+        let signature = Compiler::lambda_signature(
+            &[(
+                "value".to_string(),
+                Some(Type::new(TypeKind::Int, Span::dummy())),
+            )],
+            &None,
+        )
+        .unwrap();
+
+        assert!(matches!(signature.return_type.kind, TypeKind::Unknown));
     }
 }

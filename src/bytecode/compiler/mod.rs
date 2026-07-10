@@ -95,7 +95,12 @@ impl Compiler {
         self.configure_stdlib(config);
     }
 
-    pub(super) fn new_function(&self, name: impl Into<String>, param_count: u8, is_method: bool) -> Function {
+    pub(super) fn new_function(
+        &self,
+        name: impl Into<String>,
+        param_count: u8,
+        is_method: bool,
+    ) -> Function {
         if self.minimal_runtime_types {
             Function::new_minimal(name, param_count, is_method)
         } else {
@@ -134,8 +139,8 @@ impl Compiler {
                 "ipairs",
                 "setmetatable",
             ]
-                .into_iter()
-                .map(String::from),
+            .into_iter()
+            .map(String::from),
         );
         for module in config.enabled_modules() {
             match module {
@@ -286,7 +291,7 @@ impl Compiler {
                     .map(|p| Self::type_to_string(&p.kind))
                     .collect();
                 format!(
-                    "function({}) -> {}",
+                    "function({}): {}",
                     param_strs.join(", "),
                     Self::type_to_string(&return_type.kind)
                 )

@@ -126,4 +126,204 @@ mod tests {
         assert_eq!(Rc::strong_count(&string), 1);
         assert!(matches!(registers[0], Value::Int(7)));
     }
+
+    #[test]
+    fn generated_guard_returns_its_exit_code() {
+        let trace = Trace {
+            function_idx: 0,
+            start_ip: 0,
+            preamble: Vec::new(),
+            ops: vec![TraceOp::Guard {
+                register: 0,
+                expected_type: ValueType::Int,
+            }],
+            postamble: Vec::new(),
+            inputs: vec![0],
+            outputs: Vec::new(),
+        };
+        let compiled = JitCompiler::new()
+            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .unwrap();
+        let mut registers = vec![Value::Bool(false)];
+
+        let result = compiled.execute(
+            registers.as_mut_ptr(),
+            core::ptr::null_mut(),
+            core::ptr::null(),
+        );
+
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn generated_failure_returns_negative_exit_code() {
+        let trace = Trace {
+            function_idx: 0,
+            start_ip: 0,
+            preamble: Vec::new(),
+            ops: vec![TraceOp::Div {
+                dest: 0,
+                lhs: 1,
+                rhs: 2,
+                lhs_type: ValueType::Int,
+                rhs_type: ValueType::Int,
+            }],
+            postamble: Vec::new(),
+            inputs: vec![1, 2],
+            outputs: vec![0],
+        };
+        let compiled = JitCompiler::new()
+            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .unwrap();
+        let mut registers = vec![Value::Nil, Value::Int(7), Value::Int(0)];
+
+        let result = compiled.execute(
+            registers.as_mut_ptr(),
+            core::ptr::null_mut(),
+            core::ptr::null(),
+        );
+
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn generated_signed_division_and_modulo_match_integer_semantics() {
+        let trace = Trace {
+            function_idx: 0,
+            start_ip: 0,
+            preamble: Vec::new(),
+            ops: vec![
+                TraceOp::Div {
+                    dest: 0,
+                    lhs: 2,
+                    rhs: 3,
+                    lhs_type: ValueType::Int,
+                    rhs_type: ValueType::Int,
+                },
+                TraceOp::Mod {
+                    dest: 1,
+                    lhs: 2,
+                    rhs: 3,
+                    lhs_type: ValueType::Int,
+                    rhs_type: ValueType::Int,
+                },
+                TraceOp::NestedLoopCall {
+                    function_idx: 0,
+                    loop_start_ip: 0,
+                    bailout_ip: 0,
+                },
+            ],
+            postamble: Vec::new(),
+            inputs: vec![2, 3],
+            outputs: vec![0, 1],
+        };
+        let compiled = JitCompiler::new()
+            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .unwrap();
+        let mut registers = vec![Value::Nil, Value::Nil, Value::Int(-7), Value::Int(2)];
+
+        let result = compiled.execute(
+            registers.as_mut_ptr(),
+            core::ptr::null_mut(),
+            core::ptr::null(),
+        );
+
+        assert_eq!(result, 1);
+        assert!(matches!(registers[0], Value::Int(-3)));
+        assert!(matches!(registers[1], Value::Int(-1)));
+    }
+
+    #[test]
+    fn generated_scalar_comparisons_match_value_semantics() {
+        let trace = Trace {
+            function_idx: 0,
+            start_ip: 0,
+            preamble: Vec::new(),
+            ops: vec![
+                TraceOp::Lt {
+                    dest: 0,
+                    lhs: 6,
+                    rhs: 7,
+                    lhs_type: ValueType::Float,
+                    rhs_type: ValueType::Float,
+                },
+                TraceOp::Ge {
+                    dest: 1,
+                    lhs: 8,
+                    rhs: 9,
+                    lhs_type: ValueType::Int,
+                    rhs_type: ValueType::Float,
+                },
+                TraceOp::Eq {
+                    dest: 2,
+                    lhs: 10,
+                    rhs: 10,
+                    lhs_type: ValueType::Float,
+                    rhs_type: ValueType::Float,
+                },
+                TraceOp::Ne {
+                    dest: 3,
+                    lhs: 10,
+                    rhs: 10,
+                    lhs_type: ValueType::Float,
+                    rhs_type: ValueType::Float,
+                },
+                TraceOp::Eq {
+                    dest: 4,
+                    lhs: 11,
+                    rhs: 12,
+                    lhs_type: ValueType::Bool,
+                    rhs_type: ValueType::Bool,
+                },
+                TraceOp::Eq {
+                    dest: 5,
+                    lhs: 8,
+                    rhs: 13,
+                    lhs_type: ValueType::Int,
+                    rhs_type: ValueType::Float,
+                },
+                TraceOp::NestedLoopCall {
+                    function_idx: 0,
+                    loop_start_ip: 0,
+                    bailout_ip: 0,
+                },
+            ],
+            postamble: Vec::new(),
+            inputs: (6..=13).collect(),
+            outputs: (0..=5).collect(),
+        };
+        let compiled = JitCompiler::new()
+            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .unwrap();
+        let mut registers = vec![
+            Value::Nil,
+            Value::Nil,
+            Value::Nil,
+            Value::Nil,
+            Value::Nil,
+            Value::Nil,
+            Value::Float(-2.5),
+            Value::Float(-1.0),
+            Value::Int(3),
+            Value::Float(2.5),
+            Value::Float(f64::NAN),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Float(3.0),
+        ];
+
+        let result = compiled.execute(
+            registers.as_mut_ptr(),
+            core::ptr::null_mut(),
+            core::ptr::null(),
+        );
+
+        assert_eq!(result, 1);
+        assert!(matches!(registers[0], Value::Bool(true)));
+        assert!(matches!(registers[1], Value::Bool(true)));
+        assert!(matches!(registers[2], Value::Bool(false)));
+        assert!(matches!(registers[3], Value::Bool(true)));
+        assert!(matches!(registers[4], Value::Bool(true)));
+        assert!(matches!(registers[5], Value::Bool(false)));
+    }
 }

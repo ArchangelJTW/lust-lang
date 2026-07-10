@@ -28,7 +28,10 @@ impl Compiler {
             {
                 eprintln!("Register overflow diagnostics:");
                 eprintln!("  Current function has {} scopes", self.scopes.len());
-                eprintln!("  Max local register index: {}", self.max_local_register_index());
+                eprintln!(
+                    "  Max local register index: {}",
+                    self.max_local_register_index()
+                );
                 eprintln!("  Next register: {}", self.next_register);
                 eprintln!("  Max register: {}", self.max_register);
                 for (i, scope) in self.scopes.iter().enumerate() {
@@ -92,11 +95,18 @@ impl Compiler {
             {
                 eprintln!("Register overflow diagnostics (allocate_register):");
                 eprintln!("  Current function index: {}", self.current_function);
-                eprintln!("  Function name: {}", self.functions.get(self.current_function)
-                    .map(|f| f.name.clone())
-                    .unwrap_or_else(|| "<anonymous>".to_string()));
+                eprintln!(
+                    "  Function name: {}",
+                    self.functions
+                        .get(self.current_function)
+                        .map(|f| f.name.clone())
+                        .unwrap_or_else(|| "<anonymous>".to_string())
+                );
                 eprintln!("  Current function has {} scopes", self.scopes.len());
-                eprintln!("  Max local register index: {}", self.max_local_register_index());
+                eprintln!(
+                    "  Max local register index: {}",
+                    self.max_local_register_index()
+                );
                 eprintln!("  Next register: {}", self.next_register);
                 eprintln!("  Max register: {}", self.max_register);
                 for (i, scope) in self.scopes.iter().enumerate() {

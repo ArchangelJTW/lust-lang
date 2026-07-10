@@ -654,12 +654,26 @@ impl EmbeddedProgram {
         }
 
         ensure_return_type::<R>(name, &signature.return_type)?;
+        let return_type = signature.return_type.clone();
         self.vm
             .record_exported_native(native_export_from_signature(&canonical, &signature));
+        let native_name = name.to_string();
         let handler = move |values: &[Value]| -> std::result::Result<NativeCallResult, String> {
             let args = Args::from_values(values)?;
             let result = func(args)?;
-            Ok(NativeCallResult::Return(result.into_value()))
+            let value = result.into_value();
+            VM::with_current(|vm| {
+                if vm.value_matches_type(&value, &return_type) {
+                    Ok(NativeCallResult::Return(value))
+                } else {
+                    Err(format!(
+                        "Native '{}' must return {}, got {:?}",
+                        native_name,
+                        return_type,
+                        value.type_of()
+                    ))
+                }
+            })
         };
         self.register_native_with_aliases(name, canonical, handler);
         Ok(())
@@ -688,8 +702,10 @@ impl EmbeddedProgram {
                 ),
             });
         }
+        ensure_return_type::<R>(name, &signature.return_type)?;
 
         let registry = self.async_registry.clone();
+        let return_type = signature.return_type.clone();
         let handler = move |values: &[Value]| -> std::result::Result<NativeCallResult, String> {
             let args = Args::from_values(values)?;
             let future = func(args);
@@ -712,10 +728,10 @@ impl EmbeddedProgram {
                     ));
                 }
 
-                registry.register(AsyncTaskEntry::new(
-                    AsyncTaskTarget::ScriptTask(handle),
-                    future,
-                ));
+                registry.register(
+                    AsyncTaskEntry::new(AsyncTaskTarget::ScriptTask(handle), future)
+                        .with_expected_type(return_type.clone()),
+                );
                 Ok(NativeCallResult::Yield(Value::Nil))
             })
         };
@@ -878,8 +894,11 @@ impl EmbeddedProgram {
         };
 
         for id in pending_ids {
-            let mut completion: Option<(AsyncTaskTarget, std::result::Result<Value, String>)> =
-                None;
+            let mut completion: Option<(
+                AsyncTaskTarget,
+                Option<Type>,
+                std::result::Result<Value, String>,
+            )> = None;
             {
                 let mut registry = self.async_registry.borrow_mut();
                 let entry = match registry.pending.get_mut(&id) {
@@ -894,12 +913,21 @@ impl EmbeddedProgram {
                 let waker = entry.make_waker();
                 let mut cx = Context::from_waker(&waker);
                 if let Poll::Ready(result) = entry.future.as_mut().poll(&mut cx) {
-                    completion = Some((entry.target, result));
+                    completion = Some((entry.target, entry.expected_type.clone(), result));
                 }
             }
 
-            if let Some((target, outcome)) = completion {
+            if let Some((target, expected_type, mut outcome)) = completion {
                 self.async_registry.borrow_mut().pending.remove(&id);
+                if let (Some(expected), Ok(value)) = (&expected_type, &outcome) {
+                    if !self.vm.value_matches_type(value, expected) {
+                        outcome = Err(format!(
+                            "Async native must return {}, got {:?}",
+                            expected,
+                            value.type_of()
+                        ));
+                    }
+                }
                 match target {
                     AsyncTaskTarget::ScriptTask(handle) => match outcome {
                         Ok(value) => {
@@ -1088,7 +1116,10 @@ fn normalize_extern_type_string(mut ty: String) -> String {
     ty
 }
 
-fn native_export_from_signature(canonical_name: &str, signature: &FunctionSignature) -> NativeExport {
+fn native_export_from_signature(
+    canonical_name: &str,
+    signature: &FunctionSignature,
+) -> NativeExport {
     let name = canonical_name.replace("::", ".");
     let params = signature
         .params

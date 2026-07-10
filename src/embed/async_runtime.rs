@@ -1,3 +1,4 @@
+use crate::ast::Type;
 use crate::bytecode::{TaskHandle, Value};
 use hashbrown::HashMap;
 use std::collections::VecDeque;
@@ -46,6 +47,7 @@ impl AsyncRegistry {
 pub(crate) struct AsyncTaskEntry {
     pub(crate) target: AsyncTaskTarget,
     pub(crate) future: AsyncValueFuture,
+    pub(crate) expected_type: Option<Type>,
     wake_flag: Arc<WakeFlag>,
     immediate_poll: bool,
 }
@@ -61,9 +63,15 @@ impl AsyncTaskEntry {
         Self {
             target,
             future,
+            expected_type: None,
             wake_flag: Arc::new(WakeFlag::new()),
             immediate_poll: true,
         }
+    }
+
+    pub(crate) fn with_expected_type(mut self, expected_type: Type) -> Self {
+        self.expected_type = Some(expected_type);
+        self
     }
 
     pub(crate) fn take_should_poll(&mut self) -> bool {

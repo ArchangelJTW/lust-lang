@@ -229,7 +229,8 @@ impl Compiler {
                                     return Ok(result_reg);
                                 } else {
                                     let arg_refs: Vec<&Expr> = args.iter().collect();
-                                    let first_value_reg = self.place_exprs_consecutive(&arg_refs)?;
+                                    let first_value_reg =
+                                        self.place_exprs_consecutive(&arg_refs)?;
                                     let result_reg = self.allocate_register();
                                     self.emit(
                                         Instruction::NewEnumVariant(
@@ -605,7 +606,16 @@ impl Compiler {
                 Ok(result_reg)
             }
 
-            ExprKind::Cast { expr, .. } => self.compile_expr(expr),
+            ExprKind::Cast { expr, target_type } => {
+                let value_reg = self.compile_expr(expr)?;
+                let type_string = match &target_type.kind {
+                    crate::ast::TypeKind::Named(name) => self.resolve_type_name(name),
+                    _ => Self::type_to_string(&target_type.kind),
+                };
+                let type_name_idx = self.add_string_constant(&type_string);
+                self.emit(Instruction::CheckedCast(value_reg, type_name_idx), 0);
+                Ok(value_reg)
+            }
             ExprKind::Return(values) => {
                 if values.is_empty() {
                     self.emit(Instruction::Return(255), 0);

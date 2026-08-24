@@ -338,6 +338,12 @@ module.exports = grammar({
       ))
     )),
 
+    cast_expression: $ => prec.left(10, seq(
+      field('value', $._expression),
+      'as',
+      field('type', $.type_annotation)
+    )),
+
     // Control flow
     return_statement: $ => prec.right(1, seq(
       'return',
@@ -352,6 +358,7 @@ module.exports = grammar({
     _expression: $ => choice(
       $.literal,
       $.identifier,
+      $.cast_expression,
       $.is_expression,
       $.binary_expression,
       $.unary_expression,

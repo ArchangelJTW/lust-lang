@@ -11,6 +11,7 @@ impl JitCompiler {
             inline_depth: 0,
             specialization_registry: SpecializationRegistry::new(),
             specialized_values: HashMap::new(),
+            scalar_registers: HashMap::new(),
             next_specialized_id: 0,
         }
     }
@@ -64,6 +65,7 @@ impl JitCompiler {
         parent: Option<TraceId>,
         hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
+        self.scalar_registers.clear();
         let stack_size = Self::compute_stack_size(trace);
         let mut guards = Vec::new();
         let mut guard_index = 0i32;
@@ -85,6 +87,14 @@ impl JitCompiler {
             ; mov r12, rdi
             ; mov r13, rsi
         );
+        for slot in 0..Self::count_specialized_slots(trace) as i32 {
+            let offset = SPECIALIZED_BASE_OFFSET - slot * SPECIALIZED_SLOT_SIZE;
+            dynasm!(self.ops
+                ; mov QWORD [rbp + offset], 0
+                ; mov QWORD [rbp + offset + 8], 0
+                ; mov QWORD [rbp + offset + 16], 0
+            );
+        }
         for (dest, value) in &hoisted_constants {
             self.compile_load_const(*dest, value)?;
         }
@@ -208,7 +218,51 @@ impl JitCompiler {
         guard_index: &mut i32,
         guards: &mut Vec<Guard>,
     ) -> Result<()> {
-        for op in ops {
+        let mut skip_next = false;
+        for (op_index, op) in ops.iter().enumerate() {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if let Some(next) = ops.get(op_index + 1) {
+                if let TraceOp::GuardLoopContinue {
+                    condition_register, ..
+                } = next
+                {
+                    if self.scalar_registers.contains_key(condition_register)
+                        && Self::register_overwritten_before_read(
+                            &ops[op_index + 2..],
+                            *condition_register,
+                        )
+                    {
+                        if let Some(guard) =
+                            self.compile_integer_comparison_guard(op, next, *guard_index as usize)?
+                        {
+                            guards.push(guard);
+                            *guard_index += 1;
+                            skip_next = true;
+                            continue;
+                        }
+                    }
+                }
+                if let TraceOp::LoadConst {
+                    dest: constant_register,
+                    ..
+                } = op
+                {
+                    if self.scalar_registers.contains_key(constant_register)
+                        && Self::register_overwritten_before_read(
+                            &ops[op_index + 2..],
+                            *constant_register,
+                        )
+                        && self.compile_integer_add_immediate(op, next)?
+                    {
+                        self.update_scalar_registers(next);
+                        skip_next = true;
+                        continue;
+                    }
+                }
+            }
             match op {
                 TraceOp::LoadConst { dest, value } => {
                     self.compile_load_const(*dest, value)?;
@@ -352,6 +406,19 @@ impl JitCompiler {
                     self.compile_get_index(*dest, *array, *index)?;
                 }
 
+                TraceOp::TryGetIndex { dest, array, index } => {
+                    self.compile_try_get_index(*dest, *array, *index)?;
+                }
+
+                TraceOp::ArrayIndexOk {
+                    value_dest,
+                    condition_dest,
+                    array,
+                    index,
+                } => {
+                    self.compile_array_index_ok(*value_dest, *condition_dest, *array, *index)?;
+                }
+
                 TraceOp::ArrayLen { dest, array } => {
                     self.compile_array_len(*dest, *array)?;
                 }
@@ -444,7 +511,9 @@ impl JitCompiler {
                     callee,
                     trace,
                 } => {
+                    let outer_scalar_registers = mem::take(&mut self.scalar_registers);
                     self.compile_inline_call(*dest, *callee, trace, guard_index, guards)?;
+                    self.scalar_registers = outer_scalar_registers;
                 }
 
                 TraceOp::CallMethod {
@@ -556,6 +625,22 @@ impl JitCompiler {
                     self.compile_is_enum_variant(*dest, *value, enum_name, variant_name)?;
                 }
 
+                TraceOp::TypeIs {
+                    dest,
+                    value,
+                    type_name,
+                } => {
+                    self.compile_type_is(*dest, *value, type_name)?;
+                }
+
+                TraceOp::TryCast {
+                    dest,
+                    value,
+                    type_name,
+                } => {
+                    self.compile_try_cast(*dest, *value, type_name)?;
+                }
+
                 TraceOp::GetEnumValue {
                     dest,
                     enum_reg,
@@ -655,9 +740,489 @@ impl JitCompiler {
 
                 TraceOp::Return { .. } => {}
             }
+            self.update_scalar_registers(op);
         }
 
         Ok(())
+    }
+
+    fn compile_integer_add_immediate(
+        &mut self,
+        load: &TraceOp,
+        arithmetic: &TraceOp,
+    ) -> Result<bool> {
+        let TraceOp::LoadConst {
+            dest: constant_register,
+            value: Value::Int(immediate),
+        } = load
+        else {
+            return Ok(false);
+        };
+        let TraceOp::Add {
+            dest,
+            lhs,
+            rhs,
+            lhs_type: ValueType::Int,
+            rhs_type: ValueType::Int,
+        } = arithmetic
+        else {
+            return Ok(false);
+        };
+        let source = if lhs == constant_register && rhs != constant_register {
+            *rhs
+        } else if rhs == constant_register && lhs != constant_register {
+            *lhs
+        } else {
+            return Ok(false);
+        };
+
+        self.load_to_rax(source);
+        if *immediate == 1 {
+            dynasm!(self.ops ; inc rax);
+        } else if *immediate == -1 {
+            dynasm!(self.ops ; dec rax);
+        } else if let Ok(immediate) = i32::try_from(*immediate) {
+            dynasm!(self.ops ; add rax, immediate);
+        } else {
+            dynasm!(self.ops
+                ; mov rcx, QWORD *immediate
+                ; add rax, rcx
+            );
+        }
+        self.store_from_rax(*dest, ValueTag::Int.as_u8());
+        Ok(true)
+    }
+
+    fn compile_integer_comparison_guard(
+        &mut self,
+        comparison: &TraceOp,
+        guard: &TraceOp,
+        guard_index: usize,
+    ) -> Result<Option<Guard>> {
+        let (condition_register, lhs, rhs, comparison_kind) = match comparison {
+            TraceOp::Lt {
+                dest,
+                lhs,
+                rhs,
+                lhs_type: ValueType::Int,
+                rhs_type: ValueType::Int,
+            } => (*dest, *lhs, *rhs, 0),
+            TraceOp::Le {
+                dest,
+                lhs,
+                rhs,
+                lhs_type: ValueType::Int,
+                rhs_type: ValueType::Int,
+            } => (*dest, *lhs, *rhs, 1),
+            TraceOp::Gt {
+                dest,
+                lhs,
+                rhs,
+                lhs_type: ValueType::Int,
+                rhs_type: ValueType::Int,
+            } => (*dest, *lhs, *rhs, 2),
+            TraceOp::Ge {
+                dest,
+                lhs,
+                rhs,
+                lhs_type: ValueType::Int,
+                rhs_type: ValueType::Int,
+            } => (*dest, *lhs, *rhs, 3),
+            _ => return Ok(None),
+        };
+        let TraceOp::GuardLoopContinue {
+            condition_register: guarded_register,
+            expect_truthy,
+            bailout_ip,
+        } = guard
+        else {
+            return Ok(None);
+        };
+        if condition_register != *guarded_register {
+            return Ok(None);
+        }
+
+        let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
+        let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
+        let guard_ok = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; mov rax, [r12 + lhs_offset + 8]
+            ; mov rcx, [r12 + rhs_offset + 8]
+            ; cmp rax, rcx
+        );
+        match (comparison_kind, *expect_truthy) {
+            (0, true) | (3, false) => dynasm!(self.ops ; jl =>guard_ok),
+            (1, true) | (2, false) => dynasm!(self.ops ; jle =>guard_ok),
+            (2, true) | (1, false) => dynasm!(self.ops ; jg =>guard_ok),
+            (3, true) | (0, false) => dynasm!(self.ops ; jge =>guard_ok),
+            _ => unreachable!(),
+        }
+
+        // The interpreter resumes at the branch bytecode, which reads this
+        // register. Materialize only the uncommon failed result.
+        let failed_value = i64::from(!*expect_truthy);
+        dynasm!(self.ops ; mov rax, QWORD failed_value);
+        self.store_from_rax(condition_register, ValueTag::Bool.as_u8());
+        let guard_return_value = (guard_index + 1) as i32;
+        let exit_label = self.current_exit_label();
+        dynasm!(self.ops
+            ; mov eax, DWORD guard_return_value
+            ; jmp =>exit_label
+            ; =>guard_ok
+        );
+
+        Ok(Some(Guard {
+            index: guard_index,
+            bailout_ip: *bailout_ip,
+            kind: if *expect_truthy {
+                GuardKind::Truthy {
+                    register: condition_register,
+                }
+            } else {
+                GuardKind::Falsy {
+                    register: condition_register,
+                }
+            },
+            fail_count: 0,
+            side_trace: None,
+        }))
+    }
+
+    fn register_overwritten_before_read(ops: &[TraceOp], register: u8) -> bool {
+        for op in ops {
+            if Self::op_reads_register(op, register) {
+                return false;
+            }
+            if Self::op_may_exit(op) {
+                return false;
+            }
+            if Self::op_writes_register(op, register) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn op_may_exit(op: &TraceOp) -> bool {
+        matches!(
+            op,
+            TraceOp::Div { .. }
+                | TraceOp::Mod { .. }
+                | TraceOp::Concat { .. }
+                | TraceOp::GetIndex { .. }
+                | TraceOp::TryGetIndex { .. }
+                | TraceOp::ArrayIndexOk { .. }
+                | TraceOp::ArrayLen { .. }
+                | TraceOp::GuardNativeFunction { .. }
+                | TraceOp::GuardFunction { .. }
+                | TraceOp::GuardClosure { .. }
+                | TraceOp::CallNative { .. }
+                | TraceOp::CallFunction { .. }
+                | TraceOp::InlineCall { .. }
+                | TraceOp::CallMethod { .. }
+                | TraceOp::GetField { .. }
+                | TraceOp::SetField { .. }
+                | TraceOp::NewArray { .. }
+                | TraceOp::NewStruct { .. }
+                | TraceOp::NewEnumUnit { .. }
+                | TraceOp::NewEnumVariant { .. }
+                | TraceOp::IsEnumVariant { .. }
+                | TraceOp::TypeIs { .. }
+                | TraceOp::TryCast { .. }
+                | TraceOp::GetEnumValue { .. }
+                | TraceOp::Guard { .. }
+                | TraceOp::GuardLoopContinue { .. }
+                | TraceOp::NestedLoopCall { .. }
+                | TraceOp::Return { .. }
+                | TraceOp::Unbox { .. }
+                | TraceOp::Rebox { .. }
+                | TraceOp::DropSpecialized { .. }
+                | TraceOp::SpecializedOp { .. }
+        )
+    }
+
+    fn op_reads_register(op: &TraceOp, register: u8) -> bool {
+        let in_args =
+            |first: u8, count: u8| register >= first && register < first.saturating_add(count);
+        match op {
+            TraceOp::LoadConst { .. } => false,
+            TraceOp::Move { src, .. } | TraceOp::Neg { src, .. } => *src == register,
+            TraceOp::Add { lhs, rhs, .. }
+            | TraceOp::Sub { lhs, rhs, .. }
+            | TraceOp::Mul { lhs, rhs, .. }
+            | TraceOp::Div { lhs, rhs, .. }
+            | TraceOp::Mod { lhs, rhs, .. }
+            | TraceOp::Eq { lhs, rhs, .. }
+            | TraceOp::Ne { lhs, rhs, .. }
+            | TraceOp::Lt { lhs, rhs, .. }
+            | TraceOp::Le { lhs, rhs, .. }
+            | TraceOp::Gt { lhs, rhs, .. }
+            | TraceOp::Ge { lhs, rhs, .. }
+            | TraceOp::And { lhs, rhs, .. }
+            | TraceOp::Or { lhs, rhs, .. }
+            | TraceOp::Concat { lhs, rhs, .. } => *lhs == register || *rhs == register,
+            TraceOp::Not { src, .. } => *src == register,
+            TraceOp::GetIndex { array, index, .. }
+            | TraceOp::TryGetIndex { array, index, .. }
+            | TraceOp::ArrayIndexOk { array, index, .. } => {
+                *array == register || *index == register
+            }
+            TraceOp::ArrayLen { array, .. } => *array == register,
+            TraceOp::GuardNativeFunction { register: source, .. }
+            | TraceOp::GuardFunction { register: source, .. }
+            | TraceOp::GuardClosure { register: source, .. }
+            | TraceOp::Guard {
+                register: source, ..
+            } => *source == register,
+            TraceOp::CallNative {
+                callee,
+                first_arg,
+                arg_count,
+                ..
+            }
+            | TraceOp::CallFunction {
+                callee,
+                first_arg,
+                arg_count,
+                ..
+            } => *callee == register || in_args(*first_arg, *arg_count),
+            TraceOp::InlineCall { callee, trace, .. } => {
+                *callee == register || trace.arg_registers.contains(&register)
+            }
+            TraceOp::CallMethod {
+                object,
+                first_arg,
+                arg_count,
+                ..
+            } => *object == register || in_args(*first_arg, *arg_count),
+            TraceOp::GetField { object, .. } => *object == register,
+            TraceOp::SetField { object, value, .. } => {
+                *object == register || *value == register
+            }
+            TraceOp::NewArray {
+                first_element,
+                count,
+                ..
+            } => in_args(*first_element, *count),
+            TraceOp::NewStruct {
+                field_registers, ..
+            } => field_registers.contains(&register),
+            TraceOp::NewEnumVariant {
+                value_registers, ..
+            } => value_registers.contains(&register),
+            TraceOp::IsEnumVariant { value, .. }
+            | TraceOp::TypeIs { value, .. }
+            | TraceOp::TryCast { value, .. } => *value == register,
+            TraceOp::GetEnumValue { enum_reg, .. } => *enum_reg == register,
+            TraceOp::GuardLoopContinue {
+                condition_register, ..
+            } => *condition_register == register,
+            TraceOp::Return { value } => *value == Some(register),
+            TraceOp::Unbox { source_reg, .. } => *source_reg == register,
+            TraceOp::SpecializedOp { operands, .. } => operands.iter().any(|operand| {
+                matches!(operand, crate::jit::trace::Operand::Register(source) if *source == register)
+            }),
+            TraceOp::NewEnumUnit { .. }
+            | TraceOp::NestedLoopCall { .. }
+            | TraceOp::Rebox { .. }
+            | TraceOp::DropSpecialized { .. } => false,
+        }
+    }
+
+    fn op_writes_register(op: &TraceOp, register: u8) -> bool {
+        match op {
+            TraceOp::ArrayIndexOk {
+                value_dest,
+                condition_dest,
+                ..
+            } => *value_dest == register || *condition_dest == register,
+            TraceOp::Rebox { dest_reg, .. } => *dest_reg == register,
+            TraceOp::LoadConst { dest, .. }
+            | TraceOp::Move { dest, .. }
+            | TraceOp::Add { dest, .. }
+            | TraceOp::Sub { dest, .. }
+            | TraceOp::Mul { dest, .. }
+            | TraceOp::Div { dest, .. }
+            | TraceOp::Mod { dest, .. }
+            | TraceOp::Neg { dest, .. }
+            | TraceOp::Eq { dest, .. }
+            | TraceOp::Ne { dest, .. }
+            | TraceOp::Lt { dest, .. }
+            | TraceOp::Le { dest, .. }
+            | TraceOp::Gt { dest, .. }
+            | TraceOp::Ge { dest, .. }
+            | TraceOp::And { dest, .. }
+            | TraceOp::Or { dest, .. }
+            | TraceOp::Not { dest, .. }
+            | TraceOp::Concat { dest, .. }
+            | TraceOp::GetIndex { dest, .. }
+            | TraceOp::TryGetIndex { dest, .. }
+            | TraceOp::ArrayLen { dest, .. }
+            | TraceOp::CallNative { dest, .. }
+            | TraceOp::CallFunction { dest, .. }
+            | TraceOp::InlineCall { dest, .. }
+            | TraceOp::CallMethod { dest, .. }
+            | TraceOp::GetField { dest, .. }
+            | TraceOp::NewArray { dest, .. }
+            | TraceOp::NewStruct { dest, .. }
+            | TraceOp::NewEnumUnit { dest, .. }
+            | TraceOp::NewEnumVariant { dest, .. }
+            | TraceOp::IsEnumVariant { dest, .. }
+            | TraceOp::TypeIs { dest, .. }
+            | TraceOp::TryCast { dest, .. }
+            | TraceOp::GetEnumValue { dest, .. } => *dest == register,
+            _ => false,
+        }
+    }
+
+    fn update_scalar_registers(&mut self, op: &TraceOp) {
+        let scalar_type = |ty: ValueType| {
+            matches!(ty, ValueType::Bool | ValueType::Int | ValueType::Float).then_some(ty)
+        };
+        let set = |registers: &mut HashMap<u8, ValueType>, register, ty| {
+            if let Some(ty) = ty {
+                registers.insert(register, ty);
+            } else {
+                registers.remove(&register);
+            }
+        };
+
+        match op {
+            TraceOp::LoadConst { dest, value } => {
+                let ty = match value {
+                    Value::Bool(_) => Some(ValueType::Bool),
+                    Value::Int(_) => Some(ValueType::Int),
+                    Value::Float(_) => Some(ValueType::Float),
+                    _ => None,
+                };
+                set(&mut self.scalar_registers, *dest, ty);
+            }
+            TraceOp::Move { dest, src } => {
+                let ty = self.scalar_registers.get(src).copied();
+                set(&mut self.scalar_registers, *dest, ty);
+            }
+            TraceOp::Add {
+                dest,
+                lhs_type,
+                rhs_type,
+                ..
+            }
+            | TraceOp::Sub {
+                dest,
+                lhs_type,
+                rhs_type,
+                ..
+            }
+            | TraceOp::Mul {
+                dest,
+                lhs_type,
+                rhs_type,
+                ..
+            }
+            | TraceOp::Div {
+                dest,
+                lhs_type,
+                rhs_type,
+                ..
+            } => {
+                let ty = match (*lhs_type, *rhs_type) {
+                    (ValueType::Int, ValueType::Int) => Some(ValueType::Int),
+                    (ValueType::Int | ValueType::Float, ValueType::Int | ValueType::Float) => {
+                        Some(ValueType::Float)
+                    }
+                    _ => None,
+                };
+                set(&mut self.scalar_registers, *dest, ty);
+            }
+            TraceOp::Mod {
+                dest,
+                lhs_type,
+                rhs_type,
+                ..
+            } => {
+                let ty = match (*lhs_type, *rhs_type) {
+                    (ValueType::Int, ValueType::Int) => Some(ValueType::Int),
+                    _ => None,
+                };
+                set(&mut self.scalar_registers, *dest, ty);
+            }
+            TraceOp::Neg { dest, src } => {
+                let ty = self.scalar_registers.get(src).copied();
+                set(&mut self.scalar_registers, *dest, ty);
+            }
+            TraceOp::Eq { dest, .. }
+            | TraceOp::Ne { dest, .. }
+            | TraceOp::Lt { dest, .. }
+            | TraceOp::Le { dest, .. }
+            | TraceOp::Gt { dest, .. }
+            | TraceOp::Ge { dest, .. }
+            | TraceOp::And { dest, .. }
+            | TraceOp::Or { dest, .. }
+            | TraceOp::Not { dest, .. }
+            | TraceOp::IsEnumVariant { dest, .. }
+            | TraceOp::TypeIs { dest, .. } => {
+                self.scalar_registers.insert(*dest, ValueType::Bool);
+            }
+            TraceOp::ArrayLen { dest, .. } => {
+                self.scalar_registers.insert(*dest, ValueType::Int);
+            }
+            TraceOp::GetField { dest, .. } => {
+                self.scalar_registers.remove(dest);
+            }
+            TraceOp::Guard {
+                register,
+                expected_type,
+            } => {
+                set(
+                    &mut self.scalar_registers,
+                    *register,
+                    scalar_type(*expected_type),
+                );
+            }
+            TraceOp::ArrayIndexOk {
+                value_dest,
+                condition_dest,
+                ..
+            } => {
+                self.scalar_registers.remove(value_dest);
+                self.scalar_registers
+                    .insert(*condition_dest, ValueType::Bool);
+            }
+            TraceOp::Concat { dest, .. }
+            | TraceOp::GetIndex { dest, .. }
+            | TraceOp::TryGetIndex { dest, .. }
+            | TraceOp::CallNative { dest, .. }
+            | TraceOp::CallFunction { dest, .. }
+            | TraceOp::InlineCall { dest, .. }
+            | TraceOp::CallMethod { dest, .. }
+            | TraceOp::NewArray { dest, .. }
+            | TraceOp::NewStruct { dest, .. }
+            | TraceOp::NewEnumUnit { dest, .. }
+            | TraceOp::NewEnumVariant { dest, .. }
+            | TraceOp::TryCast { dest, .. }
+            | TraceOp::GetEnumValue { dest, .. } => {
+                self.scalar_registers.remove(dest);
+            }
+            TraceOp::Rebox { dest_reg, .. } => {
+                self.scalar_registers.remove(dest_reg);
+            }
+            TraceOp::SpecializedOp { operands, .. } => {
+                for operand in operands {
+                    if let crate::jit::trace::Operand::Register(register) = operand {
+                        self.scalar_registers.remove(register);
+                    }
+                }
+            }
+            TraceOp::SetField { .. }
+            | TraceOp::GuardNativeFunction { .. }
+            | TraceOp::GuardFunction { .. }
+            | TraceOp::GuardClosure { .. }
+            | TraceOp::GuardLoopContinue { .. }
+            | TraceOp::NestedLoopCall { .. }
+            | TraceOp::Return { .. }
+            | TraceOp::Unbox { .. }
+            | TraceOp::DropSpecialized { .. } => {}
+        }
     }
 
     fn compute_stack_size(trace: &Trace) -> i32 {

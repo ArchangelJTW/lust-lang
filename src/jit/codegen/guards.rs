@@ -189,13 +189,29 @@ impl JitCompiler {
         let cond_offset = (condition_register as i32) * (mem::size_of::<Value>() as i32);
         let guard_return_value = (guard_index + 1) as i32;
         let exit_label = self.current_exit_label();
+        let bool_tag = ValueTag::Bool.as_u8() as i8;
+        let scalar_max_tag = ValueTag::Float.as_u8() as i8;
         extern "C" {
             fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
         }
         dynasm!(self.ops
+            ; mov al, BYTE [r12 + cond_offset]
+            ; cmp al, scalar_max_tag
+            ; ja >generic_truthiness
+            ; cmp al, bool_tag
+            ; je >load_bool
+            // Nil is false; numeric scalars are true regardless of payload.
+            ; test al, al
+            ; setnz al
+            ; jmp >truthiness_ready
+            ; load_bool:
+            ; mov al, BYTE [r12 + cond_offset + 8]
+            ; jmp >truthiness_ready
+            ; generic_truthiness:
             ; lea rdi, [r12 + cond_offset]
             ; mov rax, QWORD jit_value_is_truthy as *const () as _
             ; call rax
+            ; truthiness_ready:
             ; test al, al
         );
         if expect_truthy {

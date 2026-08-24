@@ -47,6 +47,8 @@ pub struct JitCompiler {
     pub(super) specialization_registry: SpecializationRegistry,
     /// Track active specialized values in trace
     pub(super) specialized_values: HashMap<usize, SpecializedValue>,
+    /// Registers proven to contain non-owning scalar values at this point.
+    pub(super) scalar_registers: HashMap<u8, ValueType>,
     /// Next ID for specialized values
     #[allow(dead_code)]
     pub(super) next_specialized_id: usize,
@@ -153,6 +155,241 @@ mod tests {
         );
 
         assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn fused_integer_comparison_materializes_failed_condition_for_bailout() {
+        let trace = Trace {
+            function_idx: 0,
+            start_ip: 0,
+            preamble: Vec::new(),
+            ops: vec![
+                TraceOp::Guard {
+                    register: 0,
+                    expected_type: ValueType::Int,
+                },
+                TraceOp::Guard {
+                    register: 1,
+                    expected_type: ValueType::Int,
+                },
+                TraceOp::Le {
+                    dest: 2,
+                    lhs: 0,
+                    rhs: 1,
+                    lhs_type: ValueType::Int,
+                    rhs_type: ValueType::Int,
+                },
+                TraceOp::GuardLoopContinue {
+                    condition_register: 2,
+                    expect_truthy: true,
+                    bailout_ip: 9,
+                },
+            ],
+            postamble: Vec::new(),
+            inputs: vec![0, 1],
+            outputs: vec![2],
+        };
+        let compiled = JitCompiler::new()
+            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .unwrap();
+        let mut registers = vec![
+            Value::Int(3),
+            Value::Int(2),
+            Value::String(Rc::new("old".into())),
+        ];
+
+        let result = compiled.execute(
+            registers.as_mut_ptr(),
+            core::ptr::null_mut(),
+            core::ptr::null(),
+        );
+
+        assert_eq!(result, 3);
+        assert!(matches!(registers[2], Value::Bool(false)));
+        assert_eq!(compiled.guards[2].bailout_ip, 9);
+    }
+
+    #[test]
+    fn live_comparison_and_constant_temporaries_are_materialized() {
+        let trace = Trace {
+            function_idx: 0,
+            start_ip: 0,
+            preamble: Vec::new(),
+            ops: vec![
+                TraceOp::Lt {
+                    dest: 2,
+                    lhs: 0,
+                    rhs: 1,
+                    lhs_type: ValueType::Int,
+                    rhs_type: ValueType::Int,
+                },
+                TraceOp::GuardLoopContinue {
+                    condition_register: 2,
+                    expect_truthy: true,
+                    bailout_ip: 4,
+                },
+                TraceOp::Move { dest: 3, src: 2 },
+                TraceOp::LoadConst {
+                    dest: 4,
+                    value: Value::Int(1),
+                },
+                TraceOp::Add {
+                    dest: 5,
+                    lhs: 0,
+                    rhs: 4,
+                    lhs_type: ValueType::Int,
+                    rhs_type: ValueType::Int,
+                },
+                TraceOp::Move { dest: 6, src: 4 },
+                TraceOp::NestedLoopCall {
+                    function_idx: 0,
+                    loop_start_ip: 0,
+                    bailout_ip: 0,
+                },
+            ],
+            postamble: Vec::new(),
+            inputs: vec![0, 1],
+            outputs: vec![3, 5, 6],
+        };
+        let compiled = JitCompiler::new()
+            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .unwrap();
+        let old_condition = Rc::new("condition".to_string());
+        let old_constant = Rc::new("constant".to_string());
+        let mut registers = vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::String(old_condition.clone()),
+            Value::Nil,
+            Value::String(old_constant.clone()),
+            Value::Nil,
+            Value::Nil,
+        ];
+
+        compiled.execute(
+            registers.as_mut_ptr(),
+            core::ptr::null_mut(),
+            core::ptr::null(),
+        );
+
+        assert!(matches!(registers[3], Value::Bool(true)));
+        assert!(matches!(registers[5], Value::Int(2)));
+        assert!(matches!(registers[6], Value::Int(1)));
+        assert_eq!(Rc::strong_count(&old_condition), 1);
+        assert_eq!(Rc::strong_count(&old_constant), 1);
+    }
+
+    #[test]
+    fn elided_temporaries_do_not_cross_intervening_side_exits() {
+        let comparison_trace = Trace {
+            function_idx: 0,
+            start_ip: 0,
+            preamble: Vec::new(),
+            ops: vec![
+                TraceOp::Guard {
+                    register: 2,
+                    expected_type: ValueType::Bool,
+                },
+                TraceOp::Lt {
+                    dest: 2,
+                    lhs: 0,
+                    rhs: 1,
+                    lhs_type: ValueType::Int,
+                    rhs_type: ValueType::Int,
+                },
+                TraceOp::GuardLoopContinue {
+                    condition_register: 2,
+                    expect_truthy: true,
+                    bailout_ip: 4,
+                },
+                TraceOp::Guard {
+                    register: 3,
+                    expected_type: ValueType::Int,
+                },
+                TraceOp::LoadConst {
+                    dest: 2,
+                    value: Value::Int(0),
+                },
+            ],
+            postamble: Vec::new(),
+            inputs: vec![0, 1, 2, 3],
+            outputs: vec![2],
+        };
+        let compiled = JitCompiler::new()
+            .compile_trace(&comparison_trace, TraceId(0), None, Vec::new())
+            .unwrap();
+        let mut registers = vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Bool(false),
+            Value::Bool(false),
+        ];
+
+        assert_eq!(
+            compiled.execute(
+                registers.as_mut_ptr(),
+                core::ptr::null_mut(),
+                core::ptr::null(),
+            ),
+            3
+        );
+        assert!(matches!(registers[2], Value::Bool(true)));
+
+        let constant_trace = Trace {
+            function_idx: 0,
+            start_ip: 0,
+            preamble: Vec::new(),
+            ops: vec![
+                TraceOp::Guard {
+                    register: 4,
+                    expected_type: ValueType::Int,
+                },
+                TraceOp::LoadConst {
+                    dest: 4,
+                    value: Value::Int(1),
+                },
+                TraceOp::Add {
+                    dest: 5,
+                    lhs: 0,
+                    rhs: 4,
+                    lhs_type: ValueType::Int,
+                    rhs_type: ValueType::Int,
+                },
+                TraceOp::Guard {
+                    register: 3,
+                    expected_type: ValueType::Int,
+                },
+                TraceOp::LoadConst {
+                    dest: 4,
+                    value: Value::Int(2),
+                },
+            ],
+            postamble: Vec::new(),
+            inputs: vec![0, 3, 4],
+            outputs: vec![4, 5],
+        };
+        let compiled = JitCompiler::new()
+            .compile_trace(&constant_trace, TraceId(1), None, Vec::new())
+            .unwrap();
+        let mut registers = vec![
+            Value::Int(1),
+            Value::Nil,
+            Value::Nil,
+            Value::Bool(false),
+            Value::Int(99),
+            Value::Nil,
+        ];
+
+        assert_eq!(
+            compiled.execute(
+                registers.as_mut_ptr(),
+                core::ptr::null_mut(),
+                core::ptr::null(),
+            ),
+            2
+        );
+        assert!(matches!(registers[4], Value::Int(1)));
+        assert!(matches!(registers[5], Value::Int(2)));
     }
 
     #[test]

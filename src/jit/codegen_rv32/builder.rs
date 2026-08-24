@@ -59,8 +59,17 @@ impl JitCompiler {
     }
 
     /// Total frame size (local + saved-registers area), rounded to 16 bytes.
-    fn compute_frame_size(_trace: &Trace) -> i32 {
-        let total = SAVED_REGS_SIZE + MIN_JIT_STACK_SIZE;
+    fn compute_frame_size(trace: &Trace) -> i32 {
+        let specialized_slots = trace
+            .preamble
+            .iter()
+            .chain(trace.ops.iter())
+            .chain(trace.postamble.iter())
+            .filter(|op| matches!(op, TraceOp::Unbox { .. }))
+            .count() as i32;
+        let specialized_bytes =
+            -SPECIALIZED_BASE_OFFSET + specialized_slots * SPECIALIZED_SLOT_SIZE;
+        let total = (SAVED_REGS_SIZE + MIN_JIT_STACK_SIZE).max(specialized_bytes);
         (total + 15) & !15
     }
 
@@ -111,6 +120,21 @@ impl JitCompiler {
             ; mv s3, a1                 // VM pointer
             ; mv s4, zero               // unwind chain = NULL
         );
+        let specialized_slots = trace
+            .preamble
+            .iter()
+            .chain(trace.ops.iter())
+            .chain(trace.postamble.iter())
+            .filter(|op| matches!(op, TraceOp::Unbox { .. }))
+            .count() as i32;
+        for slot in 0..specialized_slots {
+            let offset = SPECIALIZED_BASE_OFFSET - slot * SPECIALIZED_SLOT_SIZE;
+            let offset4 = offset + 4;
+            let offset8 = offset + 8;
+            dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, offset]);
+            dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, offset4]);
+            dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, offset8]);
+        }
 
         // Hoisted constants
         for (dest, value) in &hoisted_constants {
@@ -147,6 +171,7 @@ impl JitCompiler {
             ; .arch riscv32i
             ; => exit_label
             ; exit:
+            ; sw a0, [sp, 0]
         );
 
         // Postamble (rebox / cleanup, executed at every exit)
@@ -156,8 +181,8 @@ impl JitCompiler {
         self.exit_stack.pop();
         self.fail_stack.pop();
 
-        // Success return value: 0
-        dynasm!(self.ops ; .arch riscv32i ; li a0, 0);
+        // Helpers in the postamble use a0, so restore the guard/failure code.
+        dynasm!(self.ops ; .arch riscv32i ; lw a0, [sp, 0]);
 
         // ── Common epilogue: restore saved registers and return ───────────────
         dynasm!(self.ops
@@ -309,6 +334,17 @@ impl JitCompiler {
                 }
                 TraceOp::GetIndex { dest, array, index } => {
                     self.compile_get_index(*dest, *array, *index)?;
+                }
+                TraceOp::TryGetIndex { dest, array, index } => {
+                    self.compile_try_get_index(*dest, *array, *index)?;
+                }
+                TraceOp::ArrayIndexOk {
+                    value_dest,
+                    condition_dest,
+                    array,
+                    index,
+                } => {
+                    self.compile_array_index_ok(*value_dest, *condition_dest, *array, *index)?;
                 }
                 TraceOp::ArrayLen { dest, array } => {
                     self.compile_array_len(*dest, *array)?;
@@ -471,6 +507,20 @@ impl JitCompiler {
                     variant_name,
                 } => {
                     self.compile_is_enum_variant(*dest, *value, enum_name, variant_name)?;
+                }
+                TraceOp::TypeIs {
+                    dest,
+                    value,
+                    type_name,
+                } => {
+                    self.compile_type_is(*dest, *value, type_name)?;
+                }
+                TraceOp::TryCast {
+                    dest,
+                    value,
+                    type_name,
+                } => {
+                    self.compile_try_cast(*dest, *value, type_name)?;
                 }
                 TraceOp::GetEnumValue {
                     dest,

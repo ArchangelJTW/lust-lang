@@ -19,7 +19,17 @@ if last:is_some() then
     println(last:unwrap())    -- Outputs: 5
 end
 
--- Get by index
+-- Bracket reads return Result<T, IndexError> with bounds details
+if numbers[2] is Ok(value) then
+    println(value)            -- Outputs: 3
+end
+
+if numbers[20] is Err(error) then
+    println(error.index)      -- Outputs: 20
+    println(error.length)     -- Outputs: 5
+end
+
+-- get() returns Option<T> when only presence matters
 local third = numbers:get(2)
 if third:is_some() then
     println(third:unwrap())   -- Outputs: 3
@@ -38,4 +48,3 @@ end
 local sliced = numbers:slice(1, 3)
 println(sliced:len())         -- Outputs: 2
  
-

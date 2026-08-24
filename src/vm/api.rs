@@ -92,6 +92,7 @@ impl VM {
             max_stack_depth: 1000,
             pending_return_value: None,
             pending_return_dest: None,
+            pending_jit_error: None,
             trace_recorder: None,
             side_trace_context: None,
             skip_next_trace_record: false,
@@ -118,6 +119,7 @@ impl VM {
             .insert(("string".to_string(), "ToString".to_string()), true);
         vm.trait_impls
             .insert(("bool".to_string(), "ToString".to_string()), true);
+        vm.register_index_error_layout();
         super::corelib::install_core_builtins(&mut vm);
         #[cfg(feature = "std")]
         for (name, func) in super::stdlib::create_stdlib(config, &vm) {
@@ -125,6 +127,20 @@ impl VM {
         }
 
         vm
+    }
+
+    fn register_index_error_layout(&mut self) {
+        let field_names = vec![Rc::new("index".to_string()), Rc::new("length".to_string())];
+        let int_type = Type::new(TypeKind::Int, crate::ast::Span::dummy());
+        let layout = Rc::new(StructLayout::new(
+            "IndexError".to_string(),
+            field_names,
+            vec![FieldStorage::Strong, FieldStorage::Strong],
+            vec![int_type.clone(), int_type],
+            vec![None, None],
+        ));
+        self.struct_metadata
+            .insert("IndexError".to_string(), RuntimeStructInfo { layout });
     }
 
     pub(crate) fn new_map(&self) -> LustMap {
@@ -146,6 +162,10 @@ impl VM {
 
     pub(crate) fn observe_value(&mut self, value: &Value) {
         self.cycle_collector.register_value(value);
+    }
+
+    pub(crate) fn set_pending_jit_error(&mut self, error: LustError) {
+        self.pending_jit_error = Some(error);
     }
 
     pub(crate) fn observe_value_graph(&mut self, value: &Value) {
@@ -215,12 +235,14 @@ impl VM {
                 },
             );
             if let Some(simple) = name.rsplit('.').next() {
-                self.struct_metadata.insert(
-                    simple.to_string(),
-                    RuntimeStructInfo {
-                        layout: layout.clone(),
-                    },
-                );
+                if simple != "IndexError" || name == "IndexError" {
+                    self.struct_metadata.insert(
+                        simple.to_string(),
+                        RuntimeStructInfo {
+                            layout: layout.clone(),
+                        },
+                    );
+                }
             }
         }
     }
@@ -237,6 +259,45 @@ impl VM {
                     message: format!("Unknown struct '{}'", struct_name),
                 })?;
         Self::build_struct_value(struct_name, info, fields)
+    }
+
+    pub(crate) fn array_index_result(&mut self, array: &Value, index: LustInt) -> Result<Value> {
+        let values = match array {
+            Value::Array(values) => values,
+            _ => {
+                return Err(LustError::RuntimeError {
+                    message: format!("Cannot index {:?}", array.type_of()),
+                });
+            }
+        };
+        let values = values.try_borrow().map_err(|_| LustError::RuntimeError {
+            message: "Cannot read array while it is mutably borrowed".to_string(),
+        })?;
+        let length = values.len();
+        let value = if index >= 0 {
+            values.get(index as usize).cloned()
+        } else {
+            None
+        };
+        drop(values);
+
+        if let Some(value) = value {
+            self.budgets.charge_value_vec(1)?;
+            return Ok(Value::ok(value));
+        }
+
+        self.budgets.charge_value_vec(3)?;
+        let error = self.instantiate_struct(
+            "IndexError",
+            vec![
+                (Rc::new("index".to_string()), Value::Int(index)),
+                (
+                    Rc::new("length".to_string()),
+                    Value::Int(int_from_usize(length)),
+                ),
+            ],
+        )?;
+        Ok(Value::err(error))
     }
 
     fn build_struct_value(
@@ -625,6 +686,28 @@ mod tests {
         assert!(matches!(
             vm.call("typed", vec![Value::Int(1)]),
             Ok(Value::Int(7))
+        ));
+    }
+
+    #[test]
+    fn standalone_vm_can_construct_index_errors() {
+        let mut vm = VM::new();
+        let array = Value::array(vec![Value::Int(1)]);
+
+        let result = vm
+            .array_index_result(&array, 2)
+            .expect("built-in IndexError layout");
+        let error = match result.as_enum() {
+            Some(("Result", "Err", Some([error]))) => error,
+            other => panic!("expected Result.Err(IndexError), got {other:?}"),
+        };
+        assert!(matches!(
+            error.struct_get_field("index"),
+            Some(Value::Int(2))
+        ));
+        assert!(matches!(
+            error.struct_get_field("length"),
+            Some(Value::Int(1))
         ));
     }
 

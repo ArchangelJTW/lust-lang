@@ -277,6 +277,24 @@ impl Compiler {
                 type_args,
                 args,
             } => {
+                if method == "unwrap" && args.is_empty() && type_args.is_none() {
+                    let mut index_expr = receiver.as_ref();
+                    while let ExprKind::Paren(inner) = &index_expr.kind {
+                        index_expr = inner;
+                    }
+                    if self.is_checked_array_index(index_expr.span) {
+                        if let ExprKind::Index { object, index } = &index_expr.kind {
+                            let obj_reg = self.compile_expr(object)?;
+                            let idx_reg = self.compile_expr(index)?;
+                            let result_reg = self.allocate_register();
+                            self.emit(Instruction::GetIndex(result_reg, obj_reg, idx_reg), 0);
+                            self.free_register(obj_reg);
+                            self.free_register(idx_reg);
+                            return Ok(result_reg);
+                        }
+                    }
+                }
+
                 match method.as_str() {
                     "map" if args.len() == 1 && type_args.is_none() => {
                         return self.compile_map_method(receiver, &args[0]);
@@ -352,7 +370,7 @@ impl Compiler {
                 let obj_reg = self.compile_expr(object)?;
                 let idx_reg = self.compile_expr(index)?;
                 let result_reg = self.allocate_register();
-                self.emit(Instruction::GetIndex(result_reg, obj_reg, idx_reg), 0);
+                self.emit(Instruction::TryGetIndex(result_reg, obj_reg, idx_reg), 0);
                 self.free_register(obj_reg);
                 self.free_register(idx_reg);
                 Ok(result_reg)
@@ -613,8 +631,13 @@ impl Compiler {
                     _ => Self::type_to_string(&target_type.kind),
                 };
                 let type_name_idx = self.add_string_constant(&type_string);
-                self.emit(Instruction::CheckedCast(value_reg, type_name_idx), 0);
-                Ok(value_reg)
+                let result_reg = self.allocate_register();
+                self.emit(
+                    Instruction::TryCast(result_reg, value_reg, type_name_idx),
+                    0,
+                );
+                self.free_register(value_reg);
+                Ok(result_reg)
             }
             ExprKind::Return(values) => {
                 if values.is_empty() {
@@ -642,7 +665,22 @@ impl Compiler {
         let left_bindings = self.extract_all_pattern_bindings(left);
         let right_bindings = self.extract_all_pattern_bindings(right);
 
-        let left_reg = self.compile_expr(left)?;
+        // Keep a directly matched scrutinee alive so pattern extraction uses
+        // the exact value that was tested. Recompiling it here used to evaluate
+        // side-effecting expressions such as `next() is Some(x)` twice.
+        let mut left_scrutinee = None;
+        let left_reg = if !left_bindings.is_empty() {
+            if let Some((expr, pattern)) = Self::direct_is_pattern(left) {
+                let scrutinee_reg = self.compile_expr(expr)?;
+                let result_reg = self.compile_is_pattern(scrutinee_reg, pattern)?;
+                left_scrutinee = Some((scrutinee_reg, pattern));
+                result_reg
+            } else {
+                self.compile_expr(left)?
+            }
+        } else {
+            self.compile_expr(left)?
+        };
         let skip_right = self.emit(Instruction::JumpIfNot(left_reg, 0), 0);
         let wrap_option = self.should_wrap_option(span);
         let option_indices = if wrap_option {
@@ -654,14 +692,31 @@ impl Compiler {
             None
         };
 
-        for (scrutinee_expr, pattern) in &left_bindings {
-            let enum_reg = self.compile_expr(scrutinee_expr)?;
+        if let Some((enum_reg, pattern)) = left_scrutinee {
             self.bind_pattern_variables(enum_reg, pattern)?;
             self.free_register(enum_reg);
+        } else {
+            for (scrutinee_expr, pattern) in &left_bindings {
+                let enum_reg = self.compile_expr(scrutinee_expr)?;
+                self.bind_pattern_variables(enum_reg, pattern)?;
+                self.free_register(enum_reg);
+            }
         }
 
         let saved_next = self.next_register;
-        let right_reg = self.compile_expr(right)?;
+        let mut right_scrutinee = None;
+        let right_reg = if !right_bindings.is_empty() {
+            if let Some((expr, pattern)) = Self::direct_is_pattern(right) {
+                let scrutinee_reg = self.compile_expr(expr)?;
+                let result_reg = self.compile_is_pattern(scrutinee_reg, pattern)?;
+                right_scrutinee = Some((scrutinee_reg, pattern));
+                result_reg
+            } else {
+                self.compile_expr(right)?
+            }
+        } else {
+            self.compile_expr(right)?
+        };
         if self.next_register < saved_next {
             self.next_register = saved_next;
         }
@@ -672,10 +727,15 @@ impl Compiler {
             None
         };
 
-        for (scrutinee_expr, pattern) in &right_bindings {
-            let enum_reg = self.compile_expr(scrutinee_expr)?;
+        if let Some((enum_reg, pattern)) = right_scrutinee {
             self.bind_pattern_variables(enum_reg, pattern)?;
             self.free_register(enum_reg);
+        } else {
+            for (scrutinee_expr, pattern) in &right_bindings {
+                let enum_reg = self.compile_expr(scrutinee_expr)?;
+                self.bind_pattern_variables(enum_reg, pattern)?;
+                self.free_register(enum_reg);
+            }
         }
 
         if let Some(skip_idx) = right_skip_bindings {

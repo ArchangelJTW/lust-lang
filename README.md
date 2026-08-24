@@ -5,7 +5,7 @@
 Lust is a strongly typed, Lua-inspired scripting language implemented in Rust. It targets embedding scenarios while staying fast with a hybrid collector and a trace-based JIT.
 
 ## Features
-- Strong static type system with ergonomic enum pattern matching via the `is` helper.
+- Strong static type system with ergonomic enum pattern matching via the `is` operator.
 - High-performance runtime that pairs reference counting with a fallback mark-and-sweep pass for long-lived cycles.
 - Trace-based JIT powered by `dynasm-rs`, emitting x64 machine code similar in function to LuaJIT.
 - Friendly embedding surface for Rust and C, including typed value conversions and module loaders.
@@ -59,13 +59,50 @@ you can write Lust-readable extern stubs to disk from your embedder:
 let _ = program.dump_externs_to_dir("externs");
 ```
 
-The `is` helper works intuitively:
+The `is` operator tests and binds patterns:
 
 ```lust
 if status is Complete(value) then
     print("done(" .. value .. ")")
 end
 ```
+
+Fallible extraction from `unknown` uses `as` and returns `Option<T>`. Casts and
+patterns associate left-to-right, so no parentheses are required:
+
+```lust
+if value as int is Some(x) and x > 0 then
+    print(x)
+end
+```
+
+Array bracket reads are non-trapping and return `Result<T, IndexError>`.
+`IndexError` exposes the attempted `index` and current `length`:
+
+```lust
+local values: Array<string> = ["first", "second"]
+
+if values[2] is Ok(value) then
+    print(value)
+elseif values[2] is Err(error) then
+    print("index " .. error.index .. " exceeds length " .. error.length)
+end
+```
+
+Use `values:get(index)` for `Option<T>` when the bounds details do not matter.
+Use `values[index]:unwrap()` only when the index is known to be valid and a
+runtime error is intentional if that invariant is broken. Indexed assignment
+still requires an existing element and raises a runtime error when out of bounds.
+
+Lust's casing convention distinguishes language roles:
+
+- Lowercase names are primitives and keywords: `int`, `string`, `unknown`.
+- PascalCase names are nominal types and enum variants: `Option`, `Result`,
+  `Array`, `Some`, `None`, and user-defined types.
+- snake_case names are variables, functions, methods, fields, and modules.
+
+This keeps `Option` visibly distinct from primitives; `OPTION` is reserved by
+convention for constant-like names rather than types.
 
 ## Embedding in C (WIP)
 

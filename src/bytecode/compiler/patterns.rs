@@ -1,5 +1,15 @@
 use super::*;
 impl Compiler {
+    pub(super) fn direct_is_pattern<'a>(
+        expr: &'a Expr,
+    ) -> Option<(&'a Expr, &'a crate::ast::Pattern)> {
+        match &expr.kind {
+            ExprKind::IsPattern { expr, pattern } => Some((expr, pattern)),
+            ExprKind::Paren(inner) => Self::direct_is_pattern(inner),
+            _ => None,
+        }
+    }
+
     pub(super) fn compile_is_pattern(
         &mut self,
         scrutinee_reg: Register,
@@ -132,6 +142,10 @@ impl Compiler {
                 }
             }
 
+            ExprKind::Paren(inner) => {
+                bindings.extend(self.extract_all_pattern_bindings(inner));
+            }
+
             _ => {}
         }
 
@@ -162,10 +176,13 @@ impl Compiler {
                                 }
                             }
 
-                            let value_reg: Register = (max_local_reg + 1) as u8;
-                            if self.next_register <= value_reg {
-                                self.next_register = value_reg + 1;
-                            }
+                            // The enum scrutinee is a live temporary. Choosing
+                            // only `max_local + 1` can alias it and emit
+                            // `GetEnumValue R3, R3, 0`, which destroys the enum
+                            // before a trace recorder can observe its input.
+                            let value_reg: Register =
+                                ((max_local_reg + 1).max(i32::from(self.next_register))) as u8;
+                            self.next_register = value_reg + 1;
 
                             if value_reg > self.max_register {
                                 self.max_register = value_reg;

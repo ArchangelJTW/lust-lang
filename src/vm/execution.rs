@@ -157,6 +157,7 @@ impl VM {
                             core::cmp::max(1, cost) as u64
                         };
                         self.budgets.charge_gas(trace_gas_cost)?;
+                        self.pending_jit_error = None;
 
                         // Capture RSP before and after to detect stack leaks (x86_64 only)
                         #[cfg(target_arch = "x86_64")]
@@ -228,8 +229,15 @@ impl VM {
                                     };
                                     self.budgets.charge_gas(side_trace_gas_cost)?;
                                     let vm_ptr = self as *mut VM;
+                                    self.pending_jit_error = None;
                                     let side_result =
                                         side_trace.execute(registers_ptr, vm_ptr, ptr::null());
+                                    drop(side_trace);
+                                    if side_result < 0 {
+                                        if let Some(error) = self.pending_jit_error.take() {
+                                            return Err(error);
+                                        }
+                                    }
                                     if side_result == 0 {
                                         crate::jit::log(|| {
                                             format!(
@@ -264,6 +272,9 @@ impl VM {
                                 continue;
                             }
                         } else {
+                            if let Some(error) = self.pending_jit_error.take() {
+                                return Err(error);
+                            }
                             crate::jit::log(|| {
                                 "⚠️  JIT: Trace execution failed (unknown error)".to_string()
                             });
@@ -272,6 +283,15 @@ impl VM {
                             }
 
                             self.jit.root_traces.remove(&(func_idx, loop_start_ip));
+                            // Re-dispatch from the loop header we just installed.
+                            //
+                            // Falling through instead would let the interpreter
+                            // go on to execute the backward `Jump` that got us
+                            // here, applying its offset on top of the rewritten
+                            // ip.  That sends ip out of range, pops the frame and
+                            // empties the call stack, so the program simply stops
+                            // — exit status 0, nothing printed, no error.
+                            continue;
                         }
                     }
                 } else {
@@ -339,7 +359,20 @@ impl VM {
                         }
                     } else {
                         if let Some(recorder) = &mut self.trace_recorder {
-                            if recorder.is_recording() && count > crate::jit::HOT_THRESHOLD + 1 {
+                            // Only finalise the recording when *this* loop is the
+                            // one being recorded.  With a nested loop the inner
+                            // back-edge reaches this handler while the recorder is
+                            // still part-way through the outer loop's body; taking
+                            // that partial body and installing it under the inner
+                            // loop's key produced a trace that re-initialised the
+                            // inner induction variable, never advanced the outer
+                            // one, and therefore never terminated.
+                            let recording_this_loop = recorder.trace.function_idx == func_idx
+                                && recorder.trace.start_ip == loop_start_ip;
+                            if recorder.is_recording()
+                                && recording_this_loop
+                                && count > crate::jit::HOT_THRESHOLD + 1
+                            {
                                 crate::jit::log(|| {
                                     format!(
                                         "📝 JIT: Trace recording complete - {} ops recorded",
@@ -1194,6 +1227,42 @@ impl VM {
                     self.set_register(dest, result)?;
                 }
 
+                Instruction::TryGetIndex(dest, collection_reg, index_reg) => {
+                    let collection = self.get_register(collection_reg)?.clone();
+                    let index = self.get_register(index_reg)?.clone();
+                    let result = if let Some(map_val) = Self::lua_table_map(&collection) {
+                        if let Value::Map(map) = map_val {
+                            let raw_key = self.make_hash_key(&Self::lua_table_key_value(&index))?;
+                            let borrowed = map.borrow();
+                            borrowed.get(&raw_key).cloned().unwrap_or(Value::Nil)
+                        } else {
+                            return Err(LustError::RuntimeError {
+                                message: format!("Cannot index {:?}", collection.type_of()),
+                            });
+                        }
+                    } else {
+                        match &collection {
+                            Value::Array(_) => {
+                                let index =
+                                    index.as_int().ok_or_else(|| LustError::RuntimeError {
+                                        message: "Array index must be an integer".to_string(),
+                                    })?;
+                                self.array_index_result(&collection, index)?
+                            }
+                            Value::Map(map) => {
+                                let key = self.make_hash_key(&index)?;
+                                map.borrow().get(&key).cloned().unwrap_or(Value::Nil)
+                            }
+                            _ => {
+                                return Err(LustError::RuntimeError {
+                                    message: format!("Cannot index {:?}", collection.type_of()),
+                                });
+                            }
+                        }
+                    };
+                    self.set_register(dest, result)?;
+                }
+
                 Instruction::ArrayLen(dest, array_reg) => {
                     let collection = self.get_register(array_reg)?;
                     match collection {
@@ -1427,7 +1496,7 @@ impl VM {
                     self.set_register(dest, Value::Bool(matches))?;
                 }
 
-                Instruction::CheckedCast(value_reg, type_name_idx) => {
+                Instruction::TryCast(dest, value_reg, type_name_idx) => {
                     let value = self.get_register(value_reg)?.clone();
                     let func = &self.functions[self.call_stack.last().unwrap().function_idx];
                     let type_name = func.chunk.constants[type_name_idx as usize]
@@ -1436,15 +1505,13 @@ impl VM {
                             message: "Cast type name must be a string".to_string(),
                         })?
                         .to_string();
-                    if !self.value_is_type(&value, &type_name) {
-                        return Err(LustError::RuntimeError {
-                            message: format!(
-                                "Cannot cast value of type {:?} to {}",
-                                value.type_of(),
-                                type_name
-                            ),
-                        });
-                    }
+                    let result = if self.value_is_type(&value, &type_name) {
+                        self.budgets.charge_value_vec(1)?;
+                        Value::some(value)
+                    } else {
+                        Value::none()
+                    };
+                    self.set_register(dest, result)?;
                 }
             }
 
@@ -1527,7 +1594,7 @@ impl VM {
         self.set_register(dest, Value::Bool(result))
     }
 
-    pub(super) fn value_is_type(&self, value: &Value, type_name: &str) -> bool {
+    pub(crate) fn value_is_type(&self, value: &Value, type_name: &str) -> bool {
         // Lua compatibility intentionally treats LuaValue as a dynamic carrier. Transpiled
         // values may still be represented by their underlying VM value at call boundaries.
         if type_name == "LuaValue" {

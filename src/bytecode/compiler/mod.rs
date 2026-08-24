@@ -40,6 +40,7 @@ pub struct Compiler {
     pub(super) extern_value_aliases: HashMap<String, String>,
     pub(super) stdlib_symbols: HashSet<String>,
     option_coercions: HashMap<String, HashSet<Span>>,
+    checked_array_indices: HashMap<String, HashSet<Span>>,
     function_signatures: HashMap<String, FunctionSignature>,
     minimal_runtime_types: bool,
 }
@@ -78,6 +79,7 @@ impl Compiler {
             extern_value_aliases: HashMap::new(),
             stdlib_symbols: HashSet::new(),
             option_coercions: HashMap::new(),
+            checked_array_indices: HashMap::new(),
             function_signatures: HashMap::new(),
             minimal_runtime_types: false,
         };
@@ -157,6 +159,10 @@ impl Compiler {
         self.option_coercions = map;
     }
 
+    pub fn set_checked_array_indices(&mut self, map: HashMap<String, HashSet<Span>>) {
+        self.checked_array_indices = map;
+    }
+
     pub fn set_function_signatures(&mut self, signatures: HashMap<String, FunctionSignature>) {
         self.function_signatures = signatures;
     }
@@ -172,6 +178,13 @@ impl Compiler {
     pub(super) fn should_wrap_option(&self, span: Span) -> bool {
         let module = self.current_module.as_deref().unwrap_or("");
         self.option_coercions
+            .get(module)
+            .map_or(false, |set| set.contains(&span))
+    }
+
+    pub(super) fn is_checked_array_index(&self, span: Span) -> bool {
+        let module = self.current_module.as_deref().unwrap_or("");
+        self.checked_array_indices
             .get(module)
             .map_or(false, |set| set.contains(&span))
     }
@@ -364,6 +377,7 @@ impl Compiler {
                 | "Task"
                 | "TaskStatus"
                 | "TaskInfo"
+                | "IndexError"
                 | "LuaValue"
                 | "LuaTable"
                 | "LuaFunction"

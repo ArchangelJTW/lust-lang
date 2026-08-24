@@ -82,7 +82,7 @@ impl TypeChecker {
                 self.check_field_access_with_hint(expr.span, object, field, expected_type)
             }
 
-            ExprKind::Index { object, index } => self.check_index_expr(object, index),
+            ExprKind::Index { object, index } => self.check_index_expr(expr.span, object, index),
             ExprKind::Array(elements) => self.check_array_literal(elements, expected_type),
             ExprKind::Map(entries) => self.check_map_literal(entries, expected_type),
             ExprKind::StructLiteral { name, fields } => {
@@ -96,7 +96,11 @@ impl TypeChecker {
             } => self.check_lambda(params, return_type.as_ref(), body),
             ExprKind::Cast { expr, target_type } => {
                 let _expr_type = self.check_expr(expr)?;
-                Ok(target_type.clone())
+                let target_type = self.canonicalize_type(target_type);
+                Ok(Type::new(
+                    TypeKind::Option(Box::new(target_type)),
+                    expr.span,
+                ))
             }
 
             ExprKind::TypeCheck {

@@ -176,6 +176,17 @@ pub enum TraceOp {
         array: Register,
         index: Register,
     },
+    TryGetIndex {
+        dest: Register,
+        array: Register,
+        index: Register,
+    },
+    ArrayIndexOk {
+        value_dest: Register,
+        condition_dest: Register,
+        array: Register,
+        index: Register,
+    },
     ArrayLen {
         dest: Register,
         array: Register,
@@ -264,6 +275,16 @@ pub enum TraceOp {
         value: Register,
         enum_name: String,
         variant_name: String,
+    },
+    TypeIs {
+        dest: Register,
+        value: Register,
+        type_name: String,
+    },
+    TryCast {
+        dest: Register,
+        value: Register,
+        type_name: String,
     },
     GetEnumValue {
         dest: Register,
@@ -434,21 +455,54 @@ impl TraceRecorder {
     pub fn specialize_trace_inputs(
         &mut self,
         registers: &[Value],
-        _function: &crate::bytecode::Function,
+        function: &crate::bytecode::Function,
     ) {
         crate::jit::log(|| format!("🔍 JIT: Scanning trace inputs for specialization..."));
 
-        // Scan all registers for arrays (not just ones with type info)
-        for reg in 0u8..=255 {
+        // Only slots below `register_count` belong to this frame.  Everything
+        // above is stale data left by previously executed frames, and a leftover
+        // `Value::Array` up there would otherwise be unboxed and specialized —
+        // reading, and on rebox writing, memory that is not ours.
+        let live_registers = usize::from(function.register_count).min(registers.len());
+
+        // An array can sit in more than one register of the same frame (a
+        // temporary left over from constructing it, say).  Those registers share
+        // one Rc, so specializing each of them separately would hand out two
+        // independent unboxed copies of the same buffer and let the second
+        // rebox clobber the first — which surfaces as the array spontaneously
+        // having length 0.  Specialize each distinct buffer at most once.
+        let mut seen_buffers: Vec<*const ()> = Vec::new();
+
+        for reg in 0..live_registers {
+            let reg = reg as u8;
             // Check if this register contains an Array at runtime
             if let Value::Array(ref arr_rc) = registers[reg as usize] {
                 crate::jit::log(|| format!("🔍 JIT: Found array in reg {}", reg));
+
+                let identity = Rc::as_ptr(arr_rc) as *const ();
+                if seen_buffers.contains(&identity) {
+                    crate::jit::log(|| {
+                        format!(
+                            "🔍 JIT: reg {} aliases an already-specialized array, skipping",
+                            reg
+                        )
+                    });
+                    continue;
+                }
                 // Selection is speculative; the generated unbox helper validates
                 // every element before the specialized representation is used.
+                // Only `Array<int>` may be specialized: the unbox/rebox helpers
+                // (`jit_unbox_array_int` / `jit_rebox_array_int`) are the only
+                // ones that exist, and the layout alone cannot distinguish an
+                // int array from a float or bool one — every scalar element is
+                // 8 bytes wide.  Claiming a float array is specializable made
+                // codegen emit the *int* helpers for float data; the unbox then
+                // correctly refused the elements and bailed out, but the trace
+                // made no progress and was re-entered forever.
+                //
+                // Widen this only together with element-typed helpers.
                 let element_type = arr_rc.borrow().first().and_then(|value| match value {
                     Value::Int(_) => Some(crate::ast::TypeKind::Int),
-                    Value::Float(_) => Some(crate::ast::TypeKind::Float),
-                    Value::Bool(_) => Some(crate::ast::TypeKind::Bool),
                     _ => None,
                 });
 
@@ -481,6 +535,7 @@ impl TraceRecorder {
                         // Track this specialized value
                         self.specialized_registers
                             .insert(reg, (specialized_id, layout));
+                        seen_buffers.push(identity);
                     }
                 }
             }
@@ -521,7 +576,89 @@ impl TraceRecorder {
         self.current_guard_set_mut().remove(&register);
     }
 
+    /// The boxed register an op overwrites, if any.
+    ///
+    /// Guards, `SetField`, `Return` and `NestedLoopCall` write no register.
+    /// `Unbox`/`Rebox`/`DropSpecialized` and `SpecializedOp` address specialized
+    /// slots rather than boxed registers and are deliberately excluded: the
+    /// rebox path removes its own tracking entry before pushing the op.
+    fn written_register(op: &TraceOp) -> Option<Register> {
+        match op {
+            TraceOp::LoadConst { dest, .. }
+            | TraceOp::Move { dest, .. }
+            | TraceOp::Add { dest, .. }
+            | TraceOp::Sub { dest, .. }
+            | TraceOp::Mul { dest, .. }
+            | TraceOp::Div { dest, .. }
+            | TraceOp::Mod { dest, .. }
+            | TraceOp::Neg { dest, .. }
+            | TraceOp::Eq { dest, .. }
+            | TraceOp::Ne { dest, .. }
+            | TraceOp::Lt { dest, .. }
+            | TraceOp::Le { dest, .. }
+            | TraceOp::Gt { dest, .. }
+            | TraceOp::Ge { dest, .. }
+            | TraceOp::And { dest, .. }
+            | TraceOp::Or { dest, .. }
+            | TraceOp::Not { dest, .. }
+            | TraceOp::Concat { dest, .. }
+            | TraceOp::GetIndex { dest, .. }
+            | TraceOp::TryGetIndex { dest, .. }
+            | TraceOp::ArrayLen { dest, .. }
+            | TraceOp::CallNative { dest, .. }
+            | TraceOp::CallFunction { dest, .. }
+            | TraceOp::InlineCall { dest, .. }
+            | TraceOp::CallMethod { dest, .. }
+            | TraceOp::GetField { dest, .. }
+            | TraceOp::NewArray { dest, .. }
+            | TraceOp::NewStruct { dest, .. }
+            | TraceOp::NewEnumUnit { dest, .. }
+            | TraceOp::NewEnumVariant { dest, .. }
+            | TraceOp::IsEnumVariant { dest, .. }
+            | TraceOp::TypeIs { dest, .. }
+            | TraceOp::TryCast { dest, .. }
+            | TraceOp::GetEnumValue { dest, .. } => Some(*dest),
+            TraceOp::SetField { .. }
+            | TraceOp::ArrayIndexOk { .. }
+            | TraceOp::Guard { .. }
+            | TraceOp::GuardNativeFunction { .. }
+            | TraceOp::GuardFunction { .. }
+            | TraceOp::GuardClosure { .. }
+            | TraceOp::GuardLoopContinue { .. }
+            | TraceOp::NestedLoopCall { .. }
+            | TraceOp::Return { .. }
+            | TraceOp::Unbox { .. }
+            | TraceOp::Rebox { .. }
+            | TraceOp::DropSpecialized { .. }
+            | TraceOp::SpecializedOp { .. } => None,
+        }
+    }
+
     fn push_op(&mut self, op: TraceOp) {
+        // A specialization describes the array a register held at trace entry.
+        // The instant the trace writes something else into that register the
+        // specialization is stale, and the postamble rebox would otherwise dump
+        // the entry-time copy into whatever unrelated array the register now
+        // holds.  That is what corrupted `grid[ctr % 4][i]`: the temp holding the
+        // inner array was specialized at entry, then reassigned by
+        // `GetIndex { dest: <temp> }` on every iteration, and the rebox wrote the
+        // stale row back over a different row of `grid`.
+        //
+        // Invalidation used to be an explicit call at a handful of recording
+        // sites, which is why `GetIndex` was missed.  Do it centrally instead so
+        // no op can forget.
+        if let TraceOp::ArrayIndexOk {
+            value_dest,
+            condition_dest,
+            ..
+        } = &op
+        {
+            self.remove_specialization_tracking(*value_dest);
+            self.remove_specialization_tracking(*condition_dest);
+        } else if let Some(dest) = Self::written_register(&op) {
+            self.remove_specialization_tracking(dest);
+        }
+
         self.op_count += 1;
         if let Some(ctx) = self.inline_stack.last_mut() {
             ctx.ops.push(op);
@@ -665,6 +802,69 @@ impl TraceRecorder {
         }
     }
 
+    /// Checked source indexing reads the boxed array. If the recorder eagerly
+    /// specialized that array at trace entry, discard the unused specialization
+    /// instead of emitting a consuming Rebox into the loop body. Rebox cannot be
+    /// unrolled safely because it transfers the specialized buffer's ownership.
+    fn disable_unused_specialization(&mut self, register: Register) -> bool {
+        let Some((specialized_id, _)) = self.specialized_registers.get(&register).cloned() else {
+            return true;
+        };
+        let uses_specialization = |op: &TraceOp| {
+            matches!(
+                op,
+                TraceOp::SpecializedOp { operands, .. }
+                    if operands.iter().any(
+                        |operand| matches!(operand, Operand::Specialized(id) if *id == specialized_id)
+                    )
+            )
+        };
+        if self.trace.ops.iter().any(&uses_specialization)
+            || self
+                .inline_stack
+                .iter()
+                .any(|context| context.ops.iter().any(&uses_specialization))
+        {
+            return false;
+        }
+
+        self.specialized_registers.remove(&register);
+        self.trace.preamble.retain(
+            |op| !matches!(op, TraceOp::Unbox { specialized_id: id, .. } if *id == specialized_id),
+        );
+        self.trace.ops.retain(
+            |op| !matches!(op, TraceOp::Unbox { specialized_id: id, .. } if *id == specialized_id),
+        );
+        for context in &mut self.inline_stack {
+            context.ops.retain(|op| {
+                !matches!(op, TraceOp::Unbox { specialized_id: id, .. } if *id == specialized_id)
+            });
+        }
+        true
+    }
+
+    fn disable_unused_array_specialization(
+        &mut self,
+        register: Register,
+        registers: &[Value],
+    ) -> bool {
+        let owner =
+            if self.specialized_registers.contains_key(&register) {
+                Some(register)
+            } else if let Some(Value::Array(array)) = registers.get(register as usize) {
+                self.specialized_registers.keys().copied().find(|candidate| {
+                matches!(
+                    registers.get(*candidate as usize),
+                    Some(Value::Array(candidate_array)) if Rc::ptr_eq(array, candidate_array)
+                )
+            })
+            } else {
+                None
+            };
+
+        owner.map_or(true, |owner| self.disable_unused_specialization(owner))
+    }
+
     fn should_inline(&self, function_idx: usize, callee_fn: &crate::bytecode::Function) -> bool {
         if function_idx == self.trace.function_idx {
             return false;
@@ -758,15 +958,36 @@ impl TraceRecorder {
         }
 
         if function_idx != self.current_function_idx() {
-            return Ok(());
+            // Execution has entered a function this trace is not inlining, so
+            // its instructions are not being recorded.  Skipping them and
+            // carrying on produces a body that omits the call entirely: its side
+            // effects are lost and, worse, the register meant to receive its
+            // result is left holding whatever it happened to contain before.
+            //
+            // A method call whose result register had last been used for the
+            // loop-condition flag turned `acc = acc + c:bump()` into `acc`
+            // plus the bit pattern of a bool.  There is no way to record a
+            // correct trace from here, so abandon it.
+            self.stop_recording();
+            crate::jit::log(|| {
+                format!(
+                    "Trace aborted: execution left the traced function (recording {}, now in {})",
+                    self.trace.function_idx, function_idx
+                )
+            });
+            return Err(LustError::RuntimeError {
+                message: "Trace aborted: execution left the traced function".to_string(),
+            });
         }
 
         if let Some(dest) = instruction.defined_register() {
             if instruction.reads_register(dest) {
                 self.stop_recording();
                 return Err(LustError::RuntimeError {
-                    message: "Trace aborted: aliased destination requires pre-execution operands"
-                        .to_string(),
+                    message: format!(
+                        "Trace aborted: {:?} aliases its destination and requires pre-execution operands",
+                        instruction.opcode()
+                    ),
                 });
             }
             self.forget_guard(dest);
@@ -803,21 +1024,28 @@ impl TraceRecorder {
                 self.remove_specialization_tracking(dest);
 
                 // Check if we're moving a specialized value
-                if let Some(&(specialized_id, ref layout)) = self.specialized_registers.get(&src) {
+                let moved_specialization = if dest != src {
+                    self.specialized_registers.get(&src).cloned()
+                } else {
+                    None
+                };
+                if let Some((specialized_id, _)) = &moved_specialization {
                     crate::jit::log(|| {
                         format!(
                             "📦 JIT: Moving specialized #{} from reg {} to reg {}",
                             specialized_id, src, dest
                         )
                     });
-                    // Track that dest now contains the specialized value
-                    self.specialized_registers
-                        .insert(dest, (specialized_id, layout.clone()));
-                    // Remove from source register
-                    self.specialized_registers.remove(&src);
                 }
 
                 self.push_op(TraceOp::Move { dest, src });
+                if let Some((specialized_id, layout)) = moved_specialization {
+                    // `push_op` invalidates the destination first; transfer the
+                    // specialization only after that generic invalidation.
+                    self.specialized_registers.remove(&src);
+                    self.specialized_registers
+                        .insert(dest, (specialized_id, layout));
+                }
                 Ok(())
             }
 
@@ -1043,6 +1271,13 @@ impl TraceRecorder {
             }
 
             Instruction::GetIndex(dest, array, index) => {
+                if !self.disable_unused_array_specialization(array, registers) {
+                    self.stop_recording();
+                    return Err(LustError::RuntimeError {
+                        message: "Trace aborted: array read follows a specialized mutation"
+                            .to_string(),
+                    });
+                }
                 if let Some(ty) = Self::get_value_type(&registers[array as usize]) {
                     if !self.is_guarded(array) {
                         self.push_op(TraceOp::Guard {
@@ -1064,6 +1299,46 @@ impl TraceRecorder {
                 }
 
                 self.push_op(TraceOp::GetIndex { dest, array, index });
+                Ok(())
+            }
+
+            Instruction::TryGetIndex(dest, array, index) => {
+                if !matches!(registers.get(array as usize), Some(Value::Array(_))) {
+                    self.stop_recording();
+                    return Err(LustError::RuntimeError {
+                        message: "Trace aborted: checked indexing currently supports arrays only"
+                            .to_string(),
+                    });
+                }
+
+                if !self.disable_unused_array_specialization(array, registers) {
+                    self.stop_recording();
+                    return Err(LustError::RuntimeError {
+                        message: "Trace aborted: checked read follows a specialized array mutation"
+                            .to_string(),
+                    });
+                }
+                if let Some(ty) = Self::get_value_type(&registers[array as usize]) {
+                    if !self.is_guarded(array) {
+                        self.push_op(TraceOp::Guard {
+                            register: array,
+                            expected_type: ty,
+                        });
+                        self.mark_guarded(array);
+                    }
+                }
+
+                if let Some(ty) = Self::get_value_type(&registers[index as usize]) {
+                    if !self.is_guarded(index) {
+                        self.push_op(TraceOp::Guard {
+                            register: index,
+                            expected_type: ty,
+                        });
+                        self.mark_guarded(index);
+                    }
+                }
+
+                self.push_op(TraceOp::TryGetIndex { dest, array, index });
                 Ok(())
             }
 
@@ -1183,6 +1458,39 @@ impl TraceRecorder {
                             self.mark_guarded(arg_reg);
                         }
                     }
+                }
+
+                // Only receivers that `call_builtin_method_simple` can actually
+                // execute may be traced.  It handles arrays, iterators and enums;
+                // everything else — ints, floats, bools, strings, maps, and
+                // structs, which `jit_call_method_safe` rejects outright — makes
+                // the compiled trace fail mid-body.
+                //
+                // A mid-body failure is unrecoverable: the trace returns -1 with
+                // the registers already mutated, and the interpreter then
+                // restarts the iteration from the loop header, executing it a
+                // second time.  That is how `acc = acc + neg:abs()` over 1..10
+                // produced 57 instead of 55.  Refuse the trace instead and let
+                // the loop stay interpreted.
+                //
+                // Lifting this means giving `call_builtin_method_simple` real
+                // Int/Float arms, not relaxing the check.
+                let receiver_supported = matches!(
+                    &registers[obj_reg as usize],
+                    Value::Array(_) | Value::Iterator(_) | Value::Enum { .. }
+                );
+                if !receiver_supported {
+                    self.stop_recording();
+                    crate::jit::log(|| {
+                        format!(
+                            "Trace aborted: method '{}' on unsupported receiver in reg {}",
+                            method_name, obj_reg
+                        )
+                    });
+                    return Err(LustError::RuntimeError {
+                        message: "Trace aborted: method receiver not supported by the JIT"
+                            .to_string(),
+                    });
                 }
 
                 self.push_op(TraceOp::CallMethod {
@@ -1392,6 +1700,44 @@ impl TraceRecorder {
                     value: value_reg,
                     enum_name,
                     variant_name,
+                });
+                self.mark_guarded(dest);
+                Ok(())
+            }
+
+            Instruction::TypeIs(dest, value_reg, type_name_idx) => {
+                let type_name = function.chunk.constants[type_name_idx as usize]
+                    .as_string()
+                    .unwrap_or("unknown")
+                    .to_string();
+                self.push_op(TraceOp::TypeIs {
+                    dest,
+                    value: value_reg,
+                    type_name,
+                });
+                self.mark_guarded(dest);
+                Ok(())
+            }
+
+            Instruction::TryCast(dest, value_reg, type_name_idx) => {
+                // The cast helper reads the boxed value. Do not emit a consuming
+                // Rebox into the cyclic body; discard an unused eager
+                // specialization, or abort if specialized mutations came first.
+                if !self.disable_unused_array_specialization(value_reg, registers) {
+                    self.stop_recording();
+                    return Err(LustError::RuntimeError {
+                        message: "Trace aborted: cast follows a specialized array mutation"
+                            .to_string(),
+                    });
+                }
+                let type_name = function.chunk.constants[type_name_idx as usize]
+                    .as_string()
+                    .unwrap_or("unknown")
+                    .to_string();
+                self.push_op(TraceOp::TryCast {
+                    dest,
+                    value: value_reg,
+                    type_name,
                 });
                 Ok(())
             }
@@ -1984,7 +2330,10 @@ mod tests {
 
     #[test]
     fn trace_finalization_only_reboxes_each_specialized_value_once() {
-        let functions = vec![crate::bytecode::Function::new("array_loop", 0, false)];
+        let mut functions = vec![crate::bytecode::Function::new("array_loop", 0, false)];
+        // `specialize_trace_inputs` only considers slots inside the frame, so the
+        // frame has to actually claim register 0.
+        functions[0].set_register_count(1);
         let mut registers = vec![Value::Nil; 256];
         registers[0] = Value::array(vec![Value::Int(1)]);
         let mut recorder = TraceRecorder::new(0, 0, 32);

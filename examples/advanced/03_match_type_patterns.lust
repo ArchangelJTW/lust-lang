@@ -19,14 +19,14 @@ end
 -- Handle unknown with match patterns
 function describe_unknown(val: unknown): string
     -- Match on specific types to narrow from unknown
-    -- Note: We use `is-and` pattern to get Option<T>, then match on the Option
-    local as_int = val is int and val
+    -- `as` safely extracts Option<T>, which can then be pattern matched.
+    local as_int = val as int
     if as_int:is_some() then
         local i = as_int:unwrap()
         return "Found int: " .. tostring(i)
     end
 
-    local as_str = val is string and val
+    local as_str = val as string
     if as_str:is_some() then
         local s = as_str:unwrap()
         return "Found string: " .. s
@@ -108,5 +108,4 @@ println(process_with_match(int_items:get(2):unwrap()))
 
 println("")
 println("=== All match pattern tests passed! ===")
-
 

@@ -32,20 +32,20 @@ function handle_unknown(val: unknown): string
     -- Must narrow unknown before using type-specific operations
 
     -- Try int first
-    local as_int = val is int and val
+    local as_int = val as int
     if as_int:is_some() then
         return "Integer: " .. tostring(as_int:unwrap())
     end
 
     -- Try string
-    local as_str = val is string and val
+    local as_str = val as string
     if as_str:is_some() then
         return "String: " .. as_str:unwrap()
     end
 
     -- Try bool
     --[[
-    local as_bool = val is bool and val
+    local as_bool = val as bool
     if as_bool:is_some() then
         if as_bool:unwrap() then
             return "Boolean: true"
@@ -115,6 +115,5 @@ end
 
 println("")
 println("=== All narrowing tests passed! ===")
-
 
 

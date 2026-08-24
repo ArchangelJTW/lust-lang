@@ -84,7 +84,8 @@ pub fn compile_program_with_config(program: Program, config: &LustConfig) -> cra
     typechecker.set_imports_by_module(imports_map.clone());
     typechecker.check_program(&program.modules)?;
     let option_coercions = typechecker.take_option_coercions();
-    let _struct_defs = typechecker.take_struct_definitions();
+    let checked_array_indices = typechecker.take_checked_array_indices();
+    let struct_defs = typechecker.take_struct_definitions();
     let _enum_defs = typechecker.take_enum_definitions();
     let signatures = typechecker.take_function_signatures();
     // Typechecker no longer needed - free its memory
@@ -106,6 +107,7 @@ pub fn compile_program_with_config(program: Program, config: &LustConfig) -> cra
     // Phase 3: Compile
     let mut compiler = Compiler::new();
     compiler.set_option_coercions(option_coercions);
+    compiler.set_checked_array_indices(checked_array_indices);
     compiler.configure_stdlib(config);
     compiler.set_imports_by_module(imports_map);
     compiler.set_entry_module(program_entry_module.clone());
@@ -119,6 +121,7 @@ pub fn compile_program_with_config(program: Program, config: &LustConfig) -> cra
     // Phase 4: Create VM
     let mut vm = VM::with_config(config);
     vm.load_functions(functions);
+    vm.register_structs(&struct_defs);
     for (type_name, trait_name) in trait_impls {
         vm.register_trait_impl(type_name, trait_name);
     }

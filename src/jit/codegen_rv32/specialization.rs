@@ -170,6 +170,9 @@ impl JitCompiler {
         let off0 = stack_offset;
         let off4 = stack_offset + 4;
         let off8 = stack_offset + 8;
+        dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, off0]);
+        dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, off4]);
+        dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, off8]);
         dynasm!(self.ops ; .arch riscv32i ; addi a1, s0, off0);
         dynasm!(self.ops ; .arch riscv32i ; addi a2, s0, off4);
         dynasm!(self.ops ; .arch riscv32i ; addi a3, s0, off8);
@@ -223,6 +226,9 @@ impl JitCompiler {
 
         let fail = self.current_fail_label();
         dynasm!(self.ops ; .arch riscv32i ; beqz a0, => fail);
+        dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, off0]);
+        dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, off4]);
+        dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, off8]);
 
         Ok(())
     }

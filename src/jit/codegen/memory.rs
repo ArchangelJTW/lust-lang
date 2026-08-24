@@ -72,7 +72,12 @@ impl JitCompiler {
         let index_offset = (index as i32) * (mem::size_of::<Value>() as i32);
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
         extern "C" {
-            fn jit_array_get_safe(array_value: *const Value, index: i64, out: *mut Value) -> u8;
+            fn jit_array_get_safe(
+                vm_ptr: *mut crate::VM,
+                array_value: *const Value,
+                index_value: *const Value,
+                out: *mut Value,
+            ) -> u8;
         }
 
         dynasm!(self.ops
@@ -82,10 +87,71 @@ impl JitCompiler {
             ; mov al, [r12 + index_offset]
             ; cmp al, 2
             ; jne >fail
-            ; lea rdi, [r12 + array_offset]
-            ; mov rsi, [r12 + index_offset + 8]
-            ; lea rdx, [r12 + dest_offset]
+            ; mov rdi, r13
+            ; lea rsi, [r12 + array_offset]
+            ; lea rdx, [r12 + index_offset]
+            ; lea rcx, [r12 + dest_offset]
             ; mov rax, QWORD jit_array_get_safe as *const () as _
+            ; call rax
+            ; test al, al
+            ; jz >fail
+        );
+        Ok(())
+    }
+
+    pub(super) fn compile_try_get_index(&mut self, dest: u8, array: u8, index: u8) -> Result<()> {
+        let array_offset = (array as i32) * (mem::size_of::<Value>() as i32);
+        let index_offset = (index as i32) * (mem::size_of::<Value>() as i32);
+        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
+        extern "C" {
+            fn jit_array_index_result_safe(
+                vm_ptr: *mut crate::VM,
+                array_value: *const Value,
+                index_value: *const Value,
+                out: *mut Value,
+            ) -> u8;
+        }
+
+        dynasm!(self.ops
+            ; mov rdi, r13
+            ; lea rsi, [r12 + array_offset]
+            ; lea rdx, [r12 + index_offset]
+            ; lea rcx, [r12 + dest_offset]
+            ; mov rax, QWORD jit_array_index_result_safe as *const () as _
+            ; call rax
+            ; test al, al
+            ; jz >fail
+        );
+        Ok(())
+    }
+
+    pub(super) fn compile_array_index_ok(
+        &mut self,
+        value_dest: u8,
+        condition_dest: u8,
+        array: u8,
+        index: u8,
+    ) -> Result<()> {
+        let value_size = mem::size_of::<Value>() as i32;
+        let array_offset = (array as i32) * value_size;
+        let index_offset = (index as i32) * value_size;
+        let value_offset = (value_dest as i32) * value_size;
+        let condition_offset = (condition_dest as i32) * value_size;
+        extern "C" {
+            fn jit_array_index_ok_safe(
+                array_value: *const Value,
+                index_value: *const Value,
+                value_out: *mut Value,
+                condition_out: *mut Value,
+            ) -> u8;
+        }
+
+        dynasm!(self.ops
+            ; lea rdi, [r12 + array_offset]
+            ; lea rsi, [r12 + index_offset]
+            ; lea rdx, [r12 + value_offset]
+            ; lea rcx, [r12 + condition_offset]
+            ; mov rax, QWORD jit_array_index_ok_safe as *const () as _
             ; call rax
             ; test al, al
             ; jz >fail
@@ -330,12 +396,17 @@ impl JitCompiler {
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
 
         extern "C" {
-            fn jit_enum_unwrap_safe(enum_ptr: *const Value, out_ptr: *mut Value) -> u8;
+            fn jit_enum_unwrap_safe(
+                vm_ptr: *mut crate::VM,
+                enum_ptr: *const Value,
+                out_ptr: *mut Value,
+            ) -> u8;
         }
 
         dynasm!(self.ops
-            ; lea rdi, [r12 + enum_offset]
-            ; lea rsi, [r12 + dest_offset]
+            ; mov rdi, r13
+            ; lea rsi, [r12 + enum_offset]
+            ; lea rdx, [r12 + dest_offset]
             ; mov rax, QWORD jit_enum_unwrap_safe as *const () as _
             ; call rax
             ; test al, al
@@ -695,6 +766,84 @@ impl JitCompiler {
             ; movzx rax, al
         );
         self.store_from_rax(dest, 1);
+        Ok(())
+    }
+
+    pub(super) fn compile_type_is(&mut self, dest: u8, value: u8, type_name: &str) -> Result<()> {
+        let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
+        let direct_tag = match type_name {
+            "nil" | "()" => Some(ValueTag::Nil),
+            "bool" => Some(ValueTag::Bool),
+            "int" => Some(ValueTag::Int),
+            "float" => Some(ValueTag::Float),
+            "string" => Some(ValueTag::String),
+            "Array" => Some(ValueTag::Array),
+            "Tuple" => Some(ValueTag::Tuple),
+            "Map" => Some(ValueTag::Map),
+            _ => None,
+        };
+        if type_name == "unknown" {
+            dynasm!(self.ops ; mov rax, QWORD 1);
+            self.store_from_rax(dest, 1);
+            return Ok(());
+        }
+        if let Some(tag) = direct_tag {
+            let tag = tag.as_u8() as i8;
+            dynasm!(self.ops
+                ; cmp BYTE [r12 + value_offset], tag
+                ; sete al
+                ; movzx rax, al
+            );
+            self.store_from_rax(dest, 1);
+            return Ok(());
+        }
+
+        extern "C" {
+            fn jit_type_is_safe(
+                vm_ptr: *mut crate::VM,
+                value_ptr: *const Value,
+                type_name_ptr: *const u8,
+                type_name_len: usize,
+            ) -> u8;
+        }
+        let (type_name_ptr, type_name_len) = self.retain_string(type_name);
+        dynasm!(self.ops
+            ; mov rdi, r13
+            ; lea rsi, [r12 + value_offset]
+            ; mov rdx, QWORD type_name_ptr as _
+            ; mov rcx, QWORD type_name_len as _
+            ; mov rax, QWORD jit_type_is_safe as *const () as _
+            ; call rax
+            ; movzx rax, al
+        );
+        self.store_from_rax(dest, 1);
+        Ok(())
+    }
+
+    pub(super) fn compile_try_cast(&mut self, dest: u8, value: u8, type_name: &str) -> Result<()> {
+        let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
+        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
+        extern "C" {
+            fn jit_try_cast_safe(
+                vm_ptr: *mut crate::VM,
+                value_ptr: *const Value,
+                type_name_ptr: *const u8,
+                type_name_len: usize,
+                out: *mut Value,
+            ) -> u8;
+        }
+        let (type_name_ptr, type_name_len) = self.retain_string(type_name);
+        dynasm!(self.ops
+            ; mov rdi, r13
+            ; lea rsi, [r12 + value_offset]
+            ; mov rdx, QWORD type_name_ptr as _
+            ; mov rcx, QWORD type_name_len as _
+            ; lea r8, [r12 + dest_offset]
+            ; mov rax, QWORD jit_try_cast_safe as *const () as _
+            ; call rax
+            ; test al, al
+            ; jz >fail
+        );
         Ok(())
     }
 

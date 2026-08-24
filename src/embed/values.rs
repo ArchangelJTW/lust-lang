@@ -963,26 +963,215 @@ mod tests {
     }
 
     #[test]
-    fn unknown_cast_is_checked_at_runtime() {
+    fn unknown_cast_returns_option() {
         let _guard = serial_guard();
         let source = r#"
-            pub function cast_int(value: unknown): int
+            pub function cast_int(value: unknown): Option<int>
                 return value as int
+            end
+
+            pub function cast_bool(value: unknown): Option<bool>
+                return value as bool
             end
         "#;
         let mut program = build_program(source);
 
+        let int_result = program
+            .call_raw("main.cast_int", vec![Value::Int(7)])
+            .expect("matching cast");
         assert!(matches!(
-            program.call_raw("main.cast_int", vec![Value::Int(7)]),
-            Ok(Value::Int(7))
+            int_result.as_enum(),
+            Some(("Option", "Some", Some(values)))
+                if matches!(values, [Value::Int(7)])
         ));
-        let error = program
+
+        let mismatch = program
             .call_raw(
                 "main.cast_int",
                 vec![Value::String(Rc::new("seven".to_string()))],
             )
-            .unwrap_err();
-        assert!(error.to_string().contains("Cannot cast value"));
+            .expect("mismatching cast is non-trapping");
+        assert!(matches!(mismatch.as_enum(), Some(("Option", "None", None))));
+
+        let bool_result = program
+            .call_raw("main.cast_bool", vec![Value::Bool(false)])
+            .expect("false remains a present option payload");
+        assert!(matches!(
+            bool_result.as_enum(),
+            Some(("Option", "Some", Some(values)))
+                if matches!(values, [Value::Bool(false)])
+        ));
+    }
+
+    #[test]
+    fn array_index_returns_result_with_structured_bounds_error() {
+        let _guard = serial_guard();
+        let source = r#"
+            struct IndexCounter
+                n: int
+            end
+
+            pub function read(index: int): Result<unknown, IndexError>
+                local values: Array<unknown> = ["ok", 1]
+                return values[index]
+            end
+
+            pub function assign(): int
+                local values: Array<int> = [1]
+                values[0] = 9
+                return values:get(0):unwrap()
+            end
+
+            pub function unwrap_loop(index: int): int
+                local values: Array<int> = [7]
+                local total: int = 0
+                for i = 1, 20 do
+                    local result = values[index]
+                    total = total + result:unwrap()
+                end
+                return total
+            end
+
+            pub function make_counter(): IndexCounter
+                return IndexCounter { n = 0 }
+            end
+
+            pub function budgeted_read(
+                counter: IndexCounter,
+                values: Array<int>,
+                index: int
+            ): int
+                local total: int = 0
+                for i = 1, 100 do
+                    counter.n = counter.n + 1
+                    local result = values[index]
+                    if result:is_ok() then
+                        total = total + result:unwrap()
+                    end
+                end
+                return total
+            end
+        "#;
+        let mut program = build_program(source);
+
+        let in_bounds = program
+            .call_raw("main.read", vec![Value::Int(1)])
+            .expect("in-bounds index");
+        assert!(matches!(
+            in_bounds.as_enum(),
+            Some(("Result", "Ok", Some(values))) if matches!(values, [Value::Int(1)])
+        ));
+
+        for index in [-1, 2] {
+            let out_of_bounds = program
+                .call_raw("main.read", vec![Value::Int(index)])
+                .expect("out-of-bounds index is a value");
+            let error = match out_of_bounds.as_enum() {
+                Some(("Result", "Err", Some([error]))) => error,
+                other => panic!("expected Result.Err(IndexError), got {other:?}"),
+            };
+            assert!(matches!(
+                error.struct_get_field("index"),
+                Some(Value::Int(actual)) if actual == index
+            ));
+            assert!(matches!(
+                error.struct_get_field("length"),
+                Some(Value::Int(2))
+            ));
+        }
+
+        assert!(matches!(
+            program.call_raw("main.assign", vec![]),
+            Ok(Value::Int(9))
+        ));
+        assert!(matches!(
+            program.call_raw("main.unwrap_loop", vec![Value::Int(0)]),
+            Ok(Value::Int(140))
+        ));
+        assert!(program
+            .call_raw("main.unwrap_loop", vec![Value::Int(1)])
+            .is_err());
+
+        let counter = program
+            .call_raw("main.make_counter", vec![])
+            .expect("counter");
+        let values = Value::array(vec![Value::Int(7)]);
+        program.set_memory_budget_bytes(core::mem::size_of::<Value>() * 37);
+        program.reset_memory_counter();
+        assert!(program
+            .call_raw(
+                "main.budgeted_read",
+                vec![counter.clone(), values, Value::Int(0)]
+            )
+            .is_err());
+        assert!(matches!(
+            counter.struct_get_field("n"),
+            Some(Value::Int(38))
+        ));
+    }
+
+    #[test]
+    fn user_index_error_name_does_not_replace_builtin_layout() {
+        let _guard = serial_guard();
+        let source = r#"
+            struct IndexError
+                message: string
+            end
+
+            pub function read(): unknown
+                local values: Array<int> = []
+                return values[0]
+            end
+        "#;
+        let mut program = build_program(source);
+
+        let result = program.call_raw("main.read", vec![]).expect("safe read");
+        let error = match result.as_enum() {
+            Some(("Result", "Err", Some([error]))) => error,
+            other => panic!("expected Result.Err(IndexError), got {other:?}"),
+        };
+        assert!(matches!(
+            error.struct_get_field("index"),
+            Some(Value::Int(0))
+        ));
+        assert!(matches!(
+            error.struct_get_field("length"),
+            Some(Value::Int(0))
+        ));
+    }
+
+    #[test]
+    fn cast_chains_into_pattern_without_parentheses_or_re_evaluation() {
+        let _guard = serial_guard();
+        let source = r#"
+            function next_value(calls: Array<int>): unknown
+                calls:push(1)
+                return 7
+            end
+
+            pub function run(): int
+                local calls: Array<int> = []
+                if next_value(calls) as int is Some(x) and x > 0 then
+                    return x * 10 + calls:len()
+                end
+                return -1
+            end
+
+            pub function parenthesized(value: unknown): int
+                if (value as int is Some(x)) then
+                    return x
+                end
+                return -1
+            end
+        "#;
+        let mut program = build_program(source);
+
+        let result = program.call_raw("main.run", vec![]);
+        assert!(matches!(result, Ok(Value::Int(71))), "{result:?}");
+        assert!(matches!(
+            program.call_raw("main.parenthesized", vec![Value::Int(9)]),
+            Ok(Value::Int(9))
+        ));
     }
 
     #[test]

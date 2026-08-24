@@ -42,12 +42,13 @@ pub enum Instruction {
     GetField(Register, Register, ConstIndex),
     SetField(Register, ConstIndex, Register),
     GetIndex(Register, Register, Register),
+    TryGetIndex(Register, Register, Register),
     ArrayLen(Register, Register),
     SetIndex(Register, Register, Register),
     Concat(Register, Register, Register),
     CallMethod(Register, ConstIndex, Register, u8, Register),
     TypeIs(Register, Register, ConstIndex),
-    CheckedCast(Register, ConstIndex),
+    TryCast(Register, Register, ConstIndex),
     LoadUpvalue(Register, u8),
     StoreUpvalue(u8, Register),
     Closure(Register, ConstIndex, Register, u8),
@@ -93,12 +94,13 @@ pub enum OpCode {
     GetField,
     SetField,
     GetIndex,
+    TryGetIndex,
     ArrayLen,
     SetIndex,
     Concat,
     CallMethod,
     TypeIs,
-    CheckedCast,
+    TryCast,
     LoadUpvalue,
     StoreUpvalue,
     Closure,
@@ -145,12 +147,13 @@ impl Instruction {
             Instruction::GetField(_, _, _) => OpCode::GetField,
             Instruction::SetField(_, _, _) => OpCode::SetField,
             Instruction::GetIndex(_, _, _) => OpCode::GetIndex,
+            Instruction::TryGetIndex(_, _, _) => OpCode::TryGetIndex,
             Instruction::ArrayLen(_, _) => OpCode::ArrayLen,
             Instruction::SetIndex(_, _, _) => OpCode::SetIndex,
             Instruction::Concat(_, _, _) => OpCode::Concat,
             Instruction::CallMethod(_, _, _, _, _) => OpCode::CallMethod,
             Instruction::TypeIs(_, _, _) => OpCode::TypeIs,
-            Instruction::CheckedCast(_, _) => OpCode::CheckedCast,
+            Instruction::TryCast(_, _, _) => OpCode::TryCast,
             Instruction::LoadUpvalue(_, _) => OpCode::LoadUpvalue,
             Instruction::StoreUpvalue(_, _) => OpCode::StoreUpvalue,
             Instruction::Closure(_, _, _, _) => OpCode::Closure,
@@ -191,10 +194,12 @@ impl Instruction {
             | Instruction::GetEnumValue(dest, _, _)
             | Instruction::GetField(dest, _, _)
             | Instruction::GetIndex(dest, _, _)
+            | Instruction::TryGetIndex(dest, _, _)
             | Instruction::ArrayLen(dest, _)
             | Instruction::Concat(dest, _, _)
             | Instruction::CallMethod(_, _, _, _, dest)
             | Instruction::TypeIs(dest, _, _)
+            | Instruction::TryCast(dest, _, _)
             | Instruction::LoadUpvalue(dest, _)
             | Instruction::Closure(dest, _, _, _) => Some(dest),
             Instruction::StoreGlobal(_, _)
@@ -204,7 +209,6 @@ impl Instruction {
             | Instruction::Return(_)
             | Instruction::SetField(_, _, _)
             | Instruction::SetIndex(_, _, _)
-            | Instruction::CheckedCast(_, _)
             | Instruction::StoreUpvalue(_, _) => None,
         }
     }
@@ -239,6 +243,7 @@ impl Instruction {
             | Instruction::And(_, lhs, rhs)
             | Instruction::Or(_, lhs, rhs)
             | Instruction::GetIndex(_, lhs, rhs)
+            | Instruction::TryGetIndex(_, lhs, rhs)
             | Instruction::Concat(_, lhs, rhs) => register == lhs || register == rhs,
             Instruction::SetIndex(collection, index, value) => {
                 register == collection || register == index || register == value
@@ -247,7 +252,7 @@ impl Instruction {
             Instruction::IsEnumVariant(_, value, _, _)
             | Instruction::GetField(_, value, _)
             | Instruction::TypeIs(_, value, _)
-            | Instruction::CheckedCast(value, _) => register == value,
+            | Instruction::TryCast(_, value, _) => register == value,
             Instruction::Call(function, first, count, _) => {
                 register == function || in_range(first, count)
             }
@@ -396,6 +401,9 @@ impl fmt::Display for Instruction {
             }
 
             Instruction::GetIndex(d, arr, idx) => write!(f, "GetIndex R{}, R{}, R{}", d, arr, idx),
+            Instruction::TryGetIndex(d, arr, idx) => {
+                write!(f, "TryGetIndex R{}, R{}, R{}", d, arr, idx)
+            }
             Instruction::ArrayLen(d, arr) => write!(f, "ArrayLen R{}, R{}", d, arr),
             Instruction::SetIndex(arr, idx, val) => {
                 write!(f, "SetIndex R{}, R{}, R{}", arr, idx, val)
@@ -420,8 +428,8 @@ impl fmt::Display for Instruction {
                 write!(f, "TypeIs R{}, R{}, K{}", d, val, type_name)
             }
 
-            Instruction::CheckedCast(value, type_name) => {
-                write!(f, "CheckedCast R{}, K{}", value, type_name)
+            Instruction::TryCast(dest, value, type_name) => {
+                write!(f, "TryCast R{}, R{}, K{}", dest, value, type_name)
             }
 
             Instruction::LoadUpvalue(d, idx) => write!(f, "LoadUpvalue R{}, U{}", d, idx),

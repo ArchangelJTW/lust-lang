@@ -1457,14 +1457,18 @@ pub unsafe extern "C" fn jit_drop_values(values: *mut Value, len: usize) {
 #[cfg(feature = "std")]
 #[no_mangle]
 pub unsafe extern "C" fn jit_array_get_safe(
+    vm_ptr: *mut VM,
     array_value_ptr: *const Value,
-    index: i64,
+    index_value_ptr: *const Value,
     out: *mut Value,
 ) -> u8 {
-    if array_value_ptr.is_null() || out.is_null() {
+    if vm_ptr.is_null() || array_value_ptr.is_null() || index_value_ptr.is_null() || out.is_null() {
         eprintln!("❌ jit_array_get_safe: null pointer detected!");
         return 0;
     }
+    let Some(index) = (&*index_value_ptr).as_int() else {
+        return 0;
+    };
 
     let array_value = &*array_value_ptr;
     let arr = match array_value {
@@ -1473,24 +1477,91 @@ pub unsafe extern "C" fn jit_array_get_safe(
             return 0;
         }
     };
-    if index < 0 {
-        return 0;
-    }
-
-    let idx = index as usize;
     let borrowed = match arr.try_borrow() {
         Ok(b) => b,
         Err(_) => {
             return 0;
         }
     };
-    if idx >= borrowed.len() {
+    let length = borrowed.len();
+    if index < 0 || index as usize >= length {
+        drop(borrowed);
+        (&mut *vm_ptr).set_pending_jit_error(crate::LustError::RuntimeError {
+            message: format!("Array index {} out of bounds (length: {})", index, length),
+        });
         return 0;
     }
 
-    let value = borrowed[idx].clone();
+    let value = borrowed[index as usize].clone();
     drop(borrowed);
     replace_value(out, value);
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_array_index_result_safe(
+    vm_ptr: *mut VM,
+    array_value_ptr: *const Value,
+    index_value_ptr: *const Value,
+    out: *mut Value,
+) -> u8 {
+    if vm_ptr.is_null() || array_value_ptr.is_null() || index_value_ptr.is_null() || out.is_null() {
+        return 0;
+    }
+    let Some(index) = (&*index_value_ptr).as_int() else {
+        return 0;
+    };
+    let vm = &mut *vm_ptr;
+    let result = match vm.array_index_result(&*array_value_ptr, index) {
+        Ok(result) => result,
+        Err(error) => {
+            vm.set_pending_jit_error(error);
+            return 0;
+        }
+    };
+    vm.observe_value(&result);
+    replace_value(out, result);
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_array_index_ok_safe(
+    array_value_ptr: *const Value,
+    index_value_ptr: *const Value,
+    value_out: *mut Value,
+    condition_out: *mut Value,
+) -> u8 {
+    if array_value_ptr.is_null()
+        || index_value_ptr.is_null()
+        || value_out.is_null()
+        || condition_out.is_null()
+    {
+        return 0;
+    }
+    let Value::Array(array) = &*array_value_ptr else {
+        return 0;
+    };
+    let Some(index) = (&*index_value_ptr).as_int() else {
+        return 0;
+    };
+    let borrowed = match array.try_borrow() {
+        Ok(borrowed) => borrowed,
+        Err(_) => return 0,
+    };
+    let value = if index >= 0 {
+        borrowed.get(index as usize).cloned()
+    } else {
+        None
+    };
+    drop(borrowed);
+
+    if let Some(value) = value {
+        replace_value(value_out, value);
+        replace_value(condition_out, Value::Bool(true));
+    } else {
+        replace_value(value_out, Value::Nil);
+        replace_value(condition_out, Value::Bool(false));
+    }
     1
 }
 
@@ -1623,20 +1694,28 @@ pub unsafe extern "C" fn jit_unbox_array_int(
             let cell_ptr = arr_rc.as_ptr();
             let vec_ref = &mut *cell_ptr;
 
-            // Take ownership of the Vec<Value> by swapping with empty vec
-            let original_vec = core::mem::replace(vec_ref, Vec::new());
-
-            if original_vec
-                .iter()
-                .any(|value| !matches!(value, Value::Int(_)))
-            {
-                *vec_ref = original_vec;
+            // Copy the elements out; do NOT move them.  This used to be a
+            // `mem::replace(vec_ref, Vec::new())`, which left the source array
+            // empty for the entire span of the trace and relied on the postamble
+            // rebox to put the elements back.  Anything that re-entered the
+            // runtime mid-trace then observed a zero-length array: a nested
+            // `for elem in arr` built its iterator from the hollowed-out array
+            // and failed with "Array index 2 out of bounds (length: 0)".
+            //
+            // Copying is affordable because unboxing happens once per trace
+            // entry, not per iteration, and it is sound because no trace op
+            // overwrites the boxed array in place — `VecPush` only appends to the
+            // specialized buffer, and the rebox publishes the result.  A runtime
+            // re-entry mid-trace can still see values that predate pushes made
+            // by the trace; closing that hole needs escape analysis so such
+            // arrays are never specialized at all.
+            if vec_ref.iter().any(|value| !matches!(value, Value::Int(_))) {
                 return 0;
             }
-            let mut specialized_vec: Vec<LustInt> = original_vec
-                .into_iter()
+            let mut specialized_vec: Vec<LustInt> = vec_ref
+                .iter()
                 .map(|value| match value {
-                    Value::Int(value) => value,
+                    Value::Int(value) => *value,
                     _ => unreachable!("array element types were validated above"),
                 })
                 .collect();
@@ -1654,8 +1733,8 @@ pub unsafe extern "C" fn jit_unbox_array_int(
             ptr::write(out_len, len);
             ptr::write(out_cap, cap);
 
-            // Note: The original Rc<RefCell<Vec<Value>>> now contains an empty Vec
-            // This is fine - when we rebox, we'll refill it
+            // The original Rc<RefCell<Vec<Value>>> keeps its contents; the rebox
+            // overwrites them with whatever the trace produced.
 
             1
         }
@@ -1674,8 +1753,11 @@ pub unsafe extern "C" fn jit_rebox_array_int(
     vec_cap: usize,
     array_value_ptr: *mut Value,
 ) -> u8 {
-    if vec_ptr.is_null() || array_value_ptr.is_null() {
+    if array_value_ptr.is_null() {
         return 0;
+    }
+    if vec_ptr.is_null() {
+        return u8::from(vec_len == 0 && vec_cap == 0);
     }
 
     // Reconstruct Vec<LustInt> from raw parts
@@ -1782,21 +1864,50 @@ pub unsafe extern "C" fn jit_enum_is_some_safe(enum_ptr: *const Value, out_ptr: 
 
 #[cfg(feature = "std")]
 #[no_mangle]
-pub unsafe extern "C" fn jit_enum_unwrap_safe(enum_ptr: *const Value, out_ptr: *mut Value) -> u8 {
-    if enum_ptr.is_null() || out_ptr.is_null() {
+pub unsafe extern "C" fn jit_enum_unwrap_safe(
+    vm_ptr: *mut VM,
+    enum_ptr: *const Value,
+    out_ptr: *mut Value,
+) -> u8 {
+    if vm_ptr.is_null() || enum_ptr.is_null() || out_ptr.is_null() {
         return 0;
     }
 
     let enum_value = &*enum_ptr;
     match enum_value {
         Value::Enum {
-            values: Some(vals), ..
-        } if vals.len() == 1 => {
+            enum_name,
+            variant,
+            values: Some(vals),
+        } if vals.len() == 1
+            && ((enum_name == "Option" && variant == "Some")
+                || (enum_name == "Result" && variant == "Ok")) =>
+        {
             let value = vals[0].clone();
             replace_value(out_ptr, value);
             1
         }
-        _ => 0,
+        Value::Enum {
+            enum_name,
+            variant,
+            values,
+        } => {
+            let detail = values
+                .as_ref()
+                .and_then(|values| values.first())
+                .map(|value| format!(": {}", value))
+                .unwrap_or_default();
+            (&mut *vm_ptr).set_pending_jit_error(crate::LustError::RuntimeError {
+                message: format!("Called unwrap() on {}::{}{}", enum_name, variant, detail),
+            });
+            0
+        }
+        value => {
+            (&mut *vm_ptr).set_pending_jit_error(crate::LustError::RuntimeError {
+                message: format!("Cannot unwrap {:?}", value.type_of()),
+            });
+            0
+        }
     }
 }
 
@@ -2363,6 +2474,58 @@ pub unsafe extern "C" fn jit_is_enum_variant_safe(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn jit_type_is_safe(
+    vm_ptr: *mut VM,
+    value_ptr: *const Value,
+    type_name_ptr: *const u8,
+    type_name_len: usize,
+) -> u8 {
+    if vm_ptr.is_null() || value_ptr.is_null() || type_name_ptr.is_null() {
+        return 0;
+    }
+
+    let type_name = match str::from_utf8(slice::from_raw_parts(type_name_ptr, type_name_len)) {
+        Ok(name) => name,
+        Err(_) => return 0,
+    };
+    if (&*vm_ptr).value_is_type(&*value_ptr, type_name) {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn jit_try_cast_safe(
+    vm_ptr: *mut VM,
+    value_ptr: *const Value,
+    type_name_ptr: *const u8,
+    type_name_len: usize,
+    out: *mut Value,
+) -> u8 {
+    if vm_ptr.is_null() || value_ptr.is_null() || type_name_ptr.is_null() || out.is_null() {
+        return 0;
+    }
+
+    let type_name = match str::from_utf8(slice::from_raw_parts(type_name_ptr, type_name_len)) {
+        Ok(name) => name,
+        Err(_) => return 0,
+    };
+    let vm = &mut *vm_ptr;
+    let result = if vm.value_is_type(&*value_ptr, type_name) {
+        if !vm.try_charge_memory_value_vec(1) {
+            return 0;
+        }
+        Value::some((*value_ptr).clone())
+    } else {
+        Value::none()
+    };
+    vm.observe_value(&result);
+    replace_value(out, result);
+    1
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn jit_get_enum_value_safe(
     enum_ptr: *const Value,
     index: usize,
@@ -2513,6 +2676,44 @@ fn call_builtin_method_simple(
 
             _ => Err(format!(
                 "Option method '{}' not supported in JIT",
+                method_name
+            )),
+        },
+        Value::Enum {
+            enum_name,
+            variant,
+            values,
+        } if enum_name == "Result" => match method_name {
+            "is_ok" => Ok(Value::Bool(variant == "Ok")),
+            "is_err" => Ok(Value::Bool(variant == "Err")),
+            "unwrap" => {
+                if variant == "Ok" {
+                    values
+                        .as_ref()
+                        .and_then(|values| values.first())
+                        .cloned()
+                        .ok_or_else(|| "Result::Ok should have exactly 1 value".to_string())
+                } else {
+                    Err("Called unwrap() on Result::Err".to_string())
+                }
+            }
+            "unwrap_or" => {
+                let default = args
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| "Result:unwrap_or requires a default value".to_string())?;
+                if variant == "Ok" {
+                    Ok(values
+                        .as_ref()
+                        .and_then(|values| values.first())
+                        .cloned()
+                        .unwrap_or(default))
+                } else {
+                    Ok(default)
+                }
+            }
+            _ => Err(format!(
+                "Result method '{}' not supported in JIT",
                 method_name
             )),
         },
@@ -2871,7 +3072,7 @@ mod jit_replacement_tests {
     #[cfg(feature = "std")]
     #[test]
     fn failed_array_specialization_restores_original_values() {
-        let value = Value::array(vec![Value::Int(1), Value::string("not an int")]);
+        let mut value = Value::array(vec![Value::Int(1), Value::string("not an int")]);
         let mut data = core::ptr::null_mut();
         let mut len = 0;
         let mut cap = 0;
@@ -2879,6 +3080,10 @@ mod jit_replacement_tests {
         let result = unsafe { jit_unbox_array_int(&value, &mut data, &mut len, &mut cap) };
 
         assert_eq!(result, 0);
+        assert_eq!(
+            unsafe { jit_rebox_array_int(data, len, cap, &mut value) },
+            1
+        );
         assert_eq!(value.array_len(), Some(2));
         assert!(matches!(value.array_get(0), Some(Value::Int(1))));
         assert!(matches!(value.array_get(1), Some(Value::String(_))));

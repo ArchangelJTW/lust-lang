@@ -5,3 +5,4 @@ vs-extension/lust-analyzer/node_modules
 examples/rust-extension/extensions/double/target
 examples/rust-extension/extensions/triple/target
 /scripts
+tools/jit-diff/__pycache__

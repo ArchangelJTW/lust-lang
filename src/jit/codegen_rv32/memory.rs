@@ -74,21 +74,78 @@ impl JitCompiler {
 
     pub(super) fn compile_get_index(&mut self, dest: u8, array: u8, index: u8) -> Result<()> {
         extern "C" {
-            fn jit_array_get_safe(array_value: *const Value, index: i32, out: *mut Value) -> u8;
+            fn jit_array_get_safe(
+                vm_ptr: *mut crate::VM,
+                array_value: *const Value,
+                index_value: *const Value,
+                out: *mut Value,
+            ) -> u8;
         }
         // Guard: array must be Array (tag=5), index must be Int (tag=2)
         self.load_tag_to_t0(array);
         dynasm!(self.ops ; .arch riscv32i ; li t1, 5 ; bne t0, t1, >fail);
         self.load_tag_to_t0(index);
         dynasm!(self.ops ; .arch riscv32i ; li t1, 2 ; bne t0, t1, >fail);
-        // a0 = &array, a1 = index_i32, a2 = &dest
+        // a0 = VM, a1 = &array, a2 = &index, a3 = &dest
+        dynasm!(self.ops ; .arch riscv32i ; mv a0, s3);
+        self.emit_addr_in_t2(array, 0);
+        dynasm!(self.ops ; .arch riscv32i ; mv a1, t2);
+        self.emit_addr_in_t2(index, 0);
+        dynasm!(self.ops ; .arch riscv32i ; mv a2, t2);
+        self.emit_addr_in_t2(dest, 0);
+        dynasm!(self.ops ; .arch riscv32i ; mv a3, t2);
+        self.emit_load_fn_ptr(jit_array_get_safe as *const ());
+        self.emit_call_t0();
+        dynasm!(self.ops ; .arch riscv32i ; beqz a0, >fail);
+        Ok(())
+    }
+
+    pub(super) fn compile_try_get_index(&mut self, dest: u8, array: u8, index: u8) -> Result<()> {
+        extern "C" {
+            fn jit_array_index_result_safe(
+                vm_ptr: *mut crate::VM,
+                array_value: *const Value,
+                index_value: *const Value,
+                out: *mut Value,
+            ) -> u8;
+        }
+        dynasm!(self.ops ; .arch riscv32i ; mv a0, s3);
+        self.emit_addr_in_t2(array, 0);
+        dynasm!(self.ops ; .arch riscv32i ; mv a1, t2);
+        self.emit_addr_in_t2(index, 0);
+        dynasm!(self.ops ; .arch riscv32i ; mv a2, t2);
+        self.emit_addr_in_t2(dest, 0);
+        dynasm!(self.ops ; .arch riscv32i ; mv a3, t2);
+        self.emit_load_fn_ptr(jit_array_index_result_safe as *const ());
+        self.emit_call_t0();
+        dynasm!(self.ops ; .arch riscv32i ; beqz a0, >fail);
+        Ok(())
+    }
+
+    pub(super) fn compile_array_index_ok(
+        &mut self,
+        value_dest: u8,
+        condition_dest: u8,
+        array: u8,
+        index: u8,
+    ) -> Result<()> {
+        extern "C" {
+            fn jit_array_index_ok_safe(
+                array_value: *const Value,
+                index_value: *const Value,
+                value_out: *mut Value,
+                condition_out: *mut Value,
+            ) -> u8;
+        }
         self.emit_addr_in_t2(array, 0);
         dynasm!(self.ops ; .arch riscv32i ; mv a0, t2);
-        self.load_data_to_t0(index);
-        dynasm!(self.ops ; .arch riscv32i ; mv a1, t0);
-        self.emit_addr_in_t2(dest, 0);
+        self.emit_addr_in_t2(index, 0);
+        dynasm!(self.ops ; .arch riscv32i ; mv a1, t2);
+        self.emit_addr_in_t2(value_dest, 0);
         dynasm!(self.ops ; .arch riscv32i ; mv a2, t2);
-        self.emit_load_fn_ptr(jit_array_get_safe as *const ());
+        self.emit_addr_in_t2(condition_dest, 0);
+        dynasm!(self.ops ; .arch riscv32i ; mv a3, t2);
+        self.emit_load_fn_ptr(jit_array_index_ok_safe as *const ());
         self.emit_call_t0();
         dynasm!(self.ops ; .arch riscv32i ; beqz a0, >fail);
         Ok(())
@@ -278,12 +335,17 @@ impl JitCompiler {
 
     pub(super) fn compile_enum_unwrap(&mut self, dest: u8, enum_reg: u8) -> Result<()> {
         extern "C" {
-            fn jit_enum_unwrap_safe(enum_ptr: *const Value, out_ptr: *mut Value) -> u8;
+            fn jit_enum_unwrap_safe(
+                vm_ptr: *mut crate::VM,
+                enum_ptr: *const Value,
+                out_ptr: *mut Value,
+            ) -> u8;
         }
+        dynasm!(self.ops ; .arch riscv32i ; mv a0, s3);
         self.emit_addr_in_t2(enum_reg, 0);
-        dynasm!(self.ops ; .arch riscv32i ; mv a0, t2);
-        self.emit_addr_in_t2(dest, 0);
         dynasm!(self.ops ; .arch riscv32i ; mv a1, t2);
+        self.emit_addr_in_t2(dest, 0);
+        dynasm!(self.ops ; .arch riscv32i ; mv a2, t2);
         self.emit_load_fn_ptr(jit_enum_unwrap_safe as *const ());
         self.emit_call_t0();
         dynasm!(self.ops ; .arch riscv32i ; beqz a0, >fail);
@@ -605,6 +667,87 @@ impl JitCompiler {
         // a0 = 1 if match, 0 if not
         dynasm!(self.ops ; .arch riscv32i ; mv t0, a0);
         self.store_t0_as_bool(dest);
+        Ok(())
+    }
+
+    pub(super) fn compile_type_is(&mut self, dest: u8, value: u8, type_name: &str) -> Result<()> {
+        let direct_tag = match type_name {
+            "nil" | "()" => Some(ValueTag::Nil),
+            "bool" => Some(ValueTag::Bool),
+            "int" => Some(ValueTag::Int),
+            "float" => Some(ValueTag::Float),
+            "string" => Some(ValueTag::String),
+            "Array" => Some(ValueTag::Array),
+            "Tuple" => Some(ValueTag::Tuple),
+            "Map" => Some(ValueTag::Map),
+            _ => None,
+        };
+        if type_name == "unknown" {
+            dynasm!(self.ops ; .arch riscv32i ; li t0, 1);
+            self.store_t0_as_bool(dest);
+            return Ok(());
+        }
+        if let Some(tag) = direct_tag {
+            self.load_tag_to_t0(value);
+            let tag = tag.as_u8() as i32;
+            dynasm!(self.ops
+                ; .arch riscv32i
+                ; li t1, tag
+                ; xor t0, t0, t1
+                ; sltiu t0, t0, 1
+            );
+            self.store_t0_as_bool(dest);
+            return Ok(());
+        }
+
+        extern "C" {
+            fn jit_type_is_safe(
+                vm_ptr: *mut crate::VM,
+                value_ptr: *const Value,
+                type_name_ptr: *const u8,
+                type_name_len: usize,
+            ) -> u8;
+        }
+        let (type_name_ptr, type_name_len) = self.retain_string(type_name);
+        let type_name_ptr = type_name_ptr as u32 as i32;
+        let type_name_len = type_name_len as i32;
+
+        dynasm!(self.ops ; .arch riscv32i ; mv a0, s3);
+        self.emit_addr_in_t2(value, 0);
+        dynasm!(self.ops ; .arch riscv32i ; mv a1, t2);
+        dynasm!(self.ops ; .arch riscv32i ; li a2, type_name_ptr);
+        dynasm!(self.ops ; .arch riscv32i ; li a3, type_name_len);
+        self.emit_load_fn_ptr(jit_type_is_safe as *const ());
+        self.emit_call_t0();
+        dynasm!(self.ops ; .arch riscv32i ; mv t0, a0);
+        self.store_t0_as_bool(dest);
+        Ok(())
+    }
+
+    pub(super) fn compile_try_cast(&mut self, dest: u8, value: u8, type_name: &str) -> Result<()> {
+        extern "C" {
+            fn jit_try_cast_safe(
+                vm_ptr: *mut crate::VM,
+                value_ptr: *const Value,
+                type_name_ptr: *const u8,
+                type_name_len: usize,
+                out: *mut Value,
+            ) -> u8;
+        }
+        let (type_name_ptr, type_name_len) = self.retain_string(type_name);
+        let type_name_ptr = type_name_ptr as u32 as i32;
+        let type_name_len = type_name_len as i32;
+
+        dynasm!(self.ops ; .arch riscv32i ; mv a0, s3);
+        self.emit_addr_in_t2(value, 0);
+        dynasm!(self.ops ; .arch riscv32i ; mv a1, t2);
+        dynasm!(self.ops ; .arch riscv32i ; li a2, type_name_ptr);
+        dynasm!(self.ops ; .arch riscv32i ; li a3, type_name_len);
+        self.emit_addr_in_t2(dest, 0);
+        dynasm!(self.ops ; .arch riscv32i ; mv a4, t2);
+        self.emit_load_fn_ptr(jit_try_cast_safe as *const ());
+        self.emit_call_t0();
+        dynasm!(self.ops ; .arch riscv32i ; beqz a0, >fail);
         Ok(())
     }
 

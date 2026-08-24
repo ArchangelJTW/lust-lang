@@ -1677,7 +1677,21 @@ impl TypeChecker {
             })
     }
 
-    pub fn check_index_expr(&mut self, object: &Expr, index: &Expr) -> Result<Type> {
+    pub fn check_index_expr(&mut self, span: Span, object: &Expr, index: &Expr) -> Result<Type> {
+        self.check_index_access(span, object, index, true)
+    }
+
+    pub fn check_index_target(&mut self, object: &Expr, index: &Expr) -> Result<Type> {
+        self.check_index_access(Self::dummy_span(), object, index, false)
+    }
+
+    fn check_index_access(
+        &mut self,
+        span: Span,
+        object: &Expr,
+        index: &Expr,
+        safe_array_read: bool,
+    ) -> Result<Type> {
         let object_type = self.check_expr(object)?;
         let index_type = self.check_expr(index)?;
         if matches!(object_type.kind, TypeKind::Unknown)
@@ -1696,7 +1710,26 @@ impl TypeChecker {
         match &object_type.kind {
             TypeKind::Array(elem_type) => {
                 self.unify(&Type::new(TypeKind::Int, Self::dummy_span()), &index_type)?;
-                Ok(elem_type.as_ref().clone())
+                if safe_array_read {
+                    if let Some(module) = &self.current_module {
+                        self.checked_array_indices
+                            .entry(module.clone())
+                            .or_default()
+                            .insert(span);
+                    }
+                    Ok(Type::new(
+                        TypeKind::Result(
+                            elem_type.clone(),
+                            Box::new(Type::new(
+                                TypeKind::Named("IndexError".to_string()),
+                                Self::dummy_span(),
+                            )),
+                        ),
+                        Self::dummy_span(),
+                    ))
+                } else {
+                    Ok(elem_type.as_ref().clone())
+                }
             }
 
             TypeKind::Map(key_type, value_type) => {

@@ -246,7 +246,10 @@ impl TypeChecker {
         }
 
         for (index, target) in targets.iter().enumerate() {
-            let raw_target_type = self.check_expr(target)?;
+            let raw_target_type = match &target.kind {
+                ExprKind::Index { object, index } => self.check_index_target(object, index)?,
+                _ => self.check_expr(target)?,
+            };
             let target_type = self.canonicalize_type(&raw_target_type);
             let value_type = if targets.len() == 1 && values.len() == 1 {
                 expr_types[0].clone()

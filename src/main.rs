@@ -1490,10 +1490,12 @@ fn compile_program(
     typechecker.set_imports_by_module(imports_map.clone());
     typechecker.check_program(&program.modules)?;
     let option_coercions = typechecker.take_option_coercions();
+    let checked_array_indices = typechecker.take_checked_array_indices();
     let struct_defs = typechecker.struct_definitions();
     let function_signatures = typechecker.function_signatures();
     let mut compiler = Compiler::new();
     compiler.set_option_coercions(option_coercions);
+    compiler.set_checked_array_indices(checked_array_indices);
     compiler.configure_stdlib(config);
     compiler.set_imports_by_module(imports_map);
     compiler.set_entry_module(program.entry_module.clone());

@@ -146,6 +146,18 @@ impl JitCompiler {
         let unbox_fn = jit_unbox_array_int as *const ();
 
         dynasm!(self.ops
+            // Zero the (ptr, len, cap) triple before attempting the unbox.
+            //
+            // If the unbox fails we jump to the bailout label, but the bailout
+            // path still runs the postamble, which reboxes from these very
+            // slots.  Left uninitialised they hold stack garbage, and a garbage
+            // `len` reaches `Vec::with_capacity` inside the rebox helper as a
+            // `capacity overflow` abort.  Zeroed, the helper's null check on
+            // `vec_ptr` makes the rebox a no-op instead.
+            ; mov QWORD [rbp + stack_offset], 0
+            ; mov QWORD [rbp + stack_offset + 8], 0
+            ; mov QWORD [rbp + stack_offset + 16], 0
+
             // Arg 1: array_ptr = r12 + reg_offset
             ; lea rdi, [r12 + reg_offset]
 
@@ -222,6 +234,13 @@ impl JitCompiler {
             // Check return value
             ; test al, al
             ; jz => self.current_fail_label()
+
+            // Rebox consumes the raw Vec allocation. Clear the metadata so a
+            // duplicated cleanup path is a harmless no-op rather than a second
+            // Vec::from_raw_parts over freed storage.
+            ; mov QWORD [rbp + stack_offset], 0
+            ; mov QWORD [rbp + stack_offset + 8], 0
+            ; mov QWORD [rbp + stack_offset + 16], 0
         );
 
         Ok(())

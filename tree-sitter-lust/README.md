@@ -198,7 +198,7 @@ This grammar supports:
 - **Pattern matching**: enum patterns with data extraction
 - **Literals**: numbers, strings, booleans, nil
 - **Comments**: `--` and `#` style
-- **Special syntax**: `:` for method calls, `:as<T>()` for type casting
+- **Special syntax**: `:` for method calls, `value as T` for a safe `Option<T>` cast, `array[index]` for a bounds-safe `Result<T, IndexError>` read, and `value is Pattern` for tests and pattern binding
 
 ## Development
 

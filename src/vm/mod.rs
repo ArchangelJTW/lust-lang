@@ -20,7 +20,7 @@ pub(super) use crate::jit::{
 pub(super) use crate::number::{
     float_abs, float_acos, float_asin, float_atan, float_atan2, float_ceil, float_clamp, float_cos,
     float_floor, float_from_int, float_round, float_sin, float_sqrt, float_tan, int_from_float,
-    int_from_usize, LustFloat,
+    int_from_usize, LustFloat, LustInt,
 };
 pub(super) use crate::{LustError, Result};
 pub(super) use alloc::{
@@ -167,6 +167,7 @@ pub struct VM {
     pub(super) max_stack_depth: usize,
     pub(super) pending_return_value: Option<Value>,
     pub(super) pending_return_dest: Option<Register>,
+    pub(super) pending_jit_error: Option<LustError>,
     pub(super) trace_recorder: Option<TraceRecorder>,
     pub(super) side_trace_context: Option<(crate::jit::TraceId, usize)>,
     pub(super) skip_next_trace_record: bool,

@@ -263,22 +263,27 @@ impl Compiler {
         elseif_branches: &[(Expr, Vec<Stmt>)],
         else_block: &Option<Vec<Stmt>>,
     ) -> Result<()> {
-        let is_standalone_pattern = matches!(&condition.kind, ExprKind::IsPattern { .. });
-        let pattern_bindings: Vec<(&Expr, &crate::ast::Pattern)> = if is_standalone_pattern {
-            self.extract_all_pattern_bindings(condition)
-        } else {
-            Vec::new()
-        };
         self.begin_scope();
-        let cond_reg = self.compile_expr(condition)?;
+        let mut tested_scrutinee = None;
+        let cond_reg = if let Some((expr, pattern)) = Self::direct_is_pattern(condition) {
+            if self.extract_all_pattern_bindings(condition).is_empty() {
+                self.compile_expr(condition)?
+            } else {
+                let scrutinee_reg = self.compile_expr(expr)?;
+                let result_reg = self.compile_is_pattern(scrutinee_reg, pattern)?;
+                tested_scrutinee = Some((scrutinee_reg, pattern));
+                result_reg
+            }
+        } else {
+            self.compile_expr(condition)?
+        };
         let jump_to_else = self.emit(Instruction::JumpIfNot(cond_reg, 0), 0);
         self.free_register(cond_reg);
-        self.reset_temp_registers();
-        for (scrutinee_expr, pattern) in pattern_bindings {
-            let enum_reg = self.compile_expr(scrutinee_expr)?;
+        if let Some((enum_reg, pattern)) = tested_scrutinee {
             self.bind_pattern_variables(enum_reg, pattern)?;
             self.free_register(enum_reg);
         }
+        self.reset_temp_registers();
 
         for stmt in then_block {
             self.compile_stmt(stmt)?;
@@ -290,22 +295,28 @@ impl Compiler {
         self.current_chunk_mut()
             .patch_jump(jump_to_else, next_branch_start);
         for (elseif_cond, elseif_body) in elseif_branches {
-            let is_standalone_pattern = matches!(&elseif_cond.kind, ExprKind::IsPattern { .. });
-            let elseif_pattern_bindings = if is_standalone_pattern {
-                self.extract_all_pattern_bindings(elseif_cond)
-            } else {
-                Vec::new()
-            };
-            let elseif_cond_reg = self.compile_expr(elseif_cond)?;
+            let mut tested_scrutinee = None;
+            let elseif_cond_reg =
+                if let Some((expr, pattern)) = Self::direct_is_pattern(elseif_cond) {
+                    if self.extract_all_pattern_bindings(elseif_cond).is_empty() {
+                        self.compile_expr(elseif_cond)?
+                    } else {
+                        let scrutinee_reg = self.compile_expr(expr)?;
+                        let result_reg = self.compile_is_pattern(scrutinee_reg, pattern)?;
+                        tested_scrutinee = Some((scrutinee_reg, pattern));
+                        result_reg
+                    }
+                } else {
+                    self.compile_expr(elseif_cond)?
+                };
             let jump_to_next = self.emit(Instruction::JumpIfNot(elseif_cond_reg, 0), 0);
             self.free_register(elseif_cond_reg);
             self.begin_scope();
-            self.reset_temp_registers();
-            for (scrutinee_expr, pattern) in elseif_pattern_bindings {
-                let enum_reg = self.compile_expr(scrutinee_expr)?;
+            if let Some((enum_reg, pattern)) = tested_scrutinee {
                 self.bind_pattern_variables(enum_reg, pattern)?;
                 self.free_register(enum_reg);
             }
+            self.reset_temp_registers();
 
             for stmt in elseif_body {
                 self.compile_stmt(stmt)?;
@@ -363,6 +374,23 @@ impl Compiler {
         Ok(())
     }
 
+    /// The value of an integer-literal expression, if it is one.
+    ///
+    /// Used to settle a numeric `for` loop's comparison direction at compile
+    /// time.  Only the forms a step is actually written in are folded: a literal,
+    /// a negated literal, and either wrapped in parentheses.
+    fn const_int_expr(expr: &Expr) -> Option<LustInt> {
+        match &expr.kind {
+            ExprKind::Literal(Literal::Integer(value)) => Some(*value),
+            ExprKind::Paren(inner) => Self::const_int_expr(inner),
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => Self::const_int_expr(operand).map(|value| -value),
+            _ => None,
+        }
+    }
+
     pub(super) fn compile_for_numeric_loop(
         &mut self,
         variable: &str,
@@ -402,9 +430,60 @@ impl Compiler {
                 .insert(format!("(for step)"), (step_reg, false));
         }
 
+        // The loop test depends on the sign of the step: an ascending loop runs
+        // while `var <= end`, a descending one while `var >= end`.  This used to
+        // emit `Le` unconditionally, so every descending loop
+        // (`for i = 100, 1, -1`) tested `100 <= 1`, failed on entry and ran zero
+        // iterations.
+        //
+        // A literal step is resolved at compile time, which keeps the common case
+        // at one comparison per iteration.  Only a step whose sign is unknown
+        // until runtime pays for the dynamic form below.
+        let static_step = match step {
+            Some(step) => Self::const_int_expr(step),
+            None => Some(1),
+        };
+
         let loop_start = self.current_chunk().instructions.len();
         let cond_reg = self.allocate_register();
-        self.emit(Instruction::Le(cond_reg, var_reg, end_reg), 0);
+        match static_step {
+            Some(value) if value < 0 => {
+                self.emit(Instruction::Ge(cond_reg, var_reg, end_reg), 0);
+            }
+            Some(_) => {
+                self.emit(Instruction::Le(cond_reg, var_reg, end_reg), 0);
+            }
+            None => {
+                // cond = (step < 0) ? (var >= end) : (var <= end), spelled with
+                // the instructions available:
+                //   cond = (neg AND ge) OR ((NOT neg) AND le)
+                let zero_reg = self.allocate_register();
+                let const_idx = self.add_int_const(0);
+                self.emit(Instruction::LoadConst(zero_reg, const_idx), 0);
+                let neg_reg = self.allocate_register();
+                self.emit(Instruction::Lt(neg_reg, step_reg, zero_reg), 0);
+                let pos_reg = self.allocate_register();
+                self.emit(Instruction::Not(pos_reg, neg_reg), 0);
+
+                let ge_reg = self.allocate_register();
+                self.emit(Instruction::Ge(ge_reg, var_reg, end_reg), 0);
+                let le_reg = self.allocate_register();
+                self.emit(Instruction::Le(le_reg, var_reg, end_reg), 0);
+                let neg_and_ge_reg = self.allocate_register();
+                self.emit(Instruction::And(neg_and_ge_reg, neg_reg, ge_reg), 0);
+                let pos_and_le_reg = self.allocate_register();
+                self.emit(Instruction::And(pos_and_le_reg, pos_reg, le_reg), 0);
+                self.emit(Instruction::Or(cond_reg, neg_and_ge_reg, pos_and_le_reg), 0);
+
+                self.free_register(pos_and_le_reg);
+                self.free_register(neg_and_ge_reg);
+                self.free_register(le_reg);
+                self.free_register(ge_reg);
+                self.free_register(pos_reg);
+                self.free_register(neg_reg);
+                self.free_register(zero_reg);
+            }
+        }
         let jump_to_end = self.emit(Instruction::JumpIfNot(cond_reg, 0), 0);
         self.free_register(cond_reg);
         self.loop_contexts.push(LoopContext {

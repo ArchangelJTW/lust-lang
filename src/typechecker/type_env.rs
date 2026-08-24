@@ -81,6 +81,7 @@ impl TypeEnv {
         self.register_builtin_type("Task");
         self.register_builtin_type("TaskStatus");
         self.register_builtin_type("TaskInfo");
+        self.register_builtin_type("IndexError");
         self.register_builtin_type("Iterator");
         self.register_builtin_type("LuaValue");
         self.register_builtin_type("LuaTable");
@@ -132,6 +133,31 @@ impl TypeEnv {
         };
         self.structs
             .insert("TaskInfo".to_string(), task_info_struct);
+        self.structs.insert(
+            "IndexError".to_string(),
+            StructDef {
+                name: "IndexError".to_string(),
+                type_params: vec![],
+                trait_bounds: vec![],
+                fields: vec![
+                    StructField {
+                        name: "index".to_string(),
+                        ty: Type::new(TypeKind::Int, dummy_span),
+                        visibility: Visibility::Public,
+                        ownership: FieldOwnership::Strong,
+                        weak_target: None,
+                    },
+                    StructField {
+                        name: "length".to_string(),
+                        ty: Type::new(TypeKind::Int, dummy_span),
+                        visibility: Visibility::Public,
+                        ownership: FieldOwnership::Strong,
+                        weak_target: None,
+                    },
+                ],
+                visibility: Visibility::Public,
+            },
+        );
         self.structs.insert(
             "LuaTable".to_string(),
             StructDef {

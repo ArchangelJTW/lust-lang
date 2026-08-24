@@ -1,4 +1,4 @@
--- Trait casting with :as<T>() method
+-- Trait checks and narrowing with the `is` operator
 
 trait Drawable
     function draw(self)
@@ -64,5 +64,4 @@ process_object(c)
 
 println("\n=== Testing Square ===")
 process_object(s)
-
 

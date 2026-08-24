@@ -7,19 +7,19 @@ function process_api_field(key: string, value: unknown): string
     println("  Processing field '" .. key .. "':")
 
     -- Use type narrowing to handle different value types
-    local as_string = value is string and value
+    local as_string = value as string
     if as_string:is_some() then
         local s = as_string:unwrap()
         return "    String value: '" .. s .. "' (length: " .. tostring(s:len()) .. ")"
     end
 
-    local as_int = value is int and value
+    local as_int = value as int
     if as_int:is_some() then
         local i = as_int:unwrap()
         return "    Integer value: " .. tostring(i)
     end
 
-    local as_bool = value is bool and value
+    local as_bool = value as bool
     if as_bool:is_some() then
         local b = as_bool:unwrap()
         if b then
@@ -68,7 +68,7 @@ function parse_config(config: Map<string, unknown>): bool
     local port_opt = config:get("port")
     if port_opt:is_some() then
         local port_unknown = port_opt:unwrap()
-        local port_int = port_unknown is int and port_unknown
+        local port_int = port_unknown as int
 
         if port_int:is_some() then
             local port = port_int:unwrap()
@@ -88,7 +88,7 @@ function parse_config(config: Map<string, unknown>): bool
     local host_opt = config:get("host")
     if host_opt:is_some() then
         local host_unknown = host_opt:unwrap()
-        local host_str = host_unknown is string and host_unknown
+        local host_str = host_unknown as string
 
         if host_str:is_some() then
             local host = host_str:unwrap()
@@ -108,7 +108,7 @@ function parse_config(config: Map<string, unknown>): bool
     local debug_opt = config:get("debug")
     if debug_opt:is_some() then
         local debug_unknown = debug_opt:unwrap()
-        local debug_bool = (debug_unknown is bool) and debug_unknown
+        local debug_bool = debug_unknown as bool
 
         if debug_bool:is_some() then
             if debug_bool:unwrap() then
@@ -187,6 +187,5 @@ end
 
 println("")
 println("=== All comprehensive tests passed! ===")
-
 
 

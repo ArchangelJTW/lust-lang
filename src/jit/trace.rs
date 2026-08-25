@@ -391,7 +391,9 @@ pub struct TraceRecorder {
     pub trace: Trace,
     max_length: usize,
     recording: bool,
+    completed: bool,
     finalized: bool,
+    root_frame_index: usize,
     guarded_registers: HashSet<Register>,
     inline_stack: Vec<InlineContext>,
     op_count: usize,
@@ -438,7 +440,9 @@ impl TraceRecorder {
             },
             max_length,
             recording: true,
+            completed: false,
             finalized: false,
+            root_frame_index: 0,
             guarded_registers: HashSet::new(),
             inline_stack: Vec::new(),
             op_count: 0,
@@ -547,6 +551,14 @@ impl TraceRecorder {
             .last()
             .map(|ctx| ctx.function_idx)
             .unwrap_or(self.trace.function_idx)
+    }
+
+    fn expected_frame_index(&self) -> usize {
+        self.root_frame_index + self.inline_stack.len()
+    }
+
+    pub fn set_root_frame_index(&mut self, frame_index: usize) {
+        self.root_frame_index = frame_index;
     }
 
     fn current_guard_set(&self) -> &HashSet<Register> {
@@ -717,6 +729,11 @@ impl TraceRecorder {
             self.finalize_trace();
             self.recording = false;
         }
+    }
+
+    fn complete_recording(&mut self) {
+        self.stop_recording();
+        self.completed = true;
     }
 
     /// Rebox all currently active specialized values
@@ -953,7 +970,35 @@ impl TraceRecorder {
         function_idx: usize,
         functions: &[crate::bytecode::Function],
     ) -> Result<(), LustError> {
+        self.record_instruction_at_frame(
+            self.expected_frame_index(),
+            instruction,
+            current_ip,
+            registers,
+            function,
+            function_idx,
+            functions,
+        )
+    }
+
+    pub fn record_instruction_at_frame(
+        &mut self,
+        frame_index: usize,
+        instruction: Instruction,
+        current_ip: usize,
+        registers: &[Value],
+        function: &crate::bytecode::Function,
+        function_idx: usize,
+        functions: &[crate::bytecode::Function],
+    ) -> Result<(), LustError> {
         if !self.recording {
+            return Ok(());
+        }
+
+        // A non-inlined call is emitted as one guarded CallFunction operation.
+        // Its interpreter frames are opaque to this trace; resume recording when
+        // execution returns to the exact activation that owns the trace.
+        if frame_index != self.expected_frame_index() {
             return Ok(());
         }
 
@@ -1477,9 +1522,7 @@ impl TraceRecorder {
                 // Int/Float arms, not relaxing the check.
                 let receiver_supported = match &registers[obj_reg as usize] {
                     Value::Array(_) | Value::Iterator(_) => true,
-                    Value::Enum { enum_name, .. } => {
-                        enum_name == "Option" || enum_name == "Result"
-                    }
+                    Value::Enum { enum_name, .. } => enum_name == "Option" || enum_name == "Result",
                     _ => false,
                 };
                 if !receiver_supported {
@@ -2076,9 +2119,18 @@ impl TraceRecorder {
                                         iteration_count
                                     )
                                 });
-                                self.stop_recording();
+                                self.complete_recording();
                                 Ok(())
                             }
+                        } else if function_idx == self.trace.function_idx
+                            && jump_target < self.trace.start_ip
+                        {
+                            self.stop_recording();
+                            Err(LustError::RuntimeError {
+                                message:
+                                    "Trace aborted: inner-loop recording reached an enclosing backedge"
+                                        .to_string(),
+                            })
                         } else {
                             // This is a nested loop that should be compiled as a separate trace
                             // Following LuaJIT's approach: don't inline loops, compile them separately
@@ -2300,6 +2352,10 @@ impl TraceRecorder {
 
     pub fn is_recording(&self) -> bool {
         self.recording
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.completed
     }
 
     pub fn abort(&mut self) {

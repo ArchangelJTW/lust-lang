@@ -818,13 +818,11 @@ fn canonicalize_impl(def: &ImplBlock, prefix: Option<&str>) -> ImplBlock {
         _ => cloned.target_type.to_string(),
     };
     if let Some(trait_name) = &cloned.trait_name {
-        cloned.trait_name = Some(
-            if trait_name == "ToString" || trait_name == "HashKey" {
-                trait_name.clone()
-            } else {
-                canonicalize_simple_name(trait_name, prefix)
-            },
-        );
+        cloned.trait_name = Some(if trait_name == "ToString" || trait_name == "HashKey" {
+            trait_name.clone()
+        } else {
+            canonicalize_simple_name(trait_name, prefix)
+        });
     }
     for method in &mut cloned.methods {
         for param in &mut method.params {

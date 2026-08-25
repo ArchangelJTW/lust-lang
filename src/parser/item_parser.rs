@@ -601,10 +601,7 @@ impl Parser {
                     crate::ast::Span::dummy(),
                 )
             };
-            (
-                None,
-                target_type,
-            )
+            (None, target_type)
         };
         let mut methods = Vec::new();
         while !self.check(TokenKind::End) && !self.is_at_end() {

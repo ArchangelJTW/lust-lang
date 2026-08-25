@@ -197,7 +197,12 @@ impl VM {
                 self.observe_value_graph(value);
             }
         }
+        self.jit.invalidate_compiled_code();
         self.functions = functions;
+    }
+
+    pub fn jit_stats(&self) -> crate::jit::JitStats {
+        self.jit.stats()
     }
 
     pub fn register_structs(&mut self, defs: &HashMap<String, StructDef>) {
@@ -582,6 +587,9 @@ impl VM {
         self.call_until_depth = Some(stack_depth_before);
         self.call_stack.push(frame);
         let result = self.run();
+        if self.trace_recorder.is_some() {
+            self.abandon_trace_recording();
+        }
         self.trace_recorder = saved_trace_recorder;
         self.side_trace_context = saved_side_trace_context;
         self.skip_next_trace_record = saved_skip_next_trace_record;
@@ -932,5 +940,191 @@ mod tests {
             vm.call("guard_exit", Vec::new()),
             Ok(Value::Int(99))
         ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn counting_loop() -> Function {
+        let mut function = Function::new("count", 1, false);
+        function.set_register_count(5);
+        let zero = function.chunk.add_constant(Value::Int(0));
+        let one = function.chunk.add_constant(Value::Int(1));
+        function.chunk.emit(Instruction::LoadConst(1, zero), 1);
+        function.chunk.emit(Instruction::LoadConst(2, one), 1);
+        function.chunk.emit(Instruction::Lt(3, 1, 0), 1);
+        function.chunk.emit(Instruction::JumpIfNot(3, 3), 1);
+        function.chunk.emit(Instruction::Add(4, 1, 2), 1);
+        function.chunk.emit(Instruction::Move(1, 4), 1);
+        function.chunk.emit(Instruction::Jump(-5), 1);
+        function.chunk.emit(Instruction::Return(1), 1);
+        function
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn recursive_sum(function_idx: usize) -> Function {
+        let mut function = Function::new("sum_down", 1, false);
+        function.set_register_count(9);
+        let zero = function.chunk.add_constant(Value::Int(0));
+        let one = function.chunk.add_constant(Value::Int(1));
+        let recursive = function.chunk.add_constant(Value::Function(function_idx));
+        function.chunk.emit(Instruction::LoadConst(1, zero), 1);
+        function.chunk.emit(Instruction::Eq(2, 0, 1), 1);
+        function.chunk.emit(Instruction::JumpIfNot(2, 1), 1);
+        function.chunk.emit(Instruction::Return(1), 1);
+        function.chunk.emit(Instruction::LoadConst(3, one), 1);
+        function.chunk.emit(Instruction::Sub(4, 0, 3), 1);
+        function.chunk.emit(Instruction::LoadConst(5, recursive), 1);
+        function.chunk.emit(Instruction::Move(6, 4), 1);
+        function.chunk.emit(Instruction::Call(5, 6, 1, 7), 1);
+        function.chunk.emit(Instruction::Add(8, 0, 7), 1);
+        function.chunk.emit(Instruction::Return(8), 1);
+        function
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn loop_calling_recursive_sum() -> Function {
+        let mut function = Function::new("sum_in_loop", 1, false);
+        function.set_register_count(11);
+        let zero = function.chunk.add_constant(Value::Int(0));
+        let one = function.chunk.add_constant(Value::Int(1));
+        let callee = function.chunk.add_constant(Value::Function(0));
+        let five = function.chunk.add_constant(Value::Int(5));
+        function.chunk.emit(Instruction::LoadConst(1, zero), 1);
+        function.chunk.emit(Instruction::LoadConst(2, zero), 1);
+        function.chunk.emit(Instruction::LoadConst(3, one), 1);
+        function.chunk.emit(Instruction::LoadConst(4, callee), 1);
+        function.chunk.emit(Instruction::LoadConst(5, five), 1);
+        function.chunk.emit(Instruction::Lt(6, 1, 0), 1);
+        function.chunk.emit(Instruction::JumpIfNot(6, 7), 1);
+        function.chunk.emit(Instruction::Move(7, 5), 1);
+        function.chunk.emit(Instruction::Call(4, 7, 1, 8), 1);
+        function.chunk.emit(Instruction::Add(9, 2, 8), 1);
+        function.chunk.emit(Instruction::Move(2, 9), 1);
+        function.chunk.emit(Instruction::Add(10, 1, 3), 1);
+        function.chunk.emit(Instruction::Move(1, 10), 1);
+        function.chunk.emit(Instruction::Jump(-9), 1);
+        function.chunk.emit(Instruction::Return(2), 1);
+        function
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn nested_counting_loop() -> Function {
+        let mut function = Function::new("nested_count", 0, false);
+        function.set_register_count(9);
+        let zero = function.chunk.add_constant(Value::Int(0));
+        let one = function.chunk.add_constant(Value::Int(1));
+        let sixteen = function.chunk.add_constant(Value::Int(16));
+        function.chunk.emit(Instruction::LoadConst(0, zero), 1);
+        function.chunk.emit(Instruction::LoadConst(1, one), 1);
+        function.chunk.emit(Instruction::LoadConst(2, sixteen), 1);
+        function.chunk.emit(Instruction::LoadConst(3, one), 1);
+        function.chunk.emit(Instruction::Le(4, 1, 2), 1);
+        function.chunk.emit(Instruction::JumpIfNot(4, 11), 1);
+        function.chunk.emit(Instruction::Move(5, 3), 1);
+        function.chunk.emit(Instruction::Le(6, 5, 3), 1);
+        function.chunk.emit(Instruction::JumpIfNot(6, 5), 1);
+        function.chunk.emit(Instruction::Add(7, 0, 3), 1);
+        function.chunk.emit(Instruction::Move(0, 7), 1);
+        function.chunk.emit(Instruction::Add(8, 5, 3), 1);
+        function.chunk.emit(Instruction::Move(5, 8), 1);
+        function.chunk.emit(Instruction::Jump(-7), 1);
+        function.chunk.emit(Instruction::Add(7, 1, 3), 1);
+        function.chunk.emit(Instruction::Move(1, 7), 1);
+        function.chunk.emit(Instruction::Jump(-13), 1);
+        function.chunk.emit(Instruction::Return(0), 1);
+        function
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn hot_loop_compiles_executes_and_reuses_its_trace() {
+        let mut vm = VM::new();
+        vm.load_functions(vec![counting_loop()]);
+
+        assert!(matches!(
+            vm.call("count", vec![Value::Int(100)]),
+            Ok(Value::Int(100))
+        ));
+        let first = vm.jit_stats();
+        assert_eq!(first.root_traces_compiled, 1);
+        assert!(first.native_trace_entries > 0);
+
+        assert!(matches!(
+            vm.call("count", vec![Value::Int(20)]),
+            Ok(Value::Int(20))
+        ));
+        let second = vm.jit_stats();
+        assert_eq!(second.root_traces_compiled, 1);
+        assert!(second.native_trace_entries > first.native_trace_entries);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn short_hot_loop_retries_recording_on_a_later_call() {
+        let mut vm = VM::new();
+        vm.load_functions(vec![counting_loop()]);
+
+        assert!(matches!(
+            vm.call("count", vec![Value::Int(5)]),
+            Ok(Value::Int(5))
+        ));
+        let first = vm.jit_stats();
+        assert_eq!(first.recordings_started, 1);
+        assert_eq!(first.recordings_aborted, 1);
+        assert_eq!(first.root_traces_compiled, 0);
+
+        assert!(matches!(
+            vm.call("count", vec![Value::Int(5)]),
+            Ok(Value::Int(5))
+        ));
+        let second = vm.jit_stats();
+        assert_eq!(second.root_traces_compiled, 1);
+        assert!(second.native_trace_entries > 0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pure_recursion_is_profiled_without_becoming_a_loop_trace() {
+        let mut vm = VM::new();
+        vm.load_functions(vec![recursive_sum(0)]);
+
+        assert!(matches!(
+            vm.call("sum_down", vec![Value::Int(10)]),
+            Ok(Value::Int(55))
+        ));
+        let stats = vm.jit_stats();
+        assert_eq!(stats.function_calls, 11);
+        assert_eq!(stats.recursive_calls, 10);
+        assert_eq!(stats.recordings_started, 0);
+        assert_eq!(stats.root_traces_compiled, 0);
+        assert_eq!(stats.native_trace_entries, 0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn hot_loop_can_trace_across_an_opaque_recursive_call() {
+        let mut vm = VM::new();
+        vm.load_functions(vec![recursive_sum(0), loop_calling_recursive_sum()]);
+
+        assert!(matches!(
+            vm.call("sum_in_loop", vec![Value::Int(100)]),
+            Ok(Value::Int(1500))
+        ));
+        let stats = vm.jit_stats();
+        assert_eq!(stats.root_traces_compiled, 1);
+        assert!(stats.native_trace_entries > 0);
+        assert!(stats.recursive_calls > 0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn nested_loop_recording_does_not_mix_enclosing_backedges() {
+        let mut vm = VM::new();
+        vm.load_functions(vec![nested_counting_loop()]);
+
+        assert!(matches!(
+            vm.call("nested_count", Vec::new()),
+            Ok(Value::Int(16))
+        ));
+        assert!(vm.jit_stats().recordings_aborted > 0);
     }
 }

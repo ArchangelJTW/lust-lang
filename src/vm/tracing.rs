@@ -1,5 +1,19 @@
 use super::*;
 impl VM {
+    pub(super) fn abandon_trace_recording(&mut self) {
+        if let Some(recorder) = self.trace_recorder.take() {
+            if self.side_trace_context.take().is_none() {
+                self.jit
+                    .recording_aborted(recorder.trace.function_idx, recorder.trace.start_ip);
+            } else {
+                self.jit.side_recording_aborted();
+            }
+        } else {
+            self.side_trace_context = None;
+        }
+        self.skip_next_trace_record = false;
+    }
+
     pub(super) fn build_stack_trace(&self) -> Vec<StackFrame> {
         let mut frames = Vec::new();
         for frame in &self.call_stack {
@@ -190,6 +204,7 @@ impl VM {
                 self.side_trace_context = Some((trace_id, guard_index));
                 let mut recorder =
                     TraceRecorder::new(function_idx, loop_start_ip, crate::jit::MAX_TRACE_LENGTH);
+                recorder.set_root_frame_index(self.call_stack.len().saturating_sub(1));
                 // Specialize loop-invariant values at side trace entry
                 {
                     let frame = self.call_stack.last().unwrap();
@@ -197,6 +212,7 @@ impl VM {
                     recorder.specialize_trace_inputs(&frame.registers, func);
                 }
                 self.trace_recorder = Some(recorder);
+                self.jit.recording_started();
             }
         }
 

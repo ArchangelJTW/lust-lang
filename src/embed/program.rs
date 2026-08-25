@@ -221,6 +221,10 @@ impl EmbeddedProgram {
         &mut self.vm
     }
 
+    pub fn jit_stats(&self) -> crate::jit::JitStats {
+        self.vm.jit_stats()
+    }
+
     pub fn set_gas_budget(&mut self, limit: u64) {
         self.vm.set_gas_budget(limit);
     }

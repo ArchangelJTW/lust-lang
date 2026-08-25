@@ -23,9 +23,10 @@ impl TypeChecker {
                 let (type_name, variant_types, type_bindings) = match &scrutinee_type.kind {
                     TypeKind::Named(name) => (name.clone(), None, HashMap::new()),
                     TypeKind::GenericInstance { name, type_args } => {
-                        let enum_def = self.env.lookup_enum(name).ok_or_else(|| {
-                            self.type_error(format!("Undefined enum '{}'", name))
-                        })?;
+                        let enum_def = self
+                            .env
+                            .lookup_enum(name)
+                            .ok_or_else(|| self.type_error(format!("Undefined enum '{}'", name)))?;
                         if enum_def.type_params.len() != type_args.len() {
                             return Err(self.type_error(format!(
                                 "Type '{}' expects {} type argument(s), got {}",
@@ -42,13 +43,11 @@ impl TypeChecker {
                             .collect();
                         (name.clone(), None, bindings)
                     }
-                    TypeKind::Option(inner) => {
-                        (
-                            "Option".to_string(),
-                            Some(vec![(**inner).clone()]),
-                            HashMap::new(),
-                        )
-                    }
+                    TypeKind::Option(inner) => (
+                        "Option".to_string(),
+                        Some(vec![(**inner).clone()]),
+                        HashMap::new(),
+                    ),
 
                     TypeKind::Result(ok, err) => (
                         "Result".to_string(),
@@ -280,9 +279,10 @@ impl TypeChecker {
                 let (type_name, variant_types, type_bindings) = match &scrutinee_type.kind {
                     TypeKind::Named(name) => (name.clone(), None, HashMap::new()),
                     TypeKind::GenericInstance { name, type_args } => {
-                        let enum_def = self.env.lookup_enum(name).ok_or_else(|| {
-                            self.type_error(format!("Undefined enum '{}'", name))
-                        })?;
+                        let enum_def = self
+                            .env
+                            .lookup_enum(name)
+                            .ok_or_else(|| self.type_error(format!("Undefined enum '{}'", name)))?;
                         if enum_def.type_params.len() != type_args.len() {
                             return Err(self.type_error(format!(
                                 "Type '{}' expects {} type argument(s), got {}",
@@ -299,13 +299,11 @@ impl TypeChecker {
                             .collect();
                         (name.clone(), None, bindings)
                     }
-                    TypeKind::Option(inner) => {
-                        (
-                            "Option".to_string(),
-                            Some(vec![(**inner).clone()]),
-                            HashMap::new(),
-                        )
-                    }
+                    TypeKind::Option(inner) => (
+                        "Option".to_string(),
+                        Some(vec![(**inner).clone()]),
+                        HashMap::new(),
+                    ),
 
                     TypeKind::Result(ok, err) => (
                         "Result".to_string(),

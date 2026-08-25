@@ -203,19 +203,21 @@ Generic functions and nominal types compile to one erased runtime body/type.
 Specialized and conditional impls are therefore rejected until Lust has a
 reified witness or monomorphization model for those forms.
 
-### Two JIT design issues that are latent rather than observable
+### JIT activation limits
 
-Neither produces a wrong answer on any case in the corpus, but both are still
-wrong in principle:
+Root recordings now distinguish completion from abort, retry with bounded
+backoff, avoid native trace entry while another trace is recording, and abort
+an inner recording when it reaches an enclosing backedge. Ordinary loop traces
+remain cached across normal exits. Loop hierarchies deliberately retain the
+older conservative warmup and one-shot root behavior; the current nested-loop
+guard is removed after its first unlinked exit, so it cannot yet accumulate the
+failures needed to attach a reusable side trace.
 
-* `trace.rs` decides loop nesting purely by comparing the back-edge target against
-  `trace.start_ip`, treating *any* other back-edge as a `NestedLoopCall`. A trace
-  can therefore still mix iterations of two different loops.
-* Every abort path calls `stop_recording()` and returns `Err`, but the compile
-  sites in `execution.rs` gate only on `!is_recording()`, and the root-trace path
-  deliberately force-compiles a trace that is still recording. Distinguishing
-  "closed at my own back-edge" from "aborted" needs both sites reconciled
-  together; a speculative `closed_at_backedge` flag was tried and reverted.
+Pure direct or mutual recursion is counted as function/recursive call activity
+but has no bytecode backedge and therefore does not start the cyclic trace
+compiler. A hot loop can contain an opaque recursive call and still compile;
+the recursive callee remains interpreted. General recursive native compilation
+needs a finite-function JIT mode with its own return/deoptimization ABI.
 
 Also unaddressed, and costing throughput rather than correctness: the recorder
 unrolls by `LOOP_UNROLL_COUNT` and the optimizer unrolls again by `UNROLL_FACTOR`,

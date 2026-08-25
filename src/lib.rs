@@ -43,7 +43,7 @@ pub use embed::{
     ValueRef,
 };
 pub use error::{LustError, Result};
-pub use jit::{JitCompiler, JitState};
+pub use jit::{JitCompiler, JitState, JitStats};
 pub use lexer::{Lexer, Token, TokenKind};
 #[cfg(feature = "std")]
 pub use lust_macros::LustStructView;

@@ -2318,6 +2318,7 @@ pub unsafe extern "C" fn jit_call_function_safe(
 
         Err(err) => {
             jit::log(|| format!("jit_call_function_safe: {}", err));
+            vm.set_pending_jit_error(err);
             0
         }
     }

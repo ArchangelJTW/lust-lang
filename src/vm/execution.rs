@@ -2,6 +2,39 @@ use super::*;
 use crate::bytecode::ValueKey;
 use core::ptr;
 impl VM {
+    fn is_loop_in_hierarchy(
+        &self,
+        function_idx: usize,
+        loop_start_ip: usize,
+        backedge_ip: usize,
+    ) -> bool {
+        let instructions = &self.functions[function_idx].chunk.instructions;
+        let jump_target =
+            |ip: usize, offset: i16| (ip as isize + 1 + offset as isize).max(0) as usize;
+        let contains_nested_loop = instructions
+            .iter()
+            .enumerate()
+            .skip(loop_start_ip)
+            .take(backedge_ip.saturating_sub(loop_start_ip))
+            .any(|(ip, instruction)| {
+                let Instruction::Jump(offset) = instruction else {
+                    return false;
+                };
+                *offset < 0 && jump_target(ip, *offset) > loop_start_ip
+            });
+        let is_nested_loop = instructions
+            .iter()
+            .enumerate()
+            .skip(backedge_ip.saturating_add(1))
+            .any(|(ip, instruction)| {
+                let Instruction::Jump(offset) = instruction else {
+                    return false;
+                };
+                *offset < 0 && jump_target(ip, *offset) < loop_start_ip
+            });
+        contains_nested_loop || is_nested_loop
+    }
+
     fn lua_table_map(value: &Value) -> Option<Value> {
         if let Value::Enum {
             enum_name,
@@ -134,15 +167,30 @@ impl VM {
             };
             if should_check_jit && self.jit.enabled {
                 let count = self.jit.profiler.record_backedge(func_idx, loop_start_ip);
-                if let Some(trace_id) = self
-                    .jit
-                    .root_traces
-                    .get(&(func_idx, loop_start_ip))
-                    .copied()
+                let backedge_ip = ip_before_execution.saturating_sub(1);
+                let loop_in_hierarchy =
+                    self.is_loop_in_hierarchy(func_idx, loop_start_ip, backedge_ip);
+                if self.side_trace_context.is_none()
+                    && self
+                        .trace_recorder
+                        .as_ref()
+                        .is_some_and(|recorder| !recorder.is_recording())
                 {
+                    self.abandon_trace_recording();
+                }
+                let root_trace_id = if self.trace_recorder.is_none() {
+                    self.jit
+                        .root_traces
+                        .get(&(func_idx, loop_start_ip))
+                        .copied()
+                } else {
+                    None
+                };
+                if let Some(trace_id) = root_trace_id {
                     let frame = self.call_stack.last_mut().unwrap();
                     let registers_ptr = frame.registers.as_mut_ptr();
                     if let Some(trace) = self.jit.trace_handle(trace_id) {
+                        self.jit.record_native_entry();
                         crate::jit::log(|| {
                             format!(
                                 "▶️  JIT: Executing trace #{} at func {} ip {}",
@@ -205,6 +253,7 @@ impl VM {
 
                             continue;
                         } else if result > 0 {
+                            self.jit.record_guard_exit();
                             let guard_index = (result - 1) as usize;
                             let side_trace_id = self
                                 .jit
@@ -268,10 +317,25 @@ impl VM {
                                 }
 
                                 self.handle_guard_failure(trace_id, guard_index, func_idx)?;
-                                self.jit.root_traces.remove(&(func_idx, loop_start_ip));
+                                let reusable_exit = self
+                                    .jit
+                                    .get_trace(trace_id)
+                                    .and_then(|trace| trace.guards.get(guard_index))
+                                    .is_some_and(|guard| {
+                                        matches!(
+                                            guard.kind,
+                                            crate::jit::GuardKind::Truthy { .. }
+                                                | crate::jit::GuardKind::Falsy { .. }
+                                        )
+                                    });
+                                if !reusable_exit || loop_in_hierarchy {
+                                    self.jit.root_traces.remove(&(func_idx, loop_start_ip));
+                                    self.jit.schedule_root_retry(func_idx, loop_start_ip);
+                                }
                                 continue;
                             }
                         } else {
+                            self.jit.record_execution_failure();
                             if let Some(error) = self.pending_jit_error.take() {
                                 return Err(error);
                             }
@@ -283,6 +347,7 @@ impl VM {
                             }
 
                             self.jit.root_traces.remove(&(func_idx, loop_start_ip));
+                            self.jit.schedule_root_retry(func_idx, loop_start_ip);
                             // Re-dispatch from the loop header we just installed.
                             //
                             // Falling through instead would let the interpreter
@@ -299,6 +364,10 @@ impl VM {
                     if is_side_trace {
                         if let Some(recorder) = &self.trace_recorder {
                             if !recorder.is_recording() {
+                                if !recorder.is_complete() {
+                                    self.abandon_trace_recording();
+                                    continue;
+                                }
                                 crate::jit::log(|| {
                                     format!(
                                         "📝 JIT: Trace recording complete - {} ops recorded",
@@ -369,10 +438,7 @@ impl VM {
                             // one, and therefore never terminated.
                             let recording_this_loop = recorder.trace.function_idx == func_idx
                                 && recorder.trace.start_ip == loop_start_ip;
-                            if recorder.is_recording()
-                                && recording_this_loop
-                                && count > crate::jit::HOT_THRESHOLD + 1
-                            {
+                            if recorder.is_recording() && recording_this_loop {
                                 crate::jit::log(|| {
                                     format!(
                                         "📝 JIT: Trace recording complete - {} ops recorded",
@@ -413,12 +479,24 @@ impl VM {
                                         crate::jit::log(|| {
                                             format!("❌ JIT: Trace compilation failed: {}", e)
                                         });
+                                        self.jit.recording_aborted(func_idx, loop_start_ip);
                                     }
                                 }
                             }
                         }
 
-                        if count == crate::jit::HOT_THRESHOLD + 1 {
+                        if self.trace_recorder.is_none()
+                            && !self
+                                .jit
+                                .root_traces
+                                .contains_key(&(func_idx, loop_start_ip))
+                            && self.jit.should_record_root(
+                                func_idx,
+                                loop_start_ip,
+                                count,
+                                crate::jit::HOT_THRESHOLD + u32::from(loop_in_hierarchy),
+                            )
+                        {
                             crate::jit::log(|| {
                                 format!(
                                     "🔥 JIT: Hot loop detected at func {} ip {} - starting trace recording!",
@@ -427,6 +505,7 @@ impl VM {
                             });
                             let mut recorder =
                                 TraceRecorder::new(func_idx, loop_start_ip, MAX_TRACE_LENGTH);
+                            recorder.set_root_frame_index(self.call_stack.len().saturating_sub(1));
                             // Specialize loop-invariant values at trace entry
                             {
                                 let frame = self.call_stack.last().unwrap();
@@ -434,6 +513,7 @@ impl VM {
                                 recorder.specialize_trace_inputs(&frame.registers, func);
                             }
                             self.trace_recorder = Some(recorder);
+                            self.jit.recording_started();
                             self.skip_next_trace_record = true;
                         }
                     }
@@ -1316,6 +1396,9 @@ impl VM {
                             }
                             let frame =
                                 self.make_call_frame(func_idx, Some(dest_reg), args, Vec::new())?;
+                            if self.trace_recorder.is_some() {
+                                self.abandon_trace_recording();
+                            }
                             self.call_stack.push(frame);
                             continue;
                         }
@@ -1348,6 +1431,9 @@ impl VM {
                                 call_args.push(object.clone());
                                 for i in 0..arg_count {
                                     call_args.push(self.get_register(first_arg + i)?.clone());
+                                }
+                                if self.trace_recorder.is_some() {
+                                    self.abandon_trace_recording();
                                 }
                                 let result = self.call_value(&global_func, call_args)?;
                                 self.set_register(dest_reg, result)?;
@@ -1535,7 +1621,8 @@ impl VM {
                                     None
                                 };
                             if let Some(registers) = registers_opt {
-                                if let Err(e) = recorder.record_instruction(
+                                if let Err(e) = recorder.record_instruction_at_frame(
+                                    executing_frame_index,
                                     instruction,
                                     ip_before_execution,
                                     registers,
@@ -1544,7 +1631,7 @@ impl VM {
                                     &self.functions,
                                 ) {
                                     crate::jit::log(|| format!("⚠️  JIT: {}", e));
-                                    self.trace_recorder = None;
+                                    self.abandon_trace_recording();
                                 }
                             }
                         }
@@ -1832,6 +1919,11 @@ impl VM {
         }
 
         let mut frame = CallFrame::new(function_idx, return_dest, function.register_count);
+        let recursive = self
+            .call_stack
+            .iter()
+            .any(|existing| existing.function_idx == function_idx);
+        self.jit.record_function_call(function_idx, recursive);
         frame.upvalues = upvalues;
         for (index, arg) in args.into_iter().enumerate() {
             self.observe_value_graph(&arg);

@@ -26,6 +26,7 @@ pub struct TypeChecker {
     pending_generic_instances: Option<HashMap<String, Type>>,
     expected_lambda_signature: Option<(Vec<Type>, Option<Type>)>,
     current_trait_bounds: HashMap<String, Vec<String>>,
+    type_param_scopes: Vec<HashSet<String>>,
     current_module: Option<String>,
     imports_by_module: HashMap<String, ModuleImports>,
     expr_types_by_module: HashMap<String, HashMap<Span, Type>>,
@@ -60,6 +61,7 @@ impl TypeChecker {
             pending_generic_instances: None,
             expected_lambda_signature: None,
             current_trait_bounds: HashMap::new(),
+            type_param_scopes: Vec::new(),
             current_module: None,
             imports_by_module: HashMap::new(),
             expr_types_by_module: HashMap::new(),
@@ -153,7 +155,9 @@ impl TypeChecker {
                             name, field.name
                         ))
                     })?;
-                    let target_name = if let TypeKind::Named(inner) = &target.kind {
+                    let target_name = if let TypeKind::Named(inner)
+                    | TypeKind::GenericInstance { name: inner, .. } = &target.kind
+                    {
                         inner
                     } else {
                         return Err(self.type_error(format!(
@@ -521,17 +525,20 @@ impl TypeChecker {
 
     pub fn register_external_struct(&mut self, mut def: StructDef) -> Result<()> {
         def.name = self.resolve_type_key(&def.name);
+        self.push_type_params(&def.type_params)?;
         for field in &mut def.fields {
             field.ty = self.canonicalize_type(&field.ty);
             if let Some(target) = &field.weak_target {
                 field.weak_target = Some(self.canonicalize_type(target));
             }
         }
+        self.pop_type_params();
         self.env.register_struct(&def)
     }
 
     pub fn register_external_enum(&mut self, mut def: EnumDef) -> Result<()> {
         def.name = self.resolve_type_key(&def.name);
+        self.push_type_params(&def.type_params)?;
         for variant in &mut def.variants {
             if let Some(fields) = &mut variant.fields {
                 for field in fields {
@@ -539,19 +546,24 @@ impl TypeChecker {
                 }
             }
         }
+        self.pop_type_params();
         self.env.register_enum(&def)
     }
 
     pub fn register_external_trait(&mut self, mut def: TraitDef) -> Result<()> {
         def.name = self.resolve_type_key(&def.name);
+        self.push_type_params(&def.type_params)?;
         for method in &mut def.methods {
+            self.push_type_params(&method.type_params)?;
             for param in &mut method.params {
                 param.ty = self.canonicalize_type(&param.ty);
             }
             if let Some(ret) = method.return_type.clone() {
                 method.return_type = Some(self.canonicalize_type(&ret));
             }
+            self.pop_type_params();
         }
+        self.pop_type_params();
         self.env.register_trait(&def)
     }
 
@@ -559,12 +571,20 @@ impl TypeChecker {
         &mut self,
         (name, mut signature): (String, FunctionSignature),
     ) -> Result<()> {
+        self.push_type_params(&signature.type_params)?;
         signature.params = signature
             .params
             .into_iter()
             .map(|ty| self.canonicalize_type(&ty))
             .collect();
         signature.return_type = self.canonicalize_type(&signature.return_type);
+        signature.trait_bounds = self.canonicalize_trait_bounds(&signature.trait_bounds);
+        for param in &signature.params {
+            self.validate_type(param)?;
+        }
+        self.validate_type(&signature.return_type)?;
+        self.validate_trait_bounds(&signature.type_params, &signature.trait_bounds)?;
+        self.pop_type_params();
         let canonical = self.resolve_type_key(&name);
         self.env.register_or_update_function(canonical, signature)
     }
@@ -576,16 +596,121 @@ impl TypeChecker {
     }
 
     pub fn register_external_impl(&mut self, mut impl_block: ImplBlock) -> Result<()> {
+        self.push_type_params(&impl_block.type_params)?;
         impl_block.target_type = self.canonicalize_type(&impl_block.target_type);
+        self.validate_type(&impl_block.target_type)?;
+        self.validate_trait_bounds(&impl_block.type_params, &impl_block.where_clause)?;
+        if !impl_block.where_clause.is_empty() {
+            return Err(self.type_error(
+                "Conditional external impls are not supported with runtime-erased type arguments"
+                    .to_string(),
+            ));
+        }
+        if let TypeKind::GenericInstance { type_args, .. } = &impl_block.target_type.kind {
+            let universal_target = type_args.len() == impl_block.type_params.len()
+                && type_args.iter().zip(&impl_block.type_params).all(|(arg, param)| {
+                    matches!(&arg.kind, TypeKind::Generic(name) if name == param)
+                });
+            if !universal_target {
+                return Err(self.type_error(
+                    "Specialized external generic impls are not supported with runtime-erased type arguments"
+                        .to_string(),
+                ));
+            }
+        }
+        impl_block.where_clause = self.canonicalize_trait_bounds(&impl_block.where_clause);
         if let Some(trait_name) = &impl_block.trait_name {
-            impl_block.trait_name = Some(self.resolve_type_key(trait_name));
+            let resolved = self.resolve_type_key(trait_name);
+            if self.env.lookup_trait(&resolved).is_none() {
+                return Err(self.type_error(format!("Undefined trait '{}'", trait_name)));
+            }
+            impl_block.trait_name = Some(resolved);
         }
         for method in &mut impl_block.methods {
+            self.push_type_params(&method.type_params)?;
             for param in &mut method.params {
                 param.ty = self.canonicalize_type(&param.ty);
             }
             if let Some(ret) = method.return_type.clone() {
                 method.return_type = Some(self.canonicalize_type(&ret));
+            }
+            method.trait_bounds = self.canonicalize_trait_bounds(&method.trait_bounds);
+            self.pop_type_params();
+        }
+        self.pop_type_params();
+
+        if let Some(trait_name) = &impl_block.trait_name {
+            let trait_def = self.env.lookup_trait(trait_name).unwrap().clone();
+            for trait_method in &trait_def.methods {
+                let impl_method = impl_block
+                    .methods
+                    .iter()
+                    .find(|method| method.name.rsplit(':').next() == Some(&trait_method.name))
+                    .ok_or_else(|| {
+                        self.type_error(format!(
+                            "Trait '{}' requires method '{}'",
+                            trait_name, trait_method.name
+                        ))
+                    })?;
+                if !impl_method.type_params.is_empty() || !impl_method.trait_bounds.is_empty() {
+                    return Err(self.type_error(format!(
+                        "Trait method implementation '{}' cannot introduce generic parameters or bounds",
+                        trait_method.name
+                    )));
+                }
+                let trait_has_self = trait_method.params.iter().any(|param| param.is_self);
+                let impl_has_self = impl_method.params.iter().any(|param| param.is_self);
+                if trait_has_self != impl_has_self {
+                    return Err(self.type_error(format!(
+                        "Method '{}' has an incompatible self receiver",
+                        trait_method.name
+                    )));
+                }
+                let trait_params: Vec<_> = trait_method
+                    .params
+                    .iter()
+                    .filter(|param| !param.is_self)
+                    .collect();
+                let impl_params: Vec<_> = impl_method
+                    .params
+                    .iter()
+                    .filter(|param| !param.is_self)
+                    .collect();
+                if trait_params.len() != impl_params.len() {
+                    return Err(self.type_error(format!(
+                        "Method '{}' has {} parameter(s), but trait '{}' requires {}",
+                        trait_method.name,
+                        impl_params.len(),
+                        trait_name,
+                        trait_params.len()
+                    )));
+                }
+                for (expected, actual) in trait_params.iter().zip(impl_params) {
+                    let expected_type = self.canonicalize_type(&expected.ty);
+                    if !self.types_equal(&expected_type, &actual.ty) {
+                        return Err(self.type_error(format!(
+                            "Method '{}' parameter type '{}' does not match trait type '{}'",
+                            trait_method.name, actual.ty, expected_type
+                        )));
+                    }
+                }
+                let expected_return = trait_method
+                    .return_type
+                    .as_ref()
+                    .map(|ty| self.canonicalize_type(ty))
+                    .unwrap_or(Type::new(TypeKind::Unit, Self::dummy_span()));
+                let actual_return = impl_method
+                    .return_type
+                    .clone()
+                    .unwrap_or(Type::new(TypeKind::Unit, Self::dummy_span()));
+                if !matches!(expected_return.kind, TypeKind::Unknown)
+                    && !self.types_equal(&expected_return, &actual_return)
+                {
+                    return Err(self.type_error(format!(
+                        "Method '{}' return type '{}' does not match trait type '{}'",
+                        trait_method.name, actual_return, expected_return
+                    )));
+                }
             }
         }
 
@@ -599,7 +724,7 @@ impl TypeChecker {
             }
         };
 
-        self.env.register_impl(&impl_block);
+        self.env.register_impl(&impl_block)?;
         for method in &impl_block.methods {
             let params: Vec<Type> = method.params.iter().map(|p| p.ty.clone()).collect();
             let return_type = method
@@ -623,6 +748,8 @@ impl TypeChecker {
                 params,
                 return_type,
                 is_method: has_self,
+                type_params: method.type_params.clone(),
+                trait_bounds: method.trait_bounds.clone(),
             };
             self.env
                 .register_or_update_function(canonical_name, signature)?;
@@ -682,12 +809,15 @@ impl TypeChecker {
                     }
                 }
 
+                self.push_type_params(&s2.type_params)?;
                 for field in &mut s2.fields {
                     field.ty = self.canonicalize_type(&field.ty);
                     if let Some(target) = &field.weak_target {
                         field.weak_target = Some(self.canonicalize_type(target));
                     }
                 }
+                s2.trait_bounds = self.canonicalize_trait_bounds(&s2.trait_bounds);
+                self.pop_type_params();
 
                 self.env.register_struct(&s2)?;
             }
@@ -700,6 +830,7 @@ impl TypeChecker {
                     }
                 }
 
+                self.push_type_params(&e2.type_params)?;
                 for variant in &mut e2.variants {
                     if let Some(fields) = &mut variant.fields {
                         for field in fields {
@@ -707,6 +838,8 @@ impl TypeChecker {
                         }
                     }
                 }
+                e2.trait_bounds = self.canonicalize_trait_bounds(&e2.trait_bounds);
+                self.pop_type_params();
 
                 self.env.register_enum(&e2)?;
             }
@@ -719,14 +852,18 @@ impl TypeChecker {
                     }
                 }
 
+                self.push_type_params(&t2.type_params)?;
                 for method in &mut t2.methods {
+                    self.push_type_params(&method.type_params)?;
                     for param in &mut method.params {
                         param.ty = self.canonicalize_type(&param.ty);
                     }
                     if let Some(ret) = method.return_type.clone() {
                         method.return_type = Some(self.canonicalize_type(&ret));
                     }
+                    self.pop_type_params();
                 }
+                self.pop_type_params();
 
                 self.env.register_trait(&t2)?;
             }
@@ -745,10 +882,13 @@ impl TypeChecker {
                 } else {
                     name.clone()
                 };
+                self.push_type_params(type_params)?;
+                let canonical_target = self.canonicalize_type(target);
+                self.pop_type_params();
                 self.env.register_type_alias(
                     qname,
                     type_params.clone(),
-                    self.canonicalize_type(target),
+                    canonical_target,
                 )?;
             }
 
@@ -798,49 +938,681 @@ impl TypeChecker {
         t1.kind == t2.kind
     }
 
+    fn push_type_params(&mut self, params: &[String]) -> Result<()> {
+        let mut scope = HashSet::new();
+        for param in params {
+            if !scope.insert(param.clone()) {
+                return Err(self.type_error(format!(
+                    "Type parameter '{}' is declared more than once",
+                    param
+                )));
+            }
+        }
+        self.type_param_scopes.push(scope);
+        Ok(())
+    }
+
+    fn pop_type_params(&mut self) {
+        self.type_param_scopes.pop();
+    }
+
+    fn is_type_param_in_scope(&self, name: &str) -> bool {
+        self.type_param_scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(name))
+    }
+
+    fn canonicalize_trait_bounds(&self, bounds: &[TraitBound]) -> Vec<TraitBound> {
+        bounds
+            .iter()
+            .map(|bound| TraitBound {
+                type_param: bound.type_param.clone(),
+                traits: bound
+                    .traits
+                    .iter()
+                    .map(|name| self.resolve_type_key(name))
+                    .collect(),
+            })
+            .collect()
+    }
+
     pub fn canonicalize_type(&self, ty: &Type) -> Type {
+        let mut expanding_aliases = HashSet::new();
+        self.canonicalize_type_inner(ty, &mut expanding_aliases)
+    }
+
+    fn canonicalize_type_inner(
+        &self,
+        ty: &Type,
+        expanding_aliases: &mut HashSet<String>,
+    ) -> Type {
         use crate::ast::TypeKind as TK;
         match &ty.kind {
-            TK::Named(name) => Type::new(TK::Named(self.resolve_type_key(name)), ty.span),
+            TK::Named(name) if !name.contains('.') && self.is_type_param_in_scope(name) => {
+                Type::new(TK::Generic(name.clone()), ty.span)
+            }
+            TK::Named(name) => {
+                let resolved = self.resolve_type_key(name);
+                if let Some((params, target)) = self.env.lookup_type_alias(&resolved) {
+                    if params.is_empty() && expanding_aliases.insert(resolved.clone()) {
+                        let expanded = self.canonicalize_type_inner(target, expanding_aliases);
+                        expanding_aliases.remove(&resolved);
+                        return expanded;
+                    }
+                }
+                if self.env.lookup_trait(&resolved).is_some() {
+                    Type::new(TK::Trait(resolved), ty.span)
+                } else {
+                    Type::new(TK::Named(resolved), ty.span)
+                }
+            }
             TK::Array(inner) => {
-                Type::new(TK::Array(Box::new(self.canonicalize_type(inner))), ty.span)
+                Type::new(
+                    TK::Array(Box::new(
+                        self.canonicalize_type_inner(inner, expanding_aliases),
+                    )),
+                    ty.span,
+                )
             }
 
             TK::Tuple(elements) => Type::new(
-                TK::Tuple(elements.iter().map(|t| self.canonicalize_type(t)).collect()),
+                TK::Tuple(
+                    elements
+                        .iter()
+                        .map(|t| self.canonicalize_type_inner(t, expanding_aliases))
+                        .collect(),
+                ),
+                ty.span,
+            ),
+            TK::Function {
+                params,
+                return_type,
+            } => Type::new(
+                TK::Function {
+                    params: params
+                        .iter()
+                        .map(|param| self.canonicalize_type_inner(param, expanding_aliases))
+                        .collect(),
+                    return_type: Box::new(
+                        self.canonicalize_type_inner(return_type, expanding_aliases),
+                    ),
+                },
                 ty.span,
             ),
             TK::Option(inner) => {
-                Type::new(TK::Option(Box::new(self.canonicalize_type(inner))), ty.span)
+                Type::new(
+                    TK::Option(Box::new(
+                        self.canonicalize_type_inner(inner, expanding_aliases),
+                    )),
+                    ty.span,
+                )
             }
 
             TK::Result(ok, err) => Type::new(
                 TK::Result(
-                    Box::new(self.canonicalize_type(ok)),
-                    Box::new(self.canonicalize_type(err)),
+                    Box::new(self.canonicalize_type_inner(ok, expanding_aliases)),
+                    Box::new(self.canonicalize_type_inner(err, expanding_aliases)),
                 ),
                 ty.span,
             ),
             TK::Map(k, v) => Type::new(
                 TK::Map(
-                    Box::new(self.canonicalize_type(k)),
-                    Box::new(self.canonicalize_type(v)),
+                    Box::new(self.canonicalize_type_inner(k, expanding_aliases)),
+                    Box::new(self.canonicalize_type_inner(v, expanding_aliases)),
                 ),
                 ty.span,
             ),
-            TK::Ref(inner) => Type::new(TK::Ref(Box::new(self.canonicalize_type(inner))), ty.span),
+            TK::Ref(inner) => Type::new(
+                TK::Ref(Box::new(
+                    self.canonicalize_type_inner(inner, expanding_aliases),
+                )),
+                ty.span,
+            ),
             TK::MutRef(inner) => {
-                Type::new(TK::MutRef(Box::new(self.canonicalize_type(inner))), ty.span)
+                Type::new(
+                    TK::MutRef(Box::new(
+                        self.canonicalize_type_inner(inner, expanding_aliases),
+                    )),
+                    ty.span,
+                )
             }
 
             TK::Pointer { mutable, pointee } => Type::new(
                 TK::Pointer {
                     mutable: *mutable,
-                    pointee: Box::new(self.canonicalize_type(pointee)),
+                    pointee: Box::new(
+                        self.canonicalize_type_inner(pointee, expanding_aliases),
+                    ),
                 },
                 ty.span,
             ),
+            TK::GenericInstance { name, type_args } => {
+                let resolved = self.resolve_type_key(name);
+                let canonical_args: Vec<Type> = type_args
+                    .iter()
+                    .map(|arg| self.canonicalize_type_inner(arg, expanding_aliases))
+                    .collect();
+                if let Some((params, target)) = self.env.lookup_type_alias(&resolved) {
+                    if params.len() == canonical_args.len()
+                        && expanding_aliases.insert(resolved.clone())
+                    {
+                        let bindings = params
+                            .iter()
+                            .cloned()
+                            .zip(canonical_args)
+                            .collect();
+                        let substituted = self.substitute_type(target, &bindings);
+                        let expanded =
+                            self.canonicalize_type_inner(&substituted, expanding_aliases);
+                        expanding_aliases.remove(&resolved);
+                        return expanded;
+                    }
+                }
+                Type::new(
+                    TK::GenericInstance {
+                        name: resolved,
+                        type_args: canonical_args,
+                    },
+                    ty.span,
+                )
+            }
+            TK::Union(types) => Type::new(
+                TK::Union(
+                    types
+                        .iter()
+                        .map(|ty| self.canonicalize_type_inner(ty, expanding_aliases))
+                        .collect(),
+                ),
+                ty.span,
+            ),
+            TK::Trait(name) => Type::new(TK::Trait(self.resolve_type_key(name)), ty.span),
+            TK::TraitBound(traits) => Type::new(
+                TK::TraitBound(
+                    traits
+                        .iter()
+                        .map(|name| self.resolve_type_key(name))
+                        .collect(),
+                ),
+                ty.span,
+            ),
             _ => ty.clone(),
+        }
+    }
+
+    fn infer_type_arguments(
+        &self,
+        expected: &Type,
+        actual: &Type,
+        type_params: &[String],
+        bindings: &mut HashMap<String, Type>,
+    ) -> Result<()> {
+        if let TypeKind::Generic(name) = &expected.kind {
+            if type_params.iter().any(|param| param == name) {
+                if let Some(bound) = bindings.get(name) {
+                    return self.unify(bound, actual);
+                }
+                bindings.insert(name.clone(), self.canonicalize_type(actual));
+                return Ok(());
+            }
+        }
+
+        match (&expected.kind, &actual.kind) {
+            (TypeKind::Array(expected), TypeKind::Array(actual))
+            | (TypeKind::Option(expected), TypeKind::Option(actual))
+            | (TypeKind::Ref(expected), TypeKind::Ref(actual))
+            | (TypeKind::MutRef(expected), TypeKind::MutRef(actual)) => {
+                self.infer_type_arguments(expected, actual, type_params, bindings)
+            }
+            (TypeKind::Map(expected_key, expected_value), TypeKind::Map(actual_key, actual_value))
+            | (
+                TypeKind::Result(expected_key, expected_value),
+                TypeKind::Result(actual_key, actual_value),
+            ) => {
+                self.infer_type_arguments(expected_key, actual_key, type_params, bindings)?;
+                self.infer_type_arguments(expected_value, actual_value, type_params, bindings)
+            }
+            (TypeKind::Tuple(expected), TypeKind::Tuple(actual))
+            | (TypeKind::Union(expected), TypeKind::Union(actual)) => {
+                if expected.len() != actual.len() {
+                    return Err(self.type_error(format!(
+                        "Type arity mismatch: expected {} element(s), got {}",
+                        expected.len(),
+                        actual.len()
+                    )));
+                }
+                for (expected, actual) in expected.iter().zip(actual.iter()) {
+                    self.infer_type_arguments(expected, actual, type_params, bindings)?;
+                }
+                Ok(())
+            }
+            (
+                TypeKind::Function {
+                    params: expected_params,
+                    return_type: expected_return,
+                },
+                TypeKind::Function {
+                    params: actual_params,
+                    return_type: actual_return,
+                },
+            ) => {
+                if expected_params.len() != actual_params.len() {
+                    return self.unify(expected, actual);
+                }
+                for (expected, actual) in expected_params.iter().zip(actual_params.iter()) {
+                    self.infer_type_arguments(expected, actual, type_params, bindings)?;
+                }
+                self.infer_type_arguments(
+                    expected_return,
+                    actual_return,
+                    type_params,
+                    bindings,
+                )
+            }
+            (
+                TypeKind::Pointer {
+                    mutable: expected_mutable,
+                    pointee: expected_pointee,
+                },
+                TypeKind::Pointer {
+                    mutable: actual_mutable,
+                    pointee: actual_pointee,
+                },
+            ) if expected_mutable == actual_mutable => self.infer_type_arguments(
+                expected_pointee,
+                actual_pointee,
+                type_params,
+                bindings,
+            ),
+            (
+                TypeKind::GenericInstance {
+                    name: expected_name,
+                    type_args: expected_args,
+                },
+                TypeKind::GenericInstance {
+                    name: actual_name,
+                    type_args: actual_args,
+                },
+            ) if expected_name == actual_name && expected_args.len() == actual_args.len() => {
+                for (expected, actual) in expected_args.iter().zip(actual_args.iter()) {
+                    self.infer_type_arguments(expected, actual, type_params, bindings)?;
+                }
+                Ok(())
+            }
+            _ => self.unify(expected, actual),
+        }
+    }
+
+    fn bind_type_argument(
+        &self,
+        name: &str,
+        concrete: &Type,
+        bindings: &mut HashMap<String, Type>,
+    ) -> Result<()> {
+        if let Some(existing) = bindings.get(name) {
+            self.unify(existing, concrete)
+        } else {
+            bindings.insert(name.to_string(), concrete.clone());
+            Ok(())
+        }
+    }
+
+    fn validate_type(&self, ty: &Type) -> Result<()> {
+        match &ty.kind {
+            TypeKind::Named(name) => {
+                let generic_arity = self
+                    .env
+                    .lookup_struct(name)
+                    .map(|def| def.type_params.len())
+                    .or_else(|| self.env.lookup_enum(name).map(|def| def.type_params.len()))
+                    .or_else(|| {
+                        self.env
+                            .lookup_type_alias(name)
+                            .map(|(params, _)| params.len())
+                    })
+                    .unwrap_or(0);
+                if generic_arity > 0 {
+                    return Err(self.type_error_at(
+                        format!(
+                            "Generic type '{}' requires {} type argument(s)",
+                            name, generic_arity
+                        ),
+                        ty.span,
+                    ));
+                }
+                if self.env.lookup_struct(name).is_none()
+                    && self.env.lookup_enum(name).is_none()
+                    && self.env.lookup_type_alias(name).is_none()
+                    && !self.env.is_builtin_type(name)
+                {
+                    return Err(self.type_error_at(format!("Undefined type '{}'", name), ty.span));
+                }
+            }
+            TypeKind::Generic(name) => {
+                if !self.is_type_param_in_scope(name) {
+                    return Err(self.type_error_at(
+                        format!("Undeclared type parameter '{}'", name),
+                        ty.span,
+                    ));
+                }
+            }
+            TypeKind::Array(inner)
+            | TypeKind::Option(inner)
+            | TypeKind::Ref(inner)
+            | TypeKind::MutRef(inner) => self.validate_type(inner)?,
+            TypeKind::Map(key, value) | TypeKind::Result(key, value) => {
+                self.validate_type(key)?;
+                self.validate_type(value)?;
+            }
+            TypeKind::Function {
+                params,
+                return_type,
+            } => {
+                for param in params {
+                    self.validate_type(param)?;
+                }
+                self.validate_type(return_type)?;
+            }
+            TypeKind::Tuple(elements) | TypeKind::Union(elements) => {
+                for element in elements {
+                    self.validate_type(element)?;
+                }
+            }
+            TypeKind::Pointer { pointee, .. } => self.validate_type(pointee)?,
+            TypeKind::GenericInstance { name, type_args } => {
+                let (arity, bounds) = if let Some(def) = self.env.lookup_struct(name) {
+                    (def.type_params.len(), Some((&def.type_params, &def.trait_bounds)))
+                } else if let Some(def) = self.env.lookup_enum(name) {
+                    (def.type_params.len(), Some((&def.type_params, &def.trait_bounds)))
+                } else if let Some((params, _)) = self.env.lookup_type_alias(name) {
+                    (params.len(), None)
+                } else {
+                    return Err(self
+                        .type_error_at(format!("Undefined generic type '{}'", name), ty.span));
+                };
+                if arity != type_args.len() {
+                    return Err(self.type_error_at(
+                        format!(
+                            "Type '{}' expects {} type argument(s), got {}",
+                            name,
+                            arity,
+                            type_args.len()
+                        ),
+                        ty.span,
+                    ));
+                }
+                for arg in type_args {
+                    self.validate_type(arg)?;
+                }
+                if let Some((type_params, trait_bounds)) = bounds {
+                    let bindings = type_params
+                        .iter()
+                        .cloned()
+                        .zip(type_args.iter().cloned())
+                        .collect();
+                    self.validate_generic_bindings(type_params, trait_bounds, &bindings)?;
+                }
+            }
+            TypeKind::Trait(name) => {
+                if self.env.lookup_trait(name).is_none() {
+                    return Err(self.type_error_at(format!("Undefined trait '{}'", name), ty.span));
+                }
+            }
+            TypeKind::TraitBound(names) => {
+                for name in names {
+                    if self.env.lookup_trait(name).is_none() {
+                        return Err(
+                            self.type_error_at(format!("Undefined trait '{}'", name), ty.span)
+                        );
+                    }
+                }
+            }
+            TypeKind::Int
+            | TypeKind::Float
+            | TypeKind::String
+            | TypeKind::Bool
+            | TypeKind::Unknown
+            | TypeKind::Unit
+            | TypeKind::Infer => {}
+        }
+        Ok(())
+    }
+
+    fn validate_trait_bounds(
+        &self,
+        type_params: &[String],
+        bounds: &[TraitBound],
+    ) -> Result<()> {
+        for bound in bounds {
+            if !type_params.iter().any(|param| param == &bound.type_param) {
+                return Err(self.type_error(format!(
+                    "Trait bound references undeclared type parameter '{}'",
+                    bound.type_param
+                )));
+            }
+            for trait_name in &bound.traits {
+                let resolved = self.resolve_type_key(trait_name);
+                if self.env.lookup_trait(&resolved).is_none() {
+                    return Err(self.type_error(format!(
+                        "Undefined trait '{}' in bound for '{}'",
+                        trait_name, bound.type_param
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_type_alias_cycle(&self, name: &str) -> Result<()> {
+        fn visit_type(
+            checker: &TypeChecker,
+            ty: &Type,
+            visiting: &mut HashSet<String>,
+        ) -> bool {
+            match &ty.kind {
+                TypeKind::Named(name) | TypeKind::GenericInstance { name, .. }
+                    if checker.env.lookup_type_alias(name).is_some() =>
+                {
+                    if !visiting.insert(name.clone()) {
+                        return true;
+                    }
+                    let (_, target) = checker.env.lookup_type_alias(name).unwrap();
+                    let cyclic = visit_type(checker, target, visiting);
+                    visiting.remove(name);
+                    if cyclic {
+                        return true;
+                    }
+                    if let TypeKind::GenericInstance { type_args, .. } = &ty.kind {
+                        return type_args
+                            .iter()
+                            .any(|arg| visit_type(checker, arg, visiting));
+                    }
+                    false
+                }
+                TypeKind::Array(inner)
+                | TypeKind::Option(inner)
+                | TypeKind::Ref(inner)
+                | TypeKind::MutRef(inner) => visit_type(checker, inner, visiting),
+                TypeKind::Map(key, value) | TypeKind::Result(key, value) => {
+                    visit_type(checker, key, visiting)
+                        || visit_type(checker, value, visiting)
+                }
+                TypeKind::Function {
+                    params,
+                    return_type,
+                } => {
+                    params
+                        .iter()
+                        .any(|param| visit_type(checker, param, visiting))
+                        || visit_type(checker, return_type, visiting)
+                }
+                TypeKind::Tuple(elements) | TypeKind::Union(elements) => elements
+                    .iter()
+                    .any(|element| visit_type(checker, element, visiting)),
+                TypeKind::Pointer { pointee, .. } => visit_type(checker, pointee, visiting),
+                TypeKind::GenericInstance { type_args, .. } => type_args
+                    .iter()
+                    .any(|arg| visit_type(checker, arg, visiting)),
+                _ => false,
+            }
+        }
+
+        let Some((_, target)) = self.env.lookup_type_alias(name) else {
+            return Ok(());
+        };
+        let mut visiting = HashSet::new();
+        visiting.insert(name.to_string());
+        if visit_type(self, target, &mut visiting) {
+            return Err(self.type_error(format!(
+                "Recursive type alias '{}' is not supported",
+                name
+            )));
+        }
+        Ok(())
+    }
+
+    fn substitute_type(&self, ty: &Type, bindings: &HashMap<String, Type>) -> Type {
+        let kind = match &ty.kind {
+            TypeKind::Generic(name) => {
+                if let Some(bound) = bindings.get(name) {
+                    return bound.clone();
+                }
+                TypeKind::Generic(name.clone())
+            }
+            TypeKind::Array(inner) => {
+                TypeKind::Array(Box::new(self.substitute_type(inner, bindings)))
+            }
+            TypeKind::Map(key, value) => TypeKind::Map(
+                Box::new(self.substitute_type(key, bindings)),
+                Box::new(self.substitute_type(value, bindings)),
+            ),
+            TypeKind::Function {
+                params,
+                return_type,
+            } => TypeKind::Function {
+                params: params
+                    .iter()
+                    .map(|param| self.substitute_type(param, bindings))
+                    .collect(),
+                return_type: Box::new(self.substitute_type(return_type, bindings)),
+            },
+            TypeKind::Tuple(elements) => TypeKind::Tuple(
+                elements
+                    .iter()
+                    .map(|element| self.substitute_type(element, bindings))
+                    .collect(),
+            ),
+            TypeKind::Option(inner) => {
+                TypeKind::Option(Box::new(self.substitute_type(inner, bindings)))
+            }
+            TypeKind::Result(ok, err) => TypeKind::Result(
+                Box::new(self.substitute_type(ok, bindings)),
+                Box::new(self.substitute_type(err, bindings)),
+            ),
+            TypeKind::Ref(inner) => {
+                TypeKind::Ref(Box::new(self.substitute_type(inner, bindings)))
+            }
+            TypeKind::MutRef(inner) => {
+                TypeKind::MutRef(Box::new(self.substitute_type(inner, bindings)))
+            }
+            TypeKind::Pointer { mutable, pointee } => TypeKind::Pointer {
+                mutable: *mutable,
+                pointee: Box::new(self.substitute_type(pointee, bindings)),
+            },
+            TypeKind::GenericInstance { name, type_args } => TypeKind::GenericInstance {
+                name: name.clone(),
+                type_args: type_args
+                    .iter()
+                    .map(|arg| self.substitute_type(arg, bindings))
+                    .collect(),
+            },
+            TypeKind::Union(types) => TypeKind::Union(
+                types
+                    .iter()
+                    .map(|ty| self.substitute_type(ty, bindings))
+                    .collect(),
+            ),
+            _ => ty.kind.clone(),
+        };
+        Type::new(kind, ty.span)
+    }
+
+    fn validate_generic_call(
+        &self,
+        signature: &FunctionSignature,
+        bindings: &HashMap<String, Type>,
+    ) -> Result<()> {
+        self.validate_generic_bindings(
+            &signature.type_params,
+            &signature.trait_bounds,
+            bindings,
+        )
+    }
+
+    fn validate_generic_bindings(
+        &self,
+        type_params: &[String],
+        trait_bounds: &[TraitBound],
+        bindings: &HashMap<String, Type>,
+    ) -> Result<()> {
+        for type_param in type_params {
+            if !bindings.contains_key(type_param) {
+                return Err(self.type_error(format!(
+                    "Cannot infer type parameter '{}' from this call",
+                    type_param
+                )));
+            }
+        }
+
+        for bound in trait_bounds {
+            let concrete = bindings.get(&bound.type_param).ok_or_else(|| {
+                self.type_error(format!(
+                    "Cannot infer bounded type parameter '{}' from this call",
+                    bound.type_param
+                ))
+            })?;
+            for trait_name in &bound.traits {
+                if !self.type_satisfies_trait(concrete, trait_name) {
+                    return Err(self.type_error(format!(
+                        "Type '{}' does not implement required trait '{}'",
+                        concrete, trait_name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn instantiate_nominal_type(
+        &self,
+        name: String,
+        type_params: &[String],
+        trait_bounds: &[TraitBound],
+        bindings: &HashMap<String, Type>,
+        span: Span,
+    ) -> Result<Type> {
+        if type_params.is_empty() {
+            return Ok(Type::new(TypeKind::Named(name), span));
+        }
+        self.validate_generic_bindings(type_params, trait_bounds, bindings)?;
+        let mut type_args = Vec::with_capacity(type_params.len());
+        for type_param in type_params {
+            type_args.push(bindings[type_param].clone());
+        }
+        Ok(Type::new(
+            TypeKind::GenericInstance { name, type_args },
+            span,
+        ))
+    }
+
+    fn type_satisfies_trait(&self, ty: &Type, trait_name: &str) -> bool {
+        match &ty.kind {
+            TypeKind::Generic(type_param) => self
+                .current_trait_bounds
+                .get(type_param)
+                .is_some_and(|bounds| bounds.iter().any(|bound| bound == trait_name)),
+            TypeKind::Trait(actual) => actual == trait_name,
+            _ => self.env.type_implements_trait(ty, trait_name),
         }
     }
 
@@ -853,6 +1625,24 @@ impl TypeChecker {
             None
         };
         self.unify_at(expected, actual, span)
+    }
+
+    fn unify_invariant(&self, expected: &Type, actual: &Type) -> Result<()> {
+        if matches!(expected.kind, TypeKind::Unknown | TypeKind::Infer)
+            || matches!(actual.kind, TypeKind::Unknown | TypeKind::Infer)
+            || self.types_equal(expected, actual)
+        {
+            Ok(())
+        } else {
+            Err(self.type_error_at(
+                format!("Type mismatch: expected '{}', got '{}'", expected, actual),
+                if actual.span.start_line > 0 {
+                    actual.span
+                } else {
+                    expected.span
+                },
+            ))
+        }
     }
 
     fn unify_at(&self, expected: &Type, actual: &Type, span: Option<Span>) -> Result<()> {
@@ -875,6 +1665,14 @@ impl TypeChecker {
         }
 
         match (&expected.kind, &actual.kind) {
+            (TypeKind::Trait(expected_trait), TypeKind::Trait(actual_trait))
+                if expected_trait == actual_trait =>
+            {
+                return Ok(())
+            }
+            (TypeKind::Trait(trait_name), _) if self.type_satisfies_trait(actual, trait_name) => {
+                return Ok(())
+            }
             (TypeKind::Union(expected_types), TypeKind::Union(actual_types)) => {
                 if expected_types.len() != actual_types.len() {
                     return Err(self.type_error(format!(
@@ -996,13 +1794,13 @@ impl TypeChecker {
                 {
                     return Ok(());
                 } else {
-                    return self.unify(exp_el, act_el);
+                    return self.unify_invariant(exp_el, act_el);
                 }
             }
 
             (TypeKind::Map(exp_key, exp_value), TypeKind::Map(act_key, act_value)) => {
-                self.unify(exp_key, act_key)?;
-                return self.unify(exp_value, act_value);
+                self.unify_invariant(exp_key, act_key)?;
+                return self.unify_invariant(exp_value, act_value);
             }
 
             (TypeKind::Named(name), TypeKind::Option(_))
@@ -1371,5 +2169,340 @@ impl TypeChecker {
         self.is_bool_like(left)
             && !self.is_bool_like(right)
             && self.option_inner_type(right).is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{intern::Interner, lexer::Lexer, parser::Parser};
+    #[cfg(feature = "std")]
+    use std::sync::Mutex;
+
+    #[cfg(feature = "std")]
+    static CHECK_LOCK: Mutex<()> = Mutex::new(());
+
+    fn check(source: &str) -> Result<()> {
+        #[cfg(feature = "std")]
+        let _guard = CHECK_LOCK.lock().unwrap();
+        let mut interner = Interner::new();
+        let mut lexer = Lexer::new(source, &mut interner);
+        let tokens = lexer.tokenize()?;
+        let mut parser = Parser::new(tokens);
+        let items = parser.parse()?;
+        TypeChecker::new().check_module(&items)
+    }
+
+    #[test]
+    fn single_letter_nominal_type_is_not_a_generic() {
+        check(
+            "struct K\n  x: int\nend\n\
+             local value: K = K { x = 7 }\n\
+             local x: int = value.x\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn generic_function_infers_and_substitutes_multi_letter_parameter() {
+        check(
+            "function identity<Element>(value: Element): Element\n\
+               return value\n\
+             end\n\
+             local number: int = identity(42)\n\
+             local text: string = identity(\"hello\")\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn generic_function_infers_nested_parameter() {
+        check(
+            "function first<Element>(values: Array<Element>): Element\n\
+               return values[0]:unwrap()\n\
+             end\n\
+             local number: int = first([42])\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn generic_struct_infers_type_and_substitutes_fields() {
+        check(
+            "struct Box<Item>\n\
+               value: Item\n\
+             end\n\
+             local boxed: Box<int> = Box { value = 42 }\n\
+             local value: int = boxed.value\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn generic_impl_substitutes_receiver_and_method_types() {
+        check(
+            "struct Box<Item>\n\
+               value: Item\n\
+             end\n\
+             impl<Item> Box<Item>\n\
+               function get(self): Item\n\
+                 return self.value\n\
+               end\n\
+               function replace<Next>(self, value: Next): Next\n\
+                 return value\n\
+               end\n\
+             end\n\
+             local boxed: Box<int> = Box { value = 42 }\n\
+             local value: int = boxed:get()\n\
+             local text: string = boxed:replace<string>(\"hello\")\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn explicit_function_type_arguments_bind_uninferred_parameters() {
+        check(
+            "function tagged<Tag>(value: int): int\n\
+               return value\n\
+             end\n\
+             local value: int = tagged<string>(42)\n",
+        )
+        .unwrap();
+
+        let error = check(
+            "function tagged<Tag>(value: int): int\n\
+               return value\n\
+             end\n\
+             local value = tagged(42)\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Cannot infer type parameter 'Tag'"));
+    }
+
+    #[test]
+    fn generic_aliases_expand_with_scoped_parameters() {
+        check(
+            "type Pair<Item> = (Item, Item)\n\
+             type Count = int\n\
+             local pair: Pair<int> = (1, 2)\n\
+             local count: Count = 3\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn recursive_type_aliases_are_rejected_without_recursing() {
+        let direct = check("type Loop = Loop\n").unwrap_err();
+        assert!(direct.to_string().contains("Recursive type alias"));
+
+        let mutual = check("type Left = Right\ntype Right = Left\n").unwrap_err();
+        assert!(mutual.to_string().contains("Recursive type alias"));
+    }
+
+    #[test]
+    fn optional_generic_fields_prefer_the_full_option_shape() {
+        check(
+            "struct Holder<Item>\n\
+               value: Option<Item>\n\
+             end\n\
+             local holder = Holder { value = Option.Some(\"hello\") }\n\
+             local text: string = holder.value:unwrap()\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn generic_unit_variants_accept_explicit_or_contextual_arguments() {
+        check(
+            "enum Maybe<Item>\n\
+               None\n\
+             end\n\
+             local explicit: Maybe<int> = Maybe.None<int>()\n\
+             local contextual: Maybe<string> = Maybe.None\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn specialized_generic_impls_are_rejected_under_erasure() {
+        let error = check(
+            "struct Box<Item>\n\
+               value: Item\n\
+             end\n\
+             impl Box<int>\n\
+               function get(self): int\n\
+                 return self.value\n\
+               end\n\
+             end\n",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Specialized generic impls are not supported"));
+    }
+
+    #[test]
+    fn generic_impl_cannot_weaken_a_trait_method_signature() {
+        let error = check(
+            "trait IntSource\n\
+               function get(self): int\n\
+             end\n\
+             struct Box<Item>\n\
+               value: Item\n\
+             end\n\
+             impl<Item> IntSource for Box<Item>\n\
+               function get(self): Item\n\
+                 return self.value\n\
+               end\n\
+             end\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("returns 'Item'"));
+    }
+
+    #[test]
+    fn invalid_generic_annotations_are_rejected_without_initializers() {
+        let error = check(
+            "struct Box<Item>\n\
+               value: Item\n\
+             end\n\
+             local value: Box<int, string>\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("expects 1 type argument"));
+    }
+
+    #[test]
+    fn spaced_comparisons_are_not_parsed_as_generic_calls() {
+        check(
+            "local a: int = 1\n\
+             local b: int = 2\n\
+             local c: int = 3\n\
+             local result: bool = a < b and c > (b)\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn conditional_generic_impl_is_rejected_under_erasure() {
+        let error = check(
+            "struct Box<Item>\n\
+               value: Item\n\
+             end\n\
+             impl<Item: ToString> Box<Item>\n\
+               function text(self): string\n\
+                 return self.value:to_string()\n\
+               end\n\
+             end\n\
+             local boxed: Box<int> = Box { value = 42 }\n\
+             local text: string = boxed:text()\n",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Conditional generic impls are not supported"));
+    }
+
+    #[test]
+    fn undeclared_type_parameters_are_rejected_as_undefined_types() {
+        let error = check(
+            "function broken(value: Missing): Missing\n\
+               return value\n\
+             end\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Undefined type 'Missing'"));
+    }
+
+    #[test]
+    fn generic_enum_constructor_infers_type_arguments() {
+        check(
+            "enum Boxed<Item>\n\
+               Value(Item)\n\
+             end\n\
+             local boxed: Boxed<int> = Boxed.Value(42)\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn repeated_generic_parameter_must_have_one_type() {
+        let error = check(
+            "function choose<T>(left: T, right: T): T\n\
+               return left\n\
+             end\n\
+             local value = choose(1, \"wrong\")\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Argument 2"));
+    }
+
+    #[test]
+    fn generic_trait_bounds_are_enforced_at_call_site() {
+        let valid =
+            "trait Drawable\n\
+               function draw(self): string\n\
+             end\n\
+             struct Circle\n\
+             end\n\
+             impl Drawable for Circle\n\
+               function draw(self): string\n\
+                 return \"circle\"\n\
+               end\n\
+             end\n\
+             function render<Item: Drawable>(item: Item): string\n\
+               return item:draw()\n\
+             end\n";
+        check(&format!("{}local output: string = render(Circle {{}})\n", valid)).unwrap();
+
+        let error = check(&format!("{}local output = render(1)\n", valid)).unwrap_err();
+        assert!(error.to_string().contains("does not implement required trait"));
+    }
+
+    #[test]
+    fn bare_trait_name_accepts_any_implementor() {
+        check(
+            "trait Drawable\n\
+               function draw(self): string\n\
+             end\n\
+             struct Circle\n\
+             end\n\
+             impl Drawable for Circle\n\
+               function draw(self): string\n\
+                 return \"circle\"\n\
+               end\n\
+             end\n\
+             local drawable: Drawable = Circle {}\n\
+             local output: string = drawable:draw()\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn mutable_containers_remain_invariant_over_trait_values() {
+        let declarations =
+            "trait Drawable\n\
+               function draw(self): string\n\
+             end\n\
+             struct Circle\n\
+             end\n\
+             impl Drawable for Circle\n\
+               function draw(self): string\n\
+                 return \"circle\"\n\
+               end\n\
+             end\n";
+        check(&format!(
+            "{}local values: Array<Drawable> = [Circle {{}}]\n",
+            declarations
+        ))
+        .unwrap();
+
+        let error = check(&format!(
+            "{}local circles: Array<Circle> = [Circle {{}}]\n\
+             local values: Array<Drawable> = circles\n",
+            declarations
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("expected 'Drawable'"));
     }
 }

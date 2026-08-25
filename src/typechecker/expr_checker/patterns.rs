@@ -5,6 +5,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use hashbrown::HashMap;
 impl TypeChecker {
     pub fn validate_is_pattern(&mut self, pattern: &Pattern, scrutinee_type: &Type) -> Result<()> {
         match pattern {
@@ -19,15 +20,40 @@ impl TypeChecker {
                 variant,
                 bindings,
             } => {
-                let (type_name, variant_types) = match &scrutinee_type.kind {
-                    TypeKind::Named(name) => (name.clone(), None),
+                let (type_name, variant_types, type_bindings) = match &scrutinee_type.kind {
+                    TypeKind::Named(name) => (name.clone(), None, HashMap::new()),
+                    TypeKind::GenericInstance { name, type_args } => {
+                        let enum_def = self.env.lookup_enum(name).ok_or_else(|| {
+                            self.type_error(format!("Undefined enum '{}'", name))
+                        })?;
+                        if enum_def.type_params.len() != type_args.len() {
+                            return Err(self.type_error(format!(
+                                "Type '{}' expects {} type argument(s), got {}",
+                                name,
+                                enum_def.type_params.len(),
+                                type_args.len()
+                            )));
+                        }
+                        let bindings = enum_def
+                            .type_params
+                            .iter()
+                            .cloned()
+                            .zip(type_args.iter().cloned())
+                            .collect();
+                        (name.clone(), None, bindings)
+                    }
                     TypeKind::Option(inner) => {
-                        ("Option".to_string(), Some(vec![(**inner).clone()]))
+                        (
+                            "Option".to_string(),
+                            Some(vec![(**inner).clone()]),
+                            HashMap::new(),
+                        )
                     }
 
                     TypeKind::Result(ok, err) => (
                         "Result".to_string(),
                         Some(vec![(**ok).clone(), (**err).clone()]),
+                        HashMap::new(),
                     ),
                     TypeKind::Union(types) => {
                         for ty in types.iter() {
@@ -94,10 +120,10 @@ impl TypeChecker {
                             if let TypeKind::Generic(_) = &field_type.kind {
                                 types.get(0).cloned().unwrap_or_else(|| field_type.clone())
                             } else {
-                                field_type.clone()
+                                self.substitute_type(field_type, &type_bindings)
                             }
                         } else {
-                            field_type.clone()
+                            self.substitute_type(field_type, &type_bindings)
                         };
                         self.validate_is_pattern(binding, &bind_type)?;
                     }
@@ -251,15 +277,40 @@ impl TypeChecker {
                 variant,
                 bindings,
             } => {
-                let (type_name, variant_types) = match &scrutinee_type.kind {
-                    TypeKind::Named(name) => (name.clone(), None),
+                let (type_name, variant_types, type_bindings) = match &scrutinee_type.kind {
+                    TypeKind::Named(name) => (name.clone(), None, HashMap::new()),
+                    TypeKind::GenericInstance { name, type_args } => {
+                        let enum_def = self.env.lookup_enum(name).ok_or_else(|| {
+                            self.type_error(format!("Undefined enum '{}'", name))
+                        })?;
+                        if enum_def.type_params.len() != type_args.len() {
+                            return Err(self.type_error(format!(
+                                "Type '{}' expects {} type argument(s), got {}",
+                                name,
+                                enum_def.type_params.len(),
+                                type_args.len()
+                            )));
+                        }
+                        let bindings = enum_def
+                            .type_params
+                            .iter()
+                            .cloned()
+                            .zip(type_args.iter().cloned())
+                            .collect();
+                        (name.clone(), None, bindings)
+                    }
                     TypeKind::Option(inner) => {
-                        ("Option".to_string(), Some(vec![(**inner).clone()]))
+                        (
+                            "Option".to_string(),
+                            Some(vec![(**inner).clone()]),
+                            HashMap::new(),
+                        )
                     }
 
                     TypeKind::Result(ok, err) => (
                         "Result".to_string(),
                         Some(vec![(**ok).clone(), (**err).clone()]),
+                        HashMap::new(),
                     ),
                     _ => {
                         return Err(self
@@ -319,10 +370,8 @@ impl TypeChecker {
                                 });
                         let bind_type = if let Some(concrete_type) = concrete {
                             concrete_type
-                        } else if matches!(field_type.kind, TypeKind::Generic(_)) {
-                            Type::new(TypeKind::Unknown, Self::dummy_span())
                         } else {
-                            field_type.clone()
+                            self.substitute_type(field_type, &type_bindings)
                         };
                         self.bind_pattern(binding, &bind_type)?;
                     }

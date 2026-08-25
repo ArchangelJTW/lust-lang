@@ -1,0 +1,38 @@
+-- Generics are statically checked and runtime-erased. Type arguments are
+-- normally inferred, but can be supplied explicitly when inference has no input.
+
+type Items<Element> = Array<Element>
+
+function first<Element>(values: Items<Element>): Element
+    return values[0]:unwrap()
+end
+
+function default_value<Element>(value: int): int
+    return value
+end
+
+struct Box<Item>
+    value: Item
+end
+
+impl<Item> Box<Item>
+    function get(self): Item
+        return self.value
+    end
+end
+
+enum Message<Payload>
+    Data(Payload)
+    Empty
+end
+
+local numbers: Items<int> = [10, 20, 30]
+local number_box: Box<int> = Box { value = first(numbers) }
+local message: Message<string> = Message.Data("hello")
+
+println(number_box:get())
+println(default_value<string>(7))
+
+if message is Data(text) then
+    println(text)
+end

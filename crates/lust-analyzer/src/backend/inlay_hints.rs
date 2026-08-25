@@ -201,7 +201,7 @@ fn collect_inlay_hints_from_expr(
             collect_inlay_hints_from_expr(operand, module, range, hints);
         }
 
-        ExprKind::Call { callee, args } => {
+        ExprKind::Call { callee, args, .. } => {
             collect_inlay_hints_from_expr(callee, module, range, hints);
             for arg in args {
                 collect_inlay_hints_from_expr(arg, module, range, hints);

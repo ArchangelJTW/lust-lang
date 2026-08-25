@@ -1299,10 +1299,12 @@ impl VM {
                             })?
                             .to_string()
                     };
-                    if let Value::Struct {
-                        name: struct_name, ..
-                    } = &object
-                    {
+                    let object_type_name = match &object {
+                        Value::Struct { name, .. } => Some(name.as_str()),
+                        Value::Enum { enum_name, .. } => Some(enum_name.as_str()),
+                        _ => None,
+                    };
+                    if let Some(struct_name) = object_type_name {
                         let mangled_name = format!("{}:{}", struct_name, method_name);
                         if let Some(func_idx) =
                             self.functions.iter().position(|f| f.name == mangled_name)

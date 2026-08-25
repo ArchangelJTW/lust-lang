@@ -421,7 +421,23 @@ impl TypeChecker {
         }
     }
 
-    pub fn check_call_expr(&mut self, span: Span, callee: &Expr, args: &[Expr]) -> Result<Type> {
+    pub fn check_call_expr(
+        &mut self,
+        span: Span,
+        callee: &Expr,
+        explicit_type_args: Option<&[Type]>,
+        args: &[Expr],
+        expected_type: Option<&Type>,
+    ) -> Result<Type> {
+        let explicit_type_args = explicit_type_args
+            .unwrap_or(&[])
+            .iter()
+            .map(|ty| {
+                let canonical = self.canonicalize_type(ty);
+                self.validate_type(&canonical)?;
+                Ok(canonical)
+            })
+            .collect::<Result<Vec<_>>>()?;
         if let ExprKind::FieldAccess { object, field } = &callee.kind {
             if let ExprKind::Identifier(type_name) = &object.kind {
                 let mut candidate_names: Vec<String> = Vec::new();
@@ -444,6 +460,15 @@ impl TypeChecker {
                 }
 
                 if let Some((resolved_name, sig)) = static_candidate {
+                    if !explicit_type_args.is_empty() {
+                        return Err(self.type_error_at(
+                            format!(
+                                "Static method '{}' does not accept explicit type arguments",
+                                resolved_name
+                            ),
+                            span,
+                        ));
+                    }
                     let allow_varargs = sig.params.len() == 1
                         && matches!(sig.params[0].kind, TypeKind::Unknown)
                         && !args.is_empty();
@@ -528,13 +553,55 @@ impl TypeChecker {
                         }
 
                         let mut type_params = HashMap::new();
+                        if !explicit_type_args.is_empty() {
+                            if explicit_type_args.len() != enum_def.type_params.len() {
+                                return Err(self.type_error_at(
+                                    format!(
+                                        "Enum '{}' expects {} type argument(s), got {}",
+                                        type_name,
+                                        enum_def.type_params.len(),
+                                        explicit_type_args.len()
+                                    ),
+                                    span,
+                                ));
+                            }
+                            for (param, arg) in enum_def
+                                .type_params
+                                .iter()
+                                .zip(explicit_type_args.iter())
+                            {
+                                type_params.insert(param.clone(), arg.clone());
+                            }
+                        }
+                        if let Some(expected) = expected_type {
+                            match &expected.kind {
+                                TypeKind::GenericInstance { name, type_args }
+                                    if name == &enum_def.name
+                                        && type_args.len() == enum_def.type_params.len() =>
+                                {
+                                    for (param, arg) in enum_def.type_params.iter().zip(type_args) {
+                                        self.bind_type_argument(param, arg, &mut type_params)?;
+                                    }
+                                }
+                                TypeKind::Option(inner) if type_name == "Option" => {
+                                    self.bind_type_argument("T", inner, &mut type_params)?;
+                                }
+                                TypeKind::Result(ok, err) if type_name == "Result" => {
+                                    self.bind_type_argument("T", ok, &mut type_params)?;
+                                    self.bind_type_argument("E", err, &mut type_params)?;
+                                }
+                                _ => {}
+                            }
+                        }
                         for (arg, expected_type) in args.iter().zip(expected_fields.iter()) {
                             let arg_type = self.check_expr(arg)?;
-                            if let TypeKind::Generic(type_param) = &expected_type.kind {
-                                type_params.insert(type_param.clone(), arg_type.clone());
-                            } else {
-                                self.unify(expected_type, &arg_type)?;
-                            }
+                            let expected_type = self.canonicalize_type(expected_type);
+                            self.infer_type_arguments(
+                                &expected_type,
+                                &arg_type,
+                                &enum_def.type_params,
+                                &mut type_params,
+                            )?;
                         }
 
                         if !type_params.is_empty() {
@@ -570,10 +637,13 @@ impl TypeChecker {
                                 type_name.clone()
                             }
                         };
-                        return Ok(Type::new(
-                            TypeKind::Named(enum_type_name),
+                        return self.instantiate_nominal_type(
+                            enum_type_name,
+                            &enum_def.type_params,
+                            &enum_def.trait_bounds,
+                            &type_params,
                             Self::dummy_span(),
-                        ));
+                        );
                     } else {
                         if !args.is_empty() {
                             return Err(self.type_error(format!(
@@ -590,17 +660,83 @@ impl TypeChecker {
                                 type_name.clone()
                             }
                         };
-                        return Ok(Type::new(
-                            TypeKind::Named(enum_type_name),
+                        let mut type_params = HashMap::new();
+                        if !explicit_type_args.is_empty() {
+                            if explicit_type_args.len() != enum_def.type_params.len() {
+                                return Err(self.type_error_at(
+                                    format!(
+                                        "Enum '{}' expects {} type argument(s), got {}",
+                                        type_name,
+                                        enum_def.type_params.len(),
+                                        explicit_type_args.len()
+                                    ),
+                                    span,
+                                ));
+                            }
+                            for (param, arg) in enum_def
+                                .type_params
+                                .iter()
+                                .zip(explicit_type_args.iter())
+                            {
+                                self.bind_type_argument(param, arg, &mut type_params)?;
+                            }
+                        }
+                        if enum_def.type_params.is_empty() {
+                            return Ok(Type::new(
+                                TypeKind::Named(enum_type_name),
+                                Self::dummy_span(),
+                            ));
+                        }
+                        if let Some(expected) = expected_type {
+                            match &expected.kind {
+                                TypeKind::GenericInstance { name, type_args }
+                                    if name == &enum_type_name
+                                        && type_args.len() == enum_def.type_params.len() =>
+                                {
+                                    for (param, arg) in
+                                        enum_def.type_params.iter().zip(type_args)
+                                    {
+                                        self.bind_type_argument(
+                                            param,
+                                            arg,
+                                            &mut type_params,
+                                        )?;
+                                    }
+                                }
+                                TypeKind::Option(inner) if type_name == "Option" => {
+                                    self.bind_type_argument("T", inner, &mut type_params)?;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if type_name == "Option" {
+                            if let Some(inner) = type_params.get("T") {
+                                return Ok(Type::new(
+                                    TypeKind::Option(Box::new(inner.clone())),
+                                    Self::dummy_span(),
+                                ));
+                            }
+                        }
+                        return self.instantiate_nominal_type(
+                            enum_type_name,
+                            &enum_def.type_params,
+                            &enum_def.trait_bounds,
+                            &type_params,
                             Self::dummy_span(),
-                        ));
+                        );
                     }
                 }
             }
         }
 
         if let ExprKind::Identifier(name) = &callee.kind {
-            if let Some(var_type) = self.env.lookup_variable(name) {
+                if let Some(var_type) = self.env.lookup_variable(name) {
+                if !explicit_type_args.is_empty() {
+                    return Err(self.type_error_at(
+                        "Function values do not accept explicit type arguments".to_string(),
+                        callee.span,
+                    ));
+                }
                 if let TypeKind::Function {
                     params: param_types,
                     return_type,
@@ -675,6 +811,12 @@ impl TypeChecker {
             let resolved = self.resolve_function_key(name);
             let sig_opt = self.env.lookup_function(&resolved).cloned();
             if sig_opt.is_none() {
+                if !explicit_type_args.is_empty() {
+                    return Err(self.type_error_at(
+                        format!("Unknown generic function '{}'", name),
+                        callee.span,
+                    ));
+                }
                 for arg in args {
                     self.check_expr(arg)?;
                 }
@@ -682,6 +824,26 @@ impl TypeChecker {
             }
             let sig = sig_opt.unwrap();
             let mut expected_params = sig.params.clone();
+            let mut generic_bindings = HashMap::new();
+            if explicit_type_args.len() > sig.type_params.len()
+                || (!explicit_type_args.is_empty()
+                    && explicit_type_args.len() != sig.type_params.len())
+            {
+                return Err(self.type_error_at(
+                    format!(
+                        "Function '{}' expects {} type argument(s), got {}",
+                        name,
+                        sig.type_params.len(),
+                        explicit_type_args.len()
+                    ),
+                    callee.span,
+                ));
+            }
+            for (type_param, concrete) in
+                sig.type_params.iter().zip(explicit_type_args.iter())
+            {
+                generic_bindings.insert(type_param.clone(), concrete.clone());
+            }
             if args.len() != expected_params.len() {
                 if args.len() > expected_params.len() {
                     if let Some(last) = expected_params.last().cloned() {
@@ -727,8 +889,17 @@ impl TypeChecker {
 
             for (i, (arg, expected_type)) in args.iter().zip(expected_params.iter()).enumerate() {
                 let arg_type = self.check_expr(arg)?;
-                self.unify_with_bounds(expected_type, &arg_type)
-                    .map_err(|_| {
+                let result = if sig.type_params.is_empty() {
+                    self.unify(expected_type, &arg_type)
+                } else {
+                    self.infer_type_arguments(
+                        expected_type,
+                        &arg_type,
+                        &sig.type_params,
+                        &mut generic_bindings,
+                    )
+                };
+                result.map_err(|_| {
                         self.type_error_at(
                             format!(
                                 "Argument {} to function '{}': expected '{}', got '{}'",
@@ -742,8 +913,19 @@ impl TypeChecker {
                     })?;
             }
 
-            Ok(sig.return_type)
+            if sig.type_params.is_empty() {
+                Ok(sig.return_type)
+            } else {
+                self.validate_generic_call(&sig, &generic_bindings)?;
+                Ok(self.substitute_type(&sig.return_type, &generic_bindings))
+            }
         } else {
+            if !explicit_type_args.is_empty() {
+                return Err(self.type_error_at(
+                    "Only named functions accept explicit type arguments".to_string(),
+                    callee.span,
+                ));
+            }
             let callee_type = self.check_expr(callee)?;
             match &callee_type.kind {
                 TypeKind::Function {
@@ -809,10 +991,34 @@ impl TypeChecker {
         &mut self,
         receiver: &Expr,
         method: &str,
+        explicit_type_args: Option<&[Type]>,
         args: &[Expr],
     ) -> Result<Type> {
         let receiver_type = self.check_expr(receiver)?;
         let span = Self::dummy_span();
+        let explicit_type_args = explicit_type_args
+            .unwrap_or(&[])
+            .iter()
+            .map(|ty| {
+                let canonical = self.canonicalize_type(ty);
+                self.validate_type(&canonical)?;
+                Ok(canonical)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !explicit_type_args.is_empty() {
+            let user_method = match &receiver_type.kind {
+                TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => {
+                    self.env.lookup_method_impl(name, method).is_some()
+                }
+                _ => false,
+            };
+            if !user_method {
+                return Err(self.type_error(format!(
+                    "Method '{}' does not accept explicit type arguments",
+                    method
+                )));
+            }
+        }
         if matches!(receiver_type.kind, TypeKind::Unknown)
             || matches!(&receiver_type.kind, TypeKind::Named(name) if name == "LuaValue")
         {
@@ -1481,10 +1687,31 @@ impl TypeChecker {
                     return Err(self.type_error(format!("LuaTable has no method '{}'", method)));
                 }
             },
-            TypeKind::Named(type_name) => {
-                if let Some(method_def) = self.env.lookup_method(type_name.as_str(), method) {
+            TypeKind::Named(type_name)
+            | TypeKind::GenericInstance {
+                name: type_name, ..
+            } => {
+                if let Some((impl_block, method_def)) =
+                    self.env.lookup_method_impl(type_name.as_str(), method)
+                {
+                    let impl_block = impl_block.clone();
                     let method_def = method_def.clone();
-                    let expected_args = method_def.params.len().saturating_sub(1);
+                    let method_params: Vec<_> = method_def
+                        .params
+                        .iter()
+                        .filter(|param| !param.is_self && param.name != "self")
+                        .collect();
+                    if !method_def
+                        .params
+                        .iter()
+                        .any(|param| param.is_self || param.name == "self")
+                    {
+                        return Err(self.type_error(format!(
+                            "Static method '{}' must be called with '.' rather than ':'",
+                            method
+                        )));
+                    }
+                    let expected_args = method_params.len();
                     if args.len() != expected_args {
                         return Err(self.type_error(format!(
                             "Method '{}' expects {} arguments, got {}",
@@ -1494,32 +1721,88 @@ impl TypeChecker {
                         )));
                     }
 
-                    for (i, (arg, param)) in args
-                        .iter()
-                        .zip(method_def.params.iter().skip(1))
-                        .enumerate()
-                    {
-                        let arg_type = self.check_expr(arg)?;
-                        if !self.types_equal(&arg_type, &param.ty) {
+                    let mut type_params = impl_block.type_params.clone();
+                    for type_param in &method_def.type_params {
+                        if type_params.iter().any(|existing| existing == type_param) {
                             return Err(self.type_error(format!(
+                                "Method type parameter '{}' shadows an impl type parameter",
+                                type_param
+                            )));
+                        }
+                        type_params.push(type_param.clone());
+                    }
+                    let mut bindings = HashMap::new();
+                    self.infer_type_arguments(
+                        &impl_block.target_type,
+                        &receiver_type,
+                        &impl_block.type_params,
+                        &mut bindings,
+                    )?;
+                    if explicit_type_args.len() > method_def.type_params.len() {
+                        return Err(self.type_error(format!(
+                            "Method '{}' expects {} type argument(s), got {}",
+                            method,
+                            method_def.type_params.len(),
+                            explicit_type_args.len()
+                        )));
+                    }
+                    if !explicit_type_args.is_empty()
+                        && explicit_type_args.len() != method_def.type_params.len()
+                    {
+                        return Err(self.type_error(format!(
+                            "Method '{}' expects {} type argument(s), got {}",
+                            method,
+                            method_def.type_params.len(),
+                            explicit_type_args.len()
+                        )));
+                    }
+                    for (type_param, concrete) in method_def
+                        .type_params
+                        .iter()
+                        .zip(explicit_type_args.iter())
+                    {
+                        bindings.insert(type_param.clone(), concrete.clone());
+                    }
+                    for (i, (arg, param)) in args.iter().zip(method_params).enumerate() {
+                        let arg_type = self.check_expr(arg)?;
+                        self.infer_type_arguments(
+                            &param.ty,
+                            &arg_type,
+                            &type_params,
+                            &mut bindings,
+                        )
+                        .map_err(|_| {
+                            self.type_error(format!(
                                 "Argument {} to method '{}': expected '{}', got '{}'",
                                 i + 1,
                                 method,
                                 param.ty,
                                 arg_type
-                            )));
-                        }
+                            ))
+                        })?;
                     }
 
-                    return Ok(method_def
+                    self.validate_generic_bindings(
+                        &impl_block.type_params,
+                        &impl_block.where_clause,
+                        &bindings,
+                    )?;
+                    self.validate_generic_bindings(
+                        &method_def.type_params,
+                        &method_def.trait_bounds,
+                        &bindings,
+                    )?;
+                    let return_type = method_def
                         .return_type
                         .clone()
-                        .unwrap_or(Type::new(TypeKind::Unit, span)));
+                        .unwrap_or(Type::new(TypeKind::Unit, span));
+                    return Ok(self.substitute_type(&return_type, &bindings));
                 }
             }
 
             TypeKind::Generic(type_param) => {
                 if let Some(trait_names) = self.current_trait_bounds.get(type_param.as_str()) {
+                    let mut matching_methods = Vec::new();
                     for trait_name in trait_names {
                         if let Some(trait_def) = {
                             let key = self.resolve_type_key(trait_name.as_str());
@@ -1530,23 +1813,53 @@ impl TypeChecker {
                             if let Some(trait_method) =
                                 trait_def.methods.iter().find(|m| m.name == method)
                             {
-                                let expected_args =
-                                    trait_method.params.iter().filter(|p| !p.is_self).count();
-                                if args.len() != expected_args {
-                                    return Err(self.type_error(format!(
-                                        "Method '{}' expects {} arguments, got {}",
-                                        method,
-                                        expected_args,
-                                        args.len()
-                                    )));
-                                }
-
-                                return Ok(trait_method
-                                    .return_type
-                                    .clone()
-                                    .unwrap_or(Type::new(TypeKind::Unit, span)));
+                                matching_methods.push((trait_name.clone(), trait_method.clone()));
                             }
                         }
+                    }
+                    if matching_methods.len() > 1 {
+                        return Err(self.type_error(format!(
+                            "Method '{}' is ambiguous for '{}'; it is provided by {}",
+                            method,
+                            type_param,
+                            matching_methods
+                                .iter()
+                                .map(|(name, _)| name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )));
+                    }
+                    if let Some((_, trait_method)) = matching_methods.pop() {
+                        let params: Vec<_> = trait_method
+                            .params
+                            .iter()
+                            .filter(|param| !param.is_self)
+                            .collect();
+                        if args.len() != params.len() {
+                            return Err(self.type_error(format!(
+                                "Method '{}' expects {} arguments, got {}",
+                                method,
+                                params.len(),
+                                args.len()
+                            )));
+                        }
+                        for (index, (arg, param)) in args.iter().zip(params).enumerate() {
+                            let actual = self.check_expr(arg)?;
+                            let expected = self.canonicalize_type(&param.ty);
+                            self.unify(&expected, &actual).map_err(|_| {
+                                self.type_error(format!(
+                                    "Argument {} to method '{}': expected '{}', got '{}'",
+                                    index + 1,
+                                    method,
+                                    expected,
+                                    actual
+                                ))
+                            })?;
+                        }
+                        let return_type = trait_method
+                            .return_type
+                            .unwrap_or(Type::new(TypeKind::Unit, span));
+                        return Ok(self.canonicalize_type(&return_type));
                     }
                 }
             }
@@ -1558,23 +1871,44 @@ impl TypeChecker {
                         .lookup_trait(&key)
                         .or_else(|| self.env.lookup_trait(trait_name.as_str()))
                 } {
-                    if let Some(trait_method) = trait_def.methods.iter().find(|m| m.name == method)
+                    if let Some(trait_method) = trait_def
+                        .methods
+                        .iter()
+                        .find(|m| m.name == method)
+                        .cloned()
                     {
-                        let expected_args =
-                            trait_method.params.iter().filter(|p| !p.is_self).count();
-                        if args.len() != expected_args {
+                        let params: Vec<_> = trait_method
+                            .params
+                            .iter()
+                            .filter(|param| !param.is_self)
+                            .collect();
+                        if args.len() != params.len() {
                             return Err(self.type_error(format!(
                                 "Method '{}' expects {} arguments, got {}",
                                 method,
-                                expected_args,
+                                params.len(),
                                 args.len()
                             )));
                         }
+                        for (index, (arg, param)) in args.iter().zip(params).enumerate() {
+                            let actual = self.check_expr(arg)?;
+                            let expected = self.canonicalize_type(&param.ty);
+                            self.unify(&expected, &actual).map_err(|_| {
+                                self.type_error(format!(
+                                    "Argument {} to method '{}': expected '{}', got '{}'",
+                                    index + 1,
+                                    method,
+                                    expected,
+                                    actual
+                                ))
+                            })?;
+                        }
 
-                        return Ok(trait_method
+                        let return_type = trait_method
                             .return_type
                             .clone()
-                            .unwrap_or(Type::new(TypeKind::Unit, span)));
+                            .unwrap_or(Type::new(TypeKind::Unit, span));
+                        return Ok(self.canonicalize_type(&return_type));
                     }
                 }
             }
@@ -1633,8 +1967,27 @@ impl TypeChecker {
                             return Ok(expected.clone());
                         }
 
+                        TypeKind::GenericInstance { name, type_args } => {
+                            let resolved = self.resolve_type_key(enum_name);
+                            if name == &resolved
+                                && type_args.len() == enum_def.type_params.len()
+                            {
+                                return Ok(expected.clone());
+                            }
+                        }
+
                         _ => {}
                     }
+                }
+
+                if !enum_def.type_params.is_empty() {
+                    return Err(self.type_error_at(
+                        format!(
+                            "Cannot infer type parameters for unit variant '{}.{}'",
+                            enum_name, field
+                        ),
+                        span,
+                    ));
                 }
 
                 return Ok(Type::new(TypeKind::Named(enum_name.clone()), span));
@@ -1658,8 +2011,31 @@ impl TypeChecker {
         if let TypeKind::Map(_, value_type) = &object_type.kind {
             return Ok(value_type.as_ref().clone());
         }
-        let type_name = match &object_type.kind {
-            TypeKind::Named(name) => name.clone(),
+        let (type_name, type_bindings) = match &object_type.kind {
+            TypeKind::Named(name) => (name.clone(), HashMap::new()),
+            TypeKind::GenericInstance { name, type_args } => {
+                let struct_def = self.env.lookup_struct(name).ok_or_else(|| {
+                    self.type_error_at(format!("Undefined struct '{}'", name), object.span)
+                })?;
+                if struct_def.type_params.len() != type_args.len() {
+                    return Err(self.type_error_at(
+                        format!(
+                            "Type '{}' expects {} type argument(s), got {}",
+                            name,
+                            struct_def.type_params.len(),
+                            type_args.len()
+                        ),
+                        object.span,
+                    ));
+                }
+                let bindings = struct_def
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(type_args.iter().cloned())
+                    .collect();
+                (name.clone(), bindings)
+            }
             _ => {
                 return Err(self.type_error_at(
                     format!("Cannot access field on type '{}'", object_type),
@@ -1667,14 +2043,17 @@ impl TypeChecker {
                 ))
             }
         };
-        self.env
+        let field_type = self
+            .env
             .lookup_struct_field(&type_name, field)
             .ok_or_else(|| {
                 self.type_error_at(
                     format!("Type '{}' has no field '{}'", type_name, field),
                     span,
                 )
-            })
+            })?;
+        let field_type = self.substitute_type(&field_type, &type_bindings);
+        Ok(self.canonicalize_type(&field_type))
     }
 
     pub fn check_index_expr(&mut self, span: Span, object: &Expr, index: &Expr) -> Result<Type> {

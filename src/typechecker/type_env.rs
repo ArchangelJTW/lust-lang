@@ -32,6 +32,8 @@ pub struct FunctionSignature {
     pub params: Vec<Type>,
     pub return_type: Type,
     pub is_method: bool,
+    pub type_params: Vec<String>,
+    pub trait_bounds: Vec<TraitBound>,
 }
 
 impl fmt::Display for FunctionSignature {
@@ -734,13 +736,55 @@ impl TypeEnv {
         Ok(())
     }
 
-    pub fn register_impl(&mut self, impl_block: &ImplBlock) {
+    pub fn lookup_type_alias(&self, name: &str) -> Option<&(Vec<String>, Type)> {
+        self.type_aliases.get(name)
+    }
+
+    pub fn register_impl(&mut self, impl_block: &ImplBlock) -> Result<()> {
+        for existing in &self.impls {
+            if let Some(trait_name) = &impl_block.trait_name {
+                if existing.trait_name.as_ref() == Some(trait_name)
+                    && self.types_overlap(&existing.target_type, &impl_block.target_type)
+                {
+                    return Err(LustError::TypeError {
+                        message: format!(
+                            "Conflicting implementations of trait '{}' for type '{}'",
+                            trait_name, impl_block.target_type
+                        ),
+                    });
+                }
+            }
+
+            if self.types_overlap(&existing.target_type, &impl_block.target_type) {
+                for method in &impl_block.methods {
+                    let method_name = method.name.rsplit(':').next().unwrap_or(&method.name);
+                    if existing.methods.iter().any(|existing_method| {
+                        existing_method
+                            .name
+                            .rsplit(':')
+                            .next()
+                            .unwrap_or(&existing_method.name)
+                            == method_name
+                    }) {
+                        return Err(LustError::TypeError {
+                            message: format!(
+                                "Method '{}' has conflicting implementations for type '{}'",
+                                method_name, impl_block.target_type
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         self.impls.push(impl_block.clone());
+        Ok(())
     }
 
     pub fn lookup_method(&self, type_name: &str, method_name: &str) -> Option<&FunctionDef> {
         for impl_block in &self.impls {
-            if let TypeKind::Named(name) = &impl_block.target_type.kind {
+            if let TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } =
+                &impl_block.target_type.kind
+            {
                 if name == type_name {
                     for method in &impl_block.methods {
                         if method.name.ends_with(&format!(":{}", method_name))
@@ -753,6 +797,29 @@ impl TypeEnv {
             }
         }
 
+        None
+    }
+
+    pub fn lookup_method_impl(
+        &self,
+        type_name: &str,
+        method_name: &str,
+    ) -> Option<(&ImplBlock, &FunctionDef)> {
+        for impl_block in &self.impls {
+            let target_name = match &impl_block.target_type.kind {
+                TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => name,
+                _ => continue,
+            };
+            if target_name != type_name {
+                continue;
+            }
+            if let Some(method) = impl_block.methods.iter().find(|method| {
+                method.name.ends_with(&format!(":{}", method_name))
+                    || method.name == method_name
+            }) {
+                return Some((impl_block, method));
+            }
+        }
         None
     }
 
@@ -771,8 +838,18 @@ impl TypeEnv {
         for impl_block in &self.impls {
             if let Some(impl_trait_name) = &impl_block.trait_name {
                 if impl_trait_name == trait_name {
-                    if self.types_match(&impl_block.target_type, ty) {
-                        return true;
+                    let mut bindings = HashMap::new();
+                    if self.match_type_pattern(&impl_block.target_type, ty, &mut bindings) {
+                        let bounds_satisfied = impl_block.where_clause.iter().all(|bound| {
+                            bindings.get(&bound.type_param).is_some_and(|concrete| {
+                                bound.traits.iter().all(|required| {
+                                    self.type_implements_trait(concrete, required)
+                                })
+                            })
+                        });
+                        if bounds_satisfied {
+                            return true;
+                        }
                     }
                 }
             }
@@ -781,8 +858,59 @@ impl TypeEnv {
         false
     }
 
+    fn match_type_pattern(
+        &self,
+        pattern: &Type,
+        actual: &Type,
+        bindings: &mut HashMap<String, Type>,
+    ) -> bool {
+        match (&pattern.kind, &actual.kind) {
+            (TypeKind::Generic(name), _) => {
+                if let Some(existing) = bindings.get(name) {
+                    self.types_match(existing, actual)
+                } else {
+                    bindings.insert(name.clone(), actual.clone());
+                    true
+                }
+            }
+            (TypeKind::Array(left), TypeKind::Array(right))
+            | (TypeKind::Option(left), TypeKind::Option(right))
+            | (TypeKind::Ref(left), TypeKind::Ref(right))
+            | (TypeKind::MutRef(left), TypeKind::MutRef(right)) => {
+                self.match_type_pattern(left, right, bindings)
+            }
+            (TypeKind::Map(lk, lv), TypeKind::Map(rk, rv))
+            | (TypeKind::Result(lk, lv), TypeKind::Result(rk, rv)) => {
+                self.match_type_pattern(lk, rk, bindings)
+                    && self.match_type_pattern(lv, rv, bindings)
+            }
+            (
+                TypeKind::GenericInstance {
+                    name: left_name,
+                    type_args: left_args,
+                },
+                TypeKind::GenericInstance {
+                    name: right_name,
+                    type_args: right_args,
+                },
+            ) => {
+                left_name == right_name
+                    && left_args.len() == right_args.len()
+                    && left_args
+                        .iter()
+                        .zip(right_args)
+                        .all(|(left, right)| self.match_type_pattern(left, right, bindings))
+            }
+            _ => self.types_match(pattern, actual),
+        }
+    }
+
     fn types_match(&self, type1: &Type, type2: &Type) -> bool {
+        if type1.kind == type2.kind {
+            return true;
+        }
         match (&type1.kind, &type2.kind) {
+            (TypeKind::Generic(_), _) | (_, TypeKind::Generic(_)) => true,
             (TypeKind::Int, TypeKind::Int) => true,
             (TypeKind::Float, TypeKind::Float) => true,
             (TypeKind::Bool, TypeKind::Bool) => true,
@@ -797,8 +925,42 @@ impl TypeEnv {
             (TypeKind::Result(ok1, err1), TypeKind::Result(ok2, err2)) => {
                 self.types_match(ok1, ok2) && self.types_match(err1, err2)
             }
+            (
+                TypeKind::GenericInstance {
+                    name: name1,
+                    type_args: args1,
+                },
+                TypeKind::GenericInstance {
+                    name: name2,
+                    type_args: args2,
+                },
+            ) => {
+                name1 == name2
+                    && args1.len() == args2.len()
+                    && args1
+                        .iter()
+                        .zip(args2)
+                        .all(|(left, right)| self.types_match(left, right))
+            }
 
             _ => false,
         }
+    }
+
+    fn types_overlap(&self, left: &Type, right: &Type) -> bool {
+        if let (
+            TypeKind::GenericInstance {
+                name: left_name, ..
+            },
+            TypeKind::GenericInstance {
+                name: right_name, ..
+            },
+        ) = (&left.kind, &right.kind)
+        {
+            if left_name == right_name {
+                return true;
+            }
+        }
+        self.types_match(left, right)
     }
 }

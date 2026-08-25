@@ -5,6 +5,7 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
+use hashbrown::HashMap;
 impl TypeChecker {
     pub fn check_array_literal(
         &mut self,
@@ -71,7 +72,7 @@ impl TypeChecker {
             if let TypeKind::Option(inner) = &expected_elem.kind {
                 if matches!(inner.kind, TypeKind::Unknown) {
                     for elem in elements {
-                        let elem_type = self.check_expr(elem)?;
+                        let elem_type = self.check_expr_with_hint(elem, Some(expected_elem))?;
                         let is_option = matches!(&elem_type.kind, TypeKind::Option(_))
                             || matches!(&elem_type.kind, TypeKind::Named(name) if name == "Option");
                         if !is_option {
@@ -91,7 +92,7 @@ impl TypeChecker {
                     || matches!(err_inner.kind, TypeKind::Unknown)
                 {
                     for elem in elements {
-                        let elem_type = self.check_expr(elem)?;
+                        let elem_type = self.check_expr_with_hint(elem, Some(expected_elem))?;
                         let is_result = matches!(&elem_type.kind, TypeKind::Result(_, _))
                             || matches!(&elem_type.kind, TypeKind::Named(name) if name == "Result");
                         if !is_result {
@@ -105,6 +106,14 @@ impl TypeChecker {
                     return Ok(expected_type.unwrap().clone());
                 }
             }
+        }
+
+        if let Some(expected_elem) = expected_elem_type {
+            for elem in elements {
+                let elem_type = self.check_expr_with_hint(elem, Some(expected_elem))?;
+                self.unify(expected_elem, &elem_type)?;
+            }
+            return Ok(expected_type.unwrap().clone());
         }
 
         let first_type = self.check_expr(&elements[0])?;
@@ -185,6 +194,12 @@ impl TypeChecker {
                 self.check_expr(value_expr)?
             };
             let canonical_value = self.canonicalize_type(&raw_value_type);
+            if let Some(hint) = key_hint {
+                self.unify(hint, &canonical_key)?;
+            }
+            if let Some(hint) = value_hint {
+                self.unify(hint, &canonical_value)?;
+            }
 
             if let Some(existing_key) = &mut inferred_key_type {
                 if !allow_mixed_keys && self.unify(existing_key, &canonical_key).is_err() {
@@ -204,14 +219,18 @@ impl TypeChecker {
         }
 
         let span = Self::dummy_span();
-        let key_type = if allow_mixed_keys {
+        let key_type = if let Some(expected) = key_hint {
+            self.canonicalize_type(expected)
+        } else if allow_mixed_keys {
             expected_key_ty
                 .and_then(|ty| Some(self.canonicalize_type(ty)))
                 .unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
         } else {
             inferred_key_type.unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
         };
-        let value_type = if allow_mixed_values {
+        let value_type = if let Some(expected) = value_hint {
+            self.canonicalize_type(expected)
+        } else if allow_mixed_values {
             expected_value_ty
                 .and_then(|ty| Some(self.canonicalize_type(ty)))
                 .unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
@@ -230,6 +249,7 @@ impl TypeChecker {
         span: Span,
         name: &str,
         fields: &[StructLiteralField],
+        expected_type: Option<&Type>,
     ) -> Result<Type> {
         let key = self.resolve_type_key(name);
         let struct_def = self
@@ -250,6 +270,25 @@ impl TypeChecker {
             ));
         }
 
+        let mut type_bindings = HashMap::new();
+        if let Some(Type {
+            kind:
+                TypeKind::GenericInstance {
+                    name: expected_name,
+                    type_args,
+                },
+            ..
+        }) = expected_type
+        {
+            if expected_name == &struct_def.name
+                && type_args.len() == struct_def.type_params.len()
+            {
+                for (param, arg) in struct_def.type_params.iter().zip(type_args) {
+                    type_bindings.insert(param.clone(), arg.clone());
+                }
+            }
+        }
+
         for field in fields {
             let expected_type = struct_def
                 .fields
@@ -262,16 +301,34 @@ impl TypeChecker {
                         field.span,
                     )
                 })?;
-            let actual_type = self.check_expr(&field.value)?;
+            let expected_type = self.canonicalize_type(expected_type);
+            let actual_type = self.check_expr_with_hint(&field.value, Some(&expected_type))?;
             match &expected_type.kind {
                 TypeKind::Option(inner_expected) => {
-                    if self.unify(inner_expected, &actual_type).is_err() {
-                        self.unify(expected_type, &actual_type)?;
+                    if matches!(actual_type.kind, TypeKind::Option(_)) {
+                        self.infer_type_arguments(
+                            &expected_type,
+                            &actual_type,
+                            &struct_def.type_params,
+                            &mut type_bindings,
+                        )?;
+                    } else {
+                        self.infer_type_arguments(
+                            inner_expected,
+                            &actual_type,
+                            &struct_def.type_params,
+                            &mut type_bindings,
+                        )?;
                     }
                 }
 
                 _ => {
-                    self.unify(expected_type, &actual_type)?;
+                    self.infer_type_arguments(
+                        &expected_type,
+                        &actual_type,
+                        &struct_def.type_params,
+                        &mut type_bindings,
+                    )?;
                 }
             }
         }
@@ -281,7 +338,13 @@ impl TypeChecker {
         } else {
             name.to_string()
         };
-        Ok(Type::new(TypeKind::Named(ty_name), Self::dummy_span()))
+        self.instantiate_nominal_type(
+            ty_name,
+            &struct_def.type_params,
+            &struct_def.trait_bounds,
+            &type_bindings,
+            Self::dummy_span(),
+        )
     }
 
     pub fn check_lambda(
@@ -295,7 +358,9 @@ impl TypeChecker {
         let mut param_types = Vec::new();
         for (i, (param_name, param_type)) in params.iter().enumerate() {
             let ty = if let Some(explicit_type) = param_type {
-                explicit_type.clone()
+                let canonical = self.canonicalize_type(explicit_type);
+                self.validate_type(&canonical)?;
+                canonical
             } else if let Some((ref expected_params, _)) = expected_signature {
                 if i < expected_params.len() {
                     expected_params[i].clone()
@@ -311,7 +376,9 @@ impl TypeChecker {
 
         let saved_return_type = self.current_function_return_type.clone();
         let inferred_return_type = if let Some(explicit) = return_type {
-            Some(explicit.clone())
+            let canonical = self.canonicalize_type(explicit);
+            self.validate_type(&canonical)?;
+            Some(canonical)
         } else if let Some((_, expected_ret)) = expected_signature {
             expected_ret.or_else(|| Some(Type::new(TypeKind::Infer, Self::dummy_span())))
         } else {

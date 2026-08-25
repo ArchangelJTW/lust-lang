@@ -35,6 +35,15 @@ impl TypeChecker {
 
                 let resolved_func = self.resolve_function_key(name);
                 if let Some(func_sig) = self.env.lookup_function(&resolved_func) {
+                    if !func_sig.type_params.is_empty() {
+                        return Err(self.type_error_at(
+                            format!(
+                                "Generic function '{}' cannot be used as a value; call it directly",
+                                name
+                            ),
+                            expr.span,
+                        ));
+                    }
                     return Ok(Type::new(
                         TypeKind::Function {
                             params: func_sig.params.clone(),
@@ -70,13 +79,25 @@ impl TypeChecker {
                 self.check_binary_expr(expr.span, left, op, right)
             }
             ExprKind::Unary { op, operand } => self.check_unary_expr(op, operand),
-            ExprKind::Call { callee, args } => self.check_call_expr(expr.span, callee, args),
+            ExprKind::Call {
+                callee,
+                type_args,
+                args,
+            } => {
+                self.check_call_expr(
+                    expr.span,
+                    callee,
+                    type_args.as_deref(),
+                    args,
+                    expected_type,
+                )
+            }
             ExprKind::MethodCall {
                 receiver,
                 method,
-                type_args: _,
+                type_args,
                 args,
-            } => self.check_method_call(receiver, method, args),
+            } => self.check_method_call(receiver, method, type_args.as_deref(), args),
 
             ExprKind::FieldAccess { object, field } => {
                 self.check_field_access_with_hint(expr.span, object, field, expected_type)
@@ -86,7 +107,7 @@ impl TypeChecker {
             ExprKind::Array(elements) => self.check_array_literal(elements, expected_type),
             ExprKind::Map(entries) => self.check_map_literal(entries, expected_type),
             ExprKind::StructLiteral { name, fields } => {
-                self.check_struct_literal(expr.span, name, fields)
+                self.check_struct_literal(expr.span, name, fields, expected_type)
             }
 
             ExprKind::Lambda {
@@ -96,7 +117,25 @@ impl TypeChecker {
             } => self.check_lambda(params, return_type.as_ref(), body),
             ExprKind::Cast { expr, target_type } => {
                 let _expr_type = self.check_expr(expr)?;
+                if let TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } =
+                    &target_type.kind
+                {
+                    let resolved = self.resolve_type_key(name);
+                    if self.env.lookup_type_alias(&resolved).is_some() {
+                        return Err(self.type_error_at(
+                            "Casts through type aliases are not supported yet".to_string(),
+                            target_type.span,
+                        ));
+                    }
+                }
                 let target_type = self.canonicalize_type(target_type);
+                self.validate_type(&target_type)?;
+                if matches!(target_type.kind, TypeKind::Generic(_)) {
+                    return Err(self.type_error_at(
+                        "Cannot cast to a runtime-erased type parameter".to_string(),
+                        target_type.span,
+                    ));
+                }
                 Ok(Type::new(
                     TypeKind::Option(Box::new(target_type)),
                     expr.span,
@@ -105,9 +144,40 @@ impl TypeChecker {
 
             ExprKind::TypeCheck {
                 expr,
-                check_type: _,
+                check_type,
             } => {
-                let _expr_type = self.check_expr(expr)?;
+                let expr_type = self.check_expr(expr)?;
+                if let TypeKind::Named(name) = &check_type.kind {
+                    let looks_like_variant = name
+                        .chars()
+                        .next()
+                        .is_some_and(|first| first.is_uppercase())
+                        && !self.env.is_builtin_type(name);
+                    if self.type_has_unit_variant(&expr_type, name)
+                        || (looks_like_variant && matches!(expr_type.kind, TypeKind::Unknown))
+                    {
+                        return Ok(Type::new(TypeKind::Bool, Self::dummy_span()));
+                    }
+                }
+                if let TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } =
+                    &check_type.kind
+                {
+                    let resolved = self.resolve_type_key(name);
+                    if self.env.lookup_type_alias(&resolved).is_some() {
+                        return Err(self.type_error_at(
+                            "Type tests through aliases are not supported yet".to_string(),
+                            check_type.span,
+                        ));
+                    }
+                }
+                let check_type = self.canonicalize_type(check_type);
+                self.validate_type(&check_type)?;
+                if matches!(check_type.kind, TypeKind::Generic(_)) {
+                    return Err(self.type_error_at(
+                        "Cannot test a runtime value against an erased type parameter".to_string(),
+                        check_type.span,
+                    ));
+                }
                 Ok(Type::new(TypeKind::Bool, Self::dummy_span()))
             }
 
@@ -324,6 +394,25 @@ impl TypeChecker {
             }
 
             ExprKind::Paren(inner) => self.check_expr(inner),
+        }
+    }
+
+    fn type_has_unit_variant(&self, ty: &Type, variant: &str) -> bool {
+        match &ty.kind {
+            TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => self
+                .env
+                .lookup_enum(name)
+                .is_some_and(|def| {
+                    def.variants
+                        .iter()
+                        .any(|candidate| candidate.name == variant && candidate.fields.is_none())
+                }),
+            TypeKind::Option(_) => variant == "None",
+            TypeKind::Result(_, _) => false,
+            TypeKind::Union(types) => types
+                .iter()
+                .any(|member| self.type_has_unit_variant(member, variant)),
+            _ => false,
         }
     }
 }

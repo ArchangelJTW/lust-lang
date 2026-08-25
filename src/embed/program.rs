@@ -1049,6 +1049,8 @@ fn compile_in_memory(
                 params: Vec::new(),
                 return_type: Type::new(TypeKind::Unit, Span::new(0, 0, 0, 0)),
                 is_method: false,
+                type_params: Vec::new(),
+                trait_bounds: Vec::new(),
             });
     }
 
@@ -1059,6 +1061,7 @@ fn compile_in_memory(
     for (type_name, trait_name) in trait_impls {
         vm.register_trait_impl(type_name, trait_name);
     }
+    extern_registry.register_trait_impls(&mut vm);
 
     for (module_path, init) in init_funcs {
         let value = vm.call(&init, Vec::new())?;

@@ -144,10 +144,13 @@ impl TypeChecker {
         }
 
         for (index, binding) in bindings.iter().enumerate() {
-            let annotation = binding
-                .type_annotation
-                .as_ref()
-                .map(|ty| self.canonicalize_type(ty));
+            let annotation = if let Some(ty) = &binding.type_annotation {
+                let canonical = self.canonicalize_type(ty);
+                self.validate_type(&canonical)?;
+                Some(canonical)
+            } else {
+                None
+            };
             let inferred = if initializer.is_some() {
                 if binding_count == 1 && expr_types.len() == 1 {
                     Some(expr_types[0].clone())
@@ -210,9 +213,18 @@ impl TypeChecker {
             return Err(self.type_error("Assignment requires a value".to_string()));
         }
 
+        let assignment_hint = if targets.len() == 1 && values.len() == 1 {
+            let target_type = match &targets[0].kind {
+                ExprKind::Index { object, index } => self.check_index_target(object, index)?,
+                _ => self.check_expr(&targets[0])?,
+            };
+            Some(self.canonicalize_type(&target_type))
+        } else {
+            None
+        };
         let mut expr_types: Vec<Type> = Vec::new();
         for value in values {
-            let raw_type = self.check_expr(value)?;
+            let raw_type = self.check_expr_with_hint(value, assignment_hint.as_ref())?;
             let val_type = self.canonicalize_type(&raw_type);
             self.pending_generic_instances.take();
             expr_types.push(val_type);
@@ -716,7 +728,8 @@ impl TypeChecker {
         let return_type = if values.is_empty() {
             Type::new(TypeKind::Unit, TypeChecker::dummy_span())
         } else if values.len() == 1 {
-            let raw_ty = self.check_expr(&values[0])?;
+            let expected = self.current_function_return_type.clone();
+            let raw_ty = self.check_expr_with_hint(&values[0], expected.as_ref())?;
             let ty = self.canonicalize_type(&raw_ty);
             self.pending_generic_instances.take();
             ty
@@ -743,9 +756,21 @@ impl TypeChecker {
     fn weak_field_target_type(&mut self, object: &Expr, field_name: &str) -> Result<Option<Type>> {
         let object_type = self.check_expr(object)?;
         let canonical_object = self.canonicalize_type(&object_type);
-        let struct_name = match &canonical_object.kind {
-            TypeKind::Named(name) => name.clone(),
-            TypeKind::GenericInstance { name, .. } => name.clone(),
+        let (struct_name, type_bindings) = match &canonical_object.kind {
+            TypeKind::Named(name) => (name.clone(), HashMap::new()),
+            TypeKind::GenericInstance { name, type_args } => {
+                let def = match self.env.lookup_struct(name) {
+                    Some(def) if def.type_params.len() == type_args.len() => def,
+                    _ => return Ok(None),
+                };
+                let bindings = def
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .zip(type_args.iter().cloned())
+                    .collect();
+                (name.clone(), bindings)
+            }
             _ => return Ok(None),
         };
         let resolved = self.resolve_type_key(&struct_name);
@@ -760,7 +785,7 @@ impl TypeChecker {
         if let Some(field) = struct_def.fields.iter().find(|f| f.name == *field_name) {
             if matches!(field.ownership, FieldOwnership::Weak) {
                 if let Some(inner) = &field.weak_target {
-                    return Ok(Some(self.canonicalize_type(inner)));
+                    return Ok(Some(self.substitute_type(inner, &type_bindings)));
                 }
             }
         }

@@ -490,9 +490,11 @@ impl Parser {
         let type_params = if self.match_token(&[TokenKind::Less]) {
             let mut params = vec![self.expect_identifier()?];
             while self.match_token(&[TokenKind::Comma]) {
+                if self.check(TokenKind::Greater) {
+                    break;
+                }
                 params.push(self.expect_identifier()?);
             }
-
             self.consume(TokenKind::Greater, "Expected '>' after type parameters")?;
             params
         } else {
@@ -505,6 +507,9 @@ impl Parser {
             let method_type_params = if self.match_token(&[TokenKind::Less]) {
                 let mut params = vec![self.expect_identifier()?];
                 while self.match_token(&[TokenKind::Comma]) {
+                    if self.check(TokenKind::Greater) {
+                        break;
+                    }
                     params.push(self.expect_identifier()?);
                 }
 
@@ -577,30 +582,30 @@ impl Parser {
 
     fn parse_impl(&mut self) -> Result<ImplBlock> {
         self.consume(TokenKind::Impl, "Expected 'impl'")?;
-        let type_params = if self.match_token(&[TokenKind::Less]) {
-            let mut params = vec![self.expect_identifier()?];
-            while self.match_token(&[TokenKind::Comma]) {
-                params.push(self.expect_identifier()?);
-            }
-
-            self.consume(TokenKind::Greater, "Expected '>' after type parameters")?;
-            params
-        } else {
-            vec![]
-        };
+        let (type_params, where_clause) = self.parse_type_params_with_bounds()?;
         let first_name = self.expect_identifier()?;
         let (trait_name, target_type) = if self.match_token(&[TokenKind::For]) {
             (Some(first_name), self.parse_type()?)
         } else {
-            (
-                None,
+            let target_type = if self.check(TokenKind::Less) {
+                crate::ast::Type::new(
+                    crate::ast::TypeKind::GenericInstance {
+                        name: first_name,
+                        type_args: self.parse_type_arguments()?,
+                    },
+                    crate::ast::Span::dummy(),
+                )
+            } else {
                 crate::ast::Type::new(
                     crate::ast::TypeKind::Named(first_name),
                     crate::ast::Span::dummy(),
-                ),
+                )
+            };
+            (
+                None,
+                target_type,
             )
         };
-        let where_clause = Vec::new();
         let mut methods = Vec::new();
         while !self.check(TokenKind::End) && !self.is_at_end() {
             let func_def = self.parse_function(Visibility::Public)?;
@@ -640,6 +645,9 @@ impl Parser {
             }
 
             if !self.match_token(&[TokenKind::Comma]) {
+                break;
+            }
+            if self.check(TokenKind::Greater) {
                 break;
             }
         }

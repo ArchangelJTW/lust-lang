@@ -34,6 +34,7 @@ pub enum ExprKind {
     },
     Call {
         callee: Box<Expr>,
+        type_args: Option<Vec<Type>>,
         args: Vec<Expr>,
     },
     MethodCall {

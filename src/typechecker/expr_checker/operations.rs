@@ -565,10 +565,8 @@ impl TypeChecker {
                                     span,
                                 ));
                             }
-                            for (param, arg) in enum_def
-                                .type_params
-                                .iter()
-                                .zip(explicit_type_args.iter())
+                            for (param, arg) in
+                                enum_def.type_params.iter().zip(explicit_type_args.iter())
                             {
                                 type_params.insert(param.clone(), arg.clone());
                             }
@@ -673,10 +671,8 @@ impl TypeChecker {
                                     span,
                                 ));
                             }
-                            for (param, arg) in enum_def
-                                .type_params
-                                .iter()
-                                .zip(explicit_type_args.iter())
+                            for (param, arg) in
+                                enum_def.type_params.iter().zip(explicit_type_args.iter())
                             {
                                 self.bind_type_argument(param, arg, &mut type_params)?;
                             }
@@ -693,14 +689,8 @@ impl TypeChecker {
                                     if name == &enum_type_name
                                         && type_args.len() == enum_def.type_params.len() =>
                                 {
-                                    for (param, arg) in
-                                        enum_def.type_params.iter().zip(type_args)
-                                    {
-                                        self.bind_type_argument(
-                                            param,
-                                            arg,
-                                            &mut type_params,
-                                        )?;
+                                    for (param, arg) in enum_def.type_params.iter().zip(type_args) {
+                                        self.bind_type_argument(param, arg, &mut type_params)?;
                                     }
                                 }
                                 TypeKind::Option(inner) if type_name == "Option" => {
@@ -730,7 +720,7 @@ impl TypeChecker {
         }
 
         if let ExprKind::Identifier(name) = &callee.kind {
-                if let Some(var_type) = self.env.lookup_variable(name) {
+            if let Some(var_type) = self.env.lookup_variable(name) {
                 if !explicit_type_args.is_empty() {
                     return Err(self.type_error_at(
                         "Function values do not accept explicit type arguments".to_string(),
@@ -839,9 +829,7 @@ impl TypeChecker {
                     callee.span,
                 ));
             }
-            for (type_param, concrete) in
-                sig.type_params.iter().zip(explicit_type_args.iter())
-            {
+            for (type_param, concrete) in sig.type_params.iter().zip(explicit_type_args.iter()) {
                 generic_bindings.insert(type_param.clone(), concrete.clone());
             }
             if args.len() != expected_params.len() {
@@ -900,17 +888,17 @@ impl TypeChecker {
                     )
                 };
                 result.map_err(|_| {
-                        self.type_error_at(
-                            format!(
-                                "Argument {} to function '{}': expected '{}', got '{}'",
-                                i + 1,
-                                name,
-                                expected_type,
-                                arg_type
-                            ),
-                            arg.span,
-                        )
-                    })?;
+                    self.type_error_at(
+                        format!(
+                            "Argument {} to function '{}': expected '{}', got '{}'",
+                            i + 1,
+                            name,
+                            expected_type,
+                            arg_type
+                        ),
+                        arg.span,
+                    )
+                })?;
             }
 
             if sig.type_params.is_empty() {
@@ -1756,10 +1744,8 @@ impl TypeChecker {
                             explicit_type_args.len()
                         )));
                     }
-                    for (type_param, concrete) in method_def
-                        .type_params
-                        .iter()
-                        .zip(explicit_type_args.iter())
+                    for (type_param, concrete) in
+                        method_def.type_params.iter().zip(explicit_type_args.iter())
                     {
                         bindings.insert(type_param.clone(), concrete.clone());
                     }
@@ -1871,11 +1857,8 @@ impl TypeChecker {
                         .lookup_trait(&key)
                         .or_else(|| self.env.lookup_trait(trait_name.as_str()))
                 } {
-                    if let Some(trait_method) = trait_def
-                        .methods
-                        .iter()
-                        .find(|m| m.name == method)
-                        .cloned()
+                    if let Some(trait_method) =
+                        trait_def.methods.iter().find(|m| m.name == method).cloned()
                     {
                         let params: Vec<_> = trait_method
                             .params
@@ -1969,9 +1952,7 @@ impl TypeChecker {
 
                         TypeKind::GenericInstance { name, type_args } => {
                             let resolved = self.resolve_type_key(enum_name);
-                            if name == &resolved
-                                && type_args.len() == enum_def.type_params.len()
-                            {
+                            if name == &resolved && type_args.len() == enum_def.type_params.len() {
                                 return Ok(expected.clone());
                             }
                         }

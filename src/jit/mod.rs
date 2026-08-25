@@ -66,6 +66,7 @@ pub const SIDE_EXIT_THRESHOLD: u32 = 10;
 pub const UNROLL_FACTOR: usize = 32;
 /// How many times to unroll a loop during trace recording
 pub const LOOP_UNROLL_COUNT: usize = 32;
+const MAX_ROOT_RETRY_SHIFT: u32 = 5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TraceId(pub usize);
 pub struct CompiledTrace {
@@ -154,12 +155,28 @@ pub enum GuardKind {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JitStats {
+    pub recordings_started: u64,
+    pub recordings_aborted: u64,
+    pub root_traces_compiled: u64,
+    pub side_traces_compiled: u64,
+    pub native_trace_entries: u64,
+    pub guard_exits: u64,
+    pub execution_failures: u64,
+    pub function_calls: u64,
+    pub recursive_calls: u64,
+}
+
 pub struct JitState {
     pub profiler: Profiler,
     pub traces: HashMap<TraceId, Rc<CompiledTrace>>,
     pub root_traces: HashMap<(usize, usize), TraceId>,
+    next_root_recording: HashMap<(usize, usize), u32>,
+    root_recording_failures: HashMap<(usize, usize), u32>,
     next_trace_id: usize,
     pub enabled: bool,
+    stats: JitStats,
 }
 
 impl JitState {
@@ -173,8 +190,11 @@ impl JitState {
             profiler: Profiler::new(),
             traces: HashMap::new(),
             root_traces: HashMap::new(),
+            next_root_recording: HashMap::new(),
+            root_recording_failures: HashMap::new(),
             next_trace_id: 0,
             enabled,
+            stats: JitStats::default(),
         }
     }
 
@@ -214,11 +234,92 @@ impl JitState {
         let id = trace.id;
         self.root_traces.insert((func_idx, ip), id);
         self.traces.insert(id, Rc::new(trace));
+        self.next_root_recording.remove(&(func_idx, ip));
+        self.root_recording_failures.remove(&(func_idx, ip));
+        self.stats.root_traces_compiled = self.stats.root_traces_compiled.saturating_add(1);
     }
 
     pub fn store_side_trace(&mut self, trace: CompiledTrace) {
         let id = trace.id;
         self.traces.insert(id, Rc::new(trace));
+        self.stats.side_traces_compiled = self.stats.side_traces_compiled.saturating_add(1);
+    }
+
+    pub fn stats(&self) -> JitStats {
+        self.stats
+    }
+
+    pub(crate) fn record_function_call(&mut self, func_idx: usize, recursive: bool) {
+        if !self.enabled {
+            return;
+        }
+        self.profiler.record_function_call(func_idx);
+        self.stats.function_calls = self.stats.function_calls.saturating_add(1);
+        if recursive {
+            self.stats.recursive_calls = self.stats.recursive_calls.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn should_record_root(
+        &self,
+        func_idx: usize,
+        ip: usize,
+        count: u32,
+        initial_threshold: u32,
+    ) -> bool {
+        count
+            >= self
+                .next_root_recording
+                .get(&(func_idx, ip))
+                .copied()
+                .unwrap_or(initial_threshold)
+    }
+
+    pub(crate) fn recording_started(&mut self) {
+        self.stats.recordings_started = self.stats.recordings_started.saturating_add(1);
+    }
+
+    pub(crate) fn recording_aborted(&mut self, func_idx: usize, ip: usize) {
+        self.stats.recordings_aborted = self.stats.recordings_aborted.saturating_add(1);
+        self.schedule_root_retry(func_idx, ip);
+    }
+
+    pub(crate) fn side_recording_aborted(&mut self) {
+        self.stats.recordings_aborted = self.stats.recordings_aborted.saturating_add(1);
+    }
+
+    pub(crate) fn schedule_root_retry(&mut self, func_idx: usize, ip: usize) {
+        let count = self.profiler.get_count(func_idx, ip);
+        let failures = self
+            .root_recording_failures
+            .entry((func_idx, ip))
+            .and_modify(|value| *value = value.saturating_add(1))
+            .or_insert(1);
+        let retry_delay = 1u32 << failures.saturating_sub(1).min(MAX_ROOT_RETRY_SHIFT);
+        self.next_root_recording
+            .insert((func_idx, ip), count.saturating_add(retry_delay));
+    }
+
+    pub(crate) fn record_native_entry(&mut self) {
+        self.stats.native_trace_entries = self.stats.native_trace_entries.saturating_add(1);
+    }
+
+    pub(crate) fn record_guard_exit(&mut self) {
+        self.stats.guard_exits = self.stats.guard_exits.saturating_add(1);
+    }
+
+    pub(crate) fn record_execution_failure(&mut self) {
+        self.stats.execution_failures = self.stats.execution_failures.saturating_add(1);
+    }
+
+    pub(crate) fn invalidate_compiled_code(&mut self) {
+        self.profiler.reset();
+        self.traces.clear();
+        self.root_traces.clear();
+        self.next_root_recording.clear();
+        self.root_recording_failures.clear();
+        self.next_trace_id = 0;
+        self.stats = JitStats::default();
     }
 }
 

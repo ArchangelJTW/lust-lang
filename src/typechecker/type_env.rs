@@ -814,8 +814,7 @@ impl TypeEnv {
                 continue;
             }
             if let Some(method) = impl_block.methods.iter().find(|method| {
-                method.name.ends_with(&format!(":{}", method_name))
-                    || method.name == method_name
+                method.name.ends_with(&format!(":{}", method_name)) || method.name == method_name
             }) {
                 return Some((impl_block, method));
             }
@@ -842,9 +841,10 @@ impl TypeEnv {
                     if self.match_type_pattern(&impl_block.target_type, ty, &mut bindings) {
                         let bounds_satisfied = impl_block.where_clause.iter().all(|bound| {
                             bindings.get(&bound.type_param).is_some_and(|concrete| {
-                                bound.traits.iter().all(|required| {
-                                    self.type_implements_trait(concrete, required)
-                                })
+                                bound
+                                    .traits
+                                    .iter()
+                                    .all(|required| self.type_implements_trait(concrete, required))
                             })
                         });
                         if bounds_satisfied {

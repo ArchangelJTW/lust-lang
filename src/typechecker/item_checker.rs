@@ -179,10 +179,9 @@ impl TypeChecker {
 
     fn check_trait_definition(&mut self, def: &TraitDef) -> Result<()> {
         if !def.type_params.is_empty() {
-            return Err(self.type_error(format!(
-                "Generic trait '{}' is not supported yet",
-                def.name
-            )));
+            return Err(
+                self.type_error(format!("Generic trait '{}' is not supported yet", def.name))
+            );
         }
         for method in &def.methods {
             if !method.type_params.is_empty() {
@@ -230,8 +229,7 @@ impl TypeChecker {
                 .is_some()
         }) {
             return Err(self.type_error(
-                "Impl targets cannot be type aliases; use the underlying nominal type"
-                    .to_string(),
+                "Impl targets cannot be type aliases; use the underlying nominal type".to_string(),
             ));
         }
         self.validate_trait_bounds(&impl_block.type_params, &impl_block.where_clause)?;
@@ -286,9 +284,9 @@ impl TypeChecker {
         self.validate_type(&canonical_target)?;
         if let TypeKind::GenericInstance { type_args, .. } = &canonical_target.kind {
             let universal_target = type_args.len() == impl_block.type_params.len()
-                && type_args.iter().zip(&impl_block.type_params).all(|(arg, param)| {
-                    matches!(&arg.kind, TypeKind::Generic(name) if name == param)
-                });
+                && type_args.iter().zip(&impl_block.type_params).all(
+                    |(arg, param)| matches!(&arg.kind, TypeKind::Generic(name) if name == param),
+                );
             if !universal_target {
                 return Err(self.type_error(
                     "Specialized generic impls are not supported with runtime-erased type arguments"
@@ -419,9 +417,7 @@ impl TypeChecker {
         for method in &impl_block.methods {
             let mut method_with_mangled_name = method.clone();
             let has_self = method.params.iter().any(|p| p.is_self || p.name == "self");
-            if !has_self
-                && (!impl_block.type_params.is_empty() || !method.type_params.is_empty())
-            {
+            if !has_self && (!impl_block.type_params.is_empty() || !method.type_params.is_empty()) {
                 return Err(self.type_error(format!(
                     "Generic static method '{}.{}' is not supported yet",
                     type_name, method.name
@@ -482,13 +478,13 @@ impl TypeChecker {
                         .clone()
                         .map(|ty| self.canonicalize_type(&ty))
                         .unwrap_or(Type::new(TypeKind::Unit, TypeChecker::dummy_span()));
-            let sig = FunctionSignature {
-                params: canonical_params.clone(),
-                return_type: canonical_return.clone(),
-                is_method: false,
-                type_params: Vec::new(),
-                trait_bounds: Vec::new(),
-            };
+                    let sig = FunctionSignature {
+                        params: canonical_params.clone(),
+                        return_type: canonical_return.clone(),
+                        is_method: false,
+                        type_params: Vec::new(),
+                        trait_bounds: Vec::new(),
+                    };
                     self.register_external_function((name.clone(), sig.clone()))?;
                     if let Some((_struct_name_raw, method_name)) = name.split_once(':') {
                         if let Some(self_ty) = canonical_params.first() {

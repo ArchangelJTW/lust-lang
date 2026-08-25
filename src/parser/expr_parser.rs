@@ -475,7 +475,11 @@ impl Parser {
         let Some(less) = self.tokens.get(self.current) else {
             return false;
         };
-        if let Some(previous) = self.current.checked_sub(1).and_then(|index| self.tokens.get(index)) {
+        if let Some(previous) = self
+            .current
+            .checked_sub(1)
+            .and_then(|index| self.tokens.get(index))
+        {
             if less.line != previous.line
                 || less.column
                     != previous

@@ -83,15 +83,7 @@ impl TypeChecker {
                 callee,
                 type_args,
                 args,
-            } => {
-                self.check_call_expr(
-                    expr.span,
-                    callee,
-                    type_args.as_deref(),
-                    args,
-                    expected_type,
-                )
-            }
+            } => self.check_call_expr(expr.span, callee, type_args.as_deref(), args, expected_type),
             ExprKind::MethodCall {
                 receiver,
                 method,
@@ -142,10 +134,7 @@ impl TypeChecker {
                 ))
             }
 
-            ExprKind::TypeCheck {
-                expr,
-                check_type,
-            } => {
+            ExprKind::TypeCheck { expr, check_type } => {
                 let expr_type = self.check_expr(expr)?;
                 if let TypeKind::Named(name) = &check_type.kind {
                     let looks_like_variant = name
@@ -399,14 +388,13 @@ impl TypeChecker {
 
     fn type_has_unit_variant(&self, ty: &Type, variant: &str) -> bool {
         match &ty.kind {
-            TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => self
-                .env
-                .lookup_enum(name)
-                .is_some_and(|def| {
+            TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => {
+                self.env.lookup_enum(name).is_some_and(|def| {
                     def.variants
                         .iter()
                         .any(|candidate| candidate.name == variant && candidate.fields.is_none())
-                }),
+                })
+            }
             TypeKind::Option(_) => variant == "None",
             TypeKind::Result(_, _) => false,
             TypeKind::Union(types) => types

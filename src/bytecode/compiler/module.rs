@@ -53,13 +53,12 @@ impl Compiler {
                                     }
                                 };
                                 if let Some(trait_name) = &impl_block.trait_name {
-                                    let resolved_trait = if trait_name == "ToString"
-                                        || trait_name == "HashKey"
-                                    {
-                                        trait_name.clone()
-                                    } else {
-                                        self.resolve_type_name(trait_name)
-                                    };
+                                    let resolved_trait =
+                                        if trait_name == "ToString" || trait_name == "HashKey" {
+                                            trait_name.clone()
+                                        } else {
+                                            self.resolve_type_name(trait_name)
+                                        };
                                     self.trait_impls.push((type_name.clone(), resolved_trait));
                                 }
 
@@ -152,12 +151,12 @@ impl Compiler {
                         }
                     };
                     if let Some(trait_name) = &impl_block.trait_name {
-                        let resolved_trait =
-                            if trait_name == "ToString" || trait_name == "HashKey" {
-                                trait_name.clone()
-                            } else {
-                                self.resolve_type_name(trait_name)
-                            };
+                        let resolved_trait = if trait_name == "ToString" || trait_name == "HashKey"
+                        {
+                            trait_name.clone()
+                        } else {
+                            self.resolve_type_name(trait_name)
+                        };
                         self.trait_impls.push((type_name.clone(), resolved_trait));
                     }
 

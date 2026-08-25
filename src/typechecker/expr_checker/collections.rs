@@ -280,8 +280,7 @@ impl TypeChecker {
             ..
         }) = expected_type
         {
-            if expected_name == &struct_def.name
-                && type_args.len() == struct_def.type_params.len()
+            if expected_name == &struct_def.name && type_args.len() == struct_def.type_params.len()
             {
                 for (param, arg) in struct_def.type_params.iter().zip(type_args) {
                     type_bindings.insert(param.clone(), arg.clone());
@@ -302,7 +301,9 @@ impl TypeChecker {
                     )
                 })?;
             let expected_type = self.canonicalize_type(expected_type);
-            let actual_type = self.check_expr_with_hint(&field.value, Some(&expected_type))?;
+            let hint = self.substitute_type(&expected_type, &type_bindings);
+            let hint = (!self.has_unbound_generic(&hint, &type_bindings)).then_some(&hint);
+            let actual_type = self.check_expr_with_hint(&field.value, hint)?;
             match &expected_type.kind {
                 TypeKind::Option(inner_expected) => {
                     if matches!(actual_type.kind, TypeKind::Option(_)) {

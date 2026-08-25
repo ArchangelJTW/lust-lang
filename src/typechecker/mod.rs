@@ -156,7 +156,8 @@ impl TypeChecker {
                         ))
                     })?;
                     let target_name = if let TypeKind::Named(inner)
-                    | TypeKind::GenericInstance { name: inner, .. } = &target.kind
+                    | TypeKind::GenericInstance { name: inner, .. } =
+                        &target.kind
                     {
                         inner
                     } else {
@@ -608,9 +609,9 @@ impl TypeChecker {
         }
         if let TypeKind::GenericInstance { type_args, .. } = &impl_block.target_type.kind {
             let universal_target = type_args.len() == impl_block.type_params.len()
-                && type_args.iter().zip(&impl_block.type_params).all(|(arg, param)| {
-                    matches!(&arg.kind, TypeKind::Generic(name) if name == param)
-                });
+                && type_args.iter().zip(&impl_block.type_params).all(
+                    |(arg, param)| matches!(&arg.kind, TypeKind::Generic(name) if name == param),
+                );
             if !universal_target {
                 return Err(self.type_error(
                     "Specialized external generic impls are not supported with runtime-erased type arguments"
@@ -885,11 +886,8 @@ impl TypeChecker {
                 self.push_type_params(type_params)?;
                 let canonical_target = self.canonicalize_type(target);
                 self.pop_type_params();
-                self.env.register_type_alias(
-                    qname,
-                    type_params.clone(),
-                    canonical_target,
-                )?;
+                self.env
+                    .register_type_alias(qname, type_params.clone(), canonical_target)?;
             }
 
             ItemKind::Extern { items, .. } => {
@@ -982,11 +980,7 @@ impl TypeChecker {
         self.canonicalize_type_inner(ty, &mut expanding_aliases)
     }
 
-    fn canonicalize_type_inner(
-        &self,
-        ty: &Type,
-        expanding_aliases: &mut HashSet<String>,
-    ) -> Type {
+    fn canonicalize_type_inner(&self, ty: &Type, expanding_aliases: &mut HashSet<String>) -> Type {
         use crate::ast::TypeKind as TK;
         match &ty.kind {
             TK::Named(name) if !name.contains('.') && self.is_type_param_in_scope(name) => {
@@ -1007,14 +1001,12 @@ impl TypeChecker {
                     Type::new(TK::Named(resolved), ty.span)
                 }
             }
-            TK::Array(inner) => {
-                Type::new(
-                    TK::Array(Box::new(
-                        self.canonicalize_type_inner(inner, expanding_aliases),
-                    )),
-                    ty.span,
-                )
-            }
+            TK::Array(inner) => Type::new(
+                TK::Array(Box::new(
+                    self.canonicalize_type_inner(inner, expanding_aliases),
+                )),
+                ty.span,
+            ),
 
             TK::Tuple(elements) => Type::new(
                 TK::Tuple(
@@ -1040,14 +1032,12 @@ impl TypeChecker {
                 },
                 ty.span,
             ),
-            TK::Option(inner) => {
-                Type::new(
-                    TK::Option(Box::new(
-                        self.canonicalize_type_inner(inner, expanding_aliases),
-                    )),
-                    ty.span,
-                )
-            }
+            TK::Option(inner) => Type::new(
+                TK::Option(Box::new(
+                    self.canonicalize_type_inner(inner, expanding_aliases),
+                )),
+                ty.span,
+            ),
 
             TK::Result(ok, err) => Type::new(
                 TK::Result(
@@ -1069,21 +1059,17 @@ impl TypeChecker {
                 )),
                 ty.span,
             ),
-            TK::MutRef(inner) => {
-                Type::new(
-                    TK::MutRef(Box::new(
-                        self.canonicalize_type_inner(inner, expanding_aliases),
-                    )),
-                    ty.span,
-                )
-            }
+            TK::MutRef(inner) => Type::new(
+                TK::MutRef(Box::new(
+                    self.canonicalize_type_inner(inner, expanding_aliases),
+                )),
+                ty.span,
+            ),
 
             TK::Pointer { mutable, pointee } => Type::new(
                 TK::Pointer {
                     mutable: *mutable,
-                    pointee: Box::new(
-                        self.canonicalize_type_inner(pointee, expanding_aliases),
-                    ),
+                    pointee: Box::new(self.canonicalize_type_inner(pointee, expanding_aliases)),
                 },
                 ty.span,
             ),
@@ -1097,11 +1083,7 @@ impl TypeChecker {
                     if params.len() == canonical_args.len()
                         && expanding_aliases.insert(resolved.clone())
                     {
-                        let bindings = params
-                            .iter()
-                            .cloned()
-                            .zip(canonical_args)
-                            .collect();
+                        let bindings = params.iter().cloned().zip(canonical_args).collect();
                         let substituted = self.substitute_type(target, &bindings);
                         let expanded =
                             self.canonicalize_type_inner(&substituted, expanding_aliases);
@@ -1164,7 +1146,10 @@ impl TypeChecker {
             | (TypeKind::MutRef(expected), TypeKind::MutRef(actual)) => {
                 self.infer_type_arguments(expected, actual, type_params, bindings)
             }
-            (TypeKind::Map(expected_key, expected_value), TypeKind::Map(actual_key, actual_value))
+            (
+                TypeKind::Map(expected_key, expected_value),
+                TypeKind::Map(actual_key, actual_value),
+            )
             | (
                 TypeKind::Result(expected_key, expected_value),
                 TypeKind::Result(actual_key, actual_value),
@@ -1202,12 +1187,7 @@ impl TypeChecker {
                 for (expected, actual) in expected_params.iter().zip(actual_params.iter()) {
                     self.infer_type_arguments(expected, actual, type_params, bindings)?;
                 }
-                self.infer_type_arguments(
-                    expected_return,
-                    actual_return,
-                    type_params,
-                    bindings,
-                )
+                self.infer_type_arguments(expected_return, actual_return, type_params, bindings)
             }
             (
                 TypeKind::Pointer {
@@ -1218,12 +1198,9 @@ impl TypeChecker {
                     mutable: actual_mutable,
                     pointee: actual_pointee,
                 },
-            ) if expected_mutable == actual_mutable => self.infer_type_arguments(
-                expected_pointee,
-                actual_pointee,
-                type_params,
-                bindings,
-            ),
+            ) if expected_mutable == actual_mutable => {
+                self.infer_type_arguments(expected_pointee, actual_pointee, type_params, bindings)
+            }
             (
                 TypeKind::GenericInstance {
                     name: expected_name,
@@ -1290,10 +1267,8 @@ impl TypeChecker {
             }
             TypeKind::Generic(name) => {
                 if !self.is_type_param_in_scope(name) {
-                    return Err(self.type_error_at(
-                        format!("Undeclared type parameter '{}'", name),
-                        ty.span,
-                    ));
+                    return Err(self
+                        .type_error_at(format!("Undeclared type parameter '{}'", name), ty.span));
                 }
             }
             TypeKind::Array(inner)
@@ -1321,14 +1296,21 @@ impl TypeChecker {
             TypeKind::Pointer { pointee, .. } => self.validate_type(pointee)?,
             TypeKind::GenericInstance { name, type_args } => {
                 let (arity, bounds) = if let Some(def) = self.env.lookup_struct(name) {
-                    (def.type_params.len(), Some((&def.type_params, &def.trait_bounds)))
+                    (
+                        def.type_params.len(),
+                        Some((&def.type_params, &def.trait_bounds)),
+                    )
                 } else if let Some(def) = self.env.lookup_enum(name) {
-                    (def.type_params.len(), Some((&def.type_params, &def.trait_bounds)))
+                    (
+                        def.type_params.len(),
+                        Some((&def.type_params, &def.trait_bounds)),
+                    )
                 } else if let Some((params, _)) = self.env.lookup_type_alias(name) {
                     (params.len(), None)
                 } else {
-                    return Err(self
-                        .type_error_at(format!("Undefined generic type '{}'", name), ty.span));
+                    return Err(
+                        self.type_error_at(format!("Undefined generic type '{}'", name), ty.span)
+                    );
                 };
                 if arity != type_args.len() {
                     return Err(self.type_error_at(
@@ -1378,11 +1360,7 @@ impl TypeChecker {
         Ok(())
     }
 
-    fn validate_trait_bounds(
-        &self,
-        type_params: &[String],
-        bounds: &[TraitBound],
-    ) -> Result<()> {
+    fn validate_trait_bounds(&self, type_params: &[String], bounds: &[TraitBound]) -> Result<()> {
         for bound in bounds {
             if !type_params.iter().any(|param| param == &bound.type_param) {
                 return Err(self.type_error(format!(
@@ -1404,11 +1382,7 @@ impl TypeChecker {
     }
 
     fn validate_type_alias_cycle(&self, name: &str) -> Result<()> {
-        fn visit_type(
-            checker: &TypeChecker,
-            ty: &Type,
-            visiting: &mut HashSet<String>,
-        ) -> bool {
+        fn visit_type(checker: &TypeChecker, ty: &Type, visiting: &mut HashSet<String>) -> bool {
             match &ty.kind {
                 TypeKind::Named(name) | TypeKind::GenericInstance { name, .. }
                     if checker.env.lookup_type_alias(name).is_some() =>
@@ -1434,8 +1408,7 @@ impl TypeChecker {
                 | TypeKind::Ref(inner)
                 | TypeKind::MutRef(inner) => visit_type(checker, inner, visiting),
                 TypeKind::Map(key, value) | TypeKind::Result(key, value) => {
-                    visit_type(checker, key, visiting)
-                        || visit_type(checker, value, visiting)
+                    visit_type(checker, key, visiting) || visit_type(checker, value, visiting)
                 }
                 TypeKind::Function {
                     params,
@@ -1463,10 +1436,9 @@ impl TypeChecker {
         let mut visiting = HashSet::new();
         visiting.insert(name.to_string());
         if visit_type(self, target, &mut visiting) {
-            return Err(self.type_error(format!(
-                "Recursive type alias '{}' is not supported",
-                name
-            )));
+            return Err(
+                self.type_error(format!("Recursive type alias '{}' is not supported", name))
+            );
         }
         Ok(())
     }
@@ -1509,9 +1481,7 @@ impl TypeChecker {
                 Box::new(self.substitute_type(ok, bindings)),
                 Box::new(self.substitute_type(err, bindings)),
             ),
-            TypeKind::Ref(inner) => {
-                TypeKind::Ref(Box::new(self.substitute_type(inner, bindings)))
-            }
+            TypeKind::Ref(inner) => TypeKind::Ref(Box::new(self.substitute_type(inner, bindings))),
             TypeKind::MutRef(inner) => {
                 TypeKind::MutRef(Box::new(self.substitute_type(inner, bindings)))
             }
@@ -1537,16 +1507,44 @@ impl TypeChecker {
         Type::new(kind, ty.span)
     }
 
+    fn has_unbound_generic(&self, ty: &Type, bindings: &HashMap<String, Type>) -> bool {
+        match &ty.kind {
+            TypeKind::Generic(name) => !bindings.contains_key(name),
+            TypeKind::Array(inner)
+            | TypeKind::Option(inner)
+            | TypeKind::Ref(inner)
+            | TypeKind::MutRef(inner) => self.has_unbound_generic(inner, bindings),
+            TypeKind::Map(key, value) | TypeKind::Result(key, value) => {
+                self.has_unbound_generic(key, bindings) || self.has_unbound_generic(value, bindings)
+            }
+            TypeKind::Function {
+                params,
+                return_type,
+            } => {
+                params
+                    .iter()
+                    .any(|param| self.has_unbound_generic(param, bindings))
+                    || self.has_unbound_generic(return_type, bindings)
+            }
+            TypeKind::Tuple(elements)
+            | TypeKind::Union(elements)
+            | TypeKind::GenericInstance {
+                type_args: elements,
+                ..
+            } => elements
+                .iter()
+                .any(|element| self.has_unbound_generic(element, bindings)),
+            TypeKind::Pointer { pointee, .. } => self.has_unbound_generic(pointee, bindings),
+            _ => false,
+        }
+    }
+
     fn validate_generic_call(
         &self,
         signature: &FunctionSignature,
         bindings: &HashMap<String, Type>,
     ) -> Result<()> {
-        self.validate_generic_bindings(
-            &signature.type_params,
-            &signature.trait_bounds,
-            bindings,
-        )
+        self.validate_generic_bindings(&signature.type_params, &signature.trait_bounds, bindings)
     }
 
     fn validate_generic_bindings(
@@ -2276,7 +2274,9 @@ mod tests {
              local value = tagged(42)\n",
         )
         .unwrap_err();
-        assert!(error.to_string().contains("Cannot infer type parameter 'Tag'"));
+        assert!(error
+            .to_string()
+            .contains("Cannot infer type parameter 'Tag'"));
     }
 
     #[test]
@@ -2439,8 +2439,7 @@ mod tests {
 
     #[test]
     fn generic_trait_bounds_are_enforced_at_call_site() {
-        let valid =
-            "trait Drawable\n\
+        let valid = "trait Drawable\n\
                function draw(self): string\n\
              end\n\
              struct Circle\n\
@@ -2453,10 +2452,16 @@ mod tests {
              function render<Item: Drawable>(item: Item): string\n\
                return item:draw()\n\
              end\n";
-        check(&format!("{}local output: string = render(Circle {{}})\n", valid)).unwrap();
+        check(&format!(
+            "{}local output: string = render(Circle {{}})\n",
+            valid
+        ))
+        .unwrap();
 
         let error = check(&format!("{}local output = render(1)\n", valid)).unwrap_err();
-        assert!(error.to_string().contains("does not implement required trait"));
+        assert!(error
+            .to_string()
+            .contains("does not implement required trait"));
     }
 
     #[test]
@@ -2480,8 +2485,7 @@ mod tests {
 
     #[test]
     fn mutable_containers_remain_invariant_over_trait_values() {
-        let declarations =
-            "trait Drawable\n\
+        let declarations = "trait Drawable\n\
                function draw(self): string\n\
              end\n\
              struct Circle\n\

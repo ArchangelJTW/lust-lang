@@ -2,6 +2,7 @@ use alloc::vec::Vec;
 use hashbrown::HashMap;
 pub struct Profiler {
     backedges: HashMap<(usize, usize), u32>,
+    function_calls: HashMap<usize, u32>,
     hot_spots: Vec<HotSpot>,
 }
 
@@ -16,6 +17,7 @@ impl Profiler {
     pub fn new() -> Self {
         Self {
             backedges: HashMap::new(),
+            function_calls: HashMap::new(),
             hot_spots: Vec::new(),
         }
     }
@@ -40,6 +42,16 @@ impl Profiler {
         self.backedges.get(&(func_idx, ip)).copied().unwrap_or(0)
     }
 
+    pub fn record_function_call(&mut self, func_idx: usize) -> u32 {
+        let count = self.function_calls.entry(func_idx).or_insert(0);
+        *count = count.saturating_add(1);
+        *count
+    }
+
+    pub fn function_call_count(&self, func_idx: usize) -> u32 {
+        self.function_calls.get(&func_idx).copied().unwrap_or(0)
+    }
+
     pub fn mark_hot(&mut self, func_idx: usize, ip: usize) {
         let iterations = self.get_count(func_idx, ip);
         self.hot_spots.push(HotSpot {
@@ -55,6 +67,7 @@ impl Profiler {
 
     pub fn reset(&mut self) {
         self.backedges.clear();
+        self.function_calls.clear();
         self.hot_spots.clear();
     }
 }

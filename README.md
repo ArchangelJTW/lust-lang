@@ -193,6 +193,35 @@ These forms fail with explicit type errors rather than being accepted and
 silently ignored. Generic traits and richer trait dispatch remain future
 language work, not implied current behavior.
 
+## JIT activation
+
+The tracing JIT profiles backward bytecode jumps and starts recording an
+ordinary hot loop after five observed backedges. Successful non-nested traces
+remain cached across normal loop exits, and a recording that ends too early or
+aborts is retried with bounded exponential backoff. Loop hierarchies use an
+extra warmup iteration and conservative one-shot roots until linked side traces
+can safely resume through every nested exit.
+
+Non-inlined Lust calls are opaque operations inside a loop trace. This allows a
+hot loop to remain native while a branch-heavy or recursive callee executes
+through the safe interpreter call helper. Pure direct or mutual recursion has
+no backward jump, so calls are profiled but the recursive function itself is
+not yet compiled; general recursion requires a separate finite-function JIT
+mode rather than the cyclic loop-trace compiler.
+
+Embedders can inspect cumulative activation counters after calling Lust code:
+
+```rust
+let stats = program.jit_stats();
+println!("compiled roots: {}", stats.root_traces_compiled);
+println!("native entries: {}", stats.native_trace_entries);
+println!("recursive calls: {}", stats.recursive_calls);
+```
+
+`VM::jit_stats()` exposes the same `JitStats` value. Loading a replacement
+function table invalidates compiled traces, profiles, retries, and counters so
+machine code cannot retain stale function indexes.
+
 ## Embedding in C (WIP)
 
 The crate ships with a C header at `include/lust_ffi.h` exposing a minimal ABI so native hosts

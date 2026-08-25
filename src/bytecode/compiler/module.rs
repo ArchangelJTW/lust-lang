@@ -35,11 +35,14 @@ impl Compiler {
                             ItemKind::Struct(_) | ItemKind::Enum(_) => {}
                             ItemKind::Trait(trait_def) => {
                                 self.trait_names.insert(trait_def.name.clone());
+                                self.trait_names
+                                    .insert(self.resolve_type_name(&trait_def.name));
                             }
 
                             ItemKind::Impl(impl_block) => {
                                 let type_name = match &impl_block.target_type.kind {
-                                    crate::ast::TypeKind::Named(name) => {
+                                    crate::ast::TypeKind::Named(name)
+                                    | crate::ast::TypeKind::GenericInstance { name, .. } => {
                                         self.resolve_type_name(name)
                                     }
 
@@ -50,7 +53,13 @@ impl Compiler {
                                     }
                                 };
                                 if let Some(trait_name) = &impl_block.trait_name {
-                                    let resolved_trait = self.resolve_type_name(trait_name);
+                                    let resolved_trait = if trait_name == "ToString"
+                                        || trait_name == "HashKey"
+                                    {
+                                        trait_name.clone()
+                                    } else {
+                                        self.resolve_type_name(trait_name)
+                                    };
                                     self.trait_impls.push((type_name.clone(), resolved_trait));
                                 }
 
@@ -126,11 +135,16 @@ impl Compiler {
                 ItemKind::Struct(_) | ItemKind::Enum(_) => {}
                 ItemKind::Trait(trait_def) => {
                     self.trait_names.insert(trait_def.name.clone());
+                    self.trait_names
+                        .insert(self.resolve_type_name(&trait_def.name));
                 }
 
                 ItemKind::Impl(impl_block) => {
                     let type_name = match &impl_block.target_type.kind {
-                        crate::ast::TypeKind::Named(name) => self.resolve_type_name(name),
+                        crate::ast::TypeKind::Named(name)
+                        | crate::ast::TypeKind::GenericInstance { name, .. } => {
+                            self.resolve_type_name(name)
+                        }
                         _ => {
                             return Err(LustError::CompileError(
                                 "Impl block target must be a named type".to_string(),
@@ -138,7 +152,12 @@ impl Compiler {
                         }
                     };
                     if let Some(trait_name) = &impl_block.trait_name {
-                        let resolved_trait = self.resolve_type_name(trait_name);
+                        let resolved_trait =
+                            if trait_name == "ToString" || trait_name == "HashKey" {
+                                trait_name.clone()
+                            } else {
+                                self.resolve_type_name(trait_name)
+                            };
                         self.trait_impls.push((type_name.clone(), resolved_trait));
                     }
 

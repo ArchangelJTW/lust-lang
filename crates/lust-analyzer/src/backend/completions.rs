@@ -10,7 +10,8 @@ use crate::utils::{
 };
 use hashbrown::HashSet;
 use lust::ast::{
-    ExternItem, FunctionParam, Item, ItemKind, Stmt, StmtKind, Type, TypeKind, Visibility,
+    ExternItem, FunctionParam, Item, ItemKind, Stmt, StmtKind, TraitBound, Type, TypeKind,
+    Visibility,
 };
 use lust::builtins::{self, BuiltinFunction, BuiltinMethod, TypeExpr};
 use lust::Span;
@@ -83,9 +84,27 @@ fn method_insert_text(method: &MethodInfo) -> (String, Option<InsertTextFormat>)
 
 fn format_function_signature_def(
     name: &str,
+    type_params: &[String],
+    trait_bounds: &[TraitBound],
     params: &[FunctionParam],
     return_type: &Option<Type>,
 ) -> String {
+    let generics = if type_params.is_empty() {
+        String::new()
+    } else {
+        let params = type_params
+            .iter()
+            .map(|param| {
+                if let Some(bound) = trait_bounds.iter().find(|bound| &bound.type_param == param) {
+                    format!("{}: {}", param, bound.traits.join(" + "))
+                } else {
+                    param.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("<{}>", params)
+    };
     let params_str = params
         .iter()
         .map(|param| {
@@ -100,9 +119,9 @@ fn format_function_signature_def(
         .collect::<Vec<_>>()
         .join(", ");
     if let Some(ret) = return_type {
-        format!("fn {}({}) -> {}", name, params_str, ret)
+        format!("function {}{}({}): {}", name, generics, params_str, ret)
     } else {
-        format!("fn {}({})", name, params_str)
+        format!("function {}{}({})", name, generics, params_str)
     }
 }
 
@@ -319,8 +338,13 @@ pub(crate) fn identifier_completions(
                 }
 
                 let simple = method_display_name(&func.name);
-                let detail =
-                    format_function_signature_def(&simple, &func.params, &func.return_type);
+                let detail = format_function_signature_def(
+                    &simple,
+                    &func.type_params,
+                    &func.trait_bounds,
+                    &func.params,
+                    &func.return_type,
+                );
                 push_item(simple, CompletionItemKind::FUNCTION, Some(detail));
             }
 

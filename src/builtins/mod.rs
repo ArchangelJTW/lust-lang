@@ -71,6 +71,8 @@ impl BuiltinFunction {
                 .return_type
                 .instantiate(&HashMap::new(), Some(span)),
             is_method: false,
+            type_params: Vec::new(),
+            trait_bounds: Vec::new(),
         }
     }
 

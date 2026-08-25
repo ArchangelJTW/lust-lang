@@ -314,7 +314,7 @@ fn collect_deps_from_lua_require_stmt(stmt: &crate::ast::Stmt, deps: &mut HashSe
 fn collect_deps_from_lua_require_expr(expr: &crate::ast::Expr, deps: &mut HashSet<String>) {
     use crate::ast::{ExprKind, Literal};
     match &expr.kind {
-        ExprKind::Call { callee, args } => {
+        ExprKind::Call { callee, args, .. } => {
             if is_lua_require_callee(callee) {
                 if let Some(name) = args.get(0).and_then(extract_lua_require_name) {
                     if !is_lua_builtin_module_name(&name) {
@@ -421,7 +421,7 @@ fn extract_lua_require_name(expr: &crate::ast::Expr) -> Option<String> {
     use crate::ast::{ExprKind, Literal};
     match &expr.kind {
         ExprKind::Literal(Literal::String(s)) => Some(s.clone()),
-        ExprKind::Call { callee, args } if is_lua_to_value_callee(callee) => {
+        ExprKind::Call { callee, args, .. } if is_lua_to_value_callee(callee) => {
             args.get(0).and_then(|arg| match &arg.kind {
                 ExprKind::Literal(Literal::String(s)) => Some(s.clone()),
                 _ => None,

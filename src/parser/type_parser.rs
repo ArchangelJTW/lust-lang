@@ -77,9 +77,6 @@ impl Parser {
                                         type_args,
                                     },
                                 }
-                            } else if base.len() == 1 && base.chars().next().unwrap().is_uppercase()
-                            {
-                                TypeKind::Generic(base.clone())
                             } else {
                                 TypeKind::Named(qualified_name)
                             }
@@ -173,10 +170,13 @@ impl Parser {
         Ok(Type::new(kind, self.make_span(&start_token, &end_token)))
     }
 
-    fn parse_type_arguments(&mut self) -> Result<Vec<Type>> {
+    pub(super) fn parse_type_arguments(&mut self) -> Result<Vec<Type>> {
         self.consume(TokenKind::Less, "Expected '<' after type name")?;
         let mut type_args = vec![self.parse_type()?];
         while self.match_token(&[TokenKind::Comma]) {
+            if self.check(TokenKind::Greater) {
+                break;
+            }
             type_args.push(self.parse_type()?);
         }
 

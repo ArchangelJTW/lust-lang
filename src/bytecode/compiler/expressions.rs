@@ -127,7 +127,7 @@ impl Compiler {
                 Ok(result_reg)
             }
 
-            ExprKind::Call { callee, args } => {
+            ExprKind::Call { callee, args, .. } => {
                 if let ExprKind::FieldAccess { object, field } = &callee.kind {
                     if let ExprKind::Identifier(type_name) = &object.kind {
                         let is_module_alias = self
@@ -214,7 +214,7 @@ impl Compiler {
                             }
 
                             if Self::looks_like_type_name(type_name) {
-                                let enum_name_idx = self.add_string_constant(type_name);
+                                let enum_name_idx = self.add_string_constant(&resolved_type);
                                 let variant_idx = self.add_string_constant(field);
                                 if args.is_empty() {
                                     let result_reg = self.allocate_register();
@@ -347,7 +347,8 @@ impl Compiler {
                     if Self::looks_like_type_name(enum_name)
                         && self.resolve_local(enum_name).is_err()
                     {
-                        let enum_name_idx = self.add_string_constant(enum_name);
+                        let resolved_enum = self.resolve_type_name(enum_name);
+                        let enum_name_idx = self.add_string_constant(&resolved_enum);
                         let variant_idx = self.add_string_constant(field);
                         let result_reg = self.allocate_register();
                         self.emit(
@@ -607,7 +608,15 @@ impl Compiler {
                 }
 
                 let type_string = match &check_type.kind {
+                    crate::ast::TypeKind::Named(name)
+                        if name == "ToString" || name == "HashKey" =>
+                    {
+                        name.clone()
+                    }
                     crate::ast::TypeKind::Named(name) => self.resolve_type_name(name),
+                    crate::ast::TypeKind::GenericInstance { name, .. } => {
+                        self.resolve_type_name(name)
+                    }
                     _ => Self::type_to_string(&check_type.kind),
                 };
                 let type_name_idx = self.add_string_constant(&type_string);
@@ -627,7 +636,15 @@ impl Compiler {
             ExprKind::Cast { expr, target_type } => {
                 let value_reg = self.compile_expr(expr)?;
                 let type_string = match &target_type.kind {
+                    crate::ast::TypeKind::Named(name)
+                        if name == "ToString" || name == "HashKey" =>
+                    {
+                        name.clone()
+                    }
                     crate::ast::TypeKind::Named(name) => self.resolve_type_name(name),
+                    crate::ast::TypeKind::GenericInstance { name, .. } => {
+                        self.resolve_type_name(name)
+                    }
                     _ => Self::type_to_string(&target_type.kind),
                 };
                 let type_name_idx = self.add_string_constant(&type_string);

@@ -88,6 +88,29 @@ impl ExternRegistry {
     pub fn register_with_vm(&self, vm: &mut VM) {
         self.register_struct_layouts(vm);
         self.register_type_stubs(vm);
+        self.register_trait_impls(vm);
+    }
+
+    pub fn register_trait_impls(&self, vm: &mut VM) {
+        let prefix = vm.export_prefix();
+        for impl_block in &self.impls {
+            let canonical = canonicalize_impl(impl_block, prefix.as_deref());
+            let Some(trait_name) = canonical.trait_name else {
+                continue;
+            };
+            let type_name = match canonical.target_type.kind {
+                TypeKind::Int => "int".to_string(),
+                TypeKind::Float => "float".to_string(),
+                TypeKind::String => "string".to_string(),
+                TypeKind::Bool => "bool".to_string(),
+                TypeKind::Array(_) => "Array".to_string(),
+                TypeKind::Map(_, _) => "Map".to_string(),
+                TypeKind::Tuple(_) => "Tuple".to_string(),
+                TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => name,
+                _ => continue,
+            };
+            vm.register_trait_impl(type_name, trait_name);
+        }
     }
 
     pub fn register_struct_layouts(&self, vm: &mut VM) {
@@ -560,6 +583,8 @@ fn function_signature_for(func: &FunctionDef) -> (String, FunctionSignature) {
             params,
             return_type,
             is_method: func.is_method,
+            type_params: func.type_params.clone(),
+            trait_bounds: func.trait_bounds.clone(),
         },
     )
 }
@@ -793,7 +818,13 @@ fn canonicalize_impl(def: &ImplBlock, prefix: Option<&str>) -> ImplBlock {
         _ => cloned.target_type.to_string(),
     };
     if let Some(trait_name) = &cloned.trait_name {
-        cloned.trait_name = Some(canonicalize_simple_name(trait_name, prefix));
+        cloned.trait_name = Some(
+            if trait_name == "ToString" || trait_name == "HashKey" {
+                trait_name.clone()
+            } else {
+                canonicalize_simple_name(trait_name, prefix)
+            },
+        );
     }
     for method in &mut cloned.methods {
         for param in &mut method.params {

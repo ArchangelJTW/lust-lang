@@ -104,6 +104,95 @@ Lust's casing convention distinguishes language roles:
 This keeps `Option` visibly distinct from primitives; `OPTION` is reserved by
 convention for constant-like names rather than types.
 
+## Generics and traits
+
+Lust generics are statically checked and runtime-erased. A generic function or
+method has one bytecode body, while the typechecker infers and substitutes a
+fresh set of type arguments at each call. The tracing JIT can still specialize
+that body for the concrete values observed at runtime.
+
+Type parameters are declaration-scoped identifiers, not a capitalization
+heuristic. `T`, `Item`, and `value_type` are generic only inside a declaration
+that introduces them; a nominal type named `K` remains a normal type everywhere
+else. Multi-letter PascalCase parameter names are recommended for readability.
+
+```lust
+function identity<Item>(value: Item): Item
+    return value
+end
+
+function first<Item>(values: Array<Item>): Item
+    return values[0]:unwrap()
+end
+
+local number: int = identity(42)
+local text: string = identity<string>("hello")
+local first_number: int = first([1, 2, 3])
+```
+
+Inference is recursive and consistent. For example, `Array<Item>` infers from
+`Array<int>`, while two parameters declared as the same `Item` must receive the
+same type. Explicit arguments use `function_name<Type>(...)` or
+`value:method<Type>(...)` and are required when a parameter cannot be inferred.
+The `<` must directly follow the function name; spaced `a < b` remains a
+comparison.
+
+Generic aliases, structs, enums, functions, instance methods, and universal
+impls are supported:
+
+```lust
+type Pair<Item> = (Item, Item)
+
+struct Box<Item>
+    value: Item
+end
+
+impl<Item> Box<Item>
+    function get(self): Item
+        return self.value
+    end
+end
+```
+
+Traits are nominal contracts and keep the Rust-inspired `trait`, `impl Trait for
+Type`, and `Item: Trait` spelling. A type conforms only through an explicit
+`impl`. A bare trait name is also the dynamic constraint type, so no `dyn` or
+`interface` keyword is needed:
+
+```lust
+trait Drawable
+    function draw(self): string
+end
+
+function render<Item: Drawable>(item: Item): string
+    return item:draw()
+end
+
+function render_dynamic(item: Drawable): string
+    return item:draw()
+end
+```
+
+Bounds are enforced at call and construction sites. Trait methods currently
+require one unannotated leading `self`, and method names form one namespace for
+each erased runtime type; conflicting implementations are rejected.
+
+Runtime erasure deliberately imposes several current restrictions:
+
+- Generic traits, generic trait methods, and default trait methods are rejected.
+- Conditional impls such as `impl<Item: Trait> Box<Item>` are rejected.
+- Specialized impls such as `impl Box<int>` are rejected; use one universal
+  `impl<Item> Box<Item>`.
+- Generic static methods and impls through type aliases are rejected.
+- `is` and `as` cannot target an erased type parameter or a type alias.
+- Generic arguments cannot be revalidated at a raw VM/native boundary because
+  values retain their erased nominal runtime type. Validate them in typed Lust
+  code or in the embedding conversion layer.
+
+These forms fail with explicit type errors rather than being accepted and
+silently ignored. Generic traits and richer trait dispatch remain future
+language work, not implied current behavior.
+
 ## Embedding in C (WIP)
 
 The crate ships with a C header at `include/lust_ffi.h` exposing a minimal ABI so native hosts

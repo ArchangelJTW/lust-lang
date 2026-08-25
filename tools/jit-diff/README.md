@@ -67,17 +67,17 @@ every shape and every trip count.
 
 | | baseline | now |
 |---|---|---|
-| `MATCH_OK` | 850 | 1248 |
+| `MATCH_OK` | 850 | 1255 |
 | `JIT_WRONG` | 121 | 0 |
 | `JIT_HANG` | 235 | 0 |
 | `JIT_CRASH` | 9 | 0 |
 | `JIT_ERROR` | 17 | 0 |
 | `BOTH_WRONG` | 3 | 0 |
-| `FRONTEND` | 1 | 1 |
+| `FRONTEND` | 1 | 0 |
 
 No case that passed at baseline regressed, and `cargo test` stayed green
-throughout. The one remaining failure is a front-end bug that both modes share
-(see *Still open*).
+throughout. The former single-letter nominal-type frontend failure is now a
+passing scoped-generics regression.
 
 Runtime `unknown` checks are native-trace operations as well: `value is T`
 emits a type test, while `value as T` produces `Option<T>`. An immediately
@@ -191,28 +191,17 @@ both together fixed 51 cases.
 
 ## Still open
 
-### Generic type parameters do not work at all
+### Runtime-erased generics
 
-The remaining `FRONTEND` case is `struct K` — a single-letter struct name.
-`parser/type_parser.rs:80` guesses that any single uppercase letter is a type
-parameter and emits `TypeKind::Generic`, so the annotation never gets
-module-qualified and `local k: K = K { x = 7 }` fails with
-`expected 'K', got 'j.K'`. The parser cannot know: only the typechecker knows
-which type parameters are in scope.
+Generic parameters are resolved from declaration scopes rather than spelling.
+The differential corpus covers multi-letter function parameters, recursive
+inference through containers, explicit call arguments, generic structs and
+instance methods, generic enums and patterns, bounded generic calls, bare trait
+values, and single-letter nominal types such as `K`.
 
-Deleting the guess is not enough, because generics are broken in both directions:
-
-```lust
-function ident<Elem>(x: Elem): Elem   -- expected 'p.Elem', got 'int'
-function ident<T>(x: T): T            -- operator + got 'T' and 'int'
-```
-
-A multi-letter parameter is treated as a module-local struct name; a single-letter
-one never unifies with a concrete type. Fixing this properly means tracking
-type-parameter scopes (the parser has the information at each of the ~7 sites that
-parse type params, but the typechecker has no scope stack at all) and is a
-separate workstream from JIT correctness. The corpus does not currently cover
-generic functions, so their true state is unmeasured.
+Generic functions and nominal types compile to one erased runtime body/type.
+Specialized and conditional impls are therefore rejected until Lust has a
+reified witness or monomorphization model for those forms.
 
 ### Two JIT design issues that are latent rather than observable
 

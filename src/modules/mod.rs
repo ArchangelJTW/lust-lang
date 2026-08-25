@@ -632,7 +632,7 @@ impl ModuleLoader {
     ) {
         use crate::ast::{ExprKind, Literal};
         match &expr.kind {
-            ExprKind::Call { callee, args } => {
+            ExprKind::Call { callee, args, .. } => {
                 if self.is_lua_require_callee(callee) {
                     if let Some(name) = args
                         .get(0)
@@ -756,7 +756,7 @@ impl ModuleLoader {
         use crate::ast::{ExprKind, Literal};
         match &expr.kind {
             ExprKind::Literal(Literal::String(s)) => Some(s.clone()),
-            ExprKind::Call { callee, args } if self.is_lua_to_value_callee(callee) => {
+            ExprKind::Call { callee, args, .. } if self.is_lua_to_value_callee(callee) => {
                 args.get(0).and_then(|arg| match &arg.kind {
                     ExprKind::Literal(Literal::String(s)) => Some(s.clone()),
                     _ => None,

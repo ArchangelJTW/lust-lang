@@ -662,6 +662,8 @@ mod tests {
             params,
             return_type,
             is_method: false,
+            type_params: Vec::new(),
+            trait_bounds: Vec::new(),
         });
         function
     }

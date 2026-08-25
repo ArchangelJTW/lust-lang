@@ -64,7 +64,9 @@ impl Compiler {
             functions: Vec::new(),
             function_table: HashMap::new(),
             trait_impls: Vec::new(),
-            trait_names: HashSet::new(),
+            trait_names: ["ToString".to_string(), "HashKey".to_string()]
+                .into_iter()
+                .collect(),
             current_function: 0,
             scopes: Vec::new(),
             loop_contexts: Vec::new(),
@@ -228,6 +230,8 @@ impl Compiler {
             params: param_types,
             return_type,
             is_method: false,
+            type_params: Vec::new(),
+            trait_bounds: Vec::new(),
         })
     }
 

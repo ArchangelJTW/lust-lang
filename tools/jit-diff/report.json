@@ -17881,6 +17881,30 @@
     "source": "local values: Array<int> = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10]\nlocal alias = values\nlocal acc: int = 0\nfor i = 1, 100 do\n  alias:pop()\n  acc = acc + alias[0]:unwrap()\nend\nprintln(acc)\n"
   },
   {
+    "name": "regression/builtin_trait_value",
+    "tags": [
+      "regression",
+      "trait",
+      "builtin",
+      "dynamic"
+    ],
+    "expected": 4,
+    "verdict": "MATCH_OK",
+    "jit_on": {
+      "kind": "ok",
+      "value": 4,
+      "exit_code": 0,
+      "detail": ""
+    },
+    "jit_off": {
+      "kind": "ok",
+      "value": 4,
+      "exit_code": 0,
+      "detail": ""
+    },
+    "source": "struct Label\n  value: string\nend\nimpl ToString for Label\n  function to_string(self): string\n    return self.value\n  end\nend\nfunction size(value: ToString): int\n  return value:to_string():len()\nend\nlocal label = Label { value = \"four\" }\nlocal dynamic: unknown = label\nif dynamic is ToString then\n  println(size(label))\nelse\n  println(0)\nend\n"
+  },
+  {
     "name": "regression/failed_unbox_with_later_specialization",
     "tags": [
       "regression",
@@ -17969,6 +17993,103 @@
       "detail": ""
     },
     "source": "local acc: int = 0\nfor i = 5, 1, -1 do\n  acc = acc + 1\nend\nprintln(acc)\n"
+  },
+  {
+    "name": "regression/generic_enum_pattern_and_method",
+    "tags": [
+      "regression",
+      "generics",
+      "enum",
+      "pattern",
+      "method"
+    ],
+    "expected": 13,
+    "verdict": "MATCH_OK",
+    "jit_on": {
+      "kind": "ok",
+      "value": 13,
+      "exit_code": 0,
+      "detail": ""
+    },
+    "jit_off": {
+      "kind": "ok",
+      "value": 13,
+      "exit_code": 0,
+      "detail": ""
+    },
+    "source": "enum Boxed<Item>\n  Value(Item)\nend\nimpl<Item> Boxed<Item>\n  function constant(self): int\n    return 4\n  end\nend\nlocal boxed: Boxed<int> = Boxed.Value(9)\nif boxed is Value(value) then\n  println(value + boxed:constant())\nelse\n  println(0)\nend\n"
+  },
+  {
+    "name": "regression/generic_function_inference",
+    "tags": [
+      "regression",
+      "generics",
+      "function",
+      "nested"
+    ],
+    "expected": 14,
+    "verdict": "MATCH_OK",
+    "jit_on": {
+      "kind": "ok",
+      "value": 14,
+      "exit_code": 0,
+      "detail": ""
+    },
+    "jit_off": {
+      "kind": "ok",
+      "value": 14,
+      "exit_code": 0,
+      "detail": ""
+    },
+    "source": "function identity<Element>(value: Element): Element\n  return value\nend\nfunction first<Element>(values: Array<Element>): Element\n  return values[0]:unwrap()\nend\nfunction tagged<Tag>(value: int): int\n  return value\nend\nprintln(identity(7) + first([5]) + tagged<string>(2))\n"
+  },
+  {
+    "name": "regression/generic_struct_impl",
+    "tags": [
+      "regression",
+      "generics",
+      "struct",
+      "method"
+    ],
+    "expected": 10,
+    "verdict": "MATCH_OK",
+    "jit_on": {
+      "kind": "ok",
+      "value": 10,
+      "exit_code": 0,
+      "detail": ""
+    },
+    "jit_off": {
+      "kind": "ok",
+      "value": 10,
+      "exit_code": 0,
+      "detail": ""
+    },
+    "source": "struct Box<Item>\n  value: Item\nend\nimpl<Item> Box<Item>\n  function get(self): Item\n    return self.value\n  end\n  function replace<Next>(self, value: Next): Next\n    return value\n  end\nend\nlocal boxed: Box<int> = Box { value = 7 }\nprintln(boxed:get() + boxed:replace(3))\n"
+  },
+  {
+    "name": "regression/generic_trait_bound_and_value",
+    "tags": [
+      "regression",
+      "generics",
+      "trait",
+      "dynamic"
+    ],
+    "expected": 36,
+    "verdict": "MATCH_OK",
+    "jit_on": {
+      "kind": "ok",
+      "value": 36,
+      "exit_code": 0,
+      "detail": ""
+    },
+    "jit_off": {
+      "kind": "ok",
+      "value": 36,
+      "exit_code": 0,
+      "detail": ""
+    },
+    "source": "trait Scaled\n  function scale(self, value: int): int\nend\nstruct Multiplier\n  factor: int\nend\nimpl Scaled for Multiplier\n  function scale(self, value: int): int\n    return self.factor * value\n  end\nend\nfunction apply<Item: Scaled>(item: Item, value: int): int\n  return item:scale(value)\nend\nfunction apply_dynamic(item: Scaled, value: int): int\n  return item:scale(value)\nend\nlocal multiplier = Multiplier { factor = 3 }\nprintln(apply(multiplier, 7) + apply_dynamic(multiplier, 5))\n"
   },
   {
     "name": "regression/int_32bit_truncation",
@@ -18163,23 +18284,48 @@
     "name": "regression/single_letter_struct_name",
     "tags": [
       "regression",
-      "frontend"
+      "generics",
+      "scope"
     ],
     "expected": 7,
-    "verdict": "FRONTEND",
+    "verdict": "MATCH_OK",
     "jit_on": {
-      "kind": "error",
-      "value": null,
-      "exit_code": 1,
-      "detail": "type error: Cannot access field on type 'K'"
+      "kind": "ok",
+      "value": 7,
+      "exit_code": 0,
+      "detail": ""
     },
     "jit_off": {
-      "kind": "error",
-      "value": null,
-      "exit_code": 1,
-      "detail": "type error: Cannot access field on type 'K'"
+      "kind": "ok",
+      "value": 7,
+      "exit_code": 0,
+      "detail": ""
     },
     "source": "struct K\n  x: int\nend\nlocal a: Array<K> = []\na:push(K { x = 7 })\nprintln(a[0]:unwrap().x)\n"
+  },
+  {
+    "name": "regression/trait_cast_value",
+    "tags": [
+      "regression",
+      "trait",
+      "cast",
+      "dynamic"
+    ],
+    "expected": 21,
+    "verdict": "MATCH_OK",
+    "jit_on": {
+      "kind": "ok",
+      "value": 21,
+      "exit_code": 0,
+      "detail": ""
+    },
+    "jit_off": {
+      "kind": "ok",
+      "value": 21,
+      "exit_code": 0,
+      "detail": ""
+    },
+    "source": "trait Scaled\n  function scale(self, value: int): int\nend\nstruct Multiplier\n  factor: int\nend\nimpl Scaled for Multiplier\n  function scale(self, value: int): int\n    return self.factor * value\n  end\nend\nlocal dynamic: unknown = Multiplier { factor = 3 }\nlocal scaled: Scaled = (dynamic as Scaled):unwrap()\nprintln(scaled:scale(7))\n"
   },
   {
     "name": "regression/unknown_try_cast_hot_loop",

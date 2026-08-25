@@ -139,7 +139,13 @@
 
 ; Impl blocks
 (impl_block
-  type: (identifier) @type)
+  trait: (identifier) @type)
+
+(impl_block
+  type: (type_annotation) @type)
+
+(type_alias_declaration
+  name: (identifier) @type)
 
 ; Type annotations
 (type_annotation
@@ -182,8 +188,11 @@
 (comment) @comment
 
 ; Type parameters
-(type_parameters
-  (identifier) @type.parameter)
+(type_parameter
+  name: (identifier) @type.parameter)
+
+(type_parameter
+  bound: (identifier) @type)
 
 ; Pattern matching
 (pattern

@@ -459,15 +459,34 @@ fn collect_tokens_from_expr(
             collect_tokens_from_expr(operand, text, line_offsets, tokens, seen);
         }
 
-        ExprKind::Call { callee, args } => {
+        ExprKind::Call {
+            callee,
+            type_args,
+            args,
+        } => {
             collect_tokens_from_expr(callee, text, line_offsets, tokens, seen);
+            if let Some(type_args) = type_args {
+                for type_arg in type_args {
+                    collect_tokens_from_type(type_arg, text, line_offsets, tokens, seen);
+                }
+            }
             for arg in args {
                 collect_tokens_from_expr(arg, text, line_offsets, tokens, seen);
             }
         }
 
-        ExprKind::MethodCall { receiver, args, .. } => {
+        ExprKind::MethodCall {
+            receiver,
+            type_args,
+            args,
+            ..
+        } => {
             collect_tokens_from_expr(receiver, text, line_offsets, tokens, seen);
+            if let Some(type_args) = type_args {
+                for type_arg in type_args {
+                    collect_tokens_from_type(type_arg, text, line_offsets, tokens, seen);
+                }
+            }
             for arg in args {
                 collect_tokens_from_expr(arg, text, line_offsets, tokens, seen);
             }
@@ -641,6 +660,19 @@ fn collect_tokens_from_type(
             collect_tokens_from_type(inner, text, line_offsets, tokens, seen);
         }
 
+        TypeKind::Generic(name) => {
+            push_identifier_token(
+                text,
+                line_offsets,
+                tokens,
+                seen,
+                ty.span,
+                name,
+                ty.span.start_col.saturating_sub(1),
+                TOKEN_TYPE_TYPE_IDX,
+            );
+        }
+
         TypeKind::String
         | TypeKind::Int
         | TypeKind::Float
@@ -648,7 +680,6 @@ fn collect_tokens_from_type(
         | TypeKind::Unknown
         | TypeKind::Infer
         | TypeKind::Unit
-        | TypeKind::Generic(_)
         | TypeKind::TraitBound(_) => {}
     }
 }

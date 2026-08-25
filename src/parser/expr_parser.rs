@@ -256,6 +256,29 @@ impl Parser {
                     expr = Expr::new(
                         ExprKind::Call {
                             callee: Box::new(expr),
+                            type_args: None,
+                            args,
+                        },
+                        span,
+                    );
+                }
+
+                TokenKind::Less if self.looks_like_generic_call(&expr) => {
+                    let type_args = self.parse_type_arguments()?;
+                    self.consume(TokenKind::LeftParen, "Expected '(' after type arguments")?;
+                    let mut args = Vec::new();
+                    if !self.check(TokenKind::RightParen) {
+                        args.push(self.parse_expr()?);
+                        while self.match_token(&[TokenKind::Comma]) {
+                            args.push(self.parse_expr()?);
+                        }
+                    }
+                    self.consume(TokenKind::RightParen, "Expected ')' after arguments")?;
+                    let span = expr.span;
+                    expr = Expr::new(
+                        ExprKind::Call {
+                            callee: Box::new(expr),
+                            type_args: Some(type_args),
                             args,
                         },
                         span,
@@ -440,6 +463,51 @@ impl Parser {
         }
 
         Ok(expr)
+    }
+
+    fn looks_like_generic_call(&self, callee: &Expr) -> bool {
+        if !matches!(
+            callee.kind,
+            ExprKind::Identifier(_) | ExprKind::FieldAccess { .. }
+        ) {
+            return false;
+        }
+        let Some(less) = self.tokens.get(self.current) else {
+            return false;
+        };
+        if let Some(previous) = self.current.checked_sub(1).and_then(|index| self.tokens.get(index)) {
+            if less.line != previous.line
+                || less.column
+                    != previous
+                        .column
+                        .saturating_add(previous.lexeme.chars().count())
+            {
+                return false;
+            }
+        }
+        let mut depth = 0usize;
+        let mut index = self.current;
+        while let Some(token) = self.tokens.get(index) {
+            match token.kind {
+                TokenKind::Less => depth += 1,
+                TokenKind::Greater => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        return self
+                            .tokens
+                            .get(index + 1)
+                            .is_some_and(|next| next.kind == TokenKind::LeftParen);
+                    }
+                }
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            index += 1;
+        }
+        false
     }
 
     fn expr_to_path(expr: &Expr) -> Option<String> {

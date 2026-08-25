@@ -45,7 +45,7 @@ impl Compiler {
                 self.find_free_vars_in_expr(operand, free_vars, bound_vars);
             }
 
-            ExprKind::Call { callee, args } => {
+            ExprKind::Call { callee, args, .. } => {
                 self.find_free_vars_in_expr(callee, free_vars, bound_vars);
                 for arg in args {
                     self.find_free_vars_in_expr(arg, free_vars, bound_vars);

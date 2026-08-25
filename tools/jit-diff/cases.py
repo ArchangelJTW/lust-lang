@@ -1150,8 +1150,8 @@ def regressions() -> Iterator[Case]:
         160,
         ("regression", "array", "specialization", "hot"),
     )
-    # Single-letter struct name colliding with a generic type variable.  This
-    # one is a front-end bug and should fail identically in both modes.
+    # A type parameter is generic only inside the declaration that introduces it;
+    # a one-letter PascalCase name remains a normal nominal type everywhere else.
     yield Case(
         "regression/single_letter_struct_name",
         "struct K\n  x: int\nend\n"
@@ -1159,7 +1159,125 @@ def regressions() -> Iterator[Case]:
         "a:push(K { x = 7 })\n"
         "println(a[0]:unwrap().x)\n",
         7,
-        ("regression", "frontend"),
+        ("regression", "generics", "scope"),
+    )
+    yield Case(
+        "regression/generic_function_inference",
+        "function identity<Element>(value: Element): Element\n"
+        "  return value\n"
+        "end\n"
+        "function first<Element>(values: Array<Element>): Element\n"
+        "  return values[0]:unwrap()\n"
+        "end\n"
+        "function tagged<Tag>(value: int): int\n"
+        "  return value\n"
+        "end\n"
+        "println(identity(7) + first([5]) + tagged<string>(2))\n",
+        14,
+        ("regression", "generics", "function", "nested"),
+    )
+    yield Case(
+        "regression/generic_struct_impl",
+        "struct Box<Item>\n"
+        "  value: Item\n"
+        "end\n"
+        "impl<Item> Box<Item>\n"
+        "  function get(self): Item\n"
+        "    return self.value\n"
+        "  end\n"
+        "  function replace<Next>(self, value: Next): Next\n"
+        "    return value\n"
+        "  end\n"
+        "end\n"
+        "local boxed: Box<int> = Box { value = 7 }\n"
+        "println(boxed:get() + boxed:replace(3))\n",
+        10,
+        ("regression", "generics", "struct", "method"),
+    )
+    yield Case(
+        "regression/generic_trait_bound_and_value",
+        "trait Scaled\n"
+        "  function scale(self, value: int): int\n"
+        "end\n"
+        "struct Multiplier\n"
+        "  factor: int\n"
+        "end\n"
+        "impl Scaled for Multiplier\n"
+        "  function scale(self, value: int): int\n"
+        "    return self.factor * value\n"
+        "  end\n"
+        "end\n"
+        "function apply<Item: Scaled>(item: Item, value: int): int\n"
+        "  return item:scale(value)\n"
+        "end\n"
+        "function apply_dynamic(item: Scaled, value: int): int\n"
+        "  return item:scale(value)\n"
+        "end\n"
+        "local multiplier = Multiplier { factor = 3 }\n"
+        "println(apply(multiplier, 7) + apply_dynamic(multiplier, 5))\n",
+        36,
+        ("regression", "generics", "trait", "dynamic"),
+    )
+    yield Case(
+        "regression/generic_enum_pattern_and_method",
+        "enum Boxed<Item>\n"
+        "  Value(Item)\n"
+        "end\n"
+        "impl<Item> Boxed<Item>\n"
+        "  function constant(self): int\n"
+        "    return 4\n"
+        "  end\n"
+        "end\n"
+        "local boxed: Boxed<int> = Boxed.Value(9)\n"
+        "if boxed is Value(value) then\n"
+        "  println(value + boxed:constant())\n"
+        "else\n"
+        "  println(0)\n"
+        "end\n",
+        13,
+        ("regression", "generics", "enum", "pattern", "method"),
+    )
+    yield Case(
+        "regression/builtin_trait_value",
+        "struct Label\n"
+        "  value: string\n"
+        "end\n"
+        "impl ToString for Label\n"
+        "  function to_string(self): string\n"
+        "    return self.value\n"
+        "  end\n"
+        "end\n"
+        "function size(value: ToString): int\n"
+        "  return value:to_string():len()\n"
+        "end\n"
+        "local label = Label { value = \"four\" }\n"
+        "local dynamic: unknown = label\n"
+        "if dynamic is ToString then\n"
+        "  println(size(label))\n"
+        "else\n"
+        "  println(0)\n"
+        "end\n",
+        4,
+        ("regression", "trait", "builtin", "dynamic"),
+    )
+    yield Case(
+        "regression/trait_cast_value",
+        "trait Scaled\n"
+        "  function scale(self, value: int): int\n"
+        "end\n"
+        "struct Multiplier\n"
+        "  factor: int\n"
+        "end\n"
+        "impl Scaled for Multiplier\n"
+        "  function scale(self, value: int): int\n"
+        "    return self.factor * value\n"
+        "  end\n"
+        "end\n"
+        "local dynamic: unknown = Multiplier { factor = 3 }\n"
+        "local scaled: Scaled = (dynamic as Scaled):unwrap()\n"
+        "println(scaled:scale(7))\n",
+        21,
+        ("regression", "trait", "cast", "dynamic"),
     )
 
 

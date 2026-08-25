@@ -13,6 +13,10 @@ module.exports = grammar({
     [$.enum_pattern, $.type_annotation],
     [$.enum_pattern, $.type_annotation, $.generic_type],
     [$.type_annotation, $.generic_type],
+    [$.binary_expression, $.unary_expression, $.call_expression],
+    [$.binary_expression, $.call_expression],
+    [$._expression, $.generic_type],
+    [$._expression, $.type_annotation],
   ],
 
   rules: {
@@ -24,6 +28,7 @@ module.exports = grammar({
       $.enum_declaration,
       $.impl_block,
       $.trait_declaration,
+      $.type_alias_declaration,
       $.use_declaration,
       $.local_declaration,
       $.assignment,
@@ -81,11 +86,28 @@ module.exports = grammar({
     type_parameters: $ => seq(
       '<',
       seq(
-        $.identifier,
-        repeat(seq(',', $.identifier)),
+        $.type_parameter,
+        repeat(seq(',', $.type_parameter)),
         optional(',')
       ),
       '>'
+    ),
+
+    type_parameter: $ => seq(
+      field('name', $.identifier),
+      optional(seq(
+        ':',
+        field('bound', $.identifier),
+        repeat(seq('+', field('bound', $.identifier)))
+      ))
+    ),
+
+    type_alias_declaration: $ => seq(
+      'type',
+      field('name', $.identifier),
+      optional($.type_parameters),
+      '=',
+      field('target', $.type_annotation)
     ),
 
     // Struct declaration
@@ -128,8 +150,11 @@ module.exports = grammar({
     // Impl block
     impl_block: $ => seq(
       'impl',
-      optional(seq($.identifier, 'for')),
-      field('type', $.identifier),
+      optional($.type_parameters),
+      choice(
+        seq(field('trait', $.identifier), 'for', field('type', $.type_annotation)),
+        field('type', $.type_annotation)
+      ),
       repeat($.function_declaration),
       'end'
     ),
@@ -146,6 +171,7 @@ module.exports = grammar({
     trait_method: $ => seq(
       'function',
       field('name', $.identifier),
+      optional($.type_parameters),
       field('parameters', $.parameter_list),
       optional(seq(':', field('return_type', $.type_annotation)))
     ),
@@ -408,6 +434,7 @@ module.exports = grammar({
     // Function call
     call_expression: $ => prec(10, seq(
       field('function', $._expression),
+      optional($.type_arguments),
       field('arguments', $.argument_list)
     )),
 

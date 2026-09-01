@@ -2,25 +2,35 @@
 [
   "function"
   "local"
-  "if"
-  "then"
-  "else"
-  "elseif"
-  "end"
-  "while"
-  "do"
-  "for"
-  "return"
+  "mut"
+  "const"
+  "static"
+  "type"
+  "module"
+  "extern"
   "struct"
   "impl"
   "enum"
-  "match"
-  "case"
   "trait"
   "use"
   "as"
   "is"
+  "ref"
+  "for"
+  "in"
+  "while"
+  "do"
+  "if"
+  "then"
+  "elseif"
+  "else"
+  "match"
+  "case"
+  "return"
+  "end"
 ] @keyword
+
+(visibility) @keyword.storage
 
 ; Control flow keywords
 [
@@ -35,6 +45,7 @@
 [
   "while"
   "for"
+  "in"
   "do"
 ] @keyword.control.repeat
 
@@ -55,10 +66,19 @@
   "enum"
   "trait"
   "impl"
+  "type"
 ] @keyword.type
 
-; Storage keywords
-"local" @keyword.storage
+; Storage / visibility keywords
+[
+  "local"
+  "mut"
+  "const"
+  "static"
+  "ref"
+  "module"
+  "extern"
+] @keyword.storage
 
 ; Operators
 [
@@ -67,8 +87,10 @@
   "*"
   "/"
   "%"
+  "^"
   "=="
   "!="
+  "~="
   "<"
   "<="
   ">"
@@ -81,14 +103,17 @@
   "-="
   "*="
   "/="
-  "%="
   ".."
+  "|"
+  "&"
+  "?"
 ] @operator
 
 ; Special operators
 ":" @punctuation.delimiter
 "." @punctuation.delimiter
 "is" @keyword.operator
+"as" @keyword.operator
 
 ; Delimiters
 [
@@ -100,16 +125,37 @@
   "}"
 ] @punctuation.bracket
 
-[
-  ","
-] @punctuation.delimiter
+"," @punctuation.delimiter
 
 ; Function declarations
 (function_declaration
   name: (identifier) @function)
 
+(function_declaration
+  name: (scoped_type_identifier) @function)
+
+(method_identifier
+  receiver: (identifier) @type
+  method: (identifier) @function.method)
+
+(method_identifier
+  receiver: (scoped_type_identifier) @type
+  method: (identifier) @function.method)
+
 (trait_method
   name: (identifier) @function)
+
+(extern_function
+  name: (identifier) @function)
+
+(extern_function
+  name: (scoped_type_identifier) @function)
+
+(extern_const
+  name: (identifier) @constant)
+
+(extern_const
+  name: (scoped_type_identifier) @constant)
 
 ; Function calls
 (call_expression
@@ -119,43 +165,60 @@
 (method_call_expression
   method: (identifier) @function.method.call)
 
-; Struct declarations
+; Declarations
 (struct_declaration
   name: (identifier) @type)
 
 (struct_field
   name: (identifier) @variable.member)
 
-; Enum declarations
 (enum_declaration
   name: (identifier) @type)
 
 (enum_variant
   name: (identifier) @constructor)
 
-; Trait declarations
 (trait_declaration
   name: (identifier) @type)
-
-; Impl blocks
-(impl_block
-  trait: (identifier) @type)
-
-(impl_block
-  type: (type_annotation) @type)
 
 (type_alias_declaration
   name: (identifier) @type)
 
-; Type annotations
-(type_annotation
-  (identifier) @type)
+(const_declaration
+  name: (identifier) @constant)
 
+(static_declaration
+  name: (identifier) @constant)
+
+(module_declaration
+  name: (identifier) @module)
+
+; Type annotations
 (primitive_type) @type.builtin
+
+(generic_type
+  name: (identifier) @type)
+
+(generic_type
+  name: (scoped_type_identifier) @type)
+
+(scoped_type_identifier) @type
+
+(type_parameter
+  name: (identifier) @type.parameter)
+
+(type_parameter
+  bound: (identifier) @type)
+
+(type_parameter
+  bound: (scoped_type_identifier) @type)
 
 ; Struct expressions
 (struct_expression
   type: (identifier) @constructor)
+
+(struct_expression
+  type: (scoped_type_identifier) @constructor)
 
 (struct_field_init
   name: (identifier) @variable.member)
@@ -182,24 +245,27 @@
 (number) @number
 (string) @string
 (boolean) @boolean
-(nil) @constant.builtin
 
 ; Comments
 (comment) @comment
 
-; Type parameters
-(type_parameter
-  name: (identifier) @type.parameter)
-
-(type_parameter
-  bound: (identifier) @type)
-
 ; Pattern matching
-(pattern
-  (identifier) @variable)
+(wildcard_pattern) @variable.builtin
 
 (enum_pattern
   variant: (identifier) @constructor)
+
+(enum_pattern
+  variant: (scoped_type_identifier) @constructor)
+
+(struct_pattern
+  type: (identifier) @constructor)
+
+(struct_pattern
+  type: (scoped_type_identifier) @constructor)
+
+(struct_pattern_field
+  name: (identifier) @variable.member)
 
 ; Special identifiers
 ((identifier) @constant
@@ -211,7 +277,6 @@
   "float"
   "bool"
   "string"
-  "nil"
   "unknown"
 ] @type.builtin
 

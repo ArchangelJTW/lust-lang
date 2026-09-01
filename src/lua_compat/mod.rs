@@ -1,4 +1,8 @@
-#![allow(non_snake_case, non_camel_case_types)]
+#![allow(
+    non_snake_case,
+    non_camel_case_types,
+    clippy::not_unsafe_ptr_arg_deref
+)]
 //! Lua 5.1 C API compatibility scaffolding.
 //! This module will host the runtime bridge and tracing that drive extern stub generation.
 

@@ -1099,6 +1099,7 @@ impl Value {
         Value::enum_variant("Result", "Err", vec![error])
     }
 
+    #[allow(clippy::inherent_to_string_shadow_display, clippy::inherent_to_string)]
     pub fn to_string(&self) -> String {
         format!("{}", self)
     }

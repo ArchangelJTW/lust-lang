@@ -1,3 +1,5 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use crate::bytecode::Value;
 use crate::embed::{EmbeddedBuilder, EmbeddedProgram};
 use crate::number::{LustFloat, LustInt};

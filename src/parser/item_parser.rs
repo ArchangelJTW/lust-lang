@@ -365,12 +365,12 @@ impl Parser {
         let estimated_stmts = (remaining_tokens / 5).max(4); // Rough estimate: 5 tokens per statement
         let mut body = Vec::with_capacity(estimated_stmts);
 
+        #[cfg(feature = "esp32c6-logging")]
         let mut stmt_count = 0;
         while !self.check(TokenKind::End) && !self.is_at_end() {
-            stmt_count += 1;
-
             #[cfg(feature = "esp32c6-logging")]
             {
+                stmt_count += 1;
                 if stmt_count % 10 == 0 {
                     log::info!("    parsed {} statements", stmt_count);
                 }

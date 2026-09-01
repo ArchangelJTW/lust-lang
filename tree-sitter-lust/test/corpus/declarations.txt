@@ -1,0 +1,142 @@
+==================
+Function declaration
+==================
+
+pub function add<T: Display + Clone>(a: T, b: T): T
+    return a + b
+end
+
+---
+
+(source_file
+  (function_declaration
+    (visibility)
+    name: (identifier)
+    (type_parameters
+      (type_parameter
+        name: (identifier)
+        bound: (identifier)
+        bound: (identifier)))
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type_annotation
+          (identifier)))
+      (parameter
+        name: (identifier)
+        type: (type_annotation
+          (identifier))))
+    return_type: (type_annotation
+      (identifier))
+    (return_statement
+      (expression_list
+        (binary_expression
+          left: (identifier)
+          right: (identifier))))))
+
+==================
+Struct declaration
+==================
+
+pub struct Node
+    name: string,
+    parent: ref Node,
+    children: Array<Node>
+end
+
+---
+
+(source_file
+  (struct_declaration
+    (visibility)
+    name: (identifier)
+    (struct_field
+      name: (identifier)
+      type: (type_annotation
+        (primitive_type)))
+    (struct_field
+      name: (identifier)
+      type: (type_annotation
+        (identifier)))
+    (struct_field
+      name: (identifier)
+      type: (type_annotation
+        (generic_type
+          name: (identifier)
+          (type_annotation
+            (identifier)))))))
+
+==================
+Enum declaration
+==================
+
+pub enum Option<T>
+    Some(T),
+    None
+end
+
+---
+
+(source_file
+  (enum_declaration
+    (visibility)
+    name: (identifier)
+    (type_parameters
+      (type_parameter
+        name: (identifier)))
+    (enum_variant
+      name: (identifier)
+      (type_annotation
+        (identifier)))
+    (enum_variant
+      name: (identifier))))
+
+==================
+Trait and Impl
+==================
+
+pub trait Drawable
+    function draw(self): ()
+end
+
+impl<T> Drawable for Box<T>
+    function draw(self): ()
+        return ()
+    end
+end
+
+---
+
+(source_file
+  (trait_declaration
+    (visibility)
+    name: (identifier)
+    (trait_method
+      name: (identifier)
+      parameters: (parameter_list
+        (parameter
+          name: (identifier)))
+      return_type: (type_annotation
+        (unit_type))))
+  (impl_block
+    (type_parameters
+      (type_parameter
+        name: (identifier)))
+    trait: (type_annotation
+      (identifier))
+    type: (type_annotation
+      (generic_type
+        name: (identifier)
+        (type_annotation
+          (identifier))))
+    (function_declaration
+      name: (identifier)
+      parameters: (parameter_list
+        (parameter
+          name: (identifier)))
+      return_type: (type_annotation
+        (unit_type))
+      (return_statement
+        (expression_list
+          (literal
+            (boolean)))))))

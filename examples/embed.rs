@@ -88,14 +88,14 @@ fn main() -> lust::Result<()> {
             end)
             while true do
                 local info = task.info(job)
-                if info.state is TaskStatus.Completed then
+                if info.state is Completed then
                     return Option.Some(info.last_result:unwrap())
-                elseif info.state is TaskStatus.Failed then
+                elseif info.state is Failed then
                     println(info.error:unwrap_or("native async failure"))
                 end
-                task.yield(Option.None)
+                task.yield(Option.None<Task>())
             end
-            return Option.None
+            return Option.None<int>()
         end
 
     "#;

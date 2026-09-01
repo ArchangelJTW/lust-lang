@@ -1,6 +1,6 @@
 use super::token::{Token, TokenKind};
 use crate::error::{LustError, Result};
-use crate::intern::{Interner, Symbol};
+use crate::intern::Interner;
 use alloc::{
     format,
     string::{String, ToString},

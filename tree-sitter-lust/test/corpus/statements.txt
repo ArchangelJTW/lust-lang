@@ -1,0 +1,159 @@
+==================
+Variables and Assignments
+==================
+
+local mut x: int = 42
+local a, b = 1, 2
+x += 10
+y: string = "hello"
+
+---
+
+(source_file
+  (local_declaration
+    bindings: (binding_list
+      (binding
+        name: (identifier)
+        type: (type_annotation
+          (primitive_type))))
+    values: (expression_list
+      (literal
+        (number))))
+  (local_declaration
+    bindings: (binding_list
+      (binding
+        name: (identifier))
+      (binding
+        name: (identifier)))
+    values: (expression_list
+      (literal
+        (number))
+      (literal
+        (number))))
+  (assignment
+    target: (assignment_target
+      (identifier))
+    value: (literal
+      (number)))
+  (assignment
+    bindings: (binding_list
+      (binding
+        name: (identifier)
+        type: (type_annotation
+          (primitive_type))))
+    values: (expression_list
+      (literal
+        (string)))))
+
+==================
+Loops
+==================
+
+while x > 0 do
+    x -= 1
+end
+
+for i = 1, 10, 2 do
+    println(i)
+end
+
+for k, v in map:iter() do
+    println(k)
+end
+
+---
+
+(source_file
+  (while_statement
+    condition: (binary_expression
+      left: (identifier)
+      right: (literal
+        (number)))
+    (assignment
+      target: (assignment_target
+        (identifier))
+      value: (literal
+        (number))))
+  (for_statement
+    (for_numeric_statement
+      variable: (identifier)
+      start: (literal
+        (number))
+      end: (literal
+        (number))
+      step: (literal
+        (number))
+      (expression_statement
+        (call_expression
+          function: (identifier)
+          arguments: (argument_list
+            (identifier))))))
+  (for_statement
+    (for_in_statement
+      variables: (identifier)
+      variables: (identifier)
+      iterator: (method_call_expression
+        object: (identifier)
+        method: (identifier)
+        arguments: (argument_list))
+      (expression_statement
+        (call_expression
+          function: (identifier)
+          arguments: (argument_list
+            (identifier)))))))
+
+==================
+Pattern Matching and Is
+==================
+
+match val do
+    case Some(x) then
+        println(x)
+    case None then
+        println("empty")
+end
+
+if x is string | int then
+    println("matched")
+end
+
+---
+
+(source_file
+  (match_statement
+    value: (identifier)
+    (match_case
+      pattern: (pattern
+        (enum_pattern
+          variant: (identifier)
+          (pattern
+            (identifier))))
+      (expression_statement
+        (call_expression
+          function: (identifier)
+          arguments: (argument_list
+            (identifier)))))
+    (match_case
+      pattern: (pattern
+        (identifier))
+      (expression_statement
+        (call_expression
+          function: (identifier)
+          arguments: (argument_list
+            (literal
+              (string)))))))
+  (if_statement
+    condition: (is_expression
+      value: (identifier)
+      pattern: (type_annotation
+        (union_type
+          (type_annotation
+            (primitive_type))
+          (type_annotation
+            (primitive_type)))))
+    (expression_statement
+      (call_expression
+        function: (identifier)
+        arguments: (argument_list
+          (literal
+            (string)))))))

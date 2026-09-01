@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "lust-analyzer"
-version = "0.4.28"
+version = "0.4.29"
 dependencies = [
  "hashbrown 0.16.1",
  "lust-rs",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "lust-macros"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -767,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "lust-rs"
-version = "3.4.14"
+version = "3.4.15"
 dependencies = [
  "console_error_panic_hook",
  "dirs",

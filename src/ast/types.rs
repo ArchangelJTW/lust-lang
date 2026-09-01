@@ -5,7 +5,9 @@ use alloc::{
     vec::Vec,
 };
 use core::fmt;
-#[derive(Debug, Clone, Eq, Hash)]
+use core::hash::{Hash, Hasher};
+
+#[derive(Debug, Clone, Eq)]
 pub struct Type {
     pub kind: TypeKind,
     pub span: Span,
@@ -14,6 +16,12 @@ pub struct Type {
 impl PartialEq for Type {
     fn eq(&self, other: &Self) -> bool {
         self.kind == other.kind
+    }
+}
+
+impl Hash for Type {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.kind.hash(state);
     }
 }
 

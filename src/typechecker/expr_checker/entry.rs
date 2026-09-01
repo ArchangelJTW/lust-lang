@@ -4,7 +4,15 @@ use alloc::{boxed::Box, format, string::ToString, vec::Vec};
 use hashbrown::HashMap;
 impl TypeChecker {
     pub fn check_expr(&mut self, expr: &Expr) -> Result<Type> {
-        let mut ty = self.check_expr_with_hint(expr, None)?;
+        self.check_expr_with_hint(expr, None)
+    }
+
+    pub fn check_expr_with_hint(
+        &mut self,
+        expr: &Expr,
+        expected_type: Option<&Type>,
+    ) -> Result<Type> {
+        let mut ty = self.check_expr_internal(expr, expected_type)?;
         if ty.span.start_line == 0 && expr.span.start_line > 0 {
             ty.span = expr.span;
         }
@@ -21,7 +29,7 @@ impl TypeChecker {
         Ok(ty)
     }
 
-    pub fn check_expr_with_hint(
+    fn check_expr_internal(
         &mut self,
         expr: &Expr,
         expected_type: Option<&Type>,

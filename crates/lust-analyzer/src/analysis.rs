@@ -87,6 +87,7 @@ pub(crate) struct AnalysisSnapshot {
     modules_by_name: HashMap<String, PathBuf>,
     module_children: HashMap<String, HashSet<String>>,
     dependency_roots: HashSet<String>,
+    #[allow(dead_code)]
     project_module_roots: HashSet<String>,
     type_index: TypeIndex,
     semantic_tokens: HashMap<PathBuf, SemanticTokenData>,
@@ -342,6 +343,7 @@ impl AnalysisSnapshot {
         self.dependency_roots.contains(name)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn project_module_roots(&self) -> impl Iterator<Item = &String> {
         self.project_module_roots.iter()
     }

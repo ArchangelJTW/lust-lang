@@ -1,14 +1,15 @@
 [workspace]
 members = [".", "crates/lust-analyzer", "crates/lust-macros"]
-exclude = ["examples/rust-extension/extensions/**"]
+exclude = ["examples/rust-extension/extensions/**", "tree-sitter-lust"]
 
 [package]
 name = "lust-rs"
-version = "3.4.14"
+version = "3.4.15"
 edition = "2021"
 include = [
   "src/**",
   "include/**",
+  "examples/embed.rs",
   "build.rs",
   "Cargo.toml",
   "README.md",
@@ -79,7 +80,7 @@ hashbrown = { version = "0.16.0", default-features = false, features = [
   "equivalent",
 ] }
 libm = { version = "0.2.8", default-features = false }
-lust-macros = { path = "crates/lust-macros", version = "0.1.0", optional = true }
+lust-macros = { path = "crates/lust-macros", version = "0.1.2", optional = true }
 regex = { version = "1.11.1", optional = true }
 rand = { version = "0.8.5", optional = true }
 serde_json = { version = "1.0.128", optional = true, features = ["std"] }
@@ -89,7 +90,7 @@ object = { version = "0.36.4", default-features = false, features = [
   "read",
 ], optional = true }
 full_moon = { version = "0.18.1", optional = true }
-esp-println = { path = "/home/joshw/Desktop/Code/rs/esp-hal/esp-println", optional = true, features = [
+esp-println = { version = "0.16.1", path = "/home/joshw/Desktop/Code/rs/esp-hal/esp-println", optional = true, features = [
   "esp32c6",
   "auto",
   "log-04",

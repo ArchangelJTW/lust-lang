@@ -97,10 +97,7 @@ impl Compiler {
                                 }
                             }
 
-                            ItemKind::TypeAlias { .. }
-                            | ItemKind::Use { .. }
-                            | ItemKind::Const { .. }
-                            | ItemKind::Static { .. } => {}
+                            ItemKind::Use { .. } => {}
                             ItemKind::Module { .. } => {}
                         }
                     }
@@ -190,10 +187,7 @@ impl Compiler {
                     }
                 }
 
-                ItemKind::TypeAlias { .. }
-                | ItemKind::Use { .. }
-                | ItemKind::Const { .. }
-                | ItemKind::Static { .. } => {}
+                ItemKind::Use { .. } => {}
             }
         }
 

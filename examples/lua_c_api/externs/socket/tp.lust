@@ -268,5 +268,5 @@ pub function connect(host: LuaValue, port: LuaValue, timeout: LuaValue, create: 
     return __lua_force_array(base.setmetatable(lua.table_from_entries([("c", c)]), metat))
 end
 _M.connect = connect
-pub const tp: LuaValue = socket.tp
+local tp: LuaValue = socket.tp
 return __lua_pack([lua.to_value(_M)])

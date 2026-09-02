@@ -95,18 +95,13 @@ impl Parser {
 
             TokenKind::Ampersand => {
                 self.advance();
-                if self.match_token(&[TokenKind::Mut]) {
-                    TypeKind::MutRef(Box::new(self.parse_type()?))
-                } else {
-                    TypeKind::Ref(Box::new(self.parse_type()?))
-                }
+                TypeKind::Ref(Box::new(self.parse_type()?))
             }
 
             TokenKind::Star => {
                 self.advance();
-                let mutable = self.match_token(&[TokenKind::Mut]);
                 TypeKind::Pointer {
-                    mutable,
+                    mutable: true,
                     pointee: Box::new(self.parse_type()?),
                 }
             }

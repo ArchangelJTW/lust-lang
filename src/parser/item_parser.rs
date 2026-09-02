@@ -61,55 +61,6 @@ impl Parser {
                 ItemKind::Impl(impl_block)
             }
 
-            TokenKind::Type => {
-                self.advance();
-                let name = self.expect_identifier()?;
-                let type_params = if self.match_token(&[TokenKind::Less]) {
-                    let mut params = vec![self.expect_identifier()?];
-                    while self.match_token(&[TokenKind::Comma]) {
-                        params.push(self.expect_identifier()?);
-                    }
-
-                    self.consume(TokenKind::Greater, "Expected '>' after type parameters")?;
-                    params
-                } else {
-                    vec![]
-                };
-                self.consume(TokenKind::Equal, "Expected '=' after type alias name")?;
-                let target = self.parse_type()?;
-                ItemKind::TypeAlias {
-                    name,
-                    type_params,
-                    target,
-                }
-            }
-
-            TokenKind::Const => {
-                self.advance();
-                let name = self.expect_identifier()?;
-                self.consume(TokenKind::Colon, "Expected ':' after const name")?;
-                let ty = self.parse_type()?;
-                self.consume(TokenKind::Equal, "Expected '=' after const type")?;
-                let value = self.parse_expr()?;
-                ItemKind::Const { name, ty, value }
-            }
-
-            TokenKind::Static => {
-                self.advance();
-                let mutable = self.match_token(&[TokenKind::Mut]);
-                let name = self.expect_identifier()?;
-                self.consume(TokenKind::Colon, "Expected ':' after static name")?;
-                let ty = self.parse_type()?;
-                self.consume(TokenKind::Equal, "Expected '=' after static type")?;
-                let value = self.parse_expr()?;
-                ItemKind::Static {
-                    name,
-                    mutable,
-                    ty,
-                    value,
-                }
-            }
-
             TokenKind::Use => {
                 self.advance();
                 let mut path = vec![self.expect_identifier()?];
@@ -261,7 +212,7 @@ impl Parser {
                             });
                         }
 
-                        TokenKind::Const => {
+                        TokenKind::Identifier if self.current_token().lexeme == "const" => {
                             self.advance();
                             let mut name = self.expect_identifier()?;
                             while self.check(TokenKind::Dot) {

@@ -472,12 +472,12 @@ _M.get = __lua_first(lua.socket_protect(function(gett: LuaValue): Array<LuaValue
         return __lua_force_array(tget(gett))
     end
 end))
-pub const PASSWORD: LuaValue = _M.PASSWORD
+local PASSWORD: LuaValue = _M.PASSWORD
 pub function command(cmdt: LuaValue): Array<LuaValue>
     return _M.command(cmdt)
 end
-pub const ftp: LuaValue = socket.ftp
-pub const genericform: LuaValue = _M.genericform
+local ftp: LuaValue = socket.ftp
+local genericform: LuaValue = _M.genericform
 pub function get(gett: LuaValue): Array<LuaValue>
     return _M.get(gett)
 end

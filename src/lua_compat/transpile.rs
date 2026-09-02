@@ -14,7 +14,6 @@ fn is_keyword(name: &str) -> bool {
     matches!(
         name.trim(),
         "local"
-            | "mut"
             | "function"
             | "return"
             | "if"
@@ -46,9 +45,6 @@ fn is_keyword(name: &str) -> bool {
             | "pub"
             | "use"
             | "module"
-            | "const"
-            | "static"
-            | "type"
     )
 }
 
@@ -639,7 +635,7 @@ impl Emitter {
                     export_lines.push("end".to_string());
                 }
                 if !has_wrapper {
-                    export_lines.push(format!("pub const {name}: LuaValue = {path}"));
+                    export_lines.push(format!("local {name}: LuaValue = {path}"));
                 }
             }
             self.export_bindings.clear();
@@ -887,7 +883,7 @@ impl Emitter {
                 for (name, expr) in exports {
                     if self.analyzer.exports.contains(&name) {
                         self.push_line(format!(
-                            "pub const {name}: LuaValue = lua.to_value({expr})"
+                            "local {name}: LuaValue = lua.to_value({expr})"
                         ));
                         self.exported.push(name.clone());
                     }
@@ -1821,7 +1817,6 @@ impl Emitter {
         matches!(
             name.trim(),
             "local"
-                | "mut"
                 | "function"
                 | "return"
                 | "if"
@@ -1853,9 +1848,6 @@ impl Emitter {
                 | "pub"
                 | "use"
                 | "module"
-                | "const"
-                | "static"
-                | "type"
         )
     }
 

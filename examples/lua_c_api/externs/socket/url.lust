@@ -385,5 +385,5 @@ pub function build_path(parsed: LuaValue, unsafe_: LuaValue): Array<LuaValue>
     return __lua_pack([lua.to_value(path)])
 end
 _M.build_path = build_path
-pub const url: LuaValue = socket.url
+local url: LuaValue = socket.url
 return __lua_pack([lua.to_value(_M)])

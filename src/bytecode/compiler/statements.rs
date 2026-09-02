@@ -5,7 +5,6 @@ impl Compiler {
         match &stmt.kind {
             StmtKind::Local {
                 bindings,
-                mutable,
                 initializer,
             } => {
                 let mut binding_regs = Vec::new();
@@ -52,7 +51,7 @@ impl Compiler {
 
                 if let Some(scope) = self.scopes.last_mut() {
                     for (name, reg) in &binding_regs {
-                        scope.locals.insert(name.clone(), (*reg, *mutable));
+                        scope.locals.insert(name.clone(), (*reg, false));
                     }
                 }
 

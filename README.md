@@ -137,12 +137,10 @@ same type. Explicit arguments use `function_name<Type>(...)` or
 The `<` must directly follow the function name; spaced `a < b` remains a
 comparison.
 
-Generic aliases, structs, enums, functions, instance methods, and universal
+Generic structs, enums, functions, instance methods, and universal
 impls are supported:
 
 ```lust
-type Pair<Item> = (Item, Item)
-
 struct Box<Item>
     value: Item
 end
@@ -183,8 +181,7 @@ Runtime erasure deliberately imposes several current restrictions:
 - Conditional impls such as `impl<Item: Trait> Box<Item>` are rejected.
 - Specialized impls such as `impl Box<int>` are rejected; use one universal
   `impl<Item> Box<Item>`.
-- Generic static methods and impls through type aliases are rejected.
-- `is` and `as` cannot target an erased type parameter or a type alias.
+- `is` and `as` cannot target an erased type parameter.
 - Generic arguments cannot be revalidated at a raw VM/native boundary because
   values retain their erased nominal runtime type. Validate them in typed Lust
   code or in the embedding conversion layer.

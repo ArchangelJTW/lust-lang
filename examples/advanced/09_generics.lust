@@ -1,9 +1,7 @@
 -- Generics are statically checked and runtime-erased. Type arguments are
 -- normally inferred, but can be supplied explicitly when inference has no input.
 
-type Items<Element> = Array<Element>
-
-function first<Element>(values: Items<Element>): Element
+function first<Element>(values: Array<Element>): Element
     return values[0]:unwrap()
 end
 
@@ -26,7 +24,7 @@ enum Message<Payload>
     Empty
 end
 
-local numbers: Items<int> = [10, 20, 30]
+local numbers: Array<int> = [10, 20, 30]
 local number_box: Box<int> = Box { value = first(numbers) }
 local message: Message<string> = Message.Data("hello")
 

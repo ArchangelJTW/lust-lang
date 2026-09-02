@@ -51,7 +51,6 @@ pub enum TokenKind {
     False,
     Identifier,
     Local,
-    Mut,
     Function,
     Return,
     If,
@@ -78,9 +77,6 @@ pub enum TokenKind {
     Pub,
     Use,
     Module,
-    Const,
-    Static,
-    Type,
     Plus,
     Minus,
     Star,
@@ -135,7 +131,6 @@ impl fmt::Display for TokenKind {
             TokenKind::False => write!(f, "false"),
             TokenKind::Identifier => write!(f, "identifier"),
             TokenKind::Local => write!(f, "local"),
-            TokenKind::Mut => write!(f, "mut"),
             TokenKind::Function => write!(f, "function"),
             TokenKind::Return => write!(f, "return"),
             TokenKind::If => write!(f, "if"),
@@ -162,9 +157,6 @@ impl fmt::Display for TokenKind {
             TokenKind::Pub => write!(f, "pub"),
             TokenKind::Use => write!(f, "use"),
             TokenKind::Module => write!(f, "module"),
-            TokenKind::Const => write!(f, "const"),
-            TokenKind::Static => write!(f, "static"),
-            TokenKind::Type => write!(f, "type"),
             TokenKind::Plus => write!(f, "+"),
             TokenKind::Minus => write!(f, "-"),
             TokenKind::Star => write!(f, "*"),
@@ -215,7 +207,6 @@ impl TokenKind {
     pub fn keyword(s: &str) -> Option<TokenKind> {
         match s {
             "local" => Some(TokenKind::Local),
-            "mut" => Some(TokenKind::Mut),
             "function" => Some(TokenKind::Function),
             "return" => Some(TokenKind::Return),
             "if" => Some(TokenKind::If),
@@ -247,9 +238,6 @@ impl TokenKind {
             "pub" => Some(TokenKind::Pub),
             "use" => Some(TokenKind::Use),
             "module" => Some(TokenKind::Module),
-            "const" => Some(TokenKind::Const),
-            "static" => Some(TokenKind::Static),
-            "type" => Some(TokenKind::Type),
             _ => None,
         }
     }

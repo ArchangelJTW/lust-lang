@@ -472,9 +472,9 @@ pub function pump_all(src: LuaValue, snk: LuaValue, step: LuaValue): Array<LuaVa
     end
 end
 pump.all = pump_all
-pub const _VERSION: LuaValue = _M._VERSION
-pub const filter: LuaValue = _M.filter
-pub const pump: LuaValue = _M.pump
-pub const sink: LuaValue = _M.sink
-pub const source: LuaValue = _M.source
+local _VERSION: LuaValue = _M._VERSION
+local filter: LuaValue = _M.filter
+local pump: LuaValue = _M.pump
+local sink: LuaValue = _M.sink
+local source: LuaValue = _M.source
 return __lua_pack([lua.to_value(_M)])

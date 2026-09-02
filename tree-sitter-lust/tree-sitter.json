@@ -8,6 +8,9 @@
       "file-types": [
         "lust"
       ],
+      "highlights": [
+        "queries/highlights.scm"
+      ],
       "injection-regex": "lust"
     }
   ],

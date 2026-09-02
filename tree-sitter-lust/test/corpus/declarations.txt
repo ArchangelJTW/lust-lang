@@ -101,7 +101,7 @@ end
 
 impl<T> Drawable for Box<T>
     function draw(self): ()
-        return ()
+        return true
     end
 end
 

@@ -126,6 +126,13 @@
 (function_declaration
   name: (scoped_type_identifier) @function)
 
+(impl_block
+  "for" @keyword.type)
+
+(impl_block
+  (function_declaration
+    name: (identifier) @function.method))
+
 (method_identifier
   receiver: (identifier) @type
   method: (identifier) @function.method)
@@ -135,7 +142,7 @@
   method: (identifier) @function.method)
 
 (trait_method
-  name: (identifier) @function)
+  name: (identifier) @function.method)
 
 (extern_function
   name: (identifier) @function)
@@ -173,17 +180,14 @@
 (trait_declaration
   name: (identifier) @type)
 
-(const_declaration
-  name: (identifier) @constant)
-
-(static_declaration
-  name: (identifier) @constant)
-
 (module_declaration
   name: (identifier) @module)
 
 ; Type annotations
 (primitive_type) @type.builtin
+
+(type_annotation
+  (identifier) @type)
 
 (generic_type
   name: (identifier) @type)
@@ -256,7 +260,15 @@
 (struct_pattern_field
   name: (identifier) @variable.member)
 
-; Special identifiers
+; Built-in variables
+((identifier) @variable.builtin
+ (#eq? @variable.builtin "self"))
+
+; Type naming convention (PascalCase)
+((identifier) @type
+ (#match? @type "^[A-Z][a-zA-Z0-9_]*$"))
+
+; Special identifiers (ALL_CAPS constants)
 ((identifier) @constant
  (#match? @constant "^[A-Z][A-Z0-9_]*$"))
 

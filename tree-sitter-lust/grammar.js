@@ -42,9 +42,6 @@ module.exports = grammar({
       $.enum_declaration,
       $.impl_block,
       $.trait_declaration,
-      $.type_alias_declaration,
-      $.const_declaration,
-      $.static_declaration,
       $.module_declaration,
       $.extern_declaration,
       $.use_declaration,
@@ -138,36 +135,6 @@ module.exports = grammar({
         field('bound', choice($.identifier, $.scoped_type_identifier, $.primitive_type)),
         repeat(seq('+', field('bound', choice($.identifier, $.scoped_type_identifier, $.primitive_type))))
       ))
-    ),
-
-    type_alias_declaration: $ => seq(
-      optional($.visibility),
-      'type',
-      field('name', $.identifier),
-      optional($.type_parameters),
-      '=',
-      field('target', $.type_annotation)
-    ),
-
-    const_declaration: $ => seq(
-      optional($.visibility),
-      'const',
-      field('name', choice($.identifier, $.scoped_type_identifier, $.primitive_type)),
-      ':',
-      field('type', $.type_annotation),
-      '=',
-      field('value', $._expression)
-    ),
-
-    static_declaration: $ => seq(
-      optional($.visibility),
-      'static',
-      optional('mut'),
-      field('name', choice($.identifier, $.scoped_type_identifier, $.primitive_type)),
-      ':',
-      field('type', $.type_annotation),
-      '=',
-      field('value', $._expression)
     ),
 
     module_declaration: $ => seq(
@@ -352,7 +319,6 @@ module.exports = grammar({
     // Local variable declaration
     local_declaration: $ => seq(
       'local',
-      optional('mut'),
       field('bindings', $.binding_list),
       optional(seq('=', field('values', $.expression_list)))
     ),
@@ -787,13 +753,11 @@ module.exports = grammar({
 
     ref_type: $ => seq(
       '&',
-      optional('mut'),
       field('type', $.type_annotation)
     ),
 
     pointer_type: $ => seq(
       '*',
-      optional('mut'),
       field('type', $.type_annotation)
     ),
 

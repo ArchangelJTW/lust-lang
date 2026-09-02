@@ -371,30 +371,6 @@ pub(crate) fn identifier_completions(
                 );
             }
 
-            ItemKind::TypeAlias { name, .. } => {
-                push_item(
-                    name.clone(),
-                    CompletionItemKind::CLASS,
-                    Some("type alias".to_string()),
-                );
-            }
-
-            ItemKind::Const { name, .. } => {
-                push_item(
-                    name.clone(),
-                    CompletionItemKind::CONSTANT,
-                    Some("const".to_string()),
-                );
-            }
-
-            ItemKind::Static { name, .. } => {
-                push_item(
-                    name.clone(),
-                    CompletionItemKind::VARIABLE,
-                    Some("static".to_string()),
-                );
-            }
-
             ItemKind::Module { name, .. } => {
                 push_item(
                     name.clone(),

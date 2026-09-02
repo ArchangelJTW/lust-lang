@@ -26,18 +26,6 @@ impl TypeChecker {
             ItemKind::Enum(def) => self.check_enum_definition(def),
             ItemKind::Trait(def) => self.check_trait_definition(def),
             ItemKind::Impl(impl_block) => self.check_impl(impl_block),
-            ItemKind::TypeAlias {
-                name,
-                type_params,
-                target,
-            } => {
-                self.validate_type_alias_cycle(&self.resolve_type_key(name))?;
-                self.push_type_params(type_params)?;
-                let canonical = self.canonicalize_type(target);
-                self.validate_type(&canonical)?;
-                self.pop_type_params();
-                Ok(())
-            }
             ItemKind::Module { items, .. } => {
                 for item in items {
                     self.check_item(item)?;
@@ -47,10 +35,6 @@ impl TypeChecker {
             }
 
             ItemKind::Use { .. } => Ok(()),
-            ItemKind::Const { name, ty, value } => self.check_const(name, ty, value),
-            ItemKind::Static {
-                name, ty, value, ..
-            } => self.check_static(name, ty, value),
             ItemKind::Extern { items, .. } => self.check_extern(items),
         }
     }
@@ -219,19 +203,6 @@ impl TypeChecker {
 
     fn check_impl(&mut self, impl_block: &ImplBlock) -> Result<()> {
         self.push_type_params(&impl_block.type_params)?;
-        let raw_target_name = match &impl_block.target_type.kind {
-            TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => Some(name),
-            _ => None,
-        };
-        if raw_target_name.is_some_and(|name| {
-            self.env
-                .lookup_type_alias(&self.resolve_type_key(name))
-                .is_some()
-        }) {
-            return Err(self.type_error(
-                "Impl targets cannot be type aliases; use the underlying nominal type".to_string(),
-            ));
-        }
         self.validate_trait_bounds(&impl_block.type_params, &impl_block.where_clause)?;
         if !impl_block.where_clause.is_empty() {
             return Err(self.type_error(
@@ -443,24 +414,6 @@ impl TypeChecker {
 
         self.current_trait_bounds = previous_impl_bounds;
         self.pop_type_params();
-        Ok(())
-    }
-
-    fn check_const(&mut self, name: &str, ty: &Type, value: &Expr) -> Result<()> {
-        let ty = self.canonicalize_type(ty);
-        self.validate_type(&ty)?;
-        let value_type = self.check_expr(value)?;
-        self.unify(&ty, &value_type)?;
-        self.env.declare_variable(name.to_string(), ty)?;
-        Ok(())
-    }
-
-    fn check_static(&mut self, name: &str, ty: &Type, value: &Expr) -> Result<()> {
-        let ty = self.canonicalize_type(ty);
-        self.validate_type(&ty)?;
-        let value_type = self.check_expr(value)?;
-        self.unify(&ty, &value_type)?;
-        self.env.declare_variable(name.to_string(), ty)?;
         Ok(())
     }
 

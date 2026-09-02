@@ -155,9 +155,9 @@ pub function stuff(): Array<LuaValue>
     return __lua_force_array(ltn12.filter.cycle(_M.dot, lua.to_value(2)))
 end
 _M.stuff = stuff
-pub const decode: LuaValue = _M.decode
-pub const decodet: LuaValue = _M.decodet
-pub const encodet: LuaValue = _M.encodet
-pub const wrap: LuaValue = _M.wrap
-pub const wrapt: LuaValue = _M.wrapt
+local decode: LuaValue = _M.decode
+local decodet: LuaValue = _M.decodet
+local encodet: LuaValue = _M.encodet
+local wrap: LuaValue = _M.wrap
+local wrapt: LuaValue = _M.wrapt
 return __lua_pack([lua.to_value(_M)])

@@ -562,10 +562,10 @@ _M.request = __lua_first(lua.socket_protect(function(reqt: LuaValue, body: LuaVa
     end
 end))
 _M.schemes = SCHEMES
-pub const genericform: LuaValue = _M.genericform
-pub const http: LuaValue = socket.http
+local genericform: LuaValue = _M.genericform
+local http: LuaValue = socket.http
 pub function request(reqt: LuaValue, body: LuaValue): Array<LuaValue>
     return _M.request(reqt, body)
 end
-pub const schemes: LuaValue = _M.schemes
+local schemes: LuaValue = _M.schemes
 return __lua_pack([lua.to_value(_M)])

@@ -311,10 +311,10 @@ sourcet[lua.to_value("until-closed")] = function(sock: LuaValue): Array<LuaValue
 end
 sourcet[lua.to_value("default")] = sourcet[lua.to_value("until-closed")]
 _M.source = __lua_first(_M.choose(sourcet))
-pub const BLOCKSIZE: LuaValue = _M.BLOCKSIZE
-pub const sink: LuaValue = _M.sink
-pub const sinkt: LuaValue = _M.sinkt
-pub const source: LuaValue = _M.source
-pub const sourcet: LuaValue = _M.sourcet
-pub const try: LuaValue = _M.try
+local BLOCKSIZE: LuaValue = _M.BLOCKSIZE
+local sink: LuaValue = _M.sink
+local sinkt: LuaValue = _M.sinkt
+local source: LuaValue = _M.source
+local sourcet: LuaValue = _M.sourcet
+local try: LuaValue = _M.try
 return __lua_pack([lua.to_value(_M)])

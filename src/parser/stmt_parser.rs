@@ -21,7 +21,6 @@ impl Parser {
         let kind = match self.peek_kind() {
             TokenKind::Local => {
                 self.advance();
-                let mutable = self.match_token(&[TokenKind::Mut]);
                 let mut bindings = Vec::new();
                 loop {
                     let name_token = self.current_token().clone();
@@ -48,7 +47,6 @@ impl Parser {
                     None
                 };
                 StmtKind::Local {
-                    mutable,
                     bindings,
                     initializer,
                 }
@@ -310,7 +308,6 @@ impl Parser {
         let initializer = self.parse_expr_list()?;
         Ok(Some(StmtKind::Local {
             bindings,
-            mutable: false,
             initializer: Some(initializer),
         }))
     }

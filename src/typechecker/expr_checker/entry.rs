@@ -117,17 +117,6 @@ impl TypeChecker {
             } => self.check_lambda(params, return_type.as_ref(), body),
             ExprKind::Cast { expr, target_type } => {
                 let _expr_type = self.check_expr(expr)?;
-                if let TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } =
-                    &target_type.kind
-                {
-                    let resolved = self.resolve_type_key(name);
-                    if self.env.lookup_type_alias(&resolved).is_some() {
-                        return Err(self.type_error_at(
-                            "Casts through type aliases are not supported yet".to_string(),
-                            target_type.span,
-                        ));
-                    }
-                }
                 let target_type = self.canonicalize_type(target_type);
                 self.validate_type(&target_type)?;
                 if matches!(target_type.kind, TypeKind::Generic(_)) {
@@ -154,17 +143,6 @@ impl TypeChecker {
                         || (looks_like_variant && matches!(expr_type.kind, TypeKind::Unknown))
                     {
                         return Ok(Type::new(TypeKind::Bool, Self::dummy_span()));
-                    }
-                }
-                if let TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } =
-                    &check_type.kind
-                {
-                    let resolved = self.resolve_type_key(name);
-                    if self.env.lookup_type_alias(&resolved).is_some() {
-                        return Err(self.type_error_at(
-                            "Type tests through aliases are not supported yet".to_string(),
-                            check_type.span,
-                        ));
                     }
                 }
                 let check_type = self.canonicalize_type(check_type);

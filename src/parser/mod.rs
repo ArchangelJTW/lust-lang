@@ -120,9 +120,6 @@ impl Parser {
             | TokenKind::Enum
             | TokenKind::Trait
             | TokenKind::Impl
-            | TokenKind::Type
-            | TokenKind::Const
-            | TokenKind::Static
             | TokenKind::Use
             | TokenKind::Module
             | TokenKind::Extern => true,
@@ -134,9 +131,6 @@ impl Parser {
                         | TokenKind::Enum
                         | TokenKind::Trait
                         | TokenKind::Impl
-                        | TokenKind::Type
-                        | TokenKind::Const
-                        | TokenKind::Static
                         | TokenKind::Use
                         | TokenKind::Module
                         | TokenKind::Extern
@@ -204,7 +198,7 @@ impl Parser {
     }
 
     fn expect_identifier(&mut self) -> Result<String> {
-        if self.check(TokenKind::Identifier) || self.check(TokenKind::Type) {
+        if self.check(TokenKind::Identifier) {
             // Avoid cloning the token - just take the lexeme directly
             let lexeme = self.current_token().lexeme.clone();
             self.advance();

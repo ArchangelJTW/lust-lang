@@ -228,18 +228,6 @@ fn collect_tokens_from_item(
             }
         }
 
-        ItemKind::TypeAlias { target, .. } => {
-            collect_tokens_from_type(target, text, line_offsets, tokens, seen);
-        }
-
-        ItemKind::Const { ty, .. } => {
-            collect_tokens_from_type(ty, text, line_offsets, tokens, seen);
-        }
-
-        ItemKind::Static { ty, .. } => {
-            collect_tokens_from_type(ty, text, line_offsets, tokens, seen);
-        }
-
         ItemKind::Module { items, .. } => {
             collect_tokens_from_items(items, text, line_offsets, tokens, seen);
         }

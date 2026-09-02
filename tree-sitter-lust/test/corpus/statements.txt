@@ -2,7 +2,7 @@
 Variables and Assignments
 ==================
 
-local mut x: int = 42
+local x: int = 42
 local a, b = 1, 2
 x += 10
 y: string = "hello"

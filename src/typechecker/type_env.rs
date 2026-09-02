@@ -21,7 +21,6 @@ pub struct TypeEnv {
     structs: HashMap<String, StructDef>,
     enums: HashMap<String, EnumDef>,
     traits: HashMap<String, TraitDef>,
-    type_aliases: HashMap<String, (Vec<String>, Type)>,
     impls: Vec<ImplBlock>,
     builtin_types: HashSet<String>,
     constants: HashMap<String, Type>,
@@ -69,7 +68,6 @@ impl TypeEnv {
             structs: HashMap::new(),
             enums: HashMap::new(),
             traits: HashMap::new(),
-            type_aliases: HashMap::new(),
             impls: Vec::new(),
             builtin_types: HashSet::new(),
             constants: HashMap::new(),
@@ -718,26 +716,6 @@ impl TypeEnv {
 
     pub fn lookup_trait(&self, name: &str) -> Option<&TraitDef> {
         self.traits.get(name)
-    }
-
-    pub fn register_type_alias(
-        &mut self,
-        name: String,
-        type_params: Vec<String>,
-        target: Type,
-    ) -> Result<()> {
-        if self.type_aliases.contains_key(&name) {
-            return Err(LustError::TypeError {
-                message: format!("Type alias '{}' is already defined", name),
-            });
-        }
-
-        self.type_aliases.insert(name, (type_params, target));
-        Ok(())
-    }
-
-    pub fn lookup_type_alias(&self, name: &str) -> Option<&(Vec<String>, Type)> {
-        self.type_aliases.get(name)
     }
 
     pub fn register_impl(&mut self, impl_block: &ImplBlock) -> Result<()> {

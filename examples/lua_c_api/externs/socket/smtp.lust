@@ -338,5 +338,5 @@ _M.send = __lua_first(lua.socket_protect(function(mailt: LuaValue): Array<LuaVal
     __lua_first(__lua_first(lua.call_method(s, "quit")))
     return __lua_force_array(__lua_first(lua.call_method(s, "close")))
 end))
-pub const smtp: LuaValue = socket.smtp
+local smtp: LuaValue = socket.smtp
 return __lua_pack([lua.to_value(_M)])

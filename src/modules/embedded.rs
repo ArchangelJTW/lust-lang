@@ -198,9 +198,6 @@ fn collect_dependencies(module: &LoadedModule, module_names: &HashSet<String>) -
                     collect_deps_from_lua_require_stmt(stmt, &mut deps);
                 }
             }
-            ItemKind::Const { value, .. } | ItemKind::Static { value, .. } => {
-                collect_deps_from_lua_require_expr(value, &mut deps);
-            }
             ItemKind::Impl(impl_block) => {
                 for method in &impl_block.methods {
                     for stmt in &method.body {

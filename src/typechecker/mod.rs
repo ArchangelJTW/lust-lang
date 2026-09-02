@@ -449,13 +449,11 @@ impl TypeChecker {
                     for stmt in &func.body {
                         if let StmtKind::Local {
                             bindings,
-                            ref mutable,
                             initializer,
                         } = &stmt.kind
                         {
                             self.check_local_stmt(
                                 bindings.as_slice(),
-                                *mutable,
                                 initializer.as_ref().map(|values| values.as_slice()),
                             )?;
                         }
@@ -869,27 +867,6 @@ impl TypeChecker {
                 self.env.register_trait(&t2)?;
             }
 
-            ItemKind::TypeAlias {
-                name,
-                type_params,
-                target,
-            } => {
-                let qname = if let Some(module) = &self.current_module {
-                    if name.contains('.') {
-                        name.clone()
-                    } else {
-                        format!("{}.{}", module, name)
-                    }
-                } else {
-                    name.clone()
-                };
-                self.push_type_params(type_params)?;
-                let canonical_target = self.canonicalize_type(target);
-                self.pop_type_params();
-                self.env
-                    .register_type_alias(qname, type_params.clone(), canonical_target)?;
-            }
-
             ItemKind::Extern { items, .. } => {
                 for ext in items {
                     match ext {
@@ -976,11 +953,6 @@ impl TypeChecker {
     }
 
     pub fn canonicalize_type(&self, ty: &Type) -> Type {
-        let mut expanding_aliases = HashSet::new();
-        self.canonicalize_type_inner(ty, &mut expanding_aliases)
-    }
-
-    fn canonicalize_type_inner(&self, ty: &Type, expanding_aliases: &mut HashSet<String>) -> Type {
         use crate::ast::TypeKind as TK;
         match &ty.kind {
             TK::Named(name) if !name.contains('.') && self.is_type_param_in_scope(name) => {
@@ -988,33 +960,17 @@ impl TypeChecker {
             }
             TK::Named(name) => {
                 let resolved = self.resolve_type_key(name);
-                if let Some((params, target)) = self.env.lookup_type_alias(&resolved) {
-                    if params.is_empty() && expanding_aliases.insert(resolved.clone()) {
-                        let expanded = self.canonicalize_type_inner(target, expanding_aliases);
-                        expanding_aliases.remove(&resolved);
-                        return expanded;
-                    }
-                }
                 if self.env.lookup_trait(&resolved).is_some() {
                     Type::new(TK::Trait(resolved), ty.span)
                 } else {
                     Type::new(TK::Named(resolved), ty.span)
                 }
             }
-            TK::Array(inner) => Type::new(
-                TK::Array(Box::new(
-                    self.canonicalize_type_inner(inner, expanding_aliases),
-                )),
-                ty.span,
-            ),
-
+            TK::Array(inner) => {
+                Type::new(TK::Array(Box::new(self.canonicalize_type(inner))), ty.span)
+            }
             TK::Tuple(elements) => Type::new(
-                TK::Tuple(
-                    elements
-                        .iter()
-                        .map(|t| self.canonicalize_type_inner(t, expanding_aliases))
-                        .collect(),
-                ),
+                TK::Tuple(elements.iter().map(|t| self.canonicalize_type(t)).collect()),
                 ty.span,
             ),
             TK::Function {
@@ -1024,73 +980,46 @@ impl TypeChecker {
                 TK::Function {
                     params: params
                         .iter()
-                        .map(|param| self.canonicalize_type_inner(param, expanding_aliases))
+                        .map(|param| self.canonicalize_type(param))
                         .collect(),
-                    return_type: Box::new(
-                        self.canonicalize_type_inner(return_type, expanding_aliases),
-                    ),
+                    return_type: Box::new(self.canonicalize_type(return_type)),
                 },
                 ty.span,
             ),
-            TK::Option(inner) => Type::new(
-                TK::Option(Box::new(
-                    self.canonicalize_type_inner(inner, expanding_aliases),
-                )),
-                ty.span,
-            ),
-
+            TK::Option(inner) => {
+                Type::new(TK::Option(Box::new(self.canonicalize_type(inner))), ty.span)
+            }
             TK::Result(ok, err) => Type::new(
                 TK::Result(
-                    Box::new(self.canonicalize_type_inner(ok, expanding_aliases)),
-                    Box::new(self.canonicalize_type_inner(err, expanding_aliases)),
+                    Box::new(self.canonicalize_type(ok)),
+                    Box::new(self.canonicalize_type(err)),
                 ),
                 ty.span,
             ),
             TK::Map(k, v) => Type::new(
                 TK::Map(
-                    Box::new(self.canonicalize_type_inner(k, expanding_aliases)),
-                    Box::new(self.canonicalize_type_inner(v, expanding_aliases)),
+                    Box::new(self.canonicalize_type(k)),
+                    Box::new(self.canonicalize_type(v)),
                 ),
                 ty.span,
             ),
-            TK::Ref(inner) => Type::new(
-                TK::Ref(Box::new(
-                    self.canonicalize_type_inner(inner, expanding_aliases),
-                )),
-                ty.span,
-            ),
-            TK::MutRef(inner) => Type::new(
-                TK::MutRef(Box::new(
-                    self.canonicalize_type_inner(inner, expanding_aliases),
-                )),
-                ty.span,
-            ),
-
+            TK::Ref(inner) => {
+                Type::new(TK::Ref(Box::new(self.canonicalize_type(inner))), ty.span)
+            }
+            TK::MutRef(inner) => {
+                Type::new(TK::MutRef(Box::new(self.canonicalize_type(inner))), ty.span)
+            }
             TK::Pointer { mutable, pointee } => Type::new(
                 TK::Pointer {
                     mutable: *mutable,
-                    pointee: Box::new(self.canonicalize_type_inner(pointee, expanding_aliases)),
+                    pointee: Box::new(self.canonicalize_type(pointee)),
                 },
                 ty.span,
             ),
             TK::GenericInstance { name, type_args } => {
                 let resolved = self.resolve_type_key(name);
-                let canonical_args: Vec<Type> = type_args
-                    .iter()
-                    .map(|arg| self.canonicalize_type_inner(arg, expanding_aliases))
-                    .collect();
-                if let Some((params, target)) = self.env.lookup_type_alias(&resolved) {
-                    if params.len() == canonical_args.len()
-                        && expanding_aliases.insert(resolved.clone())
-                    {
-                        let bindings = params.iter().cloned().zip(canonical_args).collect();
-                        let substituted = self.substitute_type(target, &bindings);
-                        let expanded =
-                            self.canonicalize_type_inner(&substituted, expanding_aliases);
-                        expanding_aliases.remove(&resolved);
-                        return expanded;
-                    }
-                }
+                let canonical_args: Vec<Type> =
+                    type_args.iter().map(|arg| self.canonicalize_type(arg)).collect();
                 Type::new(
                     TK::GenericInstance {
                         name: resolved,
@@ -1100,12 +1029,7 @@ impl TypeChecker {
                 )
             }
             TK::Union(types) => Type::new(
-                TK::Union(
-                    types
-                        .iter()
-                        .map(|ty| self.canonicalize_type_inner(ty, expanding_aliases))
-                        .collect(),
-                ),
+                TK::Union(types.iter().map(|ty| self.canonicalize_type(ty)).collect()),
                 ty.span,
             ),
             TK::Trait(name) => Type::new(TK::Trait(self.resolve_type_key(name)), ty.span),
@@ -1242,11 +1166,6 @@ impl TypeChecker {
                     .lookup_struct(name)
                     .map(|def| def.type_params.len())
                     .or_else(|| self.env.lookup_enum(name).map(|def| def.type_params.len()))
-                    .or_else(|| {
-                        self.env
-                            .lookup_type_alias(name)
-                            .map(|(params, _)| params.len())
-                    })
                     .unwrap_or(0);
                 if generic_arity > 0 {
                     return Err(self.type_error_at(
@@ -1259,7 +1178,6 @@ impl TypeChecker {
                 }
                 if self.env.lookup_struct(name).is_none()
                     && self.env.lookup_enum(name).is_none()
-                    && self.env.lookup_type_alias(name).is_none()
                     && !self.env.is_builtin_type(name)
                 {
                     return Err(self.type_error_at(format!("Undefined type '{}'", name), ty.span));
@@ -1305,11 +1223,9 @@ impl TypeChecker {
                         def.type_params.len(),
                         Some((&def.type_params, &def.trait_bounds)),
                     )
-                } else if let Some((params, _)) = self.env.lookup_type_alias(name) {
-                    (params.len(), None)
                 } else {
                     return Err(
-                        self.type_error_at(format!("Undefined generic type '{}'", name), ty.span)
+                        self.type_error_at(format!("Undefined generic type '{}'", name), ty.span),
                     );
                 };
                 if arity != type_args.len() {
@@ -1377,68 +1293,6 @@ impl TypeChecker {
                     )));
                 }
             }
-        }
-        Ok(())
-    }
-
-    fn validate_type_alias_cycle(&self, name: &str) -> Result<()> {
-        fn visit_type(checker: &TypeChecker, ty: &Type, visiting: &mut HashSet<String>) -> bool {
-            match &ty.kind {
-                TypeKind::Named(name) | TypeKind::GenericInstance { name, .. }
-                    if checker.env.lookup_type_alias(name).is_some() =>
-                {
-                    if !visiting.insert(name.clone()) {
-                        return true;
-                    }
-                    let (_, target) = checker.env.lookup_type_alias(name).unwrap();
-                    let cyclic = visit_type(checker, target, visiting);
-                    visiting.remove(name);
-                    if cyclic {
-                        return true;
-                    }
-                    if let TypeKind::GenericInstance { type_args, .. } = &ty.kind {
-                        return type_args
-                            .iter()
-                            .any(|arg| visit_type(checker, arg, visiting));
-                    }
-                    false
-                }
-                TypeKind::Array(inner)
-                | TypeKind::Option(inner)
-                | TypeKind::Ref(inner)
-                | TypeKind::MutRef(inner) => visit_type(checker, inner, visiting),
-                TypeKind::Map(key, value) | TypeKind::Result(key, value) => {
-                    visit_type(checker, key, visiting) || visit_type(checker, value, visiting)
-                }
-                TypeKind::Function {
-                    params,
-                    return_type,
-                } => {
-                    params
-                        .iter()
-                        .any(|param| visit_type(checker, param, visiting))
-                        || visit_type(checker, return_type, visiting)
-                }
-                TypeKind::Tuple(elements) | TypeKind::Union(elements) => elements
-                    .iter()
-                    .any(|element| visit_type(checker, element, visiting)),
-                TypeKind::Pointer { pointee, .. } => visit_type(checker, pointee, visiting),
-                TypeKind::GenericInstance { type_args, .. } => type_args
-                    .iter()
-                    .any(|arg| visit_type(checker, arg, visiting)),
-                _ => false,
-            }
-        }
-
-        let Some((_, target)) = self.env.lookup_type_alias(name) else {
-            return Ok(());
-        };
-        let mut visiting = HashSet::new();
-        visiting.insert(name.to_string());
-        if visit_type(self, target, &mut visiting) {
-            return Err(
-                self.type_error(format!("Recursive type alias '{}' is not supported", name))
-            );
         }
         Ok(())
     }
@@ -2280,26 +2134,6 @@ mod tests {
     }
 
     #[test]
-    fn generic_aliases_expand_with_scoped_parameters() {
-        check(
-            "type Pair<Item> = (Item, Item)\n\
-             type Count = int\n\
-             local pair: Pair<int> = (1, 2)\n\
-             local count: Count = 3\n",
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn recursive_type_aliases_are_rejected_without_recursing() {
-        let direct = check("type Loop = Loop\n").unwrap_err();
-        assert!(direct.to_string().contains("Recursive type alias"));
-
-        let mutual = check("type Left = Right\ntype Right = Left\n").unwrap_err();
-        assert!(mutual.to_string().contains("Recursive type alias"));
-    }
-
-    #[test]
     fn optional_generic_fields_prefer_the_full_option_shape() {
         check(
             "struct Holder<Item>\n\
@@ -2508,5 +2342,29 @@ mod tests {
         ))
         .unwrap_err();
         assert!(error.to_string().contains("expected 'Drawable'"));
+    }
+
+    #[test]
+    fn type_identifier_can_be_used_as_variable_or_function() {
+        check(
+            "function type(value: int): string\n\
+               return \"number\"\n\
+             end\n\
+             local type: string = type(42)\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn removed_keywords_can_be_used_as_identifiers() {
+        check(
+            "function mut(const: int, static: int): int\n\
+               return const + static\n\
+             end\n\
+             local const: int = 10\n\
+             local static: int = 20\n\
+             local mut: int = mut(const, static)\n",
+        )
+        .unwrap();
     }
 }

@@ -23,7 +23,6 @@ pub struct LocalBinding {
 pub enum StmtKind {
     Local {
         bindings: Vec<LocalBinding>,
-        mutable: bool,
         initializer: Option<Vec<Expr>>,
     },
     Assign {

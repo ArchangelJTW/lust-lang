@@ -1,4 +1,4 @@
-use super::{Expr, Span, Stmt, Type};
+use super::{Span, Stmt, Type};
 use alloc::{string::String, vec::Vec};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
@@ -20,11 +20,6 @@ pub enum ItemKind {
     Enum(EnumDef),
     Trait(TraitDef),
     Impl(ImplBlock),
-    TypeAlias {
-        name: String,
-        type_params: Vec<String>,
-        target: Type,
-    },
     Module {
         name: String,
         items: Vec<Item>,
@@ -32,17 +27,6 @@ pub enum ItemKind {
     Use {
         public: bool,
         tree: UseTree,
-    },
-    Const {
-        name: String,
-        ty: Type,
-        value: Expr,
-    },
-    Static {
-        name: String,
-        mutable: bool,
-        ty: Type,
-        value: Expr,
     },
     Extern {
         abi: String,

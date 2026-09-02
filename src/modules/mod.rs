@@ -342,13 +342,6 @@ impl ModuleLoader {
                     new_items.push(item);
                 }
 
-                ItemKind::TypeAlias { name, .. } => {
-                    exports
-                        .types
-                        .insert(name.clone(), format!("{}.{}", module_path, name));
-                    new_items.push(item);
-                }
-
                 ItemKind::Script(stmts) => {
                     if is_entry {
                         new_items.push(Item::new(ItemKind::Script(stmts.clone()), item.span));
@@ -507,9 +500,6 @@ impl ModuleLoader {
                     for stmt in &func.body {
                         self.collect_deps_from_lua_require_stmt(stmt, &mut deps);
                     }
-                }
-                ItemKind::Const { value, .. } | ItemKind::Static { value, .. } => {
-                    self.collect_deps_from_lua_require_expr(value, &mut deps);
                 }
                 ItemKind::Impl(impl_block) => {
                     for method in &impl_block.methods {

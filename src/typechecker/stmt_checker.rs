@@ -6,11 +6,9 @@ impl TypeChecker {
         match &stmt.kind {
             StmtKind::Local {
                 bindings,
-                mutable,
                 initializer,
             } => self.check_local_stmt(
                 bindings,
-                *mutable,
                 initializer.as_ref().map(|values| values.as_slice()),
             ),
             StmtKind::Assign { targets, values } => self.check_assign_stmt(targets, values),
@@ -74,7 +72,6 @@ impl TypeChecker {
     pub(super) fn check_local_stmt(
         &mut self,
         bindings: &[LocalBinding],
-        _mutable: bool,
         initializer: Option<&[Expr]>,
     ) -> Result<()> {
         if bindings.is_empty() {

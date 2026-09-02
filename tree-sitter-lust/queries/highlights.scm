@@ -2,10 +2,6 @@
 [
   "function"
   "local"
-  "mut"
-  "const"
-  "static"
-  "type"
   "module"
   "extern"
   "struct"
@@ -66,15 +62,11 @@
   "enum"
   "trait"
   "impl"
-  "type"
 ] @keyword.type
 
 ; Storage / visibility keywords
 [
   "local"
-  "mut"
-  "const"
-  "static"
   "ref"
   "module"
   "extern"
@@ -179,9 +171,6 @@
   name: (identifier) @constructor)
 
 (trait_declaration
-  name: (identifier) @type)
-
-(type_alias_declaration
   name: (identifier) @type)
 
 (const_declaration

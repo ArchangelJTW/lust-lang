@@ -28,6 +28,15 @@
       "optional": true
     }
   },
+  "tree-sitter": [
+    {
+      "scope": "source.lust",
+      "file-types": [
+        "lust"
+      ],
+      "highlights": "queries/highlights.scm"
+    }
+  ],
   "scripts": {
     "build": "tree-sitter generate && node-gyp rebuild",
     "test": "tree-sitter test",

@@ -601,7 +601,7 @@ module.exports = grammar({
       field('arguments', $.argument_list)
     )),
 
-    type_arguments: $ => seq(
+    type_arguments: $ => prec.dynamic(1, seq(
       '<',
       seq(
         $.type_annotation,
@@ -609,7 +609,7 @@ module.exports = grammar({
         optional(',')
       ),
       '>'
-    ),
+    )),
 
     // Field access
     field_access: $ => prec(10, seq(

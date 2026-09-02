@@ -1,0 +1,206 @@
+==================
+Generics and Impls
+==================
+
+function first<Element>(values: Array<Element>): Element
+    return values[0]:unwrap()
+end
+
+function default_value<Element>(value: int): int
+    return value
+end
+
+struct Box<Item>
+    value: Item
+end
+
+impl<Item> Box<Item>
+    function get(self): Item
+        return self.value
+    end
+end
+
+enum Message<Payload>
+    Data(Payload)
+    Empty
+end
+
+local numbers: Array<int> = [10, 20, 30]
+local number_box: Box<int> = Box { value = first(numbers) }
+local message: Message<string> = Message.Data("hello")
+
+println(number_box:get())
+println(default_value<string>(7))
+
+if message is Data(text) then
+    println(text)
+end
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    (type_parameters
+      (type_parameter
+        name: (identifier)))
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type_annotation
+          (generic_type
+            name: (identifier)
+            (type_annotation
+              (identifier))))))
+    return_type: (type_annotation
+      (identifier))
+    (return_statement
+      (expression_list
+        (method_call_expression
+          object: (index_access
+            object: (identifier)
+            index: (literal
+              (number)))
+          method: (identifier)
+          arguments: (argument_list)))))
+  (function_declaration
+    name: (identifier)
+    (type_parameters
+      (type_parameter
+        name: (identifier)))
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type_annotation
+          (primitive_type))))
+    return_type: (type_annotation
+      (primitive_type))
+    (return_statement
+      (expression_list
+        (identifier))))
+  (struct_declaration
+    name: (identifier)
+    (type_parameters
+      (type_parameter
+        name: (identifier)))
+    (struct_field
+      name: (identifier)
+      type: (type_annotation
+        (identifier))))
+  (impl_block
+    (type_parameters
+      (type_parameter
+        name: (identifier)))
+    type: (type_annotation
+      (generic_type
+        name: (identifier)
+        (type_annotation
+          (identifier))))
+    (function_declaration
+      name: (identifier)
+      parameters: (parameter_list
+        (parameter
+          name: (identifier)))
+      return_type: (type_annotation
+        (identifier))
+      (return_statement
+        (expression_list
+          (field_access
+            object: (identifier)
+            field: (identifier))))))
+  (enum_declaration
+    name: (identifier)
+    (type_parameters
+      (type_parameter
+        name: (identifier)))
+    (enum_variant
+      name: (identifier)
+      (type_annotation
+        (identifier)))
+    (enum_variant
+      name: (identifier)))
+  (local_declaration
+    bindings: (binding_list
+      (binding
+        name: (identifier)
+        type: (type_annotation
+          (generic_type
+            name: (identifier)
+            (type_annotation
+              (primitive_type))))))
+    values: (expression_list
+      (array_expression
+        (literal
+          (number))
+        (literal
+          (number))
+        (literal
+          (number)))))
+  (local_declaration
+    bindings: (binding_list
+      (binding
+        name: (identifier)
+        type: (type_annotation
+          (generic_type
+            name: (identifier)
+            (type_annotation
+              (primitive_type))))))
+    values: (expression_list
+      (struct_expression
+        type: (identifier)
+        (struct_field_init
+          name: (identifier)
+          value: (call_expression
+            function: (identifier)
+            arguments: (argument_list
+              (identifier)))))))
+  (local_declaration
+    bindings: (binding_list
+      (binding
+        name: (identifier)
+        type: (type_annotation
+          (generic_type
+            name: (identifier)
+            (type_annotation
+              (primitive_type))))))
+    values: (expression_list
+      (call_expression
+        function: (field_access
+          object: (identifier)
+          field: (identifier))
+        arguments: (argument_list
+          (literal
+            (string))))))
+  (expression_statement
+    (call_expression
+      function: (identifier)
+      arguments: (argument_list
+        (method_call_expression
+          object: (identifier)
+          method: (identifier)
+          arguments: (argument_list)))))
+  (expression_statement
+    (call_expression
+      function: (identifier)
+      arguments: (argument_list
+        (call_expression
+          function: (identifier)
+          (type_arguments
+            (type_annotation
+              (primitive_type)))
+          arguments: (argument_list
+            (literal
+              (number)))))))
+  (if_statement
+    condition: (is_expression
+      value: (identifier)
+      pattern: (pattern
+        (enum_pattern
+          variant: (identifier)
+          (pattern
+            (identifier)))))
+    (expression_statement
+      (call_expression
+        function: (identifier)
+        arguments: (argument_list
+          (identifier))))))

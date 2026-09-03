@@ -52,7 +52,6 @@ module.exports = grammar({
       $.while_statement,
       $.for_statement,
       $.do_statement,
-      $.match_statement,
       $.return_statement,
       $.break_statement,
       $.continue_statement,
@@ -441,22 +440,6 @@ module.exports = grammar({
       'do',
       repeat($._statement),
       'end'
-    ),
-
-    // Match statement
-    match_statement: $ => seq(
-      'match',
-      field('value', $._expression),
-      'do',
-      repeat($.match_case),
-      'end'
-    ),
-
-    match_case: $ => seq(
-      'case',
-      field('pattern', $.pattern),
-      'then',
-      repeat($._statement)
     ),
 
     pattern: $ => choice(

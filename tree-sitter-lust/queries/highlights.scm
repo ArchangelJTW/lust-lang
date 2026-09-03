@@ -20,8 +20,6 @@
   "then"
   "elseif"
   "else"
-  "match"
-  "case"
   "return"
   "end"
 ] @keyword
@@ -34,8 +32,6 @@
   "then"
   "else"
   "elseif"
-  "match"
-  "case"
 ] @keyword.control.conditional
 
 [

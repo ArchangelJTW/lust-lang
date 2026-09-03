@@ -194,8 +194,8 @@ This grammar supports:
 - **Declarations**: functions, structs, enums, traits, impl blocks
 - **Types**: primitives (int, float, bool, string), generics (Array<T>, Map<K,V>), Option<T>, Result<T,E>
 - **Expressions**: binary/unary ops, calls, method calls, field access, indexing
-- **Statements**: if/then/else, while/do, for loops, match statements
-- **Pattern matching**: enum patterns with data extraction
+- **Statements**: if/then/else, while/do, for loops
+- **Pattern matching**: enum patterns with data extraction in `is` expressions
 - **Literals**: numbers, strings, booleans, nil
 - **Comments**: `--` and `#` style
 - **Special syntax**: `:` for method calls, `value as T` for a safe `Option<T>` cast, `array[index]` for a bounds-safe `Result<T, IndexError>` read, and `value is Pattern` for tests and pattern binding

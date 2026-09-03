@@ -106,13 +106,6 @@ end
 Pattern Matching and Is
 ==================
 
-match val do
-    case Some(x) then
-        println(x)
-    case None then
-        println("empty")
-end
-
 if x is string | int then
     println("matched")
 end
@@ -120,28 +113,6 @@ end
 ---
 
 (source_file
-  (match_statement
-    value: (identifier)
-    (match_case
-      pattern: (pattern
-        (enum_pattern
-          variant: (identifier)
-          (pattern
-            (identifier))))
-      (expression_statement
-        (call_expression
-          function: (identifier)
-          arguments: (argument_list
-            (identifier)))))
-    (match_case
-      pattern: (pattern
-        (identifier))
-      (expression_statement
-        (call_expression
-          function: (identifier)
-          arguments: (argument_list
-            (literal
-              (string)))))))
   (if_statement
     condition: (is_expression
       value: (identifier)

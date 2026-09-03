@@ -585,7 +585,7 @@ pub fn stub_files_from_exports(
             if wrote_type && !contents.ends_with("\n\n") {
                 contents.push('\n');
             }
-            contents.push_str("pub extern\n");
+            contents.push_str("extern\n");
             for export in combined_entry.functions {
                 if let Some((_, function)) = export.name().rsplit_once('.') {
                     let params = format_params(export);

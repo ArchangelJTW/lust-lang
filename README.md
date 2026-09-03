@@ -39,7 +39,7 @@ use lust::EmbeddedProgram;
 fn main() -> lust::Result<()> {
     let mut program = EmbeddedProgram::builder()
         .module("main", r#"
-            pub function greet(name: string): string
+            function greet(name: string): string
                 return "hi, " .. name
             end
         "#)
@@ -230,7 +230,7 @@ can compile and call Lust code. Build the shared library with
 
 int main(void) {
     EmbeddedBuilder *builder = lust_builder_new();
-    lust_builder_add_module(builder, "main", "pub function answer(): int\n    return 42\nend\n");
+    lust_builder_add_module(builder, "main", "function answer(): int\n    return 42\nend\n");
     lust_builder_set_entry_module(builder, "main");
     EmbeddedProgram *program = lust_builder_compile(builder);
 

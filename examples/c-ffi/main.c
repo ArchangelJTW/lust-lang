@@ -14,7 +14,7 @@ static void die_with_last_error(const char *context) {
 int main(void) {
     const char *module_path = "main";
     const char *module_source =
-        "pub function add(a: int, b: int): int\n"
+        "function add(a: int, b: int): int\n"
         "    return a + b\n"
         "end\n";
 

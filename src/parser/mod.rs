@@ -123,17 +123,10 @@ impl Parser {
             | TokenKind::Use
             | TokenKind::Module
             | TokenKind::Extern => true,
-            TokenKind::Pub => self.peek_ahead(1).map_or(false, |t| {
+            TokenKind::Local => self.peek_ahead(1).map_or(false, |t| {
                 matches!(
                     t.kind,
-                    TokenKind::Function
-                        | TokenKind::Struct
-                        | TokenKind::Enum
-                        | TokenKind::Trait
-                        | TokenKind::Impl
-                        | TokenKind::Use
-                        | TokenKind::Module
-                        | TokenKind::Extern
+                    TokenKind::Function | TokenKind::Struct | TokenKind::Enum | TokenKind::Trait
                 )
             }),
             _ => false,

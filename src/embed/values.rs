@@ -966,11 +966,11 @@ mod tests {
     fn unknown_cast_returns_option() {
         let _guard = serial_guard();
         let source = r#"
-            pub function cast_int(value: unknown): Option<int>
+            function cast_int(value: unknown): Option<int>
                 return value as int
             end
 
-            pub function cast_bool(value: unknown): Option<bool>
+            function cast_bool(value: unknown): Option<bool>
                 return value as bool
             end
         "#;
@@ -1011,18 +1011,18 @@ mod tests {
                 n: int
             end
 
-            pub function read(index: int): Result<unknown, IndexError>
+            function read(index: int): Result<unknown, IndexError>
                 local values: Array<unknown> = ["ok", 1]
                 return values[index]
             end
 
-            pub function assign(): int
+            function assign(): int
                 local values: Array<int> = [1]
                 values[0] = 9
                 return array.get(values, 0):unwrap()
             end
 
-            pub function unwrap_loop(index: int): int
+            function unwrap_loop(index: int): int
                 local values: Array<int> = [7]
                 local total: int = 0
                 for i = 1, 20 do
@@ -1032,11 +1032,11 @@ mod tests {
                 return total
             end
 
-            pub function make_counter(): IndexCounter
+            function make_counter(): IndexCounter
                 return IndexCounter { n = 0 }
             end
 
-            pub function budgeted_read(
+            function budgeted_read(
                 counter: IndexCounter,
                 values: Array<int>,
                 index: int
@@ -1118,7 +1118,7 @@ mod tests {
                 message: string
             end
 
-            pub function read(): unknown
+            function read(): unknown
                 local values: Array<int> = []
                 return values[0]
             end
@@ -1149,7 +1149,7 @@ mod tests {
                 return 7
             end
 
-            pub function run(): int
+            function run(): int
                 local calls: Array<int> = []
                 if next_value(calls) as int is Some(x) and x > 0 then
                     return x * 10 + array.len(calls)
@@ -1157,7 +1157,7 @@ mod tests {
                 return -1
             end
 
-            pub function parenthesized(value: unknown): int
+            function parenthesized(value: unknown): int
                 if (value as int is Some(x)) then
                     return x
                 end
@@ -1180,11 +1180,11 @@ mod tests {
         let source = r#"
             local factors: Array<int> = []
 
-            pub function touch()
+            function touch()
                 array.push(factors, 1)
             end
 
-            pub function main()
+            function main()
                 touch()
             end
 
@@ -1515,7 +1515,7 @@ mod tests {
     fn function_handle_supports_typed_and_raw_calls() {
         let _guard = serial_guard();
         let source = r#"
-            pub function add(a: int, b: int): int
+            function add(a: int, b: int): int
                 return a + b
             end
         "#;
@@ -1556,7 +1556,7 @@ mod tests {
                 function bad_native(): int
             end
 
-            pub function invoke(): int
+            function invoke(): int
                 return bad_native()
             end
         "#;
@@ -1580,7 +1580,7 @@ mod tests {
                 function fetch_value(): Task
             end
 
-            pub function start(): Task
+            function start(): Task
                 return fetch_value()
             end
         "#;
@@ -1640,7 +1640,7 @@ mod tests {
             .finish();
 
         let module = r#"
-            pub function make(): math.Point
+            function make(): math.Point
                 return math.Point { x = 10, y = 20 }
             end
         "#;

@@ -272,7 +272,7 @@ local metat = (function()
     local __shared___index_0 = lua.table()
     return LuaTable { table = { ["__index"] = __shared___index_0 }, metamethods = { __index = __shared___index_0 } }
 end)()
-pub function open(host: LuaValue, port: LuaValue, create: LuaValue): Array<LuaValue>
+function open(host: LuaValue, port: LuaValue, create: LuaValue): Array<LuaValue>
     local c = __lua_first(socket.try(create()))
     local h = __lua_first(base.setmetatable(lua.table_from_entries([("c", c)]), metat))
     -- create finalized try
@@ -285,12 +285,12 @@ pub function open(host: LuaValue, port: LuaValue, create: LuaValue): Array<LuaVa
     return __lua_pack([lua.to_value(h)])
 end
 _M.open = open
-pub function metat_sendrequestline(self: LuaValue, method: LuaValue, uri: LuaValue): Array<LuaValue>
+function metat_sendrequestline(self: LuaValue, method: LuaValue, uri: LuaValue): Array<LuaValue>
     local reqline = __lua_first(string.format(lua.to_value("%s %s HTTP/1.1\r\n"), __lua_or(method, lua.to_value("GET")), uri))
     return __lua_force_array(self.try(__lua_first(lua.call_method(self.c, "send", reqline))))
 end
 metat.__index.sendrequestline = metat_sendrequestline
-pub function metat_sendheaders(self: LuaValue, tosend: LuaValue): Array<LuaValue>
+function metat_sendheaders(self: LuaValue, tosend: LuaValue): Array<LuaValue>
     local canonic = headers.canonic
     local h = lua.to_value("\r\n"
 )
@@ -302,7 +302,7 @@ pub function metat_sendheaders(self: LuaValue, tosend: LuaValue): Array<LuaValue
 ))])
 end
 metat.__index.sendheaders = metat_sendheaders
-pub function metat_sendbody(self: LuaValue, headers: LuaValue, source: LuaValue, step: LuaValue): Array<LuaValue>
+function metat_sendbody(self: LuaValue, headers: LuaValue, source: LuaValue, step: LuaValue): Array<LuaValue>
     source = __lua_or(source, __lua_first(ltn12.source.empty()))
     step = __lua_or(step, ltn12.pump.step)
     local mode = lua.to_value("http-chunked"
@@ -313,7 +313,7 @@ pub function metat_sendbody(self: LuaValue, headers: LuaValue, source: LuaValue,
     return __lua_force_array(self.try(ltn12.pump.all(source, __lua_first(socket.sink(mode, self.c)), step)))
 end
 metat.__index.sendbody = metat_sendbody
-pub function metat_receivestatusline(self: LuaValue): Array<LuaValue>
+function metat_receivestatusline(self: LuaValue): Array<LuaValue>
     local status, ec
     local __lua_ret = self.try(__lua_first(lua.call_method(self.c, "receive", lua.to_value(5))))
     status = __lua_nth(__lua_ret, 0)
@@ -332,11 +332,11 @@ pub function metat_receivestatusline(self: LuaValue): Array<LuaValue>
     return __lua_force_array(self.try(__lua_first(base.tonumber(code)), status))
 end
 metat.__index.receivestatusline = metat_receivestatusline
-pub function metat_receiveheaders(self: LuaValue): Array<LuaValue>
+function metat_receiveheaders(self: LuaValue): Array<LuaValue>
     return __lua_force_array(self.try(receiveheaders(self.c)))
 end
 metat.__index.receiveheaders = metat_receiveheaders
-pub function metat_receivebody(self: LuaValue, headers: LuaValue, sink: LuaValue, step: LuaValue): Array<LuaValue>
+function metat_receivebody(self: LuaValue, headers: LuaValue, sink: LuaValue, step: LuaValue): Array<LuaValue>
     sink = __lua_or(sink, __lua_first(ltn12.sink.null()))
     step = __lua_or(step, ltn12.pump.step)
     local length = __lua_first(base.tonumber(headers[lua.to_value("content-length")]))
@@ -352,13 +352,13 @@ pub function metat_receivebody(self: LuaValue, headers: LuaValue, sink: LuaValue
     return __lua_force_array(self.try(ltn12.pump.all(__lua_first(socket.source(mode, self.c, length)), sink, step)))
 end
 metat.__index.receivebody = metat_receivebody
-pub function metat_receive09body(self: LuaValue, status: LuaValue, sink: LuaValue, step: LuaValue): Array<LuaValue>
+function metat_receive09body(self: LuaValue, status: LuaValue, sink: LuaValue, step: LuaValue): Array<LuaValue>
     local source = __lua_first(ltn12.source.rewind(socket.source(lua.to_value("until-closed"), self.c)))
     __lua_first(source(status))
     return __lua_force_array(self.try(ltn12.pump.all(source, sink, step)))
 end
 metat.__index.receive09body = metat_receive09body
-pub function metat_close(self: LuaValue): Array<LuaValue>
+function metat_close(self: LuaValue): Array<LuaValue>
     return __lua_force_array(__lua_first(lua.call_method(self.c, "close")))
 end
 metat.__index.close = metat_close
@@ -564,7 +564,7 @@ end))
 _M.schemes = SCHEMES
 local genericform: LuaValue = _M.genericform
 local http: LuaValue = socket.http
-pub function request(reqt: LuaValue, body: LuaValue): Array<LuaValue>
+function request(reqt: LuaValue, body: LuaValue): Array<LuaValue>
     return _M.request(reqt, body)
 end
 local schemes: LuaValue = _M.schemes

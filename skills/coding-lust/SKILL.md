@@ -6,7 +6,7 @@ Lust is a strongly typed, Lua-inspired scripting language implemented in Rust. I
 
 ## 1. Naming & Case Conventions
 
-- **lowercase**: Primitive types and keywords (`int`, `float`, `string`, `bool`, `unknown`, `local`, `function`, `struct`, `enum`, `trait`, `impl`, `pub`, `use`, `is`, `as`, `ref`).
+- **lowercase**: Primitive types and keywords (`int`, `float`, `string`, `bool`, `unknown`, `local`, `function`, `struct`, `enum`, `trait`, `impl`, `use`, `is`, `as`, `ref`).
 - **PascalCase**: Nominal types, traits, and enum variants (`Option`, `Result`, `Some`, `None`, `Ok`, `Err`, `Array`, `Map`, `IndexError`, `TaskInfo`, `TaskStatus`, user types).
 - **snake_case**: Variables, functions, methods, fields, and module namespaces.
 
@@ -140,8 +140,8 @@ local low, high = min_max(10, 5)
 ### Structs, Impls & Methods
 ```lust
 struct Point
-    pub x: int
-    pub y: int
+    x: int
+    y: int
 end
 
 impl Point
@@ -271,12 +271,12 @@ Files automatically map to dot-separated module paths relative to the source roo
 
 ```lust
 -- In lib/math.lust:
-pub struct Point
-    pub x: int
-    pub y: int
+struct Point
+    x: int
+    y: int
 end
 
-pub function add(a: int, b: int): int
+function add(a: int, b: int): int
     return a + b
 end
 

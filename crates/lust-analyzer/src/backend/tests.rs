@@ -58,11 +58,11 @@ fn struct_field_completion_basic() {
     let tmp = TempDir::new();
     let entry_path = tmp.path().join("main.lust");
     let source = r#"
-pub struct Point
+struct Point
 x: int
 y: int
 end
-pub function length(point: Point): int
+function length(point: Point): int
 local sum = point.x + point.y
 return sum
 end
@@ -1180,11 +1180,11 @@ fn module_path_completion_suggests_modules_and_exports() {
     fs::create_dir_all(&lib_dir).expect("create lib dir");
     let math_path = lib_dir.join("math.lust");
     let math_source = r#"
-pub struct Point
+struct Point
 x: int
 y: int
 end
-pub function add(a: int, b: int): int
+function add(a: int, b: int): int
 return a + b
 end
 "#;
@@ -1254,14 +1254,14 @@ fn module_path_completion_suggests_nested_modules_from_directory() {
     fs::create_dir_all(&math_dir).expect("create math dir");
     let math_path = lib_dir.join("math.lust");
     let math_source = r#"
-pub function add(a: int, b: int): int
+function add(a: int, b: int): int
 return a + b
 end
 "#;
     fs::write(&math_path, math_source.trim_start()).expect("write math");
     let geometry_path = math_dir.join("geometry.lust");
     let geometry_source = r#"
-pub function area(r: float): float
+function area(r: float): float
 return r * r
 end
 "#;
@@ -1324,14 +1324,14 @@ fn module_path_completion_suggests_dependency_stub_modules() {
     fs::create_dir_all(&lust_double_dir).expect("create lust_double dir");
     let root_path = lust_double_dir.join("lust_double.lust");
     let root_source = r#"
-pub extern
+extern
     function host_double(int): int
 end
 "#;
     fs::write(&root_path, root_source.trim_start()).expect("write root stub");
     let nested_path = lust_double_dir.join("nested.lust");
     let nested_source = r#"
-pub extern
+extern
     function host_quadruple(int): int
 end
 "#;
@@ -1394,7 +1394,7 @@ fn module_path_completion_includes_root_modules() {
     fs::create_dir_all(&lib_dir).expect("create lib dir");
     let math_path = lib_dir.join("math.lust");
     let math_source = r#"
-pub struct Point
+struct Point
 x: int
 y: int
 end

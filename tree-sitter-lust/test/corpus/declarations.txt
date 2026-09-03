@@ -2,7 +2,7 @@
 Function declaration
 ==================
 
-pub function add<T: Display + Clone>(a: T, b: T): T
+local function add<T: Display + Clone>(a: T, b: T): T
     return a + b
 end
 
@@ -38,7 +38,7 @@ end
 Struct declaration
 ==================
 
-pub struct Node
+local struct Node
     name: string,
     parent: ref Node,
     children: Array<Node>
@@ -70,7 +70,7 @@ end
 Enum declaration
 ==================
 
-pub enum Option<T>
+local enum Option<T>
     Some(T),
     None
 end
@@ -95,7 +95,7 @@ end
 Trait and Impl
 ==================
 
-pub trait Drawable
+local trait Drawable
     function draw(self): ()
 end
 

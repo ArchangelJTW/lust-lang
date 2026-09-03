@@ -147,11 +147,11 @@ end
 _M.encode = __lua_first(choose(encodet))
 _M.decode = __lua_first(choose(decodet))
 _M.wrap = __lua_first(choose(wrapt))
-pub function normalize(marker: LuaValue): Array<LuaValue>
+function normalize(marker: LuaValue): Array<LuaValue>
     return __lua_force_array(ltn12.filter.cycle(_M.eol, lua.to_value(0), marker))
 end
 _M.normalize = normalize
-pub function stuff(): Array<LuaValue>
+function stuff(): Array<LuaValue>
     return __lua_force_array(ltn12.filter.cycle(_M.dot, lua.to_value(2)))
 end
 _M.stuff = stuff

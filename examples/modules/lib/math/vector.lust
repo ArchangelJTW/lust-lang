@@ -2,20 +2,20 @@ println("[lib.math.vector] init")
 
 local captured_variable = "my_captured_variable"
 
-pub struct IntVector
+struct IntVector
     x: int
     y: int
 end
 
-pub function make(x: int, y: int): IntVector
+function make(x: int, y: int): IntVector
     return IntVector { x = x, y = y }
 end
 
-pub function zero(): IntVector
+function zero(): IntVector
     println(captured_variable)
     return IntVector { x = 0, y = 0 }
 end
 
-pub function length_squared(vec: IntVector): int
+function length_squared(vec: IntVector): int
     return (vec.x * vec.x) + (vec.y * vec.y)
 end

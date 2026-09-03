@@ -160,7 +160,7 @@ fn extern_files_from_exports(
             if wrote_type && !contents.ends_with("\n\n") {
                 contents.push('\n');
             }
-            contents.push_str("pub extern\n");
+            contents.push_str("extern\n");
             for export in combined_entry.functions {
                 let normalized_name = export.name().replace("::", ".");
                 if let Some((_, function)) = normalized_name.rsplit_once('.') {
@@ -268,7 +268,7 @@ mod tests {
         let mut vm = VM::with_config(&LustConfig::default());
         vm.register_type_stubs(vec![ModuleStub {
             module: "host".to_string(),
-            struct_defs: vec!["pub struct Widget\nend\n".to_string()],
+            struct_defs: vec!["struct Widget\nend\n".to_string()],
             ..ModuleStub::default()
         }]);
         vm.record_exported_native(NativeExport::new(
@@ -284,8 +284,8 @@ mod tests {
         assert_eq!(written.len(), 1);
         let destination = dir.path().join(&written[0]);
         let contents = fs::read_to_string(destination).expect("read output");
-        assert!(contents.contains("pub struct Widget"));
-        assert!(contents.contains("pub extern"));
+        assert!(contents.contains("struct Widget"));
+        assert!(contents.contains("extern"));
         assert!(contents.contains("function scale(int): int"));
     }
 }

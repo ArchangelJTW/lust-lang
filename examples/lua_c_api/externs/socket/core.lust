@@ -1,6 +1,6 @@
 -- Auto-generated stub for Lua module 'socket.core'
 
-pub extern
+extern
     function socket.core.__unload(LuaValue): LuaValue
     function socket.core.connect(LuaValue): LuaValue
     function socket.core.gettime(LuaValue): LuaValue

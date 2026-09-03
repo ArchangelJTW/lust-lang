@@ -116,7 +116,7 @@ _M.BLOCKSIZE = lua.to_value(2048
 )
 _M._VERSION = lua.to_value("LTN12 1.0.3"
 )
-pub function filter_cycle(low: LuaValue, ctx: LuaValue, extra: LuaValue): Array<LuaValue>
+function filter_cycle(low: LuaValue, ctx: LuaValue, extra: LuaValue): Array<LuaValue>
     __lua_first(base.assert(low))
     return __lua_pack([lua.to_value(function(chunk: LuaValue): Array<LuaValue>
         local ret
@@ -127,7 +127,7 @@ pub function filter_cycle(low: LuaValue, ctx: LuaValue, extra: LuaValue): Array<
     end)])
 end
 filter.cycle = filter_cycle
-pub function filter_chain(__varargs: Array<LuaValue>): Array<LuaValue>
+function filter_chain(__varargs: Array<LuaValue>): Array<LuaValue>
     local arg = __lua_table_from_varargs(__varargs)
     local n = __lua_first(select(lua.to_value('#'), __varargs))
     local top, index = lua.to_value(1), lua.to_value(1
@@ -172,18 +172,18 @@ filter.chain = filter_chain
 local empty = function(): Array<LuaValue>
     return __lua_pack([lua.to_value(lua.nil)])
 end
-pub function source_empty(): Array<LuaValue>
+function source_empty(): Array<LuaValue>
     return __lua_pack([lua.to_value(empty)])
 end
 source.empty = source_empty
-pub function source_error(err: LuaValue): Array<LuaValue>
+function source_error(err: LuaValue): Array<LuaValue>
     return __lua_pack([lua.to_value(function(): Array<LuaValue>
         local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
         return __lua_join(__lua_ret, [lua.to_value(err)])
     end)])
 end
 source.error = source_error
-pub function source_file(handle: LuaValue, io_err: LuaValue): Array<LuaValue>
+function source_file(handle: LuaValue, io_err: LuaValue): Array<LuaValue>
     if __lua_truthy(handle) then
         return __lua_pack([lua.to_value(function(): Array<LuaValue>
             local chunk = __lua_first(__lua_first(lua.call_method(handle, "read", _M.BLOCKSIZE)))
@@ -197,7 +197,7 @@ pub function source_file(handle: LuaValue, io_err: LuaValue): Array<LuaValue>
     end
 end
 source.file = source_file
-pub function source_simplify(src: LuaValue): Array<LuaValue>
+function source_simplify(src: LuaValue): Array<LuaValue>
     __lua_first(base.assert(src))
     return __lua_pack([lua.to_value(function(): Array<LuaValue>
         local chunk, err_or_new
@@ -214,7 +214,7 @@ pub function source_simplify(src: LuaValue): Array<LuaValue>
     end)])
 end
 source.simplify = source_simplify
-pub function source_string(s: LuaValue): Array<LuaValue>
+function source_string(s: LuaValue): Array<LuaValue>
     if __lua_truthy(s) then
         local i = lua.to_value(1
 )
@@ -232,7 +232,7 @@ pub function source_string(s: LuaValue): Array<LuaValue>
     end
 end
 source.string = source_string
-pub function source_table(t: LuaValue): Array<LuaValue>
+function source_table(t: LuaValue): Array<LuaValue>
     __lua_first(base.assert(lua.op_eq(lua.to_value('table' ), __lua_first(type_(t)))))
     local i = lua.to_value(0
 )
@@ -243,7 +243,7 @@ pub function source_table(t: LuaValue): Array<LuaValue>
     end)])
 end
 source.table = source_table
-pub function source_rewind(src: LuaValue): Array<LuaValue>
+function source_rewind(src: LuaValue): Array<LuaValue>
     __lua_first(base.assert(src))
     local t = lua.table()
     return __lua_pack([lua.to_value(function(chunk: LuaValue): Array<LuaValue>
@@ -260,7 +260,7 @@ pub function source_rewind(src: LuaValue): Array<LuaValue>
     end)])
 end
 source.rewind = source_rewind
-pub function source_chain(src: LuaValue, f: LuaValue, __varargs: Array<LuaValue>): Array<LuaValue>
+function source_chain(src: LuaValue, f: LuaValue, __varargs: Array<LuaValue>): Array<LuaValue>
     if __lua_truthy(__lua_first(__varargs)) then
         f = __lua_first(filter.chain(f, __varargs))
     end
@@ -321,7 +321,7 @@ pub function source_chain(src: LuaValue, f: LuaValue, __varargs: Array<LuaValue>
     end)])
 end
 source.chain = source_chain
-pub function source_cat(__varargs: Array<LuaValue>): Array<LuaValue>
+function source_cat(__varargs: Array<LuaValue>): Array<LuaValue>
     local arg = __lua_table_from_varargs(__varargs)
     local src = __lua_first(arg:remove(lua.to_value(1)))
     return __lua_pack([lua.to_value(function(): Array<LuaValue>
@@ -342,7 +342,7 @@ pub function source_cat(__varargs: Array<LuaValue>): Array<LuaValue>
     end)])
 end
 source.cat = source_cat
-pub function sink_table(t: LuaValue): Array<LuaValue>
+function sink_table(t: LuaValue): Array<LuaValue>
     t = __lua_or(t, lua.table())
     local f = function(chunk: LuaValue, err: LuaValue): Array<LuaValue>
         if __lua_truthy(chunk) then
@@ -355,7 +355,7 @@ pub function sink_table(t: LuaValue): Array<LuaValue>
     return __lua_join(__lua_ret, [lua.to_value(t)])
 end
 sink.table = sink_table
-pub function sink_simplify(snk: LuaValue): Array<LuaValue>
+function sink_simplify(snk: LuaValue): Array<LuaValue>
     __lua_first(base.assert(snk))
     return __lua_pack([lua.to_value(function(chunk: LuaValue, err: LuaValue): Array<LuaValue>
         local ret, err_or_new
@@ -372,7 +372,7 @@ pub function sink_simplify(snk: LuaValue): Array<LuaValue>
     end)])
 end
 sink.simplify = sink_simplify
-pub function sink_file(handle: LuaValue, io_err: LuaValue): Array<LuaValue>
+function sink_file(handle: LuaValue, io_err: LuaValue): Array<LuaValue>
     if __lua_truthy(handle) then
         return __lua_pack([lua.to_value(function(chunk: LuaValue, err: LuaValue): Array<LuaValue>
             if __lua_truthy(not __lua_truthy(chunk)) then
@@ -392,18 +392,18 @@ local null = function(): Array<LuaValue>
     return __lua_pack([lua.to_value(lua.to_value(1
 ))])
 end
-pub function sink_null(): Array<LuaValue>
+function sink_null(): Array<LuaValue>
     return __lua_pack([lua.to_value(null)])
 end
 sink.null = sink_null
-pub function sink_error(err: LuaValue): Array<LuaValue>
+function sink_error(err: LuaValue): Array<LuaValue>
     return __lua_pack([lua.to_value(function(): Array<LuaValue>
         local __lua_ret: Array<LuaValue> = [lua.to_value(lua.nil)]
         return __lua_join(__lua_ret, [lua.to_value(err)])
     end)])
 end
 sink.error = sink_error
-pub function sink_chain(f: LuaValue, snk: LuaValue, __varargs: Array<LuaValue>): Array<LuaValue>
+function sink_chain(f: LuaValue, snk: LuaValue, __varargs: Array<LuaValue>): Array<LuaValue>
     if __lua_truthy(__lua_first(__varargs)) then
         local args = lua.table_from_entries([(1, f), (2, snk), (3, __lua_first(__varargs))])
         snk = __lua_first(args:remove((args):len()))
@@ -435,7 +435,7 @@ pub function sink_chain(f: LuaValue, snk: LuaValue, __varargs: Array<LuaValue>):
     end)])
 end
 sink.chain = sink_chain
-pub function pump_step(src: LuaValue, snk: LuaValue): Array<LuaValue>
+function pump_step(src: LuaValue, snk: LuaValue): Array<LuaValue>
     local chunk, src_err
     local __lua_ret = src()
     chunk = __lua_nth(__lua_ret, 0)
@@ -453,7 +453,7 @@ pub function pump_step(src: LuaValue, snk: LuaValue): Array<LuaValue>
     end
 end
 pump.step = pump_step
-pub function pump_all(src: LuaValue, snk: LuaValue, step: LuaValue): Array<LuaValue>
+function pump_all(src: LuaValue, snk: LuaValue, step: LuaValue): Array<LuaValue>
     __lua_first(base.assert(__lua_and(src, snk)))
     step = __lua_or(step, pump.step)
     while __lua_truthy(lua.to_value(true)) do

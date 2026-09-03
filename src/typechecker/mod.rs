@@ -1003,9 +1003,7 @@ impl TypeChecker {
                 ),
                 ty.span,
             ),
-            TK::Ref(inner) => {
-                Type::new(TK::Ref(Box::new(self.canonicalize_type(inner))), ty.span)
-            }
+            TK::Ref(inner) => Type::new(TK::Ref(Box::new(self.canonicalize_type(inner))), ty.span),
             TK::MutRef(inner) => {
                 Type::new(TK::MutRef(Box::new(self.canonicalize_type(inner))), ty.span)
             }
@@ -1018,8 +1016,10 @@ impl TypeChecker {
             ),
             TK::GenericInstance { name, type_args } => {
                 let resolved = self.resolve_type_key(name);
-                let canonical_args: Vec<Type> =
-                    type_args.iter().map(|arg| self.canonicalize_type(arg)).collect();
+                let canonical_args: Vec<Type> = type_args
+                    .iter()
+                    .map(|arg| self.canonicalize_type(arg))
+                    .collect();
                 Type::new(
                     TK::GenericInstance {
                         name: resolved,
@@ -1225,7 +1225,7 @@ impl TypeChecker {
                     )
                 } else {
                     return Err(
-                        self.type_error_at(format!("Undefined generic type '{}'", name), ty.span),
+                        self.type_error_at(format!("Undefined generic type '{}'", name), ty.span)
                     );
                 };
                 if arity != type_args.len() {
@@ -2358,12 +2358,46 @@ mod tests {
     #[test]
     fn removed_keywords_can_be_used_as_identifiers() {
         check(
-            "function mut(const: int, static: int): int\n\
-               return const + static\n\
+            "function mut(const: int, static: int, pub: int, unsafe: int): int\n\
+               return const + static + pub + unsafe\n\
              end\n\
              local const: int = 10\n\
              local static: int = 20\n\
-             local mut: int = mut(const, static)\n",
+             local pub: int = 30\n\
+             local unsafe: int = 40\n\
+             local mut: int = mut(const, static, pub, unsafe)\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn local_and_default_public_items_typecheck() {
+        check(
+            "struct PublicPoint\n\
+               x: int\n\
+               local hidden: int\n\
+             end\n\
+             local struct PrivatePoint\n\
+               x: int\n\
+             end\n\
+             function public_func(p: PublicPoint): int\n\
+               return p.x + p.hidden\n\
+             end\n\
+             local function private_func(p: PrivatePoint): int\n\
+               return p.x\n\
+             end\n\
+             enum PublicStatus\n\
+               Active\n\
+             end\n\
+             local enum PrivateStatus\n\
+               Inactive\n\
+             end\n\
+             trait PublicTrait\n\
+               function do_it(self): int\n\
+             end\n\
+             local trait PrivateTrait\n\
+               function secret(self): int\n\
+             end\n",
         )
         .unwrap();
     }
@@ -2389,19 +2423,30 @@ mod tests {
     #[test]
     fn method_syntax_on_primitives_is_rejected() {
         let err1 = check("local s = \"hello\"\nlocal l = s:len()\n").unwrap_err();
-        assert!(err1.to_string().contains("Type 'string' does not support method syntax"));
+        assert!(err1
+            .to_string()
+            .contains("Type 'string' does not support method syntax"));
 
         let err2 = check("local arr: Array<int> = [1]\narr:push(2)\n").unwrap_err();
-        assert!(err2.to_string().contains("Type 'Array' does not support method syntax"));
+        assert!(err2
+            .to_string()
+            .contains("Type 'Array' does not support method syntax"));
 
-        let err3 = check("local m: Map<string, int> = { a = 1 }\nlocal v = m:get(\"a\")\n").unwrap_err();
-        assert!(err3.to_string().contains("Type 'Map' does not support method syntax"));
+        let err3 =
+            check("local m: Map<string, int> = { a = 1 }\nlocal v = m:get(\"a\")\n").unwrap_err();
+        assert!(err3
+            .to_string()
+            .contains("Type 'Map' does not support method syntax"));
 
         let err4 = check("local x: float = 3.5\nlocal f = x:floor()\n").unwrap_err();
-        assert!(err4.to_string().contains("Type 'float' does not support method syntax"));
+        assert!(err4
+            .to_string()
+            .contains("Type 'float' does not support method syntax"));
 
         let err5 = check("local i: int = 5\nlocal a = i:abs()\n").unwrap_err();
-        assert!(err5.to_string().contains("Type 'int' does not support method syntax"));
+        assert!(err5
+            .to_string()
+            .contains("Type 'int' does not support method syntax"));
     }
 
     #[test]

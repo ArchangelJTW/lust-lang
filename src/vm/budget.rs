@@ -210,7 +210,7 @@ mod tests {
             .module(
                 "main",
                 r#"
-                    pub function spin(): ()
+                    function spin(): ()
                         while true do
                         end
                     end
@@ -238,7 +238,7 @@ mod tests {
             .module(
                 "main",
                 r#"
-                    pub function grow(): ()
+                    function grow(): ()
                         local arr: Array<int> = []
                         array.push(arr, 1)
                     end

@@ -108,7 +108,7 @@ local _M = socket.url
 -----------------------------------------------------------------------------
 _M._VERSION = lua.to_value("URL 1.0.3"
 )
-pub function escape(s: LuaValue): Array<LuaValue>
+function escape(s: LuaValue): Array<LuaValue>
     return __lua_pack([lua.to_value(((__lua_first(string.gsub(s, lua.to_value("([^A-Za-z0-9_])"), function(c: LuaValue): Array<LuaValue>
         return __lua_force_array(string.format(lua.to_value("%%%02x"), string.byte(c)))
     end)))))])
@@ -132,7 +132,7 @@ local protect_segment = function(s: LuaValue): Array<LuaValue>
         end
     end))
 end
-pub function unescape(s: LuaValue): Array<LuaValue>
+function unescape(s: LuaValue): Array<LuaValue>
     return __lua_pack([lua.to_value(((__lua_first(string.gsub(s, lua.to_value("%%(%x%x)"), function(hex: LuaValue): Array<LuaValue>
         return __lua_force_array(string.char(base.tonumber(hex, lua.to_value(16))))
     end)))))])
@@ -180,7 +180,7 @@ local absolute_path = function(base_path: LuaValue, relative_path: LuaValue): Ar
     path = __lua_first(remove_dot_components(path))
     return __lua_pack([lua.to_value(path)])
 end
-pub function parse(url: LuaValue, default: LuaValue): Array<LuaValue>
+function parse(url: LuaValue, default: LuaValue): Array<LuaValue>
     local parsed = lua.table()
     for i, v in __lua_first(base.pairs(__lua_or(default, parsed))) do
         parsed[i] = v
@@ -251,7 +251,7 @@ pub function parse(url: LuaValue, default: LuaValue): Array<LuaValue>
     return __lua_pack([lua.to_value(parsed)])
 end
 _M.parse = parse
-pub function build(parsed: LuaValue): Array<LuaValue>
+function build(parsed: LuaValue): Array<LuaValue>
     local url = __lua_or(parsed.path, lua.to_value(""
 ))
     if __lua_truthy(parsed.params) then
@@ -293,7 +293,7 @@ pub function build(parsed: LuaValue): Array<LuaValue>
     return __lua_pack([lua.to_value(url)])
 end
 _M.build = build
-pub function absolute(base_url: LuaValue, relative_url: LuaValue): Array<LuaValue>
+function absolute(base_url: LuaValue, relative_url: LuaValue): Array<LuaValue>
     local base_parsed
     if __lua_truthy(lua.op_eq(__lua_first(base["type"](base_url)), lua.to_value("table" ))) then
         base_parsed = base_url
@@ -330,7 +330,7 @@ pub function absolute(base_url: LuaValue, relative_url: LuaValue): Array<LuaValu
     return __lua_force_array(remove_dot_components(result))
 end
 _M.absolute = absolute
-pub function parse_path(path: LuaValue): Array<LuaValue>
+function parse_path(path: LuaValue): Array<LuaValue>
     local parsed = lua.table()
     path = __lua_or(path, lua.to_value(""
 ))
@@ -350,7 +350,7 @@ pub function parse_path(path: LuaValue): Array<LuaValue>
     return __lua_pack([lua.to_value(parsed)])
 end
 _M.parse_path = parse_path
-pub function build_path(parsed: LuaValue, unsafe_: LuaValue): Array<LuaValue>
+function build_path(parsed: LuaValue, unsafe_: LuaValue): Array<LuaValue>
     local path = lua.to_value(""
 )
     local n = (parsed):len()

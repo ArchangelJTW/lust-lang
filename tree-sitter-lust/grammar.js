@@ -58,7 +58,7 @@ module.exports = grammar({
       $.continue_statement,
     ),
 
-    visibility: $ => 'pub',
+    visibility: $ => 'local',
 
     // Comments
     comment: $ => token(choice(

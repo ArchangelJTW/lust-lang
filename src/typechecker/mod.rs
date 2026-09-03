@@ -2358,14 +2358,16 @@ mod tests {
     #[test]
     fn removed_keywords_can_be_used_as_identifiers() {
         check(
-            "function mut(const: int, static: int, pub: int, unsafe: int): int\n\
-               return const + static + pub + unsafe\n\
+            "function mut(const: int, static: int, pub: int, unsafe: int, match: int, case: int): int\n\
+               return const + static + pub + unsafe + match + case\n\
              end\n\
              local const: int = 10\n\
              local static: int = 20\n\
              local pub: int = 30\n\
              local unsafe: int = 40\n\
-             local mut: int = mut(const, static, pub, unsafe)\n",
+             local match: int = 50\n\
+             local case: int = 60\n\
+             local mut: int = mut(const, static, pub, unsafe, match, case)\n",
         )
         .unwrap();
     }

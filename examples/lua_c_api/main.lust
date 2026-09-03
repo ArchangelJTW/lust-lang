@@ -5,7 +5,7 @@ use lua as lua
 
 --println("luasocket core loaded\n_DATAGRAMSIZE = " .. tostring(_DATAGRAMSIZE) .. "\n_SETSIZE = " .. tostring(_SETSIZE))
 
-local result_any: unknown = request("http://info.cern.ch")
+local result_any: unknown = request("http://example.com")
 --println("http.request returned: " .. tostring(result_any) .. " (type " .. type(result_any) .. ")")
 if result_any is Array<LuaValue> then
     local result: Array<LuaValue> = result_any

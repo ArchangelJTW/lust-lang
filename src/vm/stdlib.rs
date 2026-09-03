@@ -1087,10 +1087,13 @@ fn create_array_len_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
         let val = args.get(0).cloned().unwrap_or(Value::Nil);
         match val {
-            Value::Array(arr) => {
-                Ok(NativeCallResult::Return(Value::Int(arr.borrow().len() as LustInt)))
-            }
-            other => Err(format!("array.len expects an array, got {:?}", other.type_of())),
+            Value::Array(arr) => Ok(NativeCallResult::Return(Value::Int(
+                arr.borrow().len() as LustInt
+            ))),
+            other => Err(format!(
+                "array.len expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1099,10 +1102,13 @@ fn create_array_is_empty_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
         let val = args.get(0).cloned().unwrap_or(Value::Nil);
         match val {
-            Value::Array(arr) => {
-                Ok(NativeCallResult::Return(Value::Bool(arr.borrow().is_empty())))
-            }
-            other => Err(format!("array.is_empty expects an array, got {:?}", other.type_of())),
+            Value::Array(arr) => Ok(NativeCallResult::Return(Value::Bool(
+                arr.borrow().is_empty(),
+            ))),
+            other => Err(format!(
+                "array.is_empty expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1125,7 +1131,10 @@ fn create_array_get_fn() -> Value {
                     )))
                 }
             }
-            other => Err(format!("array.get expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.get expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1137,10 +1146,17 @@ fn create_array_first_fn() -> Value {
             Value::Array(arr) => {
                 let borrowed = arr.borrow();
                 Ok(NativeCallResult::Return(
-                    borrowed.first().cloned().map(Value::some).unwrap_or_else(Value::none),
+                    borrowed
+                        .first()
+                        .cloned()
+                        .map(Value::some)
+                        .unwrap_or_else(Value::none),
                 ))
             }
-            other => Err(format!("array.first expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.first expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1152,10 +1168,17 @@ fn create_array_last_fn() -> Value {
             Value::Array(arr) => {
                 let borrowed = arr.borrow();
                 Ok(NativeCallResult::Return(
-                    borrowed.last().cloned().map(Value::some).unwrap_or_else(Value::none),
+                    borrowed
+                        .last()
+                        .cloned()
+                        .map(Value::some)
+                        .unwrap_or_else(Value::none),
                 ))
             }
-            other => Err(format!("array.last expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.last expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1180,7 +1203,10 @@ fn create_array_push_fn() -> Value {
                 borrowed.push(args[1].clone());
                 Ok(NativeCallResult::Return(Value::Nil))
             }
-            other => Err(format!("array.push expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.push expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1195,7 +1221,10 @@ fn create_array_pop_fn() -> Value {
                     popped.map(Value::some).unwrap_or_else(Value::none),
                 ))
             }
-            other => Err(format!("array.pop expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.pop expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1224,7 +1253,10 @@ fn create_array_insert_fn() -> Value {
                 borrowed.insert(idx, args[2].clone());
                 Ok(NativeCallResult::Return(Value::Nil))
             }
-            other => Err(format!("array.insert expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.insert expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1247,7 +1279,10 @@ fn create_array_remove_fn() -> Value {
                     Ok(NativeCallResult::Return(Value::none()))
                 }
             }
-            other => Err(format!("array.remove expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.remove expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1260,7 +1295,10 @@ fn create_array_clear_fn() -> Value {
                 arr.borrow_mut().clear();
                 Ok(NativeCallResult::Return(Value::Nil))
             }
-            other => Err(format!("array.clear expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.clear expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1287,7 +1325,10 @@ fn create_array_slice_fn() -> Value {
                 let sliced = borrowed[s..e].to_vec();
                 Ok(NativeCallResult::Return(Value::array(sliced)))
             }
-            other => Err(format!("array.slice expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.slice expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1306,7 +1347,10 @@ fn create_array_concat_fn() -> Value {
                 let parts: Vec<String> = borrowed.iter().map(|v| format!("{}", v)).collect();
                 Ok(NativeCallResult::Return(Value::string(parts.join(sep))))
             }
-            other => Err(format!("array.concat expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.concat expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1352,19 +1396,22 @@ fn create_array_sort_fn() -> Value {
                         (Value::Float(f1), Value::Float(f2)) => {
                             f1.partial_cmp(f2).unwrap_or(std::cmp::Ordering::Equal)
                         }
-                        (Value::Int(i), Value::Float(f)) => {
-                            (*i as f64).partial_cmp(f).unwrap_or(std::cmp::Ordering::Equal)
-                        }
-                        (Value::Float(f), Value::Int(i)) => {
-                            f.partial_cmp(&(*i as f64)).unwrap_or(std::cmp::Ordering::Equal)
-                        }
+                        (Value::Int(i), Value::Float(f)) => (*i as f64)
+                            .partial_cmp(f)
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                        (Value::Float(f), Value::Int(i)) => f
+                            .partial_cmp(&(*i as f64))
+                            .unwrap_or(std::cmp::Ordering::Equal),
                         (Value::String(s1), Value::String(s2)) => s1.cmp(s2),
                         _ => format!("{}", a).cmp(&format!("{}", b)),
                     });
                 }
                 Ok(NativeCallResult::Return(Value::Nil))
             }
-            other => Err(format!("array.sort expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.sort expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1377,7 +1424,10 @@ fn create_array_reverse_fn() -> Value {
                 arr.borrow_mut().reverse();
                 Ok(NativeCallResult::Return(Value::Nil))
             }
-            other => Err(format!("array.reverse expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.reverse expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1393,7 +1443,10 @@ fn create_array_contains_fn() -> Value {
                 let contains = arr.borrow().iter().any(|v| v == target);
                 Ok(NativeCallResult::Return(Value::Bool(contains)))
             }
-            other => Err(format!("array.contains expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.contains expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1416,7 +1469,10 @@ fn create_array_map_fn() -> Value {
                 }
                 Ok(NativeCallResult::Return(Value::array(mapped)))
             }
-            other => Err(format!("array.map expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.map expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1433,7 +1489,8 @@ fn create_array_filter_fn() -> Value {
                 let mut filtered = Vec::new();
                 for item in borrowed {
                     let res = VM::with_current(|vm| {
-                        vm.call_value(func, vec![item.clone()]).map_err(|e| e.to_string())
+                        vm.call_value(func, vec![item.clone()])
+                            .map_err(|e| e.to_string())
                     })?;
                     let keep = unwrap_first_return(res);
                     if keep.is_truthy() {
@@ -1442,7 +1499,10 @@ fn create_array_filter_fn() -> Value {
                 }
                 Ok(NativeCallResult::Return(Value::array(filtered)))
             }
-            other => Err(format!("array.filter expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.filter expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1461,13 +1521,17 @@ fn create_array_reduce_fn() -> Value {
                 let borrowed = arr.borrow().clone();
                 for item in borrowed {
                     let res = VM::with_current(|vm| {
-                        vm.call_value(func, vec![acc.clone(), item]).map_err(|e| e.to_string())
+                        vm.call_value(func, vec![acc.clone(), item])
+                            .map_err(|e| e.to_string())
                     })?;
                     acc = unwrap_first_return(res);
                 }
                 Ok(NativeCallResult::Return(acc))
             }
-            other => Err(format!("array.reduce expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.reduce expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1483,7 +1547,10 @@ fn create_array_iter_fn() -> Value {
                     std::cell::RefCell::new(iter),
                 ))))
             }
-            other => Err(format!("array.iter expects an array, got {:?}", other.type_of())),
+            other => Err(format!(
+                "array.iter expects an array, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1508,7 +1575,9 @@ fn create_map_len_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
         let val = args.get(0).cloned().unwrap_or(Value::Nil);
         match val {
-            Value::Map(m) => Ok(NativeCallResult::Return(Value::Int(m.borrow().len() as LustInt))),
+            Value::Map(m) => Ok(NativeCallResult::Return(Value::Int(
+                m.borrow().len() as LustInt
+            ))),
             other => Err(format!("map.len expects a map, got {:?}", other.type_of())),
         }
     }))
@@ -1519,7 +1588,10 @@ fn create_map_is_empty_fn() -> Value {
         let val = args.get(0).cloned().unwrap_or(Value::Nil);
         match val {
             Value::Map(m) => Ok(NativeCallResult::Return(Value::Bool(m.borrow().is_empty()))),
-            other => Err(format!("map.is_empty expects a map, got {:?}", other.type_of())),
+            other => Err(format!(
+                "map.is_empty expects a map, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1596,7 +1668,10 @@ fn create_map_delete_fn() -> Value {
                     removed.map(Value::some).unwrap_or_else(Value::none),
                 ))
             }
-            other => Err(format!("map.delete expects a map, got {:?}", other.type_of())),
+            other => Err(format!(
+                "map.delete expects a map, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1609,7 +1684,10 @@ fn create_map_clear_fn() -> Value {
                 m.borrow_mut().clear();
                 Ok(NativeCallResult::Return(Value::Nil))
             }
-            other => Err(format!("map.clear expects a map, got {:?}", other.type_of())),
+            other => Err(format!(
+                "map.clear expects a map, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1635,7 +1713,10 @@ fn create_map_values_fn() -> Value {
                 let values: Vec<Value> = m.borrow().values().cloned().collect();
                 Ok(NativeCallResult::Return(Value::array(values)))
             }
-            other => Err(format!("map.values expects a map, got {:?}", other.type_of())),
+            other => Err(format!(
+                "map.values expects a map, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1699,7 +1780,10 @@ fn create_math_abs_fn() -> Value {
         match val {
             Value::Int(i) => Ok(NativeCallResult::Return(Value::Int(i.abs()))),
             Value::Float(f) => Ok(NativeCallResult::Return(Value::Float(f.abs()))),
-            other => Err(format!("math.abs expects a number, got {:?}", other.type_of())),
+            other => Err(format!(
+                "math.abs expects a number, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1710,7 +1794,10 @@ fn create_math_floor_fn() -> Value {
         match val {
             Value::Int(i) => Ok(NativeCallResult::Return(Value::Int(i))),
             Value::Float(f) => Ok(NativeCallResult::Return(Value::Int(f.floor() as LustInt))),
-            other => Err(format!("math.floor expects a number, got {:?}", other.type_of())),
+            other => Err(format!(
+                "math.floor expects a number, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1721,7 +1808,10 @@ fn create_math_ceil_fn() -> Value {
         match val {
             Value::Int(i) => Ok(NativeCallResult::Return(Value::Int(i))),
             Value::Float(f) => Ok(NativeCallResult::Return(Value::Int(f.ceil() as LustInt))),
-            other => Err(format!("math.ceil expects a number, got {:?}", other.type_of())),
+            other => Err(format!(
+                "math.ceil expects a number, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1732,7 +1822,10 @@ fn create_math_round_fn() -> Value {
         match val {
             Value::Int(i) => Ok(NativeCallResult::Return(Value::Int(i))),
             Value::Float(f) => Ok(NativeCallResult::Return(Value::Float(f.round()))),
-            other => Err(format!("math.round expects a number, got {:?}", other.type_of())),
+            other => Err(format!(
+                "math.round expects a number, got {:?}",
+                other.type_of()
+            )),
         }
     }))
 }
@@ -1914,9 +2007,9 @@ fn create_math_clamp_fn() -> Value {
         let min = unwrap_lua_value(args[1].clone());
         let max = unwrap_lua_value(args[2].clone());
         match (&x, &min, &max) {
-            (Value::Int(xi), Value::Int(mini), Value::Int(maxi)) => {
-                Ok(NativeCallResult::Return(Value::Int((*xi).max(*mini).min(*maxi))))
-            }
+            (Value::Int(xi), Value::Int(mini), Value::Int(maxi)) => Ok(NativeCallResult::Return(
+                Value::Int((*xi).max(*mini).min(*maxi)),
+            )),
             _ => {
                 let xf = x
                     .as_float()
@@ -1930,7 +2023,9 @@ fn create_math_clamp_fn() -> Value {
                     .as_float()
                     .or_else(|| max.as_int().map(|i| i as f64))
                     .ok_or_else(|| "math.clamp expects numbers".to_string())?;
-                Ok(NativeCallResult::Return(Value::Float(xf.max(minf).min(maxf))))
+                Ok(NativeCallResult::Return(Value::Float(
+                    xf.max(minf).min(maxf),
+                )))
             }
         }
     }))

@@ -102,15 +102,15 @@ local string = __lua_first(lua.require("string"))
 local math = __lua_first(lua.nil)
 local socket = __lua_first(lua.require("socket.core"))
 local _M = socket
-pub function connect4(address: LuaValue, port: LuaValue, laddress: LuaValue, lport: LuaValue): Array<LuaValue>
+function connect4(address: LuaValue, port: LuaValue, laddress: LuaValue, lport: LuaValue): Array<LuaValue>
     return __lua_force_array(socket.connect(address, port, laddress, lport, lua.to_value("inet")))
 end
 _M.connect4 = connect4
-pub function connect6(address: LuaValue, port: LuaValue, laddress: LuaValue, lport: LuaValue): Array<LuaValue>
+function connect6(address: LuaValue, port: LuaValue, laddress: LuaValue, lport: LuaValue): Array<LuaValue>
     return __lua_force_array(socket.connect(address, port, laddress, lport, lua.to_value("inet6")))
 end
 _M.connect6 = connect6
-pub function bind(host: LuaValue, port: LuaValue, backlog: LuaValue): Array<LuaValue>
+function bind(host: LuaValue, port: LuaValue, backlog: LuaValue): Array<LuaValue>
     if __lua_truthy(lua.op_eq(host, lua.to_value("*" ))) then
         host = lua.to_value("0.0.0.0" )
     end
@@ -161,7 +161,7 @@ pub function bind(host: LuaValue, port: LuaValue, backlog: LuaValue): Array<LuaV
 end
 _M.bind = bind
 _M.try = __lua_first(_M.newtry())
-pub function choose(table: LuaValue): Array<LuaValue>
+function choose(table: LuaValue): Array<LuaValue>
     return __lua_pack([lua.to_value(function(name: LuaValue, opt1: LuaValue, opt2: LuaValue): Array<LuaValue>
         if __lua_truthy(lua.op_ne(__lua_first(base["type"](name)), lua.to_value("string" ))) then
             name, opt1, opt2 = lua.to_value("default"), name, opt1

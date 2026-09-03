@@ -1204,13 +1204,13 @@ mod tests {
             r#"
 local a: int = 1
 
-pub function f(): int
+function f(): int
     return a
 end
 
 local b: int = 2
 
-pub function g(): int
+function g(): int
     return b
 end
 
@@ -1278,6 +1278,69 @@ end
 
         assert!(program.modules.iter().any(|m| m.path == "a"));
         assert!(!program.modules.iter().any(|m| m.path == "missing.module"));
+
+        // Best-effort cleanup.
+        let _ = fs::remove_file(entry_path);
+        let _ = fs::remove_file(module_path);
+        let _ = fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn exported_by_default_and_local_privatizes() {
+        let dir = unique_temp_dir("lust_module_visibility_test");
+        fs::create_dir_all(&dir).unwrap();
+        let entry_path = dir.join("main.lust");
+        let module_path = dir.join("lib.lust");
+
+        fs::write(
+            &module_path,
+            r#"
+struct ExportedStruct
+    x: int
+    local secret: int
+end
+
+local struct PrivateStruct
+    y: int
+end
+
+function exported_fn(): int
+    return 1
+end
+
+local function private_fn(): int
+    return 2
+end
+
+enum ExportedEnum
+    VariantA
+end
+
+local enum PrivateEnum
+    VariantB
+end
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            &entry_path,
+            "use lib.{ExportedStruct, exported_fn, ExportedEnum}\n",
+        )
+        .unwrap();
+
+        let mut loader = ModuleLoader::new(dir.clone());
+        let program = loader
+            .load_program_from_entry(entry_path.to_str().unwrap())
+            .unwrap();
+
+        let lib_module = program.modules.iter().find(|m| m.path == "lib").unwrap();
+        assert!(lib_module.exports.types.contains_key("ExportedStruct"));
+        assert!(lib_module.exports.types.contains_key("ExportedEnum"));
+        assert!(lib_module.exports.functions.contains_key("exported_fn"));
+        assert!(!lib_module.exports.types.contains_key("PrivateStruct"));
+        assert!(!lib_module.exports.types.contains_key("PrivateEnum"));
+        assert!(!lib_module.exports.functions.contains_key("private_fn"));
 
         // Best-effort cleanup.
         let _ = fs::remove_file(entry_path);

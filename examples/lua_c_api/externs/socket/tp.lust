@@ -152,15 +152,15 @@ local metat = (function()
     local __shared___index_0 = lua.table()
     return LuaTable { table = { ["__index"] = __shared___index_0 }, metamethods = { __index = __shared___index_0 } }
 end)()
-pub function metat_getpeername(self: LuaValue): Array<LuaValue>
+function metat_getpeername(self: LuaValue): Array<LuaValue>
     return __lua_force_array(__lua_first(lua.call_method(self.c, "getpeername")))
 end
 metat.__index.getpeername = metat_getpeername
-pub function metat_getsockname(self: LuaValue): Array<LuaValue>
+function metat_getsockname(self: LuaValue): Array<LuaValue>
     return __lua_force_array(__lua_first(lua.call_method(self.c, "getpeername")))
 end
 metat.__index.getsockname = metat_getsockname
-pub function metat_check(self: LuaValue, ok: LuaValue): Array<LuaValue>
+function metat_check(self: LuaValue, ok: LuaValue): Array<LuaValue>
     local code, reply
     local __lua_ret = get_reply(self.c)
     code = __lua_nth(__lua_ret, 0)
@@ -193,7 +193,7 @@ pub function metat_check(self: LuaValue, ok: LuaValue): Array<LuaValue>
     end
 end
 metat.__index.check = metat_check
-pub function metat_command(self: LuaValue, cmd: LuaValue, arg: LuaValue): Array<LuaValue>
+function metat_command(self: LuaValue, cmd: LuaValue, arg: LuaValue): Array<LuaValue>
     cmd = __lua_first(string.upper(cmd))
     if __lua_truthy(arg) then
         return __lua_force_array(__lua_first(lua.call_method(self.c, "send", lua.op_concat(cmd, lua.op_concat(lua.to_value(" " ), lua.op_concat(arg, lua.to_value("\r\n")))))))
@@ -202,7 +202,7 @@ pub function metat_command(self: LuaValue, cmd: LuaValue, arg: LuaValue): Array<
     end
 end
 metat.__index.command = metat_command
-pub function metat_sink(self: LuaValue, snk: LuaValue, pat: LuaValue): Array<LuaValue>
+function metat_sink(self: LuaValue, snk: LuaValue, pat: LuaValue): Array<LuaValue>
     local chunk, err
     local __lua_ret = __lua_first(lua.call_method(self.c, "receive", pat))
     chunk = __lua_nth(__lua_ret, 0)
@@ -210,27 +210,27 @@ pub function metat_sink(self: LuaValue, snk: LuaValue, pat: LuaValue): Array<Lua
     return __lua_force_array(snk(chunk, err))
 end
 metat.__index.sink = metat_sink
-pub function metat_send(self: LuaValue, data: LuaValue): Array<LuaValue>
+function metat_send(self: LuaValue, data: LuaValue): Array<LuaValue>
     return __lua_force_array(__lua_first(lua.call_method(self.c, "send", data)))
 end
 metat.__index.send = metat_send
-pub function metat_receive(self: LuaValue, pat: LuaValue): Array<LuaValue>
+function metat_receive(self: LuaValue, pat: LuaValue): Array<LuaValue>
     return __lua_force_array(__lua_first(lua.call_method(self.c, "receive", pat)))
 end
 metat.__index.receive = metat_receive
-pub function metat_getfd(self: LuaValue): Array<LuaValue>
+function metat_getfd(self: LuaValue): Array<LuaValue>
     return __lua_force_array(__lua_first(lua.call_method(self.c, "getfd")))
 end
 metat.__index.getfd = metat_getfd
-pub function metat_dirty(self: LuaValue): Array<LuaValue>
+function metat_dirty(self: LuaValue): Array<LuaValue>
     return __lua_force_array(__lua_first(lua.call_method(self.c, "dirty")))
 end
 metat.__index.dirty = metat_dirty
-pub function metat_getcontrol(self: LuaValue): Array<LuaValue>
+function metat_getcontrol(self: LuaValue): Array<LuaValue>
     return __lua_pack([lua.to_value(self.c)])
 end
 metat.__index.getcontrol = metat_getcontrol
-pub function metat_source(self: LuaValue, source: LuaValue, step: LuaValue): Array<LuaValue>
+function metat_source(self: LuaValue, source: LuaValue, step: LuaValue): Array<LuaValue>
     local sink = __lua_first(socket.sink(lua.to_value("keep-open"), self.c))
     local ret, err
     local __lua_ret = ltn12.pump.all(source, sink, __lua_or(step, ltn12.pump.step))
@@ -240,13 +240,13 @@ pub function metat_source(self: LuaValue, source: LuaValue, step: LuaValue): Arr
     return __lua_join(__lua_ret, [lua.to_value(err)])
 end
 metat.__index.source = metat_source
-pub function metat_close(self: LuaValue): Array<LuaValue>
+function metat_close(self: LuaValue): Array<LuaValue>
     __lua_first(__lua_first(lua.call_method(self.c, "close")))
     return __lua_pack([lua.to_value(lua.to_value(1
 ))])
 end
 metat.__index.close = metat_close
-pub function connect(host: LuaValue, port: LuaValue, timeout: LuaValue, create: LuaValue): Array<LuaValue>
+function connect(host: LuaValue, port: LuaValue, timeout: LuaValue, create: LuaValue): Array<LuaValue>
     local c, e
     local __lua_ret = (__lua_or(create, socket.tcp))()
     c = __lua_nth(__lua_ret, 0)

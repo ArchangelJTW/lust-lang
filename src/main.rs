@@ -139,7 +139,7 @@ fn print_help(program: &str) {
         program
     );
     println!(
-        "    {} --dump-externs <script.lust>    Create extern stubs for rust library modules",
+        "    {} --dump-externs <script.lust>    Create extern stubs for rust or Lua 5.1 C API library modules; reads from lust-config.toml",
         program
     );
     #[cfg(feature = "lua_transpile")]
@@ -190,7 +190,7 @@ fn write_placeholder_lua_stub(
         fs::create_dir_all(parent)?;
     }
     let contents = format!(
-        "-- Placeholder extern stub for Lua module '{module}' from dependency '{dep}'.\n-- TODO: replace with traced API surface.\n\npub extern\nend\n",
+        "-- Placeholder extern stub for Lua module '{module}' from dependency '{dep}'.\n-- TODO: replace with traced API surface.\n\nextern\nend\n",
         module = module_name,
         dep = dep_name
     );

@@ -1,10 +1,10 @@
-pub enum Operation
+enum Operation
     Double
     Triple
     Scale(int)
 end
 
-pub extern
+extern
     function apply_operation(Operation, int): int
     function host_triple(int): int
     function make_scale(int): Operation

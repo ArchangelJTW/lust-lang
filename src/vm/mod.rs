@@ -17,9 +17,7 @@ pub(super) use crate::error::StackFrame;
 pub(super) use crate::jit::{
     JitCompiler, JitState, TraceOptimizer, TraceRecorder, MAX_TRACE_LENGTH,
 };
-pub(super) use crate::number::{
-    float_from_int, int_from_usize, LustFloat, LustInt,
-};
+pub(super) use crate::number::{float_from_int, int_from_usize, LustFloat, LustInt};
 pub(super) use crate::{LustError, Result};
 pub(super) use alloc::{
     format,

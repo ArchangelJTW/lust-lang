@@ -41,8 +41,6 @@ fn is_keyword(name: &str) -> bool {
             | "or"
             | "not"
             | "extern"
-            | "unsafe"
-            | "pub"
             | "use"
             | "module"
     )
@@ -630,7 +628,7 @@ impl Emitter {
                 if let Some(sig) = self.export_wrappers.get(name) {
                     let params = sig.params.join(", ");
                     let args = sig.args.join(", ");
-                    export_lines.push(format!("pub function {name}({params}): Array<LuaValue>"));
+                    export_lines.push(format!("function {name}({params}): Array<LuaValue>"));
                     export_lines.push(format!("    return {path}({args})"));
                     export_lines.push("end".to_string());
                 }
@@ -882,9 +880,7 @@ impl Emitter {
             if let Some(exports) = self.extract_exports(ret) {
                 for (name, expr) in exports {
                     if self.analyzer.exports.contains(&name) {
-                        self.push_line(format!(
-                            "local {name}: LuaValue = lua.to_value({expr})"
-                        ));
+                        self.push_line(format!("local {name}: LuaValue = lua.to_value({expr})"));
                         self.exported.push(name.clone());
                     }
                 }
@@ -984,7 +980,7 @@ impl Emitter {
             let alias_name = self.export_alias_name(&parts, &export_name);
             let params_str = params.join(", ");
             self.push_line(format!(
-                "pub function {alias_name}({params_str}): Array<LuaValue>"
+                "function {alias_name}({params_str}): Array<LuaValue>"
             ));
             self.indent += 1;
             self.emit_block(func.body().block());
@@ -1011,7 +1007,7 @@ impl Emitter {
                 target
             };
             let prefix = if exported && self.analyzer.module_decl.is_none() {
-                "pub function"
+                "function"
             } else {
                 "function"
             };
@@ -1592,9 +1588,7 @@ impl Emitter {
                 }
                 Some(format!("{}:maxn()", rendered[0]))
             }
-            "math.abs" => {
-                Some(format!("math.abs({})", rendered.join(", ")))
-            }
+            "math.abs" => Some(format!("math.abs({})", rendered.join(", "))),
             "math.mod" => {
                 if rendered.len() != 2 {
                     return Some(format!("{head}({})", rendered.join(", ")));
@@ -1604,12 +1598,8 @@ impl Emitter {
                     rendered[0], rendered[1]
                 ))
             }
-            "math.min" => {
-                Some(format!("math.min({})", rendered.join(", ")))
-            }
-            "math.max" => {
-                Some(format!("math.max({})", rendered.join(", ")))
-            }
+            "math.min" => Some(format!("math.min({})", rendered.join(", "))),
+            "math.max" => Some(format!("math.max({})", rendered.join(", "))),
             "math.random" => {
                 let m = rendered.get(0).cloned().unwrap_or_else(|| nil.clone());
                 let n = rendered.get(1).cloned().unwrap_or_else(|| nil.clone());
@@ -1827,8 +1817,6 @@ impl Emitter {
                 | "or"
                 | "not"
                 | "extern"
-                | "unsafe"
-                | "pub"
                 | "use"
                 | "module"
         )

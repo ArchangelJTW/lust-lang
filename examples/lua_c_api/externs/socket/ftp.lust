@@ -125,7 +125,7 @@ local metat = (function()
     local __shared___index_0 = lua.table()
     return LuaTable { table = { ["__index"] = __shared___index_0 }, metamethods = { __index = __shared___index_0 } }
 end)()
-pub function open(server: LuaValue, port: LuaValue, create: LuaValue): Array<LuaValue>
+function open(server: LuaValue, port: LuaValue, create: LuaValue): Array<LuaValue>
     local tp = __lua_first(socket.try(tp.connect(server, __lua_or(port, PORT), _M.TIMEOUT, create)))
     local f = __lua_first(base.setmetatable(lua.table_from_entries([("tp", tp)]), metat))
     -- make sure everything gets closed in an exception
@@ -135,19 +135,19 @@ pub function open(server: LuaValue, port: LuaValue, create: LuaValue): Array<Lua
     return __lua_pack([lua.to_value(f)])
 end
 _M.open = open
-pub function metat_portconnect(self: LuaValue): Array<LuaValue>
+function metat_portconnect(self: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_first(lua.call_method(self.server, "settimeout", _M.TIMEOUT))))
     self.data = __lua_first(self.try(__lua_first(lua.call_method(self.server, "accept"))))
     __lua_first(self.try(__lua_first(lua.call_method(self.data, "settimeout", _M.TIMEOUT))))
 end
 metat.__index.portconnect = metat_portconnect
-pub function metat_pasvconnect(self: LuaValue): Array<LuaValue>
+function metat_pasvconnect(self: LuaValue): Array<LuaValue>
     self.data = __lua_first(self.try(socket.tcp()))
     __lua_first(self.try(__lua_first(lua.call_method(self.data, "settimeout", _M.TIMEOUT))))
     __lua_first(self.try(__lua_first(lua.call_method(self.data, "connect", self.pasvt.address, self.pasvt.port))))
 end
 metat.__index.pasvconnect = metat_pasvconnect
-pub function metat_login(self: LuaValue, user: LuaValue, password: LuaValue): Array<LuaValue>
+function metat_login(self: LuaValue, user: LuaValue, password: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("user"), __lua_or(user, _M.USER)))))
     local code, _
     local __lua_ret = self.try(__lua_first(lua.call_method(self.tp, "check", lua.table_from_entries([(1, lua.to_value("2..")), (2, lua.to_value(331))]))))
@@ -161,7 +161,7 @@ pub function metat_login(self: LuaValue, user: LuaValue, password: LuaValue): Ar
 ))])
 end
 metat.__index.login = metat_login
-pub function metat_pasv(self: LuaValue): Array<LuaValue>
+function metat_pasv(self: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("pasv")))))
     local _, reply
     local __lua_ret = self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2.."))))
@@ -187,7 +187,7 @@ pub function metat_pasv(self: LuaValue): Array<LuaValue>
     return __lua_join(__lua_ret, [lua.to_value(self.pasvt.port)])
 end
 metat.__index.pasv = metat_pasv
-pub function metat_epsv(self: LuaValue): Array<LuaValue>
+function metat_epsv(self: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("epsv")))))
     local _, reply
     local __lua_ret = self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("229"))))
@@ -211,7 +211,7 @@ pub function metat_epsv(self: LuaValue): Array<LuaValue>
     return __lua_join(__lua_ret, [lua.to_value(self.pasvt.port)])
 end
 metat.__index.epsv = metat_epsv
-pub function metat_port(self: LuaValue, address: LuaValue, port: LuaValue): Array<LuaValue>
+function metat_port(self: LuaValue, address: LuaValue, port: LuaValue): Array<LuaValue>
     self.pasvt = lua.nil
     if __lua_truthy(not __lua_truthy(address)) then
         address = __lua_first(self.try(__lua_first(lua.call_method(self.tp, "getsockname"))))
@@ -231,7 +231,7 @@ pub function metat_port(self: LuaValue, address: LuaValue, port: LuaValue): Arra
 ))])
 end
 metat.__index.port = metat_port
-pub function metat_eprt(self: LuaValue, family: LuaValue, address: LuaValue, port: LuaValue): Array<LuaValue>
+function metat_eprt(self: LuaValue, family: LuaValue, address: LuaValue, port: LuaValue): Array<LuaValue>
     self.pasvt = lua.nil
     if __lua_truthy(not __lua_truthy(address)) then
         address = __lua_first(self.try(__lua_first(lua.call_method(self.tp, "getsockname"))))
@@ -248,7 +248,7 @@ pub function metat_eprt(self: LuaValue, family: LuaValue, address: LuaValue, por
 ))])
 end
 metat.__index.eprt = metat_eprt
-pub function metat_send(self: LuaValue, sendt: LuaValue): Array<LuaValue>
+function metat_send(self: LuaValue, sendt: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_or(self.pasvt, self.server), lua.to_value("need port or pasv first")))
     if __lua_truthy(self.pasvt) then
         __lua_first(__lua_first(lua.call_method(self, "pasvconnect")))
@@ -290,7 +290,7 @@ pub function metat_send(self: LuaValue, sendt: LuaValue): Array<LuaValue>
     return __lua_pack([lua.to_value(sent)])
 end
 metat.__index.send = metat_send
-pub function metat_receive(self: LuaValue, recvt: LuaValue): Array<LuaValue>
+function metat_receive(self: LuaValue, recvt: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_or(self.pasvt, self.server), lua.to_value("need port or pasv first")))
     if __lua_truthy(self.pasvt) then
         __lua_first(__lua_first(lua.call_method(self, "pasvconnect")))
@@ -326,21 +326,21 @@ pub function metat_receive(self: LuaValue, recvt: LuaValue): Array<LuaValue>
 ))])
 end
 metat.__index.receive = metat_receive
-pub function metat_cwd(self: LuaValue, dir: LuaValue): Array<LuaValue>
+function metat_cwd(self: LuaValue, dir: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("cwd"), dir))))
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value(250)))))
     return __lua_pack([lua.to_value(lua.to_value(1
 ))])
 end
 metat.__index.cwd = metat_cwd
-pub function metat_type_(self: LuaValue, type_: LuaValue): Array<LuaValue>
+function metat_type_(self: LuaValue, type_: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("type"), type_))))
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value(200)))))
     return __lua_pack([lua.to_value(lua.to_value(1
 ))])
 end
 metat.__index.type_ = metat_type_
-pub function metat_greet(self: LuaValue): Array<LuaValue>
+function metat_greet(self: LuaValue): Array<LuaValue>
     local code = __lua_first(self.try(__lua_first(lua.call_method(self.tp, "check", lua.table_from_entries([(1, lua.to_value("1..")), (2, lua.to_value("2.."))])))))
     if __lua_truthy(__lua_first(string.find(code, lua.to_value("1..")))) then
         __lua_first(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
@@ -349,14 +349,14 @@ pub function metat_greet(self: LuaValue): Array<LuaValue>
 ))])
 end
 metat.__index.greet = metat_greet
-pub function metat_quit(self: LuaValue): Array<LuaValue>
+function metat_quit(self: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("quit")))))
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
     return __lua_pack([lua.to_value(lua.to_value(1
 ))])
 end
 metat.__index.quit = metat_quit
-pub function metat_close(self: LuaValue): Array<LuaValue>
+function metat_close(self: LuaValue): Array<LuaValue>
     if __lua_truthy(self.data) then
         __lua_first(__lua_first(lua.call_method(self.data, "close")))
     end
@@ -473,15 +473,15 @@ _M.get = __lua_first(lua.socket_protect(function(gett: LuaValue): Array<LuaValue
     end
 end))
 local PASSWORD: LuaValue = _M.PASSWORD
-pub function command(cmdt: LuaValue): Array<LuaValue>
+function command(cmdt: LuaValue): Array<LuaValue>
     return _M.command(cmdt)
 end
 local ftp: LuaValue = socket.ftp
 local genericform: LuaValue = _M.genericform
-pub function get(gett: LuaValue): Array<LuaValue>
+function get(gett: LuaValue): Array<LuaValue>
     return _M.get(gett)
 end
-pub function put(putt: LuaValue, body: LuaValue): Array<LuaValue>
+function put(putt: LuaValue, body: LuaValue): Array<LuaValue>
     return _M.put(putt, body)
 end
 return __lua_pack([lua.to_value(_M)])

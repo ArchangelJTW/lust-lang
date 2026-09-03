@@ -19,10 +19,10 @@ impl Parser {
     #[inline(never)]
     pub(super) fn parse_item(&mut self) -> Result<Item> {
         let start_token = self.current_token().clone();
-        let visibility = if self.match_token(&[TokenKind::Pub]) {
-            Visibility::Public
-        } else {
+        let visibility = if self.match_token(&[TokenKind::Local]) {
             Visibility::Private
+        } else {
+            Visibility::Public
         };
 
         #[cfg(feature = "esp32c6-logging")]
@@ -72,7 +72,7 @@ impl Parser {
                                 self.consume(TokenKind::RightBrace, "Expected '}' after glob")?;
                                 return Ok(Item::new(
                                     ItemKind::Use {
-                                        public: visibility == Visibility::Public,
+                                        public: false,
                                         tree: crate::ast::UseTree::Glob { prefix: path },
                                     },
                                     self.make_span(&start_token, &self.tokens[self.current - 1]),
@@ -102,7 +102,7 @@ impl Parser {
                         let end_token = self.tokens[self.current - 1].clone();
                         return Ok(Item::new(
                             ItemKind::Use {
-                                public: visibility == Visibility::Public,
+                                public: false,
                                 tree: crate::ast::UseTree::Group {
                                     prefix: path,
                                     items,
@@ -116,7 +116,7 @@ impl Parser {
                         let end_token = self.tokens[self.current - 1].clone();
                         return Ok(Item::new(
                             ItemKind::Use {
-                                public: visibility == Visibility::Public,
+                                public: false,
                                 tree: crate::ast::UseTree::Glob { prefix: path },
                             },
                             self.make_span(&start_token, &end_token),
@@ -132,7 +132,7 @@ impl Parser {
                     None
                 };
                 ItemKind::Use {
-                    public: visibility == Visibility::Public,
+                    public: false,
                     tree: crate::ast::UseTree::Path {
                         path,
                         alias,
@@ -356,10 +356,10 @@ impl Parser {
         let (type_params, trait_bounds) = self.parse_type_params_with_bounds()?;
         let mut fields = Vec::new();
         while !self.check(TokenKind::End) && !self.is_at_end() {
-            let field_vis = if self.match_token(&[TokenKind::Pub]) {
-                Visibility::Public
-            } else {
+            let field_vis = if self.match_token(&[TokenKind::Local]) {
                 Visibility::Private
+            } else {
+                Visibility::Public
             };
             let field_name = self.expect_identifier()?;
             self.consume(TokenKind::Colon, "Expected ':' after field name")?;
@@ -556,7 +556,12 @@ impl Parser {
         };
         let mut methods = Vec::new();
         while !self.check(TokenKind::End) && !self.is_at_end() {
-            let func_def = self.parse_function(Visibility::Public)?;
+            let visibility = if self.match_token(&[TokenKind::Local]) {
+                Visibility::Private
+            } else {
+                Visibility::Public
+            };
+            let func_def = self.parse_function(visibility)?;
             methods.push(func_def);
         }
 

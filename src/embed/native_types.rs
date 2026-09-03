@@ -609,8 +609,8 @@ fn impl_module(impl_block: &ImplBlock) -> Option<String> {
 
 fn format_struct_def(name: String, def: &StructDef) -> String {
     let mut out = String::new();
-    if matches!(def.visibility, Visibility::Public) {
-        out.push_str("pub ");
+    if matches!(def.visibility, Visibility::Private) {
+        out.push_str("local ");
     }
     out.push_str("struct ");
     out.push_str(&name);
@@ -622,8 +622,8 @@ fn format_struct_def(name: String, def: &StructDef) -> String {
     out.push('\n');
     for field in &def.fields {
         out.push_str("    ");
-        if matches!(field.visibility, Visibility::Public) {
-            out.push_str("pub ");
+        if matches!(field.visibility, Visibility::Private) {
+            out.push_str("local ");
         }
         out.push_str(&field.name);
         out.push_str(": ");
@@ -648,8 +648,8 @@ fn format_struct_def(name: String, def: &StructDef) -> String {
 
 fn format_enum_def(name: String, def: &EnumDef) -> String {
     let mut out = String::new();
-    if matches!(def.visibility, Visibility::Public) {
-        out.push_str("pub ");
+    if matches!(def.visibility, Visibility::Private) {
+        out.push_str("local ");
     }
     out.push_str("enum ");
     out.push_str(&name);
@@ -676,8 +676,8 @@ fn format_enum_def(name: String, def: &EnumDef) -> String {
 
 fn format_trait_def(name: String, def: &TraitDef) -> String {
     let mut out = String::new();
-    if matches!(def.visibility, Visibility::Public) {
-        out.push_str("pub ");
+    if matches!(def.visibility, Visibility::Private) {
+        out.push_str("local ");
     }
     out.push_str("trait ");
     out.push_str(&name);
@@ -698,7 +698,7 @@ fn format_trait_def(name: String, def: &TraitDef) -> String {
 
 fn format_const_def(name: String, ty: &Type) -> String {
     let mut out = String::new();
-    out.push_str("pub const ");
+    out.push_str("const ");
     out.push_str(&name);
     out.push_str(": ");
     out.push_str(&format_type(ty));

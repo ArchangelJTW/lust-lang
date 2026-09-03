@@ -46,12 +46,12 @@ fn main() -> lust::Result<()> {
             name = "Lust Point"
         }
 
-        pub function translate(point: Point, dx: int, dy: int): Point
+        function translate(point: Point, dx: int, dy: int): Point
             println("Point Name: " .. point.name)
             return Point { x = point.x + dx, y = point.y + dy, name = point.name }
         end
 
-        pub function summarize(values: Array<int>): int
+        function summarize(values: Array<int>): int
             local total: int = 0
             for value in values do
                 total = total + value
@@ -59,7 +59,7 @@ fn main() -> lust::Result<()> {
             return total
         end
 
-        pub function describe(status: Status): string
+        function describe(status: Status): string
             if status is Pending then
                 return "pending"
             elseif status is Complete(value) then
@@ -68,21 +68,21 @@ fn main() -> lust::Result<()> {
             return "unknown"
         end
 
-        pub function amplify(value: int): int
+        function amplify(value: int): int
             return host_scale(value) * SCALE_FACTOR
         end
 
-        pub function bump_scale(): ()
+        function bump_scale(): ()
             SCALE_FACTOR = SCALE_FACTOR + 1
         end
 
-        pub function get_async_value(): Task
+        function get_async_value(): Task
             return fetch_value(function(value: int)
                 println("callback invoked from Rust with " .. tostring(value))
             end)
         end
 
-        pub function await_fetch(): Option<int>
+        function await_fetch(): Option<int>
             local job = fetch_value(function(value: int)
                 println("callback (await) saw " .. tostring(value))
             end)

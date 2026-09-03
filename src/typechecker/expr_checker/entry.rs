@@ -29,11 +29,7 @@ impl TypeChecker {
         Ok(ty)
     }
 
-    fn check_expr_internal(
-        &mut self,
-        expr: &Expr,
-        expected_type: Option<&Type>,
-    ) -> Result<Type> {
+    fn check_expr_internal(&mut self, expr: &Expr, expected_type: Option<&Type>) -> Result<Type> {
         match &expr.kind {
             ExprKind::Literal(lit) => self.check_literal(lit),
             ExprKind::Identifier(name) => {

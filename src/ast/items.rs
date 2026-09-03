@@ -20,18 +20,9 @@ pub enum ItemKind {
     Enum(EnumDef),
     Trait(TraitDef),
     Impl(ImplBlock),
-    Module {
-        name: String,
-        items: Vec<Item>,
-    },
-    Use {
-        public: bool,
-        tree: UseTree,
-    },
-    Extern {
-        abi: String,
-        items: Vec<ExternItem>,
-    },
+    Module { name: String, items: Vec<Item> },
+    Use { public: bool, tree: UseTree },
+    Extern { abi: String, items: Vec<ExternItem> },
 }
 
 #[derive(Debug, Clone, PartialEq)]

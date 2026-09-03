@@ -132,23 +132,23 @@ local metat = (function()
     local __shared___index_0 = lua.table()
     return LuaTable { table = { ["__index"] = __shared___index_0 }, metamethods = { __index = __shared___index_0 } }
 end)()
-pub function metat_greet(self: LuaValue, domain: LuaValue): Array<LuaValue>
+function metat_greet(self: LuaValue, domain: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("EHLO"), __lua_or(domain, _M.DOMAIN)))))
     return __lua_force_array(lua.socket_skip(lua.to_value(1), self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2.."))))))
 end
 metat.__index.greet = metat_greet
-pub function metat_mail(self: LuaValue, from: LuaValue): Array<LuaValue>
+function metat_mail(self: LuaValue, from: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("MAIL"), lua.op_concat(lua.to_value("FROM:" ), from)))))
     return __lua_force_array(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
 end
 metat.__index.mail = metat_mail
-pub function metat_rcpt(self: LuaValue, to: LuaValue): Array<LuaValue>
+function metat_rcpt(self: LuaValue, to: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("RCPT"), lua.op_concat(lua.to_value("TO:" ), to)))))
     return __lua_force_array(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
 end
 metat.__index.rcpt = metat_rcpt
-pub function metat_data(self: LuaValue, src: LuaValue, step: LuaValue): Array<LuaValue>
+function metat_data(self: LuaValue, src: LuaValue, step: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("DATA")))))
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("3..")))))
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "source", src, step))))
@@ -156,16 +156,16 @@ pub function metat_data(self: LuaValue, src: LuaValue, step: LuaValue): Array<Lu
     return __lua_force_array(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
 end
 metat.__index.data = metat_data
-pub function metat_quit(self: LuaValue): Array<LuaValue>
+function metat_quit(self: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("QUIT")))))
     return __lua_force_array(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
 end
 metat.__index.quit = metat_quit
-pub function metat_close(self: LuaValue): Array<LuaValue>
+function metat_close(self: LuaValue): Array<LuaValue>
     return __lua_force_array(__lua_first(lua.call_method(self.tp, "close")))
 end
 metat.__index.close = metat_close
-pub function metat_login(self: LuaValue, user: LuaValue, password: LuaValue): Array<LuaValue>
+function metat_login(self: LuaValue, user: LuaValue, password: LuaValue): Array<LuaValue>
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("AUTH"), lua.to_value("LOGIN")))))
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("3..")))))
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "send", lua.op_concat(__lua_first(mime.b64(user)), lua.to_value("\r\n"))))))
@@ -174,13 +174,13 @@ pub function metat_login(self: LuaValue, user: LuaValue, password: LuaValue): Ar
     return __lua_force_array(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
 end
 metat.__index.login = metat_login
-pub function metat_plain(self: LuaValue, user: LuaValue, password: LuaValue): Array<LuaValue>
+function metat_plain(self: LuaValue, user: LuaValue, password: LuaValue): Array<LuaValue>
     local auth = lua.op_concat(lua.to_value("PLAIN " ), __lua_first(mime.b64(lua.op_concat(lua.to_value("\0" ), lua.op_concat(user, lua.op_concat(lua.to_value("\0" ), password))))))
     __lua_first(self.try(__lua_first(lua.call_method(self.tp, "command", lua.to_value("AUTH"), auth))))
     return __lua_force_array(self.try(__lua_first(lua.call_method(self.tp, "check", lua.to_value("2..")))))
 end
 metat.__index.plain = metat_plain
-pub function metat_auth(self: LuaValue, user: LuaValue, password: LuaValue, ext: LuaValue): Array<LuaValue>
+function metat_auth(self: LuaValue, user: LuaValue, password: LuaValue, ext: LuaValue): Array<LuaValue>
     if __lua_truthy(__lua_or(not __lua_truthy(user), not __lua_truthy(password))) then
         return __lua_pack([lua.to_value(lua.to_value(1 ))])
     end
@@ -193,7 +193,7 @@ pub function metat_auth(self: LuaValue, user: LuaValue, password: LuaValue, ext:
     end
 end
 metat.__index.auth = metat_auth
-pub function metat_send(self: LuaValue, mailt: LuaValue): Array<LuaValue>
+function metat_send(self: LuaValue, mailt: LuaValue): Array<LuaValue>
     __lua_first(__lua_first(lua.call_method(self, "mail", mailt.from)))
     if __lua_truthy(lua.op_eq(__lua_first(base["type"](mailt.rcpt)), lua.to_value("table" ))) then
         for i, v in __lua_first(base.ipairs(mailt.rcpt)) do
@@ -205,7 +205,7 @@ pub function metat_send(self: LuaValue, mailt: LuaValue): Array<LuaValue>
     __lua_first(__lua_first(lua.call_method(self, "data", __lua_first(ltn12.source.chain(mailt.source, mime.stuff())), mailt.step)))
 end
 metat.__index.send = metat_send
-pub function open(server: LuaValue, port: LuaValue, create: LuaValue): Array<LuaValue>
+function open(server: LuaValue, port: LuaValue, create: LuaValue): Array<LuaValue>
     local tp = __lua_first(socket.try(tp.connect(__lua_or(server, _M.SERVER), __lua_or(port, _M.PORT), _M.TIMEOUT, create)))
     local s = __lua_first(base.setmetatable(lua.table_from_entries([("tp", tp)]), metat))
     -- make sure tp is closed if we get an exception
@@ -306,7 +306,7 @@ local adjust_headers = function(mesgt: LuaValue): Array<LuaValue>
 )
     return __lua_pack([lua.to_value(lower)])
 end
-pub function message(mesgt: LuaValue): Array<LuaValue>
+function message(mesgt: LuaValue): Array<LuaValue>
     mesgt.headers = __lua_first(adjust_headers(mesgt))
     local co = __lua_first(coroutine.create(function(): Array<LuaValue>
         __lua_first(send_message(mesgt))

@@ -1,8 +1,4 @@
-#![allow(
-    non_snake_case,
-    non_camel_case_types,
-    clippy::not_unsafe_ptr_arg_deref
-)]
+#![allow(non_snake_case, non_camel_case_types, clippy::not_unsafe_ptr_arg_deref)]
 //! Lua 5.1 C API compatibility scaffolding.
 //! This module will host the runtime bridge and tracing that drive extern stub generation.
 
@@ -1264,7 +1260,7 @@ pub fn render_table_stub(module_name: &str, handle: &LuaTableHandle) -> String {
 
     let mut out = String::new();
     out.push_str(&format!(
-        "-- Auto-generated stub for Lua module '{}'\n\npub extern\n",
+        "-- Auto-generated stub for Lua module '{}'\n\nextern\n",
         module_name
     ));
     for func in functions {

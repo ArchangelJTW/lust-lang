@@ -278,7 +278,10 @@ impl TypeEnv {
         self.register_builtin_function_slice(builtins::task_functions(), dummy_span);
         self.register_builtin_function_slice(builtins::lua_functions(), dummy_span);
         if let Some(global_scope) = self.scopes.first_mut() {
-            global_scope.insert("array".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+            global_scope.insert(
+                "array".to_string(),
+                Type::new(TypeKind::Unknown, dummy_span),
+            );
             global_scope.insert("map".to_string(), Type::new(TypeKind::Unknown, dummy_span));
             global_scope.insert("math".to_string(), Type::new(TypeKind::Unknown, dummy_span));
             global_scope.insert(

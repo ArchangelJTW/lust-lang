@@ -5,7 +5,7 @@ use lust_double.nested.host_quadruple
 local factors: Array<Factor> = []
 local operations: Array<Operation> = []
 
-pub function build_examples()
+function build_examples()
     array.clear(factors)
     array.clear(operations)
 
@@ -17,7 +17,7 @@ pub function build_examples()
     array.push(operations, make_scale(10))
 end
 
-pub function report_factor_results()
+function report_factor_results()
     for factor in factors do
         local label = "Factor(base=" .. tostring(factor.base) ..
             ", multiplier=" .. tostring(factor.multiplier) .. ")"
@@ -28,7 +28,7 @@ pub function report_factor_results()
     end
 end
 
-pub function report_host_calls()
+function report_host_calls()
     for value = 1, 5 do
         println("host_double(" .. tostring(value) .. ") = " .. tostring(host_double(value)))
         println("host_triple(" .. tostring(value) .. ") = " .. tostring(host_triple(value)))
@@ -36,7 +36,7 @@ pub function report_host_calls()
     end
 end
 
-pub function apply_operations_to(value: int): Array<int>
+function apply_operations_to(value: int): Array<int>
     local results = []
     for operation in operations do
         array.push(results, apply_operation(operation, value))
@@ -44,7 +44,7 @@ pub function apply_operations_to(value: int): Array<int>
     return results
 end
 
-pub function main()
+function main()
     build_examples()
     report_host_calls()
     report_factor_results()

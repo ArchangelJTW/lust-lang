@@ -1,77 +1,26 @@
 -- Unknown Types Demo
--- Demonstrates working with the 'unknown' type and safe type casting
+-- Demonstrates dynamic typing with 'unknown' type and safe casting
 
-println("=== Unknown Types Demo ===")
-println("")
+local data: Map<string, unknown> = {
+    name = "Alice",
+    age = 30,
+    active = true
+}
 
--- Map stores values with unknown type
-println("Test 1: Map with mixed types")
-local data: Map<string, unknown> = {}
-data:set("name", "Alice")
-data:set("age", 30)
-data:set("score", 95.5)
-data:set("active", true)
+println("Map length: " .. tostring(map.len(data)))
 
-println("Map length: " .. tostring(data:len()))
-
--- Getting values returns Option<unknown>
-println("")
-println("Test 2: Type casting from unknown")
-local age_opt = data:get("age")
-if age_opt:is_some() then
-    local unknown_val = age_opt:unwrap()  -- unknown type
-
-    -- Safe type extraction returns Option<T>
-    local int_val = unknown_val as int
-    if int_val:is_some() then
-        println("Age (as int): " .. tostring(int_val:unwrap()))
-    end
-
-    -- Try casting to wrong type - returns None
-    local str_val = unknown_val as string
-    if str_val:is_none() then
-        println("Age is not a string (correct)")
+local name_opt = map.get(data, "name")
+if name_opt is Some(name_val) then
+    local name_str = name_val as string
+    if name_str is Some(name) then
+        println("Name: " .. name)
     end
 end
 
--- Type cast score to float
-println("")
-println("Test 3: Casting to float")
-local score_opt = data:get("score")
-if score_opt:is_some() then
-    local unknown_score = score_opt:unwrap()
-    local float_score = unknown_score as float
-    if float_score:is_some() then
-        println("Score (as float): " .. tostring(float_score:unwrap()))
+local age_opt = map.get(data, "age")
+if age_opt is Some(age_val) then
+    local age_int = age_val as int
+    if age_int is Some(age) then
+        println("Age: " .. tostring(age))
     end
 end
-
--- Type cast bool
-println("")
-println("Test 4: Casting to bool")
-local active_opt = data:get("active")
-if active_opt:is_some() then
-    local unknown_active = active_opt:unwrap()
-    local bool_active = unknown_active as bool
-    if bool_active:is_some() then
-        if bool_active:unwrap() then
-            println("User is active")
-        end
-    end
-end
-
--- Direct casting to string
-println("")
-println("Test 5: Casting to string")
-local name_opt = data:get("name")
-if name_opt:is_some() then
-    local unknown_name = name_opt:unwrap()
-    local str_name = unknown_name as string
-    if str_name:is_some() then
-        println("Name: " .. str_name:unwrap())
-    end
-end
-
-println("")
-println("=== All tests passed! ===")
- 

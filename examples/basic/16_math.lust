@@ -1,35 +1,35 @@
--- Math helper methods for floats and ints
+-- Math module functions for floats and ints
 
--- Float methods
+-- Float functions
 local x: float = 3.7
-println(x:floor())           -- Outputs: 3
-println(x:ceil())            -- Outputs: 4
-println(x:round())           -- Outputs: 4
+println(math.floor(x))           -- Outputs: 3
+println(math.ceil(x))            -- Outputs: 4
+println(math.round(x))           -- Outputs: 4
 
 local y: float = 16.0
-println(y:sqrt())            -- Outputs: 4
+println(math.sqrt(y))            -- Outputs: 4
 
 local z: float = -5.5
-println(z:abs())             -- Outputs: 5.5
+println(math.abs(z))             -- Outputs: 5.5
 
 local t: float = 1.0
-println(t:sin())             -- Outputs: 0.8414709848
-println(t:cos())             -- Outputs: 0.5403023059
-println(t:tan())             -- Outputs: 1.5574077247
-println(t:asin())            -- Outputs: 1.5707963268
-println(t:acos())            -- Outputs: 0
-println(t:atan())            -- Outputs: 0.7853981634
-println(t:atan2(1.0))        -- Outputs: 0.7853981634
+println(math.sin(t))             -- Outputs: 0.8414709848
+println(math.cos(t))             -- Outputs: 0.5403023059
+println(math.tan(t))             -- Outputs: 1.5574077247
+println(math.asin(t))            -- Outputs: 1.5707963268
+println(math.acos(t))            -- Outputs: 0
+println(math.atan(t))            -- Outputs: 0.7853981634
+println(math.atan2(t, 1.0))      -- Outputs: 0.7853981634
 
 local w: float = 7.5
-println(w:clamp(0.0, 10.0))  -- Outputs: 7.5
-println(w:clamp(0.0, 5.0))   -- Outputs: 5
+println(math.clamp(w, 0.0, 10.0))  -- Outputs: 7.5
+println(math.clamp(w, 0.0, 5.0))   -- Outputs: 5
 
--- Int methods
+-- Int functions
 local a: int = -42
-println(a:abs())             -- Outputs: 42
+println(math.abs(a))             -- Outputs: 42
 
 local b: int = 75
-println(b:clamp(0, 100))     -- Outputs: 75
-println(b:clamp(0, 50))      -- Outputs: 50
+println(math.clamp(b, 0, 100))     -- Outputs: 75
+println(math.clamp(b, 0, 50))      -- Outputs: 50
  

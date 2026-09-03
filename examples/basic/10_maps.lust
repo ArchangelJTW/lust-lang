@@ -1,42 +1,40 @@
--- Map<K, V> - typed homogeneous key-value collections
+-- Maps with module functions
 
--- Create a map with type annotations
 local scores: Map<string, int> = {
     Alice = 100,
     Bob = 85,
     Charlie = 92
 }
 
--- Get returns Option<V>
-local alice_score = scores:get("Alice")
+-- Basic functions
+println(map.len(scores))                 -- Outputs: 3
+println(map.is_empty(scores))            -- Outputs: false
+
+-- Querying
+println(map.has(scores, "Alice"))        -- Outputs: true
+println(map.has(scores, "David"))        -- Outputs: false
+
+-- Accessing values
+local alice_score = map.get(scores, "Alice")
 if alice_score:is_some() then
-    println(alice_score:unwrap())     -- Outputs: 100
+    println(alice_score:unwrap())        -- Outputs: 100
 end
 
--- Set adds or updates
-scores:set("David", 88)
+-- Setting values
+map.set(scores, "David", 95)
+println(map.len(scores))                 -- Outputs: 4
 
--- Check if key exists
-println(scores:has("Alice"))          -- Outputs: true
-println(scores:has("Eve"))            -- Outputs: false
+-- Keys and Values
+local all_names = map.keys(scores)
+println(array.len(all_names))            -- Outputs: 4
 
--- Length
-println(scores:len())                 -- Outputs: 4
+local all_scores = map.values(scores)
+println(array.len(all_scores))           -- Outputs: 4
 
--- Get all keys (returns Array<K>)
-local all_names = scores:keys()
-println(all_names:len())              -- Outputs: 4
-
--- Get all values (returns Array<V>)
-local all_scores = scores:values()
-println(all_scores:len())             -- Outputs: 4
-
--- Delete returns Option<V>
-local removed = scores:delete("Bob")
+-- Deleting
+local removed = map.delete(scores, "Bob")
 if removed:is_some() then
-    println(removed:unwrap())         -- Outputs: 85
+    println(removed:unwrap())            -- Outputs: 85
 end
 
-println(scores:len())                 -- Outputs: 3
- 
-
+println(map.len(scores))                 -- Outputs: 3

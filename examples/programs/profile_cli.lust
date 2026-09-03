@@ -9,7 +9,7 @@ local DEFAULT_AGE = "25"
 local DEFAULT_COLOR = "Blue"
 
 function get_profile_field(profile: Map<string, unknown>, key: string, fallback: string): string
-    local value_opt = profile:get(key)
+    local value_opt = map.get(profile, key)
     if value_opt is Some(value) and value is string then
         return value
     end
@@ -18,9 +18,9 @@ end
 
 function new_profile(name: string, age: string, color: string): Map<string, unknown>
     local profile: Map<string, unknown> = {}
-    profile:set("name", name)
-    profile:set("age", age)
-    profile:set("color", color)
+    map.set(profile, "name", name)
+    map.set(profile, "age", age)
+    map.set(profile, "color", color)
     return profile
 end
 
@@ -34,15 +34,15 @@ end
 
 function parse_profile(text: string, defaults: Map<string, unknown>): Map<string, unknown>
     local profile = clone_profile(defaults)
-    local lines = text:split("\n")
+    local lines = string.split(text, "\n")
     local i: int = 0
-    while i < lines:len() do
-        if lines:get(i) is Some(line) and line:len() > 0 then
-            local parts = line:split("=")
-            if parts:len() >= 2 then
-                if parts:get(0) is Some(key) and (key == "name" or key == "age" or key == "color") 
-                and parts:get(1) is Some(value) then
-                    profile:set(key, value)
+    while i < array.len(lines) do
+        if array.get(lines, i) is Some(line) and string.len(line) > 0 then
+            local parts = string.split(line, "=")
+            if array.len(parts) >= 2 then
+                if array.get(parts, 0) is Some(key) and (key == "name" or key == "age" or key == "color") 
+                and array.get(parts, 1) is Some(value) then
+                    map.set(profile, key, value)
                 end
             end
         end
@@ -72,7 +72,7 @@ end
 
 function prompt_field(label: string, current: string): string
     local prompt_text = label
-    if current:len() > 0 then
+    if string.len(current) > 0 then
         prompt_text = prompt_text .. " [" .. current .. "]: "
     else
         prompt_text = prompt_text .. ": "
@@ -85,8 +85,8 @@ function prompt_field(label: string, current: string): string
 
     local line_result = io.read_line()
     if line_result is Ok(raw_input) then
-        local input = raw_input:trim()
-        if input:len() == 0 then
+        local input = string.trim(raw_input)
+        if string.len(input) == 0 then
             return current
         end
         return input

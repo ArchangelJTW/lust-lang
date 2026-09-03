@@ -1521,8 +1521,10 @@ impl TraceRecorder {
                 // Lifting this means giving `call_builtin_method_simple` real
                 // Int/Float arms, not relaxing the check.
                 let receiver_supported = match &registers[obj_reg as usize] {
-                    Value::Array(_) | Value::Iterator(_) => true,
-                    Value::Enum { enum_name, .. } => enum_name == "Option" || enum_name == "Result",
+                    Value::Iterator(_) => true,
+                    Value::Enum { enum_name, .. } => {
+                        enum_name == "Option" || enum_name == "Result"
+                    }
                     _ => false,
                 };
                 if !receiver_supported {

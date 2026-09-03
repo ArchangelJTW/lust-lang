@@ -2367,4 +2367,53 @@ mod tests {
         )
         .unwrap();
     }
+
+    #[test]
+    fn module_functions_and_generic_inference_work() {
+        check(
+            "local arr: Array<int> = [1, 2, 3]\n\
+             array.push(arr, 4)\n\
+             local first_opt: Option<int> = array.get(arr, 0)\n\
+             local l: int = array.len(arr)\n\
+             local m: Map<string, int> = { a = 1 }\n\
+             map.set(m, \"b\", 2)\n\
+             local v_opt: Option<int> = map.get(m, \"a\")\n\
+             local s: string = \"hello\"\n\
+             local sl: int = string.len(s)\n\
+             local x: float = 3.7\n\
+             local fl: int = math.floor(x)\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn method_syntax_on_primitives_is_rejected() {
+        let err1 = check("local s = \"hello\"\nlocal l = s:len()\n").unwrap_err();
+        assert!(err1.to_string().contains("Type 'string' does not support method syntax"));
+
+        let err2 = check("local arr: Array<int> = [1]\narr:push(2)\n").unwrap_err();
+        assert!(err2.to_string().contains("Type 'Array' does not support method syntax"));
+
+        let err3 = check("local m: Map<string, int> = { a = 1 }\nlocal v = m:get(\"a\")\n").unwrap_err();
+        assert!(err3.to_string().contains("Type 'Map' does not support method syntax"));
+
+        let err4 = check("local x: float = 3.5\nlocal f = x:floor()\n").unwrap_err();
+        assert!(err4.to_string().contains("Type 'float' does not support method syntax"));
+
+        let err5 = check("local i: int = 5\nlocal a = i:abs()\n").unwrap_err();
+        assert!(err5.to_string().contains("Type 'int' does not support method syntax"));
+    }
+
+    #[test]
+    fn method_syntax_on_nominals_and_iter_works() {
+        check(
+            "local opt: Option<int> = Option.Some(42)\n\
+             local is_s: bool = opt:is_some()\n\
+             local val: int = opt:unwrap()\n\
+             local arr: Array<int> = [1, 2]\n\
+             local it = array.iter(arr)\n\
+             local next_opt = it:next()\n",
+        )
+        .unwrap();
+    }
 }

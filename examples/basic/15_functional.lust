@@ -1,38 +1,35 @@
--- Functional array methods: map, filter, reduce
+-- Functional array functions: map, filter, reduce
 
 local numbers: Array<int> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 println("=== Map ===")
--- Type inference: 'n' is inferred as int from array element type
-local doubled = numbers:map(function(n) return n * 2 end)
+local doubled = array.map(numbers, function(n: int): int return n * 2 end)
 println(doubled)
-println(doubled:len())  -- Outputs: 10
-local first_doubled = doubled:first()
+println(array.len(doubled))  -- Outputs: 10
+local first_doubled = array.first(doubled)
 if first_doubled:is_some() then
     println(first_doubled:unwrap())  -- Outputs: 2
 end
 
 println("=== Filter ===")
--- Return type inferred from method signature (must return bool)
-local evens = numbers:filter(function(n) return n % 2 == 0 end)
-println(evens:len())  -- Outputs: 5
+local evens = array.filter(numbers, function(n: int): bool return n % 2 == 0 end)
+println(array.len(evens))  -- Outputs: 5
 
 println("=== Reduce ===")
--- Both 'acc' and 'n' types are inferred
-local sum: int = numbers:reduce(0, function(acc, n) return acc + n end)
+local sum: int = array.reduce(numbers, 0, function(acc: int, n: int): int return acc + n end)
 println(sum)  -- Outputs: 55
 
 println("=== Chaining ===")
 -- Filter odds, double them, sum the result
-local odds = numbers:filter(function(n) return n % 2 == 1 end)
-local doubled_odds = odds:map(function(n) return n * 2 end)
-local sum_doubled_odds: int = doubled_odds:reduce(0, function(acc, n) return acc + n end)
+local odds = array.filter(numbers, function(n: int): bool return n % 2 == 1 end)
+local doubled_odds = array.map(odds, function(n: int): int return n * 2 end)
+local sum_doubled_odds: int = array.reduce(doubled_odds, 0, function(acc: int, n: int): int return acc + n end)
 println(sum_doubled_odds)  -- Outputs: 50 (2+6+10+14+18 = 50)
 
-println("=== Closure Capture in Functional Methods ===")
+println("=== Closure Capture in Functional Functions ===")
 local multiplier: int = 3
-local tripled = numbers:map(function(n) return n * multiplier end)
-local first_tripled = tripled:first()
+local tripled = array.map(numbers, function(n: int): int return n * multiplier end)
+local first_tripled = array.first(tripled)
 if first_tripled:is_some() then
     println(first_tripled:unwrap())  -- Outputs: 3
 end

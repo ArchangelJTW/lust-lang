@@ -9,8 +9,8 @@ function process_value(value: string | int | float): int
     if value is string then
         -- Compiler knows 'value' is string here
         println("  String value: " .. value)
-        println("  Length: " .. tostring(value:len()))
-        return value:len()
+        println("  Length: " .. tostring(string.len(value)))
+        return string.len(value)
     elseif value is int then
         -- Compiler knows 'value' is int here
         println("  Int value: " .. tostring(value))
@@ -25,7 +25,6 @@ function process_value(value: string | int | float): int
 
     return 0
 end
- 
 
 -- Handle unknown type from Map
 function handle_unknown(val: unknown): string
@@ -44,7 +43,6 @@ function handle_unknown(val: unknown): string
     end
 
     -- Try bool
-    --[[
     local as_bool = val as bool
     if as_bool:is_some() then
         if as_bool:unwrap() then
@@ -52,7 +50,6 @@ function handle_unknown(val: unknown): string
         end
         return "Boolean: false"
     end
-    ]]
 
     return "Unknown type"
 end
@@ -61,37 +58,26 @@ println("=== Type Narrowing Demo ===")
 println("")
 
 -- Test 1: Union type narrowing
-println("Test 1: Union type narrowing")
-local result1 = process_value("hello")
-println("  Result: " .. tostring(result1))
+println("Test 1: Union narrowing")
+process_value("hello")
+process_value(42)
+process_value(3.14)
 
+-- Test 2: Unknown type narrowing with Map data
 println("")
-local result2 = process_value(42)
-println("  Result: " .. tostring(result2))
+println("Test 2: Unknown narrowing from Map")
+local data: Map<string, unknown> = {
+    name = "Bob",
+    age = 25,
+    verified = true
+}
 
-println("")
-local result3 = process_value(3.14)
-println("  Result: " .. tostring(result3))
-
--- Test 2: Unknown type narrowing with Map
-println("")
-println("Test 2: Unknown type narrowing")
-local data: Map<string, unknown> = {}
-data:set("id", 100)
-data:set("name", "Bob")
-data:set("verified", true)
-
-local id_opt = data:get("id")
-if id_opt:is_some() then
-    println(handle_unknown(id_opt:unwrap()))
-end
-
-local name_opt = data:get("name")
+local name_opt = map.get(data, "name")
 if name_opt:is_some() then
     println(handle_unknown(name_opt:unwrap()))
 end
 
-local verified_opt = data:get("verified")
+local verified_opt = map.get(data, "verified")
 if verified_opt:is_some() then
     println(handle_unknown(verified_opt:unwrap()))
 end
@@ -101,8 +87,8 @@ println("")
 println("Test 3: Type guards in loops")
 local values: Array<string | int> = ["first", 1, "second", 2, "third", 3]
 local i: int = 0
-while i < values:len() do
-    local val = values:get(i):unwrap()
+while i < array.len(values) do
+    local val = array.get(values, i):unwrap()
 
     if val is string then
         println("  String: " .. val)
@@ -115,5 +101,3 @@ end
 
 println("")
 println("=== All narrowing tests passed! ===")
-
-

@@ -10,7 +10,7 @@ function process_api_field(key: string, value: unknown): string
     local as_string = value as string
     if as_string:is_some() then
         local s = as_string:unwrap()
-        return "    String value: '" .. s .. "' (length: " .. tostring(s:len()) .. ")"
+        return "    String value: '" .. s .. "' (length: " .. tostring(string.len(s)) .. ")"
     end
 
     local as_int = value as int
@@ -37,7 +37,7 @@ end
 -- For now, we work around by casting to concrete types
 function validate_id_string(id: string): bool
     println("Validating string ID...")
-    if id:len() > 0 then
+    if string.len(id) > 0 then
         println("  Valid string ID: " .. id)
         return true
     end
@@ -65,7 +65,7 @@ function parse_config(config: Map<string, unknown>): bool
     local all_valid: bool = true
 
     -- Validate port (should be int)
-    local port_opt = config:get("port")
+    local port_opt = map.get(config, "port")
     if port_opt:is_some() then
         local port_unknown = port_opt:unwrap()
         local port_int = port_unknown as int
@@ -85,14 +85,14 @@ function parse_config(config: Map<string, unknown>): bool
     end
 
     -- Validate host (should be string)
-    local host_opt = config:get("host")
+    local host_opt = map.get(config, "host")
     if host_opt:is_some() then
         local host_unknown = host_opt:unwrap()
         local host_str = host_unknown as string
 
         if host_str:is_some() then
             local host = host_str:unwrap()
-            if host:len() > 0 then
+            if string.len(host) > 0 then
                 println("  Valid host: " .. host)
             else
                 println("  Host cannot be empty")
@@ -105,7 +105,7 @@ function parse_config(config: Map<string, unknown>): bool
     end
 
     -- Validate debug flag (should be bool)
-    local debug_opt = config:get("debug")
+    local debug_opt = map.get(config, "debug")
     if debug_opt:is_some() then
         local debug_unknown = debug_opt:unwrap()
         local debug_bool = debug_unknown as bool
@@ -131,21 +131,21 @@ println("")
 -- Test 1: API field processing
 println("Test 1: API Response Processing")
 local api_response: Map<string, unknown> = {}
-api_response:set("status", 200)
-api_response:set("message", "Success")
-api_response:set("authenticated", true)
+map.set(api_response, "status", 200)
+map.set(api_response, "message", "Success")
+map.set(api_response, "authenticated", true)
 
-local status_opt = api_response:get("status")
+local status_opt = map.get(api_response, "status")
 if status_opt:is_some() then
     println(process_api_field("status", status_opt:unwrap()))
 end
 
-local msg_opt = api_response:get("message")
+local msg_opt = map.get(api_response, "message")
 if msg_opt:is_some() then
     println(process_api_field("message", msg_opt:unwrap()))
 end
 
-local auth_opt = api_response:get("authenticated")
+local auth_opt = map.get(api_response, "authenticated")
 if auth_opt:is_some() then
     println(process_api_field("authenticated", auth_opt:unwrap()))
 end
@@ -175,9 +175,9 @@ end
 println("")
 println("Test 4: Configuration Validation")
 local config: Map<string, unknown> = {}
-config:set("port", 8080)
-config:set("host", "localhost")
-config:set("debug", true)
+map.set(config, "port", 8080)
+map.set(config, "host", "localhost")
+map.set(config, "debug", true)
 
 if parse_config(config) then
     println("Configuration is valid!")
@@ -187,5 +187,3 @@ end
 
 println("")
 println("=== All comprehensive tests passed! ===")
-
-

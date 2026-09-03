@@ -1,39 +1,34 @@
--- String methods
+-- String module functions
 
 local text = "Hello, World!"
 
--- Basic methods
-println(text:len())                    -- Outputs: 13
-println(text:is_empty())               -- Outputs: false
+-- Basic functions
+println(string.len(text))                    -- Outputs: 13
+println(string.is_empty(text))               -- Outputs: false
 
 -- Searching
-local pos = text:find("World")
-if pos:is_some() then
-    println(pos:unwrap())              -- Outputs: 7
-end
-
-println(text:starts_with("Hello"))    -- Outputs: true
-println(text:ends_with("!"))          -- Outputs: true
-println(text:contains("World"))       -- Outputs: true
+println(string.starts_with(text, "Hello"))    -- Outputs: true
+println(string.ends_with(text, "!"))          -- Outputs: true
+println(string.contains(text, "World"))       -- Outputs: true
 
 -- Substring
-println(text:substring(0, 5))         -- Outputs: Hello
+println(string.sub(text, 1, 5))              -- Outputs: Hello
 
 -- Case conversion
-println(text:to_upper())              -- Outputs: HELLO, WORLD!
-println(text:to_lower())              -- Outputs: hello, world!
+println(string.upper(text))                  -- Outputs: HELLO, WORLD!
+println(string.lower(text))                  -- Outputs: hello, world!
 
 -- Trimming
 local padded = "  spaces  "
-println(padded:trim())                -- Outputs: spaces
-println(padded:trim_start())          -- Outputs: spaces
-println(padded:trim_end())            -- Outputs:   spaces
+println(string.trim(padded))                -- Outputs: spaces
+println(string.trim_start(padded))          -- Outputs: spaces
+println(string.trim_end(padded))            -- Outputs:   spaces
 
 -- Replace
-println(text:replace("World", "Lust"))  -- Outputs: Hello, Lust!
+println(string.replace(text, "World", "Lust"))  -- Outputs: Hello, Lust!
 
 -- Split
-local words = text:split(", ")
-println(words:len())                  -- Outputs: 2
+local words = string.split(text, ", ")
+println(array.len(words))                  -- Outputs: 2
  
 

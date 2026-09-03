@@ -336,20 +336,20 @@ def OPS() -> list[Op]:
         Op(
             "int_neg_abs",
             "local acc: int = 0\nlocal ctr: int = 0\n",
-            "ctr = ctr + 1\nlocal neg: int = 0 - ctr\nacc = acc + neg:abs()\n",
+            "ctr = ctr + 1\nlocal neg: int = 0 - ctr\nacc = acc + math.abs(neg)\n",
             "acc",
             lambda t: t * (t + 1) // 2,
-            ("int", "method"),
+            ("int", "module"),
         )
     )
     ops.append(
         Op(
             "int_minmax",
             "local acc: int = 0\nlocal ctr: int = 0\n",
-            "ctr = ctr + 1\nacc = acc + ctr:min(50)\n",
+            "ctr = ctr + 1\nacc = acc + math.min(ctr, 50)\n",
             "acc",
             lambda t: sum(min(k, 50) for k in range(1, t + 1)),
-            ("int", "method"),
+            ("int", "module"),
         )
     )
 
@@ -359,7 +359,7 @@ def OPS() -> list[Op]:
             "float_add",
             "local facc: float = 0.0\n",
             "facc = facc + 0.5\n",
-            "(facc * 2.0):to_int()",
+            "(facc * 2.0) as int",
             lambda t: t,
             ("float",),
         )
@@ -369,7 +369,7 @@ def OPS() -> list[Op]:
             "float_mul",
             "local facc: float = 0.0\n",
             "facc = facc * 0.5 + 1.0\n",
-            "(facc * 1000000.0):to_int()",
+            "(facc * 1000000.0) as int",
             _sim_float_mul,
             ("float",),
         )
@@ -378,18 +378,18 @@ def OPS() -> list[Op]:
         Op(
             "float_sqrt",
             "local facc: float = 0.0\nlocal two: float = 2.0\n",
-            "facc = facc + two:sqrt()\n",
-            "(facc * 1000.0):to_int()",
+            "facc = facc + math.sqrt(two)\n",
+            "(facc * 1000.0) as int",
             _sim_float_sqrt,
-            ("float", "method"),
+            ("float", "module"),
         )
     )
     ops.append(
         Op(
             "float_div",
             "local facc: float = 1.0\nlocal ctr: int = 0\n",
-            "ctr = ctr + 1\nfacc = facc + 1.0 / ctr:to_float()\n",
-            "(facc * 1000000.0):to_int()",
+            "ctr = ctr + 1\nfacc = facc + 1.0 / (ctr as float)\n",
+            "(facc * 1000000.0) as int",
             _sim_float_div,
             ("float",),
         )
@@ -398,10 +398,10 @@ def OPS() -> list[Op]:
         Op(
             "float_floor",
             "local facc: float = 0.0\nlocal fv: float = 3.7\n",
-            "facc = facc + fv:floor()\n",
-            "facc:to_int()",
+            "facc = facc + math.floor(fv)\n",
+            "facc as int",
             lambda t: 3 * t,
-            ("float", "method"),
+            ("float", "module"),
         )
     )
 
@@ -542,7 +542,7 @@ def OPS() -> list[Op]:
             "arr_write_float",
             "local arr: Array<float> = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]\nlocal ctr: int = 0\n",
             "arr[ctr % 8] = arr[ctr % 8]:unwrap() + 0.25\nctr = ctr + 1\n",
-            "((arr[0]:unwrap() + arr[1]:unwrap() + arr[2]:unwrap() + arr[3]:unwrap() + arr[4]:unwrap() + arr[5]:unwrap() + arr[6]:unwrap() + arr[7]:unwrap()) * 100.0):to_int()",
+            "((arr[0]:unwrap() + arr[1]:unwrap() + arr[2]:unwrap() + arr[3]:unwrap() + arr[4]:unwrap() + arr[5]:unwrap() + arr[6]:unwrap() + arr[7]:unwrap()) * 100.0) as int",
             _sim_arr_write_float,
             ("array", "float"),
         )
@@ -551,8 +551,8 @@ def OPS() -> list[Op]:
         Op(
             "arr_push",
             "local arr: Array<int> = []\nlocal ctr: int = 0\n",
-            "ctr = ctr + 1\narr:push(ctr)\n",
-            "arr:len()",
+            "ctr = ctr + 1\narray.push(arr, ctr)\n",
+            "array.len(arr)",
             lambda t: t,
             ("array", "alloc"),
         )
@@ -561,7 +561,7 @@ def OPS() -> list[Op]:
         Op(
             "arr_push_pop",
             "local arr: Array<int> = []\nlocal acc: int = 0\n",
-            "arr:push(1)\nlocal got = arr:pop()\nacc = acc + got:unwrap_or(0)\n",
+            "array.push(arr, 1)\nlocal got = array.pop(arr)\nacc = acc + got:unwrap_or(0)\n",
             "acc",
             lambda t: t,
             ("array", "alloc", "option"),
@@ -571,7 +571,7 @@ def OPS() -> list[Op]:
         Op(
             "arr_len",
             "local arr: Array<int> = [1, 2, 3, 4, 5, 6, 7, 8]\nlocal acc: int = 0\n",
-            "acc = acc + arr:len()\n",
+            "acc = acc + array.len(arr)\n",
             "acc",
             lambda t: 8 * t,
             ("array",),
@@ -581,7 +581,7 @@ def OPS() -> list[Op]:
         Op(
             "arr_get_option",
             "local arr: Array<int> = [1, 2, 3, 4, 5, 6, 7, 8]\nlocal acc: int = 0\nlocal ctr: int = 0\n",
-            "local got = arr:get(ctr % 8)\nacc = acc + got:unwrap_or(0)\nctr = ctr + 1\n",
+            "local got = array.get(arr, ctr % 8)\nacc = acc + got:unwrap_or(0)\nctr = ctr + 1\n",
             "acc",
             _sim_arr_read,
             ("array", "option"),
@@ -646,7 +646,7 @@ def OPS() -> list[Op]:
             "struct_arr_read",
             struct_decl
             + "local pts: Array<Point> = []\n"
-            "for seed = 1, 8 do\n  pts:push(Point { x = seed, y = 1 })\nend\n"
+            "for seed = 1, 8 do\n  array.push(pts, Point { x = seed, y = 1 })\nend\n"
             "local acc: int = 0\nlocal ctr: int = 0\n",
             "local pt = pts[ctr % 8]:unwrap()\nacc = acc + pt.x\nctr = ctr + 1\n",
             "acc",
@@ -659,7 +659,7 @@ def OPS() -> list[Op]:
             "struct_arr_write",
             struct_decl
             + "local pts: Array<Point> = []\n"
-            "for seed = 1, 8 do\n  pts:push(Point { x = 0, y = 0 })\nend\n"
+            "for seed = 1, 8 do\n  array.push(pts, Point { x = 0, y = 0 })\nend\n"
             "local ctr: int = 0\n",
             "local pt = pts[ctr % 8]:unwrap()\npt.x = pt.x + 1\nctr = ctr + 1\n",
             "pts[0]:unwrap().x + pts[1]:unwrap().x + pts[2]:unwrap().x + pts[3]:unwrap().x + pts[4]:unwrap().x + pts[5]:unwrap().x + pts[6]:unwrap().x + pts[7]:unwrap().x",
@@ -732,7 +732,7 @@ def OPS() -> list[Op]:
             "str_concat",
             'local buf: string = ""\n',
             'buf = buf .. "x"\n',
-            "buf:len()",
+            "string.len(buf)",
             lambda t: t,
             ("string", "alloc"),
         )
@@ -741,7 +741,7 @@ def OPS() -> list[Op]:
         Op(
             "str_methods",
             'local text: string = "hello world"\nlocal acc: int = 0\n',
-            'if text:contains("world") then\n  acc = acc + text:len()\nend\n',
+            'if string.contains(text, "world") then\n  acc = acc + string.len(text)\nend\n',
             "acc",
             lambda t: 11 * t,
             ("string",),
@@ -751,7 +751,7 @@ def OPS() -> list[Op]:
         Op(
             "str_tostring",
             "local acc: int = 0\nlocal ctr: int = 0\n",
-            "ctr = ctr + 1\nacc = acc + tostring(ctr):len()\n",
+            "ctr = ctr + 1\nacc = acc + string.len(tostring(ctr))\n",
             "acc",
             lambda t: sum(len(str(k)) for k in range(1, t + 1)),
             ("string",),
@@ -761,7 +761,7 @@ def OPS() -> list[Op]:
         Op(
             "map_set_get",
             "local tbl: Map<string, int> = {}\nlocal acc: int = 0\n",
-            'tbl:set("k", acc + 1)\nlocal got = tbl:get("k")\nacc = got:unwrap_or(0)\n',
+            'map.set(tbl, "k", acc + 1)\nlocal got = map.get(tbl, "k")\nacc = got:unwrap_or(0)\n',
             "acc",
             lambda t: t,
             ("map", "option"),
@@ -771,8 +771,8 @@ def OPS() -> list[Op]:
         Op(
             "map_grow",
             "local tbl: Map<string, int> = {}\nlocal ctr: int = 0\n",
-            "ctr = ctr + 1\ntbl:set(tostring(ctr), ctr)\n",
-            "tbl:len()",
+            "ctr = ctr + 1\nmap.set(tbl, tostring(ctr), ctr)\n",
+            "map.len(tbl)",
             lambda t: t,
             ("map", "alloc"),
         )
@@ -1028,7 +1028,7 @@ def regressions() -> Iterator[Case]:
         "local acc: int = 0\n"
         "for i = 1, 10 do\n"
         "  local neg: int = 0 - i\n"
-        "  acc = acc + neg:abs()\n"
+        "  acc = acc + math.abs(neg)\n"
         "end\n"
         "println(acc)\n",
         55,
@@ -1116,7 +1116,7 @@ def regressions() -> Iterator[Case]:
         "local alias = values\n"
         "local acc: int = 0\n"
         "for i = 1, 100 do\n"
-        "  alias:pop()\n"
+        "  array.pop(alias)\n"
         "  if alias[0] is Ok(value) then\n"
         "    acc = acc + value\n"
         "  end\n"
@@ -1131,7 +1131,7 @@ def regressions() -> Iterator[Case]:
         "local alias = values\n"
         "local acc: int = 0\n"
         "for i = 1, 100 do\n"
-        "  alias:pop()\n"
+        "  array.pop(alias)\n"
         "  acc = acc + alias[0]:unwrap()\n"
         "end\n"
         "println(acc)\n",
@@ -1144,7 +1144,7 @@ def regressions() -> Iterator[Case]:
         "local values: Array<int> = [1, 2, 3, 4, 5, 6, 7, 8]\n"
         "local acc: int = 0\n"
         "for i = 1, 20 do\n"
-        "  acc = acc + values:len()\n"
+        "  acc = acc + array.len(values)\n"
         "end\n"
         "println(acc)\n",
         160,
@@ -1156,7 +1156,7 @@ def regressions() -> Iterator[Case]:
         "regression/single_letter_struct_name",
         "struct K\n  x: int\nend\n"
         "local a: Array<K> = []\n"
-        "a:push(K { x = 7 })\n"
+        "array.push(a, K { x = 7 })\n"
         "println(a[0]:unwrap().x)\n",
         7,
         ("regression", "generics", "scope"),
@@ -1248,7 +1248,7 @@ def regressions() -> Iterator[Case]:
         "  end\n"
         "end\n"
         "function size(value: ToString): int\n"
-        "  return value:to_string():len()\n"
+        "  return string.len(value:to_string())\n"
         "end\n"
         "local label = Label { value = \"four\" }\n"
         "local dynamic: unknown = label\n"

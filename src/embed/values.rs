@@ -1019,7 +1019,7 @@ mod tests {
             pub function assign(): int
                 local values: Array<int> = [1]
                 values[0] = 9
-                return values:get(0):unwrap()
+                return array.get(values, 0):unwrap()
             end
 
             pub function unwrap_loop(index: int): int
@@ -1145,14 +1145,14 @@ mod tests {
         let _guard = serial_guard();
         let source = r#"
             function next_value(calls: Array<int>): unknown
-                calls:push(1)
+                array.push(calls, 1)
                 return 7
             end
 
             pub function run(): int
                 local calls: Array<int> = []
                 if next_value(calls) as int is Some(x) and x > 0 then
-                    return x * 10 + calls:len()
+                    return x * 10 + array.len(calls)
                 end
                 return -1
             end
@@ -1181,7 +1181,7 @@ mod tests {
             local factors: Array<int> = []
 
             pub function touch()
-                factors:push(1)
+                array.push(factors, 1)
             end
 
             pub function main()

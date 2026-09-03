@@ -20,7 +20,7 @@ end
 function attach_child(parent: Node, child: Node): Node
     -- Assigning to a `ref` field accepts either an Option<Node> or a Node.
     child.parent = parent
-    parent.children:push(child)
+    array.push(parent.children, child)
     return child
 end
 
@@ -49,7 +49,7 @@ if direct_parent is Some(parent) then
 end
 
 -- Removing the grandchild severs the only strong edge; the weak parent becomes None.
-local removed = child.children:pop()
+local removed = array.pop(child.children)
 if removed is Some(orphan) then
     orphan.parent = Option.None
     if orphan.parent is None then

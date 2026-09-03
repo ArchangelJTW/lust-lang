@@ -1,31 +1,29 @@
--- Type casting with `is` and short circuit output
+-- Type casting with `is` and `as`
+-- Type casting returns Option for safe narrowing or boolean check
 
--- Type casting returns Option<T>
-
--- Cast from Unknown (from Map)
 local data: Map<string, unknown> = {}
-data:set("age", 30)
-data:set("name", "Alice")
+map.set(data, "age", 30)
+map.set(data, "name", "Alice")
 
-local age_opt = data:get("age")
+local age_opt = map.get(data, "age")
 if age_opt:is_some() then
     local unknown_val = age_opt:unwrap()  -- Unknown type
 
-    -- Try to cast to int (succeeds)
+    -- Safe cast using `as` which returns Option<T>
     local int_val = unknown_val as int
     if int_val:is_some() then
         println(int_val:unwrap())         -- Outputs: 30
     end
 
-    -- Try to cast to string (fails)
+    -- Failed cast returns None
     local str_val = unknown_val as string
     if str_val:is_none() then
-        println("Not a string")           -- This prints
+        println("Not a string")           -- Outputs: Not a string
     end
 end
 
--- Cast name to string (succeeds)
-local name_opt = data:get("name")
+-- Direct type check using `is`
+local name_opt = map.get(data, "name")
 if name_opt:is_some() then
     local unknown_name = name_opt:unwrap()
     local str_name = unknown_name as string

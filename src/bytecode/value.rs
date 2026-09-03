@@ -2719,58 +2719,6 @@ fn call_builtin_method_simple(
                 method_name
             )),
         },
-        Value::Array(arr) => match method_name {
-            "len" => Ok(Value::Int(int_from_usize(arr.borrow().len()))),
-            "push" => {
-                let value = args
-                    .get(0)
-                    .cloned()
-                    .ok_or_else(|| "Array:push requires a value argument".to_string())?;
-                arr.borrow_mut().push(value);
-                Ok(Value::Nil)
-            }
-            "pop" => {
-                let popped = arr.borrow_mut().pop();
-                Ok(popped.map(Value::some).unwrap_or_else(Value::none))
-            }
-            "first" => {
-                let borrowed = arr.borrow();
-                Ok(borrowed
-                    .first()
-                    .cloned()
-                    .map(Value::some)
-                    .unwrap_or_else(Value::none))
-            }
-            "last" => {
-                let borrowed = arr.borrow();
-                Ok(borrowed
-                    .last()
-                    .cloned()
-                    .map(Value::some)
-                    .unwrap_or_else(Value::none))
-            }
-            "get" => {
-                let index = args
-                    .get(0)
-                    .and_then(Value::as_int)
-                    .ok_or_else(|| "Array:get requires an integer index".to_string())?;
-                let borrowed = arr.borrow();
-                Ok(borrowed
-                    .get(index as usize)
-                    .cloned()
-                    .map(Value::some)
-                    .unwrap_or_else(Value::none))
-            }
-            "iter" => {
-                let items = arr.borrow().clone();
-                let iter = IteratorState::Array { items, index: 0 };
-                Ok(Value::Iterator(Rc::new(RefCell::new(iter))))
-            }
-            _ => Err(format!(
-                "Array method '{}' not supported in JIT",
-                method_name
-            )),
-        },
         _ => Err(format!(
             "Method '{}' not supported in JIT (deoptimizing)",
             method_name

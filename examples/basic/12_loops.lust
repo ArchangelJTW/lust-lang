@@ -25,7 +25,7 @@ end
 
 println("=== Generic For-In Loop (map iteration) ===")
 local fruits_map: Map<string, int> = {["apple"] = 3, ["banana"] = 5, ["cherry"] = 2}
-for fruit, amount in fruits_map:iter() do
+for fruit, amount in map.iter(fruits_map) do
     println("Fruit: " ..fruit.. " Amount: " ..tostring(amount))
 end
 

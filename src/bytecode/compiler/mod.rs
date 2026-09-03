@@ -136,6 +136,10 @@ impl Compiler {
                 "select",
                 "task",
                 "lua",
+                "array",
+                "map",
+                "math",
+                "string",
                 "error",
                 "assert",
                 "tonumber",
@@ -148,7 +152,7 @@ impl Compiler {
         );
         for module in config.enabled_modules() {
             match module {
-                "io" | "os" | "string" | "math" | "table" => {
+                "io" | "os" => {
                     self.stdlib_symbols.insert(module.to_string());
                 }
 

@@ -4,7 +4,6 @@ use alloc::{
     boxed::Box,
     format,
     string::{String, ToString},
-    vec,
     vec::Vec,
 };
 use hashbrown::HashMap;
@@ -460,48 +459,88 @@ impl TypeChecker {
                 }
 
                 if let Some((resolved_name, sig)) = static_candidate {
-                    if !explicit_type_args.is_empty() {
-                        return Err(self.type_error_at(
-                            format!(
-                                "Static method '{}' does not accept explicit type arguments",
-                                resolved_name
-                            ),
-                            span,
-                        ));
-                    }
-                    let allow_varargs = sig.params.len() == 1
-                        && matches!(sig.params[0].kind, TypeKind::Unknown)
-                        && !args.is_empty();
-                    let allow_optional = args.len() < sig.params.len()
-                        && !args.is_empty()
-                        && sig.params[args.len()..]
-                            .iter()
-                            .all(|param| matches!(param.kind, TypeKind::Unknown));
-                    if args.len() > sig.params.len() && !allow_varargs
-                        || (args.len() < sig.params.len() && !allow_optional && !allow_varargs)
+                    let mut expected_params = sig.params.clone();
+                    let mut generic_bindings = HashMap::new();
+                    if explicit_type_args.len() > sig.type_params.len()
+                        || (!explicit_type_args.is_empty()
+                            && explicit_type_args.len() != sig.type_params.len())
                     {
                         return Err(self.type_error_at(
                             format!(
-                                "Static method '{}' expects {} arguments, got {}",
+                                "Function '{}' expects {} type argument(s), got {}",
                                 resolved_name,
-                                sig.params.len(),
-                                args.len()
+                                sig.type_params.len(),
+                                explicit_type_args.len()
                             ),
-                            span,
+                            callee.span,
                         ));
+                    }
+                    for (type_param, concrete) in
+                        sig.type_params.iter().zip(explicit_type_args.iter())
+                    {
+                        generic_bindings.insert(type_param.clone(), concrete.clone());
+                    }
+                    if args.len() != expected_params.len() {
+                        if args.len() > expected_params.len() {
+                            if let Some(last) = expected_params.last().cloned() {
+                                let last_allows_varargs = matches!(last.kind, TypeKind::Unknown)
+                                    || matches!(&last.kind, TypeKind::Named(name) if name == "LuaValue");
+                                if last_allows_varargs {
+                                    while expected_params.len() < args.len() {
+                                        expected_params.push(last.clone());
+                                    }
+                                } else {
+                                    return Err(self.type_error_at(
+                                        format!(
+                                            "Function '{}' expects {} arguments, got {}",
+                                            resolved_name,
+                                            sig.params.len(),
+                                            args.len()
+                                        ),
+                                        callee.span,
+                                    ));
+                                }
+                            }
+                        } else {
+                            let missing = &expected_params[args.len()..];
+                            let missing_optional = missing.iter().all(|p| {
+                                matches!(p.kind, TypeKind::Unknown)
+                                    || matches!(&p.kind, TypeKind::Named(name) if name == "LuaValue")
+                            });
+                            if missing_optional {
+                                expected_params.truncate(args.len());
+                            } else {
+                                return Err(self.type_error_at(
+                                    format!(
+                                        "Function '{}' expects {} arguments, got {}",
+                                        resolved_name,
+                                        sig.params.len(),
+                                        args.len()
+                                    ),
+                                    callee.span,
+                                ));
+                            }
+                        }
                     }
 
-                    for (i, (arg, expected_type)) in args
-                        .iter()
-                        .zip(sig.params.iter())
-                        .take(sig.params.len().min(args.len()))
-                        .enumerate()
+                    for (i, (arg, expected_type)) in
+                        args.iter().zip(expected_params.iter()).enumerate()
                     {
                         let arg_type = self.check_expr(arg)?;
-                        self.unify(expected_type, &arg_type).map_err(|_| {
+                        let result = if sig.type_params.is_empty() {
+                            self.unify(expected_type, &arg_type)
+                        } else {
+                            self.infer_type_arguments(
+                                expected_type,
+                                &arg_type,
+                                &sig.type_params,
+                                &mut generic_bindings,
+                            )
+                        };
+                        result.map_err(|_| {
                             self.type_error_at(
                                 format!(
-                                    "Argument {} to static method '{}': expected '{}', got '{}'",
+                                    "Argument {} to function '{}': expected '{}', got '{}'",
                                     i + 1,
                                     resolved_name,
                                     expected_type,
@@ -512,11 +551,12 @@ impl TypeChecker {
                         })?;
                     }
 
-                    if allow_varargs || allow_optional {
+                    if sig.type_params.is_empty() {
                         return Ok(sig.return_type);
+                    } else {
+                        self.validate_generic_call(&sig, &generic_bindings)?;
+                        return Ok(self.substitute_type(&sig.return_type, &generic_bindings));
                     }
-
-                    return Ok(sig.return_type);
                 }
 
                 let enum_lookup = {
@@ -1016,408 +1056,67 @@ impl TypeChecker {
             return Ok(Type::new(TypeKind::Unknown, span));
         }
         match &receiver_type.kind {
-            TypeKind::String => match method {
-                "len" => {
+            TypeKind::String => {
+                return Err(self.type_error(format!(
+                    "Type 'string' does not support method syntax. Use 'string.{}(...)' instead.",
+                    method
+                )));
+            }
+            TypeKind::Array(_) => {
+                return Err(self.type_error(format!(
+                    "Type 'Array' does not support method syntax. Use 'array.{}(...)' instead.",
+                    method
+                )));
+            }
+            TypeKind::Map(_, _) => {
+                return Err(self.type_error(format!(
+                    "Type 'Map' does not support method syntax. Use 'map.{}(...)' instead.",
+                    method
+                )));
+            }
+            TypeKind::Float => {
+                return Err(self.type_error(format!(
+                    "Type 'float' does not support method syntax. Use 'math.{}(...)' instead.",
+                    method
+                )));
+            }
+            TypeKind::Int => {
+                return Err(self.type_error(format!(
+                    "Type 'int' does not support method syntax. Use 'math.{}(...)' instead.",
+                    method
+                )));
+            }
+            TypeKind::Named(type_name) if type_name == "Array" => {
+                return Err(self.type_error(format!(
+                    "Type 'Array' does not support method syntax. Use 'array.{}(...)' instead.",
+                    method
+                )));
+            }
+            TypeKind::Named(type_name) if type_name == "Map" => {
+                return Err(self.type_error(format!(
+                    "Type 'Map' does not support method syntax. Use 'map.{}(...)' instead.",
+                    method
+                )));
+            }
+            TypeKind::Named(type_name) if type_name == "Iterator" => match method {
+                "next" => {
                     if !args.is_empty() {
-                        return Err(self.type_error("len() takes no arguments".to_string()));
+                        return Err(self.type_error("next() takes no arguments".to_string()));
                     }
-
-                    return Ok(Type::new(TypeKind::Int, span));
-                }
-
-                "substring" => {
-                    if args.len() != 2 {
-                        return Err(self.type_error("substring() requires 2 arguments".to_string()));
-                    }
-
-                    self.check_expr(&args[0])?;
-                    self.check_expr(&args[1])?;
-                    return Ok(Type::new(TypeKind::String, span));
-                }
-
-                "find" => {
-                    if args.len() != 1 {
-                        return Err(self.type_error("find() requires 1 argument".to_string()));
-                    }
-
-                    self.check_expr(&args[0])?;
-                    return Ok(Type::new(TypeKind::Named("Option".to_string()), span));
-                }
-
-                "starts_with" | "ends_with" | "contains" => {
-                    if args.len() != 1 {
-                        return Err(self.type_error(format!("{}() requires 1 argument", method)));
-                    }
-
-                    self.check_expr(&args[0])?;
-                    return Ok(Type::new(TypeKind::Bool, span));
-                }
-
-                "split" => {
-                    if args.len() != 1 {
-                        return Err(self.type_error("split() requires 1 argument".to_string()));
-                    }
-
-                    self.check_expr(&args[0])?;
                     return Ok(Type::new(
-                        TypeKind::Array(Box::new(Type::new(TypeKind::String, span))),
+                        TypeKind::Option(Box::new(Type::new(TypeKind::Unknown, span))),
                         span,
                     ));
                 }
-
-                "trim" | "trim_start" | "trim_end" | "to_upper" | "to_lower" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error(format!("{}() takes no arguments", method)));
-                    }
-
-                    return Ok(Type::new(TypeKind::String, span));
-                }
-
-                "replace" => {
-                    if args.len() != 2 {
-                        return Err(self.type_error("replace() requires 2 arguments".to_string()));
-                    }
-
-                    self.check_expr(&args[0])?;
-                    self.check_expr(&args[1])?;
-                    return Ok(Type::new(TypeKind::String, span));
-                }
-
-                "is_empty" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("is_empty() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Bool, span));
-                }
-
-                "chars" | "lines" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error(format!("{}() takes no arguments", method)));
-                    }
-
-                    return Ok(Type::new(
-                        TypeKind::Array(Box::new(Type::new(TypeKind::String, span))),
-                        span,
-                    ));
-                }
-
-                _ => {}
-            },
-            TypeKind::Array(elem_type) => match method {
-                "len" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("len() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Int, span));
-                }
-
-                "get" => {
-                    if args.len() != 1 {
-                        return Err(self.type_error("get() requires 1 argument".to_string()));
-                    }
-
-                    self.check_expr(&args[0])?;
-                    return Ok(Type::new(TypeKind::Option(elem_type.clone()), span));
-                }
-
-                "first" | "last" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error(format!("{}() takes no arguments", method)));
-                    }
-
-                    return Ok(Type::new(TypeKind::Option(elem_type.clone()), span));
-                }
-
-                "push" => {
-                    if args.len() != 1 {
-                        return Err(self.type_error("push() requires 1 argument".to_string()));
-                    }
-
-                    self.check_expr(&args[0])?;
-                    return Ok(Type::new(TypeKind::Unit, span));
-                }
-
-                "pop" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("pop() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Option(elem_type.clone()), span));
-                }
-
                 "iter" => {
                     if !args.is_empty() {
                         return Err(self.type_error("iter() takes no arguments".to_string()));
                     }
-
                     return Ok(Type::new(TypeKind::Named("Iterator".to_string()), span));
                 }
-
-                "slice" => {
-                    if args.len() != 2 {
-                        return Err(self.type_error("slice() requires 2 arguments".to_string()));
-                    }
-
-                    self.check_expr(&args[0])?;
-                    self.check_expr(&args[1])?;
-                    return Ok(Type::new(TypeKind::Array(elem_type.clone()), span));
+                _ => {
+                    return Err(self.type_error(format!("Iterator has no method '{}'", method)));
                 }
-
-                "clear" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("clear() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Unit, span));
-                }
-
-                "is_empty" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("is_empty() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Bool, span));
-                }
-
-                "map" => {
-                    if args.len() != 1 {
-                        return Err(
-                            self.type_error("map() requires 1 argument (function)".to_string())
-                        );
-                    }
-
-                    self.expected_lambda_signature = Some((vec![(**elem_type).clone()], None));
-                    let func_type = self.check_expr(&args[0])?;
-                    match &func_type.kind {
-                        TypeKind::Function {
-                            params: _,
-                            return_type,
-                        } => {
-                            return Ok(Type::new(TypeKind::Array(return_type.clone()), span));
-                        }
-
-                        _ => {
-                            return Err(
-                                self.type_error("map() requires a function argument".to_string())
-                            );
-                        }
-                    }
-                }
-
-                "filter" => {
-                    if args.len() != 1 {
-                        return Err(
-                            self.type_error("filter() requires 1 argument (function)".to_string())
-                        );
-                    }
-
-                    self.expected_lambda_signature = Some((
-                        vec![(**elem_type).clone()],
-                        Some(Type::new(TypeKind::Bool, span)),
-                    ));
-                    let func_type = self.check_expr(&args[0])?;
-                    match &func_type.kind {
-                        TypeKind::Function {
-                            params: _,
-                            return_type,
-                        } => {
-                            self.unify(&Type::new(TypeKind::Bool, span), return_type)?;
-                            return Ok(Type::new(TypeKind::Array(elem_type.clone()), span));
-                        }
-
-                        _ => {
-                            return Err(self
-                                .type_error("filter() requires a function argument".to_string()));
-                        }
-                    }
-                }
-
-                "reduce" => {
-                    if args.len() != 2 {
-                        return Err(self.type_error(
-                            "reduce() requires 2 arguments (initial value and function)"
-                                .to_string(),
-                        ));
-                    }
-
-                    let init_type = self.check_expr(&args[0])?;
-                    self.expected_lambda_signature = Some((
-                        vec![init_type.clone(), (**elem_type).clone()],
-                        Some(init_type.clone()),
-                    ));
-                    let func_type = self.check_expr(&args[1])?;
-                    match &func_type.kind {
-                        TypeKind::Function {
-                            params: _,
-                            return_type,
-                        } => {
-                            self.unify(&init_type, return_type)?;
-                            return Ok(init_type);
-                        }
-
-                        _ => {
-                            return Err(self.type_error(
-                                "reduce() requires a function as second argument".to_string(),
-                            ));
-                        }
-                    }
-                }
-
-                _ => {}
-            },
-            TypeKind::Map(key_type, value_type) => match method {
-                "iter" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("iter() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Named("Iterator".to_string()), span));
-                }
-
-                "len" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("len() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Int, span));
-                }
-
-                "get" => {
-                    if args.len() != 1 {
-                        return Err(self.type_error("get() requires 1 argument (key)".to_string()));
-                    }
-
-                    let arg_type = self.check_expr(&args[0])?;
-                    self.unify(key_type, &arg_type)?;
-                    return Ok(Type::new(TypeKind::Option(value_type.clone()), span));
-                }
-
-                "set" => {
-                    if args.len() != 2 {
-                        return Err(
-                            self.type_error("set() requires 2 arguments (key, value)".to_string())
-                        );
-                    }
-
-                    let key_arg_type = self.check_expr(&args[0])?;
-                    let value_arg_type = self.check_expr(&args[1])?;
-                    self.unify(key_type, &key_arg_type)?;
-                    self.unify(value_type, &value_arg_type)?;
-                    return Ok(Type::new(TypeKind::Unit, span));
-                }
-
-                "has" => {
-                    if args.len() != 1 {
-                        return Err(self.type_error("has() requires 1 argument (key)".to_string()));
-                    }
-
-                    let arg_type = self.check_expr(&args[0])?;
-                    self.unify(key_type, &arg_type)?;
-                    return Ok(Type::new(TypeKind::Bool, span));
-                }
-
-                "delete" => {
-                    if args.len() != 1 {
-                        return Err(
-                            self.type_error("delete() requires 1 argument (key)".to_string())
-                        );
-                    }
-
-                    let arg_type = self.check_expr(&args[0])?;
-                    self.unify(key_type, &arg_type)?;
-                    return Ok(Type::new(TypeKind::Option(value_type.clone()), span));
-                }
-
-                "keys" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("keys() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Array(key_type.clone()), span));
-                }
-
-                "values" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("values() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Array(value_type.clone()), span));
-                }
-
-                _ => {}
-            },
-            TypeKind::Named(type_name) if type_name == "Array" => match method {
-                "len" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("len() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Int, span));
-                }
-
-                "get" => {
-                    if args.len() != 1 {
-                        return Err(self.type_error("get() requires 1 argument".to_string()));
-                    }
-
-                    self.check_expr(&args[0])?;
-                    return Ok(Type::new(TypeKind::Named("Option".to_string()), span));
-                }
-
-                "first" | "last" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error(format!("{}() takes no arguments", method)));
-                    }
-
-                    return Ok(Type::new(TypeKind::Named("Option".to_string()), span));
-                }
-
-                "push" => {
-                    if args.len() != 1 {
-                        return Err(self.type_error("push() requires 1 argument".to_string()));
-                    }
-
-                    self.check_expr(&args[0])?;
-                    return Ok(Type::new(TypeKind::Unit, span));
-                }
-
-                "pop" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("pop() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Named("Option".to_string()), span));
-                }
-
-                "slice" => {
-                    if args.len() != 2 {
-                        return Err(self.type_error("slice() requires 2 arguments".to_string()));
-                    }
-
-                    self.check_expr(&args[0])?;
-                    self.check_expr(&args[1])?;
-                    return Ok(receiver_type.clone());
-                }
-
-                "clear" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("clear() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Unit, span));
-                }
-
-                "is_empty" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("is_empty() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Bool, span));
-                }
-
-                _ => {}
             },
             TypeKind::Option(inner_type) => match method {
                 "is_some" | "is_none" => {
@@ -1516,101 +1215,6 @@ impl TypeChecker {
                 }
             }
 
-            TypeKind::Float => match method {
-                "to_int" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("to_int() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Int, span));
-                }
-
-                "floor" | "ceil" | "round" | "sqrt" | "abs" | "sin" | "cos" | "tan" | "asin"
-                | "acos" | "atan" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error(format!("{}() takes no arguments", method)));
-                    }
-
-                    return Ok(Type::new(TypeKind::Float, span));
-                }
-
-                "atan2" => {
-                    if args.len() != 1 {
-                        return Err(self.type_error("atan2() requires 1 argument".to_string()));
-                    }
-
-                    let other_type = self.check_expr(&args[0])?;
-                    self.unify(&Type::new(TypeKind::Float, span), &other_type)?;
-                    return Ok(Type::new(TypeKind::Float, span));
-                }
-
-                "min" | "max" => {
-                    if args.len() != 1 {
-                        return Err(self.type_error(format!("{}() requires 1 argument", method)));
-                    }
-
-                    self.check_expr(&args[0])?;
-                    return Ok(Type::new(TypeKind::Float, span));
-                }
-
-                "clamp" => {
-                    if args.len() != 2 {
-                        return Err(
-                            self.type_error("clamp() requires 2 arguments (min, max)".to_string())
-                        );
-                    }
-
-                    let min_type = self.check_expr(&args[0])?;
-                    let max_type = self.check_expr(&args[1])?;
-                    self.unify(&Type::new(TypeKind::Float, span), &min_type)?;
-                    self.unify(&Type::new(TypeKind::Float, span), &max_type)?;
-                    return Ok(Type::new(TypeKind::Float, span));
-                }
-
-                _ => {}
-            },
-            TypeKind::Int => match method {
-                "to_float" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("to_float() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Float, span));
-                }
-
-                "abs" => {
-                    if !args.is_empty() {
-                        return Err(self.type_error("abs() takes no arguments".to_string()));
-                    }
-
-                    return Ok(Type::new(TypeKind::Int, span));
-                }
-
-                "min" | "max" => {
-                    if args.len() != 1 {
-                        return Err(self.type_error(format!("{}() requires 1 argument", method)));
-                    }
-
-                    self.check_expr(&args[0])?;
-                    return Ok(Type::new(TypeKind::Int, span));
-                }
-
-                "clamp" => {
-                    if args.len() != 2 {
-                        return Err(
-                            self.type_error("clamp() requires 2 arguments (min, max)".to_string())
-                        );
-                    }
-
-                    let min_type = self.check_expr(&args[0])?;
-                    let max_type = self.check_expr(&args[1])?;
-                    self.unify(&Type::new(TypeKind::Int, span), &min_type)?;
-                    self.unify(&Type::new(TypeKind::Int, span), &max_type)?;
-                    return Ok(Type::new(TypeKind::Int, span));
-                }
-
-                _ => {}
-            },
             TypeKind::Named(type_name) if type_name == "LuaTable" => match method {
                 "len" | "maxn" => {
                     if !args.is_empty() {

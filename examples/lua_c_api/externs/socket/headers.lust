@@ -12,8 +12,8 @@ end
 local __lua_table_from_varargs = function(items: Array<LuaValue>): LuaTable
     local t = lua.table()
     local idx: int = 0
-    while idx < items:len() do
-        local v = items:get(idx)
+    while idx < array.len(items) do
+        local v = array.get(items, idx)
         if v:is_some() then
             t[idx + 1] = lua.unwrap(v:unwrap())
         end
@@ -26,7 +26,7 @@ local __lua_truthy = function(val: unknown): bool
 end
 local __lua_first = function(val: unknown): unknown
     if val is Array<LuaValue> then
-        local first = val:get(0)
+        local first = array.get(val, 0)
         if first:is_some() then
             return first:unwrap()
         end
@@ -39,7 +39,7 @@ local __lua_first = function(val: unknown): unknown
 end
 local __lua_nth = function(val: unknown, idx: int): unknown
     if val is Array<LuaValue> then
-        local item = val:get(idx)
+        local item = array.get(val, idx)
         if item:is_some() then
             return item:unwrap()
         end
@@ -56,10 +56,10 @@ end
 local __lua_join = function(prefix: Array<LuaValue>, tail: unknown): Array<LuaValue>
     local arr = __lua_force_array(tail)
     local idx: int = 0
-    while idx < arr:len() do
-        local v = arr:get(idx)
+    while idx < array.len(arr) do
+        local v = array.get(arr, idx)
         if v:is_some() then
-            prefix:push(v:unwrap())
+            array.push(prefix, v:unwrap())
         end
         idx = idx + 1
     end

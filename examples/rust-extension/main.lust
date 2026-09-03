@@ -6,15 +6,15 @@ local factors: Array<Factor> = []
 local operations: Array<Operation> = []
 
 pub function build_examples()
-    factors:clear()
-    operations:clear()
+    array.clear(factors)
+    array.clear(operations)
 
-    factors:push(make_factor(2, 3))
-    factors:push(make_factor(4, 5))
+    array.push(factors, make_factor(2, 3))
+    array.push(factors, make_factor(4, 5))
 
-    operations:push(Operation.Double)
-    operations:push(Operation.Triple)
-    operations:push(make_scale(10))
+    array.push(operations, Operation.Double)
+    array.push(operations, Operation.Triple)
+    array.push(operations, make_scale(10))
 end
 
 pub function report_factor_results()
@@ -39,7 +39,7 @@ end
 pub function apply_operations_to(value: int): Array<int>
     local results = []
     for operation in operations do
-        results:push(apply_operation(operation, value))
+        array.push(results, apply_operation(operation, value))
     end
     return results
 end

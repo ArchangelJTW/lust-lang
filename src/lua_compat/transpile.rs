@@ -523,8 +523,8 @@ impl Emitter {
                 .to_string(),
             "    local t = lua.table()".to_string(),
             "    local idx: int = 0".to_string(),
-            "    while idx < items:len() do".to_string(),
-            "        local v = items:get(idx)".to_string(),
+            "    while idx < array.len(items) do".to_string(),
+            "        local v = array.get(items, idx)".to_string(),
             "        if v:is_some() then".to_string(),
             "            t[idx + 1] = lua.unwrap(v:unwrap())".to_string(),
             "        end".to_string(),
@@ -537,7 +537,7 @@ impl Emitter {
             "end".to_string(),
             "local __lua_first = function(val: unknown): unknown".to_string(),
             "    if val is Array<LuaValue> then".to_string(),
-            "        local first = val:get(0)".to_string(),
+            "        local first = array.get(val, 0)".to_string(),
             "        if first:is_some() then".to_string(),
             "            return first:unwrap()".to_string(),
             "        end".to_string(),
@@ -550,7 +550,7 @@ impl Emitter {
             "end".to_string(),
             "local __lua_nth = function(val: unknown, idx: int): unknown".to_string(),
             "    if val is Array<LuaValue> then".to_string(),
-            "        local item = val:get(idx)".to_string(),
+            "        local item = array.get(val, idx)".to_string(),
             "        if item:is_some() then".to_string(),
             "            return item:unwrap()".to_string(),
             "        end".to_string(),
@@ -568,10 +568,10 @@ impl Emitter {
                 .to_string(),
             "    local arr = __lua_force_array(tail)".to_string(),
             "    local idx: int = 0".to_string(),
-            "    while idx < arr:len() do".to_string(),
-            "        local v = arr:get(idx)".to_string(),
+            "    while idx < array.len(arr) do".to_string(),
+            "        local v = array.get(arr, idx)".to_string(),
             "        if v:is_some() then".to_string(),
-            "            prefix:push(v:unwrap())".to_string(),
+            "            array.push(prefix, v:unwrap())".to_string(),
             "        end".to_string(),
             "        idx = idx + 1".to_string(),
             "    end".to_string(),
@@ -1593,10 +1593,7 @@ impl Emitter {
                 Some(format!("{}:maxn()", rendered[0]))
             }
             "math.abs" => {
-                if rendered.len() != 1 {
-                    return Some(format!("{head}({})", rendered.join(", ")));
-                }
-                Some(format!("lua.unwrap({}):abs()", rendered[0]))
+                Some(format!("math.abs({})", rendered.join(", ")))
             }
             "math.mod" => {
                 if rendered.len() != 2 {
@@ -1608,24 +1605,10 @@ impl Emitter {
                 ))
             }
             "math.min" => {
-                if rendered.is_empty() {
-                    return Some(format!("{head}()"));
-                }
-                let mut expr = format!("lua.unwrap({})", rendered[0]);
-                for arg in rendered.iter().skip(1) {
-                    expr = format!("{expr}:min(lua.unwrap({arg}))");
-                }
-                Some(expr)
+                Some(format!("math.min({})", rendered.join(", ")))
             }
             "math.max" => {
-                if rendered.is_empty() {
-                    return Some(format!("{head}()"));
-                }
-                let mut expr = format!("lua.unwrap({})", rendered[0]);
-                for arg in rendered.iter().skip(1) {
-                    expr = format!("{expr}:max(lua.unwrap({arg}))");
-                }
-                Some(expr)
+                Some(format!("math.max({})", rendered.join(", ")))
             }
             "math.random" => {
                 let m = rendered.get(0).cloned().unwrap_or_else(|| nil.clone());

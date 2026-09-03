@@ -1,4 +1,7 @@
 use super::*;
+use crate::backend::completions::{
+    builtin_global_completions, builtin_instance_method_completions,
+};
 use crate::analysis::{find_type_for_position, AnalysisSnapshot, ModuleSnapshot};
 use crate::utils::{
     analyzer_lust_config, base_type_name, compute_line_offsets, offset_to_position,
@@ -1564,4 +1567,70 @@ fn analyze_context_handles_cursor_on_trigger() {
         analyze_member_method_context(text, offset_after_trigger).expect("context after");
     assert!(ctx_after.prefix.is_empty());
     assert_eq!(ctx_after.object_name.as_deref(), Some("self"));
+}
+
+#[test]
+fn builtin_module_and_instance_completions_match_new_api() {
+    prewarm_builtins();
+
+    // Module functions available via module dot notation
+    let array_completions = builtin_global_completions("array", "");
+    let array_labels: Vec<_> = array_completions.iter().map(|item| item.label.as_str()).collect();
+    assert!(array_labels.contains(&"push"));
+    assert!(array_labels.contains(&"pop"));
+    assert!(array_labels.contains(&"len"));
+    assert!(array_labels.contains(&"get"));
+    assert!(array_labels.contains(&"map"));
+    assert!(array_labels.contains(&"filter"));
+
+    let string_completions = builtin_global_completions("string", "");
+    let string_labels: Vec<_> = string_completions.iter().map(|item| item.label.as_str()).collect();
+    assert!(string_labels.contains(&"len"));
+    assert!(string_labels.contains(&"split"));
+    assert!(string_labels.contains(&"trim"));
+    assert!(string_labels.contains(&"contains"));
+    assert!(string_labels.contains(&"replace"));
+
+    let math_completions = builtin_global_completions("math", "");
+    let math_labels: Vec<_> = math_completions.iter().map(|item| item.label.as_str()).collect();
+    assert!(math_labels.contains(&"abs"));
+    assert!(math_labels.contains(&"floor"));
+    assert!(math_labels.contains(&"ceil"));
+    assert!(math_labels.contains(&"min"));
+    assert!(math_labels.contains(&"max"));
+    assert!(math_labels.contains(&"sqrt"));
+
+    let map_completions = builtin_global_completions("map", "");
+    let map_labels: Vec<_> = map_completions.iter().map(|item| item.label.as_str()).collect();
+    assert!(map_labels.contains(&"get"));
+    assert!(map_labels.contains(&"set"));
+    assert!(map_labels.contains(&"len"));
+    assert!(map_labels.contains(&"delete"));
+    assert!(map_labels.contains(&"keys"));
+    assert!(map_labels.contains(&"values"));
+
+    // Primitive types have NO builtin instance methods
+    assert!(builtin_instance_method_completions("Array", "").is_empty());
+    assert!(builtin_instance_method_completions("String", "").is_empty());
+    assert!(builtin_instance_method_completions("Int", "").is_empty());
+    assert!(builtin_instance_method_completions("Float", "").is_empty());
+    assert!(builtin_instance_method_completions("Map", "").is_empty());
+
+    // Option, Result, and Iterator retain their instance methods
+    let opt_methods = builtin_instance_method_completions("Option", "");
+    let opt_labels: Vec<_> = opt_methods.iter().map(|item| item.label.as_str()).collect();
+    assert!(opt_labels.contains(&"unwrap"));
+    assert!(opt_labels.contains(&"is_some"));
+    assert!(opt_labels.contains(&"is_none"));
+
+    let res_methods = builtin_instance_method_completions("Result", "");
+    let res_labels: Vec<_> = res_methods.iter().map(|item| item.label.as_str()).collect();
+    assert!(res_labels.contains(&"unwrap"));
+    assert!(res_labels.contains(&"is_ok"));
+    assert!(res_labels.contains(&"is_err"));
+
+    let iter_methods = builtin_instance_method_completions("Iterator", "");
+    let iter_labels: Vec<_> = iter_methods.iter().map(|item| item.label.as_str()).collect();
+    assert!(iter_labels.contains(&"next"));
+    assert!(iter_labels.contains(&"iter"));
 }

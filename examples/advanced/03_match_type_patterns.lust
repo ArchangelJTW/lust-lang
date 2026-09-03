@@ -4,7 +4,7 @@
 -- Process different types with match statement
 function process_with_match(value: string | int | bool): string
     if value is string then
-        return "String: " .. value .. " (len: " .. tostring(value:len()) .. ")"
+        return "String: " .. value .. " (len: " .. tostring(string.len(value)) .. ")"
     elseif value is int then
         return "Integer: " .. tostring(value) .. " (doubled: " .. tostring(value * 2) .. ")"
     elseif value is bool then
@@ -66,21 +66,21 @@ println(process_with_match(false))
 println("")
 println("Test 2: Unknown narrowing")
 local config: Map<string, unknown> = {}
-config:set("port", 8080)
-config:set("host", "localhost")
-config:set("debug", true)
+map.set(config, "port", 8080)
+map.set(config, "host", "localhost")
+map.set(config, "debug", true)
 
-local port_opt = config:get("port")
+local port_opt = map.get(config, "port")
 if port_opt:is_some() then
     println(describe_unknown(port_opt:unwrap()))
 end
 
-local host_opt = config:get("host")
+local host_opt = map.get(config, "host")
 if host_opt:is_some() then
     println(describe_unknown(host_opt:unwrap()))
 end
 
-local debug_opt = config:get("debug")
+local debug_opt = map.get(config, "debug")
 if debug_opt:is_some() then
     println(describe_unknown(debug_opt:unwrap()))
 end
@@ -99,13 +99,12 @@ println("Test 4: Array of union types")
 local str_items: Array<string> = ["a", "b", "c"]
 local int_items: Array<int> = [1, 2, 3]
 
-println(process_with_match(str_items:get(0):unwrap()))
-println(process_with_match(int_items:get(0):unwrap()))
-println(process_with_match(str_items:get(1):unwrap()))
-println(process_with_match(int_items:get(1):unwrap()))
-println(process_with_match(str_items:get(2):unwrap()))
-println(process_with_match(int_items:get(2):unwrap()))
+println(process_with_match(array.get(str_items, 0):unwrap()))
+println(process_with_match(array.get(int_items, 0):unwrap()))
+println(process_with_match(array.get(str_items, 1):unwrap()))
+println(process_with_match(array.get(int_items, 1):unwrap()))
+println(process_with_match(array.get(str_items, 2):unwrap()))
+println(process_with_match(array.get(int_items, 2):unwrap()))
 
 println("")
 println("=== All match pattern tests passed! ===")
-

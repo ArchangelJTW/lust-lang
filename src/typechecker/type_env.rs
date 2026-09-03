@@ -271,9 +271,20 @@ impl TypeEnv {
             },
         );
         self.register_builtin_function_slice(builtins::base_functions(), dummy_span);
+        self.register_builtin_function_slice(builtins::array_functions(), dummy_span);
+        self.register_builtin_function_slice(builtins::map_functions(), dummy_span);
+        self.register_builtin_function_slice(builtins::math_functions(), dummy_span);
+        self.register_builtin_function_slice(builtins::string_functions(), dummy_span);
         self.register_builtin_function_slice(builtins::task_functions(), dummy_span);
         self.register_builtin_function_slice(builtins::lua_functions(), dummy_span);
         if let Some(global_scope) = self.scopes.first_mut() {
+            global_scope.insert("array".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+            global_scope.insert("map".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+            global_scope.insert("math".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+            global_scope.insert(
+                "string".to_string(),
+                Type::new(TypeKind::Unknown, dummy_span),
+            );
             global_scope.insert("task".to_string(), Type::new(TypeKind::Unknown, dummy_span));
             global_scope.insert("lua".to_string(), Type::new(TypeKind::Unknown, dummy_span));
         }
@@ -379,17 +390,6 @@ impl TypeEnv {
             }
 
             self.register_builtin_function_slice(builtins::io_functions(), dummy_span);
-        }
-
-        if config.is_module_enabled("string") {
-            if let Some(global_scope) = self.scopes.first_mut() {
-                global_scope.insert(
-                    "string".to_string(),
-                    Type::new(TypeKind::Unknown, dummy_span),
-                );
-            }
-
-            self.register_builtin_function_slice(builtins::string_functions(), dummy_span);
         }
 
         if config.is_module_enabled("os") {

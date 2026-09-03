@@ -6,6 +6,7 @@ use hashbrown::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct BuiltinSignature {
+    pub type_params: &'static [&'static str],
     pub params: Vec<TypeExpr>,
     pub return_type: TypeExpr,
 }
@@ -71,7 +72,12 @@ impl BuiltinFunction {
                 .return_type
                 .instantiate(&HashMap::new(), Some(span)),
             is_method: false,
-            type_params: Vec::new(),
+            type_params: self
+                .signature
+                .type_params
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             trait_bounds: Vec::new(),
         }
     }
@@ -151,7 +157,7 @@ impl TypeExpr {
             TypeExpr::Generic(name) => generics
                 .get(name)
                 .cloned()
-                .unwrap_or_else(|| Type::new(TypeKind::Unknown, span)),
+                .unwrap_or_else(|| Type::new(TypeKind::Generic((*name).to_string()), span)),
             TypeExpr::SelfType => generics
                 .get("Self")
                 .cloned()
@@ -225,6 +231,45 @@ pub fn match_receiver(pattern: &TypeExpr, actual: &Type) -> Option<HashMap<&'sta
     }
 }
 
+fn func(
+    name: &'static str,
+    description: &'static str,
+    param_names: &'static [&'static str],
+    params: Vec<TypeExpr>,
+    return_type: TypeExpr,
+) -> BuiltinFunction {
+    BuiltinFunction {
+        name,
+        description,
+        signature: BuiltinSignature {
+            type_params: &[],
+            params,
+            return_type,
+        },
+        param_names,
+    }
+}
+
+fn generic_func(
+    name: &'static str,
+    description: &'static str,
+    type_params: &'static [&'static str],
+    param_names: &'static [&'static str],
+    params: Vec<TypeExpr>,
+    return_type: TypeExpr,
+) -> BuiltinFunction {
+    BuiltinFunction {
+        name,
+        description,
+        signature: BuiltinSignature {
+            type_params,
+            params,
+            return_type,
+        },
+        param_names,
+    }
+}
+
 fn method(
     receiver: TypeExpr,
     name: &'static str,
@@ -238,372 +283,13 @@ fn method(
         name,
         description,
         signature: BuiltinSignature {
+            type_params: &[],
             params,
             return_type,
         },
         param_names,
         semantics: MethodSemantics::Simple,
     }
-}
-
-fn method_with_semantics(
-    receiver: TypeExpr,
-    name: &'static str,
-    description: &'static str,
-    param_names: &'static [&'static str],
-    params: Vec<TypeExpr>,
-    return_type: TypeExpr,
-    semantics: MethodSemantics,
-) -> BuiltinMethod {
-    let mut m = method(
-        receiver,
-        name,
-        description,
-        param_names,
-        params,
-        return_type,
-    );
-    m.semantics = semantics;
-    m
-}
-
-fn string_methods() -> Vec<BuiltinMethod> {
-    vec![
-        method(
-            TypeExpr::String,
-            "len",
-            "Return the length of the string in bytes",
-            &[],
-            vec![],
-            TypeExpr::Int,
-        ),
-        method(
-            TypeExpr::String,
-            "substring",
-            "Extract a substring from the string",
-            &["start", "end"],
-            vec![TypeExpr::Int, TypeExpr::Int],
-            TypeExpr::String,
-        ),
-        method(
-            TypeExpr::String,
-            "find",
-            "Find the first occurrence of a substring",
-            &["pattern"],
-            vec![TypeExpr::String],
-            TypeExpr::Option(Box::new(TypeExpr::Int)),
-        ),
-        method(
-            TypeExpr::String,
-            "starts_with",
-            "Check whether the string starts with a prefix",
-            &["prefix"],
-            vec![TypeExpr::String],
-            TypeExpr::Bool,
-        ),
-        method(
-            TypeExpr::String,
-            "ends_with",
-            "Check whether the string ends with a suffix",
-            &["suffix"],
-            vec![TypeExpr::String],
-            TypeExpr::Bool,
-        ),
-        method(
-            TypeExpr::String,
-            "contains",
-            "Check whether the string contains a substring",
-            &["substring"],
-            vec![TypeExpr::String],
-            TypeExpr::Bool,
-        ),
-        method(
-            TypeExpr::String,
-            "split",
-            "Split the string on a separator",
-            &["delimiter"],
-            vec![TypeExpr::String],
-            TypeExpr::Array(Box::new(TypeExpr::String)),
-        ),
-        method(
-            TypeExpr::String,
-            "trim",
-            "Trim whitespace from both ends of the string",
-            &[],
-            vec![],
-            TypeExpr::String,
-        ),
-        method(
-            TypeExpr::String,
-            "trim_start",
-            "Trim whitespace from the start of the string",
-            &[],
-            vec![],
-            TypeExpr::String,
-        ),
-        method(
-            TypeExpr::String,
-            "trim_end",
-            "Trim whitespace from the end of the string",
-            &[],
-            vec![],
-            TypeExpr::String,
-        ),
-        method(
-            TypeExpr::String,
-            "replace",
-            "Replace occurrences of a substring",
-            &["from", "to"],
-            vec![TypeExpr::String, TypeExpr::String],
-            TypeExpr::String,
-        ),
-        method(
-            TypeExpr::String,
-            "to_upper",
-            "Convert the string to uppercase",
-            &[],
-            vec![],
-            TypeExpr::String,
-        ),
-        method(
-            TypeExpr::String,
-            "to_lower",
-            "Convert the string to lowercase",
-            &[],
-            vec![],
-            TypeExpr::String,
-        ),
-        method(
-            TypeExpr::String,
-            "is_empty",
-            "Check if the string is empty",
-            &[],
-            vec![],
-            TypeExpr::Bool,
-        ),
-        method(
-            TypeExpr::String,
-            "chars",
-            "Return the characters as an array of strings",
-            &[],
-            vec![],
-            TypeExpr::Array(Box::new(TypeExpr::String)),
-        ),
-        method(
-            TypeExpr::String,
-            "lines",
-            "Return the lines as an array of strings",
-            &[],
-            vec![],
-            TypeExpr::Array(Box::new(TypeExpr::String)),
-        ),
-        method(
-            TypeExpr::String,
-            "iter",
-            "Return an iterator over the characters of the string",
-            &[],
-            vec![],
-            TypeExpr::Named("Iterator"),
-        ),
-    ]
-}
-
-fn array_methods() -> Vec<BuiltinMethod> {
-    let receiver = TypeExpr::Array(Box::new(TypeExpr::Generic("T")));
-    let mut methods = Vec::new();
-    methods.push(method(
-        receiver.clone(),
-        "iter",
-        "Return an iterator over the array items",
-        &[],
-        vec![],
-        TypeExpr::Named("Iterator"),
-    ));
-    methods.push(method(
-        receiver.clone(),
-        "len",
-        "Return the number of elements in the array",
-        &[],
-        vec![],
-        TypeExpr::Int,
-    ));
-    methods.push(method(
-        receiver.clone(),
-        "get",
-        "Return the element at the given index, if any",
-        &["index"],
-        vec![TypeExpr::Int],
-        TypeExpr::Option(Box::new(TypeExpr::Generic("T"))),
-    ));
-    methods.push(method(
-        receiver.clone(),
-        "first",
-        "Return the first element, if any",
-        &[],
-        vec![],
-        TypeExpr::Option(Box::new(TypeExpr::Generic("T"))),
-    ));
-    methods.push(method(
-        receiver.clone(),
-        "last",
-        "Return the last element, if any",
-        &[],
-        vec![],
-        TypeExpr::Option(Box::new(TypeExpr::Generic("T"))),
-    ));
-    methods.push(method(
-        receiver.clone(),
-        "push",
-        "Append a value to the array",
-        &["value"],
-        vec![TypeExpr::Generic("T")],
-        TypeExpr::Unit,
-    ));
-    methods.push(method(
-        receiver.clone(),
-        "pop",
-        "Remove and return the last element, if any",
-        &[],
-        vec![],
-        TypeExpr::Option(Box::new(TypeExpr::Generic("T"))),
-    ));
-    methods.push(method_with_semantics(
-        receiver.clone(),
-        "map",
-        "Transform each element using the provided function",
-        &["func"],
-        vec![TypeExpr::Function {
-            params: vec![TypeExpr::Generic("T")],
-            return_type: Box::new(TypeExpr::Unknown),
-        }],
-        TypeExpr::Array(Box::new(TypeExpr::Unknown)),
-        MethodSemantics::ArrayMap,
-    ));
-    methods.push(method_with_semantics(
-        receiver.clone(),
-        "filter",
-        "Keep elements where the predicate returns true",
-        &["func"],
-        vec![TypeExpr::Function {
-            params: vec![TypeExpr::Generic("T")],
-            return_type: Box::new(TypeExpr::Bool),
-        }],
-        TypeExpr::Array(Box::new(TypeExpr::Generic("T"))),
-        MethodSemantics::ArrayFilter,
-    ));
-    methods.push(method_with_semantics(
-        receiver.clone(),
-        "reduce",
-        "Fold elements into a single value",
-        &["initial", "func"],
-        vec![
-            TypeExpr::Unknown,
-            TypeExpr::Function {
-                params: vec![TypeExpr::Unknown, TypeExpr::Generic("T")],
-                return_type: Box::new(TypeExpr::Unknown),
-            },
-        ],
-        TypeExpr::Unknown,
-        MethodSemantics::ArrayReduce,
-    ));
-    methods.push(method(
-        receiver.clone(),
-        "slice",
-        "Return a slice of the array between two indices",
-        &["start", "end"],
-        vec![TypeExpr::Int, TypeExpr::Int],
-        TypeExpr::Array(Box::new(TypeExpr::Generic("T"))),
-    ));
-    methods.push(method(
-        receiver.clone(),
-        "clear",
-        "Remove all elements from the array",
-        &[],
-        vec![],
-        TypeExpr::Unit,
-    ));
-    methods.push(method(
-        receiver,
-        "is_empty",
-        "Check if the array contains no elements",
-        &[],
-        vec![],
-        TypeExpr::Bool,
-    ));
-    methods
-}
-
-fn map_methods() -> Vec<BuiltinMethod> {
-    let receiver = TypeExpr::Map(
-        Box::new(TypeExpr::Generic("K")),
-        Box::new(TypeExpr::Generic("V")),
-    );
-    vec![
-        method(
-            receiver.clone(),
-            "iter",
-            "Iterate over key/value pairs",
-            &[],
-            vec![],
-            TypeExpr::Named("Iterator"),
-        ),
-        method(
-            receiver.clone(),
-            "len",
-            "Return the number of entries in the map",
-            &[],
-            vec![],
-            TypeExpr::Int,
-        ),
-        method(
-            receiver.clone(),
-            "get",
-            "Look up a value by key",
-            &["key"],
-            vec![TypeExpr::Generic("K")],
-            TypeExpr::Option(Box::new(TypeExpr::Generic("V"))),
-        ),
-        method(
-            receiver.clone(),
-            "set",
-            "Insert or overwrite a key/value pair",
-            &["key", "value"],
-            vec![TypeExpr::Generic("K"), TypeExpr::Generic("V")],
-            TypeExpr::Unit,
-        ),
-        method(
-            receiver.clone(),
-            "has",
-            "Check whether the map contains a key",
-            &["key"],
-            vec![TypeExpr::Generic("K")],
-            TypeExpr::Bool,
-        ),
-        method(
-            receiver.clone(),
-            "delete",
-            "Remove an entry from the map",
-            &["key"],
-            vec![TypeExpr::Generic("K")],
-            TypeExpr::Option(Box::new(TypeExpr::Generic("V"))),
-        ),
-        method(
-            receiver.clone(),
-            "keys",
-            "Return the keys as an array",
-            &[],
-            vec![],
-            TypeExpr::Array(Box::new(TypeExpr::Generic("K"))),
-        ),
-        method(
-            receiver,
-            "values",
-            "Return the values as an array",
-            &[],
-            vec![],
-            TypeExpr::Array(Box::new(TypeExpr::Generic("V"))),
-        ),
-    ]
 }
 
 fn iterator_methods() -> Vec<BuiltinMethod> {
@@ -706,772 +392,666 @@ fn result_methods() -> Vec<BuiltinMethod> {
     ]
 }
 
-fn float_methods() -> Vec<BuiltinMethod> {
-    vec![
-        method(
-            TypeExpr::Float,
-            "to_int",
-            "Convert the float to an integer by truncation",
-            &[],
-            vec![],
-            TypeExpr::Int,
-        ),
-        method(
-            TypeExpr::Float,
-            "floor",
-            "Return the greatest integer less than or equal to the value",
-            &[],
-            vec![],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Float,
-            "ceil",
-            "Return the smallest integer greater than or equal to the value",
-            &[],
-            vec![],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Float,
-            "round",
-            "Round the float to the nearest integer",
-            &[],
-            vec![],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Float,
-            "sqrt",
-            "Return the square root of the float",
-            &[],
-            vec![],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Float,
-            "abs",
-            "Return the absolute value of the float",
-            &[],
-            vec![],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Float,
-            "sin",
-            "Return the sine of the float in radians",
-            &[],
-            vec![],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Float,
-            "cos",
-            "Return the cosine of the float in radians",
-            &[],
-            vec![],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Float,
-            "tan",
-            "Return the tangent of the float in radians",
-            &[],
-            vec![],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Float,
-            "asin",
-            "Return the arcsine of the float in radians",
-            &[],
-            vec![],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Float,
-            "acos",
-            "Return the arccosine of the float in radians",
-            &[],
-            vec![],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Float,
-            "atan",
-            "Return the arctangent of the float in radians",
-            &[],
-            vec![],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Float,
-            "atan2",
-            "Return the arctangent of y/x using the receiver as y",
-            &["other"],
-            vec![TypeExpr::Float],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Float,
-            "min",
-            "Return the smaller of two numbers",
-            &["other"],
-            vec![TypeExpr::Float],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Float,
-            "max",
-            "Return the larger of two numbers",
-            &["other"],
-            vec![TypeExpr::Float],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Float,
-            "clamp",
-            "Clamp the float between a minimum and maximum value",
-            &["min", "max"],
-            vec![TypeExpr::Float, TypeExpr::Float],
-            TypeExpr::Float,
-        ),
-    ]
-}
-
-fn int_methods() -> Vec<BuiltinMethod> {
-    vec![
-        method(
-            TypeExpr::Int,
-            "to_float",
-            "Convert the integer to a float",
-            &[],
-            vec![],
-            TypeExpr::Float,
-        ),
-        method(
-            TypeExpr::Int,
-            "abs",
-            "Return the absolute value of the integer",
-            &[],
-            vec![],
-            TypeExpr::Int,
-        ),
-        method(
-            TypeExpr::Int,
-            "min",
-            "Return the smaller of two integers",
-            &["other"],
-            vec![TypeExpr::Int],
-            TypeExpr::Int,
-        ),
-        method(
-            TypeExpr::Int,
-            "max",
-            "Return the larger of two integers",
-            &["other"],
-            vec![TypeExpr::Int],
-            TypeExpr::Int,
-        ),
-        method(
-            TypeExpr::Int,
-            "clamp",
-            "Clamp the integer between a minimum and maximum value",
-            &["min", "max"],
-            vec![TypeExpr::Int, TypeExpr::Int],
-            TypeExpr::Int,
-        ),
-    ]
-}
-
-fn lua_table_methods() -> Vec<BuiltinMethod> {
-    vec![
-        method(
-            TypeExpr::Named("LuaTable"),
-            "len",
-            "Return the length of the array portion (1-based contiguous keys)",
-            &[],
-            vec![],
-            TypeExpr::Int,
-        ),
-        method(
-            TypeExpr::Named("LuaTable"),
-            "push",
-            "Append a value to the array portion",
-            &["value"],
-            vec![TypeExpr::Unknown],
-            TypeExpr::Unit,
-        ),
-        method(
-            TypeExpr::Named("LuaTable"),
-            "insert",
-            "Insert a value into the array portion at a position",
-            &["pos", "value"],
-            vec![TypeExpr::Unknown, TypeExpr::Unknown],
-            TypeExpr::Unit,
-        ),
-        method(
-            TypeExpr::Named("LuaTable"),
-            "remove",
-            "Remove a value from the array portion at a position",
-            &["pos"],
-            vec![TypeExpr::Unknown],
-            TypeExpr::Unknown,
-        ),
-        method(
-            TypeExpr::Named("LuaTable"),
-            "concat",
-            "Concatenate array elements into a string",
-            &["sep", "i", "j"],
-            vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
-            TypeExpr::String,
-        ),
-        method(
-            TypeExpr::Named("LuaTable"),
-            "unpack",
-            "Unpack array elements as multiple returns",
-            &["i", "j"],
-            vec![TypeExpr::Unknown, TypeExpr::Unknown],
-            TypeExpr::Unknown,
-        ),
-        method(
-            TypeExpr::Named("LuaTable"),
-            "sort",
-            "Sort the array portion",
-            &["comp"],
-            vec![TypeExpr::Unknown],
-            TypeExpr::Unit,
-        ),
-        method(
-            TypeExpr::Named("LuaTable"),
-            "maxn",
-            "Find the largest positive numeric index",
-            &[],
-            vec![],
-            TypeExpr::Int,
-        ),
-    ]
-}
-
 static BASE_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 
 fn build_base_functions() -> Vec<BuiltinFunction> {
     vec![
-        BuiltinFunction {
-            name: "print",
-            description: "Print values without a newline",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::Unit,
-            },
-            param_names: &["value"],
-        },
-        BuiltinFunction {
-            name: "println",
-            description: "Print values followed by a newline",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::Unit,
-            },
-            param_names: &["value"],
-        },
-        BuiltinFunction {
-            name: "type",
-            description: "Return the runtime type name",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::String,
-            },
-            param_names: &["value"],
-        },
-        BuiltinFunction {
-            name: "tostring",
-            description: "Convert a value to a string",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::String,
-            },
-            param_names: &["value"],
-        },
-        BuiltinFunction {
-            name: "error",
-            description: "Raise a runtime error",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::Unknown,
-            },
-            param_names: &["message"],
-        },
-        BuiltinFunction {
-            name: "assert",
-            description: "Assert a condition or raise an error",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown, TypeExpr::Unknown],
-                return_type: TypeExpr::Unknown,
-            },
-            param_names: &["cond", "message"],
-        },
-        BuiltinFunction {
-            name: "tonumber",
-            description: "Convert a value to a number",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown, TypeExpr::Unknown],
-                return_type: TypeExpr::Unknown,
-            },
-            param_names: &["value", "base"],
-        },
-        BuiltinFunction {
-            name: "pairs",
-            description: "Iterate over key/value pairs",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::Named("Iterator"),
-            },
-            param_names: &["table"],
-        },
-        BuiltinFunction {
-            name: "ipairs",
-            description: "Iterate over array elements with indices",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::Named("Iterator"),
-            },
-            param_names: &["array"],
-        },
-        BuiltinFunction {
-            name: "select",
-            description: "Return arguments starting at an index or the argument count",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown, TypeExpr::Unknown],
-                return_type: TypeExpr::Unknown,
-            },
-            param_names: &["index_or_hash", "..."],
-        },
-        BuiltinFunction {
-            name: "random",
-            description: "Generate a random number in an optional range",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown, TypeExpr::Unknown],
-                return_type: TypeExpr::Unknown,
-            },
-            param_names: &["m", "n"],
-        },
-        BuiltinFunction {
-            name: "randomseed",
-            description: "Seed the random number generator",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::Unit,
-            },
-            param_names: &["seed"],
-        },
-        BuiltinFunction {
-            name: "unpack",
-            description: "Unpack array elements into multiple returns",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
-                return_type: TypeExpr::Unknown,
-            },
-            param_names: &["table", "i", "j"],
-        },
-        BuiltinFunction {
-            name: "setmetatable",
-            description: "Assign a metatable to a Lua table value",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown, TypeExpr::Unknown],
-                return_type: TypeExpr::Unknown,
-            },
-            param_names: &["table", "meta"],
-        },
+        func(
+            "print",
+            "Print values without a newline",
+            &["value"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unit,
+        ),
+        func(
+            "println",
+            "Print values followed by a newline",
+            &["value"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unit,
+        ),
+        func(
+            "type",
+            "Return the runtime type name",
+            &["value"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::String,
+        ),
+        func(
+            "tostring",
+            "Convert a value to a string",
+            &["value"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::String,
+        ),
+        func(
+            "error",
+            "Raise a runtime error",
+            &["message"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "assert",
+            "Assert a condition or raise an error",
+            &["cond", "message"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "tonumber",
+            "Convert a value to a number",
+            &["value", "base"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "pairs",
+            "Iterate over key/value pairs",
+            &["table"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Named("Iterator"),
+        ),
+        func(
+            "ipairs",
+            "Iterate over array elements with indices",
+            &["array"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Named("Iterator"),
+        ),
+        func(
+            "select",
+            "Return arguments starting at an index or the argument count",
+            &["index_or_hash", "..."],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "random",
+            "Generate a random number in an optional range",
+            &["m", "n"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "randomseed",
+            "Seed the random number generator",
+            &["seed"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unit,
+        ),
+        func(
+            "unpack",
+            "Unpack array elements into multiple returns",
+            &["table", "i", "j"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "setmetatable",
+            "Assign a metatable to a Lua table value",
+            &["table", "meta"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
     ]
 }
 
+static ARRAY_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+static MAP_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+static MATH_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 static STRING_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 static TASK_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 static LUA_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+static IO_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+static OS_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 
-fn build_task_functions() -> Vec<BuiltinFunction> {
+fn build_array_functions() -> Vec<BuiltinFunction> {
+    let t = TypeExpr::Generic("T");
+    let arr_t = TypeExpr::Array(Box::new(t.clone()));
     vec![
-        BuiltinFunction {
-            name: "task.run",
-            description: "Run a function as a task",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::Named("Task"),
-            },
-            param_names: &["func"],
-        },
-        BuiltinFunction {
-            name: "task.create",
-            description: "Create a suspended task",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::Named("Task"),
-            },
-            param_names: &["func"],
-        },
-        BuiltinFunction {
-            name: "task.status",
-            description: "Get the status of a task",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Named("Task")],
-                return_type: TypeExpr::Named("TaskStatus"),
-            },
-            param_names: &["task"],
-        },
-        BuiltinFunction {
-            name: "task.info",
-            description: "Get detailed information about a task",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Named("Task")],
-                return_type: TypeExpr::Named("TaskInfo"),
-            },
-            param_names: &["task"],
-        },
-        BuiltinFunction {
-            name: "task.resume",
-            description: "Resume a suspended task",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Named("Task")],
-                return_type: TypeExpr::Named("TaskInfo"),
-            },
-            param_names: &["task"],
-        },
-        BuiltinFunction {
-            name: "task.yield",
-            description: "Yield from the current task",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::Unknown,
-            },
-            param_names: &["value"],
-        },
-        BuiltinFunction {
-            name: "task.stop",
-            description: "Stop a running task",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Named("Task")],
-                return_type: TypeExpr::Bool,
-            },
-            param_names: &["task"],
-        },
-        BuiltinFunction {
-            name: "task.restart",
-            description: "Restart a completed task",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Named("Task")],
-                return_type: TypeExpr::Named("TaskInfo"),
-            },
-            param_names: &["task"],
-        },
-        BuiltinFunction {
-            name: "task.current",
-            description: "Return the currently executing task",
-            signature: BuiltinSignature {
-                params: vec![],
-                return_type: TypeExpr::Option(Box::new(TypeExpr::Named("Task"))),
-            },
-            param_names: &[],
-        },
+        generic_func(
+            "array.len",
+            "Return the number of elements in the array",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Int,
+        ),
+        generic_func(
+            "array.is_empty",
+            "Check if the array contains no elements",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Bool,
+        ),
+        generic_func(
+            "array.get",
+            "Return the element at the given index, if any",
+            &["T"],
+            &["arr", "index"],
+            vec![arr_t.clone(), TypeExpr::Int],
+            TypeExpr::Option(Box::new(t.clone())),
+        ),
+        generic_func(
+            "array.first",
+            "Return the first element, if any",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Option(Box::new(t.clone())),
+        ),
+        generic_func(
+            "array.last",
+            "Return the last element, if any",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Option(Box::new(t.clone())),
+        ),
+        generic_func(
+            "array.push",
+            "Append a value to the array",
+            &["T"],
+            &["arr", "value"],
+            vec![arr_t.clone(), t.clone()],
+            TypeExpr::Unit,
+        ),
+        generic_func(
+            "array.pop",
+            "Remove and return the last element, if any",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Option(Box::new(t.clone())),
+        ),
+        generic_func(
+            "array.insert",
+            "Insert an element at the given index",
+            &["T"],
+            &["arr", "index", "value"],
+            vec![arr_t.clone(), TypeExpr::Int, t.clone()],
+            TypeExpr::Unit,
+        ),
+        generic_func(
+            "array.remove",
+            "Remove and return the element at the given index",
+            &["T"],
+            &["arr", "index"],
+            vec![arr_t.clone(), TypeExpr::Int],
+            TypeExpr::Option(Box::new(t.clone())),
+        ),
+        generic_func(
+            "array.clear",
+            "Remove all elements from the array",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Unit,
+        ),
+        generic_func(
+            "array.slice",
+            "Return a slice of the array between two indices",
+            &["T"],
+            &["arr", "start", "end"],
+            vec![arr_t.clone(), TypeExpr::Int, TypeExpr::Int],
+            arr_t.clone(),
+        ),
+        generic_func(
+            "array.concat",
+            "Concatenate array elements into a string with an optional separator",
+            &["T"],
+            &["arr", "sep"],
+            vec![arr_t.clone(), TypeExpr::Unknown],
+            TypeExpr::String,
+        ),
+        generic_func(
+            "array.sort",
+            "Sort elements in the array in-place",
+            &["T"],
+            &["arr", "comp"],
+            vec![arr_t.clone(), TypeExpr::Unknown],
+            TypeExpr::Unit,
+        ),
+        generic_func(
+            "array.reverse",
+            "Reverse elements in the array in-place",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Unit,
+        ),
+        generic_func(
+            "array.contains",
+            "Check if the array contains a given value",
+            &["T"],
+            &["arr", "value"],
+            vec![arr_t.clone(), t.clone()],
+            TypeExpr::Bool,
+        ),
+        generic_func(
+            "array.map",
+            "Transform each element using the provided function",
+            &["T"],
+            &["arr", "func"],
+            vec![
+                arr_t.clone(),
+                TypeExpr::Function {
+                    params: vec![t.clone()],
+                    return_type: Box::new(TypeExpr::Unknown),
+                },
+            ],
+            TypeExpr::Array(Box::new(TypeExpr::Unknown)),
+        ),
+        generic_func(
+            "array.filter",
+            "Keep elements where the predicate returns true",
+            &["T"],
+            &["arr", "func"],
+            vec![
+                arr_t.clone(),
+                TypeExpr::Function {
+                    params: vec![t.clone()],
+                    return_type: Box::new(TypeExpr::Bool),
+                },
+            ],
+            arr_t.clone(),
+        ),
+        generic_func(
+            "array.reduce",
+            "Fold elements into a single value",
+            &["T"],
+            &["arr", "initial", "func"],
+            vec![
+                arr_t.clone(),
+                TypeExpr::Unknown,
+                TypeExpr::Function {
+                    params: vec![TypeExpr::Unknown, t.clone()],
+                    return_type: Box::new(TypeExpr::Unknown),
+                },
+            ],
+            TypeExpr::Unknown,
+        ),
+        generic_func(
+            "array.iter",
+            "Return an iterator over the array items",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Named("Iterator"),
+        ),
     ]
 }
 
-fn build_lua_functions() -> Vec<BuiltinFunction> {
+fn build_map_functions() -> Vec<BuiltinFunction> {
+    let k = TypeExpr::Generic("K");
+    let v = TypeExpr::Generic("V");
+    let map_kv = TypeExpr::Map(Box::new(k.clone()), Box::new(v.clone()));
     vec![
-        BuiltinFunction {
-            name: "lua.to_value",
-            description: "Wrap a Lust value in LuaValue",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::Named("LuaValue"),
-            },
-            param_names: &["value"],
-        },
-        BuiltinFunction {
-            name: "lua.require",
-            description:
-                "Lua-style module resolver (loads from already-initialized globals when available)",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::Unknown,
-            },
-            param_names: &["name"],
-        },
-        BuiltinFunction {
-            name: "lua.table",
-            description: "Create an empty Lua-style table",
-            signature: BuiltinSignature {
-                params: vec![],
-                return_type: TypeExpr::Named("LuaTable"),
-            },
-            param_names: &[],
-        },
-        BuiltinFunction {
-            name: "lua.setmetatable",
-            description: "Set the metatable for a Lua table value",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Named("LuaValue"), TypeExpr::Named("LuaValue")],
-                return_type: TypeExpr::Named("LuaValue"),
-            },
-            param_names: &["table", "meta"],
-        },
-        BuiltinFunction {
-            name: "lua.getmetatable",
-            description: "Get the metatable for a Lua table value",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Named("LuaValue")],
-                return_type: TypeExpr::Named("LuaValue"),
-            },
-            param_names: &["table"],
-        },
-        BuiltinFunction {
-            name: "lua.unwrap",
-            description: "Extract a raw Lust value from a LuaValue wrapper",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::Unknown,
-            },
-            param_names: &["value"],
-        },
+        generic_func(
+            "map.len",
+            "Return the number of entries in the map",
+            &["K", "V"],
+            &["map"],
+            vec![map_kv.clone()],
+            TypeExpr::Int,
+        ),
+        generic_func(
+            "map.is_empty",
+            "Check if the map contains no entries",
+            &["K", "V"],
+            &["map"],
+            vec![map_kv.clone()],
+            TypeExpr::Bool,
+        ),
+        generic_func(
+            "map.get",
+            "Look up a value by key",
+            &["K", "V"],
+            &["map", "key"],
+            vec![map_kv.clone(), k.clone()],
+            TypeExpr::Option(Box::new(v.clone())),
+        ),
+        generic_func(
+            "map.set",
+            "Insert or overwrite a key/value pair",
+            &["K", "V"],
+            &["map", "key", "value"],
+            vec![map_kv.clone(), k.clone(), v.clone()],
+            TypeExpr::Unit,
+        ),
+        generic_func(
+            "map.has",
+            "Check whether the map contains a key",
+            &["K", "V"],
+            &["map", "key"],
+            vec![map_kv.clone(), k.clone()],
+            TypeExpr::Bool,
+        ),
+        generic_func(
+            "map.delete",
+            "Remove an entry from the map and return its value if present",
+            &["K", "V"],
+            &["map", "key"],
+            vec![map_kv.clone(), k.clone()],
+            TypeExpr::Option(Box::new(v.clone())),
+        ),
+        generic_func(
+            "map.clear",
+            "Remove all entries from the map",
+            &["K", "V"],
+            &["map"],
+            vec![map_kv.clone()],
+            TypeExpr::Unit,
+        ),
+        generic_func(
+            "map.keys",
+            "Return the keys of the map as an array",
+            &["K", "V"],
+            &["map"],
+            vec![map_kv.clone()],
+            TypeExpr::Array(Box::new(k.clone())),
+        ),
+        generic_func(
+            "map.values",
+            "Return the values of the map as an array",
+            &["K", "V"],
+            &["map"],
+            vec![map_kv.clone()],
+            TypeExpr::Array(Box::new(v.clone())),
+        ),
+        generic_func(
+            "map.iter",
+            "Iterate over key/value pairs in the map",
+            &["K", "V"],
+            &["map"],
+            vec![map_kv.clone()],
+            TypeExpr::Named("Iterator"),
+        ),
+    ]
+}
+
+fn build_math_functions() -> Vec<BuiltinFunction> {
+    vec![
+        func("math.abs", "Return the absolute value of a number", &["x"], vec![TypeExpr::Unknown], TypeExpr::Unknown),
+        func("math.floor", "Return the largest integer less than or equal to x", &["x"], vec![TypeExpr::Unknown], TypeExpr::Int),
+        func("math.ceil", "Return the smallest integer greater than or equal to x", &["x"], vec![TypeExpr::Unknown], TypeExpr::Int),
+        func("math.round", "Round to the nearest integer", &["x"], vec![TypeExpr::Unknown], TypeExpr::Unknown),
+        func("math.sqrt", "Return the square root of x", &["x"], vec![TypeExpr::Float], TypeExpr::Float),
+        func("math.sin", "Return the sine of x in radians", &["x"], vec![TypeExpr::Float], TypeExpr::Float),
+        func("math.cos", "Return the cosine of x in radians", &["x"], vec![TypeExpr::Float], TypeExpr::Float),
+        func("math.tan", "Return the tangent of x in radians", &["x"], vec![TypeExpr::Float], TypeExpr::Float),
+        func("math.asin", "Return the arcsine of x in radians", &["x"], vec![TypeExpr::Float], TypeExpr::Float),
+        func("math.acos", "Return the arccosine of x in radians", &["x"], vec![TypeExpr::Float], TypeExpr::Float),
+        func("math.atan", "Return the arctangent of x in radians", &["x"], vec![TypeExpr::Float], TypeExpr::Float),
+        func("math.atan2", "Return the arctangent of y/x in radians", &["y", "x"], vec![TypeExpr::Float, TypeExpr::Float], TypeExpr::Float),
+        func("math.min", "Return the minimum of the provided numbers", &["x", "y"], vec![TypeExpr::Unknown, TypeExpr::Unknown], TypeExpr::Unknown),
+        func("math.max", "Return the maximum of the provided numbers", &["x", "y"], vec![TypeExpr::Unknown, TypeExpr::Unknown], TypeExpr::Unknown),
+        func("math.clamp", "Clamp a number between min and max bounds", &["x", "min", "max"], vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown], TypeExpr::Unknown),
+        func("math.random", "Generate a pseudo-random number", &["m", "n"], vec![TypeExpr::Unknown, TypeExpr::Unknown], TypeExpr::Unknown),
+        func("math.randomseed", "Set the seed for the pseudo-random number generator", &["seed"], vec![TypeExpr::Unknown], TypeExpr::Unit),
+        func("math.deg", "Convert angle from radians to degrees", &["rad"], vec![TypeExpr::Float], TypeExpr::Float),
+        func("math.rad", "Convert angle from degrees to radians", &["deg"], vec![TypeExpr::Float], TypeExpr::Float),
+        func("math.exp", "Return e^x", &["x"], vec![TypeExpr::Float], TypeExpr::Float),
+        func("math.log", "Return the natural logarithm of x (or logarithm to optional base)", &["x", "base"], vec![TypeExpr::Float, TypeExpr::Unknown], TypeExpr::Float),
+        func("math.tointeger", "Convert a number to an integer if possible", &["x"], vec![TypeExpr::Unknown], TypeExpr::Option(Box::new(TypeExpr::Int))),
+        func("math.tofloat", "Convert a number to a float", &["x"], vec![TypeExpr::Unknown], TypeExpr::Option(Box::new(TypeExpr::Float))),
     ]
 }
 
 fn build_string_functions() -> Vec<BuiltinFunction> {
     vec![
-        BuiltinFunction {
-            name: "string.len",
-            description: "Return the length of a string",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::Int,
-            },
-            param_names: &["s"],
-        },
-        BuiltinFunction {
-            name: "string.lower",
-            description: "Lowercase a string",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::String,
-            },
-            param_names: &["s"],
-        },
-        BuiltinFunction {
-            name: "string.upper",
-            description: "Uppercase a string",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::String,
-            },
-            param_names: &["s"],
-        },
-        BuiltinFunction {
-            name: "string.sub",
-            description: "Extract a substring using Lua-style indices",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
-                return_type: TypeExpr::String,
-            },
-            param_names: &["s", "i", "j"],
-        },
-        BuiltinFunction {
-            name: "string.byte",
-            description: "Return byte values from a string slice",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
-                return_type: TypeExpr::Unknown,
-            },
-            param_names: &["s", "i", "j"],
-        },
-        BuiltinFunction {
-            name: "string.char",
-            description: "Create a string from numeric bytes",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::String,
-            },
-            param_names: &["byte"],
-        },
-        BuiltinFunction {
-            name: "string.find",
-            description: "Find a pattern within a string",
-            signature: BuiltinSignature {
-                params: vec![
-                    TypeExpr::Unknown,
-                    TypeExpr::Unknown,
-                    TypeExpr::Unknown,
-                    TypeExpr::Unknown,
-                ],
-                return_type: TypeExpr::Unknown,
-            },
-            param_names: &["s", "pattern", "init", "plain"],
-        },
-        BuiltinFunction {
-            name: "string.gsub",
-            description: "Globally substitute occurrences of a pattern",
-            signature: BuiltinSignature {
-                params: vec![
-                    TypeExpr::Unknown,
-                    TypeExpr::Unknown,
-                    TypeExpr::Unknown,
-                    TypeExpr::Unknown,
-                ],
-                return_type: TypeExpr::Unknown,
-            },
-            param_names: &["s", "pattern", "repl", "n"],
-        },
-        BuiltinFunction {
-            name: "string.format",
-            description: "Format values according to a pattern",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::String,
-            },
-            param_names: &["fmt"],
-        },
+        func("string.len", "Return the length of a string in bytes", &["s"], vec![TypeExpr::String], TypeExpr::Int),
+        func("string.sub", "Extract a substring using 1-based indices", &["s", "i", "j"], vec![TypeExpr::String, TypeExpr::Int, TypeExpr::Unknown], TypeExpr::String),
+        func("string.lower", "Convert a string to lowercase", &["s"], vec![TypeExpr::String], TypeExpr::String),
+        func("string.upper", "Convert a string to uppercase", &["s"], vec![TypeExpr::String], TypeExpr::String),
+        func("string.byte", "Return internal numeric codes of characters", &["s", "i", "j"], vec![TypeExpr::String, TypeExpr::Unknown, TypeExpr::Unknown], TypeExpr::Unknown),
+        func("string.char", "Create a string from integer character codes", &["byte"], vec![TypeExpr::Unknown], TypeExpr::String),
+        func("string.find", "Find the first match of pattern in string", &["s", "pattern", "init", "plain"], vec![TypeExpr::String, TypeExpr::String, TypeExpr::Unknown, TypeExpr::Unknown], TypeExpr::Unknown),
+        func("string.match", "Extract pattern captures from string", &["s", "pattern", "init"], vec![TypeExpr::String, TypeExpr::String, TypeExpr::Unknown], TypeExpr::Unknown),
+        func("string.gsub", "Global pattern substitution in string", &["s", "pattern", "repl", "n"], vec![TypeExpr::String, TypeExpr::String, TypeExpr::Unknown, TypeExpr::Unknown], TypeExpr::Unknown),
+        func("string.format", "Format a string using printf-style specifiers", &["fmt", "..."], vec![TypeExpr::String, TypeExpr::Unknown], TypeExpr::String),
+        func("string.rep", "Return a string repeated n times", &["s", "n", "sep"], vec![TypeExpr::String, TypeExpr::Int, TypeExpr::Unknown], TypeExpr::String),
+        func("string.reverse", "Return a string with reversed characters", &["s"], vec![TypeExpr::String], TypeExpr::String),
+        func("string.split", "Split a string by delimiter", &["s", "delimiter"], vec![TypeExpr::String, TypeExpr::String], TypeExpr::Array(Box::new(TypeExpr::String))),
+        func("string.trim", "Trim whitespace from start and end of string", &["s"], vec![TypeExpr::String], TypeExpr::String),
+        func("string.trim_start", "Trim leading whitespace from string", &["s"], vec![TypeExpr::String], TypeExpr::String),
+        func("string.trim_end", "Trim trailing whitespace from string", &["s"], vec![TypeExpr::String], TypeExpr::String),
+        func("string.replace", "Replace occurrences of substring with replacement", &["s", "from", "to"], vec![TypeExpr::String, TypeExpr::String, TypeExpr::String], TypeExpr::String),
+        func("string.starts_with", "Check if string starts with prefix", &["s", "prefix"], vec![TypeExpr::String, TypeExpr::String], TypeExpr::Bool),
+        func("string.ends_with", "Check if string ends with suffix", &["s", "suffix"], vec![TypeExpr::String, TypeExpr::String], TypeExpr::Bool),
+        func("string.contains", "Check if string contains substring", &["s", "substring"], vec![TypeExpr::String, TypeExpr::String], TypeExpr::Bool),
+        func("string.is_empty", "Check if string is empty", &["s"], vec![TypeExpr::String], TypeExpr::Bool),
+        func("string.chars", "Return characters of string as array of single-character strings", &["s"], vec![TypeExpr::String], TypeExpr::Array(Box::new(TypeExpr::String))),
+        func("string.lines", "Return lines of string as array of strings", &["s"], vec![TypeExpr::String], TypeExpr::Array(Box::new(TypeExpr::String))),
+    ]
+}
+fn build_task_functions() -> Vec<BuiltinFunction> {
+    vec![
+        func(
+            "task.run",
+            "Run a function as a task",
+            &["func"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Named("Task"),
+        ),
+        func(
+            "task.create",
+            "Create a suspended task",
+            &["func"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Named("Task"),
+        ),
+        func(
+            "task.status",
+            "Get the status of a task",
+            &["task"],
+            vec![TypeExpr::Named("Task")],
+            TypeExpr::Named("TaskStatus"),
+        ),
+        func(
+            "task.info",
+            "Get detailed information about a task",
+            &["task"],
+            vec![TypeExpr::Named("Task")],
+            TypeExpr::Named("TaskInfo"),
+        ),
+        func(
+            "task.resume",
+            "Resume a suspended task",
+            &["task"],
+            vec![TypeExpr::Named("Task")],
+            TypeExpr::Named("TaskInfo"),
+        ),
+        func(
+            "task.yield",
+            "Yield from the current task",
+            &["value"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "task.stop",
+            "Stop a running task",
+            &["task"],
+            vec![TypeExpr::Named("Task")],
+            TypeExpr::Bool,
+        ),
+        func(
+            "task.restart",
+            "Restart a completed task",
+            &["task"],
+            vec![TypeExpr::Named("Task")],
+            TypeExpr::Named("TaskInfo"),
+        ),
+        func(
+            "task.current",
+            "Return the currently executing task",
+            &[],
+            vec![],
+            TypeExpr::Option(Box::new(TypeExpr::Named("Task"))),
+        ),
     ]
 }
 
-static IO_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+fn build_lua_functions() -> Vec<BuiltinFunction> {
+    vec![
+        func(
+            "lua.to_value",
+            "Wrap a Lust value in LuaValue",
+            &["value"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Named("LuaValue"),
+        ),
+        func(
+            "lua.require",
+            "Lua-style module resolver (loads from already-initialized globals when available)",
+            &["name"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "lua.table",
+            "Create an empty Lua-style table",
+            &[],
+            vec![],
+            TypeExpr::Named("LuaTable"),
+        ),
+        func(
+            "lua.setmetatable",
+            "Set the metatable for a Lua table value",
+            &["table", "meta"],
+            vec![TypeExpr::Named("LuaValue"), TypeExpr::Named("LuaValue")],
+            TypeExpr::Named("LuaValue"),
+        ),
+        func(
+            "lua.getmetatable",
+            "Get the metatable for a Lua table value",
+            &["table"],
+            vec![TypeExpr::Named("LuaValue")],
+            TypeExpr::Named("LuaValue"),
+        ),
+        func(
+            "lua.unwrap",
+            "Extract a raw Lust value from a LuaValue wrapper",
+            &["value"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+    ]
+}
 
 fn build_io_functions() -> Vec<BuiltinFunction> {
     vec![
-        BuiltinFunction {
-            name: "io.read_file",
-            description: "Read the contents of a file",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::String],
-                return_type: TypeExpr::Result(
-                    Box::new(TypeExpr::String),
-                    Box::new(TypeExpr::String),
-                ),
-            },
-            param_names: &["path"],
-        },
-        BuiltinFunction {
-            name: "io.read_file_bytes",
-            description: "Read the contents of a file as byte values",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::String],
-                return_type: TypeExpr::Result(
-                    Box::new(TypeExpr::Array(Box::new(TypeExpr::Int))),
-                    Box::new(TypeExpr::String),
-                ),
-            },
-            param_names: &["path"],
-        },
-        BuiltinFunction {
-            name: "io.write_file",
-            description: "Write contents to a file",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::String, TypeExpr::Unknown],
-                return_type: TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
-            },
-            param_names: &["path", "value"],
-        },
-        BuiltinFunction {
-            name: "io.read_stdin",
-            description: "Read all available stdin",
-            signature: BuiltinSignature {
-                params: vec![],
-                return_type: TypeExpr::Result(
-                    Box::new(TypeExpr::String),
-                    Box::new(TypeExpr::String),
-                ),
-            },
-            param_names: &[],
-        },
-        BuiltinFunction {
-            name: "io.read_line",
-            description: "Read a single line from stdin",
-            signature: BuiltinSignature {
-                params: vec![],
-                return_type: TypeExpr::Result(
-                    Box::new(TypeExpr::String),
-                    Box::new(TypeExpr::String),
-                ),
-            },
-            param_names: &[],
-        },
-        BuiltinFunction {
-            name: "io.write_stdout",
-            description: "Write a value to stdout",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Unknown],
-                return_type: TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
-            },
-            param_names: &["value"],
-        },
+        func(
+            "io.read_file",
+            "Read the contents of a file",
+            &["path"],
+            vec![TypeExpr::String],
+            TypeExpr::Result(
+                Box::new(TypeExpr::String),
+                Box::new(TypeExpr::String),
+            ),
+        ),
+        func(
+            "io.read_file_bytes",
+            "Read the contents of a file as byte values",
+            &["path"],
+            vec![TypeExpr::String],
+            TypeExpr::Result(
+                Box::new(TypeExpr::Array(Box::new(TypeExpr::Int))),
+                Box::new(TypeExpr::String),
+            ),
+        ),
+        func(
+            "io.write_file",
+            "Write contents to a file",
+            &["path", "value"],
+            vec![TypeExpr::String, TypeExpr::Unknown],
+            TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
+        ),
+        func(
+            "io.read_stdin",
+            "Read all available stdin",
+            &[],
+            vec![],
+            TypeExpr::Result(
+                Box::new(TypeExpr::String),
+                Box::new(TypeExpr::String),
+            ),
+        ),
+        func(
+            "io.read_line",
+            "Read a single line from stdin",
+            &[],
+            vec![],
+            TypeExpr::Result(
+                Box::new(TypeExpr::String),
+                Box::new(TypeExpr::String),
+            ),
+        ),
+        func(
+            "io.write_stdout",
+            "Write a value to stdout",
+            &["value"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
+        ),
     ]
 }
 
-static OS_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
-
 fn build_os_functions() -> Vec<BuiltinFunction> {
     vec![
-        BuiltinFunction {
-            name: "os.time",
-            description: "Get the current UNIX timestamp with sub-second precision",
-            signature: BuiltinSignature {
-                params: vec![],
-                return_type: TypeExpr::Float,
-            },
-            param_names: &[],
-        },
-        BuiltinFunction {
-            name: "os.sleep",
-            description: "Sleep for the given number of seconds",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::Float],
-                return_type: TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
-            },
-            param_names: &["seconds"],
-        },
-        BuiltinFunction {
-            name: "os.create_file",
-            description: "Create an empty file on disk",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::String],
-                return_type: TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
-            },
-            param_names: &["path"],
-        },
-        BuiltinFunction {
-            name: "os.create_dir",
-            description: "Create a directory",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::String],
-                return_type: TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
-            },
-            param_names: &["path"],
-        },
-        BuiltinFunction {
-            name: "os.remove_file",
-            description: "Remove a file from disk",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::String],
-                return_type: TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
-            },
-            param_names: &["path"],
-        },
-        BuiltinFunction {
-            name: "os.remove_dir",
-            description: "Remove an empty directory",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::String],
-                return_type: TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
-            },
-            param_names: &["path"],
-        },
-        BuiltinFunction {
-            name: "os.rename",
-            description: "Rename or move a path",
-            signature: BuiltinSignature {
-                params: vec![TypeExpr::String, TypeExpr::String],
-                return_type: TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
-            },
-            param_names: &["from", "to"],
-        },
+        func(
+            "os.time",
+            "Get the current UNIX timestamp with sub-second precision",
+            &[],
+            vec![],
+            TypeExpr::Float,
+        ),
+        func(
+            "os.sleep",
+            "Sleep for the given number of seconds",
+            &["seconds"],
+            vec![TypeExpr::Float],
+            TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
+        ),
+        func(
+            "os.create_file",
+            "Create an empty file on disk",
+            &["path"],
+            vec![TypeExpr::String],
+            TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
+        ),
+        func(
+            "os.create_dir",
+            "Create a directory",
+            &["path"],
+            vec![TypeExpr::String],
+            TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
+        ),
+        func(
+            "os.remove_file",
+            "Remove a file from disk",
+            &["path"],
+            vec![TypeExpr::String],
+            TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
+        ),
+        func(
+            "os.remove_dir",
+            "Remove an empty directory",
+            &["path"],
+            vec![TypeExpr::String],
+            TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
+        ),
+        func(
+            "os.rename",
+            "Rename or move a path",
+            &["from", "to"],
+            vec![TypeExpr::String, TypeExpr::String],
+            TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
+        ),
     ]
 }
 
@@ -1479,20 +1059,28 @@ static BUILTIN_METHODS: StaticOnceCell<Vec<BuiltinMethod>> = StaticOnceCell::new
 
 fn build_builtin_methods() -> Vec<BuiltinMethod> {
     let mut methods = Vec::new();
-    methods.extend(string_methods());
-    methods.extend(array_methods());
-    methods.extend(map_methods());
-    methods.extend(lua_table_methods());
     methods.extend(iterator_methods());
     methods.extend(option_methods());
     methods.extend(result_methods());
-    methods.extend(float_methods());
-    methods.extend(int_methods());
     methods
 }
 
 pub fn base_functions() -> &'static [BuiltinFunction] {
     BASE_FUNCTIONS.get_or_init(build_base_functions).as_slice()
+}
+
+pub fn array_functions() -> &'static [BuiltinFunction] {
+    ARRAY_FUNCTIONS
+        .get_or_init(build_array_functions)
+        .as_slice()
+}
+
+pub fn map_functions() -> &'static [BuiltinFunction] {
+    MAP_FUNCTIONS.get_or_init(build_map_functions).as_slice()
+}
+
+pub fn math_functions() -> &'static [BuiltinFunction] {
+    MATH_FUNCTIONS.get_or_init(build_math_functions).as_slice()
 }
 
 pub fn string_functions() -> &'static [BuiltinFunction] {
@@ -1592,11 +1180,14 @@ static BUILTINS_DATABASE: StaticOnceCell<BuiltinsDatabase> = StaticOnceCell::new
 
 fn build_builtins_database() -> BuiltinsDatabase {
     let mut modules: BTreeMap<&'static str, BuiltinModule> = BTreeMap::new();
-    let module_specs: [(&'static str, &'static str, &'static [BuiltinFunction]); 4] = [
+    let module_specs: [(&'static str, &'static str, &'static [BuiltinFunction]); 7] = [
+        ("array", "array collection module", array_functions()),
+        ("map", "map collection module", map_functions()),
+        ("math", "math module", math_functions()),
+        ("string", "string module", string_functions()),
         ("task", "task runtime module", task_functions()),
         ("io", "io file & console module", io_functions()),
         ("os", "os filesystem module", os_functions()),
-        ("string", "string compatibility module", string_functions()),
     ];
     for (name, description, functions) in module_specs {
         let mut module_funcs: Vec<&'static BuiltinFunction> = functions.iter().collect();

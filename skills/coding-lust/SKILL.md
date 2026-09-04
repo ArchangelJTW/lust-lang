@@ -1,3 +1,8 @@
+---
+name: coding-lust
+description: Use this skill to become informed of the syntax and standard library of the Lust programming language
+---
+
 # Lust Language Guide & Skills Reference
 
 Lust is a strongly typed, Lua-inspired scripting language implemented in Rust. It features strong static type checking, enum pattern matching, generic functions and types, trait-based polymorphism, cooperative multitasking, weak reference cycle safety, and a trace-based JIT.

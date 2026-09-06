@@ -14,6 +14,11 @@ use alloc::{
 };
 use core::{matches, unreachable};
 impl Parser {
+    fn span_through_previous(&self, start: Span) -> Span {
+        let end = &self.tokens[self.current - 1];
+        Span::new(start.start_line, start.start_col, end.line, end.column)
+    }
+
     #[inline(never)]
     pub(super) fn parse_expr(&mut self) -> Result<Expr> {
         #[cfg(feature = "esp32c6-logging")]
@@ -37,7 +42,7 @@ impl Parser {
         while self.match_token(&[TokenKind::Or]) {
             let op = BinaryOp::Or;
             let right = self.parse_logical_and()?;
-            let span = expr.span;
+            let span = self.span_through_previous(expr.span);
             expr = Expr::new(
                 ExprKind::Binary {
                     left: Box::new(expr),
@@ -57,7 +62,7 @@ impl Parser {
         while self.match_token(&[TokenKind::And]) {
             let op = BinaryOp::And;
             let right = self.parse_comparison()?;
-            let span = expr.span;
+            let span = self.span_through_previous(expr.span);
             expr = Expr::new(
                 ExprKind::Binary {
                     left: Box::new(expr),
@@ -92,7 +97,7 @@ impl Parser {
                 _ => unreachable!(),
             };
             let right = self.parse_range()?;
-            let span = expr.span;
+            let span = self.span_through_previous(expr.span);
             expr = Expr::new(
                 ExprKind::Binary {
                     left: Box::new(expr),
@@ -110,7 +115,7 @@ impl Parser {
         let expr = self.parse_concat()?;
         if self.match_token(&[TokenKind::DoubleDot]) {
             let end = self.parse_concat()?;
-            let span = expr.span;
+            let span = self.span_through_previous(expr.span);
             return Ok(Expr::new(
                 ExprKind::Range {
                     start: Box::new(expr),
@@ -135,7 +140,7 @@ impl Parser {
 
             self.advance();
             let right = self.parse_term()?;
-            let span = expr.span;
+            let span = self.span_through_previous(expr.span);
             expr = Expr::new(
                 ExprKind::Binary {
                     left: Box::new(expr),
@@ -158,7 +163,7 @@ impl Parser {
                 _ => unreachable!(),
             };
             let right = self.parse_factor()?;
-            let span = expr.span;
+            let span = self.span_through_previous(expr.span);
             expr = Expr::new(
                 ExprKind::Binary {
                     left: Box::new(expr),
@@ -182,7 +187,7 @@ impl Parser {
                 _ => unreachable!(),
             };
             let right = self.parse_power()?;
-            let span = expr.span;
+            let span = self.span_through_previous(expr.span);
             expr = Expr::new(
                 ExprKind::Binary {
                     left: Box::new(expr),
@@ -200,7 +205,7 @@ impl Parser {
         let expr = self.parse_unary()?;
         if self.match_token(&[TokenKind::Caret]) {
             let right = self.parse_power()?;
-            let span = expr.span;
+            let span = self.span_through_previous(expr.span);
             return Ok(Expr::new(
                 ExprKind::Binary {
                     left: Box::new(expr),
@@ -396,7 +401,7 @@ impl Parser {
                 TokenKind::As => {
                     self.advance();
                     let target_type = self.parse_type()?;
-                    let span = expr.span;
+                    let span = self.span_through_previous(expr.span);
                     expr = Expr::new(
                         ExprKind::Cast {
                             expr: Box::new(expr),
@@ -408,7 +413,6 @@ impl Parser {
 
                 TokenKind::Is => {
                     self.advance();
-                    let span = expr.span;
 
                     #[cfg(feature = "esp32c6-logging")]
                     log::info!("        parsing 'is' expression");
@@ -425,6 +429,7 @@ impl Parser {
                         log::info!("        parsing is pattern");
 
                         let pattern = self.parse_pattern()?;
+                        let span = self.span_through_previous(expr.span);
                         expr = Expr::new(
                             ExprKind::IsPattern {
                                 expr: Box::new(expr),
@@ -434,6 +439,7 @@ impl Parser {
                         );
                     } else {
                         let check_type = self.parse_type()?;
+                        let span = self.span_through_previous(expr.span);
                         expr = Expr::new(
                             ExprKind::TypeCheck {
                                 expr: Box::new(expr),
@@ -446,7 +452,7 @@ impl Parser {
 
                 TokenKind::Question => {
                     self.advance();
-                    let span = expr.span;
+                    let span = self.span_through_previous(expr.span);
                     expr = Expr::new(
                         ExprKind::MethodCall {
                             receiver: Box::new(expr),

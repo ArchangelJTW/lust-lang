@@ -250,6 +250,7 @@ impl Backend {
                 let type_result = typechecker.check_program(&program.modules);
                 let option_coercions = typechecker.take_option_coercions();
                 let checked_array_indices = typechecker.take_checked_array_indices();
+                let numeric_types = typechecker.take_numeric_types();
                 let struct_defs = typechecker.struct_definitions();
                 let enum_defs = typechecker.enum_definitions();
                 let function_signatures = typechecker.function_signatures();
@@ -279,6 +280,7 @@ impl Backend {
                 let mut compiler = Compiler::new();
                 compiler.set_option_coercions(option_coercions);
                 compiler.set_checked_array_indices(checked_array_indices);
+                compiler.set_numeric_types(numeric_types);
                 compiler.configure_stdlib(&config);
                 compiler.set_imports_by_module(imports_map);
                 compiler.set_entry_module(program.entry_module.clone());

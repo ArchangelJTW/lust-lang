@@ -26,11 +26,10 @@ impl Compiler {
 
                 if let Some(values) = initializer {
                     if bindings.len() == 1 && values.len() == 1 {
+                        let expression_start = self.current_chunk().instructions.len();
                         let value_reg = self.compile_expr(&values[0])?;
                         let (_name, target_reg) = &binding_regs[0];
-                        if value_reg != *target_reg {
-                            self.emit(Instruction::Move(*target_reg, value_reg), 0);
-                        }
+                        self.move_result(*target_reg, value_reg, expression_start);
                         self.free_register(value_reg);
                     } else {
                         let tuple_reg = self.compile_exprs_to_tuple(values)?;
@@ -98,15 +97,17 @@ impl Compiler {
                         }
                     }
 
+                    let expression_start = self.current_chunk().instructions.len();
                     let value_reg = self.compile_expr(&values[0])?;
-                    self.assign_value_to_target(&targets[0], value_reg)?;
+                    self.assign_value_to_target(&targets[0], value_reg, expression_start)?;
                     self.free_register(value_reg);
                 } else {
                     let tuple_reg = self.compile_exprs_to_tuple(values)?;
                     for (index, target) in targets.iter().enumerate() {
                         let value_reg = self.allocate_register();
-                        self.emit(Instruction::TupleGet(value_reg, tuple_reg, index as u8), 0);
-                        self.assign_value_to_target(target, value_reg)?;
+                        let expression_start =
+                            self.emit(Instruction::TupleGet(value_reg, tuple_reg, index as u8), 0);
+                        self.assign_value_to_target(target, value_reg, expression_start)?;
                         self.free_register(value_reg);
                     }
 
@@ -138,10 +139,17 @@ impl Compiler {
                 };
                 let value_reg = self.compile_expr(value)?;
                 let result_reg = self.allocate_register();
-                self.compile_binary_op(*op, result_reg, target_reg, value_reg)?;
+                let expression_start = self.current_chunk().instructions.len();
+                self.compile_binary_op(
+                    *op,
+                    result_reg,
+                    target_reg,
+                    value_reg,
+                    (target.span, value.span),
+                )?;
                 if target_is_local {
                     if result_reg != target_reg {
-                        self.emit(Instruction::Move(target_reg, result_reg), 0);
+                        self.move_result(target_reg, result_reg, expression_start);
                         self.free_register(result_reg);
                     }
 
@@ -399,6 +407,18 @@ impl Compiler {
         body: &[Stmt],
     ) -> Result<()> {
         self.begin_scope();
+        let int_loop = self.numeric_type(start.span) == Some(NumericType::Int)
+            && self.numeric_type(end.span) == Some(NumericType::Int)
+            && step.map_or(true, |step| {
+                self.numeric_type(step.span) == Some(NumericType::Int)
+            });
+        let specialize = |instruction: Instruction| {
+            if int_loop {
+                instruction.specialize_numeric(NumericType::Int)
+            } else {
+                instruction
+            }
+        };
         let var_reg = self.next_local_slot();
         let start_reg = self.compile_expr(start)?;
         if start_reg != var_reg {
@@ -447,10 +467,10 @@ impl Compiler {
         let cond_reg = self.allocate_register();
         match static_step {
             Some(value) if value < 0 => {
-                self.emit(Instruction::Ge(cond_reg, var_reg, end_reg), 0);
+                self.emit(specialize(Instruction::Ge(cond_reg, var_reg, end_reg)), 0);
             }
             Some(_) => {
-                self.emit(Instruction::Le(cond_reg, var_reg, end_reg), 0);
+                self.emit(specialize(Instruction::Le(cond_reg, var_reg, end_reg)), 0);
             }
             None => {
                 // cond = (step < 0) ? (var >= end) : (var <= end), spelled with
@@ -460,14 +480,14 @@ impl Compiler {
                 let const_idx = self.add_int_const(0);
                 self.emit(Instruction::LoadConst(zero_reg, const_idx), 0);
                 let neg_reg = self.allocate_register();
-                self.emit(Instruction::Lt(neg_reg, step_reg, zero_reg), 0);
+                self.emit(specialize(Instruction::Lt(neg_reg, step_reg, zero_reg)), 0);
                 let pos_reg = self.allocate_register();
                 self.emit(Instruction::Not(pos_reg, neg_reg), 0);
 
                 let ge_reg = self.allocate_register();
-                self.emit(Instruction::Ge(ge_reg, var_reg, end_reg), 0);
+                self.emit(specialize(Instruction::Ge(ge_reg, var_reg, end_reg)), 0);
                 let le_reg = self.allocate_register();
-                self.emit(Instruction::Le(le_reg, var_reg, end_reg), 0);
+                self.emit(specialize(Instruction::Le(le_reg, var_reg, end_reg)), 0);
                 let neg_and_ge_reg = self.allocate_register();
                 self.emit(Instruction::And(neg_and_ge_reg, neg_reg, ge_reg), 0);
                 let pos_and_le_reg = self.allocate_register();
@@ -497,8 +517,8 @@ impl Compiler {
         let loop_ctx = self.loop_contexts.pop().unwrap();
         let increment_pos = self.current_chunk().instructions.len();
         let temp_reg = self.allocate_register();
-        self.emit(Instruction::Add(temp_reg, var_reg, step_reg), 0);
-        self.emit(Instruction::Move(var_reg, temp_reg), 0);
+        let increment = self.emit(specialize(Instruction::Add(temp_reg, var_reg, step_reg)), 0);
+        self.move_result(var_reg, temp_reg, increment);
         self.free_register(temp_reg);
         for continue_jump in loop_ctx.continue_jumps {
             self.current_chunk_mut()
@@ -558,7 +578,7 @@ impl Compiler {
 
                 let loop_start = self.current_chunk().instructions.len();
                 let cond_reg = self.allocate_register();
-                self.emit(Instruction::Lt(cond_reg, i_reg, len_reg), 0);
+                self.emit(Instruction::LtInt(cond_reg, i_reg, len_reg), 0);
                 let jump_to_end = self.emit(Instruction::JumpIfNot(cond_reg, 0), 0);
                 self.free_register(cond_reg);
                 self.loop_contexts.push(LoopContext {
@@ -577,8 +597,8 @@ impl Compiler {
                 let one_idx = self.add_int_const(1);
                 self.emit(Instruction::LoadConst(one_reg, one_idx), 0);
                 let tmp_reg = self.allocate_register();
-                self.emit(Instruction::Add(tmp_reg, i_reg, one_reg), 0);
-                self.emit(Instruction::Move(i_reg, tmp_reg), 0);
+                let increment = self.emit(Instruction::AddInt(tmp_reg, i_reg, one_reg), 0);
+                self.move_result(i_reg, tmp_reg, increment);
                 self.free_register(tmp_reg);
                 self.free_register(one_reg);
                 for continue_jump in loop_ctx.continue_jumps {

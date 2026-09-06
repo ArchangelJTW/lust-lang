@@ -651,6 +651,218 @@ mod tests {
     use crate::ast::{Span, TypeKind};
     use crate::typechecker::FunctionSignature;
 
+    #[test]
+    fn typed_numeric_instructions_match_generic_semantics() {
+        use crate::number::NumericType;
+        let operations = [
+            Instruction::Add(2, 0, 1),
+            Instruction::Sub(2, 0, 1),
+            Instruction::Mul(2, 0, 1),
+            Instruction::Div(2, 0, 1),
+            Instruction::Mod(2, 0, 1),
+            Instruction::Neg(2, 0),
+            Instruction::Eq(2, 0, 1),
+            Instruction::Ne(2, 0, 1),
+            Instruction::Lt(2, 0, 1),
+            Instruction::Le(2, 0, 1),
+            Instruction::Gt(2, 0, 1),
+            Instruction::Ge(2, 0, 1),
+        ];
+        for kind in [NumericType::Int, NumericType::Float] {
+            let inputs = match kind {
+                NumericType::Int => vec![
+                    (Value::Int(7), Value::Int(3)),
+                    (Value::Int(-7), Value::Int(3)),
+                    (Value::Int(0), Value::Int(0)),
+                ],
+                NumericType::Float => vec![
+                    (Value::Float(7.5), Value::Float(2.0)),
+                    (Value::Float(-7.5), Value::Float(2.0)),
+                    (Value::Float(LustFloat::NAN), Value::Float(1.0)),
+                    (
+                        Value::Float(LustFloat::INFINITY),
+                        Value::Float(LustFloat::INFINITY),
+                    ),
+                    (Value::Float(0.0), Value::Float(-0.0)),
+                ],
+            };
+            for op in operations {
+                let typed = op.specialize_numeric(kind);
+                assert_eq!(typed.numeric_specialization().unwrap().0, op);
+                assert_eq!(typed.defined_register(), Some(2));
+                assert!(typed.reads_register(0));
+                assert!(!typed.reads_register(2));
+                let mut functions = Vec::new();
+                for (name, instruction) in [("generic", op), ("typed", typed)] {
+                    let mut function = Function::new(name, 2, false);
+                    function.set_register_count(3);
+                    function.chunk.emit(instruction, 1);
+                    function.chunk.emit(Instruction::Return(2), 1);
+                    functions.push(function);
+                }
+                let mut vm = VM::new();
+                vm.load_functions(functions);
+                for (left, right) in &inputs {
+                    let expected = vm.call("generic", vec![left.clone(), right.clone()]);
+                    let actual = vm.call("typed", vec![left.clone(), right.clone()]);
+                    match (actual, expected) {
+                        (Ok(Value::Float(a)), Ok(Value::Float(b))) => {
+                            assert!(
+                                a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
+                                "{typed}: {a} != {b}"
+                            );
+                        }
+                        (Ok(a), Ok(b)) => assert_eq!(a, b, "{typed}"),
+                        (Err(_), Err(_)) => {}
+                        (a, b) => panic!("{typed}: {a:?} != {b:?}"),
+                    }
+                }
+                assert!(vm
+                    .call("typed", vec![Value::Bool(true), Value::Bool(false)])
+                    .is_err());
+                let wrong_numeric = match kind {
+                    NumericType::Int => Value::Float(1.0),
+                    NumericType::Float => Value::Int(1),
+                };
+                assert!(vm
+                    .call("typed", vec![wrong_numeric.clone(), wrong_numeric])
+                    .is_err());
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn embedded_numeric_types_are_module_specific() {
+        for low_memory in [false, true] {
+            let config = LustConfig::default()
+                .with_low_memory_mode(low_memory)
+                .with_minimal_runtime_types(low_memory);
+            let mut program = crate::EmbeddedProgram::builder()
+                .with_config(config)
+                .module(
+                    "integers",
+                    "function add(n: int, m: int): int\n    return n + m\nend\n",
+                )
+                .module(
+                    "floats",
+                    "function add(n: float, m: float): float\n    return n + m\nend\n",
+                )
+                .module("main", "use integers\nuse floats\n")
+                .entry_module("main")
+                .compile()
+                .unwrap();
+            for (name, expected) in [
+                ("integers.add", Instruction::AddInt(2, 0, 1)),
+                ("floats.add", Instruction::AddFloat(2, 0, 1)),
+            ] {
+                let function = program
+                    .vm_mut()
+                    .functions
+                    .iter()
+                    .find(|f| f.name == name)
+                    .unwrap();
+                assert!(
+                    function.chunk.instructions.contains(&expected),
+                    "{}",
+                    function.disassemble()
+                );
+            }
+            assert_eq!(
+                program
+                    .call_raw("integers.add", vec![Value::Int(2), Value::Int(3)])
+                    .unwrap(),
+                Value::Int(5)
+            );
+            assert_eq!(
+                program
+                    .call_raw("floats.add", vec![Value::Float(2.5), Value::Float(3.0)])
+                    .unwrap(),
+                Value::Float(5.5)
+            );
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn compiled_typed_loops_execute_and_reject_host_type_violations() {
+        let source = r#"
+struct Counter
+    value: int
+end
+function counter(): Counter
+    return Counter { value = 2 }
+end
+function sum(n: int, counter: Counter): int
+    local total: int = 0
+    for i = 1, n do
+        total += counter.value
+    end
+    return total
+end
+function floats(): float
+    local total: float = 0.0
+    for i = 1.0, 100.0, 1.0 do
+        total += i
+    end
+    return total
+end
+function option_sum(n: int): int
+    local total: int = 0
+    local counter: int = 0
+    for i = 1, n do
+        counter += 1
+        local opt: Option<int> = Option.Some(counter)
+        if opt is Some(value) then
+            total += value
+        end
+    end
+    return total
+end
+"#;
+        for jit in [false, true] {
+            let mut config = LustConfig::default();
+            config.set_jit_enabled(jit);
+            let mut program = crate::EmbeddedProgram::builder()
+                .with_config(config)
+                .module("main", source)
+                .entry_module("main")
+                .compile()
+                .unwrap();
+            let counter = program.call_raw("main.counter", vec![]).unwrap();
+            assert_eq!(
+                program
+                    .call_raw("main.sum", vec![Value::Int(100), counter.clone()])
+                    .unwrap(),
+                Value::Int(200)
+            );
+            assert_eq!(
+                program.call_raw("main.floats", vec![]).unwrap(),
+                Value::Float(5050.0)
+            );
+            assert_eq!(
+                program
+                    .call_raw("main.option_sum", vec![Value::Int(100)])
+                    .unwrap(),
+                Value::Int(5050)
+            );
+            if jit && cfg!(target_arch = "x86_64") {
+                assert!(program.jit_stats().root_traces_compiled >= 2);
+                assert!(program.jit_stats().native_trace_entries >= 2);
+            }
+            counter
+                .struct_set_field("value", Value::Float(2.5))
+                .unwrap();
+            let error = program
+                .call_raw("main.sum", vec![Value::Int(100), counter])
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("expected int operands"),
+                "{error}"
+            );
+        }
+    }
+
     fn typed_function(
         name: &str,
         params: Vec<Type>,

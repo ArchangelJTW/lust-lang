@@ -17,6 +17,23 @@ impl TypeChecker {
             ty.span = expr.span;
         }
 
+        if expr.span.start_line > 0 {
+            let module = self.current_module.as_deref().unwrap_or("");
+            let numeric = match ty.kind {
+                TypeKind::Int => Some(crate::number::NumericType::Int),
+                TypeKind::Float => Some(crate::number::NumericType::Float),
+                _ => None,
+            };
+            if let Some(numeric) = numeric {
+                self.numeric_types_by_module
+                    .entry(module.to_string())
+                    .or_default()
+                    .insert(expr.span, numeric);
+            } else if let Some(types) = self.numeric_types_by_module.get_mut(module) {
+                types.remove(&expr.span);
+            }
+        }
+
         if expr.span.start_line > 0 && !self.low_memory_mode {
             if let Some(module) = &self.current_module {
                 self.expr_types_by_module

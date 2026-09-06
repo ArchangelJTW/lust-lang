@@ -1026,7 +1026,21 @@ impl TraceRecorder {
         }
 
         if let Some(dest) = instruction.defined_register() {
-            if instruction.reads_register(dest) {
+            let preserves_numeric_inputs =
+                instruction
+                    .numeric_specialization()
+                    .is_some_and(|(generic, _, _, _)| {
+                        matches!(
+                            generic,
+                            Instruction::Add(..)
+                                | Instruction::Sub(..)
+                                | Instruction::Mul(..)
+                                | Instruction::Div(..)
+                                | Instruction::Mod(..)
+                                | Instruction::Neg(..)
+                        )
+                    });
+            if instruction.reads_register(dest) && !preserves_numeric_inputs {
                 self.stop_recording();
                 return Err(LustError::RuntimeError {
                     message: format!(
@@ -1037,6 +1051,28 @@ impl TraceRecorder {
             }
             self.forget_guard(dest);
         }
+
+        // Reuse the numeric trace IR, but retain the bytecode's input contract.
+        // Host mutation and trace entry still require guards before payload loads.
+        let instruction =
+            if let Some((generic, ty, lhs, rhs)) = instruction.numeric_specialization() {
+                let expected = match ty {
+                    crate::number::NumericType::Int => ValueType::Int,
+                    crate::number::NumericType::Float => ValueType::Float,
+                };
+                if [lhs, rhs]
+                    .iter()
+                    .any(|&reg| Self::get_value_type(&registers[reg as usize]) != Some(expected))
+                {
+                    self.stop_recording();
+                    return Err(LustError::RuntimeError {
+                        message: "Trace aborted: typed numeric operand mismatch".to_string(),
+                    });
+                }
+                generic
+            } else {
+                instruction
+            };
 
         let outcome: Result<(), LustError> = match instruction {
             Instruction::LoadConst(dest, _) => {
@@ -2491,6 +2527,90 @@ mod tests {
             .ops
             .iter()
             .any(|op| matches!(op, TraceOp::Guard { register: 0, .. })));
+    }
+
+    #[test]
+    fn typed_arithmetic_can_alias_an_input_but_cannot_change_its_contract() {
+        let functions = vec![crate::bytecode::Function::new("typed_alias", 0, false)];
+        for (instruction, registers, expected) in [
+            (
+                Instruction::AddInt(0, 0, 1),
+                vec![Value::Int(5), Value::Int(3)],
+                ValueType::Int,
+            ),
+            (
+                Instruction::AddFloat(0, 0, 1),
+                vec![Value::Float(5.0), Value::Float(3.0)],
+                ValueType::Float,
+            ),
+        ] {
+            let mut recorder = TraceRecorder::new(0, 0, 32);
+            recorder
+                .record_instruction(instruction, 1, &registers, &functions[0], 0, &functions)
+                .unwrap();
+            assert!(recorder.trace.ops.iter().any(|op| matches!(op,
+                TraceOp::Guard { register: 0, expected_type } if *expected_type == expected
+            )));
+            assert!(recorder.trace.ops.iter().any(|op| matches!(op,
+                TraceOp::Add { dest: 0, lhs: 0, lhs_type, rhs_type, .. }
+                    if *lhs_type == expected && *rhs_type == expected
+            )));
+        }
+        let mut recorder = TraceRecorder::new(0, 0, 32);
+        assert!(recorder
+            .record_instruction(
+                Instruction::AddInt(0, 0, 1),
+                1,
+                &[Value::Float(5.0), Value::Float(3.0)],
+                &functions[0],
+                0,
+                &functions
+            )
+            .is_err());
+        assert!(!recorder.is_recording());
+    }
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn compiled_typed_arithmetic_bails_before_reading_wrong_payloads() {
+        let functions = vec![crate::bytecode::Function::new("typed_guard", 0, false)];
+        let mut recorder = TraceRecorder::new(0, 0, 32);
+        recorder
+            .record_instruction(
+                Instruction::AddInt(0, 0, 1),
+                1,
+                &[Value::Int(5), Value::Int(3)],
+                &functions[0],
+                0,
+                &functions,
+            )
+            .unwrap();
+        let mut trace = recorder.finish();
+        trace.ops.push(TraceOp::GuardLoopContinue {
+            condition_register: 2,
+            expect_truthy: true,
+            bailout_ip: 9,
+        });
+        let compiled = crate::jit::JitCompiler::new()
+            .compile_trace(&trace, crate::jit::TraceId(0), None, Vec::new())
+            .unwrap();
+        let mut registers = vec![Value::Int(2), Value::Int(3), Value::Bool(false)];
+        compiled.execute(
+            registers.as_mut_ptr(),
+            core::ptr::null_mut(),
+            core::ptr::null(),
+        );
+        assert_eq!(registers[0], Value::Int(5));
+        registers[0] = Value::Float(2.5);
+        assert_eq!(
+            compiled.execute(
+                registers.as_mut_ptr(),
+                core::ptr::null_mut(),
+                core::ptr::null()
+            ),
+            1
+        );
+        assert_eq!(registers[0], Value::Float(2.5));
     }
 
     #[test]

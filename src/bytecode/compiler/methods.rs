@@ -19,11 +19,11 @@ impl Compiler {
         let one_const_idx = self.add_int_const(1);
         let one_reg = self.allocate_register();
         self.emit(Instruction::LoadConst(one_reg, one_const_idx), 0);
-        self.emit(Instruction::Sub(end_reg, len_reg, one_reg), 0);
+        self.emit(Instruction::SubInt(end_reg, len_reg, one_reg), 0);
         let loop_watermark = self.next_register;
         let loop_start = self.current_chunk().instructions.len();
         let cond_reg = self.allocate_register();
-        self.emit(Instruction::Le(cond_reg, i_reg, end_reg), 0);
+        self.emit(Instruction::LeInt(cond_reg, i_reg, end_reg), 0);
         let jump_to_end = self.emit(Instruction::JumpIfNot(cond_reg, 0), 0);
         let elem_reg = self.allocate_register();
         self.emit(Instruction::GetIndex(elem_reg, array_reg, i_reg), 0);
@@ -38,7 +38,7 @@ impl Compiler {
         let inc_reg = self.allocate_register();
         let one_reg2 = self.allocate_register();
         self.emit(Instruction::LoadConst(one_reg2, one_const_idx), 0);
-        self.emit(Instruction::Add(inc_reg, i_reg, one_reg2), 0);
+        self.emit(Instruction::AddInt(inc_reg, i_reg, one_reg2), 0);
         self.emit(Instruction::Move(i_reg, inc_reg), 0);
         self.next_register = loop_watermark;
         self.emit_jump_back_to(loop_start);
@@ -66,11 +66,11 @@ impl Compiler {
         let one_const_idx = self.add_int_const(1);
         let one_reg = self.allocate_register();
         self.emit(Instruction::LoadConst(one_reg, one_const_idx), 0);
-        self.emit(Instruction::Sub(end_reg, len_reg, one_reg), 0);
+        self.emit(Instruction::SubInt(end_reg, len_reg, one_reg), 0);
         let loop_watermark = self.next_register;
         let loop_start = self.current_chunk().instructions.len();
         let cond_reg = self.allocate_register();
-        self.emit(Instruction::Le(cond_reg, i_reg, end_reg), 0);
+        self.emit(Instruction::LeInt(cond_reg, i_reg, end_reg), 0);
         let jump_to_end = self.emit(Instruction::JumpIfNot(cond_reg, 0), 0);
         let elem_reg = self.allocate_register();
         self.emit(Instruction::GetIndex(elem_reg, array_reg, i_reg), 0);
@@ -92,7 +92,7 @@ impl Compiler {
         let inc_reg = self.allocate_register();
         let one_reg2 = self.allocate_register();
         self.emit(Instruction::LoadConst(one_reg2, one_const_idx), 0);
-        self.emit(Instruction::Add(inc_reg, i_reg, one_reg2), 0);
+        self.emit(Instruction::AddInt(inc_reg, i_reg, one_reg2), 0);
         self.emit(Instruction::Move(i_reg, inc_reg), 0);
         self.next_register = loop_watermark;
         self.emit_jump_back_to(loop_start);
@@ -119,11 +119,11 @@ impl Compiler {
         let one_const_idx = self.add_int_const(1);
         let one_reg = self.allocate_register();
         self.emit(Instruction::LoadConst(one_reg, one_const_idx), 0);
-        self.emit(Instruction::Sub(end_reg, len_reg, one_reg), 0);
+        self.emit(Instruction::SubInt(end_reg, len_reg, one_reg), 0);
         let loop_watermark = self.next_register;
         let loop_start = self.current_chunk().instructions.len();
         let cond_reg = self.allocate_register();
-        self.emit(Instruction::Le(cond_reg, i_reg, end_reg), 0);
+        self.emit(Instruction::LeInt(cond_reg, i_reg, end_reg), 0);
         let jump_to_end = self.emit(Instruction::JumpIfNot(cond_reg, 0), 0);
         let elem_reg = self.allocate_register();
         self.emit(Instruction::GetIndex(elem_reg, array_reg, i_reg), 0);
@@ -144,7 +144,7 @@ impl Compiler {
         let inc_reg = self.allocate_register();
         let one_reg2 = self.allocate_register();
         self.emit(Instruction::LoadConst(one_reg2, one_const_idx), 0);
-        self.emit(Instruction::Add(inc_reg, i_reg, one_reg2), 0);
+        self.emit(Instruction::AddInt(inc_reg, i_reg, one_reg2), 0);
         self.emit(Instruction::Move(i_reg, inc_reg), 0);
         self.next_register = loop_watermark;
         self.emit_jump_back_to(loop_start);

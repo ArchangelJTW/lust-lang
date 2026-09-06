@@ -310,7 +310,13 @@ impl TypeChecker {
                 if matches!(target_type.kind, TypeKind::Int | TypeKind::Float)
                     && matches!(value_type.kind, TypeKind::Int | TypeKind::Float)
                 {
-                    target_type.clone()
+                    if matches!(target_type.kind, TypeKind::Float)
+                        || matches!(value_type.kind, TypeKind::Float)
+                    {
+                        Type::new(TypeKind::Float, value.span)
+                    } else {
+                        target_type.clone()
+                    }
                 } else {
                     return Err(self.type_error(format!(
                         "Compound assignment {}= requires numeric types",
@@ -567,6 +573,13 @@ impl TypeChecker {
                     "For loop step value must be numeric, got {}",
                     step_type
                 )));
+            }
+            if matches!(start_type.kind, TypeKind::Int) && matches!(step_type.kind, TypeKind::Float)
+            {
+                return Err(self.type_error_at(
+                    "A float step would change the integer loop variable's type; use a float start value".to_string(),
+                    step_expr.span,
+                ));
             }
         }
 

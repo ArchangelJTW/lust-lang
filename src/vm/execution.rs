@@ -582,6 +582,103 @@ impl VM {
                     self.set_register(dest, value)?;
                 }
 
+                Instruction::AddInt(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Int(a + b)))?;
+                }
+                Instruction::SubInt(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Int(a - b)))?;
+                }
+                Instruction::MulInt(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Int(a * b)))?;
+                }
+                Instruction::DivInt(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| {
+                        if b == 0 {
+                            Err(LustError::RuntimeError {
+                                message: "Division by zero".to_string(),
+                            })
+                        } else {
+                            Ok(Value::Int(a / b))
+                        }
+                    })?;
+                }
+                Instruction::ModInt(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| {
+                        if b == 0 {
+                            Err(LustError::RuntimeError {
+                                message: "Modulo by zero".to_string(),
+                            })
+                        } else {
+                            Ok(Value::Int(a % b))
+                        }
+                    })?;
+                }
+                Instruction::NegInt(dest, src) => {
+                    self.int_binary_op(dest, src, src, |a, _| Ok(Value::Int(-a)))?;
+                }
+                Instruction::EqInt(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Bool(a == b)))?;
+                }
+                Instruction::NeInt(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Bool(a != b)))?;
+                }
+                Instruction::LtInt(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Bool(a < b)))?;
+                }
+                Instruction::LeInt(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Bool(a <= b)))?;
+                }
+                Instruction::GtInt(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Bool(a > b)))?;
+                }
+                Instruction::GeInt(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Bool(a >= b)))?;
+                }
+                Instruction::AddFloat(dest, lhs, rhs) => {
+                    self.float_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Float(a + b)))?;
+                }
+                Instruction::SubFloat(dest, lhs, rhs) => {
+                    self.float_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Float(a - b)))?;
+                }
+                Instruction::MulFloat(dest, lhs, rhs) => {
+                    self.float_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Float(a * b)))?;
+                }
+                Instruction::DivFloat(dest, lhs, rhs) => {
+                    self.float_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Float(a / b)))?;
+                }
+                Instruction::ModFloat(dest, lhs, rhs) => {
+                    self.float_binary_op(dest, lhs, rhs, |a, b| {
+                        if b == 0.0 {
+                            Err(LustError::RuntimeError {
+                                message: "Modulo by zero".to_string(),
+                            })
+                        } else {
+                            Ok(Value::Float(a % b))
+                        }
+                    })?;
+                }
+                Instruction::NegFloat(dest, src) => {
+                    self.float_binary_op(dest, src, src, |a, _| Ok(Value::Float(-a)))?;
+                }
+                Instruction::EqFloat(dest, lhs, rhs) => {
+                    self.float_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Bool(a == b)))?;
+                }
+                Instruction::NeFloat(dest, lhs, rhs) => {
+                    self.float_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Bool(a != b)))?;
+                }
+                Instruction::LtFloat(dest, lhs, rhs) => {
+                    self.float_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Bool(a < b)))?;
+                }
+                Instruction::LeFloat(dest, lhs, rhs) => {
+                    self.float_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Bool(a <= b)))?;
+                }
+                Instruction::GtFloat(dest, lhs, rhs) => {
+                    self.float_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Bool(a > b)))?;
+                }
+                Instruction::GeFloat(dest, lhs, rhs) => {
+                    self.float_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Bool(a >= b)))?;
+                }
+
                 Instruction::Add(dest, lhs, rhs) => {
                     self.binary_op(dest, lhs, rhs, |l, r| match (l, r) {
                         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
@@ -1654,6 +1751,54 @@ impl VM {
         let left = self.get_register(lhs)?;
         let right = self.get_register(rhs)?;
         let result = op(left, right)?;
+        self.set_register(dest, result)
+    }
+
+    fn int_binary_op<F>(
+        &mut self,
+        dest: Register,
+        lhs: Register,
+        rhs: Register,
+        op: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(LustInt, LustInt) -> Result<Value>,
+    {
+        let left = self.get_register(lhs)?;
+        let right = self.get_register(rhs)?;
+        let (Value::Int(a), Value::Int(b)) = (left, right) else {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Typed numeric instruction expected int operands, got {:?} and {:?}",
+                    left, right
+                ),
+            });
+        };
+        let result = op(*a, *b)?;
+        self.set_register(dest, result)
+    }
+
+    fn float_binary_op<F>(
+        &mut self,
+        dest: Register,
+        lhs: Register,
+        rhs: Register,
+        op: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(LustFloat, LustFloat) -> Result<Value>,
+    {
+        let left = self.get_register(lhs)?;
+        let right = self.get_register(rhs)?;
+        let (Value::Float(a), Value::Float(b)) = (left, right) else {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Typed numeric instruction expected float operands, got {:?} and {:?}",
+                    left, right
+                ),
+            });
+        };
+        let result = op(*a, *b)?;
         self.set_register(dest, result)
     }
 

@@ -159,6 +159,48 @@ impl Compiler {
             .insert(reg, type_kind);
     }
 
+    pub(super) fn move_result(&mut self, dest: Register, src: Register, expression_start: usize) {
+        if dest == src {
+            return;
+        }
+        // Only the just-produced temporary is dead here, not an existing local.
+        // Typed arithmetic preserves its input kinds even when the destination aliases.
+        let expression = &self.current_chunk().instructions[expression_start..];
+        let straight_line = !expression.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::Jump(_)
+                    | Instruction::JumpIf(..)
+                    | Instruction::JumpIfNot(..)
+                    | Instruction::Return(_)
+            )
+        });
+        if straight_line && i32::from(src) > self.max_local_register_index() {
+            if let Some((instruction, ty, _, _)) = expression
+                .last()
+                .and_then(|instruction| instruction.numeric_specialization())
+            {
+                if instruction.defined_register() == Some(src) {
+                    let replacement = match instruction {
+                        Instruction::Add(_, l, r) => Some(Instruction::Add(dest, l, r)),
+                        Instruction::Sub(_, l, r) => Some(Instruction::Sub(dest, l, r)),
+                        Instruction::Mul(_, l, r) => Some(Instruction::Mul(dest, l, r)),
+                        Instruction::Div(_, l, r) => Some(Instruction::Div(dest, l, r)),
+                        Instruction::Mod(_, l, r) => Some(Instruction::Mod(dest, l, r)),
+                        Instruction::Neg(_, s) => Some(Instruction::Neg(dest, s)),
+                        _ => None,
+                    };
+                    if let Some(replacement) = replacement {
+                        *self.current_chunk_mut().instructions.last_mut().unwrap() =
+                            replacement.specialize_numeric(ty);
+                        return;
+                    }
+                }
+            }
+        }
+        self.emit(Instruction::Move(dest, src), 0);
+    }
+
     pub(super) fn emit(&mut self, instruction: Instruction, line: usize) -> usize {
         let effective_line = if line == 0 { self.current_line } else { line };
         self.functions[self.current_function]

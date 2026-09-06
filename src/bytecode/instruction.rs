@@ -1,3 +1,4 @@
+use crate::number::NumericType;
 use core::fmt;
 pub type Register = u8;
 pub type ConstIndex = u16;
@@ -22,6 +23,30 @@ pub enum Instruction {
     Le(Register, Register, Register),
     Gt(Register, Register, Register),
     Ge(Register, Register, Register),
+    AddInt(Register, Register, Register),
+    SubInt(Register, Register, Register),
+    MulInt(Register, Register, Register),
+    DivInt(Register, Register, Register),
+    ModInt(Register, Register, Register),
+    NegInt(Register, Register),
+    EqInt(Register, Register, Register),
+    NeInt(Register, Register, Register),
+    LtInt(Register, Register, Register),
+    LeInt(Register, Register, Register),
+    GtInt(Register, Register, Register),
+    GeInt(Register, Register, Register),
+    AddFloat(Register, Register, Register),
+    SubFloat(Register, Register, Register),
+    MulFloat(Register, Register, Register),
+    DivFloat(Register, Register, Register),
+    ModFloat(Register, Register, Register),
+    NegFloat(Register, Register),
+    EqFloat(Register, Register, Register),
+    NeFloat(Register, Register, Register),
+    LtFloat(Register, Register, Register),
+    LeFloat(Register, Register, Register),
+    GtFloat(Register, Register, Register),
+    GeFloat(Register, Register, Register),
     And(Register, Register, Register),
     Or(Register, Register, Register),
     Not(Register, Register),
@@ -74,6 +99,30 @@ pub enum OpCode {
     Le,
     Gt,
     Ge,
+    AddInt,
+    SubInt,
+    MulInt,
+    DivInt,
+    ModInt,
+    NegInt,
+    EqInt,
+    NeInt,
+    LtInt,
+    LeInt,
+    GtInt,
+    GeInt,
+    AddFloat,
+    SubFloat,
+    MulFloat,
+    DivFloat,
+    ModFloat,
+    NegFloat,
+    EqFloat,
+    NeFloat,
+    LtFloat,
+    LeFloat,
+    GtFloat,
+    GeFloat,
     And,
     Or,
     Not,
@@ -127,6 +176,30 @@ impl Instruction {
             Instruction::Le(_, _, _) => OpCode::Le,
             Instruction::Gt(_, _, _) => OpCode::Gt,
             Instruction::Ge(_, _, _) => OpCode::Ge,
+            Instruction::AddInt(_, _, _) => OpCode::AddInt,
+            Instruction::SubInt(_, _, _) => OpCode::SubInt,
+            Instruction::MulInt(_, _, _) => OpCode::MulInt,
+            Instruction::DivInt(_, _, _) => OpCode::DivInt,
+            Instruction::ModInt(_, _, _) => OpCode::ModInt,
+            Instruction::NegInt(_, _) => OpCode::NegInt,
+            Instruction::EqInt(_, _, _) => OpCode::EqInt,
+            Instruction::NeInt(_, _, _) => OpCode::NeInt,
+            Instruction::LtInt(_, _, _) => OpCode::LtInt,
+            Instruction::LeInt(_, _, _) => OpCode::LeInt,
+            Instruction::GtInt(_, _, _) => OpCode::GtInt,
+            Instruction::GeInt(_, _, _) => OpCode::GeInt,
+            Instruction::AddFloat(_, _, _) => OpCode::AddFloat,
+            Instruction::SubFloat(_, _, _) => OpCode::SubFloat,
+            Instruction::MulFloat(_, _, _) => OpCode::MulFloat,
+            Instruction::DivFloat(_, _, _) => OpCode::DivFloat,
+            Instruction::ModFloat(_, _, _) => OpCode::ModFloat,
+            Instruction::NegFloat(_, _) => OpCode::NegFloat,
+            Instruction::EqFloat(_, _, _) => OpCode::EqFloat,
+            Instruction::NeFloat(_, _, _) => OpCode::NeFloat,
+            Instruction::LtFloat(_, _, _) => OpCode::LtFloat,
+            Instruction::LeFloat(_, _, _) => OpCode::LeFloat,
+            Instruction::GtFloat(_, _, _) => OpCode::GtFloat,
+            Instruction::GeFloat(_, _, _) => OpCode::GeFloat,
             Instruction::And(_, _, _) => OpCode::And,
             Instruction::Or(_, _, _) => OpCode::Or,
             Instruction::Not(_, _) => OpCode::Not,
@@ -179,6 +252,30 @@ impl Instruction {
             | Instruction::Le(dest, _, _)
             | Instruction::Gt(dest, _, _)
             | Instruction::Ge(dest, _, _)
+            | Instruction::AddInt(dest, _, _)
+            | Instruction::SubInt(dest, _, _)
+            | Instruction::MulInt(dest, _, _)
+            | Instruction::DivInt(dest, _, _)
+            | Instruction::ModInt(dest, _, _)
+            | Instruction::NegInt(dest, _)
+            | Instruction::EqInt(dest, _, _)
+            | Instruction::NeInt(dest, _, _)
+            | Instruction::LtInt(dest, _, _)
+            | Instruction::LeInt(dest, _, _)
+            | Instruction::GtInt(dest, _, _)
+            | Instruction::GeInt(dest, _, _)
+            | Instruction::AddFloat(dest, _, _)
+            | Instruction::SubFloat(dest, _, _)
+            | Instruction::MulFloat(dest, _, _)
+            | Instruction::DivFloat(dest, _, _)
+            | Instruction::ModFloat(dest, _, _)
+            | Instruction::NegFloat(dest, _)
+            | Instruction::EqFloat(dest, _, _)
+            | Instruction::NeFloat(dest, _, _)
+            | Instruction::LtFloat(dest, _, _)
+            | Instruction::LeFloat(dest, _, _)
+            | Instruction::GtFloat(dest, _, _)
+            | Instruction::GeFloat(dest, _, _)
             | Instruction::And(dest, _, _)
             | Instruction::Or(dest, _, _)
             | Instruction::Not(dest, _)
@@ -220,6 +317,8 @@ impl Instruction {
         match *self {
             Instruction::Move(_, src)
             | Instruction::Neg(_, src)
+            | Instruction::NegInt(_, src)
+            | Instruction::NegFloat(_, src)
             | Instruction::Not(_, src)
             | Instruction::JumpIf(src, _)
             | Instruction::JumpIfNot(src, _)
@@ -240,6 +339,28 @@ impl Instruction {
             | Instruction::Le(_, lhs, rhs)
             | Instruction::Gt(_, lhs, rhs)
             | Instruction::Ge(_, lhs, rhs)
+            | Instruction::AddInt(_, lhs, rhs)
+            | Instruction::SubInt(_, lhs, rhs)
+            | Instruction::MulInt(_, lhs, rhs)
+            | Instruction::DivInt(_, lhs, rhs)
+            | Instruction::ModInt(_, lhs, rhs)
+            | Instruction::EqInt(_, lhs, rhs)
+            | Instruction::NeInt(_, lhs, rhs)
+            | Instruction::LtInt(_, lhs, rhs)
+            | Instruction::LeInt(_, lhs, rhs)
+            | Instruction::GtInt(_, lhs, rhs)
+            | Instruction::GeInt(_, lhs, rhs)
+            | Instruction::AddFloat(_, lhs, rhs)
+            | Instruction::SubFloat(_, lhs, rhs)
+            | Instruction::MulFloat(_, lhs, rhs)
+            | Instruction::DivFloat(_, lhs, rhs)
+            | Instruction::ModFloat(_, lhs, rhs)
+            | Instruction::EqFloat(_, lhs, rhs)
+            | Instruction::NeFloat(_, lhs, rhs)
+            | Instruction::LtFloat(_, lhs, rhs)
+            | Instruction::LeFloat(_, lhs, rhs)
+            | Instruction::GtFloat(_, lhs, rhs)
+            | Instruction::GeFloat(_, lhs, rhs)
             | Instruction::And(_, lhs, rhs)
             | Instruction::Or(_, lhs, rhs)
             | Instruction::GetIndex(_, lhs, rhs)
@@ -276,6 +397,72 @@ impl Instruction {
     }
 }
 
+impl Instruction {
+    pub fn specialize_numeric(self, ty: NumericType) -> Self {
+        use NumericType::{Float, Int};
+        match (self, ty) {
+            (Self::Add(d, l, r), Int) => Self::AddInt(d, l, r),
+            (Self::Sub(d, l, r), Int) => Self::SubInt(d, l, r),
+            (Self::Mul(d, l, r), Int) => Self::MulInt(d, l, r),
+            (Self::Div(d, l, r), Int) => Self::DivInt(d, l, r),
+            (Self::Mod(d, l, r), Int) => Self::ModInt(d, l, r),
+            (Self::Neg(d, s), Int) => Self::NegInt(d, s),
+            (Self::Eq(d, l, r), Int) => Self::EqInt(d, l, r),
+            (Self::Ne(d, l, r), Int) => Self::NeInt(d, l, r),
+            (Self::Lt(d, l, r), Int) => Self::LtInt(d, l, r),
+            (Self::Le(d, l, r), Int) => Self::LeInt(d, l, r),
+            (Self::Gt(d, l, r), Int) => Self::GtInt(d, l, r),
+            (Self::Ge(d, l, r), Int) => Self::GeInt(d, l, r),
+            (Self::Add(d, l, r), Float) => Self::AddFloat(d, l, r),
+            (Self::Sub(d, l, r), Float) => Self::SubFloat(d, l, r),
+            (Self::Mul(d, l, r), Float) => Self::MulFloat(d, l, r),
+            (Self::Div(d, l, r), Float) => Self::DivFloat(d, l, r),
+            (Self::Mod(d, l, r), Float) => Self::ModFloat(d, l, r),
+            (Self::Neg(d, s), Float) => Self::NegFloat(d, s),
+            (Self::Eq(d, l, r), Float) => Self::EqFloat(d, l, r),
+            (Self::Ne(d, l, r), Float) => Self::NeFloat(d, l, r),
+            (Self::Lt(d, l, r), Float) => Self::LtFloat(d, l, r),
+            (Self::Le(d, l, r), Float) => Self::LeFloat(d, l, r),
+            (Self::Gt(d, l, r), Float) => Self::GtFloat(d, l, r),
+            (Self::Ge(d, l, r), Float) => Self::GeFloat(d, l, r),
+            _ => self,
+        }
+    }
+
+    /// Generic operation and checked input contract for trace lowering.
+    /// Negation repeats its single source in both operand positions.
+    pub fn numeric_specialization(self) -> Option<(Self, NumericType, Register, Register)> {
+        use NumericType::{Float, Int};
+        Some(match self {
+            Self::AddInt(d, l, r) => (Self::Add(d, l, r), Int, l, r),
+            Self::SubInt(d, l, r) => (Self::Sub(d, l, r), Int, l, r),
+            Self::MulInt(d, l, r) => (Self::Mul(d, l, r), Int, l, r),
+            Self::DivInt(d, l, r) => (Self::Div(d, l, r), Int, l, r),
+            Self::ModInt(d, l, r) => (Self::Mod(d, l, r), Int, l, r),
+            Self::NegInt(d, s) => (Self::Neg(d, s), Int, s, s),
+            Self::EqInt(d, l, r) => (Self::Eq(d, l, r), Int, l, r),
+            Self::NeInt(d, l, r) => (Self::Ne(d, l, r), Int, l, r),
+            Self::LtInt(d, l, r) => (Self::Lt(d, l, r), Int, l, r),
+            Self::LeInt(d, l, r) => (Self::Le(d, l, r), Int, l, r),
+            Self::GtInt(d, l, r) => (Self::Gt(d, l, r), Int, l, r),
+            Self::GeInt(d, l, r) => (Self::Ge(d, l, r), Int, l, r),
+            Self::AddFloat(d, l, r) => (Self::Add(d, l, r), Float, l, r),
+            Self::SubFloat(d, l, r) => (Self::Sub(d, l, r), Float, l, r),
+            Self::MulFloat(d, l, r) => (Self::Mul(d, l, r), Float, l, r),
+            Self::DivFloat(d, l, r) => (Self::Div(d, l, r), Float, l, r),
+            Self::ModFloat(d, l, r) => (Self::Mod(d, l, r), Float, l, r),
+            Self::NegFloat(d, s) => (Self::Neg(d, s), Float, s, s),
+            Self::EqFloat(d, l, r) => (Self::Eq(d, l, r), Float, l, r),
+            Self::NeFloat(d, l, r) => (Self::Ne(d, l, r), Float, l, r),
+            Self::LtFloat(d, l, r) => (Self::Lt(d, l, r), Float, l, r),
+            Self::LeFloat(d, l, r) => (Self::Le(d, l, r), Float, l, r),
+            Self::GtFloat(d, l, r) => (Self::Gt(d, l, r), Float, l, r),
+            Self::GeFloat(d, l, r) => (Self::Ge(d, l, r), Float, l, r),
+            _ => return None,
+        })
+    }
+}
+
 impl fmt::Display for Instruction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -297,6 +484,30 @@ impl fmt::Display for Instruction {
             Instruction::Le(d, l, r) => write!(f, "Le R{}, R{}, R{}", d, l, r),
             Instruction::Gt(d, l, r) => write!(f, "Gt R{}, R{}, R{}", d, l, r),
             Instruction::Ge(d, l, r) => write!(f, "Ge R{}, R{}, R{}", d, l, r),
+            Instruction::AddInt(d, l, r) => write!(f, "AddInt R{}, R{}, R{}", d, l, r),
+            Instruction::SubInt(d, l, r) => write!(f, "SubInt R{}, R{}, R{}", d, l, r),
+            Instruction::MulInt(d, l, r) => write!(f, "MulInt R{}, R{}, R{}", d, l, r),
+            Instruction::DivInt(d, l, r) => write!(f, "DivInt R{}, R{}, R{}", d, l, r),
+            Instruction::ModInt(d, l, r) => write!(f, "ModInt R{}, R{}, R{}", d, l, r),
+            Instruction::NegInt(d, s) => write!(f, "NegInt R{}, R{}", d, s),
+            Instruction::EqInt(d, l, r) => write!(f, "EqInt R{}, R{}, R{}", d, l, r),
+            Instruction::NeInt(d, l, r) => write!(f, "NeInt R{}, R{}, R{}", d, l, r),
+            Instruction::LtInt(d, l, r) => write!(f, "LtInt R{}, R{}, R{}", d, l, r),
+            Instruction::LeInt(d, l, r) => write!(f, "LeInt R{}, R{}, R{}", d, l, r),
+            Instruction::GtInt(d, l, r) => write!(f, "GtInt R{}, R{}, R{}", d, l, r),
+            Instruction::GeInt(d, l, r) => write!(f, "GeInt R{}, R{}, R{}", d, l, r),
+            Instruction::AddFloat(d, l, r) => write!(f, "AddFloat R{}, R{}, R{}", d, l, r),
+            Instruction::SubFloat(d, l, r) => write!(f, "SubFloat R{}, R{}, R{}", d, l, r),
+            Instruction::MulFloat(d, l, r) => write!(f, "MulFloat R{}, R{}, R{}", d, l, r),
+            Instruction::DivFloat(d, l, r) => write!(f, "DivFloat R{}, R{}, R{}", d, l, r),
+            Instruction::ModFloat(d, l, r) => write!(f, "ModFloat R{}, R{}, R{}", d, l, r),
+            Instruction::NegFloat(d, s) => write!(f, "NegFloat R{}, R{}", d, s),
+            Instruction::EqFloat(d, l, r) => write!(f, "EqFloat R{}, R{}, R{}", d, l, r),
+            Instruction::NeFloat(d, l, r) => write!(f, "NeFloat R{}, R{}, R{}", d, l, r),
+            Instruction::LtFloat(d, l, r) => write!(f, "LtFloat R{}, R{}, R{}", d, l, r),
+            Instruction::LeFloat(d, l, r) => write!(f, "LeFloat R{}, R{}, R{}", d, l, r),
+            Instruction::GtFloat(d, l, r) => write!(f, "GtFloat R{}, R{}, R{}", d, l, r),
+            Instruction::GeFloat(d, l, r) => write!(f, "GeFloat R{}, R{}, R{}", d, l, r),
             Instruction::And(d, l, r) => write!(f, "And R{}, R{}, R{}", d, l, r),
             Instruction::Or(d, l, r) => write!(f, "Or R{}, R{}, R{}", d, l, r),
             Instruction::Not(d, s) => write!(f, "Not R{}, R{}", d, s),

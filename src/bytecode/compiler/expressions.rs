@@ -111,7 +111,13 @@ impl Compiler {
                     }
 
                     let result_reg = self.allocate_register();
-                    self.compile_binary_op(*op, result_reg, left_reg, right_reg)?;
+                    self.compile_binary_op(
+                        *op,
+                        result_reg,
+                        left_reg,
+                        right_reg,
+                        (left.span, right.span),
+                    )?;
                     Ok(result_reg)
                 }
             },
@@ -120,7 +126,13 @@ impl Compiler {
                 let operand_reg = self.compile_expr(operand)?;
                 let result_reg = self.allocate_register();
                 match op {
-                    UnaryOp::Neg => self.emit(Instruction::Neg(result_reg, operand_reg), 0),
+                    UnaryOp::Neg => {
+                        let instruction = Instruction::Neg(result_reg, operand_reg);
+                        let instruction = self
+                            .numeric_type(operand.span)
+                            .map_or(instruction, |ty| instruction.specialize_numeric(ty));
+                        self.emit(instruction, 0)
+                    }
                     UnaryOp::Not => self.emit(Instruction::Not(result_reg, operand_reg), 0),
                 };
                 self.free_register(operand_reg);
@@ -814,6 +826,7 @@ impl Compiler {
         dest: Register,
         left: Register,
         right: Register,
+        operand_spans: (Span, Span),
     ) -> Result<()> {
         let instr = match op {
             BinaryOp::Add => Instruction::Add(dest, left, right),
@@ -836,6 +849,13 @@ impl Compiler {
                     op
                 )))
             }
+        };
+        let instr = match (
+            self.numeric_type(operand_spans.0),
+            self.numeric_type(operand_spans.1),
+        ) {
+            (Some(left), Some(right)) if left == right => instr.specialize_numeric(left),
+            _ => instr,
         };
         self.emit(instr, 0);
         Ok(())
@@ -890,13 +910,12 @@ impl Compiler {
         &mut self,
         target: &Expr,
         value_reg: Register,
+        expression_start: usize,
     ) -> Result<()> {
         match &target.kind {
             ExprKind::Identifier(name) => {
                 if let Ok(target_reg) = self.resolve_local(name) {
-                    if value_reg != target_reg {
-                        self.emit(Instruction::Move(target_reg, value_reg), 0);
-                    }
+                    self.move_result(target_reg, value_reg, expression_start);
 
                     if self.should_sync_module_local(name) {
                         self.emit_store_module_global(name, target_reg);

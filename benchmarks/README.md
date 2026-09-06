@@ -14,7 +14,61 @@ and executed. The VM runs 250,000 iterations per call and the JIT runs
 100,000,000. The example target uses the ordinary release profile, including
 its `panic = "abort"` setting.
 
-## Measurements
+## Typed Numeric Lowering
+
+The typechecker now passes compact per-expression `Int`/`Float` facts to the
+bytecode compiler, including in low-memory mode. This is separate from editor
+type information and from the function-wide `register_types` map. CLI,
+embedding, embedded-module, and analyzer compilation paths all pass these facts.
+They are compilation metadata, not additional per-register runtime storage.
+
+Homogeneous numeric arithmetic, negation, and comparisons lower to typed
+instructions such as `AddInt`, `AddFloat`, and `LtInt`. Mixed numeric operands,
+unknown types, and erased generic operands retain generic instructions. The
+interpreter checks the required input kinds rather than dispatching among all
+numeric combinations. Trace lowering preserves that contract and retains type
+guards before native payload access, including after host mutation.
+
+Typed arithmetic results assigned to locals are written directly to the local
+when the temporary is dead and the expression is straight-line. For example,
+`sum = sum + i` now needs one arithmetic instruction rather than arithmetic plus
+`Move`. Its input kinds remain recoverable by the post-execution trace recorder
+even when the destination aliases an input. Generic aliased arithmetic and
+aliased comparisons still require pre-execution operands and are not enabled.
+The old JIT arithmetic/move peephole was removed because it could discard a live
+local update; elimination now happens in the compiler with lifetime information.
+
+Two correctness prerequisites accompany the lowering:
+
+- Composite expressions have distinct source spans instead of overwriting their
+  left operand's type information.
+- Compound assignments and numeric loop steps cannot silently change a statically
+  integer binding to float. A fractional loop step requires a float start value.
+
+### Measurements
+
+Compared with `542c1fd`, using the unchanged harness and the current release
+profile (`opt-level = 3`, fat LTO), on the same Ryzen 7 7800X3D and Rust 1.96.0.
+Both binaries were run sequentially with `taskset -c 2`. These times are
+milliseconds per call; each is the median of seven samples.
+
+| Mode | Workload | Before | After |
+|---|---|---:|---:|
+| VM | Integer sum | 46.175 | 31.502 |
+| VM | Ascending float sum | 48.025 | 31.571 |
+| VM | Descending float sum | 54.091 | 38.780 |
+| x86_64 JIT | Integer sum | 55.017 | 56.525 |
+| x86_64 JIT | Ascending float sum | 270.495 | 270.687 |
+| x86_64 JIT | Descending float sum | 266.622 | 266.330 |
+
+Typed opcode dispatch alone was approximately flat in this optimized build.
+Removing redundant VM instructions produced the material improvement: roughly
+25%-35% less VM time across repeated runs. Native float timings were unchanged;
+the integer JIT loop was about 3% slower in this pair, with small variation
+between runs. No JIT speedup is claimed. These are microbenchmarks, not a general
+language speedup claim, and generic/mixed paths are not represented by this table.
+
+## Earlier Measurements
 
 Measured against `8628164` with the same harness, on a Ryzen 7 7800X3D with
 Rust 1.96.0 and the existing release settings (`opt-level = "z"`, fat LTO).
@@ -37,7 +91,7 @@ no clear improvement in the already-fast integer JIT loop or the descending
 float JIT loop; the small differences in those rows should not be treated as
 reliable gains.
 
-## Implemented Changes
+## Earlier Changes
 
 - Cycle discovery returns immediately for leaf values, avoiding a heap-allocated
   traversal stack and cloning on every scalar register write and scalar VM root.
@@ -54,34 +108,36 @@ reliable gains.
 - Conditions already proven to be booleans use a direct payload test instead
   of generic truthiness dispatch. Unknown conditions retain the existing path.
 
-The RISC-V JIT is unchanged. These changes use existing runtime/codegen type
-facts; they do not yet introduce a new static typed-bytecode pipeline.
+Those earlier optimizations used runtime/codegen type facts rather than the new
+static lowering described above. RISC-V codegen has not been modified.
 
 ## Further Opportunities
 
-1. **Carry expression types into bytecode lowering.** `TypeChecker` collects
-   expression types, but `Compiler` receives function signatures and selected
-   lowering hints, not general expression types. The current
-   `Function::register_types` map covers annotated locals/parameters and loop
-   variables, not every value at every instruction. Reused registers and erased
-   generics make that map unsuitable as a blanket guarantee. Program-point type
-   facts could select typed arithmetic and direct struct-field access. Raw VM
-   and native boundaries still need validation or guards.
+1. **Extend static lowering to fields and mixed numeric operations.** Resolved
+   receiver/layout information could replace field-name lookup in the VM.
+   Strong-field mutation currently accepts arbitrary host `Value`s, so declared
+   field types alone do not justify unchecked payload access. The function-wide
+   `register_types` map remains unsuitable as a substitute for program-point facts.
 2. **Keep JIT scalars in machine registers.** Numeric codegen already selects
    integer/SSE instructions, but normally loads operands from and stores results
    to the boxed VM register array for every operation. Register allocation across
    operations and loop iterations could remove this traffic. It needs explicit
    spill/materialization rules for helper calls and every side exit.
-3. **Offer a speed-oriented build profile.** The current release profile favors
-   minimum binary size with `opt-level = "z"`. Benchmarking `opt-level = 3` in a
-   separate desktop/server profile is worthwhile, especially for interpreter
-   dispatch and runtime helpers. The embedded-size default was not changed.
+3. **Establish verified boundaries before removing input checks.** Static type
+   facts select operations today, but raw bytecode, host mutation, and missing or
+   erased signatures still need validation. Unchecked scalar storage requires a
+   stronger invariant than source annotations alone. The release profile was
+   already changed to `opt-level = 3` before this lowering work and is unchanged
+   by it.
 
 ## Verification
 
-- `cargo test --workspace --quiet`: 144 tests passed; one doctest ignored.
+- `cargo test --workspace --quiet`: 153 tests passed; one doctest ignored.
+- `cargo test --workspace --features lua_transpile --locked --quiet`: the same
+  153 tests passed with optional Lua transpilation enabled.
 - `cargo rustc --no-default-features --lib --crate-type rlib`: passed. A standalone
   `no_std` cdylib still requires the embedding target's allocator/panic runtime.
+  The same three unused-import/dead-code warnings are present in the baseline.
 - The 1,255-case JIT differential corpus produced byte-for-byte identical JSON
   reports before and after: 1,148 `MATCH_OK`, 107 existing `FRONTEND` failures.
   Those frontend failures are not counted as passing tests; dedicated native

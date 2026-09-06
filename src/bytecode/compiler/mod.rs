@@ -5,6 +5,7 @@ pub(super) use crate::ast::{
 };
 use crate::config::LustConfig;
 pub(super) use crate::number::LustInt;
+pub(super) use crate::number::NumericType;
 use crate::typechecker::FunctionSignature;
 pub(super) use crate::{Expr, LustError, Result};
 pub(super) use alloc::{
@@ -41,6 +42,7 @@ pub struct Compiler {
     pub(super) stdlib_symbols: HashSet<String>,
     option_coercions: HashMap<String, HashSet<Span>>,
     checked_array_indices: HashMap<String, HashSet<Span>>,
+    numeric_types: HashMap<String, HashMap<Span, NumericType>>,
     function_signatures: HashMap<String, FunctionSignature>,
     minimal_runtime_types: bool,
 }
@@ -82,6 +84,7 @@ impl Compiler {
             stdlib_symbols: HashSet::new(),
             option_coercions: HashMap::new(),
             checked_array_indices: HashMap::new(),
+            numeric_types: HashMap::new(),
             function_signatures: HashMap::new(),
             minimal_runtime_types: false,
         };
@@ -167,6 +170,17 @@ impl Compiler {
 
     pub fn set_checked_array_indices(&mut self, map: HashMap<String, HashSet<Span>>) {
         self.checked_array_indices = map;
+    }
+
+    pub fn set_numeric_types(&mut self, map: HashMap<String, HashMap<Span, NumericType>>) {
+        self.numeric_types = map;
+    }
+
+    pub(super) fn numeric_type(&self, span: Span) -> Option<NumericType> {
+        self.numeric_types
+            .get(self.current_module.as_deref().unwrap_or(""))?
+            .get(&span)
+            .copied()
     }
 
     pub fn set_function_signatures(&mut self, signatures: HashMap<String, FunctionSignature>) {
@@ -438,6 +452,163 @@ impl Default for Compiler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{intern::Interner, Lexer, Parser, TypeChecker, VM};
+
+    fn compile_typed(source: &str, low_memory: bool) -> Vec<Function> {
+        let mut interner = Interner::new();
+        let tokens = Lexer::new(source, &mut interner).tokenize().unwrap();
+        let items = Parser::new(tokens).parse().unwrap();
+        let config = LustConfig::default()
+            .with_low_memory_mode(low_memory)
+            .with_minimal_runtime_types(low_memory);
+        let mut checker = TypeChecker::with_config(&config);
+        checker.check_module(&items).unwrap();
+        let mut compiler = Compiler::new();
+        compiler.configure(&config);
+        compiler.set_numeric_types(checker.take_numeric_types());
+        compiler.set_function_signatures(checker.take_function_signatures());
+        compiler.compile_module(&items).unwrap()
+    }
+
+    #[test]
+    fn numeric_lowering_uses_expression_types_in_both_memory_modes() {
+        for low_memory in [false, true] {
+            let functions = compile_typed(
+                r#"
+function integer(n: int): bool
+    local value = n + 1 + 2
+    value += 3
+    return value < n * 4
+end
+function floating(n: float): float
+    local value = n + 1.0
+    value = -value
+    return value * 2.0
+end
+function mixed(n: int): float
+    return n + 1 + 0.5
+end
+function dynamic(n: unknown): unknown
+    return n + 1
+end
+function generic<T>(n: T, other: T): bool
+    return n == other
+end
+"#,
+                low_memory,
+            );
+            let ops = |name: &str| {
+                &functions
+                    .iter()
+                    .find(|f| f.name == name)
+                    .unwrap()
+                    .chunk
+                    .instructions
+            };
+            assert!(ops("integer")
+                .iter()
+                .any(|op| matches!(op, Instruction::AddInt(d, l, _) if d == l)));
+            assert!(ops("integer")
+                .iter()
+                .any(|op| matches!(op, Instruction::LtInt(..))));
+            assert!(ops("integer")
+                .iter()
+                .any(|op| matches!(op, Instruction::MulInt(..))));
+            assert!(!ops("integer")
+                .iter()
+                .any(|op| matches!(op, Instruction::Add(..))));
+            assert!(ops("floating")
+                .iter()
+                .any(|op| matches!(op, Instruction::AddFloat(..))));
+            assert!(ops("floating")
+                .iter()
+                .any(|op| matches!(op, Instruction::NegFloat(..))));
+            assert!(ops("floating")
+                .iter()
+                .any(|op| matches!(op, Instruction::MulFloat(..))));
+            assert!(ops("mixed")
+                .iter()
+                .any(|op| matches!(op, Instruction::AddInt(..))));
+            assert!(ops("mixed")
+                .iter()
+                .any(|op| matches!(op, Instruction::Add(..))));
+            assert!(ops("dynamic")
+                .iter()
+                .any(|op| matches!(op, Instruction::Add(..))));
+            assert!(ops("generic")
+                .iter()
+                .any(|op| matches!(op, Instruction::Eq(..))));
+
+            let mut vm = VM::new();
+            vm.load_functions(functions);
+            assert_eq!(
+                vm.call("integer", vec![Value::Int(4)]).unwrap(),
+                Value::Bool(true)
+            );
+            assert_eq!(
+                vm.call("floating", vec![Value::Float(2.0)]).unwrap(),
+                Value::Float(-6.0)
+            );
+            assert_eq!(
+                vm.call("mixed", vec![Value::Int(2)]).unwrap(),
+                Value::Float(3.5)
+            );
+            assert_eq!(
+                vm.call("dynamic", vec![Value::Float(2.5)]).unwrap(),
+                Value::Float(3.5)
+            );
+        }
+    }
+
+    #[test]
+    fn typed_assignments_preserve_copies_and_reused_slots() {
+        let functions = compile_typed(
+            r#"
+function copies(n: int): int
+    local first = n + 1
+    local second = first
+    second += 2
+    return first * 10 + second
+end
+function scopes(n: int): float
+    local total = 0
+    if n > 0 then
+        local value: int = n + 1
+        total = value
+    end
+    local value: float = 1.5
+    value = value + 2.5
+    return value
+end
+"#,
+            false,
+        );
+        let mut vm = VM::new();
+        vm.load_functions(functions);
+        assert_eq!(
+            vm.call("copies", vec![Value::Int(2)]).unwrap(),
+            Value::Int(35)
+        );
+        for n in [0, 2] {
+            assert_eq!(
+                vm.call("scopes", vec![Value::Int(n)]).unwrap(),
+                Value::Float(4.0)
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_result_fusion_does_not_cross_control_flow() {
+        let mut compiler = Compiler::new();
+        compiler.functions.push(Function::new("branch", 0, false));
+        compiler.emit(Instruction::Jump(1), 1);
+        compiler.emit(Instruction::AddInt(2, 0, 1), 1);
+        compiler.move_result(0, 2, 0);
+        assert_eq!(
+            compiler.current_chunk().instructions.last(),
+            Some(&Instruction::Move(0, 2))
+        );
+    }
 
     #[test]
     fn omitted_lambda_return_type_is_dynamic_at_runtime() {

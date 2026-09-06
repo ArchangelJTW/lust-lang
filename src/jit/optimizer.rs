@@ -21,7 +21,6 @@ impl TraceOptimizer {
         self.fuse_try_cast_patterns(trace);
         self.hoist_constants(trace);
         self.unroll_loop(trace, crate::jit::UNROLL_FACTOR);
-        self.eliminate_arithmetic_moves(trace);
         self.eliminate_redundant_type_guards(trace);
         self.coalesce_registers(trace);
         let optimized_ops = trace.ops.len();
@@ -284,65 +283,6 @@ impl TraceOptimizer {
             | TraceOp::InlineCall { dest, .. } => Some(*dest),
             TraceOp::ArrayIndexOk { .. } => None,
             _ => None,
-        }
-    }
-
-    fn eliminate_arithmetic_moves(&mut self, trace: &mut Trace) {
-        let mut new_ops = Vec::new();
-        let mut i = 0;
-        while i < trace.ops.len() {
-            if i + 1 < trace.ops.len() {
-                let current = &trace.ops[i];
-                let next = &trace.ops[i + 1];
-                if let Some((_, final_dest)) = self.match_arithmetic_move(current, next) {
-                    let mut rewritten = current.clone();
-                    self.rewrite_arithmetic_dest(&mut rewritten, final_dest);
-                    new_ops.push(rewritten);
-                    i += 2;
-                    continue;
-                }
-            }
-
-            new_ops.push(trace.ops[i].clone());
-            i += 1;
-        }
-
-        trace.ops = new_ops;
-    }
-
-    fn match_arithmetic_move(&self, op1: &TraceOp, op2: &TraceOp) -> Option<(Register, Register)> {
-        let arith_dest = match op1 {
-            TraceOp::Add { dest, .. }
-            | TraceOp::Sub { dest, .. }
-            | TraceOp::Mul { dest, .. }
-            | TraceOp::Div { dest, .. }
-            | TraceOp::Mod { dest, .. } => *dest,
-            _ => return None,
-        };
-        if let TraceOp::Move {
-            dest: move_dest,
-            src,
-        } = op2
-        {
-            if *src == arith_dest {
-                return Some((arith_dest, *move_dest));
-            }
-        }
-
-        None
-    }
-
-    fn rewrite_arithmetic_dest(&self, op: &mut TraceOp, new_dest: Register) {
-        match op {
-            TraceOp::Add { dest, .. }
-            | TraceOp::Sub { dest, .. }
-            | TraceOp::Mul { dest, .. }
-            | TraceOp::Div { dest, .. }
-            | TraceOp::Mod { dest, .. } => {
-                *dest = new_dest;
-            }
-
-            _ => {}
         }
     }
 

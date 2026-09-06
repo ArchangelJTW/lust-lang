@@ -3,6 +3,7 @@ mod item_checker;
 mod stmt_checker;
 mod type_env;
 use crate::modules::{LoadedModule, ModuleImports};
+use crate::number::NumericType;
 use crate::{
     ast::*,
     config::LustConfig,
@@ -31,6 +32,7 @@ pub struct TypeChecker {
     imports_by_module: HashMap<String, ModuleImports>,
     expr_types_by_module: HashMap<String, HashMap<Span, Type>>,
     variable_types_by_module: HashMap<String, HashMap<Span, Type>>,
+    numeric_types_by_module: HashMap<String, HashMap<Span, NumericType>>,
     short_circuit_info: HashMap<String, HashMap<Span, ShortCircuitInfo>>,
     checked_array_indices: HashMap<String, HashSet<Span>>,
     low_memory_mode: bool,
@@ -66,6 +68,7 @@ impl TypeChecker {
             imports_by_module: HashMap::new(),
             expr_types_by_module: HashMap::new(),
             variable_types_by_module: HashMap::new(),
+            numeric_types_by_module: HashMap::new(),
             short_circuit_info: HashMap::new(),
             checked_array_indices: HashMap::new(),
             low_memory_mode: config.low_memory_mode(),
@@ -389,6 +392,11 @@ impl TypeChecker {
             expr_types: mem::take(&mut self.expr_types_by_module),
             variable_types: mem::take(&mut self.variable_types_by_module),
         }
+    }
+
+    /// Compact lowering facts, retained even when editor type information is disabled.
+    pub fn take_numeric_types(&mut self) -> HashMap<String, HashMap<Span, NumericType>> {
+        mem::take(&mut self.numeric_types_by_module)
     }
 
     pub fn take_option_coercions(&mut self) -> HashMap<String, HashSet<Span>> {
@@ -2053,6 +2061,18 @@ mod tests {
              local x: int = value.x\n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn numeric_updates_cannot_silently_change_an_integer_binding_to_float() {
+        for op in ["+=", "-=", "*=", "/="] {
+            let error = check(&format!("local value: int = 1\nvalue {op} 0.5\n")).unwrap_err();
+            assert!(error.to_string().contains("Type mismatch"), "{error}");
+            check(&format!("local value: float = 1.0\nvalue {op} 2\n")).unwrap();
+        }
+        let error = check("for i = 1, 3, 0.5 do\nend\n").unwrap_err();
+        assert!(error.to_string().contains("float step"));
+        check("for i = 1.0, 3.0, 0.5 do\nend\n").unwrap();
     }
 
     #[test]

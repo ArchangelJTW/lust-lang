@@ -1,5 +1,11 @@
 #![allow(dead_code)]
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericType {
+    Int,
+    Float,
+}
+
 #[cfg(feature = "std")]
 pub type LustInt = i64;
 #[cfg(not(feature = "std"))]

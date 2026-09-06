@@ -1,7 +1,7 @@
 use super::*;
 
 impl JitCompiler {
-    fn load_numeric_comparison_operands(
+    pub(super) fn load_numeric_comparison_operands(
         &mut self,
         lhs: u8,
         rhs: u8,

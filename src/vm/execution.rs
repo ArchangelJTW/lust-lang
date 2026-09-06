@@ -730,19 +730,19 @@ impl VM {
                 }
 
                 Instruction::Lt(dest, lhs, rhs) => {
-                    self.comparison_op(dest, lhs, rhs, |l, r| l < r)?;
+                    self.comparison_op(dest, lhs, rhs, |l, r| l < r, |l, r| l < r)?;
                 }
 
                 Instruction::Le(dest, lhs, rhs) => {
-                    self.comparison_op(dest, lhs, rhs, |l, r| l <= r)?;
+                    self.comparison_op(dest, lhs, rhs, |l, r| l <= r, |l, r| l <= r)?;
                 }
 
                 Instruction::Gt(dest, lhs, rhs) => {
-                    self.comparison_op(dest, lhs, rhs, |l, r| l > r)?;
+                    self.comparison_op(dest, lhs, rhs, |l, r| l > r, |l, r| l > r)?;
                 }
 
                 Instruction::Ge(dest, lhs, rhs) => {
-                    self.comparison_op(dest, lhs, rhs, |l, r| l >= r)?;
+                    self.comparison_op(dest, lhs, rhs, |l, r| l >= r, |l, r| l >= r)?;
                 }
 
                 Instruction::And(dest, lhs, rhs) => {
@@ -1657,20 +1657,22 @@ impl VM {
         self.set_register(dest, result)
     }
 
-    pub(super) fn comparison_op<F>(
+    pub(super) fn comparison_op<I, F>(
         &mut self,
         dest: Register,
         lhs: Register,
         rhs: Register,
+        int_op: I,
         op: F,
     ) -> Result<()>
     where
+        I: FnOnce(LustInt, LustInt) -> bool,
         F: FnOnce(LustFloat, LustFloat) -> bool,
     {
         let left = self.get_register(lhs)?;
         let right = self.get_register(rhs)?;
         let result = match (left, right) {
-            (Value::Int(a), Value::Int(b)) => op(float_from_int(*a), float_from_int(*b)),
+            (Value::Int(a), Value::Int(b)) => int_op(*a, *b),
             (Value::Float(a), Value::Float(b)) => op(*a, *b),
             (Value::Int(a), Value::Float(b)) => op(float_from_int(*a), *b),
             (Value::Float(a), Value::Int(b)) => op(*a, float_from_int(*b)),

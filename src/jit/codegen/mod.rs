@@ -210,6 +210,152 @@ mod tests {
     }
 
     #[test]
+    fn fused_numeric_guards_preserve_ordering_and_bailout_state() {
+        let cases = [
+            (
+                Value::Float(1.0),
+                Value::Float(2.0),
+                [true, true, false, false],
+            ),
+            (
+                Value::Float(2.0),
+                Value::Float(1.0),
+                [false, false, true, true],
+            ),
+            (
+                Value::Float(-0.0),
+                Value::Float(0.0),
+                [false, true, false, true],
+            ),
+            (
+                Value::Float(f64::INFINITY),
+                Value::Float(f64::INFINITY),
+                [false, true, false, true],
+            ),
+            (
+                Value::Float(f64::NEG_INFINITY),
+                Value::Float(f64::INFINITY),
+                [true, true, false, false],
+            ),
+            (Value::Float(f64::NAN), Value::Float(1.0), [false; 4]),
+            (Value::Float(1.0), Value::Float(f64::NAN), [false; 4]),
+            (Value::Int(1), Value::Float(2.0), [true, true, false, false]),
+            (Value::Float(2.0), Value::Int(1), [false, false, true, true]),
+            (Value::Int(1), Value::Float(f64::NAN), [false; 4]),
+            (Value::Float(f64::NAN), Value::Int(1), [false; 4]),
+            (
+                Value::Int(i64::MAX - 1),
+                Value::Int(i64::MAX),
+                [true, true, false, false],
+            ),
+        ];
+        for (left, right, expected) in cases {
+            let value_type = |value: &Value| match value {
+                Value::Int(_) => ValueType::Int,
+                Value::Float(_) => ValueType::Float,
+                _ => unreachable!(),
+            };
+            let lhs_type = value_type(&left);
+            let rhs_type = value_type(&right);
+            for (index, comparison) in [
+                TraceOp::Lt {
+                    dest: 2,
+                    lhs: 0,
+                    rhs: 1,
+                    lhs_type,
+                    rhs_type,
+                },
+                TraceOp::Le {
+                    dest: 2,
+                    lhs: 0,
+                    rhs: 1,
+                    lhs_type,
+                    rhs_type,
+                },
+                TraceOp::Gt {
+                    dest: 2,
+                    lhs: 0,
+                    rhs: 1,
+                    lhs_type,
+                    rhs_type,
+                },
+                TraceOp::Ge {
+                    dest: 2,
+                    lhs: 0,
+                    rhs: 1,
+                    lhs_type,
+                    rhs_type,
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for expect_truthy in [false, true] {
+                    for live_condition in [false, true] {
+                        let mut trace = Trace {
+                            function_idx: 0,
+                            start_ip: 0,
+                            preamble: vec![TraceOp::Guard {
+                                register: 2,
+                                expected_type: ValueType::Bool,
+                            }],
+                            ops: vec![
+                                comparison.clone(),
+                                TraceOp::GuardLoopContinue {
+                                    condition_register: 2,
+                                    expect_truthy,
+                                    bailout_ip: 9,
+                                },
+                                TraceOp::LoadConst {
+                                    dest: 2,
+                                    value: Value::Int(7),
+                                },
+                                TraceOp::NestedLoopCall {
+                                    function_idx: 0,
+                                    loop_start_ip: 0,
+                                    bailout_ip: 10,
+                                },
+                            ],
+                            postamble: Vec::new(),
+                            inputs: vec![0, 1, 2],
+                            outputs: vec![2, 3],
+                        };
+                        if live_condition {
+                            // A subsequent use must disable boolean elision.
+                            trace.ops.insert(2, TraceOp::Move { dest: 3, src: 2 });
+                        }
+                        let compiled = JitCompiler::new()
+                            .compile_trace(&trace, TraceId(0), None, Vec::new())
+                            .unwrap();
+                        let mut registers = vec![
+                            left.clone(),
+                            right.clone(),
+                            Value::Bool(!expected[index]),
+                            Value::Nil,
+                        ];
+                        let result = compiled.execute(
+                            registers.as_mut_ptr(),
+                            core::ptr::null_mut(),
+                            core::ptr::null(),
+                        );
+                        if expected[index] == expect_truthy {
+                            assert_eq!(result, 3);
+                            assert_eq!(registers[2], Value::Int(7));
+                            if live_condition {
+                                assert_eq!(registers[3], Value::Bool(expected[index]));
+                            }
+                        } else {
+                            assert_eq!(result, 2);
+                            assert_eq!(registers[2], Value::Bool(expected[index]));
+                            assert_eq!(compiled.guards[1].bailout_ip, 9);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn live_comparison_and_constant_temporaries_are_materialized() {
         let trace = Trace {
             function_idx: 0,

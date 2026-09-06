@@ -700,6 +700,72 @@ mod tests {
     }
 
     #[test]
+    fn numeric_comparisons_preserve_integer_precision_and_nan_semantics() {
+        let cases = [
+            (
+                Value::Int(LustInt::MAX - 1),
+                Value::Int(LustInt::MAX),
+                [true, true, false, false],
+            ),
+            (
+                Value::Int(LustInt::MIN + 1),
+                Value::Int(LustInt::MIN),
+                [false, false, true, true],
+            ),
+            (
+                Value::Int(LustInt::MAX),
+                Value::Int(LustInt::MAX),
+                [false, true, false, true],
+            ),
+            (
+                Value::Float(1.5),
+                Value::Float(2.5),
+                [true, true, false, false],
+            ),
+            (
+                Value::Float(-0.0),
+                Value::Float(0.0),
+                [false, true, false, true],
+            ),
+            (Value::Float(LustFloat::NAN), Value::Float(1.0), [false; 4]),
+            (Value::Float(1.0), Value::Float(LustFloat::NAN), [false; 4]),
+            (Value::Int(2), Value::Float(2.5), [true, true, false, false]),
+            (Value::Float(2.5), Value::Int(2), [false, false, true, true]),
+        ];
+        for (index, instruction) in [
+            Instruction::Lt(2, 0, 1),
+            Instruction::Le(2, 0, 1),
+            Instruction::Gt(2, 0, 1),
+            Instruction::Ge(2, 0, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut function = Function::new("compare", 2, false);
+            function.set_register_count(3);
+            function.chunk.emit(instruction, 1);
+            function.chunk.emit(Instruction::Return(2), 1);
+            let mut vm = VM::new();
+            vm.jit.enabled = false;
+            vm.load_functions(vec![function]);
+            for (left, right, expected) in &cases {
+                let result = vm
+                    .call("compare", vec![left.clone(), right.clone()])
+                    .unwrap();
+                assert_eq!(
+                    result,
+                    Value::Bool(expected[index]),
+                    "{instruction:?}: {left:?}, {right:?}"
+                );
+            }
+            let error = vm
+                .call("compare", vec![Value::Bool(true), Value::Int(1)])
+                .unwrap_err();
+            assert!(error.to_string().contains("Cannot compare"));
+        }
+    }
+
+    #[test]
     fn standalone_vm_can_construct_index_errors() {
         let mut vm = VM::new();
         let array = Value::array(vec![Value::Int(1)]);

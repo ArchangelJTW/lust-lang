@@ -236,7 +236,7 @@ impl JitCompiler {
                         )
                     {
                         if let Some(guard) =
-                            self.compile_integer_comparison_guard(op, next, *guard_index as usize)?
+                            self.compile_numeric_comparison_guard(op, next, *guard_index as usize)?
                         {
                             guards.push(guard);
                             *guard_index += 1;
@@ -793,43 +793,48 @@ impl JitCompiler {
         Ok(true)
     }
 
-    fn compile_integer_comparison_guard(
+    fn compile_numeric_comparison_guard(
         &mut self,
         comparison: &TraceOp,
         guard: &TraceOp,
         guard_index: usize,
     ) -> Result<Option<Guard>> {
-        let (condition_register, lhs, rhs, comparison_kind) = match comparison {
+        let (condition_register, lhs, rhs, lhs_type, rhs_type, comparison_kind) = match comparison {
             TraceOp::Lt {
                 dest,
                 lhs,
                 rhs,
-                lhs_type: ValueType::Int,
-                rhs_type: ValueType::Int,
-            } => (*dest, *lhs, *rhs, 0),
+                lhs_type,
+                rhs_type,
+            } => (*dest, *lhs, *rhs, *lhs_type, *rhs_type, 0),
             TraceOp::Le {
                 dest,
                 lhs,
                 rhs,
-                lhs_type: ValueType::Int,
-                rhs_type: ValueType::Int,
-            } => (*dest, *lhs, *rhs, 1),
+                lhs_type,
+                rhs_type,
+            } => (*dest, *lhs, *rhs, *lhs_type, *rhs_type, 1),
             TraceOp::Gt {
                 dest,
                 lhs,
                 rhs,
-                lhs_type: ValueType::Int,
-                rhs_type: ValueType::Int,
-            } => (*dest, *lhs, *rhs, 2),
+                lhs_type,
+                rhs_type,
+            } => (*dest, *lhs, *rhs, *lhs_type, *rhs_type, 2),
             TraceOp::Ge {
                 dest,
                 lhs,
                 rhs,
-                lhs_type: ValueType::Int,
-                rhs_type: ValueType::Int,
-            } => (*dest, *lhs, *rhs, 3),
+                lhs_type,
+                rhs_type,
+            } => (*dest, *lhs, *rhs, *lhs_type, *rhs_type, 3),
             _ => return Ok(None),
         };
+        if !matches!(lhs_type, ValueType::Int | ValueType::Float)
+            || !matches!(rhs_type, ValueType::Int | ValueType::Float)
+        {
+            return Ok(None);
+        }
         let TraceOp::GuardLoopContinue {
             condition_register: guarded_register,
             expect_truthy,
@@ -842,20 +847,34 @@ impl JitCompiler {
             return Ok(None);
         }
 
-        let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-        let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
         let guard_ok = self.ops.new_dynamic_label();
-        dynasm!(self.ops
-            ; mov rax, [r12 + lhs_offset + 8]
-            ; mov rcx, [r12 + rhs_offset + 8]
-            ; cmp rax, rcx
-        );
-        match (comparison_kind, *expect_truthy) {
-            (0, true) | (3, false) => dynasm!(self.ops ; jl =>guard_ok),
-            (1, true) | (2, false) => dynasm!(self.ops ; jle =>guard_ok),
-            (2, true) | (1, false) => dynasm!(self.ops ; jg =>guard_ok),
-            (3, true) | (0, false) => dynasm!(self.ops ; jge =>guard_ok),
-            _ => unreachable!(),
+        if self.load_numeric_comparison_operands(lhs, rhs, lhs_type, rhs_type) {
+            let guard_fail = self.ops.new_dynamic_label();
+            dynasm!(self.ops ; ucomisd xmm0, xmm1);
+            // Every ordered comparison is false for NaN. CF/ZF alone would
+            // incorrectly treat unordered operands as less-than or equal.
+            if *expect_truthy {
+                dynasm!(self.ops ; jp =>guard_fail);
+            } else {
+                dynasm!(self.ops ; jp =>guard_ok);
+            }
+            match (comparison_kind, *expect_truthy) {
+                (0, true) | (3, false) => dynasm!(self.ops ; jb =>guard_ok),
+                (1, true) | (2, false) => dynasm!(self.ops ; jbe =>guard_ok),
+                (2, true) | (1, false) => dynasm!(self.ops ; ja =>guard_ok),
+                (3, true) | (0, false) => dynasm!(self.ops ; jae =>guard_ok),
+                _ => unreachable!(),
+            }
+            dynasm!(self.ops ; =>guard_fail);
+        } else {
+            dynasm!(self.ops ; cmp rax, rcx);
+            match (comparison_kind, *expect_truthy) {
+                (0, true) | (3, false) => dynasm!(self.ops ; jl =>guard_ok),
+                (1, true) | (2, false) => dynasm!(self.ops ; jle =>guard_ok),
+                (2, true) | (1, false) => dynasm!(self.ops ; jg =>guard_ok),
+                (3, true) | (0, false) => dynasm!(self.ops ; jge =>guard_ok),
+                _ => unreachable!(),
+            }
         }
 
         // The interpreter resumes at the branch bytecode, which reads this

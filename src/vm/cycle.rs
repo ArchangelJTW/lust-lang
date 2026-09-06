@@ -3,7 +3,7 @@ use crate::bytecode::{LustMap, Value};
 use crate::vm::task::TaskInstance;
 use crate::vm::{CallFrame, TaskSignal, VM};
 use alloc::rc::{Rc, Weak};
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 use core::cell::RefCell;
 use hashbrown::{hash_map::Entry, HashMap, HashSet};
 
@@ -150,6 +150,29 @@ impl CycleCollector {
     }
 
     fn discover_value(&mut self, value: &Value, scan_existing: bool) {
+        // Leaf values cannot own a cycle. Avoid allocating a traversal stack for
+        // every scalar register write (and every scalar visited in VM roots).
+        match value {
+            Value::Nil
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::String(_)
+            | Value::Function(_)
+            | Value::NativeFunction(_)
+            | Value::WeakStruct(_)
+            | Value::Task(_)
+            | Value::Enum { values: None, .. } => return,
+            Value::Array(_)
+            | Value::Tuple(_)
+            | Value::Map(_)
+            | Value::Struct { .. }
+            | Value::Enum {
+                values: Some(_), ..
+            }
+            | Value::Closure { .. }
+            | Value::Iterator(_) => {}
+        }
         let mut stack = vec![value.clone()];
         let mut visited = HashSet::new();
         while let Some(value) = stack.pop() {
@@ -667,6 +690,48 @@ mod tests {
     use crate::bytecode::value::WeakStructRef;
     use crate::bytecode::{StructLayout, Upvalue, ValueKey};
     use alloc::string::ToString;
+
+    #[test]
+    fn registration_skips_leaves_but_follows_owning_wrappers() {
+        let mut collector = CycleCollector::new();
+        for value in [
+            Value::Nil,
+            Value::Int(1),
+            Value::Float(1.0),
+            Value::Bool(true),
+            Value::string("leaf"),
+            Value::Function(0),
+            Value::enum_unit("Option", "None"),
+        ] {
+            collector.register_value(&value);
+        }
+        assert!(collector.containers.is_empty());
+        assert_eq!(collector.pending_registrations, 0);
+
+        for wrapper in 0..3 {
+            let array = Value::array(Vec::new());
+            array.array_push(array.clone()).unwrap();
+            let weak = match &array {
+                Value::Array(rc) => Rc::downgrade(rc),
+                _ => unreachable!(),
+            };
+            let root = match wrapper {
+                0 => Value::tuple(vec![array]),
+                1 => Value::enum_variant("Option", "Some", vec![array]),
+                _ => Value::Closure {
+                    function_idx: 0,
+                    upvalues: Rc::new(vec![Upvalue::new(array)]),
+                },
+            };
+            collector.register_value(&root);
+            assert_eq!(collector.containers.len(), 1);
+            collector.collect_registered();
+            assert!(weak.upgrade().is_some());
+            drop(root);
+            collector.collect_registered();
+            assert!(weak.upgrade().is_none());
+        }
+    }
 
     #[test]
     fn externally_held_direct_cycle_is_preserved() {

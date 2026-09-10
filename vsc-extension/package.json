@@ -2,7 +2,13 @@
   "name": "lust-analyzer",
   "displayName": "lust-analyzer",
   "description": "Lust language support for Visual Studio Code",
-  "version": "0.0.1",
+  "version": "0.5.1",
+  "publisher": "ArchangelJTW",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ArchangelJTW/lust-lang.git"
+  },
   "engines": {
     "vscode": "^1.105.0"
   },
@@ -23,7 +29,15 @@
         ],
         "extensions": [
           ".lust"
-        ]
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "lust",
+        "scopeName": "source.lust",
+        "path": "./syntaxes/lust.tmLanguage.json"
       }
     ],
     "configuration": {
@@ -32,7 +46,7 @@
         "lustAnalyzer.serverPath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Absolute path to the `lust-analyzer` executable. Leave empty to use a binary in `target/{debug,release}` relative to this extension."
+          "markdownDescription": "Path to the `lust-analyzer` executable. Leave empty to automatically detect from workspace target directories, ~/.cargo/bin, or PATH."
         }
       }
     }

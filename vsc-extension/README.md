@@ -4,8 +4,11 @@ This extension wires the `lust-analyzer` Language Server into Visual Studio Code
 
 ## Features
 
-- Publish compiler/type-checker diagnostics while you type.
-- Understands Lust modules resolved through the standard compiler pipeline.
+- Full syntax highlighting matching the latest Tree-sitter grammar definitions.
+- Automatic bracket matching, comments toggling, and auto-closing pairs.
+- Real-time compiler and type-checker diagnostics as you type via `lust-analyzer`.
+- Go-to-definition, hover documentation, completions, and inlay hints.
+- Automatic detection of `lust-analyzer` in workspace targets, `~/.cargo/bin`, or system `PATH`.
 
 ## Requirements
 

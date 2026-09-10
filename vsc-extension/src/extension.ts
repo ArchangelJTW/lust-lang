@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
 import {
 	LanguageClient,
 	LanguageClientOptions,
@@ -21,7 +22,10 @@ export async function activate(context: vscode.ExtensionContext) {
 	};
 
 	const clientOptions: LanguageClientOptions = {
-		documentSelector: [{ scheme: 'file', language: 'lust' }],
+		documentSelector: [
+			{ scheme: 'file', language: 'lust' },
+			{ scheme: 'untitled', language: 'lust' },
+		],
 		synchronize: {
 			fileEvents: vscode.workspace.createFileSystemWatcher('**/*.lust'),
 		},
@@ -55,15 +59,40 @@ function resolveAnalyzerPath(context: vscode.ExtensionContext): string | undefin
 	const config = vscode.workspace.getConfiguration('lustAnalyzer');
 	const configuredPath = config.get<string>('serverPath')?.trim();
 
-	const candidatePaths: string[] = [];
+	const exeName = process.platform === 'win32' ? 'lust-analyzer.exe' : 'lust-analyzer';
+
 	if (configuredPath) {
-		candidatePaths.push(configuredPath);
+		if (fs.existsSync(configuredPath)) {
+			return configuredPath;
+		}
+		const foundConfiguredInPath = findInPath(configuredPath);
+		if (foundConfiguredInPath) {
+			return foundConfiguredInPath;
+		}
 	}
 
-	const exeName = process.platform === 'win32' ? 'lust-analyzer.exe' : 'lust-analyzer';
-	const debugPath = context.asAbsolutePath(path.join('..', '..', 'target', 'debug', exeName));
-	const releasePath = context.asAbsolutePath(path.join('..', '..', 'target', 'release', exeName));
-	candidatePaths.push(debugPath, releasePath);
+	const candidatePaths: string[] = [];
+
+	// Check open workspace folders (target/release then target/debug)
+	const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
+	for (const folder of workspaceFolders) {
+		candidatePaths.push(
+			path.join(folder.uri.fsPath, 'target', 'release', exeName),
+			path.join(folder.uri.fsPath, 'target', 'debug', exeName),
+		);
+	}
+
+	// Check relative to extension location (target/release then target/debug)
+	candidatePaths.push(
+		context.asAbsolutePath(path.join('..', 'target', 'release', exeName)),
+		context.asAbsolutePath(path.join('..', 'target', 'debug', exeName)),
+		context.asAbsolutePath(path.join('..', '..', 'target', 'release', exeName)),
+		context.asAbsolutePath(path.join('..', '..', 'target', 'debug', exeName)),
+	);
+
+	// Check ~/.cargo/bin
+	const cargoBinPath = path.join(os.homedir(), '.cargo', 'bin', exeName);
+	candidatePaths.push(cargoBinPath);
 
 	const resolved = candidatePaths.find((candidate) => {
 		if (!candidate) {
@@ -80,10 +109,35 @@ function resolveAnalyzerPath(context: vscode.ExtensionContext): string | undefin
 		return resolved;
 	}
 
+	// Check system PATH
+	const pathBinary = findInPath(exeName);
+	if (pathBinary) {
+		return pathBinary;
+	}
+
 	void vscode.window.showErrorMessage(
 		`Could not find lust-analyzer binary. Build the project (cargo build -p lust-analyzer) ` +
 			`or set "lustAnalyzer.serverPath" to the executable.`,
 	);
 
+	return undefined;
+}
+
+function findInPath(exeName: string): string | undefined {
+	const envPath = process.env.PATH || '';
+	const delimiter = path.delimiter;
+	for (const dir of envPath.split(delimiter)) {
+		if (!dir) {
+			continue;
+		}
+		const fullPath = path.join(dir, exeName);
+		try {
+			if (fs.existsSync(fullPath)) {
+				return fullPath;
+			}
+		} catch {
+			// ignore access errors
+		}
+	}
 	return undefined;
 }

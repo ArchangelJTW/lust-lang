@@ -257,4 +257,10 @@ A complete example lives in `examples/c-ffi`.
 The language is still heavily WIP in general, absolute stability is not guaranteed.
 
 # License
-License for the language/interpreter is currently PolyForm Noncommercial License 1.0.0.  Once I am comfortable with the state of the language core it will be moved to MIT/GPLv3 (Undecided).
+
+Lust is dual-licensed under either:
+
+* [MIT License](LICENSE-MIT)
+* [Apache License, Version 2.0](LICENSE-APACHE)
+
+at your option.

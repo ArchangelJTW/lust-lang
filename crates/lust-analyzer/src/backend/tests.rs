@@ -5,7 +5,7 @@ use crate::backend::completions::{
 use crate::analysis::{find_type_for_position, AnalysisSnapshot, ModuleSnapshot};
 use crate::utils::{
     analyzer_lust_config, base_type_name, compute_line_offsets, offset_to_position,
-    span_from_identifier,
+    position_to_offset, span_from_identifier,
 };
 use lust::modules::{LoadedModule, ModuleImports, ModuleLoader, ModuleExports};
 use lust::TypeChecker;
@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower_lsp::lsp_types::{HoverContents, Position};
+use url::Url;
 struct TempDir {
     path: PathBuf,
 }
@@ -1634,3 +1635,630 @@ fn builtin_module_and_instance_completions_match_new_api() {
     assert!(iter_labels.contains(&"next"));
     assert!(iter_labels.contains(&"iter"));
 }
+
+fn create_test_snapshot(
+    tmp: &TempDir,
+    files: &[(&str, &str)],
+) -> (AnalysisSnapshot, HashMap<String, PathBuf>) {
+    let mut path_map = HashMap::new();
+    for (name, source) in files {
+        let p = tmp.path().join(name);
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&p, source.trim_start()).unwrap();
+        path_map.insert(name.to_string(), p);
+    }
+    let entry_path = path_map.get("main.lust").unwrap();
+    let mut loader = ModuleLoader::new(tmp.path());
+    let program = loader
+        .load_program_from_entry(entry_path.to_str().unwrap())
+        .unwrap();
+    let mut imports_map = HashMap::new();
+    for module in &program.modules {
+        imports_map.insert(module.path.clone(), module.imports.clone());
+    }
+    let mut typechecker = new_typechecker();
+    typechecker.set_imports_by_module(imports_map);
+    typechecker.check_program(&program.modules).unwrap();
+    let struct_defs = typechecker.struct_definitions();
+    let enum_defs = typechecker.enum_definitions();
+    let type_info = typechecker.take_type_info();
+    let snapshot = AnalysisSnapshot::new(
+        &program,
+        type_info,
+        &HashMap::new(),
+        struct_defs,
+        enum_defs,
+        HashSet::new(),
+    );
+    (snapshot, path_map)
+}
+
+fn apply_text_edits(text: &str, mut edits: Vec<tower_lsp::lsp_types::TextEdit>) -> String {
+    let mut current = text.to_string();
+    edits.sort_by(|a, b| {
+        b.range
+            .start
+            .line
+            .cmp(&a.range.start.line)
+            .then_with(|| b.range.start.character.cmp(&a.range.start.character))
+    });
+    for edit in edits {
+        let offsets = compute_line_offsets(&current);
+        let start_offset = position_to_offset(&current, edit.range.start, &offsets).unwrap();
+        let end_offset = position_to_offset(&current, edit.range.end, &offsets).unwrap();
+        current.replace_range(start_offset..end_offset, &edit.new_text);
+    }
+    current
+}
+
+#[test]
+fn test_rename_struct_across_usages() {
+    let tmp = TempDir::new();
+    let source = r#"
+struct Point
+    x: int
+    y: int
+end
+
+impl Point
+    function new(x: int, y: int): Point
+        return Point { x = x, y = y }
+    end
+    function get_x(self): int
+        return self.x
+    end
+end
+
+function make_point(): Point
+    local p: Point = Point.new(10, 20)
+    local p2 = Point { x = 30, y = 40 }
+    return p
+end
+"#;
+    let (snapshot, path_map) = create_test_snapshot(&tmp, &[("main.lust", source)]);
+    let main_path = path_map.get("main.lust").unwrap();
+    let text = fs::read_to_string(main_path).unwrap();
+    let line_offsets = compute_line_offsets(&text);
+
+    // Cursor on `struct Point`
+    let point_offset = text.find("struct Point").unwrap() + "struct ".len();
+    let position = offset_to_position(&text, point_offset, &line_offsets);
+
+    // 1. Prepare rename
+    let prep = prepare_rename(&snapshot, main_path, position).expect("prepare rename");
+    match prep {
+        tower_lsp::lsp_types::PrepareRenameResponse::RangeWithPlaceholder {
+            placeholder, ..
+        } => {
+            assert_eq!(placeholder, "Point");
+        }
+        _ => panic!("expected placeholder"),
+    }
+
+    // 2. Rename to Vector2
+    let edit_opt =
+        rename_symbol(&snapshot, main_path, position, "Vector2").expect("rename symbol");
+    let edit = edit_opt.expect("workspace edit");
+    let changes = edit.changes.expect("changes map");
+    let main_url = Url::from_file_path(main_path).unwrap();
+    let edits = changes.get(&main_url).expect("edits for main.lust");
+
+    assert!(
+        edits.len() >= 6,
+        "expected at least 6 edits for Point across its usages, got {}",
+        edits.len()
+    );
+
+    let updated = apply_text_edits(&text, edits.clone());
+    assert!(
+        updated.contains("struct Vector2"),
+        "expected struct Vector2 in updated source:\n{updated}"
+    );
+    assert!(
+        updated.contains("impl Vector2"),
+        "expected impl Vector2 in updated source:\n{updated}"
+    );
+    assert!(
+        updated.contains("function new(x: int, y: int): Vector2"),
+        "expected new return type Vector2 in updated source:\n{updated}"
+    );
+    assert!(
+        updated.contains("return Vector2 { x = x, y = y }"),
+        "expected return Vector2 in updated source:\n{updated}"
+    );
+    assert!(
+        updated.contains("function make_point(): Vector2"),
+        "expected make_point return type Vector2 in updated source:\n{updated}"
+    );
+    assert!(
+        updated.contains("local p: Vector2 = Vector2.new(10, 20)"),
+        "expected local p: Vector2 in updated source:\n{updated}"
+    );
+    assert!(
+        updated.contains("local p2 = Vector2 { x = 30, y = 40 }"),
+        "expected local p2 in updated source:\n{updated}"
+    );
+    assert!(
+        !updated.contains("Point"),
+        "all occurrences of Point should be replaced by Vector2:\n{updated}"
+    );
+}
+
+#[test]
+fn test_rename_struct_cross_file() {
+    let tmp = TempDir::new();
+    let point_source = r#"
+struct Point
+    x: int
+    y: int
+end
+"#;
+    let main_source = r#"
+use lib.point.Point
+
+function test(): Point
+    local p: Point = Point { x = 1, y = 2 }
+    return p
+end
+"#;
+    let (snapshot, path_map) = create_test_snapshot(
+        &tmp,
+        &[
+            ("lib/point.lust", point_source),
+            ("main.lust", main_source),
+        ],
+    );
+    let point_path = path_map.get("lib/point.lust").unwrap();
+    let main_path = path_map.get("main.lust").unwrap();
+
+    let main_text = fs::read_to_string(main_path).unwrap();
+    let main_offsets = compute_line_offsets(&main_text);
+    let offset = main_text.find("Point {").unwrap();
+    let position = offset_to_position(&main_text, offset, &main_offsets);
+
+    let edit = rename_symbol(&snapshot, main_path, position, "Coord")
+        .expect("rename success")
+        .expect("workspace edit");
+    let changes = edit.changes.expect("changes map");
+
+    let point_url = Url::from_file_path(point_path).unwrap();
+    let main_url = Url::from_file_path(main_path).unwrap();
+
+    let point_edits = changes.get(&point_url).expect("edits for lib/point.lust");
+    let main_edits = changes.get(&main_url).expect("edits for main.lust");
+
+    assert!(!point_edits.is_empty(), "lib/point.lust must have edits");
+    assert!(
+        main_edits.len() >= 3,
+        "main.lust must have at least 3 edits, got {}",
+        main_edits.len()
+    );
+
+    let updated_point =
+        apply_text_edits(&fs::read_to_string(point_path).unwrap(), point_edits.clone());
+    let updated_main = apply_text_edits(&main_text, main_edits.clone());
+
+    assert!(
+        updated_point.contains("struct Coord"),
+        "point.lust should have struct Coord:\n{updated_point}"
+    );
+    assert!(
+        updated_main.contains("use lib.point.Coord"),
+        "main.lust should have use lib.point.Coord:\n{updated_main}"
+    );
+    assert!(
+        updated_main.contains("function test(): Coord"),
+        "main.lust should have return type Coord:\n{updated_main}"
+    );
+    assert!(
+        updated_main.contains("Coord { x = 1, y = 2 }"),
+        "main.lust should have Coord literal:\n{updated_main}"
+    );
+}
+
+#[test]
+fn test_rename_field() {
+    let tmp = TempDir::new();
+    let source = r#"
+struct Point
+    x: int
+    y: int
+end
+
+function get_x(p: Point): int
+    local lit = Point { x = 42, y = 0 }
+    return p.x + lit.x
+end
+"#;
+    let (snapshot, path_map) = create_test_snapshot(&tmp, &[("main.lust", source)]);
+    let main_path = path_map.get("main.lust").unwrap();
+    let text = fs::read_to_string(main_path).unwrap();
+    let offsets = compute_line_offsets(&text);
+
+    // Cursor on `p.x`
+    let px_offset = text.find("p.x").unwrap() + "p.".len();
+    let position = offset_to_position(&text, px_offset, &offsets);
+
+    let edit = rename_symbol(&snapshot, main_path, position, "coord_x")
+        .expect("rename success")
+        .expect("workspace edit");
+    let changes = edit.changes.expect("changes map");
+    let main_url = Url::from_file_path(main_path).unwrap();
+    let edits = changes.get(&main_url).expect("edits for main");
+
+    let updated = apply_text_edits(&text, edits.clone());
+    assert!(
+        updated.contains("coord_x: int"),
+        "field definition should be renamed:\n{updated}"
+    );
+    assert!(
+        updated.contains("Point { coord_x = 42, y = 0 }"),
+        "struct literal field should be renamed:\n{updated}"
+    );
+    assert!(
+        updated.contains("return p.coord_x + lit.coord_x"),
+        "field accesses should be renamed:\n{updated}"
+    );
+}
+
+#[test]
+fn test_rename_validation_and_rejections() {
+    let tmp = TempDir::new();
+    let source = r#"
+struct Point
+    x: int
+end
+"#;
+    let (snapshot, path_map) = create_test_snapshot(&tmp, &[("main.lust", source)]);
+    let main_path = path_map.get("main.lust").unwrap();
+    let text = fs::read_to_string(main_path).unwrap();
+    let offsets = compute_line_offsets(&text);
+
+    let point_offset = text.find("Point").unwrap();
+    let position = offset_to_position(&text, point_offset, &offsets);
+
+    // Empty name
+    assert!(rename_symbol(&snapshot, main_path, position, "").is_err());
+    assert!(rename_symbol(&snapshot, main_path, position, "   ").is_err());
+
+    // Keyword name
+    assert!(rename_symbol(&snapshot, main_path, position, "function").is_err());
+    assert!(rename_symbol(&snapshot, main_path, position, "end").is_err());
+
+    // Invalid identifier
+    assert!(rename_symbol(&snapshot, main_path, position, "123bad").is_err());
+    assert!(rename_symbol(&snapshot, main_path, position, "has spaces").is_err());
+
+    // Position outside any symbol
+    let empty_pos = Position::new(0, 0);
+    assert!(rename_symbol(&snapshot, main_path, empty_pos, "ValidName")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn test_find_references_and_highlights() {
+    let tmp = TempDir::new();
+    let source = r#"
+struct Point
+    x: int
+    y: int
+end
+
+function get_x(p: Point): int
+    return p.x
+end
+"#;
+    let (snapshot, path_map) = create_test_snapshot(&tmp, &[("main.lust", source)]);
+    let main_path = path_map.get("main.lust").unwrap();
+    let text = fs::read_to_string(main_path).unwrap();
+    let offsets = compute_line_offsets(&text);
+
+    let offset = text.find("Point").unwrap();
+    let position = offset_to_position(&text, offset, &offsets);
+
+    // References with declaration
+    let refs_with_decl =
+        find_references(&snapshot, main_path, position, true).expect("references with decl");
+    assert!(
+        refs_with_decl.len() >= 2,
+        "expected at least 2 references (def + param), got {}",
+        refs_with_decl.len()
+    );
+
+    // References without declaration
+    let refs_no_decl =
+        find_references(&snapshot, main_path, position, false).expect("references no decl");
+    assert_eq!(
+        refs_no_decl.len(),
+        refs_with_decl.len() - 1,
+        "references without declaration should have 1 less"
+    );
+
+    // Document highlights
+    let highlights =
+        document_highlights(&snapshot, main_path, position).expect("document highlights");
+    assert_eq!(highlights.len(), refs_with_decl.len());
+}
+
+#[test]
+fn test_document_and_workspace_symbols() {
+    let tmp = TempDir::new();
+    let source = r#"
+struct Point
+    x: int
+    y: int
+end
+
+enum Color
+    Red
+    Green
+    Blue
+end
+
+function add(a: int, b: int): int
+    return a + b
+end
+"#;
+    let (snapshot, path_map) = create_test_snapshot(&tmp, &[("main.lust", source)]);
+    let main_path = path_map.get("main.lust").unwrap();
+
+    // Document symbols (outline)
+    let doc_symbols_resp = document_symbols(&snapshot, main_path).expect("document symbols");
+    match doc_symbols_resp {
+        tower_lsp::lsp_types::DocumentSymbolResponse::Nested(syms) => {
+            let names: Vec<_> = syms.iter().map(|s| s.name.as_str()).collect();
+            assert!(names.contains(&"Point"));
+            assert!(names.contains(&"Color"));
+            assert!(names.contains(&"add"));
+
+            let point_sym = syms.iter().find(|s| s.name == "Point").unwrap();
+            let children = point_sym.children.as_ref().unwrap();
+            let child_names: Vec<_> = children.iter().map(|c| c.name.as_str()).collect();
+            assert!(child_names.contains(&"x"));
+            assert!(child_names.contains(&"y"));
+        }
+        _ => panic!("expected nested symbols"),
+    }
+
+    // Workspace symbols
+    let ws_symbols = workspace_symbols(&snapshot, "point");
+    let ws_names: Vec<_> = ws_symbols.iter().map(|s| s.name.as_str()).collect();
+    assert!(ws_names.contains(&"Point"));
+
+    let ws_all = workspace_symbols(&snapshot, "");
+    assert!(ws_all.len() >= 3);
+}
+
+#[test]
+fn test_signature_help() {
+    let tmp = TempDir::new();
+    let source = r#"
+struct Point
+    x: int
+    y: int
+end
+
+impl Point
+    function new(x: int, y: int): Point
+        return Point { x = x, y = y }
+    end
+end
+
+function test(): Point
+    return Point.new(10, 20)
+end
+"#;
+    let (snapshot, path_map) = create_test_snapshot(&tmp, &[("main.lust", source)]);
+    let main_path = path_map.get("main.lust").unwrap();
+    let text = fs::read_to_string(main_path).unwrap();
+    let offsets = compute_line_offsets(&text);
+
+    // Cursor inside `Point.new(10, 20)` after comma
+    let call_offset = text.find("Point.new(10, ").unwrap() + "Point.new(10, ".len();
+    let position = offset_to_position(&text, call_offset, &offsets);
+
+    let sig_help = signature_help(&snapshot, main_path, position, &text).expect("signature help");
+    assert_eq!(sig_help.active_parameter, Some(1));
+    assert_eq!(sig_help.signatures.len(), 1);
+    let sig = &sig_help.signatures[0];
+    assert!(
+        sig.label.contains("fn new(x: int, y: int) -> Point"),
+        "label: {}",
+        sig.label
+    );
+}
+
+#[test]
+fn test_goto_definition_enhanced() {
+    let tmp = TempDir::new();
+    let source = r#"
+struct Point
+    x: int
+    y: int
+end
+
+function calculate(p: Point): int
+    local sum = p.x + p.y
+    return sum
+end
+"#;
+    let (snapshot, path_map) = create_test_snapshot(&tmp, &[("main.lust", source)]);
+    let main_path = path_map.get("main.lust").unwrap();
+    let text = fs::read_to_string(main_path).unwrap();
+    let offsets = compute_line_offsets(&text);
+
+    // 1. Definition of Point from `p: Point`
+    let p_point_offset = text.find(": Point").unwrap() + ": ".len();
+    let pos_point = offset_to_position(&text, p_point_offset, &offsets);
+    let occ = snapshot
+        .find_symbol_at_position(main_path, &pos_point)
+        .expect("symbol at position");
+    let def = snapshot
+        .symbol_definition(&occ.symbol)
+        .expect("definition of Point");
+    assert_eq!(def.file_path, *main_path);
+    // Definition is at `struct Point` (line 0 in trimmed source)
+    assert_eq!(def.range.start.line, 0);
+
+    // 2. Definition of field x from `p.x`
+    let px_offset = text.find("p.x").unwrap() + "p.".len();
+    let pos_px = offset_to_position(&text, px_offset, &offsets);
+    let occ_x = snapshot
+        .find_symbol_at_position(main_path, &pos_px)
+        .expect("symbol at p.x");
+    let def_x = snapshot
+        .symbol_definition(&occ_x.symbol)
+        .expect("definition of x");
+    assert_eq!(def_x.file_path, *main_path);
+    // Field x is defined on line 1 in trimmed source
+    assert_eq!(def_x.range.start.line, 1);
+
+    // 3. Definition of local variable from `return sum`
+    let sum_offset = text.find("return sum").unwrap() + "return ".len();
+    let pos_sum = offset_to_position(&text, sum_offset, &offsets);
+    let occ_sum = snapshot
+        .find_symbol_at_position(main_path, &pos_sum)
+        .expect("symbol at return sum");
+    let def_sum = snapshot
+        .symbol_definition(&occ_sum.symbol)
+        .expect("definition of sum");
+    assert_eq!(def_sum.file_path, *main_path);
+    // local sum is defined on line 6 in trimmed source
+    assert_eq!(def_sum.range.start.line, 6);
+}
+
+#[test]
+fn test_rename_function() {
+    let tmp = TempDir::new();
+    let source = r#"
+function compute_total(a: int, b: int): int
+    return a + b
+end
+
+function main(): int
+    local res = compute_total(10, 20)
+    return compute_total(res, 5)
+end
+"#;
+    let (snapshot, path_map) = create_test_snapshot(&tmp, &[("main.lust", source)]);
+    let main_path = path_map.get("main.lust").unwrap();
+    let text = fs::read_to_string(main_path).unwrap();
+    let offsets = compute_line_offsets(&text);
+
+    let offset = text.find("compute_total").unwrap();
+    let position = offset_to_position(&text, offset, &offsets);
+
+    let edit = rename_symbol(&snapshot, main_path, position, "sum_all")
+        .expect("rename success")
+        .expect("workspace edit");
+    let changes = edit.changes.expect("changes");
+    let edits = changes
+        .get(&Url::from_file_path(main_path).unwrap())
+        .expect("main edits");
+
+    assert_eq!(edits.len(), 3, "expected 3 edits for compute_total");
+    let updated = apply_text_edits(&text, edits.clone());
+    assert!(updated.contains("function sum_all(a: int, b: int): int"));
+    assert!(updated.contains("local res = sum_all(10, 20)"));
+    assert!(updated.contains("return sum_all(res, 5)"));
+    assert!(!updated.contains("compute_total"));
+}
+
+#[test]
+fn test_rename_local_variable() {
+    let tmp = TempDir::new();
+    let source = r#"
+function f1(): int
+    local counter = 0
+    counter = counter + 1
+    return counter
+end
+
+function f2(): int
+    local counter = 99
+    return counter
+end
+"#;
+    let (snapshot, path_map) = create_test_snapshot(&tmp, &[("main.lust", source)]);
+    let main_path = path_map.get("main.lust").unwrap();
+    let text = fs::read_to_string(main_path).unwrap();
+    let offsets = compute_line_offsets(&text);
+
+    // Rename `counter` in f1
+    let f1_counter = text.find("local counter").unwrap() + "local ".len();
+    let position = offset_to_position(&text, f1_counter, &offsets);
+
+    let edit = rename_symbol(&snapshot, main_path, position, "count")
+        .expect("rename success")
+        .expect("workspace edit");
+    let changes = edit.changes.expect("changes");
+    let edits = changes
+        .get(&Url::from_file_path(main_path).unwrap())
+        .expect("main edits");
+
+    assert_eq!(edits.len(), 4, "expected 4 edits for f1's counter");
+    let updated = apply_text_edits(&text, edits.clone());
+    assert!(updated.contains("local count = 0"));
+    assert!(updated.contains("count = count + 1"));
+    assert!(updated.contains("return count"));
+    // f2's counter should remain untouched!
+    assert!(updated.contains("local counter = 99"));
+    assert!(updated.contains("return counter"));
+}
+
+#[test]
+fn test_rename_enum_and_variant() {
+    let tmp = TempDir::new();
+    let source = r#"
+enum Status
+    Active
+    Inactive
+end
+
+function check(s: Status): bool
+    local current = Status.Active
+    return true
+end
+"#;
+    let (snapshot, path_map) = create_test_snapshot(&tmp, &[("main.lust", source)]);
+    let main_path = path_map.get("main.lust").unwrap();
+    let text = fs::read_to_string(main_path).unwrap();
+    let offsets = compute_line_offsets(&text);
+
+    // 1. Rename Enum `Status` -> `State`
+    let status_offset = text.find("Status").unwrap();
+    let status_pos = offset_to_position(&text, status_offset, &offsets);
+    let edit_enum = rename_symbol(&snapshot, main_path, status_pos, "State")
+        .expect("rename enum success")
+        .expect("workspace edit");
+    let edits_enum = edit_enum
+        .changes
+        .unwrap()
+        .get(&Url::from_file_path(main_path).unwrap())
+        .unwrap()
+        .clone();
+    let updated_enum = apply_text_edits(&text, edits_enum);
+    assert!(updated_enum.contains("enum State"));
+    assert!(updated_enum.contains("function check(s: State)"));
+    assert!(updated_enum.contains("Status.Active") || updated_enum.contains("State.Active"));
+
+    // 2. Rename Variant `Active` -> `Running`
+    let active_offset = text.find("Active").unwrap();
+    let active_pos = offset_to_position(&text, active_offset, &offsets);
+    let edit_var = rename_symbol(&snapshot, main_path, active_pos, "Running")
+        .expect("rename variant success")
+        .expect("workspace edit");
+    let edits_var = edit_var
+        .changes
+        .unwrap()
+        .get(&Url::from_file_path(main_path).unwrap())
+        .unwrap()
+        .clone();
+    let updated_var = apply_text_edits(&text, edits_var);
+    assert!(updated_var.contains("Running"));
+}
+
+

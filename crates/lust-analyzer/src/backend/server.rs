@@ -21,13 +21,17 @@ use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionOptions, CompletionParams, CompletionResponse, CompletionTriggerKind,
-    Diagnostic, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, InlayHint,
-    InlayHintOptions, InlayHintParams, InlayHintServerCapabilities, MarkupContent, MarkupKind,
-    MessageType, OneOf, SemanticToken, SemanticTokens, SemanticTokensFullOptions,
+    Diagnostic, DocumentHighlight, DocumentHighlightParams, DocumentSymbolParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    InlayHint, InlayHintOptions, InlayHintParams, InlayHintServerCapabilities, Location,
+    MarkupContent, MarkupKind, MessageType, OneOf, PrepareRenameResponse, ReferenceParams,
+    RenameOptions, RenameParams, SemanticToken, SemanticTokens, SemanticTokensFullOptions,
     SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, SemanticTokensRangeParams,
     SemanticTokensRangeResult, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    SymbolInformation, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, WorkspaceEdit, WorkspaceSymbolParams,
 };
 use tower_lsp::{async_trait, Client, LanguageServer, LspService, Server};
 use url::Url;
@@ -40,8 +44,13 @@ use super::completions::{
     resolve_base_type_name_for_context, resolve_type_candidates, static_method_completions,
     struct_field_completions, CompletionKind,
 };
+use super::highlights::document_highlights;
 use super::hover::hover_for_method_call;
 use super::inlay_hints::collect_inlay_hints_for_module;
+use super::references::find_references;
+use super::rename::{prepare_rename, rename_symbol};
+use super::signature_help::signature_help;
+use super::symbols::{document_symbols, workspace_symbols};
 
 #[derive(Clone)]
 struct DocumentState {
@@ -379,6 +388,19 @@ impl LanguageServer for Backend {
         };
         let hover_provider = Some(HoverProviderCapability::Simple(true));
         let definition_provider = Some(OneOf::Left(true));
+        let references_provider = Some(OneOf::Left(true));
+        let rename_provider = Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        }));
+        let document_highlight_provider = Some(OneOf::Left(true));
+        let document_symbol_provider = Some(OneOf::Left(true));
+        let workspace_symbol_provider = Some(OneOf::Left(true));
+        let signature_help_provider = Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: None,
+            work_done_progress_options: Default::default(),
+        });
         let inlay_hint_provider = Some(OneOf::Right(InlayHintServerCapabilities::Options(
             InlayHintOptions::default(),
         )));
@@ -403,6 +425,12 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(text_document_sync)),
                 hover_provider,
                 definition_provider,
+                references_provider,
+                rename_provider,
+                document_highlight_provider,
+                document_symbol_provider,
+                workspace_symbol_provider,
+                signature_help_provider,
                 completion_provider,
                 inlay_hint_provider,
                 semantic_tokens_provider,
@@ -789,6 +817,35 @@ impl LanguageServer for Backend {
             Ok(path) => path,
             Err(_) => return Ok(None),
         };
+
+        let symbol_def_location = {
+            let analysis = self.analysis.read().await;
+            if let Some(snapshot) = analysis.as_ref() {
+                if let Some(occ) = snapshot.find_symbol_at_position(&file_path, &position) {
+                    if let Some(def) = snapshot.symbol_definition(&occ.symbol) {
+                        if let Ok(uri) = Url::from_file_path(&def.file_path) {
+                            Some(Location {
+                                uri,
+                                range: def.range,
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(location) = symbol_def_location {
+            return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+        }
+
         let text = self.document_text(&uri).await;
         let word = text
             .as_ref()
@@ -830,6 +887,122 @@ impl LanguageServer for Backend {
         }
 
         Ok(None)
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let file_path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let analysis = self.analysis.read().await;
+        let Some(snapshot) = analysis.as_ref() else {
+            return Ok(None);
+        };
+        let locs = find_references(
+            snapshot,
+            &file_path,
+            position,
+            params.context.include_declaration,
+        );
+        Ok(locs)
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let uri = params.text_document.uri;
+        let position = params.position;
+        let file_path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let analysis = self.analysis.read().await;
+        let Some(snapshot) = analysis.as_ref() else {
+            return Ok(None);
+        };
+        Ok(prepare_rename(snapshot, &file_path, position))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let file_path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let analysis = self.analysis.read().await;
+        let Some(snapshot) = analysis.as_ref() else {
+            return Ok(None);
+        };
+        match rename_symbol(snapshot, &file_path, position, &params.new_name) {
+            Ok(edit) => Ok(edit),
+            Err(err) => Err(tower_lsp::jsonrpc::Error::invalid_params(err)),
+        }
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let file_path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let analysis = self.analysis.read().await;
+        let Some(snapshot) = analysis.as_ref() else {
+            return Ok(None);
+        };
+        Ok(document_highlights(snapshot, &file_path, position))
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let uri = params.text_document.uri;
+        let file_path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let analysis = self.analysis.read().await;
+        let Some(snapshot) = analysis.as_ref() else {
+            return Ok(None);
+        };
+        Ok(document_symbols(snapshot, &file_path))
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let analysis = self.analysis.read().await;
+        let Some(snapshot) = analysis.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(workspace_symbols(snapshot, &params.query)))
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let file_path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let text = match self.document_text(&uri).await {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let analysis = self.analysis.read().await;
+        let Some(snapshot) = analysis.as_ref() else {
+            return Ok(None);
+        };
+        Ok(signature_help(snapshot, &file_path, position, &text))
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {

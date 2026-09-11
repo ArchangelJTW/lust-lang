@@ -466,6 +466,132 @@ pub(crate) fn span_for_identifier(
     ))
 }
 
+pub(crate) fn is_reserved_keyword(name: &str) -> bool {
+    lust::lexer::TokenKind::keyword(name).is_some() || matches!(name, "nil" | "self")
+}
+
+pub(crate) fn is_valid_identifier_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+pub(crate) fn range_contains_position(range: &Range, position: &Position) -> bool {
+    if position.line < range.start.line || position.line > range.end.line {
+        return false;
+    }
+    if range.start.line == range.end.line {
+        position.character >= range.start.character && position.character <= range.end.character
+    } else if position.line == range.start.line {
+        position.character >= range.start.character
+    } else if position.line == range.end.line {
+        position.character <= range.end.character
+    } else {
+        true
+    }
+}
+
+pub(crate) fn find_exact_identifier_in_line(
+    line_text: &str,
+    line_idx: usize,
+    name: &str,
+    start_char_hint: usize,
+) -> Option<(Span, Range)> {
+    if name.is_empty() {
+        return None;
+    }
+    let name_len = name.chars().count();
+    let chars: Vec<char> = line_text.chars().collect();
+    if chars.len() < name_len {
+        return None;
+    }
+    let search_offsets = if start_char_hint < chars.len() {
+        vec![start_char_hint, 0]
+    } else {
+        vec![0]
+    };
+    for search_start in search_offsets {
+        let mut i = search_start;
+        while i + name_len <= chars.len() {
+            let matches = chars[i..i + name_len]
+                .iter()
+                .zip(name.chars())
+                .all(|(a, b)| *a == b);
+            if matches {
+                let prev_ok = i == 0 || !is_identifier_char(chars[i - 1]);
+                let next_ok =
+                    i + name_len >= chars.len() || !is_identifier_char(chars[i + name_len]);
+                if prev_ok && next_ok {
+                    let span = Span::new(line_idx + 1, i + 1, line_idx + 1, i + name_len);
+                    let range = Range {
+                        start: Position::new(line_idx as u32, i as u32),
+                        end: Position::new(line_idx as u32, (i + name_len) as u32),
+                    };
+                    return Some((span, range));
+                }
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+pub(crate) fn find_identifier_in_source(
+    text: &str,
+    line_offsets: &[usize],
+    line_idx: usize,
+    name: &str,
+    start_char_hint: usize,
+) -> Option<(Span, Range)> {
+    if line_idx >= line_offsets.len() {
+        return None;
+    }
+    let line_start = line_offsets[line_idx];
+    let line_end = line_offsets
+        .get(line_idx + 1)
+        .copied()
+        .unwrap_or(text.len());
+    let mut line_text = &text[line_start..line_end];
+    if let Some(stripped) = line_text.strip_suffix('\n') {
+        line_text = stripped;
+    }
+    if let Some(stripped) = line_text.strip_suffix('\r') {
+        line_text = stripped;
+    }
+    find_exact_identifier_in_line(line_text, line_idx, name, start_char_hint)
+}
+
+pub(crate) fn find_identifier_in_span(
+    text: &str,
+    line_offsets: &[usize],
+    span: Span,
+    name: &str,
+) -> Option<(Span, Range)> {
+    if span.start_line == 0 {
+        return None;
+    }
+    let start_line_idx = span.start_line.saturating_sub(1);
+    let end_line_idx = span.end_line.saturating_sub(1);
+    let start_col = span.start_col.saturating_sub(1);
+    for line_idx in start_line_idx..=end_line_idx {
+        let hint = if line_idx == start_line_idx {
+            start_col
+        } else {
+            0
+        };
+        if let Some(res) = find_identifier_in_source(text, line_offsets, line_idx, name, hint) {
+            return Some(res);
+        }
+    }
+    None
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn analyzer_lust_config() -> LustConfig {
     let mut config = LustConfig::default();

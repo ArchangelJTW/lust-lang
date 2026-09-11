@@ -1,7 +1,12 @@
 mod completions;
+mod highlights;
 mod hover;
 mod inlay_hints;
+mod references;
+mod rename;
 mod server;
+mod signature_help;
+mod symbols;
 
 pub use server::run;
 
@@ -14,7 +19,17 @@ pub(crate) use completions::{
     CompletionKind,
 };
 #[cfg(test)]
+pub(crate) use highlights::*;
+#[cfg(test)]
 pub(crate) use hover::*;
+#[cfg(test)]
+pub(crate) use references::*;
+#[cfg(test)]
+pub(crate) use rename::*;
+#[cfg(test)]
+pub(crate) use signature_help::*;
+#[cfg(test)]
+pub(crate) use symbols::*;
 
 #[cfg(test)]
 mod tests {

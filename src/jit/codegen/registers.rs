@@ -37,7 +37,7 @@ impl JitCompiler {
         let scalar_max_tag = ValueTag::Float.as_u8() as i8;
         match discriminant {
             1 => {
-                extern "C" {
+                unsafe extern "C" {
                     fn jit_replace_bool(dest: *mut Value, value: u8) -> u8;
                 }
                 dynasm!(self.ops
@@ -55,7 +55,7 @@ impl JitCompiler {
                 );
             }
             2 => {
-                extern "C" {
+                unsafe extern "C" {
                     fn jit_replace_int(dest: *mut Value, value: crate::number::LustInt) -> u8;
                 }
                 dynasm!(self.ops
@@ -93,7 +93,7 @@ impl JitCompiler {
             return;
         }
         let scalar_max_tag = ValueTag::Float.as_u8() as i8;
-        extern "C" {
+        unsafe extern "C" {
             fn jit_replace_float_bits(dest: *mut Value, bits: u64) -> u8;
         }
         dynasm!(self.ops

@@ -118,25 +118,33 @@ fn make_async_waker(flag: &Arc<WakeFlag>) -> Waker {
 }
 
 unsafe fn async_waker_clone(ptr: *const ()) -> RawWaker {
-    let arc = Arc::<WakeFlag>::from_raw(ptr as *const WakeFlag);
-    let cloned = arc.clone();
-    std::mem::forget(arc);
-    RawWaker::new(Arc::into_raw(cloned) as *const (), &ASYNC_WAKER_VTABLE)
+    unsafe {
+        let arc = Arc::<WakeFlag>::from_raw(ptr as *const WakeFlag);
+        let cloned = arc.clone();
+        std::mem::forget(arc);
+        RawWaker::new(Arc::into_raw(cloned) as *const (), &ASYNC_WAKER_VTABLE)
+    }
 }
 
 unsafe fn async_waker_wake(ptr: *const ()) {
-    let arc = Arc::<WakeFlag>::from_raw(ptr as *const WakeFlag);
-    arc.wake();
+    unsafe {
+        let arc = Arc::<WakeFlag>::from_raw(ptr as *const WakeFlag);
+        arc.wake();
+    }
 }
 
 unsafe fn async_waker_wake_by_ref(ptr: *const ()) {
-    let arc = Arc::<WakeFlag>::from_raw(ptr as *const WakeFlag);
-    arc.wake();
-    std::mem::forget(arc);
+    unsafe {
+        let arc = Arc::<WakeFlag>::from_raw(ptr as *const WakeFlag);
+        arc.wake();
+        std::mem::forget(arc);
+    }
 }
 
 unsafe fn async_waker_drop(ptr: *const ()) {
-    let _ = Arc::<WakeFlag>::from_raw(ptr as *const WakeFlag);
+    unsafe {
+        let _ = Arc::<WakeFlag>::from_raw(ptr as *const WakeFlag);
+    }
 }
 
 static ASYNC_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(

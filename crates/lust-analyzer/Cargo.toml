@@ -11,15 +11,15 @@ description = "A WIP implementation of the language server protocol (LSP) for th
 homepage = "https://lust-lang.dev/"
 
 [dependencies]
-tokio = { version = "1.48.0", features = [
+tokio = { version = "1.53.1", features = [
   "macros",
   "rt-multi-thread",
   "io-std",
 ] }
 tower-lsp = "0.20.0"
-url = "2.5.7"
-lust = { path = "../..", version = "3.5.1", package = "lust-rs" }
-hashbrown = { version = "0.16.0", default-features = false, features = [
+url = "2.5.8"
+lust = { path = "../..", version = "3.5.2", package = "lust-rs" }
+hashbrown = { version = "0.17.1", default-features = false, features = [
   "default-hasher",
   "equivalent",
 ] }

@@ -34,14 +34,13 @@ impl TypeChecker {
             }
         }
 
-        if expr.span.start_line > 0 && !self.low_memory_mode {
-            if let Some(module) = &self.current_module {
+        if expr.span.start_line > 0 && !self.low_memory_mode
+            && let Some(module) = &self.current_module {
                 self.expr_types_by_module
                     .entry(module.clone())
                     .or_default()
                     .insert(expr.span, ty.clone());
             }
-        }
 
         Ok(ty)
     }
@@ -284,8 +283,8 @@ impl TypeChecker {
                                 Self::dummy_span(),
                             ));
                         }
-                    } else if enum_name == "Result" {
-                        if let (Some(ok_type), Some(err_type)) =
+                    } else if enum_name == "Result"
+                        && let (Some(ok_type), Some(err_type)) =
                             (type_params.get("T"), type_params.get("E"))
                         {
                             return Ok(Type::new(
@@ -296,7 +295,6 @@ impl TypeChecker {
                                 Self::dummy_span(),
                             ));
                         }
-                    }
                 } else {
                     if !args.is_empty() {
                         return Err(self.type_error(format!(

@@ -239,8 +239,8 @@ impl VM {
                     layout: layout.clone(),
                 },
             );
-            if let Some(simple) = name.rsplit('.').next() {
-                if simple != "IndexError" || name == "IndexError" {
+            if let Some(simple) = name.rsplit('.').next()
+                && (simple != "IndexError" || name == "IndexError") {
                     self.struct_metadata.insert(
                         simple.to_string(),
                         RuntimeStructInfo {
@@ -248,7 +248,6 @@ impl VM {
                         },
                     );
                 }
-            }
         }
     }
 
@@ -338,7 +337,7 @@ impl VM {
                 .field_names()
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, name)| (!filled[idx]).then(|| (**name).clone()))
+                .filter(|&(idx, _name)| !filled[idx]).map(|(_idx, name)| (**name).clone())
                 .collect();
             return Err(LustError::RuntimeError {
                 message: format!(

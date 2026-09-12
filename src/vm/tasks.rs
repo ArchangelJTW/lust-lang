@@ -387,9 +387,7 @@ impl VM {
         };
         task.reset();
         self.task_manager.insert(task);
-        if let Err(err) = self.run_task_internal(task_id, None) {
-            return Err(err);
-        }
+        self.run_task_internal(task_id, None)?;
 
         Ok(())
     }
@@ -492,8 +490,7 @@ impl VM {
         if let Value::Enum {
             enum_name, variant, ..
         } = object
-        {
-            if enum_name == "LuaValue" && variant == "Userdata" {
+            && enum_name == "LuaValue" && variant == "Userdata" {
                 if let Some(result) =
                     self.try_call_lua_dynamic_method(object, method_name, &args)?
                 {
@@ -510,30 +507,24 @@ impl VM {
                     );
                 }
             }
-        }
 
-        if let Value::Struct { name, .. } = object {
-            if name == "LuaTable" {
-                if let Some(result) =
+        if let Value::Struct { name, .. } = object
+            && name == "LuaTable"
+                && let Some(result) =
                     self.try_call_lua_dynamic_method(object, method_name, &args)?
                 {
                     return Ok(result);
                 }
-            }
-        }
 
         if let Value::Enum {
             enum_name,
             variant,
             values,
         } = object
-        {
-            if enum_name == "LuaValue" && variant == "Table" {
-                if let Some(inner) = values.as_ref().and_then(|vals| vals.get(0)) {
+            && enum_name == "LuaValue" && variant == "Table"
+                && let Some(inner) = values.as_ref().and_then(|vals| vals.first()) {
                     return self.call_builtin_method(inner, method_name, args);
                 }
-            }
-        }
 
         let object_type_name = match object {
             Value::Struct { name, .. } => Some(name.as_str()),
@@ -549,7 +540,7 @@ impl VM {
             }
 
             let mut candidate_names = vec![mangled_name.clone()];
-            if let Some(simple) = struct_name.rsplit(|c| c == '.' || c == ':').next() {
+            if let Some(simple) = struct_name.rsplit(['.', ':']).next() {
                 candidate_names.push(format!("{}:{}", simple, method_name));
             }
 
@@ -664,7 +655,7 @@ impl VM {
                             let raw = super::corelib::unwrap_lua_value(val.clone());
                             pieces.push(format!("{}", raw));
                         }
-                        Ok(Value::string(pieces.join(&sep)))
+                        Ok(Value::string(pieces.join(sep)))
                     }
                     #[cfg(feature = "std")]
                     "unpack" => {
@@ -716,11 +707,10 @@ impl VM {
                         let map = map_rc.borrow();
                         let mut max_idx: LustInt = 0;
                         for key in map.keys() {
-                            if let Value::Int(i) = key.to_value() {
-                                if i > max_idx && i > 0 {
+                            if let Value::Int(i) = key.to_value()
+                                && i > max_idx && i > 0 {
                                     max_idx = i;
                                 }
-                            }
                         }
                         Ok(Value::Int(max_idx))
                     }
@@ -935,11 +925,10 @@ impl VM {
             return Ok(Value::Nil);
         }
 
-        if let Some(direct) = self.lua_direct_index(receiver, key) {
-            if !matches!(direct, Value::Nil) {
+        if let Some(direct) = self.lua_direct_index(receiver, key)
+            && !matches!(direct, Value::Nil) {
                 return Ok(direct);
             }
-        }
 
         let Some(indexer) = self.lua_index_metamethod(receiver) else {
             return Ok(Value::Nil);
@@ -973,13 +962,10 @@ impl VM {
             variant,
             values,
         } = receiver
-        {
-            if enum_name == "LuaValue" && variant == "Table" {
-                if let Some(inner) = values.as_ref().and_then(|vals| vals.get(0)) {
+            && enum_name == "LuaValue" && variant == "Table"
+                && let Some(inner) = values.as_ref().and_then(|vals| vals.first()) {
                     return self.lua_direct_index(inner, key);
                 }
-            }
-        }
 
         match receiver {
             Value::Struct { name, .. } if name == "LuaTable" => {
@@ -988,14 +974,14 @@ impl VM {
                 };
                 let raw_key = super::corelib::unwrap_lua_value(key.clone());
                 let lookup_key = ValueKey::from_value(&raw_key);
-                let value = map_rc.borrow().get(&lookup_key).cloned();
-                value
+                
+                map_rc.borrow().get(&lookup_key).cloned()
             }
             Value::Map(map_rc) => {
                 let raw_key = super::corelib::unwrap_lua_value(key.clone());
                 let lookup_key = ValueKey::from_value(&raw_key);
-                let value = map_rc.borrow().get(&lookup_key).cloned();
-                value
+                
+                map_rc.borrow().get(&lookup_key).cloned()
             }
             _ => None,
         }
@@ -1008,16 +994,14 @@ impl VM {
             values,
         } = receiver
         {
-            if enum_name == "LuaValue" && variant == "Table" {
-                if let Some(inner) = values.as_ref().and_then(|vals| vals.get(0)) {
+            if enum_name == "LuaValue" && variant == "Table"
+                && let Some(inner) = values.as_ref().and_then(|vals| vals.first()) {
                     return self.lua_index_metamethod(inner);
                 }
-            }
-            if enum_name == "LuaValue" && variant == "Userdata" {
-                if let Some(inner) = values.as_ref().and_then(|vals| vals.get(0)) {
+            if enum_name == "LuaValue" && variant == "Userdata"
+                && let Some(inner) = values.as_ref().and_then(|vals| vals.first()) {
                     return self.lua_index_metamethod(inner);
                 }
-            }
         }
 
         let Value::Struct { name, .. } = receiver else {
@@ -1029,11 +1013,11 @@ impl VM {
         if name != "LuaTable" && name != "LuaUserdata" {
             return None;
         }
-        let value = meta_rc
+        
+        meta_rc
             .borrow()
             .get(&ValueKey::string("__index".to_string()))
-            .cloned();
-        value
+            .cloned()
     }
 }
 

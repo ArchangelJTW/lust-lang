@@ -56,16 +56,15 @@ impl TypeChecker {
                     ),
                     TypeKind::Union(types) => {
                         for ty in types.iter() {
-                            if let TypeKind::Named(name) = &ty.kind {
-                                if let Some(_) = {
+                            if let TypeKind::Named(name) = &ty.kind
+                                && {
                                     let key = self.resolve_type_key(name);
                                     self.env
                                         .lookup_enum(&key)
                                         .or_else(|| self.env.lookup_enum(name))
-                                } {
+                                }.is_some() {
                                     return Ok(());
                                 }
-                            }
 
                             if matches!(ty.kind, TypeKind::Option(_) | TypeKind::Result(_, _)) {
                                 return Ok(());
@@ -117,7 +116,7 @@ impl TypeChecker {
                     for (binding, field_type) in bindings.iter().zip(variant_fields.iter()) {
                         let bind_type = if let Some(ref types) = variant_types {
                             if let TypeKind::Generic(_) = &field_type.kind {
-                                types.get(0).cloned().unwrap_or_else(|| field_type.clone())
+                                types.first().cloned().unwrap_or_else(|| field_type.clone())
                             } else {
                                 self.substitute_type(field_type, &type_bindings)
                             }
@@ -149,8 +148,8 @@ impl TypeChecker {
                 expr: scrutinee,
                 check_type: target_type,
             } => {
-                if let ExprKind::Identifier(var_name) = &scrutinee.kind {
-                    if let Some(current_type) = self.env.lookup_variable(var_name) {
+                if let ExprKind::Identifier(var_name) = &scrutinee.kind
+                    && let Some(current_type) = self.env.lookup_variable(var_name) {
                         let narrowed_type = if let TypeKind::Named(name) = &target_type.kind {
                             let resolved = self.resolve_type_key(name);
                             if self.env.lookup_trait(&resolved).is_some() {
@@ -178,16 +177,15 @@ impl TypeChecker {
                             _ => {}
                         }
                     }
-                }
             }
 
             ExprKind::IsPattern {
                 expr: scrutinee,
                 pattern,
             } => {
-                if let Pattern::TypeCheck(target_type) = pattern {
-                    if let ExprKind::Identifier(var_name) = &scrutinee.kind {
-                        if let Some(current_type) = self.env.lookup_variable(var_name) {
+                if let Pattern::TypeCheck(target_type) = pattern
+                    && let ExprKind::Identifier(var_name) = &scrutinee.kind
+                        && let Some(current_type) = self.env.lookup_variable(var_name) {
                             match &current_type.kind {
                                 TypeKind::Unknown => {
                                     narrowings.push((var_name.clone(), target_type.clone()));
@@ -206,8 +204,6 @@ impl TypeChecker {
                                 _ => {}
                             }
                         }
-                    }
-                }
             }
 
             ExprKind::Binary { left, op, right } => {
@@ -353,14 +349,14 @@ impl TypeChecker {
                                 .and_then(|types| match type_name.as_str() {
                                     "Option" => {
                                         if variant == "Some" {
-                                            types.get(0).cloned()
+                                            types.first().cloned()
                                         } else {
                                             None
                                         }
                                     }
 
                                     "Result" => match variant.as_str() {
-                                        "Ok" => types.get(0).cloned(),
+                                        "Ok" => types.first().cloned(),
                                         "Err" => types.get(1).cloned(),
                                         _ => types.get(i).cloned(),
                                     },

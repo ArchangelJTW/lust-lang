@@ -228,14 +228,12 @@ impl JitCompiler {
                 if let TraceOp::GuardLoopContinue {
                     condition_register, ..
                 } = next
-                {
-                    if self.scalar_registers.contains_key(condition_register)
+                    && self.scalar_registers.contains_key(condition_register)
                         && Self::register_overwritten_before_read(
                             &ops[op_index + 2..],
                             *condition_register,
                         )
-                    {
-                        if let Some(guard) =
+                        && let Some(guard) =
                             self.compile_numeric_comparison_guard(op, next, *guard_index as usize)?
                         {
                             guards.push(guard);
@@ -243,14 +241,11 @@ impl JitCompiler {
                             skip_next = true;
                             continue;
                         }
-                    }
-                }
                 if let TraceOp::LoadConst {
                     dest: constant_register,
                     ..
                 } = op
-                {
-                    if self.scalar_registers.contains_key(constant_register)
+                    && self.scalar_registers.contains_key(constant_register)
                         && Self::register_overwritten_before_read(
                             &ops[op_index + 2..],
                             *constant_register,
@@ -261,7 +256,6 @@ impl JitCompiler {
                         skip_next = true;
                         continue;
                     }
-                }
             }
             match op {
                 TraceOp::LoadConst { dest, value } => {

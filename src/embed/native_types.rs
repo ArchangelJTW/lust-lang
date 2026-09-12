@@ -725,12 +725,11 @@ fn format_trait_method(method: &TraitMethod) -> String {
             .join(", "),
     );
     out.push(')');
-    if let Some(ret) = &method.return_type {
-        if !matches!(ret.kind, TypeKind::Unit) {
+    if let Some(ret) = &method.return_type
+        && !matches!(ret.kind, TypeKind::Unit) {
             out.push_str(": ");
             out.push_str(&format_type(ret));
         }
-    }
     out
 }
 

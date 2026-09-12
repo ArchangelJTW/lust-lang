@@ -12,7 +12,7 @@ impl Compiler {
             bound_vars.insert(param_name.clone());
         }
 
-        self.find_free_vars_in_expr(expr, &mut free_vars, &mut bound_vars);
+        self.find_free_vars_in_expr(expr, &mut free_vars, &bound_vars);
         let mut captured_vars = Vec::new();
         for var in free_vars {
             if self.resolve_local(&var).is_ok() {

@@ -186,14 +186,13 @@ impl TypeChecker {
                 }
             }
 
-            if binding.span.start_line > 0 && !self.low_memory_mode {
-                if let Some(module) = &self.current_module {
+            if binding.span.start_line > 0 && !self.low_memory_mode
+                && let Some(module) = &self.current_module {
                     self.variable_types_by_module
                         .entry(module.clone())
                         .or_default()
                         .insert(binding.span, var_type.clone());
                 }
-            }
 
             self.env.declare_variable(binding.name.clone(), var_type)?;
         }
@@ -265,8 +264,8 @@ impl TypeChecker {
             } else {
                 expanded_types[index].clone()
             };
-            if let ExprKind::FieldAccess { object, field } = &target.kind {
-                if let Some(inner_type) = self.weak_field_target_type(object, field)? {
+            if let ExprKind::FieldAccess { object, field } = &target.kind
+                && let Some(inner_type) = self.weak_field_target_type(object, field)? {
                     match self.unify(&target_type, &value_type) {
                         Ok(_) => continue,
                         Err(err) => {
@@ -278,23 +277,20 @@ impl TypeChecker {
                         }
                     }
                 }
-            }
 
-            if let TypeKind::Option(inner) = &target_type.kind {
-                if !matches!(value_type.kind, TypeKind::Option(_))
+            if let TypeKind::Option(inner) = &target_type.kind
+                && !matches!(value_type.kind, TypeKind::Option(_))
                     && self.types_compatible(inner, &value_type)
                 {
                     self.unify(inner, &value_type)?;
                     continue;
                 }
-            }
 
-            if let TypeKind::Named(name) = &target_type.kind {
-                if name == "LuaValue" {
+            if let TypeKind::Named(name) = &target_type.kind
+                && name == "LuaValue" {
                     // LuaValue can hold any primitive; allow without tightening types here.
                     continue;
                 }
-            }
 
             self.unify(&target_type, &value_type)?;
         }
@@ -440,8 +436,8 @@ impl TypeChecker {
                 expr: scrutinee,
                 check_type: target_type,
             } => {
-                if let ExprKind::Identifier(var_name) = &scrutinee.kind {
-                    if let Some(current_type) = self.env.lookup_variable(var_name) {
+                if let ExprKind::Identifier(var_name) = &scrutinee.kind
+                    && let Some(current_type) = self.env.lookup_variable(var_name) {
                         let narrowed_type = if let TypeKind::Named(name) = &target_type.kind {
                             let resolved_trait = self.resolve_type_key(name);
                             if self.env.lookup_trait(&resolved_trait).is_some() {
@@ -469,16 +465,15 @@ impl TypeChecker {
                             _ => {}
                         }
                     }
-                }
             }
 
             ExprKind::IsPattern {
                 expr: scrutinee,
                 pattern,
             } => {
-                if let Pattern::TypeCheck(target_type) = pattern {
-                    if let ExprKind::Identifier(var_name) = &scrutinee.kind {
-                        if let Some(current_type) = self.env.lookup_variable(var_name) {
+                if let Pattern::TypeCheck(target_type) = pattern
+                    && let ExprKind::Identifier(var_name) = &scrutinee.kind
+                        && let Some(current_type) = self.env.lookup_variable(var_name) {
                             let narrowed_type = if let TypeKind::Named(name) = &target_type.kind {
                                 let resolved_trait = self.resolve_type_key(name);
                                 if self.env.lookup_trait(&resolved_trait).is_some() {
@@ -507,8 +502,6 @@ impl TypeChecker {
                                 _ => {}
                             }
                         }
-                    }
-                }
             }
 
             ExprKind::Binary { left, op, right } => {
@@ -792,13 +785,11 @@ impl TypeChecker {
             Some(def) => def,
             None => return Ok(None),
         };
-        if let Some(field) = struct_def.fields.iter().find(|f| f.name == *field_name) {
-            if matches!(field.ownership, FieldOwnership::Weak) {
-                if let Some(inner) = &field.weak_target {
+        if let Some(field) = struct_def.fields.iter().find(|f| f.name == *field_name)
+            && matches!(field.ownership, FieldOwnership::Weak)
+                && let Some(inner) = &field.weak_target {
                     return Ok(Some(self.substitute_type(inner, &type_bindings)));
                 }
-            }
-        }
 
         Ok(None)
     }

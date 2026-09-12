@@ -1,8 +1,8 @@
 use super::*;
 impl Compiler {
-    pub(super) fn direct_is_pattern<'a>(
-        expr: &'a Expr,
-    ) -> Option<(&'a Expr, &'a crate::ast::Pattern)> {
+    pub(super) fn direct_is_pattern(
+        expr: &Expr,
+    ) -> Option<(&Expr, &crate::ast::Pattern)> {
         match &expr.kind {
             ExprKind::IsPattern { expr, pattern } => Some((expr, pattern)),
             ExprKind::Paren(inner) => Self::direct_is_pattern(inner),

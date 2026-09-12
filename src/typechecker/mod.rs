@@ -50,6 +50,12 @@ struct ShortCircuitInfo {
     option_inner: Option<Type>,
 }
 
+impl Default for TypeChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TypeChecker {
     pub fn new() -> Self {
         Self::with_config(&LustConfig::default())
@@ -213,13 +219,12 @@ impl TypeChecker {
                         if let Some(cycle) = dfs(neighbor, graph, visited, on_stack, stack) {
                             return Some(cycle);
                         }
-                    } else if on_stack.contains(neighbor) {
-                        if let Some(pos) = stack.iter().position(|n| n == neighbor) {
+                    } else if on_stack.contains(neighbor)
+                        && let Some(pos) = stack.iter().position(|n| n == neighbor) {
                             let mut cycle = stack[pos..].to_vec();
                             cycle.push(neighbor.clone());
                             return Some(cycle);
                         }
-                    }
                 }
             }
 
@@ -232,8 +237,8 @@ impl TypeChecker {
         let mut on_stack: HashSet<String> = HashSet::new();
         let mut stack: Vec<String> = Vec::new();
         for name in struct_defs.keys() {
-            if !visited.contains(name) {
-                if let Some(cycle) = dfs(name, &graph, &mut visited, &mut on_stack, &mut stack) {
+            if !visited.contains(name)
+                && let Some(cycle) = dfs(name, &graph, &mut visited, &mut on_stack, &mut stack) {
                     let contains_weak = cycle
                         .iter()
                         .any(|node| struct_has_weak.get(node).copied().unwrap_or(false));
@@ -248,7 +253,6 @@ impl TypeChecker {
                     //     description
                     // )));
                 }
-            }
         }
 
         Ok(())
@@ -371,11 +375,10 @@ impl TypeChecker {
 
             if let Some(module) = parent_module {
                 for candidate in candidates {
-                    if let Some((candidate_module, _)) = candidate.rsplit_once('.') {
-                        if candidate_module == module {
+                    if let Some((candidate_module, _)) = candidate.rsplit_once('.')
+                        && candidate_module == module {
                             return Some(candidate.clone());
                         }
-                    }
                 }
             }
         }
@@ -452,8 +455,8 @@ impl TypeChecker {
         };
         let init_name = format!("__init@{}", module);
         for item in items {
-            if let ItemKind::Function(func) = &item.kind {
-                if func.name == init_name {
+            if let ItemKind::Function(func) = &item.kind
+                && func.name == init_name {
                     for stmt in &func.body {
                         if let StmtKind::Local {
                             bindings,
@@ -467,7 +470,6 @@ impl TypeChecker {
                         }
                     }
                 }
-            }
         }
 
         Ok(())
@@ -479,11 +481,10 @@ impl TypeChecker {
         }
 
         if let Some(module) = &self.current_module {
-            if let Some(imports) = self.imports_by_module.get(module) {
-                if let Some(fq) = imports.function_aliases.get(name) {
+            if let Some(imports) = self.imports_by_module.get(module)
+                && let Some(fq) = imports.function_aliases.get(name) {
                     return fq.clone();
                 }
-            }
 
             let qualified = format!("{}.{}", module, name);
             if self.env.lookup_function(&qualified).is_some() {
@@ -506,11 +507,10 @@ impl TypeChecker {
         }
 
         if let Some(module) = &self.current_module {
-            if let Some(imports) = self.imports_by_module.get(module) {
-                if let Some(fq) = imports.function_aliases.get(name) {
+            if let Some(imports) = self.imports_by_module.get(module)
+                && let Some(fq) = imports.function_aliases.get(name) {
                     return fq.clone();
                 }
-            }
 
             return format!("{}.{}", module, name);
         }
@@ -519,13 +519,11 @@ impl TypeChecker {
     }
 
     pub fn resolve_module_alias(&self, alias: &str) -> Option<String> {
-        if let Some(module) = &self.current_module {
-            if let Some(imports) = self.imports_by_module.get(module) {
-                if let Some(m) = imports.module_aliases.get(alias) {
+        if let Some(module) = &self.current_module
+            && let Some(imports) = self.imports_by_module.get(module)
+                && let Some(m) = imports.module_aliases.get(alias) {
                     return Some(m.clone());
                 }
-            }
-        }
 
         None
     }
@@ -767,17 +765,15 @@ impl TypeChecker {
 
     pub fn resolve_type_key(&self, name: &str) -> String {
         if let Some((head, tail)) = name.split_once('.') {
-            if let Some(module) = &self.current_module {
-                if let Some(imports) = self.imports_by_module.get(module) {
-                    if let Some(real_module) = imports.module_aliases.get(head) {
+            if let Some(module) = &self.current_module
+                && let Some(imports) = self.imports_by_module.get(module)
+                    && let Some(real_module) = imports.module_aliases.get(head) {
                         if tail.is_empty() {
                             return real_module.clone();
                         } else {
                             return format!("{}.{}", real_module, tail);
                         }
                     }
-                }
-            }
 
             return name.to_string();
         }
@@ -794,11 +790,10 @@ impl TypeChecker {
         }
 
         if let Some(module) = &self.current_module {
-            if let Some(imports) = self.imports_by_module.get(module) {
-                if let Some(fq) = imports.type_aliases.get(name) {
+            if let Some(imports) = self.imports_by_module.get(module)
+                && let Some(fq) = imports.type_aliases.get(name) {
                     return fq.clone();
                 }
-            }
 
             return format!("{}.{}", module, name);
         }
@@ -810,11 +805,10 @@ impl TypeChecker {
         match &item.kind {
             ItemKind::Struct(s) => {
                 let mut s2 = s.clone();
-                if let Some(module) = &self.current_module {
-                    if !s2.name.contains('.') {
+                if let Some(module) = &self.current_module
+                    && !s2.name.contains('.') {
                         s2.name = format!("{}.{}", module, s2.name);
                     }
-                }
 
                 self.push_type_params(&s2.type_params)?;
                 for field in &mut s2.fields {
@@ -831,11 +825,10 @@ impl TypeChecker {
 
             ItemKind::Enum(e) => {
                 let mut e2 = e.clone();
-                if let Some(module) = &self.current_module {
-                    if !e2.name.contains('.') {
+                if let Some(module) = &self.current_module
+                    && !e2.name.contains('.') {
                         e2.name = format!("{}.{}", module, e2.name);
                     }
-                }
 
                 self.push_type_params(&e2.type_params)?;
                 for variant in &mut e2.variants {
@@ -853,11 +846,10 @@ impl TypeChecker {
 
             ItemKind::Trait(t) => {
                 let mut t2 = t.clone();
-                if let Some(module) = &self.current_module {
-                    if !t2.name.contains('.') {
+                if let Some(module) = &self.current_module
+                    && !t2.name.contains('.') {
                         t2.name = format!("{}.{}", module, t2.name);
                     }
-                }
 
                 self.push_type_params(&t2.type_params)?;
                 for method in &mut t2.methods {
@@ -1061,15 +1053,14 @@ impl TypeChecker {
         type_params: &[String],
         bindings: &mut HashMap<String, Type>,
     ) -> Result<()> {
-        if let TypeKind::Generic(name) = &expected.kind {
-            if type_params.iter().any(|param| param == name) {
+        if let TypeKind::Generic(name) = &expected.kind
+            && type_params.iter().any(|param| param == name) {
                 if let Some(bound) = bindings.get(name) {
                     return self.unify(bound, actual);
                 }
                 bindings.insert(name.clone(), self.canonicalize_type(actual));
                 return Ok(());
             }
-        }
 
         match (&expected.kind, &actual.kind) {
             (TypeKind::Array(expected), TypeKind::Array(actual))
@@ -1753,12 +1744,8 @@ impl TypeChecker {
             _ => {}
         }
 
-        match (&expected.kind, &actual.kind) {
-            (TypeKind::Map(k1, v1), TypeKind::Map(k2, v2)) => {
-                return self.types_compatible(k1, k2) && self.types_compatible(v1, v2);
-            }
-
-            _ => {}
+        if let (TypeKind::Map(k1, v1), TypeKind::Map(k2, v2)) = (&expected.kind, &actual.kind) {
+            return self.types_compatible(k1, k2) && self.types_compatible(v1, v2);
         }
 
         match (&expected.kind, &actual.kind) {
@@ -1791,8 +1778,7 @@ impl TypeChecker {
             _ => {}
         }
 
-        match (&expected.kind, &actual.kind) {
-            (
+        if let (
                 TypeKind::Function {
                     params: p1,
                     return_type: r1,
@@ -1801,21 +1787,18 @@ impl TypeChecker {
                     params: p2,
                     return_type: r2,
                 },
-            ) => {
-                if p1.len() != p2.len() {
-                    return false;
-                }
-
-                for (t1, t2) in p1.iter().zip(p2.iter()) {
-                    if !self.types_compatible(t1, t2) {
-                        return false;
-                    }
-                }
-
-                return self.types_compatible(r1, r2);
+            ) = (&expected.kind, &actual.kind) {
+            if p1.len() != p2.len() {
+                return false;
             }
 
-            _ => {}
+            for (t1, t2) in p1.iter().zip(p2.iter()) {
+                if !self.types_compatible(t1, t2) {
+                    return false;
+                }
+            }
+
+            return self.types_compatible(r1, r2);
         }
 
         self.types_equal(expected, actual)
@@ -1876,15 +1859,12 @@ impl TypeChecker {
 
     fn short_circuit_profile(&self, expr: &Expr, ty: &Type) -> ShortCircuitInfo {
         let module_key = self
-            .current_module
-            .as_ref()
-            .map(String::as_str)
+            .current_module.as_deref()
             .unwrap_or("");
-        if let Some(module_map) = self.short_circuit_info.get(module_key) {
-            if let Some(info) = module_map.get(&expr.span) {
+        if let Some(module_map) = self.short_circuit_info.get(module_key)
+            && let Some(info) = module_map.get(&expr.span) {
                 return info.clone();
             }
-        }
 
         ShortCircuitInfo {
             truthy: if self.type_can_be_truthy(ty) {
@@ -1906,11 +1886,10 @@ impl TypeChecker {
 
     fn clear_option_for_span(&mut self, span: Span) {
         let module_key = self.current_module_key();
-        if let Some(module_map) = self.short_circuit_info.get_mut(&module_key) {
-            if let Some(info) = module_map.get_mut(&span) {
+        if let Some(module_map) = self.short_circuit_info.get_mut(&module_key)
+            && let Some(info) = module_map.get_mut(&span) {
                 info.option_inner = None;
             }
-        }
     }
 
     fn type_can_be_truthy(&self, ty: &Type) -> bool {

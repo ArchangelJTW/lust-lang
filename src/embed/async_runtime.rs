@@ -171,6 +171,12 @@ impl<Args, R> Clone for AsyncTaskQueue<Args, R> {
     }
 }
 
+impl<Args, R> Default for AsyncTaskQueue<Args, R> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<Args, R> AsyncTaskQueue<Args, R> {
     pub fn new() -> Self {
         Self {

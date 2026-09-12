@@ -42,13 +42,11 @@ impl Compiler {
                 }
 
                 let mut lookup_name = name.clone();
-                if let Some(module) = &self.current_module {
-                    if let Some(imports) = self.imports_by_module.get(module) {
-                        if let Some(fq) = imports.function_aliases.get(name) {
+                if let Some(module) = &self.current_module
+                    && let Some(imports) = self.imports_by_module.get(module)
+                        && let Some(fq) = imports.function_aliases.get(name) {
                             lookup_name = fq.clone();
                         }
-                    }
-                }
 
                 if let Some(&func_idx) = self.function_table.get(&lookup_name) {
                     let reg = self.allocate_register();
@@ -140,13 +138,13 @@ impl Compiler {
             }
 
             ExprKind::Call { callee, args, .. } => {
-                if let ExprKind::FieldAccess { object, field } = &callee.kind {
-                    if let ExprKind::Identifier(type_name) = &object.kind {
+                if let ExprKind::FieldAccess { object, field } = &callee.kind
+                    && let ExprKind::Identifier(type_name) = &object.kind {
                         let is_module_alias = self
                             .current_module
                             .as_ref()
                             .and_then(|module| self.imports_by_module.get(module))
-                            .map_or(false, |imports| {
+                            .is_some_and(|imports| {
                                 imports.module_aliases.contains_key(type_name)
                                     && !self.is_module_level_identifier(type_name)
                             });
@@ -157,13 +155,11 @@ impl Compiler {
                         if treat_as_static_dispatch {
                             let mut candidates = Vec::new();
                             let mut alias_candidate = format!("{}.{}", type_name, field);
-                            if let Some(module) = &self.current_module {
-                                if let Some(imports) = self.imports_by_module.get(module) {
-                                    if let Some(real_mod) = imports.module_aliases.get(type_name) {
+                            if let Some(module) = &self.current_module
+                                && let Some(imports) = self.imports_by_module.get(module)
+                                    && let Some(real_mod) = imports.module_aliases.get(type_name) {
                                         alias_candidate = format!("{}.{}", real_mod, field);
                                     }
-                                }
-                            }
 
                             candidates.push(alias_candidate.clone());
                             let resolved_type = self.resolve_type_name(type_name);
@@ -259,7 +255,6 @@ impl Compiler {
                             }
                         }
                     }
-                }
 
                 let first_arg_reg = if args.is_empty() {
                     0
@@ -294,8 +289,8 @@ impl Compiler {
                     while let ExprKind::Paren(inner) = &index_expr.kind {
                         index_expr = inner;
                     }
-                    if self.is_checked_array_index(index_expr.span) {
-                        if let ExprKind::Index { object, index } = &index_expr.kind {
+                    if self.is_checked_array_index(index_expr.span)
+                        && let ExprKind::Index { object, index } = &index_expr.kind {
                             let obj_reg = self.compile_expr(object)?;
                             let idx_reg = self.compile_expr(index)?;
                             let result_reg = self.allocate_register();
@@ -304,7 +299,6 @@ impl Compiler {
                             self.free_register(idx_reg);
                             return Ok(result_reg);
                         }
-                    }
                 }
 
                 match method.as_str() {
@@ -355,8 +349,8 @@ impl Compiler {
             }
 
             ExprKind::FieldAccess { object, field } => {
-                if let ExprKind::Identifier(enum_name) = &object.kind {
-                    if Self::looks_like_type_name(enum_name)
+                if let ExprKind::Identifier(enum_name) = &object.kind
+                    && Self::looks_like_type_name(enum_name)
                         && self.resolve_local(enum_name).is_err()
                     {
                         let resolved_enum = self.resolve_type_name(enum_name);
@@ -369,7 +363,6 @@ impl Compiler {
                         );
                         return Ok(result_reg);
                     }
-                }
 
                 let obj_reg = self.compile_expr(object)?;
                 let field_idx = self.add_string_constant(field);
@@ -503,12 +496,12 @@ impl Compiler {
                 return_type,
                 body,
             } => {
-                let captured_vars = self.analyze_free_variables(body, &params)?;
+                let captured_vars = self.analyze_free_variables(body, params)?;
                 let lambda_func_idx = self.functions.len();
                 let lambda_name = format!("<lambda@{}>", lambda_func_idx);
                 let lambda_func = self.new_function(&lambda_name, params.len() as u8, false);
                 self.functions.push(lambda_func);
-                self.try_set_lambda_signature(lambda_func_idx, &params, &return_type);
+                self.try_set_lambda_signature(lambda_func_idx, params, return_type);
                 let saved_func_idx = self.current_function;
                 let saved_scopes = self.scopes.clone();
                 let saved_next_reg = self.next_register;
@@ -593,15 +586,15 @@ impl Compiler {
                 };
                 let is_likely_variant = if !is_trait {
                     if let crate::ast::TypeKind::Named(name) = &check_type.kind {
-                        name.chars().next().map_or(false, |c| c.is_uppercase())
+                        name.chars().next().is_some_and(|c| c.is_uppercase())
                     } else {
                         false
                     }
                 } else {
                     false
                 };
-                if is_likely_variant {
-                    if let crate::ast::TypeKind::Named(variant_name) = &check_type.kind {
+                if is_likely_variant
+                    && let crate::ast::TypeKind::Named(variant_name) = &check_type.kind {
                         let enum_name_idx = self.add_string_constant("");
                         let variant_idx = self.add_string_constant(variant_name);
                         let result_reg = self.allocate_register();
@@ -617,7 +610,6 @@ impl Compiler {
                         self.free_register(value_reg);
                         return Ok(result_reg);
                     }
-                }
 
                 let type_string = match &check_type.kind {
                     crate::ast::TypeKind::Named(name)

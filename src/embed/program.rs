@@ -378,7 +378,7 @@ impl EmbeddedProgram {
     }
 
     fn simple_name(name: &str) -> &str {
-        name.rsplit(|c| c == '.' || c == ':').next().unwrap_or(name)
+        name.rsplit(['.', ':']).next().unwrap_or(name)
     }
 
     fn register_native_with_aliases<F>(&mut self, requested_name: &str, canonical: String, func: F)
@@ -616,7 +616,7 @@ impl EmbeddedProgram {
         let registry = self.async_registry.clone();
         let name_string = name.into();
         let handler = move |values: &[Value]| -> std::result::Result<NativeCallResult, String> {
-            let args: Vec<Value> = values.iter().cloned().collect();
+            let args: Vec<Value> = values.to_vec();
             let future: AsyncValueFuture = Box::pin(func(args));
             VM::with_current(|vm| {
                 let handle = vm
@@ -660,7 +660,7 @@ impl EmbeddedProgram {
         ensure_return_type::<R>(name, &signature.return_type)?;
         let return_type = signature.return_type.clone();
         self.vm
-            .record_exported_native(native_export_from_signature(&canonical, &signature));
+            .record_exported_native(native_export_from_signature(&canonical, signature));
         let native_name = name.to_string();
         let handler = move |values: &[Value]| -> std::result::Result<NativeCallResult, String> {
             let args = Args::from_values(values)?;
@@ -923,15 +923,14 @@ impl EmbeddedProgram {
 
             if let Some((target, expected_type, mut outcome)) = completion {
                 self.async_registry.borrow_mut().pending.remove(&id);
-                if let (Some(expected), Ok(value)) = (&expected_type, &outcome) {
-                    if !self.vm.value_matches_type(value, expected) {
+                if let (Some(expected), Ok(value)) = (&expected_type, &outcome)
+                    && !self.vm.value_matches_type(value, expected) {
                         outcome = Err(format!(
                             "Async native must return {}, got {:?}",
                             expected,
                             value.type_of()
                         ));
                     }
-                }
                 match target {
                     AsyncTaskTarget::ScriptTask(handle) => match outcome {
                         Ok(value) => {
@@ -1007,8 +1006,8 @@ fn compile_in_memory(
     let mut init_funcs: Vec<(String, String)> = Vec::new();
     let mut wrapped_items: Vec<Item> = Vec::new();
     for module in program.modules {
-        if module.path != program_entry_module {
-            if let Some(ref init) = module.init_function {
+        if module.path != program_entry_module
+            && let Some(ref init) = module.init_function {
                 let init_name = module
                     .imports
                     .function_aliases
@@ -1017,7 +1016,6 @@ fn compile_in_memory(
                     .unwrap_or_else(|| init.clone());
                 init_funcs.push((module.path.clone(), init_name));
             }
-        }
         wrapped_items.push(Item::new(
             ItemKind::Module {
                 name: module.path,

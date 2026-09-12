@@ -31,8 +31,8 @@ impl TypeChecker {
                 None
             }
         });
-        if let Some(expected_elem) = expected_elem_type {
-            if let TypeKind::Union(union_types) = &expected_elem.kind {
+        if let Some(expected_elem) = expected_elem_type
+            && let TypeKind::Union(union_types) = &expected_elem.kind {
                 for elem in elements {
                     let elem_type = self.check_expr(elem)?;
                     let mut matches = false;
@@ -58,7 +58,6 @@ impl TypeChecker {
 
                 return Ok(expected_type.unwrap().clone());
             }
-        }
 
         if let Some(expected_elem) = expected_elem_type {
             if matches!(expected_elem.kind, TypeKind::Unknown) {
@@ -69,8 +68,8 @@ impl TypeChecker {
                 return Ok(expected_type.unwrap().clone());
             }
 
-            if let TypeKind::Option(inner) = &expected_elem.kind {
-                if matches!(inner.kind, TypeKind::Unknown) {
+            if let TypeKind::Option(inner) = &expected_elem.kind
+                && matches!(inner.kind, TypeKind::Unknown) {
                     for elem in elements {
                         let elem_type = self.check_expr_with_hint(elem, Some(expected_elem))?;
                         let is_option = matches!(&elem_type.kind, TypeKind::Option(_))
@@ -85,11 +84,10 @@ impl TypeChecker {
 
                     return Ok(expected_type.unwrap().clone());
                 }
-            }
 
-            if let TypeKind::Result(ok_inner, err_inner) = &expected_elem.kind {
-                if matches!(ok_inner.kind, TypeKind::Unknown)
-                    || matches!(err_inner.kind, TypeKind::Unknown)
+            if let TypeKind::Result(ok_inner, err_inner) = &expected_elem.kind
+                && (matches!(ok_inner.kind, TypeKind::Unknown)
+                    || matches!(err_inner.kind, TypeKind::Unknown))
                 {
                     for elem in elements {
                         let elem_type = self.check_expr_with_hint(elem, Some(expected_elem))?;
@@ -105,7 +103,6 @@ impl TypeChecker {
 
                     return Ok(expected_type.unwrap().clone());
                 }
-            }
         }
 
         if let Some(expected_elem) = expected_elem_type {
@@ -137,21 +134,19 @@ impl TypeChecker {
         let mut expected_value_ty: Option<&Type> = None;
         let mut allow_mixed_keys = false;
         let mut allow_mixed_values = false;
-        if let Some(expected) = expected_type {
-            if let TypeKind::Map(key, value) = &expected.kind {
+        if let Some(expected) = expected_type
+            && let TypeKind::Map(key, value) = &expected.kind {
                 expected_key_ty = Some(key.as_ref());
                 expected_value_ty = Some(value.as_ref());
                 allow_mixed_keys = matches!(key.kind, TypeKind::Unknown | TypeKind::Infer);
                 allow_mixed_values = matches!(value.kind, TypeKind::Unknown | TypeKind::Infer);
             }
-        }
 
         if entries.is_empty() {
-            if let Some(expected) = expected_type {
-                if let TypeKind::Map(_, _) = &expected.kind {
+            if let Some(expected) = expected_type
+                && let TypeKind::Map(_, _) = &expected.kind {
                     return Ok(self.canonicalize_type(expected));
                 }
-            }
 
             let span = Self::dummy_span();
             return Ok(Type::new(
@@ -163,20 +158,8 @@ impl TypeChecker {
             ));
         }
 
-        let key_hint = expected_key_ty.and_then(|ty| {
-            if matches!(ty.kind, TypeKind::Unknown | TypeKind::Infer) {
-                None
-            } else {
-                Some(ty)
-            }
-        });
-        let value_hint = expected_value_ty.and_then(|ty| {
-            if matches!(ty.kind, TypeKind::Unknown | TypeKind::Infer) {
-                None
-            } else {
-                Some(ty)
-            }
-        });
+        let key_hint = expected_key_ty.filter(|&ty| !matches!(ty.kind, TypeKind::Unknown | TypeKind::Infer));
+        let value_hint = expected_value_ty.filter(|&ty| !matches!(ty.kind, TypeKind::Unknown | TypeKind::Infer));
 
         let mut inferred_key_type: Option<Type> = None;
         let mut inferred_value_type: Option<Type> = None;
@@ -222,8 +205,7 @@ impl TypeChecker {
         let key_type = if let Some(expected) = key_hint {
             self.canonicalize_type(expected)
         } else if allow_mixed_keys {
-            expected_key_ty
-                .and_then(|ty| Some(self.canonicalize_type(ty)))
+            expected_key_ty.map(|ty| self.canonicalize_type(ty))
                 .unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
         } else {
             inferred_key_type.unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
@@ -231,8 +213,7 @@ impl TypeChecker {
         let value_type = if let Some(expected) = value_hint {
             self.canonicalize_type(expected)
         } else if allow_mixed_values {
-            expected_value_ty
-                .and_then(|ty| Some(self.canonicalize_type(ty)))
+            expected_value_ty.map(|ty| self.canonicalize_type(ty))
                 .unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
         } else {
             inferred_value_type.unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
@@ -279,14 +260,12 @@ impl TypeChecker {
                 },
             ..
         }) = expected_type
-        {
-            if expected_name == &struct_def.name && type_args.len() == struct_def.type_params.len()
+            && expected_name == &struct_def.name && type_args.len() == struct_def.type_params.len()
             {
                 for (param, arg) in struct_def.type_params.iter().zip(type_args) {
                     type_bindings.insert(param.clone(), arg.clone());
                 }
             }
-        }
 
         for field in fields {
             let expected_type = struct_def

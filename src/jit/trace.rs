@@ -461,7 +461,7 @@ impl TraceRecorder {
         registers: &[Value],
         function: &crate::bytecode::Function,
     ) {
-        crate::jit::log(|| format!("🔍 JIT: Scanning trace inputs for specialization..."));
+        crate::jit::log(|| "🔍 JIT: Scanning trace inputs for specialization...".to_string());
 
         // Only slots below `register_count` belong to this frame.  Everything
         // above is stale data left by previously executed frames, and a leftover
@@ -879,7 +879,7 @@ impl TraceRecorder {
                 None
             };
 
-        owner.map_or(true, |owner| self.disable_unused_specialization(owner))
+        owner.is_none_or(|owner| self.disable_unused_specialization(owner))
     }
 
     fn should_inline(&self, function_idx: usize, callee_fn: &crate::bytecode::Function) -> bool {
@@ -1327,25 +1327,23 @@ impl TraceRecorder {
             }
 
             Instruction::Concat(dest, lhs, rhs) => {
-                if let Some(ty) = Self::get_value_type(&registers[lhs as usize]) {
-                    if !self.is_guarded(lhs) {
+                if let Some(ty) = Self::get_value_type(&registers[lhs as usize])
+                    && !self.is_guarded(lhs) {
                         self.push_op(TraceOp::Guard {
                             register: lhs,
                             expected_type: ty,
                         });
                         self.mark_guarded(lhs);
                     }
-                }
 
-                if let Some(ty) = Self::get_value_type(&registers[rhs as usize]) {
-                    if !self.is_guarded(rhs) {
+                if let Some(ty) = Self::get_value_type(&registers[rhs as usize])
+                    && !self.is_guarded(rhs) {
                         self.push_op(TraceOp::Guard {
                             register: rhs,
                             expected_type: ty,
                         });
                         self.mark_guarded(rhs);
                     }
-                }
 
                 self.push_op(TraceOp::Concat { dest, lhs, rhs });
                 Ok(())
@@ -1359,25 +1357,23 @@ impl TraceRecorder {
                             .to_string(),
                     });
                 }
-                if let Some(ty) = Self::get_value_type(&registers[array as usize]) {
-                    if !self.is_guarded(array) {
+                if let Some(ty) = Self::get_value_type(&registers[array as usize])
+                    && !self.is_guarded(array) {
                         self.push_op(TraceOp::Guard {
                             register: array,
                             expected_type: ty,
                         });
                         self.mark_guarded(array);
                     }
-                }
 
-                if let Some(ty) = Self::get_value_type(&registers[index as usize]) {
-                    if !self.is_guarded(index) {
+                if let Some(ty) = Self::get_value_type(&registers[index as usize])
+                    && !self.is_guarded(index) {
                         self.push_op(TraceOp::Guard {
                             register: index,
                             expected_type: ty,
                         });
                         self.mark_guarded(index);
                     }
-                }
 
                 self.push_op(TraceOp::GetIndex { dest, array, index });
                 Ok(())
@@ -1399,40 +1395,37 @@ impl TraceRecorder {
                             .to_string(),
                     });
                 }
-                if let Some(ty) = Self::get_value_type(&registers[array as usize]) {
-                    if !self.is_guarded(array) {
+                if let Some(ty) = Self::get_value_type(&registers[array as usize])
+                    && !self.is_guarded(array) {
                         self.push_op(TraceOp::Guard {
                             register: array,
                             expected_type: ty,
                         });
                         self.mark_guarded(array);
                     }
-                }
 
-                if let Some(ty) = Self::get_value_type(&registers[index as usize]) {
-                    if !self.is_guarded(index) {
+                if let Some(ty) = Self::get_value_type(&registers[index as usize])
+                    && !self.is_guarded(index) {
                         self.push_op(TraceOp::Guard {
                             register: index,
                             expected_type: ty,
                         });
                         self.mark_guarded(index);
                     }
-                }
 
                 self.push_op(TraceOp::TryGetIndex { dest, array, index });
                 Ok(())
             }
 
             Instruction::ArrayLen(dest, array) => {
-                if let Some(ty) = Self::get_value_type(&registers[array as usize]) {
-                    if !self.is_guarded(array) {
+                if let Some(ty) = Self::get_value_type(&registers[array as usize])
+                    && !self.is_guarded(array) {
                         self.push_op(TraceOp::Guard {
                             register: array,
                             expected_type: ty,
                         });
                         self.mark_guarded(array);
                     }
-                }
 
                 self.push_op(TraceOp::ArrayLen { dest, array });
                 self.mark_guarded(dest);
@@ -1463,15 +1456,14 @@ impl TraceRecorder {
 
                             // Guard the argument
                             let value_reg = first_arg;
-                            if let Some(ty) = Self::get_value_type(&registers[value_reg as usize]) {
-                                if !self.is_guarded(value_reg) {
+                            if let Some(ty) = Self::get_value_type(&registers[value_reg as usize])
+                                && !self.is_guarded(value_reg) {
                                     self.push_op(TraceOp::Guard {
                                         register: value_reg,
                                         expected_type: ty,
                                     });
                                     self.mark_guarded(value_reg);
                                 }
-                            }
 
                             // Emit specialized push operation
                             self.push_op(TraceOp::SpecializedOp {
@@ -1518,27 +1510,25 @@ impl TraceRecorder {
                 }
 
                 // Normal (non-specialized) method call
-                if let Some(ty) = Self::get_value_type(&registers[obj_reg as usize]) {
-                    if !self.is_guarded(obj_reg) {
+                if let Some(ty) = Self::get_value_type(&registers[obj_reg as usize])
+                    && !self.is_guarded(obj_reg) {
                         self.push_op(TraceOp::Guard {
                             register: obj_reg,
                             expected_type: ty,
                         });
                         self.mark_guarded(obj_reg);
                     }
-                }
 
                 for i in 0..arg_count {
                     let arg_reg = first_arg + i;
-                    if let Some(ty) = Self::get_value_type(&registers[arg_reg as usize]) {
-                        if !self.is_guarded(arg_reg) {
+                    if let Some(ty) = Self::get_value_type(&registers[arg_reg as usize])
+                        && !self.is_guarded(arg_reg) {
                             self.push_op(TraceOp::Guard {
                                 register: arg_reg,
                                 expected_type: ty,
                             });
                             self.mark_guarded(arg_reg);
                         }
-                    }
                 }
 
                 // Only receivers that `call_builtin_method_simple` can actually
@@ -1599,15 +1589,14 @@ impl TraceRecorder {
 
                     _ => (None, false),
                 };
-                if let Some(ty) = Self::get_value_type(&registers[obj_reg as usize]) {
-                    if !self.is_guarded(obj_reg) {
+                if let Some(ty) = Self::get_value_type(&registers[obj_reg as usize])
+                    && !self.is_guarded(obj_reg) {
                         self.push_op(TraceOp::Guard {
                             register: obj_reg,
                             expected_type: ty,
                         });
                         self.mark_guarded(obj_reg);
                     }
-                }
 
                 let value_type = Self::get_value_type(&registers[dest as usize]);
                 self.push_op(TraceOp::GetField {
@@ -1635,26 +1624,24 @@ impl TraceRecorder {
 
                     _ => (None, false),
                 };
-                if let Some(ty) = Self::get_value_type(&registers[obj_reg as usize]) {
-                    if !self.is_guarded(obj_reg) {
+                if let Some(ty) = Self::get_value_type(&registers[obj_reg as usize])
+                    && !self.is_guarded(obj_reg) {
                         self.push_op(TraceOp::Guard {
                             register: obj_reg,
                             expected_type: ty,
                         });
                         self.mark_guarded(obj_reg);
                     }
-                }
 
                 let value_type = Self::get_value_type(&registers[value_reg as usize]);
-                if let Some(ty) = value_type {
-                    if !self.is_guarded(value_reg) {
+                if let Some(ty) = value_type
+                    && !self.is_guarded(value_reg) {
                         self.push_op(TraceOp::Guard {
                             register: value_reg,
                             expected_type: ty,
                         });
                         self.mark_guarded(value_reg);
                     }
-                }
 
                 self.rebox_specialized_register(value_reg, "SetField");
 
@@ -1694,15 +1681,14 @@ impl TraceRecorder {
                 for i in 0..field_count {
                     let field_reg = first_field_reg + i;
                     field_registers.push(field_reg);
-                    if let Some(ty) = Self::get_value_type(&registers[field_reg as usize]) {
-                        if !self.is_guarded(field_reg) {
+                    if let Some(ty) = Self::get_value_type(&registers[field_reg as usize])
+                        && !self.is_guarded(field_reg) {
                             self.push_op(TraceOp::Guard {
                                 register: field_reg,
                                 expected_type: ty,
                             });
                             self.mark_guarded(field_reg);
                         }
-                    }
                 }
 
                 for &field_reg in &field_registers {
@@ -1868,8 +1854,8 @@ impl TraceRecorder {
                         }
 
                         let mut did_inline = false;
-                        if let Some(callee_fn) = functions.get(*function_idx) {
-                            if self.should_inline(*function_idx, callee_fn)
+                        if let Some(callee_fn) = functions.get(*function_idx)
+                            && self.should_inline(*function_idx, callee_fn)
                                 && (arg_count as usize) <= callee_fn.register_count as usize
                             {
                                 let mut arg_registers = Vec::with_capacity(arg_count as usize);
@@ -1889,7 +1875,6 @@ impl TraceRecorder {
                                 );
                                 did_inline = true;
                             }
-                        }
 
                         if !did_inline {
                             self.push_op(TraceOp::CallFunction {
@@ -1921,8 +1906,8 @@ impl TraceRecorder {
                         }
 
                         let mut did_inline = false;
-                        if let Some(callee_fn) = functions.get(*function_idx) {
-                            if self.should_inline(*function_idx, callee_fn)
+                        if let Some(callee_fn) = functions.get(*function_idx)
+                            && self.should_inline(*function_idx, callee_fn)
                                 && (arg_count as usize) <= callee_fn.register_count as usize
                             {
                                 let mut arg_registers = Vec::with_capacity(arg_count as usize);
@@ -1942,7 +1927,6 @@ impl TraceRecorder {
                                 );
                                 did_inline = true;
                             }
-                        }
 
                         if !did_inline {
                             self.push_op(TraceOp::CallFunction {
@@ -2070,8 +2054,8 @@ impl TraceRecorder {
                 };
 
                 // Rebox any specialized values before return
-                if let Some(reg) = return_reg {
-                    if let Some(&(specialized_id, ref layout)) =
+                if let Some(reg) = return_reg
+                    && let Some(&(specialized_id, ref layout)) =
                         self.specialized_registers.get(&reg)
                     {
                         crate::jit::log(|| {
@@ -2089,7 +2073,6 @@ impl TraceRecorder {
 
                         self.specialized_registers.remove(&reg);
                     }
-                }
 
                 // Ensure no specialized values leak past the return
                 self.rebox_all_specialized_values();

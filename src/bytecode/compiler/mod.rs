@@ -199,14 +199,14 @@ impl Compiler {
         let module = self.current_module.as_deref().unwrap_or("");
         self.option_coercions
             .get(module)
-            .map_or(false, |set| set.contains(&span))
+            .is_some_and(|set| set.contains(&span))
     }
 
     pub(super) fn is_checked_array_index(&self, span: Span) -> bool {
         let module = self.current_module.as_deref().unwrap_or("");
         self.checked_array_indices
             .get(module)
-            .map_or(false, |set| set.contains(&span))
+            .is_some_and(|set| set.contains(&span))
     }
 
     fn assign_signature_by_name(&mut self, func_idx: usize, name: &str) {
@@ -262,14 +262,13 @@ impl Compiler {
             .current_module
             .clone()
             .or_else(|| self.entry_module.clone());
-        if let Some(module) = module_name {
-            if !name.contains('.') {
+        if let Some(module) = module_name
+            && !name.contains('.') {
                 let qualified = format!("{}.{}", module, name);
                 self.extern_value_aliases
                     .entry(qualified)
                     .or_insert(runtime_name);
             }
-        }
     }
 
     pub(super) fn describe_expr_kind(kind: &ExprKind) -> &'static str {
@@ -357,7 +356,7 @@ impl Compiler {
                     .iter()
                     .map(|t| Self::type_to_string(&t.kind))
                     .collect();
-                format!("{}", type_strs.join(" | "))
+                type_strs.join(" | ").to_string()
             }
 
             TypeKind::Unit => "()".to_string(),
@@ -380,7 +379,7 @@ impl Compiler {
     fn module_context_name(&self) -> Option<&str> {
         self.current_module
             .as_deref()
-            .or_else(|| self.entry_module.as_deref())
+            .or(self.entry_module.as_deref())
     }
 
     fn is_builtin_type_name(name: &str) -> bool {
@@ -410,17 +409,15 @@ impl Compiler {
 
     pub(super) fn resolve_type_name(&self, name: &str) -> String {
         if let Some((head, tail)) = name.split_once('.') {
-            if let Some(module) = self.module_context_name() {
-                if let Some(imports) = self.imports_by_module.get(module) {
-                    if let Some(real_module) = imports.module_aliases.get(head) {
+            if let Some(module) = self.module_context_name()
+                && let Some(imports) = self.imports_by_module.get(module)
+                    && let Some(real_module) = imports.module_aliases.get(head) {
                         if tail.is_empty() {
                             return real_module.clone();
                         } else {
                             return format!("{}.{}", real_module, tail);
                         }
                     }
-                }
-            }
 
             return name.to_string();
         }
@@ -430,11 +427,10 @@ impl Compiler {
         }
 
         if let Some(module) = self.module_context_name() {
-            if let Some(imports) = self.imports_by_module.get(module) {
-                if let Some(fq) = imports.type_aliases.get(name) {
+            if let Some(imports) = self.imports_by_module.get(module)
+                && let Some(fq) = imports.type_aliases.get(name) {
                     return fq.clone();
                 }
-            }
 
             return format!("{}.{}", module, name);
         }

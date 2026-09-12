@@ -671,7 +671,7 @@ fn read_or_create_config(path: &Path) -> Result<Value, String> {
 }
 
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
-fn ensure_dependencies_table<'a>(doc: &'a mut Value) -> Result<&'a mut Map<String, Value>, String> {
+fn ensure_dependencies_table(doc: &mut Value) -> Result<&mut Map<String, Value>, String> {
     let table = doc
         .as_table_mut()
         .ok_or_else(|| "configuration root must be a table".to_string())?;
@@ -1306,8 +1306,8 @@ fn run_file(filename: &str, disassemble: bool) {
                                     vm.set_global(&result.module, table_val);
                                 }
                                 for (key, val) in handle.borrow().entries.iter() {
-                                    if let LuaValue::String(name) = key {
-                                        if let Ok(converted) =
+                                    if let LuaValue::String(name) = key
+                                        && let Ok(converted) =
                                             lua_to_lust(val, &vm, result.state.clone())
                                         {
                                             vm.set_global(
@@ -1315,7 +1315,6 @@ fn run_file(filename: &str, disassemble: bool) {
                                                 converted,
                                             );
                                         }
-                                    }
                                 }
                             }
                         }
@@ -1342,8 +1341,7 @@ fn run_file(filename: &str, disassemble: bool) {
                 // export a single value (usually a table).
                 let module_value = match val {
                     lust::bytecode::Value::Array(arr) => arr
-                        .borrow()
-                        .get(0)
+                        .borrow().first()
                         .cloned()
                         .unwrap_or(lust::bytecode::Value::Nil),
                     other => other,
@@ -1447,13 +1445,12 @@ fn compile_program(
                             }
                         }
                         Ok(ft) if ft.is_file() => {
-                            if entry.path().extension().and_then(|e| e.to_str()) == Some("lust") {
-                                if let Some(stem) =
+                            if entry.path().extension().and_then(|e| e.to_str()) == Some("lust")
+                                && let Some(stem) =
                                     entry.path().file_stem().and_then(|s| s.to_str())
                                 {
                                     prefixes.insert(stem.to_string());
                                 }
-                            }
                         }
                         _ => {}
                     }
@@ -1506,8 +1503,8 @@ fn compile_program(
     let trait_impls = compiler.get_trait_impls().to_vec();
     let mut init_funcs: Vec<(String, String)> = Vec::new();
     for m in &program.modules {
-        if m.path != program.entry_module {
-            if let Some(init) = &m.init_function {
+        if m.path != program.entry_module
+            && let Some(init) = &m.init_function {
                 let init_name = m
                     .imports
                     .function_aliases
@@ -1516,7 +1513,6 @@ fn compile_program(
                     .unwrap_or_else(|| init.clone());
                 init_funcs.push((m.path.clone(), init_name));
             }
-        }
     }
 
     Ok((functions, trait_impls, init_funcs, struct_defs))
@@ -1640,15 +1636,14 @@ fn print_source_snippet(source: &str, filename: &str, line: usize, column: Optio
     }
 
     eprintln!(" {} | {}", line, code_line);
-    if let Some(col) = column {
-        if col > 0 {
+    if let Some(col) = column
+        && col > 0 {
             let mut marker = String::new();
-            marker.push_str(" ");
+            marker.push(' ');
             marker.push_str(&" ".repeat(line.to_string().len()));
             marker.push_str(" | ");
             marker.push_str(&" ".repeat(col.saturating_sub(1)));
             marker.push('^');
             eprintln!("{}", marker);
         }
-    }
 }

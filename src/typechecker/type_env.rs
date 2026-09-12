@@ -47,6 +47,12 @@ impl fmt::Display for FunctionSignature {
     }
 }
 
+impl Default for TypeEnv {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TypeEnv {
     pub fn new() -> Self {
         Self::with_config(&LustConfig::default())
@@ -601,7 +607,7 @@ impl TypeEnv {
     ) {
         self.generic_instances
             .entry(var_name)
-            .or_insert_with(HashMap::new)
+            .or_default()
             .insert(type_param, concrete_type);
     }
 
@@ -723,8 +729,8 @@ impl TypeEnv {
 
     pub fn register_impl(&mut self, impl_block: &ImplBlock) -> Result<()> {
         for existing in &self.impls {
-            if let Some(trait_name) = &impl_block.trait_name {
-                if existing.trait_name.as_ref() == Some(trait_name)
+            if let Some(trait_name) = &impl_block.trait_name
+                && existing.trait_name.as_ref() == Some(trait_name)
                     && self.types_overlap(&existing.target_type, &impl_block.target_type)
                 {
                     return Err(LustError::TypeError {
@@ -734,7 +740,6 @@ impl TypeEnv {
                         ),
                     });
                 }
-            }
 
             if self.types_overlap(&existing.target_type, &impl_block.target_type) {
                 for method in &impl_block.methods {
@@ -765,8 +770,7 @@ impl TypeEnv {
         for impl_block in &self.impls {
             if let TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } =
                 &impl_block.target_type.kind
-            {
-                if name == type_name {
+                && name == type_name {
                     for method in &impl_block.methods {
                         if method.name.ends_with(&format!(":{}", method_name))
                             || method.name == method_name
@@ -775,7 +779,6 @@ impl TypeEnv {
                         }
                     }
                 }
-            }
         }
 
         None
@@ -816,8 +819,8 @@ impl TypeEnv {
 
     pub fn type_implements_trait(&self, ty: &Type, trait_name: &str) -> bool {
         for impl_block in &self.impls {
-            if let Some(impl_trait_name) = &impl_block.trait_name {
-                if impl_trait_name == trait_name {
+            if let Some(impl_trait_name) = &impl_block.trait_name
+                && impl_trait_name == trait_name {
                     let mut bindings = HashMap::new();
                     if self.match_type_pattern(&impl_block.target_type, ty, &mut bindings) {
                         let bounds_satisfied = impl_block.where_clause.iter().all(|bound| {
@@ -833,7 +836,6 @@ impl TypeEnv {
                         }
                     }
                 }
-            }
         }
 
         false
@@ -937,11 +939,9 @@ impl TypeEnv {
                 name: right_name, ..
             },
         ) = (&left.kind, &right.kind)
-        {
-            if left_name == right_name {
+            && left_name == right_name {
                 return true;
             }
-        }
         self.types_match(left, right)
     }
 }

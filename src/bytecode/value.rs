@@ -131,39 +131,37 @@ fn unwrap_lua_value_for_key(value: &Value) -> Value {
         variant,
         values,
     } = value
-    {
-        if enum_name == "LuaValue" {
+        && enum_name == "LuaValue" {
             return match variant.as_str() {
                 "Nil" => Value::Nil,
                 "Bool" => values
                     .as_ref()
-                    .and_then(|v| v.get(0))
+                    .and_then(|v| v.first())
                     .cloned()
                     .unwrap_or(Value::Bool(false)),
                 "Int" | "Number" => values
                     .as_ref()
-                    .and_then(|v| v.get(0))
+                    .and_then(|v| v.first())
                     .cloned()
                     .unwrap_or(Value::Int(0)),
                 "String" => values
                     .as_ref()
-                    .and_then(|v| v.get(0))
+                    .and_then(|v| v.first())
                     .cloned()
                     .unwrap_or(Value::String(Rc::new(String::new()))),
                 "Table" => values
                     .as_ref()
-                    .and_then(|v| v.get(0))
+                    .and_then(|v| v.first())
                     .cloned()
                     .unwrap_or(Value::Nil),
                 "Function" => values
                     .as_ref()
-                    .and_then(|v| v.get(0))
+                    .and_then(|v| v.first())
                     .cloned()
                     .unwrap_or(Value::Nil),
                 _ => value.clone(),
             };
         }
-    }
     value.clone()
 }
 
@@ -485,7 +483,7 @@ impl StructLayout {
             } if enum_name == "Option" => {
                 if variant == "Some" {
                     if let Some(inner_values) = values {
-                        if let Some(inner) = inner_values.get(0) {
+                        if let Some(inner) = inner_values.first() {
                             let coerced = self.to_weak_struct(field_name, inner.clone())?;
                             Ok(Value::enum_variant("Option", "Some", vec![coerced]))
                         } else {
@@ -521,7 +519,7 @@ impl StructLayout {
             } if enum_name == "Option" => {
                 if variant == "Some" {
                     if let Some(inner_values) = values {
-                        if let Some(inner) = inner_values.get(0) {
+                        if let Some(inner) = inner_values.first() {
                             match inner {
                                 Value::WeakStruct(weak) => {
                                     if let Some(upgraded) = weak.upgrade() {
@@ -1466,7 +1464,7 @@ pub unsafe extern "C" fn jit_init_nil(dest: *mut Value) -> u8 {
 pub unsafe extern "C" fn jit_drop_values(values: *mut Value, len: usize) {
     unsafe {
         if !values.is_null() && len != 0 {
-            ptr::drop_in_place(slice::from_raw_parts_mut(values, len));
+            ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(values, len));
         }
     }
 }
@@ -2272,7 +2270,7 @@ pub unsafe extern "C" fn jit_call_native_safe(
                         return None;
                     }
                     let offset = out_ptr - base;
-                    if offset % value_size != 0 {
+                    if !offset.is_multiple_of(value_size) {
                         return None;
                     }
                     let reg = offset / value_size;
@@ -2937,12 +2935,11 @@ pub unsafe extern "C" fn jit_get_field_indexed_int_fast(
                     return 0;
                 }
 
-                if let Ok(borrowed) = fields.try_borrow() {
-                    if let Some(Value::Int(val)) = borrowed.get(field_index) {
+                if let Ok(borrowed) = fields.try_borrow()
+                    && let Some(Value::Int(val)) = borrowed.get(field_index) {
                         *out_ref = Value::Int(*val);
                         return 1;
                     }
-                }
 
                 0
             }
@@ -2975,12 +2972,11 @@ pub unsafe extern "C" fn jit_set_field_indexed_int_fast(
                     return 0;
                 }
 
-                if let Ok(mut borrowed) = fields.try_borrow_mut() {
-                    if field_index < borrowed.len() {
+                if let Ok(mut borrowed) = fields.try_borrow_mut()
+                    && field_index < borrowed.len() {
                         borrowed[field_index] = Value::Int(new_value);
                         return 1;
                     }
-                }
 
                 0
             }

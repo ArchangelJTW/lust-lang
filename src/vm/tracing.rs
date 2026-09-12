@@ -59,11 +59,10 @@ impl VM {
     pub(super) fn invoke_tostring(&mut self, value: &Value, type_name: &str) -> Result<Rc<String>> {
         if self.type_has_tostring(type_name) {
             let cache_key = Self::struct_cache_key(value);
-            if let Some(key) = cache_key {
-                if let Some(cached) = self.struct_tostring_cache.get(&key) {
+            if let Some(key) = cache_key
+                && let Some(cached) = self.struct_tostring_cache.get(&key) {
                     return Ok(cached.clone());
                 }
-            }
 
             let result = self.call_builtin_method(value, TO_STRING_METHOD, Vec::new())?;
             match result {
@@ -91,11 +90,10 @@ impl VM {
 
     pub(super) fn type_has_tostring(&self, type_name: &str) -> bool {
         let mut candidates = vec![type_name];
-        if let Some(last) = type_name.rsplit('.').next() {
-            if last != type_name {
+        if let Some(last) = type_name.rsplit('.').next()
+            && last != type_name {
                 candidates.push(last);
             }
-        }
 
         for candidate in candidates {
             let key = (candidate.to_string(), TO_STRING_TRAIT.to_string());
@@ -114,11 +112,10 @@ impl VM {
 
     pub(super) fn type_has_hashkey(&self, type_name: &str) -> bool {
         let mut candidates = vec![type_name];
-        if let Some(last) = type_name.rsplit('.').next() {
-            if last != type_name {
+        if let Some(last) = type_name.rsplit('.').next()
+            && last != type_name {
                 candidates.push(last);
             }
-        }
 
         for candidate in candidates {
             let key = (candidate.to_string(), HASH_KEY_TRAIT.to_string());
@@ -199,8 +196,8 @@ impl VM {
         } else {
             None
         };
-        if let Some((function_idx, loop_start_ip)) = should_record_side_trace {
-            if self.trace_recorder.is_none() {
+        if let Some((function_idx, loop_start_ip)) = should_record_side_trace
+            && self.trace_recorder.is_none() {
                 self.side_trace_context = Some((trace_id, guard_index));
                 let mut recorder =
                     TraceRecorder::new(function_idx, loop_start_ip, crate::jit::MAX_TRACE_LENGTH);
@@ -214,7 +211,6 @@ impl VM {
                 self.trace_recorder = Some(recorder);
                 self.jit.recording_started();
             }
-        }
 
         Ok(())
     }

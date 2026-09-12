@@ -175,12 +175,11 @@ impl Compiler {
                     | Instruction::Return(_)
             )
         });
-        if straight_line && i32::from(src) > self.max_local_register_index() {
-            if let Some((instruction, ty, _, _)) = expression
+        if straight_line && i32::from(src) > self.max_local_register_index()
+            && let Some((instruction, ty, _, _)) = expression
                 .last()
                 .and_then(|instruction| instruction.numeric_specialization())
-            {
-                if instruction.defined_register() == Some(src) {
+                && instruction.defined_register() == Some(src) {
                     let replacement = match instruction {
                         Instruction::Add(_, l, r) => Some(Instruction::Add(dest, l, r)),
                         Instruction::Sub(_, l, r) => Some(Instruction::Sub(dest, l, r)),
@@ -196,8 +195,6 @@ impl Compiler {
                         return;
                     }
                 }
-            }
-        }
         self.emit(Instruction::Move(dest, src), 0);
     }
 

@@ -9,7 +9,7 @@ use std::os::raw::c_char;
 use std::ptr;
 use std::slice;
 thread_local! {
-    static LAST_ERROR: std::cell::RefCell<Option<CString>> = std::cell::RefCell::new(None);
+    static LAST_ERROR: std::cell::RefCell<Option<CString>> = const { std::cell::RefCell::new(None) };
 }
 
 fn clear_last_error() {

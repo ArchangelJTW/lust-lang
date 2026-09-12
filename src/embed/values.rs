@@ -509,7 +509,7 @@ impl<'a> ValueRef<'a> {
 
     pub fn as_value(&self) -> &Value {
         match self {
-            ValueRef::Borrowed(inner) => &*inner,
+            ValueRef::Borrowed(inner) => inner,
             ValueRef::Owned(value) => value,
         }
     }
@@ -658,9 +658,7 @@ impl ArrayHandle {
     pub fn get(&self, index: usize) -> Option<ValueRef<'_>> {
         {
             let values = self.inner.borrow();
-            if values.get(index).is_none() {
-                return None;
-            }
+            values.get(index)?;
         }
 
         let values = self.inner.borrow();
@@ -881,7 +879,7 @@ pub(crate) fn lust_type_names_match(value: &str, expected: &str) -> bool {
 }
 
 pub(crate) fn simple_type_name(name: &str) -> &str {
-    name.rsplit(|c| c == '.' || c == ':').next().unwrap_or(name)
+    name.rsplit(['.', ':']).next().unwrap_or(name)
 }
 
 pub(crate) fn matches_array_type<F>(ty: &Type, matcher: &F) -> bool
@@ -899,7 +897,7 @@ where
 pub(crate) fn matches_array_handle_type(ty: &Type) -> bool {
     match &ty.kind {
         TypeKind::Array(_) | TypeKind::Unknown => true,
-        TypeKind::Union(types) => types.iter().any(|alt| matches_array_handle_type(alt)),
+        TypeKind::Union(types) => types.iter().any(matches_array_handle_type),
         _ => false,
     }
 }
@@ -907,7 +905,7 @@ pub(crate) fn matches_array_handle_type(ty: &Type) -> bool {
 pub(crate) fn matches_map_handle_type(ty: &Type) -> bool {
     match &ty.kind {
         TypeKind::Map(_, _) | TypeKind::Unknown => true,
-        TypeKind::Union(types) => types.iter().any(|alt| matches_map_handle_type(alt)),
+        TypeKind::Union(types) => types.iter().any(matches_map_handle_type),
         _ => false,
     }
 }
@@ -915,7 +913,7 @@ pub(crate) fn matches_map_handle_type(ty: &Type) -> bool {
 pub(crate) fn matches_function_handle_type(ty: &Type) -> bool {
     match &ty.kind {
         TypeKind::Function { .. } | TypeKind::Unknown => true,
-        TypeKind::Union(types) => types.iter().any(|alt| matches_function_handle_type(alt)),
+        TypeKind::Union(types) => types.iter().any(matches_function_handle_type),
         _ => false,
     }
 }

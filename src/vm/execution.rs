@@ -41,23 +41,17 @@ impl VM {
             variant,
             values,
         } = value
-        {
-            if enum_name == "LuaValue" && variant == "Table" {
-                if let Some(inner) = values.as_ref().and_then(|vals| vals.get(0)) {
-                    if let Some(map) = inner.struct_get_field("table") {
+            && enum_name == "LuaValue" && variant == "Table"
+                && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
+                    && let Some(map) = inner.struct_get_field("table") {
                         return Some(map);
                     }
-                }
-            }
-        }
 
-        if let Value::Struct { name, .. } = value {
-            if name == "LuaTable" {
-                if let Some(map) = value.struct_get_field("table") {
+        if let Value::Struct { name, .. } = value
+            && name == "LuaTable"
+                && let Some(map) = value.struct_get_field("table") {
                     return Some(map);
                 }
-            }
-        }
 
         None
     }
@@ -68,20 +62,18 @@ impl VM {
             variant,
             values,
         } = value
-        {
-            if enum_name == "LuaValue" {
+            && enum_name == "LuaValue" {
                 return match variant.as_str() {
                     "Nil" => Value::Nil,
                     "Bool" | "Int" | "Float" | "String" | "Table" | "Function"
                     | "LightUserdata" | "Userdata" | "Thread" => values
                         .as_ref()
-                        .and_then(|v| v.get(0))
+                        .and_then(|v| v.first())
                         .cloned()
                         .unwrap_or(Value::Nil),
                     _ => value.clone(),
                 };
             }
-        }
         value.clone()
     }
 
@@ -96,27 +88,23 @@ impl VM {
 
     pub(super) fn run(&mut self) -> Result<Value> {
         loop {
-            if let Some(target_depth) = self.call_until_depth {
-                if self.call_stack.len() == target_depth {
-                    if let Some(return_value) = self.pending_return_value.take() {
+            if let Some(target_depth) = self.call_until_depth
+                && self.call_stack.len() == target_depth
+                    && let Some(return_value) = self.pending_return_value.take() {
                         self.call_until_depth = None;
                         return Ok(return_value);
                     }
-                }
-            }
 
-            if let Some(return_value) = self.pending_return_value.take() {
-                if let Some(dest_reg) = self.pending_return_dest.take() {
+            if let Some(return_value) = self.pending_return_value.take()
+                && let Some(dest_reg) = self.pending_return_dest.take() {
                     self.set_register(dest_reg, return_value)?;
                 }
-            }
 
-            if self.current_task.is_some() {
-                if let Some(signal) = self.pending_task_signal.take() {
+            if self.current_task.is_some()
+                && let Some(signal) = self.pending_task_signal.take() {
                     self.last_task_signal = Some(signal);
                     return Ok(Value::Nil);
                 }
-            }
 
             if self.call_stack.len() > self.max_stack_depth {
                 return Err(LustError::RuntimeError {
@@ -282,11 +270,10 @@ impl VM {
                                     let side_result =
                                         side_trace.execute(registers_ptr, vm_ptr, ptr::null());
                                     drop(side_trace);
-                                    if side_result < 0 {
-                                        if let Some(error) = self.pending_jit_error.take() {
+                                    if side_result < 0
+                                        && let Some(error) = self.pending_jit_error.take() {
                                             return Err(error);
                                         }
-                                    }
                                     if side_result == 0 {
                                         crate::jit::log(|| {
                                             format!(
@@ -310,11 +297,10 @@ impl VM {
                                     .and_then(|trace| trace.guards.get(guard_index))
                                     .map(|guard| guard.bailout_ip);
 
-                                if let Some(bailout_ip) = bailout_ip {
-                                    if let Some(frame) = self.call_stack.last_mut() {
+                                if let Some(bailout_ip) = bailout_ip
+                                    && let Some(frame) = self.call_stack.last_mut() {
                                         frame.ip = bailout_ip;
                                     }
-                                }
 
                                 self.handle_guard_failure(trace_id, guard_index, func_idx)?;
                                 let reusable_exit = self
@@ -362,8 +348,8 @@ impl VM {
                 } else {
                     let is_side_trace = self.side_trace_context.is_some();
                     if is_side_trace {
-                        if let Some(recorder) = &self.trace_recorder {
-                            if !recorder.is_recording() {
+                        if let Some(recorder) = &self.trace_recorder
+                            && !recorder.is_recording() {
                                 if !recorder.is_complete() {
                                     self.abandon_trace_recording();
                                     continue;
@@ -402,8 +388,7 @@ impl VM {
                                         });
                                         if let Some(parent) =
                                             self.jit.get_trace_mut(parent_trace_id)
-                                        {
-                                            if guard_index < parent.guards.len() {
+                                            && guard_index < parent.guards.len() {
                                                 parent.guards[guard_index].side_trace =
                                                     Some(trace_id);
                                                 crate::jit::log(|| {
@@ -413,7 +398,6 @@ impl VM {
                                                     )
                                                 });
                                             }
-                                        }
 
                                         self.jit.store_side_trace(compiled_trace);
                                     }
@@ -425,7 +409,6 @@ impl VM {
                                     }
                                 }
                             }
-                        }
                     } else {
                         if let Some(recorder) = &mut self.trace_recorder {
                             // Only finalise the recording when *this* loop is the
@@ -901,15 +884,11 @@ impl VM {
                             variant,
                             values,
                         } = &func_value
-                        {
-                            if enum_name == "LuaValue"
+                            && enum_name == "LuaValue"
                                 && (variant == "Table" || variant == "Userdata")
-                            {
-                                if let Some(inner) = values.as_ref().and_then(|v| v.get(0)) {
+                                && let Some(inner) = values.as_ref().and_then(|v| v.first()) {
                                     check_value = inner;
                                 }
-                            }
-                        }
                         // Check if it's a LuaTable/LuaUserdata struct with metamethods
                         if let Value::Struct { name, .. } = check_value {
                             (name == "LuaTable" || name == "LuaUserdata")
@@ -934,14 +913,12 @@ impl VM {
                         if let Value::Enum {
                             enum_name, variant, ..
                         } = &func_value
-                        {
-                            if enum_name == "LuaValue"
+                            && enum_name == "LuaValue"
                                 && (variant == "Table" || variant == "Userdata")
                             {
                                 #[cfg(feature = "std")]
                                 eprintln!("DEBUG Instruction::Call: Have LuaValue.{} but needs_call_value=false", variant);
                             }
-                        }
                     }
 
                     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
@@ -953,7 +930,7 @@ impl VM {
                                 values,
                             } if enum_name == "LuaValue" && variant == "Function" => values
                                 .as_ref()
-                                .and_then(|vals| vals.get(0))
+                                .and_then(|vals| vals.first())
                                 .and_then(|v| v.struct_get_field("handle"))
                                 .and_then(|v| v.as_int())
                                 .map(|i| i as usize),
@@ -1501,7 +1478,7 @@ impl VM {
                         }
 
                         let mut candidate_names = vec![mangled_name.clone()];
-                        if let Some(simple) = struct_name.rsplit(|c| c == '.' || c == ':').next() {
+                        if let Some(simple) = struct_name.rsplit(['.', ':']).next() {
                             candidate_names.push(format!("{}:{}", simple, method_name));
                         }
 
@@ -1700,9 +1677,9 @@ impl VM {
                 }
             }
 
-            if self.jit.enabled {
-                if let Some(recorder) = &mut self.trace_recorder {
-                    if recorder.is_recording() {
+            if self.jit.enabled
+                && let Some(recorder) = &mut self.trace_recorder
+                    && recorder.is_recording() {
                         if self.skip_next_trace_record {
                             self.skip_next_trace_record = false;
                         } else {
@@ -1717,8 +1694,8 @@ impl VM {
                                 } else {
                                     None
                                 };
-                            if let Some(registers) = registers_opt {
-                                if let Err(e) = recorder.record_instruction_at_frame(
+                            if let Some(registers) = registers_opt
+                                && let Err(e) = recorder.record_instruction_at_frame(
                                     executing_frame_index,
                                     instruction,
                                     ip_before_execution,
@@ -1730,11 +1707,8 @@ impl VM {
                                     crate::jit::log(|| format!("⚠️  JIT: {}", e));
                                     self.abandon_trace_recording();
                                 }
-                            }
                         }
                     }
-                }
-            }
         }
     }
 
@@ -1897,9 +1871,9 @@ impl VM {
             return true;
         }
 
-        if let Some(_) = self
+        if self
             .trait_impls
-            .get(&(value_type_name.to_string(), type_name.to_string()))
+            .get(&(value_type_name.to_string(), type_name.to_string())).is_some()
         {
             return true;
         }
@@ -1947,7 +1921,7 @@ impl VM {
                     variant,
                     values,
                 } if enum_name == "Option" => match variant.as_str() {
-                    "None" => values.as_ref().map_or(true, |values| values.is_empty()),
+                    "None" => values.as_ref().is_none_or(|values| values.is_empty()),
                     "Some" => values.as_ref().is_some_and(|values| {
                         values.len() == 1 && self.value_matches_type(&values[0], inner)
                     }),
@@ -2047,8 +2021,8 @@ impl VM {
                 ),
             });
         }
-        if let Some(signature) = &function.signature {
-            if signature.params.len() == args.len() {
+        if let Some(signature) = &function.signature
+            && signature.params.len() == args.len() {
                 for (index, (value, ty)) in args.iter().zip(&signature.params).enumerate() {
                     if !self.value_matches_type(value, ty) {
                         return Err(LustError::RuntimeError {
@@ -2063,7 +2037,6 @@ impl VM {
                     }
                 }
             }
-        }
 
         let mut frame = CallFrame::new(function_idx, return_dest, function.register_count);
         let recursive = self
@@ -2128,11 +2101,10 @@ impl VM {
 
     fn invoke_hashkey(&mut self, value: &Value, type_name: &str) -> Result<Value> {
         let mut candidates = vec![format!("{}:{}", type_name, HASH_KEY_METHOD)];
-        if let Some(last) = type_name.rsplit('.').next() {
-            if last != type_name {
+        if let Some(last) = type_name.rsplit('.').next()
+            && last != type_name {
                 candidates.push(format!("{}:{}", last, HASH_KEY_METHOD));
             }
-        }
 
         for candidate in candidates {
             if let Some(idx) = self.functions.iter().position(|f| f.name == candidate) {
@@ -2217,13 +2189,13 @@ impl VM {
         outcome: NativeCallResult,
     ) -> Result<()> {
         #[cfg(feature = "std")]
-        if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() {
-            if let NativeCallResult::Return(value) = &outcome {
-                if let Value::Array(arr) = value {
+        if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some()
+            && let NativeCallResult::Return(value) = &outcome
+                && let Value::Array(arr) = value {
                     let borrowed = arr.borrow();
                     let interesting = borrowed.len() > 1
                         && matches!(
-                            borrowed.get(0),
+                            borrowed.first(),
                             Some(Value::Enum { enum_name, variant, .. })
                                 if enum_name == "LuaValue" && variant == "Nil"
                         );
@@ -2243,8 +2215,6 @@ impl VM {
                         );
                     }
                 }
-            }
-        }
         match outcome {
             NativeCallResult::Return(value) => self.set_register(dest, value),
             NativeCallResult::Yield(value) => {
@@ -2306,13 +2276,10 @@ impl VM {
                 variant,
                 values,
             } = func
-            {
-                if enum_name == "LuaValue" && (variant == "Table" || variant == "Userdata") {
-                    if let Some(inner) = values.as_ref().and_then(|vals| vals.get(0)) {
+                && enum_name == "LuaValue" && (variant == "Table" || variant == "Userdata")
+                    && let Some(inner) = values.as_ref().and_then(|vals| vals.first()) {
                         current = inner;
                     }
-                }
-            }
 
             if let Value::Struct { name, .. } = current {
                 if name == "LuaTable" || name == "LuaUserdata" {
@@ -2356,7 +2323,7 @@ impl VM {
             } if enum_name == "LuaValue" && variant == "Function" => {
                 let handle = values
                     .as_ref()
-                    .and_then(|vals| vals.get(0))
+                    .and_then(|vals| vals.first())
                     .and_then(|v| v.struct_get_field("handle"))
                     .and_then(|v| v.as_int())
                     .map(|i| i as usize)
@@ -2371,7 +2338,7 @@ impl VM {
                         ),
                     }
                 })?;
-                return self.call_value(&inner, args);
+                self.call_value(&inner, args)
             }
             Value::Function(func_idx) => {
                 let saved_pending_return_value = self.pending_return_value.clone();

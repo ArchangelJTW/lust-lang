@@ -7,7 +7,7 @@ use crate::config::LustConfig;
 use crate::lua_compat::register_lust_function;
 use crate::LustInt;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{make_rng, RngExt, SeedableRng};
 use regex::Regex;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -2228,17 +2228,17 @@ fn create_math_random_fn() -> Value {
                 }
             });
         let value = with_rng_mut(|rng| match (lower.as_ref(), upper.as_ref()) {
-            (None, _) => Value::Float(rng.r#gen::<f64>()),
+            (None, _) => Value::Float(rng.random::<f64>()),
             (Some(max), None) => {
                 let hi = coerce_int(max).unwrap_or(1);
                 let upper_bound = if hi < 1 { 1 } else { hi };
-                Value::Int(rng.gen_range(1..=upper_bound))
+                Value::Int(rng.random_range(1..=upper_bound))
             }
             (Some(min), Some(max)) => {
                 let lo = coerce_int(min).unwrap_or(1);
                 let hi = coerce_int(max).unwrap_or(lo);
                 let (start, end) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-                Value::Int(rng.gen_range(start..=end))
+                Value::Int(rng.random_range(start..=end))
             }
         })?;
         Ok(NativeCallResult::Return(value))
@@ -2252,7 +2252,7 @@ fn create_math_randomseed_fn() -> Value {
             .map(|v| unwrap_lua_value(v.clone()))
             .unwrap_or(Value::Int(0));
         let seed = coerce_int(&seed_val).unwrap_or(0) as u64;
-        let mutex = RNG.get_or_init(|| Mutex::new(StdRng::from_entropy()));
+        let mutex = RNG.get_or_init(|| Mutex::new(make_rng()));
         *mutex.lock().map_err(|e| e.to_string())? = StdRng::seed_from_u64(seed);
         Ok(NativeCallResult::Return(Value::Nil))
     }))
@@ -2271,7 +2271,7 @@ fn with_rng_mut<F, R>(f: F) -> Result<R, String>
 where
     F: FnOnce(&mut StdRng) -> R,
 {
-    let mutex = RNG.get_or_init(|| Mutex::new(StdRng::from_entropy()));
+    let mutex = RNG.get_or_init(|| Mutex::new(make_rng()));
     mutex
         .lock()
         .map_err(|e| e.to_string())

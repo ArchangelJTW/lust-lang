@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use full_moon::{
     ast::{
         Block, Expression, Field, FunctionArgs, FunctionBody, FunctionCall, FunctionDeclaration,
-        FunctionName, Index, LastStmt, Parameter, Prefix, Return, Suffix, UnOp, Value,
+        FunctionName, Index, LastStmt, Parameter, Prefix, Return, Suffix, UnOp,
     },
     parse,
 };
@@ -76,10 +76,8 @@ fn var_segments(var: &full_moon::ast::Var) -> Option<Vec<String>> {
 }
 
 fn expr_segments(expr: &Expression) -> Option<Vec<String>> {
-    if let Expression::Value { value, .. } = expr {
-        if let Value::Var(var) = &**value {
-            return var_segments(var);
-        }
+    if let Expression::Var(var) = expr {
+        return var_segments(var);
     }
     None
 }
@@ -88,7 +86,10 @@ fn expr_segments(expr: &Expression) -> Option<Vec<String>> {
 /// This attempts to mirror the Lua module as closely as possible while mapping Lua `require`
 /// to `lua.require(...)` calls and exporting members discovered in a trailing `return { ... }`.
 pub fn transpile_lua_stub(source: &str, module_name: &str) -> Result<String, String> {
-    let ast = parse(source).map_err(|e| format!("failed to parse Lua: {e}"))?;
+    let ast = parse(source).map_err(|errors| {
+        let err_str = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ");
+        format!("failed to parse Lua: {err_str}")
+    })?;
     let block = ast.nodes();
     let mut analyzer = Analyzer::new(module_name);
     analyzer.analyze_block(block);
@@ -221,18 +222,16 @@ impl Analyzer {
     }
 
     fn extract_exports(&self, expr: &Expression) -> Option<Vec<String>> {
-        if let Expression::Value { value, .. } = expr {
-            if let Value::TableConstructor(table) = &**value {
-                let mut names = Vec::new();
-                for field in table.fields() {
-                    if let Field::NameKey { key, .. } = field {
-                        let name = sanitize_identifier(&key.token().to_string());
-                        names.push(name);
-                    }
+        if let Expression::TableConstructor(table) = expr {
+            let mut names = Vec::new();
+            for field in table.fields() {
+                if let Field::NameKey { key, .. } = field {
+                    let name = sanitize_identifier(&key.token().to_string());
+                    names.push(name);
                 }
-                if !names.is_empty() {
-                    return Some(names);
-                }
+            }
+            if !names.is_empty() {
+                return Some(names);
             }
         }
         None
@@ -240,33 +239,30 @@ impl Analyzer {
 
     fn analyze_expr(&mut self, expr: &Expression) {
         match expr {
-            Expression::Value { value, .. } => match &**value {
-                Value::FunctionCall(call) => self.analyze_function_call(call),
-                Value::Function((_token, body)) => self.analyze_block(body.block()),
-                Value::TableConstructor(table) => {
-                    for field in table.fields() {
-                        match field {
-                            Field::ExpressionKey { key, value, .. } => {
-                                self.analyze_expr(key);
-                                self.analyze_expr(value);
-                            }
-                            Field::NameKey { value, .. } => self.analyze_expr(value),
-                            Field::NoKey(value) => self.analyze_expr(value),
-                            _ => {}
+            Expression::FunctionCall(call) => self.analyze_function_call(call),
+            Expression::Function(func) => self.analyze_block(func.body().block()),
+            Expression::TableConstructor(table) => {
+                for field in table.fields() {
+                    match field {
+                        Field::ExpressionKey { key, value, .. } => {
+                            self.analyze_expr(key);
+                            self.analyze_expr(value);
+                        }
+                        Field::NameKey { value, .. } => self.analyze_expr(value),
+                        Field::NoKey(value) => self.analyze_expr(value),
+                        _ => {}
+                    }
+                }
+            }
+            Expression::Var(var) => {
+                if let full_moon::ast::Var::Expression(var_expr) = var {
+                    for suffix in var_expr.suffixes() {
+                        if let Suffix::Index(Index::Brackets { expression, .. }) = suffix {
+                            self.analyze_expr(expression);
                         }
                     }
                 }
-                Value::Var(var) => {
-                    if let full_moon::ast::Var::Expression(var_expr) = var {
-                        for suffix in var_expr.suffixes() {
-                            if let Suffix::Index(Index::Brackets { expression, .. }) = suffix {
-                                self.analyze_expr(expression);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            },
+            }
             Expression::BinaryOperator { lhs, rhs, .. } => {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
@@ -288,34 +284,30 @@ impl Analyzer {
                 {
                     if let FunctionArgs::Parentheses { arguments, .. } = args {
                         let mut iter = arguments.iter();
-                        if let Some(Expression::Value { value, .. }) = iter.next() {
-                            if let Value::String(tok) = &**value {
-                                let mod_name = tok.to_string().trim_matches('"').to_string();
-                                let mut seeall = false;
-                                if let Some(Expression::Value { value, .. }) = iter.next() {
-                                    if let Value::Var(var) = &**value {
-                                        if let full_moon::ast::Var::Expression(expr) = var {
-                                            if let Prefix::Name(pkg) = expr.prefix() {
-                                                if pkg.to_string() == "package" {
-                                                    if let Some(Suffix::Index(Index::Dot {
-                                                        name,
-                                                        ..
-                                                    })) = expr.suffixes().next()
-                                                    {
-                                                        if name.to_string() == "seeall" {
-                                                            seeall = true;
-                                                        }
-                                                    }
+                        if let Some(Expression::String(tok)) = iter.next() {
+                            let mod_name = tok.to_string().trim_matches('"').to_string();
+                            let mut seeall = false;
+                            if let Some(Expression::Var(var)) = iter.next() {
+                                if let full_moon::ast::Var::Expression(expr) = var {
+                                    if let Prefix::Name(pkg) = expr.prefix() {
+                                        if pkg.to_string() == "package" {
+                                            if let Some(Suffix::Index(Index::Dot {
+                                                name,
+                                                ..
+                                            })) = expr.suffixes().next()
+                                            {
+                                                if name.to_string() == "seeall" {
+                                                    seeall = true;
                                                 }
                                             }
                                         }
                                     }
                                 }
-                                self.module_decl = Some(ModuleDecl {
-                                    name: mod_name,
-                                    seeall,
-                                });
                             }
+                            self.module_decl = Some(ModuleDecl {
+                                name: mod_name,
+                                seeall,
+                            });
                         }
                     }
                 }
@@ -411,8 +403,7 @@ impl Analyzer {
                         self.module_tables.push(ident);
                     }
                 }
-            } else if matches!(expr, Expression::Value { value, .. } if matches!(&**value, Value::TableConstructor(_)))
-            {
+            } else if matches!(expr, Expression::TableConstructor(_)) {
                 let ident = sanitize_identifier(name);
                 if !self.module_tables.contains(&ident) {
                     self.module_tables.push(ident);
@@ -923,14 +914,12 @@ impl Emitter {
     fn extract_exports(&mut self, ret: &Return) -> Option<Vec<(String, String)>> {
         let mut out = Vec::new();
         for expr in ret.returns().iter() {
-            if let Expression::Value { value, .. } = expr {
-                if let Value::TableConstructor(table) = &**value {
-                    for field in table.fields() {
-                        if let Field::NameKey { key, value, .. } = field {
-                            let name = sanitize_identifier(&key.token().to_string());
-                            let expr = self.emit_expr(value);
-                            out.push((name, expr));
-                        }
+            if let Expression::TableConstructor(table) = expr {
+                for field in table.fields() {
+                    if let Field::NameKey { key, value, .. } = field {
+                        let name = sanitize_identifier(&key.token().to_string());
+                        let expr = self.emit_expr(value);
+                        out.push((name, expr));
                     }
                 }
             }
@@ -1043,7 +1032,7 @@ impl Emitter {
                     names.push(ident.clone());
                     typed.push(format!("{ident}: LuaValue"));
                 }
-                Parameter::Ellipse(_) => {
+                Parameter::Ellipsis(_) => {
                     names.push(VARARGS_NAME.to_string());
                     typed.push(format!("{VARARGS_NAME}: Array<LuaValue>"));
                 }
@@ -1100,73 +1089,67 @@ impl Emitter {
             Expression::Parentheses { expression, .. } => {
                 format!("({})", self.emit_expr_mode(expression, wrap_calls))
             }
-            Expression::Value { value, .. } => match &**value {
-                Value::Number(tok) => {
-                    let num_str = tok.to_string();
+            Expression::Number(tok) => {
+                let num_str = tok.to_string();
+                if wrap_calls {
+                    format!("lua.to_value({})", num_str)
+                } else {
+                    num_str
+                }
+            }
+            Expression::String(tok) => {
+                let str_val = tok.to_string();
+                if wrap_calls {
+                    format!("lua.to_value({})", str_val)
+                } else {
+                    str_val
+                }
+            }
+            Expression::Symbol(tok) => match tok.token().to_string().as_str() {
+                "nil" => "lua.nil".to_string(),
+                "..." => {
                     if wrap_calls {
-                        format!("lua.to_value({})", num_str)
+                        format!("__lua_first({VARARGS_NAME})")
                     } else {
-                        num_str
+                        VARARGS_NAME.to_string()
                     }
                 }
-                Value::String(tok) => {
-                    let str_val = tok.to_string();
+                "true" => {
                     if wrap_calls {
-                        format!("lua.to_value({})", str_val)
+                        "lua.to_value(true)".to_string()
                     } else {
-                        str_val
+                        "true".to_string()
                     }
                 }
-                Value::Symbol(tok) => match tok.token().to_string().as_str() {
-                    "nil" => "lua.nil".to_string(),
-                    "..." => {
-                        if wrap_calls {
-                            format!("__lua_first({VARARGS_NAME})")
-                        } else {
-                            VARARGS_NAME.to_string()
-                        }
-                    }
-                    "true" => {
-                        if wrap_calls {
-                            "lua.to_value(true)".to_string()
-                        } else {
-                            "true".to_string()
-                        }
-                    }
-                    "false" => {
-                        if wrap_calls {
-                            "lua.to_value(false)".to_string()
-                        } else {
-                            "false".to_string()
-                        }
-                    }
-                    other => other.to_string(),
-                },
-                Value::Var(var) => self.emit_var_mode(var, wrap_calls),
-                Value::TableConstructor(table) => self.emit_table(table),
-                Value::Function((_token, body)) => {
-                    let (params, _) = self.emit_function_params(body);
-                    let params = params.join(", ");
-                    let mut inner = Emitter::new(&self.module, Analyzer::new(&self.module));
-                    inner.indent = self.indent + 1;
-                    inner.emit_block(body.block());
-                    let body_src = inner.lines.join("\n");
-                    let indent = "    ".repeat(self.indent);
-                    format!("function({params}): Array<LuaValue>\n{body_src}\n{indent}end")
-                }
-                Value::FunctionCall(call) => {
-                    let raw = self.emit_function_call_raw(call, wrap_calls);
+                "false" => {
                     if wrap_calls {
-                        format!("__lua_first({raw})")
+                        "lua.to_value(false)".to_string()
                     } else {
-                        raw
+                        "false".to_string()
                     }
                 }
-                Value::ParenthesesExpression(expr) => {
-                    format!("({})", self.emit_expr_mode(expr, wrap_calls))
-                }
-                _ => "lua.nil".to_string(),
+                other => other.to_string(),
             },
+            Expression::Var(var) => self.emit_var_mode(var, wrap_calls),
+            Expression::TableConstructor(table) => self.emit_table(table),
+            Expression::Function(func) => {
+                let (params, _) = self.emit_function_params(func.body());
+                let params = params.join(", ");
+                let mut inner = Emitter::new(&self.module, Analyzer::new(&self.module));
+                inner.indent = self.indent + 1;
+                inner.emit_block(func.body().block());
+                let body_src = inner.lines.join("\n");
+                let indent = "    ".repeat(self.indent);
+                format!("function({params}): Array<LuaValue>\n{body_src}\n{indent}end")
+            }
+            Expression::FunctionCall(call) => {
+                let raw = self.emit_function_call_raw(call, wrap_calls);
+                if wrap_calls {
+                    format!("__lua_first({raw})")
+                } else {
+                    raw
+                }
+            }
             _ => "lua.nil".to_string(),
         }
     }
@@ -1274,17 +1257,15 @@ impl Emitter {
                 if head == "require" {
                     if let FunctionArgs::Parentheses { arguments, .. } = args {
                         let first = arguments.iter().next();
-                        if let Some(Expression::Value { value, .. }) = first {
-                            if let Value::String(tok) = &**value {
-                                let module = tok
-                                    .to_string()
-                                    .trim_matches(|c| c == '"' || c == '\'')
-                                    .to_string();
-                                if module == "math" || module == "table" {
-                                    return "lua.nil".to_string();
-                                }
-                                return format!("lua.require({})", tok.to_string());
+                        if let Some(Expression::String(tok)) = first {
+                            let module = tok
+                                .to_string()
+                                .trim_matches(|c| c == '"' || c == '\'')
+                                .to_string();
+                            if module == "math" || module == "table" {
+                                return "lua.nil".to_string();
                             }
+                            return format!("lua.require({})", tok.to_string());
                         }
                         if let Some(expr) = first {
                             return format!(
@@ -1417,7 +1398,7 @@ impl Emitter {
 
                     // For metamethods with table values, create a shared reference
                     let (key_str, final_value_str) = if is_metamethod
-                        && matches!(value, Expression::Value { value, .. } if matches!(&**value, Value::TableConstructor(_)))
+                        && matches!(value, Expression::TableConstructor(_))
                     {
                         // This is a metamethod with a table literal value - create shared reference
                         let var_name =
@@ -1638,20 +1619,15 @@ impl Emitter {
 
     fn is_multi_return_expr(&self, expr: &Expression) -> bool {
         match expr {
-            Expression::Value { value, .. } => match &**value {
-                Value::FunctionCall(_) => true,
-                Value::Var(var) => {
-                    if let full_moon::ast::Var::Expression(v) = var {
-                        v.suffixes().any(|s| matches!(s, Suffix::Call(_)))
-                    } else {
-                        false
-                    }
+            Expression::FunctionCall(_) => true,
+            Expression::Var(var) => {
+                if let full_moon::ast::Var::Expression(v) = var {
+                    v.suffixes().any(|s| matches!(s, Suffix::Call(_)))
+                } else {
+                    false
                 }
-                Value::Symbol(tok) => tok.token().to_string() == "...",
-                // Parentheses suppress multiple returns in Lua: `(f())` behaves like a single value.
-                Value::ParenthesesExpression(_) => false,
-                _ => false,
-            },
+            }
+            Expression::Symbol(tok) => tok.token().to_string() == "...",
             // Parentheses suppress multiple returns in Lua: `(f())` behaves like a single value.
             Expression::Parentheses { .. } => false,
             _ => false,
@@ -1667,50 +1643,46 @@ impl Emitter {
 
     fn find_function_body<'a>(&'a self, expr: &'a Expression) -> Option<&'a FunctionBody> {
         match expr {
-            Expression::Value { value, .. } => match &**value {
-                Value::Function((_token, body)) => Some(body),
-                Value::FunctionCall(call) => {
-                    if let Some(body) = self.find_function_body_in_prefix(call.prefix()) {
-                        return Some(body);
+            Expression::Function(func) => Some(func.body()),
+            Expression::FunctionCall(call) => {
+                if let Some(body) = self.find_function_body_in_prefix(call.prefix()) {
+                    return Some(body);
+                }
+                for suffix in call.suffixes() {
+                    if let Suffix::Call(call_suffix) = suffix {
+                        if let Some(body) = self.find_function_body_in_call(call_suffix) {
+                            return Some(body);
+                        }
                     }
-                    for suffix in call.suffixes() {
-                        if let Suffix::Call(call_suffix) = suffix {
-                            if let Some(body) = self.find_function_body_in_call(call_suffix) {
+                }
+                None
+            }
+            Expression::TableConstructor(table) => {
+                for field in table.fields() {
+                    match field {
+                        Field::NameKey { value, .. } => {
+                            if let Some(body) = self.find_function_body(value) {
                                 return Some(body);
                             }
                         }
-                    }
-                    None
-                }
-                Value::TableConstructor(table) => {
-                    for field in table.fields() {
-                        match field {
-                            Field::NameKey { value, .. } => {
-                                if let Some(body) = self.find_function_body(value) {
-                                    return Some(body);
-                                }
+                        Field::ExpressionKey { key, value, .. } => {
+                            if let Some(body) = self
+                                .find_function_body(key)
+                                .or_else(|| self.find_function_body(value))
+                            {
+                                return Some(body);
                             }
-                            Field::ExpressionKey { key, value, .. } => {
-                                if let Some(body) = self
-                                    .find_function_body(key)
-                                    .or_else(|| self.find_function_body(value))
-                                {
-                                    return Some(body);
-                                }
-                            }
-                            Field::NoKey(value) => {
-                                if let Some(body) = self.find_function_body(value) {
-                                    return Some(body);
-                                }
-                            }
-                            &_ => {}
                         }
+                        Field::NoKey(value) => {
+                            if let Some(body) = self.find_function_body(value) {
+                                return Some(body);
+                            }
+                        }
+                        _ => {}
                     }
-                    None
                 }
-                Value::ParenthesesExpression(inner) => self.find_function_body(inner),
-                _ => None,
-            },
+                None
+            }
             Expression::BinaryOperator { lhs, rhs, .. } => self
                 .find_function_body(lhs)
                 .or_else(|| self.find_function_body(rhs)),
@@ -1820,10 +1792,7 @@ impl Emitter {
 
     fn is_varargs_expr(&self, expr: &Expression) -> bool {
         match expr {
-            Expression::Value { value, .. } => match &**value {
-                Value::Symbol(tok) => tok.token().to_string() == "...",
-                _ => false,
-            },
+            Expression::Symbol(tok) => tok.token().to_string() == "...",
             Expression::Parentheses { expression, .. } => self.is_varargs_expr(expression),
             _ => false,
         }

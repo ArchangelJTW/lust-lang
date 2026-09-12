@@ -122,9 +122,9 @@ impl TypeChecker {
             }
 
             BinaryOp::Range => {
-                return Err(self.type_error(
+                Err(self.type_error(
                     "Range operator is not supported; use numeric for-loops".to_string(),
-                ));
+                ))
             }
 
             BinaryOp::And | BinaryOp::Or => {
@@ -225,11 +225,10 @@ impl TypeChecker {
                 falsy_parts.push(falsy);
             }
 
-            if self.type_can_be_truthy(&left_type) {
-                if let Some(falsy) = right_info.falsy.clone() {
+            if self.type_can_be_truthy(&left_type)
+                && let Some(falsy) = right_info.falsy.clone() {
                     falsy_parts.push(falsy);
                 }
-            }
 
             let falsy = self.merge_optional_types(falsy_parts);
             let result = self.combine_truthy_falsy(truthy.clone(), falsy.clone());
@@ -270,7 +269,7 @@ impl TypeChecker {
         }
     }
 
-    fn extract_short_circuit_scrutinee<'a>(expr: &'a Expr) -> Option<&'a Expr> {
+    fn extract_short_circuit_scrutinee(expr: &Expr) -> Option<&Expr> {
         match &expr.kind {
             ExprKind::TypeCheck {
                 expr: scrutinee, ..
@@ -283,7 +282,7 @@ impl TypeChecker {
         }
     }
 
-    fn identifier_from_expr<'a>(expr: &'a Expr) -> Option<&'a str> {
+    fn identifier_from_expr(expr: &Expr) -> Option<&str> {
         match &expr.kind {
             ExprKind::Identifier(name) => Some(name.as_str()),
             ExprKind::Paren(inner) => Self::identifier_from_expr(inner),
@@ -437,8 +436,8 @@ impl TypeChecker {
                 Ok(canonical)
             })
             .collect::<Result<Vec<_>>>()?;
-        if let ExprKind::FieldAccess { object, field } = &callee.kind {
-            if let ExprKind::Identifier(type_name) = &object.kind {
+        if let ExprKind::FieldAccess { object, field } = &callee.kind
+            && let ExprKind::Identifier(type_name) = &object.kind {
                 let mut candidate_names: Vec<String> = Vec::new();
                 if let Some(real_mod) = self.resolve_module_alias(type_name) {
                     candidate_names.push(format!("{}.{}", real_mod, field));
@@ -653,8 +652,8 @@ impl TypeChecker {
                                     Self::dummy_span(),
                                 ));
                             }
-                        } else if type_name == "Result" {
-                            if let (Some(ok_type), Some(err_type)) =
+                        } else if type_name == "Result"
+                            && let (Some(ok_type), Some(err_type)) =
                                 (type_params.get("T"), type_params.get("E"))
                             {
                                 return Ok(Type::new(
@@ -665,7 +664,6 @@ impl TypeChecker {
                                     Self::dummy_span(),
                                 ));
                             }
-                        }
 
                         let enum_type_name = {
                             let key = self.resolve_type_key(type_name);
@@ -739,14 +737,13 @@ impl TypeChecker {
                                 _ => {}
                             }
                         }
-                        if type_name == "Option" {
-                            if let Some(inner) = type_params.get("T") {
+                        if type_name == "Option"
+                            && let Some(inner) = type_params.get("T") {
                                 return Ok(Type::new(
                                     TypeKind::Option(Box::new(inner.clone())),
                                     Self::dummy_span(),
                                 ));
                             }
-                        }
                         return self.instantiate_nominal_type(
                             enum_type_name,
                             &enum_def.type_params,
@@ -757,7 +754,6 @@ impl TypeChecker {
                     }
                 }
             }
-        }
 
         if let ExprKind::Identifier(name) = &callee.kind {
             if let Some(var_type) = self.env.lookup_variable(name) {
@@ -1189,13 +1185,12 @@ impl TypeChecker {
                             return Err(self.type_error("unwrap() takes no arguments".to_string()));
                         }
 
-                        if let ExprKind::Identifier(var_name) = &receiver.kind {
-                            if let Some(concrete_type) =
+                        if let ExprKind::Identifier(var_name) = &receiver.kind
+                            && let Some(concrete_type) =
                                 self.env.lookup_generic_param(var_name, "T")
                             {
                                 return Ok(concrete_type);
                             }
-                        }
 
                         return Ok(Type::new(TypeKind::Unknown, span));
                     }
@@ -1399,13 +1394,12 @@ impl TypeChecker {
                             self.env
                                 .lookup_trait(&key)
                                 .or_else(|| self.env.lookup_trait(trait_name.as_str()))
-                        } {
-                            if let Some(trait_method) =
+                        }
+                            && let Some(trait_method) =
                                 trait_def.methods.iter().find(|m| m.name == method)
                             {
                                 matching_methods.push((trait_name.clone(), trait_method.clone()));
                             }
-                        }
                     }
                     if matching_methods.len() > 1 {
                         return Err(self.type_error(format!(
@@ -1460,8 +1454,8 @@ impl TypeChecker {
                     self.env
                         .lookup_trait(&key)
                         .or_else(|| self.env.lookup_trait(trait_name.as_str()))
-                } {
-                    if let Some(trait_method) =
+                }
+                    && let Some(trait_method) =
                         trait_def.methods.iter().find(|m| m.name == method).cloned()
                     {
                         let params: Vec<_> = trait_method
@@ -1497,7 +1491,6 @@ impl TypeChecker {
                             .unwrap_or(Type::new(TypeKind::Unit, span));
                         return Ok(self.canonicalize_type(&return_type));
                     }
-                }
             }
 
             _ => {}
@@ -1516,8 +1509,8 @@ impl TypeChecker {
         field: &str,
         expected_type: Option<&Type>,
     ) -> Result<Type> {
-        if let ExprKind::Identifier(enum_name) = &object.kind {
-            if let Some(enum_def) = {
+        if let ExprKind::Identifier(enum_name) = &object.kind
+            && let Some(enum_def) = {
                 let key = self.resolve_type_key(enum_name);
                 self.env
                     .lookup_enum(&key)
@@ -1527,7 +1520,7 @@ impl TypeChecker {
                 let variant_def = enum_def
                     .variants
                     .iter()
-                    .find(|v| &v.name == field)
+                    .find(|v| v.name == field)
                     .ok_or_else(|| {
                         self.type_error_at(
                             format!("Enum '{}' has no variant '{}'", enum_name, field),
@@ -1577,7 +1570,6 @@ impl TypeChecker {
 
                 return Ok(Type::new(TypeKind::Named(enum_name.clone()), span));
             }
-        }
 
         let object_type = self.check_expr(object)?;
         if matches!(object_type.kind, TypeKind::Unknown)
@@ -1585,14 +1577,13 @@ impl TypeChecker {
         {
             return Ok(Type::new(TypeKind::Unknown, span));
         }
-        if let TypeKind::Union(types) = &object_type.kind {
-            if types.iter().any(|t| {
+        if let TypeKind::Union(types) = &object_type.kind
+            && types.iter().any(|t| {
                 matches!(t.kind, TypeKind::Unknown)
                     || matches!(&t.kind, TypeKind::Named(name) if name == "LuaValue" || name == "LuaTable")
             }) {
                 return Ok(Type::new(TypeKind::Unknown, span));
             }
-        }
         if let TypeKind::Map(_, value_type) = &object_type.kind {
             return Ok(value_type.as_ref().clone());
         }
@@ -1663,14 +1654,13 @@ impl TypeChecker {
         {
             return Ok(Type::new(TypeKind::Unknown, Self::dummy_span()));
         }
-        if let TypeKind::Union(types) = &object_type.kind {
-            if types.iter().any(|t| {
+        if let TypeKind::Union(types) = &object_type.kind
+            && types.iter().any(|t| {
                 matches!(t.kind, TypeKind::Unknown)
                     || matches!(&t.kind, TypeKind::Named(name) if name == "LuaValue" || name == "LuaTable")
             }) {
                 return Ok(Type::new(TypeKind::Unknown, Self::dummy_span()));
             }
-        }
         match &object_type.kind {
             TypeKind::Array(elem_type) => {
                 self.unify(&Type::new(TypeKind::Int, Self::dummy_span()), &index_type)?;

@@ -161,7 +161,7 @@ impl IntoTypedValue for Value {
 impl IntoTypedValue for StructInstance {
     fn into_typed_value(self) -> TypedValue {
         let value = self.into_value();
-        TypedValue::new(value, |v, ty| matches_lust_struct(v, ty), "struct")
+        TypedValue::new(value, matches_lust_struct, "struct")
     }
 }
 
@@ -174,7 +174,7 @@ impl IntoTypedValue for StructHandle {
 impl IntoTypedValue for EnumInstance {
     fn into_typed_value(self) -> TypedValue {
         let value = self.into_value();
-        TypedValue::new(value, |v, ty| matches_lust_enum(v, ty), "enum")
+        TypedValue::new(value, matches_lust_enum, "enum")
     }
 }
 
@@ -224,14 +224,14 @@ impl IntoTypedValue for String {
     }
 }
 
-impl<'a> IntoTypedValue for &'a str {
+impl IntoTypedValue for &str {
     fn into_typed_value(self) -> TypedValue {
         let value = self.into_value();
         TypedValue::new(value, string_matcher, "string")
     }
 }
 
-impl<'a> IntoTypedValue for &'a String {
+impl IntoTypedValue for &String {
     fn into_typed_value(self) -> TypedValue {
         let value = self.into_value();
         TypedValue::new(value, string_matcher, "string")
@@ -577,7 +577,7 @@ impl IntoLustValue for StructInstance {
             TypeKind::Unknown | TypeKind::Named(_) | TypeKind::GenericInstance { .. } => true,
             TypeKind::Union(types) => types
                 .iter()
-                .any(|alt| <Self as IntoLustValue>::matches_lust_type(alt)),
+                .any(<Self as IntoLustValue>::matches_lust_type),
             _ => false,
         }
     }
@@ -630,7 +630,7 @@ impl FromLustValue for StructInstance {
             TypeKind::Unknown | TypeKind::Named(_) | TypeKind::GenericInstance { .. } => true,
             TypeKind::Union(types) => types
                 .iter()
-                .any(|alt| <Self as FromLustValue>::matches_lust_type(alt)),
+                .any(<Self as FromLustValue>::matches_lust_type),
             _ => false,
         }
     }
@@ -684,7 +684,7 @@ impl IntoLustValue for EnumInstance {
             TypeKind::Unknown | TypeKind::Named(_) | TypeKind::GenericInstance { .. } => true,
             TypeKind::Union(types) => types
                 .iter()
-                .any(|alt| <Self as IntoLustValue>::matches_lust_type(alt)),
+                .any(<Self as IntoLustValue>::matches_lust_type),
             _ => false,
         }
     }
@@ -711,7 +711,7 @@ impl FromLustValue for EnumInstance {
             TypeKind::Unknown | TypeKind::Named(_) | TypeKind::GenericInstance { .. } => true,
             TypeKind::Union(types) => types
                 .iter()
-                .any(|alt| <Self as FromLustValue>::matches_lust_type(alt)),
+                .any(<Self as FromLustValue>::matches_lust_type),
             _ => false,
         }
     }
@@ -836,7 +836,7 @@ impl FromLustValue for MapHandle {
     }
 }
 
-impl<'a> IntoLustValue for &'a str {
+impl IntoLustValue for &str {
     fn into_value(self) -> Value {
         Value::String(Rc::new(self.to_owned()))
     }
@@ -850,7 +850,7 @@ impl<'a> IntoLustValue for &'a str {
     }
 }
 
-impl<'a> IntoLustValue for &'a String {
+impl IntoLustValue for &String {
     fn into_value(self) -> Value {
         Value::String(Rc::new(self.clone()))
     }

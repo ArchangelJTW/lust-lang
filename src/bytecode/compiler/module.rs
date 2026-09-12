@@ -308,11 +308,10 @@ impl Compiler {
     }
 
     pub(super) fn is_module_level_identifier(&self, name: &str) -> bool {
-        if let Some(module) = self.module_scope_name() {
-            if let Some(locals) = self.module_locals.get(module) {
+        if let Some(module) = self.module_scope_name()
+            && let Some(locals) = self.module_locals.get(module) {
                 return locals.contains(name);
             }
-        }
 
         false
     }

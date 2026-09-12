@@ -312,7 +312,7 @@ fn inspect_library(path: &Path) -> Result<LibrarySignature, DependencyResolution
 }
 
 fn has_lua_files(root: &Path) -> bool {
-    collect_lua_files(root).len() > 0
+    !collect_lua_files(root).is_empty()
 }
 
 fn collect_lua_files(root: &Path) -> Vec<PathBuf> {
@@ -327,11 +327,10 @@ fn collect_lua_files_recursive(base: &Path, current: &Path, files: &mut Vec<Path
             let path = entry.path();
             if path.is_dir() {
                 collect_lua_files_recursive(base, &path, files);
-            } else if path.extension().and_then(|s| s.to_str()) == Some("lua") {
-                if let Ok(relative) = path.strip_prefix(base) {
+            } else if path.extension().and_then(|s| s.to_str()) == Some("lua")
+                && let Ok(relative) = path.strip_prefix(base) {
                     files.push(relative.to_path_buf());
                 }
-            }
         }
     }
 }

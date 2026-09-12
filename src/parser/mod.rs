@@ -123,7 +123,7 @@ impl Parser {
             | TokenKind::Use
             | TokenKind::Module
             | TokenKind::Extern => true,
-            TokenKind::Local => self.peek_ahead(1).map_or(false, |t| {
+            TokenKind::Local => self.peek_ahead(1).is_some_and(|t| {
                 matches!(
                     t.kind,
                     TokenKind::Function | TokenKind::Struct | TokenKind::Enum | TokenKind::Trait
@@ -138,7 +138,7 @@ impl Parser {
     }
 
     fn peek_kind(&self) -> TokenKind {
-        self.current_token().kind.clone()
+        self.current_token().kind
     }
 
     fn peek_ahead(&self, n: usize) -> Option<&Token> {
@@ -167,7 +167,7 @@ impl Parser {
 
     fn match_token(&mut self, kinds: &[TokenKind]) -> bool {
         for kind in kinds {
-            if self.check(kind.clone()) {
+            if self.check(*kind) {
                 self.advance();
                 return true;
             }

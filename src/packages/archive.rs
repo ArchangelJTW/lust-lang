@@ -252,11 +252,10 @@ fn sanitize_manifest(path: &Path) -> Result<(), ArchiveError> {
 
 fn sanitize_dependency_tables(table: &mut toml::value::Table, changed: &mut bool) {
     for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
-        if let Some(value) = table.get_mut(key) {
-            if let Value::Table(dep_table) = value {
+        if let Some(value) = table.get_mut(key)
+            && let Value::Table(dep_table) = value {
                 sanitize_dependency_table(dep_table, changed);
             }
-        }
     }
     for (_, value) in table.iter_mut() {
         if let Value::Table(sub) = value {
@@ -267,11 +266,10 @@ fn sanitize_dependency_tables(table: &mut toml::value::Table, changed: &mut bool
 
 fn sanitize_dependency_table(table: &mut toml::value::Table, changed: &mut bool) {
     for (_, value) in table.iter_mut() {
-        if let Value::Table(spec) = value {
-            if sanitize_spec_table(spec) {
+        if let Value::Table(spec) = value
+            && sanitize_spec_table(spec) {
                 *changed = true;
             }
-        }
     }
 }
 

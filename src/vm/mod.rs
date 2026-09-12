@@ -35,7 +35,7 @@ mod tracing;
 pub use self::api::{NativeExport, NativeExportParam};
 #[cfg(feature = "std")]
 thread_local! {
-    static CURRENT_VM_STACK: RefCell<Vec<*mut VM>> = RefCell::new(Vec::new());
+    static CURRENT_VM_STACK: RefCell<Vec<*mut VM>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(not(feature = "std"))]

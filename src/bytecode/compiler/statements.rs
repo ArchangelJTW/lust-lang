@@ -77,10 +77,9 @@ impl Compiler {
                             right,
                         },
                     ) = (&targets[0].kind, &values[0].kind)
-                    {
-                        if let ExprKind::Identifier(left_name) = &left.kind {
-                            if left_name == target_name {
-                                if let Ok(target_reg) = self.resolve_local(target_name) {
+                        && let ExprKind::Identifier(left_name) = &left.kind
+                            && left_name == target_name
+                                && let Ok(target_reg) = self.resolve_local(target_name) {
                                     let rhs_reg = self.compile_expr(right)?;
                                     self.emit(
                                         Instruction::Concat(target_reg, target_reg, rhs_reg),
@@ -93,9 +92,6 @@ impl Compiler {
                                     self.free_register(rhs_reg);
                                     return Ok(());
                                 }
-                            }
-                        }
-                    }
 
                     let expression_start = self.current_chunk().instructions.len();
                     let value_reg = self.compile_expr(&values[0])?;
@@ -122,7 +118,7 @@ impl Compiler {
                             (local_reg, true, name.clone())
                         } else if self.is_module_level_identifier(name) {
                             let reg = self.allocate_register();
-                            self.emit_load_module_global(&name, reg)?;
+                            self.emit_load_module_global(name, reg)?;
                             (reg, false, name.clone())
                         } else {
                             return Err(LustError::CompileError(
@@ -409,7 +405,7 @@ impl Compiler {
         self.begin_scope();
         let int_loop = self.numeric_type(start.span) == Some(NumericType::Int)
             && self.numeric_type(end.span) == Some(NumericType::Int)
-            && step.map_or(true, |step| {
+            && step.is_none_or(|step| {
                 self.numeric_type(step.span) == Some(NumericType::Int)
             });
         let specialize = |instruction: Instruction| {
@@ -443,10 +439,10 @@ impl Compiler {
         if let Some(scope) = self.scopes.last_mut() {
             scope
                 .locals
-                .insert(format!("(for limit)"), (end_reg, false));
+                .insert("(for limit)".to_string(), (end_reg, false));
             scope
                 .locals
-                .insert(format!("(for step)"), (step_reg, false));
+                .insert("(for step)".to_string(), (step_reg, false));
         }
 
         // The loop test depends on the sign of the step: an ascending loop runs
@@ -550,8 +546,8 @@ impl Compiler {
             } if method == "iter" => Some(receiver),
             _ => Some(iterator),
         };
-        if variables.len() == 1 {
-            if let Some(arr_expr) = array_receiver_expr {
+        if variables.len() == 1
+            && let Some(arr_expr) = array_receiver_expr {
                 self.begin_scope();
                 let array_reg = self.compile_expr(arr_expr)?;
                 let elem_reg = self.allocate_register();
@@ -620,7 +616,6 @@ impl Compiler {
                 self.end_scope();
                 return Ok(());
             }
-        }
 
         self.begin_scope();
         let iter_reg = if let crate::ast::ExprKind::MethodCall { method, .. } = &iterator.kind {
@@ -651,7 +646,7 @@ impl Compiler {
         if let Some(scope) = self.scopes.last_mut() {
             scope
                 .locals
-                .insert(format!("(for iterator)"), (iter_reg, false));
+                .insert("(for iterator)".to_string(), (iter_reg, false));
         }
 
         let loop_start = self.current_chunk().instructions.len();

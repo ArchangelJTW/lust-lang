@@ -427,8 +427,8 @@ impl<'a> Lexer<'a> {
             self.advance();
         }
 
-        if !self.is_at_end() && self.current_char() == '.' {
-            if self.peek(1) != Some('.') && self.peek(1).map_or(false, |c| c.is_ascii_digit()) {
+        if !self.is_at_end() && self.current_char() == '.'
+            && self.peek(1) != Some('.') && self.peek(1).is_some_and(|c| c.is_ascii_digit()) {
                 is_float = true;
                 value.push(self.current_char());
                 self.advance();
@@ -437,7 +437,6 @@ impl<'a> Lexer<'a> {
                     self.advance();
                 }
             }
-        }
 
         if !self.is_at_end() && (self.current_char() == 'e' || self.current_char() == 'E') {
             is_float = true;

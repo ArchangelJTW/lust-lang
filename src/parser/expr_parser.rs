@@ -28,7 +28,7 @@ impl Parser {
             self.current_token().line
         );
 
-        Ok(self.parse_assignment()?)
+        self.parse_assignment()
     }
 
     #[inline(never)]
@@ -132,11 +132,10 @@ impl Parser {
     fn parse_concat(&mut self) -> Result<Expr> {
         let mut expr = self.parse_term()?;
         while self.check(TokenKind::DoubleDot) {
-            if let Some(next) = self.peek_ahead(1) {
-                if matches!(next.kind, TokenKind::Integer | TokenKind::Float) {
+            if let Some(next) = self.peek_ahead(1)
+                && matches!(next.kind, TokenKind::Integer | TokenKind::Float) {
                     break;
                 }
-            }
 
             self.advance();
             let right = self.parse_term()?;
@@ -485,16 +484,14 @@ impl Parser {
             .current
             .checked_sub(1)
             .and_then(|index| self.tokens.get(index))
-        {
-            if less.line != previous.line
+            && (less.line != previous.line
                 || less.column
                     != previous
                         .column
-                        .saturating_add(previous.lexeme.chars().count())
+                        .saturating_add(previous.lexeme.chars().count()))
             {
                 return false;
             }
-        }
         let mut depth = 0usize;
         let mut index = self.current;
         while let Some(token) = self.tokens.get(index) {
@@ -641,7 +638,7 @@ impl Parser {
             TokenKind::Function => {
                 if self
                     .peek_ahead(1)
-                    .map_or(false, |t| t.kind == TokenKind::LeftParen)
+                    .is_some_and(|t| t.kind == TokenKind::LeftParen)
                 {
                     return self.parse_lambda_function();
                 } else {

@@ -64,8 +64,8 @@ impl TypeChecker {
             trait_bounds: self.canonicalize_trait_bounds(&func.trait_bounds),
         };
         let mut resolved_self_type: Option<String> = None;
-        if func.is_method {
-            if let Some(colon_pos) = func.name.find(':') {
+        if func.is_method
+            && let Some(colon_pos) = func.name.find(':') {
                 let type_name = &func.name[..colon_pos];
                 let resolved = self.resolve_type_key(type_name);
                 resolved_self_type = Some(resolved.clone());
@@ -84,7 +84,6 @@ impl TypeChecker {
                     self.env.register_impl(&impl_block)?;
                 }
             }
-        }
 
         if self.env.lookup_function(&func.name).is_none() {
             self.env.register_function(func.name.clone(), sig)?;
@@ -97,12 +96,11 @@ impl TypeChecker {
         }
 
         self.env.push_scope();
-        if func.is_method && !func.params.iter().any(|p| p.is_self) {
-            if let Some(resolved) = resolved_self_type.as_ref().cloned() {
+        if func.is_method && !func.params.iter().any(|p| p.is_self)
+            && let Some(resolved) = resolved_self_type.as_ref().cloned() {
                 let self_type = Type::new(TypeKind::Named(resolved), TypeChecker::dummy_span());
                 self.env.declare_variable("self".to_string(), self_type)?;
             }
-        }
 
         for (param, ty) in func.params.iter().zip(canonical_param_types.iter()) {
             self.env.declare_variable(param.name.clone(), ty.clone())?;
@@ -114,8 +112,8 @@ impl TypeChecker {
             self.check_stmt(stmt)?;
         }
 
-        if !func.body.is_empty() {
-            if let Some(last_stmt) = func.body.last() {
+        if !func.body.is_empty()
+            && let Some(last_stmt) = func.body.last() {
                 match &last_stmt.kind {
                     StmtKind::Return(_) => {}
                     StmtKind::Expr(expr) => {
@@ -125,7 +123,6 @@ impl TypeChecker {
                     _ => {}
                 }
             }
-        }
 
         self.current_function_return_type = prev_return_type;
         self.current_trait_bounds = prev_trait_bounds;
@@ -232,8 +229,7 @@ impl TypeChecker {
                     if let Some(index) = declared_params
                         .iter()
                         .position(|param| param == &bound.type_param)
-                    {
-                        if let Some(Type {
+                        && let Some(Type {
                             kind: TypeKind::Generic(actual_param),
                             ..
                         }) = type_args.get(index)
@@ -248,7 +244,6 @@ impl TypeChecker {
                                 .or_default()
                                 .extend(traits);
                         }
-                    }
                 }
             }
         }
@@ -339,14 +334,13 @@ impl TypeChecker {
                         if trait_has_self { "have " } else { "not have " }
                     )));
                 }
-                if let Some(self_param) = impl_method.params.iter().find(|param| param.is_self) {
-                    if !matches!(self_param.ty.kind, TypeKind::Infer) {
+                if let Some(self_param) = impl_method.params.iter().find(|param| param.is_self)
+                    && !matches!(self_param.ty.kind, TypeKind::Infer) {
                         return Err(self.type_error(format!(
                             "Method '{}' in impl for '{}' must use an unannotated self parameter",
                             trait_method.name, type_name
                         )));
                     }
-                }
                 if trait_params.len() != impl_params.len() {
                     return Err(self.type_error(format!(
                         "Method '{}' in impl for '{}' has {} parameters, but trait '{}' requires {}",
@@ -439,8 +433,8 @@ impl TypeChecker {
                         trait_bounds: Vec::new(),
                     };
                     self.register_external_function((name.clone(), sig.clone()))?;
-                    if let Some((_struct_name_raw, method_name)) = name.split_once(':') {
-                        if let Some(self_ty) = canonical_params.first() {
+                    if let Some((_struct_name_raw, method_name)) = name.split_once(':')
+                        && let Some(self_ty) = canonical_params.first() {
                             let canonical_self = self_ty.clone();
                             if matches!(
                                 canonical_self.kind,
@@ -484,7 +478,6 @@ impl TypeChecker {
                                 self.register_external_impl(impl_block)?;
                             }
                         }
-                    }
                 }
 
                 ExternItem::Const { name, ty } => {

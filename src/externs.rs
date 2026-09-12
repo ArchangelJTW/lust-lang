@@ -183,8 +183,8 @@ fn extern_files_from_exports(
                         contents.push_str(return_type);
                     }
                     contents.push('\n');
-                } else if let Some(default) = &options.default_module {
-                    if default == &module {
+                } else if let Some(default) = &options.default_module
+                    && default == &module {
                         let params = format_params(export);
                         let return_type = export.return_type();
                         contents.push_str("    function ");
@@ -198,7 +198,6 @@ fn extern_files_from_exports(
                         }
                         contents.push('\n');
                     }
-                }
             }
             contents.push_str("end\n");
         }
@@ -238,11 +237,10 @@ fn format_params(export: &NativeExport) -> String {
 fn relative_stub_path(module: &str) -> PathBuf {
     let mut path = PathBuf::new();
     let mut segments: Vec<String> = module.split('.').map(|seg| seg.replace('-', "_")).collect();
-    if let Some(first) = segments.first() {
-        if first == "externs" {
+    if let Some(first) = segments.first()
+        && first == "externs" {
             segments.remove(0);
         }
-    }
     if let Some(first) = segments.first() {
         path.push(first);
     }

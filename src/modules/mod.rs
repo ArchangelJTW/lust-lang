@@ -625,12 +625,10 @@ impl ModuleLoader {
         use crate::ast::{ExprKind, Literal};
         match &expr.kind {
             ExprKind::Call { callee, args, .. } => {
-                if self.is_lua_require_callee(callee) {
-                    if let Some(name) = args
-                        .get(0)
+                if self.is_lua_require_callee(callee)
+                    && let Some(name) = args.first()
                         .and_then(|arg| self.extract_lua_require_name(arg))
-                    {
-                        if !Self::is_lua_builtin_module_name(&name) {
+                        && !Self::is_lua_builtin_module_name(&name) {
                             // `lua.require()` calls originate from transpiled Lua stubs. Unlike
                             // Lust `use` imports, these should only pull in modules that we can
                             // actually locate in the current module roots (extern stubs, on-disk
@@ -641,8 +639,6 @@ impl ModuleLoader {
                                 deps.insert(name);
                             }
                         }
-                    }
-                }
                 self.collect_deps_from_lua_require_expr(callee, deps);
                 for arg in args {
                     self.collect_deps_from_lua_require_expr(arg, deps);
@@ -749,7 +745,7 @@ impl ModuleLoader {
         match &expr.kind {
             ExprKind::Literal(Literal::String(s)) => Some(s.clone()),
             ExprKind::Call { callee, args, .. } if self.is_lua_to_value_callee(callee) => {
-                args.get(0).and_then(|arg| match &arg.kind {
+                args.first().and_then(|arg| match &arg.kind {
                     ExprKind::Literal(Literal::String(s)) => Some(s.clone()),
                     _ => None,
                 })

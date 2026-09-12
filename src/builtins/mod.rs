@@ -1508,11 +1508,10 @@ pub fn lookup_builtin_method(
     name: &str,
 ) -> Option<(&'static BuiltinMethod, HashMap<&'static str, Type>)> {
     for method in builtin_methods() {
-        if method.name == name {
-            if let Some(bindings) = match_receiver(&method.receiver, receiver) {
+        if method.name == name
+            && let Some(bindings) = match_receiver(&method.receiver, receiver) {
                 return Some((method, bindings));
             }
-        }
     }
     None
 }

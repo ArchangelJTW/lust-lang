@@ -40,8 +40,8 @@ impl TraceOptimizer {
         let mut ops = Vec::with_capacity(trace.ops.len());
         let mut i = 0;
         while i < trace.ops.len() {
-            if i + 3 < trace.ops.len() {
-                if let (
+            if i + 3 < trace.ops.len()
+                && let (
                     TraceOp::TryGetIndex {
                         dest: result_reg,
                         array,
@@ -68,8 +68,8 @@ impl TraceOptimizer {
                     &trace.ops[i + 1],
                     &trace.ops[i + 2],
                     &trace.ops[i + 3],
-                ) {
-                    if tested_reg == result_reg
+                )
+                    && tested_reg == result_reg
                         && enum_reg == result_reg
                         && condition_register == condition_reg
                         && enum_name == "Result"
@@ -89,8 +89,6 @@ impl TraceOptimizer {
                         i += 4;
                         continue;
                     }
-                }
-            }
 
             ops.push(trace.ops[i].clone());
             i += 1;
@@ -106,8 +104,8 @@ impl TraceOptimizer {
         let mut ops = Vec::with_capacity(trace.ops.len());
         let mut i = 0;
         while i < trace.ops.len() {
-            if i + 3 < trace.ops.len() {
-                if let (
+            if i + 3 < trace.ops.len()
+                && let (
                     TraceOp::TryCast {
                         dest: option_reg,
                         value,
@@ -134,8 +132,8 @@ impl TraceOptimizer {
                     &trace.ops[i + 1],
                     &trace.ops[i + 2],
                     &trace.ops[i + 3],
-                ) {
-                    if tested_reg == option_reg
+                )
+                    && tested_reg == option_reg
                         && enum_reg == option_reg
                         && condition_register == condition_reg
                         && enum_name == "Option"
@@ -154,8 +152,6 @@ impl TraceOptimizer {
                         i += 4;
                         continue;
                     }
-                }
-            }
 
             ops.push(trace.ops[i].clone());
             i += 1;

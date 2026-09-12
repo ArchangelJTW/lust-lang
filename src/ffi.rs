@@ -133,12 +133,12 @@ fn value_to_ffi(value: Value) -> Result<LustFfiValue> {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_clear_last_error() {
     clear_last_error();
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_last_error_message() -> *const c_char {
     LAST_ERROR.with(|slot| {
         if let Some(err) = slot.borrow().as_ref() {
@@ -149,7 +149,7 @@ pub extern "C" fn lust_last_error_message() -> *const c_char {
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_string_free(ptr: *mut c_char) {
     if ptr.is_null() {
         return;
@@ -160,7 +160,7 @@ pub extern "C" fn lust_string_free(ptr: *mut c_char) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_value_dispose(value: *mut LustFfiValue) {
     if value.is_null() {
         return;
@@ -176,13 +176,13 @@ pub extern "C" fn lust_value_dispose(value: *mut LustFfiValue) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_builder_new() -> *mut EmbeddedBuilder {
     clear_last_error();
     Box::into_raw(Box::new(EmbeddedBuilder::new()))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_builder_free(builder: *mut EmbeddedBuilder) {
     if builder.is_null() {
         return;
@@ -193,7 +193,7 @@ pub extern "C" fn lust_builder_free(builder: *mut EmbeddedBuilder) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_builder_add_module(
     builder: *mut EmbeddedBuilder,
     module_path: *const c_char,
@@ -236,7 +236,7 @@ pub extern "C" fn lust_builder_add_module(
     true
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_builder_set_entry_module(
     builder: *mut EmbeddedBuilder,
     module_path: *const c_char,
@@ -265,7 +265,7 @@ pub extern "C" fn lust_builder_set_entry_module(
     true
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_builder_set_base_dir(
     builder: *mut EmbeddedBuilder,
     base_dir: *const c_char,
@@ -294,7 +294,7 @@ pub extern "C" fn lust_builder_set_base_dir(
     true
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_builder_compile(builder: *mut EmbeddedBuilder) -> *mut EmbeddedProgram {
     clear_last_error();
     if builder.is_null() {
@@ -312,7 +312,7 @@ pub extern "C" fn lust_builder_compile(builder: *mut EmbeddedBuilder) -> *mut Em
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_program_free(program: *mut EmbeddedProgram) {
     if program.is_null() {
         return;
@@ -323,7 +323,7 @@ pub extern "C" fn lust_program_free(program: *mut EmbeddedProgram) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_program_run_entry(program: *mut EmbeddedProgram) -> bool {
     clear_last_error();
     if program.is_null() {
@@ -335,7 +335,7 @@ pub extern "C" fn lust_program_run_entry(program: *mut EmbeddedProgram) -> bool 
     handle_result(program_ref.run_entry_script()).is_some()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_program_call(
     program: *mut EmbeddedProgram,
     function_name: *const c_char,
@@ -411,7 +411,7 @@ pub extern "C" fn lust_program_call(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_program_get_global(
     program: *mut EmbeddedProgram,
     name: *const c_char,
@@ -466,7 +466,7 @@ pub extern "C" fn lust_program_get_global(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_program_set_global(
     program: *mut EmbeddedProgram,
     name: *const c_char,

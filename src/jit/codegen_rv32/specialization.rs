@@ -147,7 +147,7 @@ impl JitCompiler {
     ///
     /// Calls: `jit_unbox_array_int(array_ptr, out_vec_ptr, out_len, out_cap) -> u8`
     fn compile_unbox_array_int(&mut self, specialized_id: usize, source_reg: u8) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_unbox_array_int(
                 array_value_ptr: *const Value,
                 out_vec_ptr: *mut *mut LustInt,
@@ -191,7 +191,7 @@ impl JitCompiler {
     ///
     /// Calls: `jit_rebox_array_int(vec_ptr, vec_len, vec_cap, out_value_ptr) -> u8`
     fn compile_rebox_array_int(&mut self, dest_reg: u8, specialized_id: usize) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_rebox_array_int(
                 vec_ptr: *mut LustInt,
                 vec_len: usize,
@@ -237,7 +237,7 @@ impl JitCompiler {
     ///
     /// Calls: `jit_vec_int_push(vec_ptr_addr, len_addr, cap_addr, value) -> u8`
     fn compile_vec_int_push(&mut self, vec_id: usize, value_reg: u8) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_vec_int_push(
                 vec_ptr: *mut *mut LustInt,
                 vec_len: *mut usize,
@@ -300,7 +300,7 @@ impl JitCompiler {
     ///
     /// Calls: `jit_drop_vec_int(vec_ptr, vec_len, vec_cap)`
     fn compile_drop_vec_int(&mut self, vec_id: usize) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_drop_vec_int(vec_ptr: *mut LustInt, vec_len: usize, vec_cap: usize);
         }
 

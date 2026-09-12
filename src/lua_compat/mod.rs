@@ -1428,14 +1428,14 @@ pub fn trace_luaopen(spec: &LuaModuleSpec) -> Result<Vec<LuaOpenResult>, String>
 
 /// --- C ABI shims ---
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_newstate() -> *mut lua_State {
     Box::into_raw(Box::new(lua_State {
         state: LuaState::new(),
     }))
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_newstate(
     _alloc: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void>,
     _ud: *mut c_void,
@@ -1443,14 +1443,14 @@ pub unsafe extern "C" fn lua_newstate(
     luaL_newstate()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_close(L: *mut lua_State) {
     if !L.is_null() {
         drop(Box::from_raw(L));
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_gettop(L: *mut lua_State) -> c_int {
     if let Some(state) = state_from_ptr(L) {
         let top = state.len() as c_int;
@@ -1461,7 +1461,7 @@ pub unsafe extern "C" fn lua_gettop(L: *mut lua_State) -> c_int {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_settop(L: *mut lua_State, idx: c_int) {
     if let Some(state) = state_from_ptr(L) {
         let new_len = if idx >= 0 {
@@ -1485,7 +1485,7 @@ pub unsafe extern "C" fn lua_settop(L: *mut lua_State, idx: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_pushvalue(L: *mut lua_State, idx: c_int) {
     if let Some(state) = state_from_ptr(L) {
         if let Some(val) = value_at(state, idx) {
@@ -1495,7 +1495,7 @@ pub unsafe extern "C" fn lua_pushvalue(L: *mut lua_State, idx: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_remove(L: *mut lua_State, idx: c_int) {
     if let Some(state) = state_from_ptr(L) {
         if pseudo_table(state, idx).is_some() {
@@ -1509,7 +1509,7 @@ pub unsafe extern "C" fn lua_remove(L: *mut lua_State, idx: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_insert(L: *mut lua_State, idx: c_int) {
     if let Some(state) = state_from_ptr(L) {
         if let Some(slot) = translate_index(state.stack.len(), idx) {
@@ -1521,7 +1521,7 @@ pub unsafe extern "C" fn lua_insert(L: *mut lua_State, idx: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_replace(L: *mut lua_State, idx: c_int) {
     if let Some(state) = state_from_ptr(L) {
         // Lua semantics: `lua_replace(L, idx)` is equivalent to `lua_copy(L, -1, idx); lua_pop(L, 1);`
@@ -1540,7 +1540,7 @@ pub unsafe extern "C" fn lua_replace(L: *mut lua_State, idx: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_checkstack(L: *mut lua_State, _sz: c_int) -> c_int {
     if let Some(state) = state_from_ptr(L) {
         state.record_call("lua_checkstack", vec![_sz.to_string()]);
@@ -1548,7 +1548,7 @@ pub unsafe extern "C" fn lua_checkstack(L: *mut lua_State, _sz: c_int) -> c_int 
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_type(L: *mut lua_State, idx: c_int) -> c_int {
     if let Some(state) = state_from_ptr(L) {
         let code = value_at(state, idx)
@@ -1561,7 +1561,7 @@ pub unsafe extern "C" fn lua_type(L: *mut lua_State, idx: c_int) -> c_int {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_typename(L: *mut lua_State, tp: c_int) -> *const c_char {
     const TYPE_NAMES: [&[u8]; 10] = [
         b"no value\0",
@@ -1595,7 +1595,7 @@ pub unsafe extern "C" fn lua_typename(L: *mut lua_State, tp: c_int) -> *const c_
     raw.as_ptr() as *const c_char
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_isstring(L: *mut lua_State, idx: c_int) -> c_int {
     matches!(lua_type(L, idx), LUA_TSTRING | LUA_TNUMBER) as c_int
 }
@@ -1627,7 +1627,7 @@ fn parse_lua_number(text: &str) -> Option<lua_Number> {
     rest.parse::<lua_Number>().ok().map(|v| v * sign)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_isnumber(L: *mut lua_State, idx: c_int) -> c_int {
     if let Some(state) = state_from_ptr(L) {
         state.record_call("lua_isnumber", vec![idx.to_string()]);
@@ -1640,22 +1640,22 @@ pub unsafe extern "C" fn lua_isnumber(L: *mut lua_State, idx: c_int) -> c_int {
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_iscfunction(L: *mut lua_State, idx: c_int) -> c_int {
     matches!(lua_type(L, idx), LUA_TFUNCTION) as c_int
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_istable(L: *mut lua_State, idx: c_int) -> c_int {
     (lua_type(L, idx) == LUA_TTABLE) as c_int
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_isuserdata(L: *mut lua_State, idx: c_int) -> c_int {
     matches!(lua_type(L, idx), LUA_TUSERDATA | LUA_TLIGHTUSERDATA) as c_int
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_toboolean(L: *mut lua_State, idx: c_int) -> c_int {
     if let Some(state) = state_from_ptr(L) {
         state.record_call("lua_toboolean", vec![idx.to_string()]);
@@ -1674,7 +1674,7 @@ pub unsafe extern "C" fn lua_toboolean(L: *mut lua_State, idx: c_int) -> c_int {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_tonumber(L: *mut lua_State, idx: c_int) -> lua_Number {
     if let Some(state) = state_from_ptr(L) {
         state.record_call("lua_tonumber", vec![idx.to_string()]);
@@ -1689,7 +1689,7 @@ pub unsafe extern "C" fn lua_tonumber(L: *mut lua_State, idx: c_int) -> lua_Numb
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_tointeger(L: *mut lua_State, idx: c_int) -> lua_Integer {
     if let Some(state) = state_from_ptr(L) {
         state.record_call("lua_tointeger", vec![idx.to_string()]);
@@ -1706,7 +1706,7 @@ pub unsafe extern "C" fn lua_tointeger(L: *mut lua_State, idx: c_int) -> lua_Int
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_tolstring(
     L: *mut lua_State,
     idx: c_int,
@@ -1732,7 +1732,7 @@ pub unsafe extern "C" fn lua_tolstring(
     ptr
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_objlen(L: *mut lua_State, idx: c_int) -> usize {
     let mut length = 0usize;
     if let Some(state) = state_from_ptr(L) {
@@ -1765,7 +1765,7 @@ pub unsafe extern "C" fn lua_objlen(L: *mut lua_State, idx: c_int) -> usize {
     length
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_equal(L: *mut lua_State, idx1: c_int, idx2: c_int) -> c_int {
     let t1 = lua_type(L, idx1);
     let t2 = lua_type(L, idx2);
@@ -1780,12 +1780,12 @@ pub unsafe extern "C" fn lua_equal(L: *mut lua_State, idx1: c_int, idx2: c_int) 
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_rawequal(L: *mut lua_State, idx1: c_int, idx2: c_int) -> c_int {
     lua_equal(L, idx1, idx2)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_lessthan(L: *mut lua_State, _idx1: c_int, _idx2: c_int) -> c_int {
     // Minimal stub: ordering not tracked.
     if let Some(state) = state_from_ptr(L) {
@@ -1794,7 +1794,7 @@ pub unsafe extern "C" fn lua_lessthan(L: *mut lua_State, _idx1: c_int, _idx2: c_
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_pushnil(L: *mut lua_State) {
     if let Some(state) = state_from_ptr(L) {
         state.push(LuaValue::Nil);
@@ -1802,7 +1802,7 @@ pub unsafe extern "C" fn lua_pushnil(L: *mut lua_State) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_pushnumber(L: *mut lua_State, n: lua_Number) {
     if let Some(state) = state_from_ptr(L) {
         state.push(LuaValue::Float(n));
@@ -1810,7 +1810,7 @@ pub unsafe extern "C" fn lua_pushnumber(L: *mut lua_State, n: lua_Number) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_pushinteger(L: *mut lua_State, n: lua_Integer) {
     if let Some(state) = state_from_ptr(L) {
         state.push(LuaValue::Int(n));
@@ -1818,7 +1818,7 @@ pub unsafe extern "C" fn lua_pushinteger(L: *mut lua_State, n: lua_Integer) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_pushlstring(L: *mut lua_State, s: *const c_char, len: usize) {
     if let Some(state) = state_from_ptr(L) {
         let string = if s.is_null() || len == 0 {
@@ -1835,7 +1835,7 @@ pub unsafe extern "C" fn lua_pushlstring(L: *mut lua_State, s: *const c_char, le
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_pushstring(L: *mut lua_State, s: *const c_char) {
     if let Some(state) = state_from_ptr(L) {
         let text = if s.is_null() {
@@ -1848,7 +1848,7 @@ pub unsafe extern "C" fn lua_pushstring(L: *mut lua_State, s: *const c_char) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_pushfstring(L: *mut lua_State, fmt: *const c_char) -> *const c_char {
     let mut text = String::new();
     if !fmt.is_null() {
@@ -1863,7 +1863,7 @@ pub unsafe extern "C" fn lua_pushfstring(L: *mut lua_State, fmt: *const c_char) 
     core::ptr::null()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_pushboolean(L: *mut lua_State, b: c_int) {
     if let Some(state) = state_from_ptr(L) {
         state.push(LuaValue::Bool(b != 0));
@@ -1871,7 +1871,7 @@ pub unsafe extern "C" fn lua_pushboolean(L: *mut lua_State, b: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_pushlightuserdata(L: *mut lua_State, p: *mut c_void) {
     if let Some(state) = state_from_ptr(L) {
         state.push(LuaValue::LightUserdata(p as usize));
@@ -1879,7 +1879,7 @@ pub unsafe extern "C" fn lua_pushlightuserdata(L: *mut lua_State, p: *mut c_void
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_pushcclosure(L: *mut lua_State, f: lua_CFunction, _n: c_int) {
     if let Some(state) = state_from_ptr(L) {
         let n = _n.max(0) as usize;
@@ -1905,12 +1905,12 @@ pub unsafe extern "C" fn lua_pushcclosure(L: *mut lua_State, f: lua_CFunction, _
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_pushcfunction(L: *mut lua_State, f: lua_CFunction) {
     lua_pushcclosure(L, f, 0);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_newtable(L: *mut lua_State) {
     if let Some(state) = state_from_ptr(L) {
         state.push(LuaValue::Table(Rc::new(RefCell::new(LuaTable::new()))));
@@ -1918,12 +1918,12 @@ pub unsafe extern "C" fn lua_newtable(L: *mut lua_State) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_createtable(L: *mut lua_State, _narr: c_int, _nrec: c_int) {
     lua_newtable(L);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_gettable(L: *mut lua_State, idx: c_int) {
     if let Some(state) = state_from_ptr(L) {
         // If `idx` is negative, it is relative to the stack *before* the key is popped.
@@ -1945,7 +1945,7 @@ pub unsafe extern "C" fn lua_gettable(L: *mut lua_State, idx: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_settable(L: *mut lua_State, idx: c_int) {
     if let Some(state) = state_from_ptr(L) {
         // If `idx` is negative, it is relative to the stack *before* the key/value are popped.
@@ -1970,7 +1970,7 @@ pub unsafe extern "C" fn lua_settable(L: *mut lua_State, idx: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_getfield(L: *mut lua_State, idx: c_int, k: *const c_char) {
     if let Some(state) = state_from_ptr(L) {
         let key = if k.is_null() {
@@ -1993,7 +1993,7 @@ pub unsafe extern "C" fn lua_getfield(L: *mut lua_State, idx: c_int, k: *const c
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char) {
     if let Some(state) = state_from_ptr(L) {
         // If `idx` is negative, it is relative to the stack *before* the value is popped.
@@ -2025,7 +2025,7 @@ pub unsafe extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_next(L: *mut lua_State, _idx: c_int) -> c_int {
     if let Some(state) = state_from_ptr(L) {
         let handle = ensure_table_at(state, _idx);
@@ -2065,12 +2065,12 @@ pub unsafe extern "C" fn lua_next(L: *mut lua_State, _idx: c_int) -> c_int {
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_rawget(L: *mut lua_State, idx: c_int) {
     lua_gettable(L, idx)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_rawgeti(L: *mut lua_State, idx: c_int, n: c_int) {
     if let Some(state) = state_from_ptr(L) {
         if let Some(handle) = ensure_table_at(state, idx) {
@@ -2088,12 +2088,12 @@ pub unsafe extern "C" fn lua_rawgeti(L: *mut lua_State, idx: c_int, n: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_rawset(L: *mut lua_State, idx: c_int) {
     lua_settable(L, idx)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_rawseti(L: *mut lua_State, idx: c_int, n: c_int) {
     if let Some(state) = state_from_ptr(L) {
         // If `idx` is negative, it is relative to the stack *before* the value is popped.
@@ -2109,7 +2109,7 @@ pub unsafe extern "C" fn lua_rawseti(L: *mut lua_State, idx: c_int, n: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_concat(L: *mut lua_State, n: c_int) {
     if let Some(state) = state_from_ptr(L) {
         let mut parts: Vec<String> = Vec::new();
@@ -2130,7 +2130,7 @@ pub unsafe extern "C" fn lua_concat(L: *mut lua_State, n: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_setmetatable(L: *mut lua_State, objindex: c_int) -> c_int {
     if let Some(state) = state_from_ptr(L) {
         let len_before_pop = state.stack.len();
@@ -2201,7 +2201,7 @@ pub unsafe extern "C" fn lua_setmetatable(L: *mut lua_State, objindex: c_int) ->
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_getmetatable(L: *mut lua_State, objindex: c_int) -> c_int {
     if let Some(state) = state_from_ptr(L) {
         if let Some(handle) = ensure_table_at(state, objindex) {
@@ -2238,7 +2238,7 @@ fn push_lua_results(state: &mut LuaState, mut results: Vec<LuaValue>, nresults: 
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_call(L: *mut lua_State, nargs: c_int, nresults: c_int) {
     if let Some(state) = state_from_ptr(L) {
         let mut args: Vec<LuaValue> = Vec::new();
@@ -2328,7 +2328,7 @@ pub unsafe extern "C" fn lua_call(L: *mut lua_State, nargs: c_int, nresults: c_i
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_pcall(
     L: *mut lua_State,
     nargs: c_int,
@@ -2429,7 +2429,7 @@ pub unsafe extern "C" fn lua_pcall(
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_error(L: *mut lua_State) -> c_int {
     if let Some(state) = state_from_ptr(L) {
         let err = state.pop().unwrap_or(LuaValue::Nil);
@@ -2439,7 +2439,7 @@ pub unsafe extern "C" fn lua_error(L: *mut lua_State) -> c_int {
     -1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_argerror(
     L: *mut lua_State,
     narg: c_int,
@@ -2457,7 +2457,7 @@ pub unsafe extern "C" fn luaL_argerror(
     -1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_checkstack(
     L: *mut lua_State,
     sz: c_int,
@@ -2474,7 +2474,7 @@ pub unsafe extern "C" fn luaL_checkstack(
     lua_checkstack(L, sz)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_checktype(L: *mut lua_State, narg: c_int, t: c_int) {
     if let Some(state) = state_from_ptr(L) {
         state.record_call("luaL_checktype", vec![narg.to_string(), t.to_string()]);
@@ -2486,7 +2486,7 @@ pub unsafe extern "C" fn luaL_checktype(L: *mut lua_State, narg: c_int, t: c_int
     let _ = luaL_argerror(L, narg, core::ptr::null());
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_checkoption(
     L: *mut lua_State,
     idx: c_int,
@@ -2524,7 +2524,7 @@ pub unsafe extern "C" fn luaL_checkoption(
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_openlib(
     L: *mut lua_State,
     libname: *const c_char,
@@ -2534,7 +2534,7 @@ pub unsafe extern "C" fn luaL_openlib(
     luaL_register(L, libname, regs);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_register(
     L: *mut lua_State,
     libname: *const c_char,
@@ -2616,7 +2616,7 @@ pub unsafe extern "C" fn luaL_register(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_newmetatable(L: *mut lua_State, tname: *const c_char) -> c_int {
     let mut created = 0;
     if let Some(state) = state_from_ptr(L) {
@@ -2651,7 +2651,7 @@ pub unsafe extern "C" fn luaL_newmetatable(L: *mut lua_State, tname: *const c_ch
     created
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_getmetatable(L: *mut lua_State, tname: *const c_char) {
     if let Some(state) = state_from_ptr(L) {
         let name = if tname.is_null() {
@@ -2672,7 +2672,7 @@ pub unsafe extern "C" fn luaL_getmetatable(L: *mut lua_State, tname: *const c_ch
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_checklstring(
     L: *mut lua_State,
     idx: c_int,
@@ -2685,12 +2685,12 @@ pub unsafe extern "C" fn luaL_checklstring(
     ptr
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_checkstring(L: *mut lua_State, idx: c_int) -> *const c_char {
     luaL_checklstring(L, idx, core::ptr::null_mut())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_optlstring(
     L: *mut lua_State,
     idx: c_int,
@@ -2719,7 +2719,7 @@ pub unsafe extern "C" fn luaL_optlstring(
     lua_tolstring(L, idx, len)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_checknumber(L: *mut lua_State, idx: c_int) -> lua_Number {
     let n = lua_tonumber(L, idx);
     if let Some(state) = state_from_ptr(L) {
@@ -2728,7 +2728,7 @@ pub unsafe extern "C" fn luaL_checknumber(L: *mut lua_State, idx: c_int) -> lua_
     n
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_checkinteger(L: *mut lua_State, idx: c_int) -> lua_Integer {
     let n = lua_tointeger(L, idx);
     if let Some(state) = state_from_ptr(L) {
@@ -2737,7 +2737,7 @@ pub unsafe extern "C" fn luaL_checkinteger(L: *mut lua_State, idx: c_int) -> lua
     n
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_optnumber(
     L: *mut lua_State,
     idx: c_int,
@@ -2750,7 +2750,7 @@ pub unsafe extern "C" fn luaL_optnumber(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_optinteger(
     L: *mut lua_State,
     idx: c_int,
@@ -2763,7 +2763,7 @@ pub unsafe extern "C" fn luaL_optinteger(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_ref(L: *mut lua_State, _t: c_int) -> c_int {
     if let Some(state) = state_from_ptr(L) {
         let value = state.pop().unwrap_or(LuaValue::Nil);
@@ -2775,7 +2775,7 @@ pub unsafe extern "C" fn luaL_ref(L: *mut lua_State, _t: c_int) -> c_int {
     -1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_unref(L: *mut lua_State, _t: c_int, r: c_int) {
     if let Some(state) = state_from_ptr(L) {
         state.references.remove(&r);
@@ -2783,7 +2783,7 @@ pub unsafe extern "C" fn luaL_unref(L: *mut lua_State, _t: c_int, r: c_int) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_error(L: *mut lua_State, s: *const c_char) -> c_int {
     if let Some(state) = state_from_ptr(L) {
         let msg = if s.is_null() {
@@ -2797,7 +2797,7 @@ pub unsafe extern "C" fn luaL_error(L: *mut lua_State, s: *const c_char) -> c_in
     -1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_loadbuffer(
     L: *mut lua_State,
     _buff: *const c_char,
@@ -2812,7 +2812,7 @@ pub unsafe extern "C" fn luaL_loadbuffer(
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_loadstring(L: *mut lua_State, s: *const c_char) -> c_int {
     if let Some(state) = state_from_ptr(L) {
         let name = if s.is_null() {
@@ -2826,7 +2826,7 @@ pub unsafe extern "C" fn luaL_loadstring(L: *mut lua_State, s: *const c_char) ->
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_checkudata(
     L: *mut lua_State,
     idx: c_int,
@@ -2835,7 +2835,7 @@ pub unsafe extern "C" fn luaL_checkudata(
     lua_touserdata(L, idx)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_buffinit(L: *mut lua_State, B: *mut luaL_Buffer) {
     if B.is_null() {
         return;
@@ -2848,7 +2848,7 @@ pub unsafe extern "C" fn luaL_buffinit(L: *mut lua_State, B: *mut luaL_Buffer) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_prepbuffer(B: *mut luaL_Buffer) -> *mut c_char {
     if B.is_null() {
         return core::ptr::null_mut();
@@ -2871,7 +2871,7 @@ pub unsafe extern "C" fn luaL_prepbuffer(B: *mut luaL_Buffer) -> *mut c_char {
     buf.buffer.as_mut_ptr()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_addlstring(B: *mut luaL_Buffer, s: *const c_char, len: usize) {
     if B.is_null() {
         return;
@@ -2911,7 +2911,7 @@ pub unsafe extern "C" fn luaL_addlstring(B: *mut luaL_Buffer, s: *const c_char, 
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_pushresult(B: *mut luaL_Buffer) {
     if B.is_null() {
         return;
@@ -2940,7 +2940,7 @@ pub unsafe extern "C" fn luaL_pushresult(B: *mut luaL_Buffer) {
     buf.p = buf.buffer.as_mut_ptr();
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_addstring(B: *mut luaL_Buffer, s: *const c_char) {
     if B.is_null() || s.is_null() {
         return;
@@ -2954,7 +2954,7 @@ pub unsafe extern "C" fn luaL_addstring(B: *mut luaL_Buffer, s: *const c_char) {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_addvalue(B: *mut luaL_Buffer) {
     if B.is_null() {
         return;
@@ -3065,12 +3065,12 @@ mod tests {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_openlibs(_L: *mut lua_State) {
     // No-op stub for compatibility; libraries will be installed manually as needed.
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_newuserdata(L: *mut lua_State, sz: usize) -> *mut c_void {
     if let Some(state) = state_from_ptr(L) {
         let id = state.next_userdata_id();
@@ -3090,7 +3090,7 @@ pub unsafe extern "C" fn lua_newuserdata(L: *mut lua_State, sz: usize) -> *mut c
     core::ptr::null_mut()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c_void {
     if let Some(state) = state_from_ptr(L) {
         state.record_call("lua_touserdata", vec![idx.to_string()]);
@@ -3101,7 +3101,7 @@ pub unsafe extern "C" fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c
     core::ptr::null_mut()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_tocfunction(L: *mut lua_State, idx: c_int) -> lua_CFunction {
     if let Some(state) = state_from_ptr(L) {
         state.record_call("lua_tocfunction", vec![idx.to_string()]);
@@ -3112,7 +3112,7 @@ pub unsafe extern "C" fn lua_tocfunction(L: *mut lua_State, idx: c_int) -> lua_C
     None
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lua_topointer(L: *mut lua_State, idx: c_int) -> *const c_void {
     if let Some(state) = state_from_ptr(L) {
         state.record_call("lua_topointer", vec![idx.to_string()]);

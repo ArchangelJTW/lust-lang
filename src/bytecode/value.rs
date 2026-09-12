@@ -523,7 +523,7 @@ impl StructLayout {
                     if let Some(inner_values) = values {
                         if let Some(inner) = inner_values.get(0) {
                             match inner {
-                                Value::WeakStruct(ref weak) => {
+                                Value::WeakStruct(weak) => {
                                     if let Some(upgraded) = weak.upgrade() {
                                         Value::enum_variant("Option", "Some", vec![upgraded])
                                     } else {
@@ -1385,7 +1385,7 @@ unsafe fn replace_value(dest: *mut Value, value: Value) {
     drop(ptr::replace(dest, value));
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_replace_int(dest: *mut Value, value: LustInt) -> u8 {
     if dest.is_null() {
         return 0;
@@ -1394,12 +1394,12 @@ pub unsafe extern "C" fn jit_replace_int(dest: *mut Value, value: LustInt) -> u8
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_replace_int32(dest: *mut Value, value: i32) -> u8 {
     jit_replace_int(dest, value as LustInt)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_replace_float_bits(dest: *mut Value, bits: u64) -> u8 {
     if dest.is_null() {
         return 0;
@@ -1412,7 +1412,7 @@ pub unsafe extern "C" fn jit_replace_float_bits(dest: *mut Value, bits: u64) -> 
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_replace_float32_bits(dest: *mut Value, bits: u32) -> u8 {
     if dest.is_null() {
         return 0;
@@ -1421,7 +1421,7 @@ pub unsafe extern "C" fn jit_replace_float32_bits(dest: *mut Value, bits: u32) -
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_replace_bool(dest: *mut Value, value: u8) -> u8 {
     if dest.is_null() {
         return 0;
@@ -1430,7 +1430,7 @@ pub unsafe extern "C" fn jit_replace_bool(dest: *mut Value, value: u8) -> u8 {
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_replace_nil(dest: *mut Value) -> u8 {
     if dest.is_null() {
         return 0;
@@ -1439,7 +1439,7 @@ pub unsafe extern "C" fn jit_replace_nil(dest: *mut Value) -> u8 {
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_init_nil(dest: *mut Value) -> u8 {
     if dest.is_null() {
         return 0;
@@ -1448,7 +1448,7 @@ pub unsafe extern "C" fn jit_init_nil(dest: *mut Value) -> u8 {
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_drop_values(values: *mut Value, len: usize) {
     if !values.is_null() && len != 0 {
         ptr::drop_in_place(slice::from_raw_parts_mut(values, len));
@@ -1456,7 +1456,7 @@ pub unsafe extern "C" fn jit_drop_values(values: *mut Value, len: usize) {
 }
 
 #[cfg(feature = "std")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_array_get_safe(
     vm_ptr: *mut VM,
     array_value_ptr: *const Value,
@@ -1499,7 +1499,7 @@ pub unsafe extern "C" fn jit_array_get_safe(
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_array_index_result_safe(
     vm_ptr: *mut VM,
     array_value_ptr: *const Value,
@@ -1525,7 +1525,7 @@ pub unsafe extern "C" fn jit_array_index_result_safe(
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_array_index_ok_safe(
     array_value_ptr: *const Value,
     index_value_ptr: *const Value,
@@ -1567,7 +1567,7 @@ pub unsafe extern "C" fn jit_array_index_ok_safe(
 }
 
 #[cfg(feature = "std")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_array_len_safe(array_value_ptr: *const Value) -> i64 {
     if array_value_ptr.is_null() {
         return -1;
@@ -1588,7 +1588,7 @@ static JIT_NEW_ARRAY_COUNTER: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(feature = "std")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_new_array_safe(
     vm_ptr: *mut VM,
     elements_ptr: *const Value,
@@ -1635,7 +1635,7 @@ pub unsafe extern "C" fn jit_new_array_safe(
 }
 
 #[cfg(feature = "std")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_array_push_safe(
     vm_ptr: *mut VM,
     array_ptr: *const Value,
@@ -1676,7 +1676,7 @@ pub unsafe extern "C" fn jit_array_push_safe(
 /// Returns 1 on success, 0 on failure
 /// Outputs: vec_ptr (pointer to data), vec_len, vec_cap
 #[cfg(feature = "std")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_unbox_array_int(
     array_value_ptr: *const Value,
     out_vec_ptr: *mut *mut LustInt,
@@ -1747,7 +1747,7 @@ pub unsafe extern "C" fn jit_unbox_array_int(
 /// IMPORTANT: Writes the specialized vec data back into the EXISTING Rc<RefCell<Vec<Value>>>
 /// This ensures the original array is updated, not replaced
 #[cfg(feature = "std")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_rebox_array_int(
     vec_ptr: *mut LustInt,
     vec_len: usize,
@@ -1791,7 +1791,7 @@ pub unsafe extern "C" fn jit_rebox_array_int(
 /// Specialized push operation for Vec<LustInt>
 /// Directly pushes LustInt to the specialized vector
 #[cfg(feature = "std")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_vec_int_push(
     vec_ptr: *mut *mut LustInt,
     vec_len: *mut usize,
@@ -1832,7 +1832,7 @@ pub unsafe extern "C" fn jit_vec_int_push(
 /// WARNING: This should NOT be called! Specialized values that get invalidated
 /// during loop recording don't actually exist on the stack during execution.
 #[cfg(feature = "std")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_drop_vec_int(vec_ptr: *mut LustInt, vec_len: usize, vec_cap: usize) {
     eprintln!(
         "🗑️  jit_drop_vec_int: ptr={:p}, len={}, cap={}",
@@ -1846,7 +1846,7 @@ pub unsafe extern "C" fn jit_drop_vec_int(vec_ptr: *mut LustInt, vec_len: usize,
 }
 
 #[cfg(feature = "std")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_enum_is_some_safe(enum_ptr: *const Value, out_ptr: *mut Value) -> u8 {
     if enum_ptr.is_null() || out_ptr.is_null() {
         return 0;
@@ -1864,7 +1864,7 @@ pub unsafe extern "C" fn jit_enum_is_some_safe(enum_ptr: *const Value, out_ptr: 
 }
 
 #[cfg(feature = "std")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_enum_unwrap_safe(
     vm_ptr: *mut VM,
     enum_ptr: *const Value,
@@ -1913,7 +1913,7 @@ pub unsafe extern "C" fn jit_enum_unwrap_safe(
 }
 
 #[cfg(feature = "std")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_set_field_strong_safe(
     object_ptr: *const Value,
     field_index: usize,
@@ -1946,7 +1946,7 @@ pub unsafe extern "C" fn jit_set_field_strong_safe(
 }
 
 #[cfg(feature = "std")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_concat_safe(
     vm_ptr: *mut VM,
     left_value_ptr: *const Value,
@@ -1990,7 +1990,7 @@ pub unsafe extern "C" fn jit_concat_safe(
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_guard_native_function(
     value_ptr: *const Value,
     expected_fn_ptr: *const (),
@@ -2030,7 +2030,7 @@ pub unsafe extern "C" fn jit_guard_native_function(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_guard_function_identity(
     value_ptr: *const Value,
     expected_kind: u8,
@@ -2123,7 +2123,7 @@ pub unsafe extern "C" fn jit_guard_function_identity(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_call_native_safe(
     vm_ptr: *mut VM,
     callee_ptr: *const Value,
@@ -2254,7 +2254,7 @@ pub unsafe extern "C" fn jit_call_native_safe(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_call_function_safe(
     vm_ptr: *mut VM,
     callee_ptr: *const Value,
@@ -2325,7 +2325,7 @@ pub unsafe extern "C" fn jit_call_function_safe(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_current_registers(vm_ptr: *mut VM) -> *mut Value {
     if vm_ptr.is_null() {
         return core::ptr::null_mut();
@@ -2338,7 +2338,7 @@ pub unsafe extern "C" fn jit_current_registers(vm_ptr: *mut VM) -> *mut Value {
         .unwrap_or(core::ptr::null_mut())
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_value_is_truthy(value_ptr: *const Value) -> u8 {
     if value_ptr.is_null() {
         return 0;
@@ -2352,7 +2352,7 @@ pub unsafe extern "C" fn jit_value_is_truthy(value_ptr: *const Value) -> u8 {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_new_enum_unit_safe(
     vm_ptr: *mut VM,
     enum_name_ptr: *const u8,
@@ -2391,7 +2391,7 @@ pub unsafe extern "C" fn jit_new_enum_unit_safe(
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_new_enum_variant_safe(
     vm_ptr: *mut VM,
     enum_name_ptr: *const u8,
@@ -2445,7 +2445,7 @@ pub unsafe extern "C" fn jit_new_enum_variant_safe(
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_is_enum_variant_safe(
     value_ptr: *const Value,
     enum_name_ptr: *const u8,
@@ -2475,7 +2475,7 @@ pub unsafe extern "C" fn jit_is_enum_variant_safe(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_type_is_safe(
     vm_ptr: *mut VM,
     value_ptr: *const Value,
@@ -2497,7 +2497,7 @@ pub unsafe extern "C" fn jit_type_is_safe(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_try_cast_safe(
     vm_ptr: *mut VM,
     value_ptr: *const Value,
@@ -2527,7 +2527,7 @@ pub unsafe extern "C" fn jit_try_cast_safe(
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_get_enum_value_safe(
     enum_ptr: *const Value,
     index: usize,
@@ -2551,7 +2551,7 @@ pub unsafe extern "C" fn jit_get_enum_value_safe(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_call_method_safe(
     vm_ptr: *mut VM,
     object_ptr: *const Value,
@@ -2726,7 +2726,7 @@ fn call_builtin_method_simple(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_get_field_safe(
     object_ptr: *const Value,
     field_name_ptr: *const u8,
@@ -2757,7 +2757,7 @@ pub unsafe extern "C" fn jit_get_field_safe(
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_set_field_safe(
     object_ptr: *const Value,
     field_name_ptr: *const u8,
@@ -2791,7 +2791,7 @@ pub unsafe extern "C" fn jit_set_field_safe(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_get_field_indexed_safe(
     object_ptr: *const Value,
     field_index: usize,
@@ -2812,7 +2812,7 @@ pub unsafe extern "C" fn jit_get_field_indexed_safe(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_set_field_indexed_safe(
     object_ptr: *const Value,
     field_index: usize,
@@ -2830,7 +2830,7 @@ pub unsafe extern "C" fn jit_set_field_indexed_safe(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_get_field_indexed_int_fast(
     object_ptr: *const Value,
     field_index: usize,
@@ -2862,7 +2862,7 @@ pub unsafe extern "C" fn jit_get_field_indexed_int_fast(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_set_field_indexed_int_fast(
     object_ptr: *const Value,
     field_index: usize,
@@ -2898,7 +2898,7 @@ pub unsafe extern "C" fn jit_set_field_indexed_int_fast(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_new_struct_safe(
     vm_ptr: *mut VM,
     struct_name_ptr: *const u8,
@@ -2959,7 +2959,7 @@ pub unsafe extern "C" fn jit_new_struct_safe(
     1
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8 {
     if src_ptr.is_null() || dest_ptr.is_null() {
         return 0;

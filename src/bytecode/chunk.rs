@@ -48,9 +48,9 @@ impl Chunk {
     pub fn patch_jump(&mut self, jump_idx: usize, target_idx: usize) {
         let offset = (target_idx as isize - jump_idx as isize - 1) as i16;
         match &mut self.instructions[jump_idx] {
-            Instruction::Jump(ref mut off) => *off = offset,
-            Instruction::JumpIf(_, ref mut off) => *off = offset,
-            Instruction::JumpIfNot(_, ref mut off) => *off = offset,
+            Instruction::Jump(off) => *off = offset,
+            Instruction::JumpIf(_, off) => *off = offset,
+            Instruction::JumpIfNot(_, off) => *off = offset,
             _ => panic!("Attempted to patch non-jump instruction"),
         }
     }

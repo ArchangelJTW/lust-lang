@@ -2228,7 +2228,7 @@ fn create_math_random_fn() -> Value {
                 }
             });
         let value = with_rng_mut(|rng| match (lower.as_ref(), upper.as_ref()) {
-            (None, _) => Value::Float(rng.gen::<f64>()),
+            (None, _) => Value::Float(rng.r#gen::<f64>()),
             (Some(max), None) => {
                 let hi = coerce_int(max).unwrap_or(1);
                 let upper_bound = if hi < 1 { 1 } else { hi };

@@ -44,7 +44,7 @@ impl JitCompiler {
     }
 
     fn copy_owned_constant(&mut self, dest: u8, value: &Value) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
         }
         let src_ptr = self.retain_value(value.clone());
@@ -60,7 +60,7 @@ impl JitCompiler {
     }
 
     pub(super) fn compile_move(&mut self, dest: u8, src: u8) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
         }
         self.emit_addr_in_t2(src, 0);
@@ -73,7 +73,7 @@ impl JitCompiler {
     }
 
     pub(super) fn compile_get_index(&mut self, dest: u8, array: u8, index: u8) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_array_get_safe(
                 vm_ptr: *mut crate::VM,
                 array_value: *const Value,
@@ -101,7 +101,7 @@ impl JitCompiler {
     }
 
     pub(super) fn compile_try_get_index(&mut self, dest: u8, array: u8, index: u8) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_array_index_result_safe(
                 vm_ptr: *mut crate::VM,
                 array_value: *const Value,
@@ -129,7 +129,7 @@ impl JitCompiler {
         array: u8,
         index: u8,
     ) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_array_index_ok_safe(
                 array_value: *const Value,
                 index_value: *const Value,
@@ -152,7 +152,7 @@ impl JitCompiler {
     }
 
     pub(super) fn compile_array_len(&mut self, dest: u8, array: u8) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             // Returns i64 on std (a0=lo, a1=hi on rv32); we use a0 only.
             fn jit_array_len_safe(array_value: *const Value) -> i64;
         }
@@ -177,7 +177,7 @@ impl JitCompiler {
         _value_type: Option<ValueType>,
         _is_weak: bool,
     ) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_get_field_safe(
                 object_ptr: *const Value,
                 field_name_ptr: *const u8,
@@ -225,7 +225,7 @@ impl JitCompiler {
         _value_type: Option<ValueType>,
         is_weak: bool,
     ) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_set_field_safe(
                 object_ptr: *const Value,
                 field_name_ptr: *const u8,
@@ -280,7 +280,7 @@ impl JitCompiler {
         first_element: u8,
         count: u8,
     ) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_new_array_safe(
                 vm_ptr: *mut crate::VM,
                 elements_ptr: *const Value,
@@ -301,7 +301,7 @@ impl JitCompiler {
     }
 
     pub(super) fn compile_array_push(&mut self, array: u8, value: u8) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_array_push_safe(
                 vm_ptr: *mut crate::VM,
                 array_ptr: *const Value,
@@ -320,7 +320,7 @@ impl JitCompiler {
     }
 
     pub(super) fn compile_enum_is_some(&mut self, dest: u8, enum_reg: u8) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_enum_is_some_safe(enum_ptr: *const Value, out_ptr: *mut Value) -> u8;
         }
         self.emit_addr_in_t2(enum_reg, 0);
@@ -334,7 +334,7 @@ impl JitCompiler {
     }
 
     pub(super) fn compile_enum_unwrap(&mut self, dest: u8, enum_reg: u8) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_enum_unwrap_safe(
                 vm_ptr: *mut crate::VM,
                 enum_ptr: *const Value,
@@ -360,7 +360,7 @@ impl JitCompiler {
         first_arg: u8,
         arg_count: u8,
     ) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_call_native_safe(
                 vm_ptr: *mut crate::VM,
                 callee_ptr: *const Value,
@@ -410,7 +410,7 @@ impl JitCompiler {
         _is_closure: bool,
         _upvalues_ptr: Option<*const ()>,
     ) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_call_function_safe(
                 vm_ptr: *mut crate::VM,
                 callee_ptr: *const Value,
@@ -449,7 +449,7 @@ impl JitCompiler {
         first_arg: u8,
         arg_count: u8,
     ) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_call_method_safe(
                 vm_ptr: *mut crate::VM,
                 object_ptr: *const Value,
@@ -494,7 +494,7 @@ impl JitCompiler {
         field_names: &[alloc::string::String],
         field_registers: &[u8],
     ) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_new_struct_safe(
                 vm_ptr: *mut crate::VM,
                 struct_name_ptr: *const u8,
@@ -556,7 +556,7 @@ impl JitCompiler {
         enum_name: &str,
         variant_name: &str,
     ) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_new_enum_unit_safe(
                 vm_ptr: *mut crate::VM,
                 enum_name_ptr: *const u8,
@@ -593,7 +593,7 @@ impl JitCompiler {
         variant_name: &str,
         value_registers: &[u8],
     ) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_new_enum_variant_safe(
                 vm_ptr: *mut crate::VM,
                 enum_name_ptr: *const u8,
@@ -640,7 +640,7 @@ impl JitCompiler {
         enum_name: &str,
         variant_name: &str,
     ) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_is_enum_variant_safe(
                 value_ptr: *const Value,
                 enum_name_ptr: *const u8,
@@ -700,7 +700,7 @@ impl JitCompiler {
             return Ok(());
         }
 
-        extern "C" {
+        unsafe extern "C" {
             fn jit_type_is_safe(
                 vm_ptr: *mut crate::VM,
                 value_ptr: *const Value,
@@ -725,7 +725,7 @@ impl JitCompiler {
     }
 
     pub(super) fn compile_try_cast(&mut self, dest: u8, value: u8, type_name: &str) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_try_cast_safe(
                 vm_ptr: *mut crate::VM,
                 value_ptr: *const Value,
@@ -757,7 +757,7 @@ impl JitCompiler {
         enum_reg: u8,
         index: u8,
     ) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_get_enum_value_safe(enum_ptr: *const Value, index: usize, out: *mut Value)
                 -> u8;
         }

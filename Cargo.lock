@@ -798,7 +798,7 @@ dependencies = [
 
 [[package]]
 name = "lust-analyzer"
-version = "0.5.1"
+version = "0.6.1"
 dependencies = [
  "hashbrown 0.16.1",
  "lust-rs",

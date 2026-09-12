@@ -7,16 +7,16 @@ name = "lust-rs"
 version = "3.5.2"
 edition = "2024"
 include = [
-  "src/**",
-  "include/**",
-  "examples/embed.rs",
-  "benchmarks/numeric.rs",
-  "build.rs",
-  "Cargo.toml",
-  "README.md",
-  "LICENSE",
-  "LICENSE-MIT",
-  "LICENSE-APACHE",
+  "/src/**",
+  "/include/**",
+  "/examples/embed.rs",
+  "/benchmarks/numeric.rs",
+  "/build.rs",
+  "/Cargo.toml",
+  "/README.md",
+  "/LICENSE",
+  "/LICENSE-MIT",
+  "/LICENSE-APACHE",
 ]
 license = "MIT OR Apache-2.0"
 readme = "README.md"

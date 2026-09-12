@@ -79,7 +79,7 @@ impl JitCompiler {
 
     /// Store `t0` as a Bool (tag=1, data=t0) into `regs[vm_reg]`.
     pub(super) fn store_t0_as_bool(&mut self, vm_reg: u8) {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_replace_bool(dest: *mut Value, value: u8) -> u8;
         }
         dynasm!(self.ops ; .arch riscv32i ; mv a1, t0);

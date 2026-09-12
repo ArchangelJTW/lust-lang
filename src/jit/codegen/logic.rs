@@ -117,7 +117,7 @@ impl JitCompiler {
         let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
         let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
-        extern "C" {
+        unsafe extern "C" {
             fn jit_concat_safe(
                 vm_ptr: *mut crate::VM,
                 left: *const Value,

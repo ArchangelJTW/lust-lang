@@ -135,7 +135,7 @@ impl JitCompiler {
         let reg_offset = (source_reg as i32) * 64;
 
         // Call jit_unbox_array_int(array_ptr, out_vec_ptr, out_len, out_cap)
-        extern "C" {
+        unsafe extern "C" {
             fn jit_unbox_array_int(
                 array_value_ptr: *const Value,
                 out_vec_ptr: *mut *mut LustInt,
@@ -204,7 +204,7 @@ impl JitCompiler {
         let reg_offset = (dest_reg as i32) * 64;
 
         // Call jit_rebox_array_int(vec_ptr, vec_len, vec_cap, out_value_ptr)
-        extern "C" {
+        unsafe extern "C" {
             fn jit_rebox_array_int(
                 vec_ptr: *mut LustInt,
                 vec_len: usize,
@@ -266,7 +266,7 @@ impl JitCompiler {
         let value_offset = (value_reg as i32) * 64 + 8; // +8 to skip tag, get int value
 
         // Call jit_vec_int_push(vec_ptr_addr, len_addr, cap_addr, value)
-        extern "C" {
+        unsafe extern "C" {
             fn jit_vec_int_push(
                 vec_ptr: *mut *mut LustInt,
                 vec_len: *mut usize,
@@ -371,7 +371,7 @@ impl JitCompiler {
         let stack_offset = spec_value.stack_offset;
 
         // Call jit_drop_vec_int(vec_ptr, vec_len, vec_cap)
-        extern "C" {
+        unsafe extern "C" {
             fn jit_drop_vec_int(vec_ptr: *mut LustInt, vec_len: usize, vec_cap: usize);
         }
         let drop_fn = jit_drop_vec_int as *const ();

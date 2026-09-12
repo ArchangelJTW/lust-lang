@@ -41,7 +41,7 @@ impl JitCompiler {
 
     /// Store `t0` as an integer value (tag=Int=2, data=t0) into `regs[vm_reg]`.
     pub(super) fn store_t0_as_int(&mut self, vm_reg: u8) {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_replace_int32(dest: *mut Value, value: i32) -> u8;
         }
         dynasm!(self.ops ; .arch riscv32i ; mv a1, t0);
@@ -54,7 +54,7 @@ impl JitCompiler {
     /// Store `t0` as a float value (tag=Float=3, data stored via fmv) into `regs[vm_reg]`.
     /// `ft0` must hold the f32 value to store; `t0` is used as a temp.
     pub(super) fn store_ft0_as_float(&mut self, vm_reg: u8) {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_replace_float32_bits(dest: *mut Value, bits: u32) -> u8;
         }
         dynasm!(self.ops ; .arch riscv32i ; .feature f ; fmv.x.w a1, ft0);

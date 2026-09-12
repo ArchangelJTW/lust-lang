@@ -38,7 +38,7 @@ impl JitCompiler {
     fn copy_owned_constant(&mut self, dest: u8, value: &Value) -> Result<()> {
         let offset = (dest as i32) * (mem::size_of::<Value>() as i32);
         let src_ptr = self.retain_value(value.clone());
-        extern "C" {
+        unsafe extern "C" {
             fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
         }
         dynasm!(self.ops
@@ -55,7 +55,7 @@ impl JitCompiler {
     pub(super) fn compile_move(&mut self, dest: u8, src: u8) -> Result<()> {
         let src_offset = (src as i32) * (mem::size_of::<Value>() as i32);
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
-        extern "C" {
+        unsafe extern "C" {
             fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
         }
         dynasm!(self.ops
@@ -71,7 +71,7 @@ impl JitCompiler {
         let array_offset = (array as i32) * (mem::size_of::<Value>() as i32);
         let index_offset = (index as i32) * (mem::size_of::<Value>() as i32);
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
-        extern "C" {
+        unsafe extern "C" {
             fn jit_array_get_safe(
                 vm_ptr: *mut crate::VM,
                 array_value: *const Value,
@@ -103,7 +103,7 @@ impl JitCompiler {
         let array_offset = (array as i32) * (mem::size_of::<Value>() as i32);
         let index_offset = (index as i32) * (mem::size_of::<Value>() as i32);
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
-        extern "C" {
+        unsafe extern "C" {
             fn jit_array_index_result_safe(
                 vm_ptr: *mut crate::VM,
                 array_value: *const Value,
@@ -137,7 +137,7 @@ impl JitCompiler {
         let index_offset = (index as i32) * value_size;
         let value_offset = (value_dest as i32) * value_size;
         let condition_offset = (condition_dest as i32) * value_size;
-        extern "C" {
+        unsafe extern "C" {
             fn jit_array_index_ok_safe(
                 array_value: *const Value,
                 index_value: *const Value,
@@ -161,7 +161,7 @@ impl JitCompiler {
 
     pub(super) fn compile_array_len(&mut self, dest: u8, array: u8) -> Result<()> {
         let array_offset = (array as i32) * (mem::size_of::<Value>() as i32);
-        extern "C" {
+        unsafe extern "C" {
             fn jit_array_len_safe(array_value: *const Value) -> i64;
         }
 
@@ -190,7 +190,7 @@ impl JitCompiler {
     ) -> Result<()> {
         let object_offset = (object as i32) * (mem::size_of::<Value>() as i32);
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
-        extern "C" {
+        unsafe extern "C" {
             fn jit_get_field_safe(
                 object_ptr: *const Value,
                 field_name_ptr: *const u8,
@@ -242,7 +242,7 @@ impl JitCompiler {
     ) -> Result<()> {
         let object_offset = (object as i32) * (mem::size_of::<Value>() as i32);
         let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
-        extern "C" {
+        unsafe extern "C" {
             fn jit_set_field_safe(
                 object_ptr: *const Value,
                 field_name_ptr: *const u8,
@@ -276,7 +276,7 @@ impl JitCompiler {
                 );
             } else {
                 // Strong field - can skip canonicalization
-                extern "C" {
+                unsafe extern "C" {
                     fn jit_set_field_strong_safe(
                         object_ptr: *const Value,
                         field_index: usize,
@@ -321,7 +321,7 @@ impl JitCompiler {
         let first_elem_offset = (first_element as i32) * value_size;
         let count_usize = count as usize;
 
-        extern "C" {
+        unsafe extern "C" {
             fn jit_new_array_safe(
                 vm_ptr: *mut crate::VM,
                 elements_ptr: *const Value,
@@ -349,7 +349,7 @@ impl JitCompiler {
         let array_offset = (array as i32) * (mem::size_of::<Value>() as i32);
         let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
 
-        extern "C" {
+        unsafe extern "C" {
             fn jit_array_push_safe(
                 vm_ptr: *mut crate::VM,
                 array_ptr: *const Value,
@@ -375,7 +375,7 @@ impl JitCompiler {
         let enum_offset = (enum_reg as i32) * (mem::size_of::<Value>() as i32);
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
 
-        extern "C" {
+        unsafe extern "C" {
             fn jit_enum_is_some_safe(enum_ptr: *const Value, out_ptr: *mut Value) -> u8;
         }
 
@@ -395,7 +395,7 @@ impl JitCompiler {
         let enum_offset = (enum_reg as i32) * (mem::size_of::<Value>() as i32);
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
 
-        extern "C" {
+        unsafe extern "C" {
             fn jit_enum_unwrap_safe(
                 vm_ptr: *mut crate::VM,
                 enum_ptr: *const Value,
@@ -429,7 +429,7 @@ impl JitCompiler {
         let first_arg_offset = (first_arg as i32) * (mem::size_of::<Value>() as i32);
         let arg_count_i32 = arg_count as i32;
         let exit_label = self.current_exit_label();
-        extern "C" {
+        unsafe extern "C" {
             fn jit_call_native_safe(
                 vm_ptr: *mut crate::VM,
                 callee_ptr: *const Value,
@@ -479,7 +479,7 @@ impl JitCompiler {
         let first_arg_offset = (first_arg as i32) * (mem::size_of::<Value>() as i32);
         let arg_count_i32 = arg_count as i32;
         let dest_i32 = dest as i32;
-        extern "C" {
+        unsafe extern "C" {
             fn jit_call_function_safe(
                 vm_ptr: *mut crate::VM,
                 callee_ptr: *const Value,
@@ -525,7 +525,7 @@ impl JitCompiler {
     ) -> Result<()> {
         let object_offset = (object as i32) * (mem::size_of::<Value>() as i32);
         let dest_i32 = dest as i32;
-        extern "C" {
+        unsafe extern "C" {
             fn jit_call_method_safe(
                 vm_ptr: *mut crate::VM,
                 object_ptr: *const Value,
@@ -579,7 +579,7 @@ impl JitCompiler {
         field_registers: &[u8],
     ) -> Result<()> {
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
-        extern "C" {
+        unsafe extern "C" {
             fn jit_new_struct_safe(
                 vm_ptr: *mut crate::VM,
                 struct_name_ptr: *const u8,
@@ -658,7 +658,7 @@ impl JitCompiler {
         variant_name: &str,
     ) -> Result<()> {
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
-        extern "C" {
+        unsafe extern "C" {
             fn jit_new_enum_unit_safe(
                 vm_ptr: *mut crate::VM,
                 enum_name_ptr: *const u8,
@@ -693,7 +693,7 @@ impl JitCompiler {
         value_registers: &[u8],
     ) -> Result<()> {
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
-        extern "C" {
+        unsafe extern "C" {
             fn jit_new_enum_variant_safe(
                 vm_ptr: *mut crate::VM,
                 enum_name_ptr: *const u8,
@@ -744,7 +744,7 @@ impl JitCompiler {
         variant_name: &str,
     ) -> Result<()> {
         let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
-        extern "C" {
+        unsafe extern "C" {
             fn jit_is_enum_variant_safe(
                 value_ptr: *const Value,
                 enum_name_ptr: *const u8,
@@ -798,7 +798,7 @@ impl JitCompiler {
             return Ok(());
         }
 
-        extern "C" {
+        unsafe extern "C" {
             fn jit_type_is_safe(
                 vm_ptr: *mut crate::VM,
                 value_ptr: *const Value,
@@ -823,7 +823,7 @@ impl JitCompiler {
     pub(super) fn compile_try_cast(&mut self, dest: u8, value: u8, type_name: &str) -> Result<()> {
         let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
-        extern "C" {
+        unsafe extern "C" {
             fn jit_try_cast_safe(
                 vm_ptr: *mut crate::VM,
                 value_ptr: *const Value,
@@ -855,7 +855,7 @@ impl JitCompiler {
     ) -> Result<()> {
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
         let enum_offset = (enum_reg as i32) * (mem::size_of::<Value>() as i32);
-        extern "C" {
+        unsafe extern "C" {
             fn jit_get_enum_value_safe(enum_ptr: *const Value, index: usize, out: *mut Value)
                 -> u8;
         }

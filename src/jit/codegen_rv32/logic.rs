@@ -87,7 +87,7 @@ impl JitCompiler {
     }
 
     pub(super) fn compile_concat(&mut self, dest: u8, lhs: u8, rhs: u8) -> Result<()> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_concat_safe(
                 vm_ptr: *mut crate::VM,
                 left: *const Value,

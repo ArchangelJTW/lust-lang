@@ -84,7 +84,7 @@ impl JitCompiler {
         is_closure: bool,
         guard_index: usize,
     ) -> Result<Guard> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_guard_function_identity(
                 value_ptr: *const Value,
                 expected_kind: u8,
@@ -144,7 +144,7 @@ impl JitCompiler {
         expected_ptr: *const (),
         guard_index: usize,
     ) -> Result<Guard> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_guard_native_function(
                 value_ptr: *const Value,
                 expected: *const (),
@@ -190,7 +190,7 @@ impl JitCompiler {
         bailout_ip: usize,
         guard_index: usize,
     ) -> Result<Guard> {
-        extern "C" {
+        unsafe extern "C" {
             fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
         }
         let guard_return_value = (guard_index + 1) as i32;

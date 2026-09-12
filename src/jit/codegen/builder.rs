@@ -1315,7 +1315,7 @@ impl JitCompiler {
             let outer_fail = self.current_fail_label();
             let inline_fail = self.ops.new_dynamic_label();
             let inline_end = self.ops.new_dynamic_label();
-            extern "C" {
+            unsafe extern "C" {
                 fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
                 fn jit_init_nil(dest: *mut Value) -> u8;
                 fn jit_drop_values(values: *mut Value, len: usize);

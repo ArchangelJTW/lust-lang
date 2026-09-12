@@ -101,8 +101,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let original_home = env::var("HOME").ok();
         let original_userprofile = env::var("USERPROFILE").ok();
-        env::set_var("HOME", dir.path());
-        env::set_var("USERPROFILE", dir.path());
+        unsafe {
+            env::set_var("HOME", dir.path());
+            env::set_var("USERPROFILE", dir.path());
+        }
 
         save_credentials("secret-token").unwrap();
         let creds = load_credentials().unwrap().unwrap();
@@ -111,13 +113,15 @@ mod tests {
         let path = credentials_file().unwrap();
         assert!(path.exists());
 
-        env::remove_var("HOME");
-        env::remove_var("USERPROFILE");
-        if let Some(home) = original_home {
-            env::set_var("HOME", home);
-        }
-        if let Some(userprofile) = original_userprofile {
-            env::set_var("USERPROFILE", userprofile);
+        unsafe {
+            env::remove_var("HOME");
+            env::remove_var("USERPROFILE");
+            if let Some(home) = original_home {
+                env::set_var("HOME", home);
+            }
+            if let Some(userprofile) = original_userprofile {
+                env::set_var("USERPROFILE", userprofile);
+            }
         }
     }
 }

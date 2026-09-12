@@ -87,7 +87,7 @@ impl JitCompiler {
     ) -> Result<Guard> {
         let offset = (register as i32) * (mem::size_of::<Value>() as i32);
         let guard_return_value = (guard_index + 1) as i32;
-        extern "C" {
+        unsafe extern "C" {
             fn jit_guard_function_identity(
                 value_ptr: *const Value,
                 expected_kind: u8,
@@ -144,7 +144,7 @@ impl JitCompiler {
     ) -> Result<Guard> {
         let offset = (register as i32) * (mem::size_of::<Value>() as i32);
         let guard_return_value = (guard_index + 1) as i32;
-        extern "C" {
+        unsafe extern "C" {
             fn jit_guard_native_function(
                 value_ptr: *const Value,
                 expected: *const (),
@@ -191,7 +191,7 @@ impl JitCompiler {
         let exit_label = self.current_exit_label();
         let bool_tag = ValueTag::Bool.as_u8() as i8;
         let scalar_max_tag = ValueTag::Float.as_u8() as i8;
-        extern "C" {
+        unsafe extern "C" {
             fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
         }
         if self.scalar_registers.get(&condition_register) == Some(&ValueType::Bool) {

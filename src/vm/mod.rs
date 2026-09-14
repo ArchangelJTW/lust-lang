@@ -132,20 +132,23 @@ pub(crate) fn pop_vm_ptr() {
     });
 }
 
-#[cfg(feature = "std")]
-pub(super) fn with_vm_stack<F, R>(f: F) -> R
-where
-    F: FnOnce(&Vec<*mut VM>) -> R,
-{
-    with_vm_stack_ref(f)
+fn current_vm_ptr() -> Option<*mut VM> {
+    with_vm_stack_ref(|stack| stack.last().copied())
 }
 
-#[cfg(not(feature = "std"))]
-pub(super) fn with_vm_stack<F, R>(f: F) -> R
-where
-    F: FnOnce(&Vec<*mut VM>) -> R,
-{
-    with_vm_stack_ref(f)
+struct CurrentVmGuard;
+
+impl CurrentVmGuard {
+    fn new(vm: *mut VM) -> Self {
+        push_vm_ptr(vm);
+        Self
+    }
+}
+
+impl Drop for CurrentVmGuard {
+    fn drop(&mut self) {
+        pop_vm_ptr();
+    }
 }
 
 pub(super) const TO_STRING_TRAIT: &str = "ToString";
@@ -153,6 +156,9 @@ pub(super) const TO_STRING_METHOD: &str = "to_string";
 pub(super) const HASH_KEY_TRAIT: &str = "HashKey";
 pub(super) const HASH_KEY_METHOD: &str = "to_hashkey";
 pub struct VM {
+    // Retain the host runtime's lookup function across dynamic-library boundaries.
+    // Each extension can have its own copy of CURRENT_VM_STACK.
+    current_vm_lookup: fn() -> Option<*mut VM>,
     pub(super) jit: JitState,
     pub(super) budgets: BudgetState,
     pub(super) functions: Vec<Function>,

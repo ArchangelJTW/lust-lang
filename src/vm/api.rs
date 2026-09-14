@@ -82,6 +82,7 @@ impl VM {
 
     pub fn with_config(config: &LustConfig) -> Self {
         let mut vm = Self {
+            current_vm_lookup: super::current_vm_ptr,
             jit: JitState::new(),
             budgets: BudgetState::default(),
             functions: Vec::new(),
@@ -182,12 +183,15 @@ impl VM {
     where
         F: FnOnce(&mut VM) -> CoreResult<R, String>,
     {
-        let ptr_opt = super::with_vm_stack(|stack| stack.last().copied());
+        let ptr_opt = super::current_vm_ptr();
         if let Some(ptr) = ptr_opt {
             let vm = unsafe { &mut *ptr };
             f(vm)
         } else {
-            Err("task API requires a running VM".to_string())
+            Err(
+                "No active VM context; this API must be called from a VM-executed native callback"
+                    .to_string(),
+            )
         }
     }
 
@@ -363,7 +367,20 @@ impl VM {
         let name = name.into();
         self.observe_value_graph(&value);
         match value {
-            Value::NativeFunction(_) => {
+            Value::NativeFunction(func) => {
+                let host_lookup = self.current_vm_lookup;
+                let local_lookup = super::current_vm_ptr as fn() -> Option<*mut VM>;
+                let value = if core::ptr::fn_addr_eq(host_lookup, local_lookup) {
+                    Value::NativeFunction(func)
+                } else {
+                    // This registration is executing in an extension's runtime copy.
+                    // Resolve the calling VM at invocation time, then expose it to
+                    // the extension's VM::with_current for the duration of the call.
+                    Value::NativeFunction(Rc::new(move |args| {
+                        let _context = host_lookup().map(super::CurrentVmGuard::new);
+                        func(args)
+                    }))
+                };
                 let cloned = value.clone();
                 self.natives.insert(name.clone(), value);
                 self.globals.insert(name, cloned);
@@ -441,6 +458,7 @@ impl VM {
         let name = export.name.clone();
         let params = export.params.clone();
         let return_type = export.return_type.clone();
+        let type_module = self.export_prefix();
         self.push_export_metadata(export);
         let native = Value::NativeFunction(Rc::new(move |args| {
             if args.len() != params.len() {
@@ -452,7 +470,7 @@ impl VM {
             }
             VM::with_current(|vm| {
                 for (index, (value, param)) in args.iter().zip(&params).enumerate() {
-                    if !vm.value_is_type(value, param.ty()) {
+                    if !vm.value_is_export_type(value, param.ty(), type_module.as_deref()) {
                         return Err(format!(
                             "Native argument {} expects {}, got {:?}",
                             index + 1,
@@ -469,7 +487,7 @@ impl VM {
                     } else {
                         return_type.as_str()
                     };
-                    if !vm.value_is_type(value, expected) {
+                    if !vm.value_is_export_type(value, expected, type_module.as_deref()) {
                         return Err(format!(
                             "Native must return {}, got {:?}",
                             expected,
@@ -481,6 +499,21 @@ impl VM {
             })
         }));
         self.register_native(name, native);
+    }
+
+    fn value_is_export_type(&self, value: &Value, expected: &str, module: Option<&str>) -> bool {
+        if self.value_is_type(value, expected) {
+            return true;
+        }
+        // Export metadata uses the same module-local type names as the generated
+        // extern stubs, while runtime struct and enum values have canonical names.
+        module.is_some_and(|module| {
+            expected.split('|').map(str::trim).any(|member| {
+                !member.contains('.')
+                    && !member.contains("::")
+                    && self.value_is_type(value, &format!("{module}.{member}"))
+            })
+        })
     }
 
     #[cfg(feature = "std")]
@@ -1121,6 +1154,126 @@ end
             .call("array_arg", vec![Value::array(vec![Value::Bool(true)])])
             .unwrap_err();
         assert!(error.to_string().contains("expects Array<int>"));
+    }
+
+    #[test]
+    fn missing_native_context_diagnostic_is_not_task_specific() {
+        let error = VM::with_current(|_| Ok(())).unwrap_err();
+        assert!(error.contains("No active VM context"));
+        assert!(error.contains("native callback"));
+        assert!(!error.contains("task API"));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn native_callbacks_bridge_runtime_contexts_and_restore_the_previous_vm() {
+        use core::cell::Cell;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        std::thread_local! {
+            static HOST_VM: Cell<Option<*mut VM>> = const { Cell::new(None) };
+        }
+        fn host_lookup() -> Option<*mut VM> {
+            HOST_VM.with(Cell::get)
+        }
+        struct HostContext;
+        impl Drop for HostContext {
+            fn drop(&mut self) {
+                HOST_VM.with(|slot| slot.set(None));
+            }
+        }
+        let _host_context = HostContext;
+
+        let mut registration_vm = VM::new();
+        registration_vm.current_vm_lookup = host_lookup;
+        registration_vm.register_exported_native(
+            NativeExport::new("current_marker", Vec::new(), "int"),
+            |_| VM::with_current(|vm| Ok(vm.get_global("marker").unwrap().into())),
+        );
+        registration_vm.register_native(
+            "panic_in_callback",
+            Value::NativeFunction(Rc::new(|_| {
+                VM::with_current::<_, ()>(|_| panic!("callback panic"))?;
+                unreachable!()
+            })),
+        );
+        let Value::NativeFunction(callback) = registration_vm.get_global("current_marker").unwrap()
+        else {
+            panic!("expected native callback");
+        };
+        let Value::NativeFunction(panicking) = registration_vm.get_global("panic_in_callback").unwrap()
+        else {
+            panic!("expected native callback");
+        };
+
+        // Model the host and extension having independent thread-local stacks.
+        // The callback must use the invoking VM, not the registration-time VM.
+        let mut previous_vm = VM::new();
+        let previous_ptr = &mut previous_vm as *mut VM;
+        let _previous_context = crate::vm::CurrentVmGuard::new(previous_ptr);
+        for marker in [7, 42] {
+            let mut host_vm = VM::new();
+            host_vm.set_global("marker", Value::Int(marker));
+            HOST_VM.with(|slot| slot.set(Some(&mut host_vm)));
+            assert!(matches!(callback(&[]), Ok(NativeCallResult::Return(Value::Int(n))) if n == marker));
+            assert_eq!(crate::vm::current_vm_ptr(), Some(previous_ptr));
+            assert!(callback(&[Value::Nil]).is_err());
+            assert_eq!(crate::vm::current_vm_ptr(), Some(previous_ptr));
+            assert!(catch_unwind(AssertUnwindSafe(|| panicking(&[]))).is_err());
+            assert_eq!(crate::vm::current_vm_ptr(), Some(previous_ptr));
+            HOST_VM.with(|slot| slot.set(None));
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn exported_nominal_types_resolve_in_the_extension_module() {
+        use crate::embed::{ExternRegistry, StructBuilder};
+
+        let mut vm = VM::new();
+        vm.push_export_prefix("extension");
+        let mut registry = ExternRegistry::new();
+        registry.add_struct(StructBuilder::new("Factor").finish());
+        registry.add_struct(StructBuilder::new("other.Factor").finish());
+        registry.register_with_vm(&mut vm);
+        for (name, nominal_type) in [("factor", "Factor"), ("operation", "Operation")] {
+            vm.register_exported_native(
+                NativeExport::new(
+                    name,
+                    vec![NativeExportParam::new("value", nominal_type)],
+                    nominal_type,
+                ),
+                |args| Ok(args[0].clone().into()),
+            );
+        }
+        vm.register_exported_native(
+            NativeExport::new("bad_factor", Vec::new(), "Factor"),
+            |_| VM::with_current(|vm| {
+                vm.instantiate_struct("other.Factor", Vec::new())
+                    .map(NativeCallResult::Return)
+                    .map_err(|error| error.to_string())
+            }),
+        );
+        vm.pop_export_prefix();
+
+        let factor = vm.instantiate_struct("extension.Factor", Vec::new()).unwrap();
+        let other_factor = vm.instantiate_struct("other.Factor", Vec::new()).unwrap();
+        for (name, valid, invalid) in [
+            ("extension.factor", factor, other_factor),
+            (
+                "extension.operation",
+                Value::enum_variant("extension.Operation", "Double", Vec::new()),
+                Value::enum_variant("other.Operation", "Double", Vec::new()),
+            ),
+        ] {
+            let callback = vm.get_global(name).unwrap();
+            assert_eq!(vm.call_value(&callback, vec![valid.clone()]).unwrap(), valid);
+            let error = vm.call_value(&callback, vec![invalid]).unwrap_err();
+            assert!(error.to_string().contains("Native argument 1 expects"));
+        }
+        let bad_factor = vm.get_global("extension.bad_factor").unwrap();
+        let error = vm.call_value(&bad_factor, Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("Native must return Factor"));
     }
 
     #[test]

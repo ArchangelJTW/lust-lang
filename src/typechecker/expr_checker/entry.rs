@@ -1,7 +1,6 @@
 use super::*;
 use crate::builtins;
 use alloc::{boxed::Box, format, string::ToString, vec::Vec};
-use hashbrown::HashMap;
 impl TypeChecker {
     pub fn check_expr(&mut self, expr: &Expr) -> Result<Type> {
         self.check_expr_with_hint(expr, None)
@@ -236,78 +235,30 @@ impl TypeChecker {
                 variant,
                 args,
             } => {
-                let enum_def = self
+                let key = self.resolve_type_key(enum_name);
+                if self
                     .env
-                    .lookup_enum(enum_name)
-                    .ok_or_else(|| self.type_error(format!("Undefined enum '{}'", enum_name)))?
-                    .clone();
-                let variant_def = enum_def
-                    .variants
-                    .iter()
-                    .find(|v| v.name == *variant)
-                    .ok_or_else(|| {
-                        self.type_error(format!(
-                            "Enum '{}' has no variant '{}'",
-                            enum_name, variant
-                        ))
-                    })?;
-                if let Some(expected_fields) = &variant_def.fields {
-                    if args.len() != expected_fields.len() {
-                        return Err(self.type_error(format!(
-                            "Variant '{}::{}' expects {} arguments, got {}",
-                            enum_name,
-                            variant,
-                            expected_fields.len(),
-                            args.len()
-                        )));
-                    }
-
-                    let mut type_params = HashMap::new();
-                    for (arg, expected_type) in args.iter().zip(expected_fields.iter()) {
-                        let arg_type = self.check_expr(arg)?;
-                        if let TypeKind::Generic(type_param) = &expected_type.kind {
-                            type_params.insert(type_param.clone(), arg_type.clone());
-                        } else {
-                            self.unify(expected_type, &arg_type)?;
-                        }
-                    }
-
-                    if !type_params.is_empty() {
-                        self.pending_generic_instances = Some(type_params.clone());
-                    }
-
-                    if enum_name == "Option" {
-                        if let Some(inner_type) = type_params.get("T") {
-                            return Ok(Type::new(
-                                TypeKind::Option(Box::new(inner_type.clone())),
-                                Self::dummy_span(),
-                            ));
-                        }
-                    } else if enum_name == "Result"
-                        && let (Some(ok_type), Some(err_type)) =
-                            (type_params.get("T"), type_params.get("E"))
-                        {
-                            return Ok(Type::new(
-                                TypeKind::Result(
-                                    Box::new(ok_type.clone()),
-                                    Box::new(err_type.clone()),
-                                ),
-                                Self::dummy_span(),
-                            ));
-                        }
-                } else {
-                    if !args.is_empty() {
-                        return Err(self.type_error(format!(
-                            "Variant '{}::{}' is a unit variant and takes no arguments",
-                            enum_name, variant
-                        )));
-                    }
+                    .lookup_enum(&key)
+                    .or_else(|| self.env.lookup_enum(enum_name))
+                    .is_none()
+                {
+                    return Err(self.type_error_at(
+                        format!("Undefined enum '{}'", enum_name),
+                        expr.span,
+                    ));
                 }
-
-                Ok(Type::new(
-                    TypeKind::Named(enum_name.clone()),
-                    Self::dummy_span(),
-                ))
+                // Share inference and validation with the dotted constructor syntax.
+                let callee = Expr::new(
+                    ExprKind::FieldAccess {
+                        object: Box::new(Expr::new(
+                            ExprKind::Identifier(enum_name.clone()),
+                            expr.span,
+                        )),
+                        field: variant.clone(),
+                    },
+                    expr.span,
+                );
+                self.check_call_expr(expr.span, &callee, None, args, expected_type)
             }
 
             ExprKind::Tuple(elements) => {
@@ -379,7 +330,7 @@ impl TypeChecker {
                 Ok(return_type)
             }
 
-            ExprKind::Paren(inner) => self.check_expr(inner),
+            ExprKind::Paren(inner) => self.check_expr_with_hint(inner, expected_type),
         }
     }
 

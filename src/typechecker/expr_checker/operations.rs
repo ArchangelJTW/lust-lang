@@ -525,7 +525,12 @@ impl TypeChecker {
                     for (i, (arg, expected_type)) in
                         args.iter().zip(expected_params.iter()).enumerate()
                     {
-                        let arg_type = self.check_expr(arg)?;
+                        let hint = self.generic_argument_hint(
+                            expected_type,
+                            &sig.type_params,
+                            &generic_bindings,
+                        );
+                        let arg_type = self.check_expr_with_hint(arg, hint.as_ref())?;
                         let result = if sig.type_params.is_empty() {
                             self.unify(expected_type, &arg_type)
                         } else {
@@ -539,11 +544,12 @@ impl TypeChecker {
                         result.map_err(|_| {
                             self.type_error_at(
                                 format!(
-                                    "Argument {} to function '{}': expected '{}', got '{}'",
+                                    "Argument {} to function '{}': expected '{}', got '{}'{}",
                                     i + 1,
                                     resolved_name,
-                                    expected_type,
-                                    arg_type
+                                    self.substitute_type(expected_type, &generic_bindings),
+                                    arg_type,
+                                    Self::call_trait_bounds_description(&sig.trait_bounds)
                                 ),
                                 arg.span,
                             )
@@ -631,8 +637,13 @@ impl TypeChecker {
                             }
                         }
                         for (arg, expected_type) in args.iter().zip(expected_fields.iter()) {
-                            let arg_type = self.check_expr(arg)?;
                             let expected_type = self.canonicalize_type(expected_type);
+                            let hint = self.generic_argument_hint(
+                                &expected_type,
+                                &enum_def.type_params,
+                                &type_params,
+                            );
+                            let arg_type = self.check_expr_with_hint(arg, hint.as_ref())?;
                             self.infer_type_arguments(
                                 &expected_type,
                                 &arg_type,
@@ -665,16 +676,8 @@ impl TypeChecker {
                                 ));
                             }
 
-                        let enum_type_name = {
-                            let key = self.resolve_type_key(type_name);
-                            if self.env.lookup_enum(&key).is_some() {
-                                key
-                            } else {
-                                type_name.clone()
-                            }
-                        };
                         return self.instantiate_nominal_type(
-                            enum_type_name,
+                            enum_def.name.clone(),
                             &enum_def.type_params,
                             &enum_def.trait_bounds,
                             &type_params,
@@ -688,14 +691,7 @@ impl TypeChecker {
                             )));
                         }
 
-                        let enum_type_name = {
-                            let key = self.resolve_type_key(type_name);
-                            if self.env.lookup_enum(&key).is_some() {
-                                key
-                            } else {
-                                type_name.clone()
-                            }
-                        };
+                        let enum_type_name = enum_def.name.clone();
                         let mut type_params = HashMap::new();
                         if !explicit_type_args.is_empty() {
                             if explicit_type_args.len() != enum_def.type_params.len() {
@@ -815,7 +811,7 @@ impl TypeChecker {
                     for (i, (arg, expected_type)) in
                         args.iter().zip(expected_params.iter()).enumerate()
                     {
-                        let arg_type = self.check_expr(arg)?;
+                        let arg_type = self.check_expr_with_hint(arg, Some(expected_type))?;
                         self.unify(expected_type, &arg_type).map_err(|_| {
                             self.type_error_at(
                                 format!(
@@ -912,7 +908,12 @@ impl TypeChecker {
             }
 
             for (i, (arg, expected_type)) in args.iter().zip(expected_params.iter()).enumerate() {
-                let arg_type = self.check_expr(arg)?;
+                let hint = self.generic_argument_hint(
+                    expected_type,
+                    &sig.type_params,
+                    &generic_bindings,
+                );
+                let arg_type = self.check_expr_with_hint(arg, hint.as_ref())?;
                 let result = if sig.type_params.is_empty() {
                     self.unify(expected_type, &arg_type)
                 } else {
@@ -926,11 +927,12 @@ impl TypeChecker {
                 result.map_err(|_| {
                     self.type_error_at(
                         format!(
-                            "Argument {} to function '{}': expected '{}', got '{}'",
+                            "Argument {} to function '{}': expected '{}', got '{}'{}",
                             i + 1,
                             name,
-                            expected_type,
-                            arg_type
+                            self.substitute_type(expected_type, &generic_bindings),
+                            arg_type,
+                            Self::call_trait_bounds_description(&sig.trait_bounds)
                         ),
                         arg.span,
                     )
@@ -971,7 +973,7 @@ impl TypeChecker {
                     for (i, (arg, expected_type)) in
                         args.iter().zip(expected_params.iter()).enumerate()
                     {
-                        let arg_type = self.check_expr(arg)?;
+                        let arg_type = self.check_expr_with_hint(arg, Some(expected_type))?;
                         self.unify_with_bounds(expected_type, &arg_type)
                             .map_err(|_| {
                                 self.type_error_at(
@@ -1009,6 +1011,20 @@ impl TypeChecker {
                 )),
             }
         }
+    }
+
+    fn call_trait_bounds_description(bounds: &[TraitBound]) -> String {
+        if bounds.is_empty() {
+            return String::new();
+        }
+        format!(
+            " (required bounds: {})",
+            bounds
+                .iter()
+                .map(|bound| format!("{}: {}", bound.type_param, bound.traits.join(" + ")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 
     pub fn check_method_call(
@@ -1349,7 +1365,8 @@ impl TypeChecker {
                         bindings.insert(type_param.clone(), concrete.clone());
                     }
                     for (i, (arg, param)) in args.iter().zip(method_params).enumerate() {
-                        let arg_type = self.check_expr(arg)?;
+                        let hint = self.generic_argument_hint(&param.ty, &type_params, &bindings);
+                        let arg_type = self.check_expr_with_hint(arg, hint.as_ref())?;
                         self.infer_type_arguments(
                             &param.ty,
                             &arg_type,
@@ -1358,11 +1375,13 @@ impl TypeChecker {
                         )
                         .map_err(|_| {
                             self.type_error(format!(
-                                "Argument {} to method '{}': expected '{}', got '{}'",
+                                "Argument {} to method '{}': expected '{}', got '{}'{}{}",
                                 i + 1,
                                 method,
-                                param.ty,
-                                arg_type
+                                self.substitute_type(&param.ty, &bindings),
+                                arg_type,
+                                Self::call_trait_bounds_description(&impl_block.where_clause),
+                                Self::call_trait_bounds_description(&method_def.trait_bounds)
                             ))
                         })?;
                     }
@@ -1428,8 +1447,8 @@ impl TypeChecker {
                             )));
                         }
                         for (index, (arg, param)) in args.iter().zip(params).enumerate() {
-                            let actual = self.check_expr(arg)?;
                             let expected = self.canonicalize_type(&param.ty);
+                            let actual = self.check_expr_with_hint(arg, Some(&expected))?;
                             self.unify(&expected, &actual).map_err(|_| {
                                 self.type_error(format!(
                                     "Argument {} to method '{}': expected '{}', got '{}'",
@@ -1472,8 +1491,8 @@ impl TypeChecker {
                             )));
                         }
                         for (index, (arg, param)) in args.iter().zip(params).enumerate() {
-                            let actual = self.check_expr(arg)?;
                             let expected = self.canonicalize_type(&param.ty);
+                            let actual = self.check_expr_with_hint(arg, Some(&expected))?;
                             self.unify(&expected, &actual).map_err(|_| {
                                 self.type_error(format!(
                                     "Argument {} to method '{}': expected '{}', got '{}'",
@@ -1548,8 +1567,9 @@ impl TypeChecker {
                         }
 
                         TypeKind::GenericInstance { name, type_args } => {
-                            let resolved = self.resolve_type_key(enum_name);
-                            if name == &resolved && type_args.len() == enum_def.type_params.len() {
+                            if name == &enum_def.name && type_args.len() == enum_def.type_params.len()
+                            {
+                                self.validate_type(expected)?;
                                 return Ok(expected.clone());
                             }
                         }
@@ -1568,7 +1588,7 @@ impl TypeChecker {
                     ));
                 }
 
-                return Ok(Type::new(TypeKind::Named(enum_name.clone()), span));
+                return Ok(Type::new(TypeKind::Named(enum_def.name.clone()), span));
             }
 
         let object_type = self.check_expr(object)?;

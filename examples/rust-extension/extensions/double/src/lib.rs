@@ -83,8 +83,7 @@ fn register_functions(vm: &mut VM) -> Result<(), String> {
         ],
         "Factor",
     );
-    let vm_ptr = vm as *mut VM;
-    vm.register_exported_native(export, move |values: &[Value]| {
+    vm.register_exported_native(export, |values: &[Value]| {
         let base = values
             .get(0)
             .and_then(|value| value.as_int())
@@ -94,8 +93,7 @@ fn register_functions(vm: &mut VM) -> Result<(), String> {
             .and_then(|value| value.as_int())
             .ok_or_else(|| "expected multiplier: int".to_string())?;
 
-        let factor_value = unsafe {
-            let vm = &mut *vm_ptr;
+        let factor_value = VM::with_current(|vm| {
             vm.instantiate_struct(
                 "lust_double.Factor",
                 vec![
@@ -103,8 +101,8 @@ fn register_functions(vm: &mut VM) -> Result<(), String> {
                     (Rc::new("multiplier".to_string()), Value::Int(multiplier)),
                 ],
             )
-            .map_err(|err| err.to_string())?
-        };
+            .map_err(|err| err.to_string())
+        })?;
         Ok(NativeCallResult::Return(factor_value))
     });
 

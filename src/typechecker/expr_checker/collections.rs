@@ -13,7 +13,9 @@ impl TypeChecker {
         expected_type: Option<&Type>,
     ) -> Result<Type> {
         if elements.is_empty() {
-            if let Some(expected) = expected_type {
+            if let Some(expected) = expected_type
+                && matches!(expected.kind, TypeKind::Array(_))
+            {
                 return Ok(expected.clone());
             }
 
@@ -280,9 +282,12 @@ impl TypeChecker {
                     )
                 })?;
             let expected_type = self.canonicalize_type(expected_type);
-            let hint = self.substitute_type(&expected_type, &type_bindings);
-            let hint = (!self.has_unbound_generic(&hint, &type_bindings)).then_some(&hint);
-            let actual_type = self.check_expr_with_hint(&field.value, hint)?;
+            let hint = self.generic_argument_hint(
+                &expected_type,
+                &struct_def.type_params,
+                &type_bindings,
+            );
+            let actual_type = self.check_expr_with_hint(&field.value, hint.as_ref())?;
             match &expected_type.kind {
                 TypeKind::Option(inner_expected) => {
                     if matches!(actual_type.kind, TypeKind::Option(_)) {
@@ -313,13 +318,8 @@ impl TypeChecker {
             }
         }
 
-        let ty_name = if self.env.lookup_struct(&key).is_some() {
-            key
-        } else {
-            name.to_string()
-        };
         self.instantiate_nominal_type(
-            ty_name,
+            struct_def.name.clone(),
             &struct_def.type_params,
             &struct_def.trait_bounds,
             &type_bindings,

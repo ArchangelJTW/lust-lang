@@ -1360,15 +1360,21 @@ impl TypeChecker {
         Type::new(kind, ty.span)
     }
 
-    fn has_unbound_generic(&self, ty: &Type, bindings: &HashMap<String, Type>) -> bool {
+    fn has_unbound_generic(
+        &self,
+        ty: &Type,
+        type_params: &[String],
+        bindings: &HashMap<String, Type>,
+    ) -> bool {
         match &ty.kind {
-            TypeKind::Generic(name) => !bindings.contains_key(name),
+            TypeKind::Generic(name) => type_params.contains(name) && !bindings.contains_key(name),
             TypeKind::Array(inner)
             | TypeKind::Option(inner)
             | TypeKind::Ref(inner)
-            | TypeKind::MutRef(inner) => self.has_unbound_generic(inner, bindings),
+            | TypeKind::MutRef(inner) => self.has_unbound_generic(inner, type_params, bindings),
             TypeKind::Map(key, value) | TypeKind::Result(key, value) => {
-                self.has_unbound_generic(key, bindings) || self.has_unbound_generic(value, bindings)
+                self.has_unbound_generic(key, type_params, bindings)
+                    || self.has_unbound_generic(value, type_params, bindings)
             }
             TypeKind::Function {
                 params,
@@ -1376,8 +1382,8 @@ impl TypeChecker {
             } => {
                 params
                     .iter()
-                    .any(|param| self.has_unbound_generic(param, bindings))
-                    || self.has_unbound_generic(return_type, bindings)
+                    .any(|param| self.has_unbound_generic(param, type_params, bindings))
+                    || self.has_unbound_generic(return_type, type_params, bindings)
             }
             TypeKind::Tuple(elements)
             | TypeKind::Union(elements)
@@ -1386,10 +1392,24 @@ impl TypeChecker {
                 ..
             } => elements
                 .iter()
-                .any(|element| self.has_unbound_generic(element, bindings)),
-            TypeKind::Pointer { pointee, .. } => self.has_unbound_generic(pointee, bindings),
+                .any(|element| self.has_unbound_generic(element, type_params, bindings)),
+            TypeKind::Pointer { pointee, .. } => {
+                self.has_unbound_generic(pointee, type_params, bindings)
+            }
             _ => false,
         }
+    }
+
+    fn generic_argument_hint(
+        &self,
+        expected: &Type,
+        type_params: &[String],
+        bindings: &HashMap<String, Type>,
+    ) -> Option<Type> {
+        // Check before substitution: a binding may itself refer to a type parameter
+        // from the caller, which is valid context rather than missing inference.
+        (!self.has_unbound_generic(expected, type_params, bindings))
+            .then(|| self.substitute_type(expected, bindings))
     }
 
     fn validate_generic_call(
@@ -2022,6 +2042,10 @@ mod tests {
     static CHECK_LOCK: Mutex<()> = Mutex::new(());
 
     fn check(source: &str) -> Result<()> {
+        check_in_module(source, None)
+    }
+
+    fn check_in_module(source: &str, module: Option<&str>) -> Result<()> {
         #[cfg(feature = "std")]
         let _guard = CHECK_LOCK.lock().unwrap();
         let mut interner = Interner::new();
@@ -2029,7 +2053,250 @@ mod tests {
         let tokens = lexer.tokenize()?;
         let mut parser = Parser::new(tokens);
         let items = parser.parse()?;
-        TypeChecker::new().check_module(&items)
+        let mut checker = TypeChecker::new();
+        checker.current_module = module.map(ToString::to_string);
+        checker.check_module(&items)
+    }
+
+    #[test]
+    fn enum_constructor_ast_preserves_canonical_generic_types() {
+        #[cfg(feature = "std")]
+        let _guard = CHECK_LOCK.lock().unwrap();
+        let mut interner = Interner::new();
+        let tokens = Lexer::new(
+            "enum Operation\nDouble\nend\nenum Pair<Item>\nValues(Item, Item)\nNone\nend\n",
+            &mut interner,
+        )
+        .tokenize()
+        .unwrap();
+        let items = Parser::new(tokens).parse().unwrap();
+        let mut checker = TypeChecker::new();
+        checker.current_module = Some("models".to_string());
+        checker.check_module(&items).unwrap();
+        let span = TypeChecker::dummy_span();
+        let constructor = |name: &str, variant: &str, args| {
+            Expr::new(
+                ExprKind::EnumConstructor {
+                    enum_name: name.to_string(),
+                    variant: variant.to_string(),
+                    args,
+                },
+                span,
+            )
+        };
+        let operation = constructor("Operation", "Double", vec![]);
+        assert_eq!(
+            checker.check_expr(&operation).unwrap().kind,
+            TypeKind::Named("models.Operation".to_string())
+        );
+        let pair_type = Type::new(
+            TypeKind::GenericInstance {
+                name: "models.Pair".to_string(),
+                type_args: vec![Type::new(TypeKind::Int, span)],
+            },
+            span,
+        );
+        let pair = constructor(
+            "Pair",
+            "Values",
+            vec![
+                Expr::new(ExprKind::Literal(Literal::Integer(1)), span),
+                Expr::new(ExprKind::Literal(Literal::Integer(2)), span),
+            ],
+        );
+        assert_eq!(checker.check_expr(&pair).unwrap().kind, pair_type.kind);
+        let empty = constructor("Pair", "None", vec![]);
+        assert_eq!(
+            checker.check_expr_with_hint(&empty, Some(&pair_type)).unwrap().kind,
+            pair_type.kind
+        );
+        assert!(checker.check_expr(&empty).is_err());
+        let invalid = constructor(
+            "Pair",
+            "Values",
+            vec![
+                Expr::new(ExprKind::Literal(Literal::Integer(1)), span),
+                Expr::new(ExprKind::Literal(Literal::String("wrong".to_string())), span),
+            ],
+        );
+        assert!(checker.check_expr(&invalid).is_err());
+    }
+
+    #[test]
+    fn qualified_enums_and_structs_work_as_arguments_and_payloads() {
+        check_in_module(
+            r#"
+enum Operation
+    Double
+    Scale(int)
+end
+struct Factor
+    operation: Operation
+    amount: int
+end
+enum Message
+    Apply(Factor)
+end
+function take_operation(value: Operation): Operation
+    return value
+end
+function take_factor(value: Factor): int
+    return value.amount
+end
+local operations: Array<Operation> = []
+array.push(operations, Operation.Double)
+array.push(operations, Operation.Double())
+array.push(operations, Operation.Scale(3))
+local operation: Operation = take_operation(Operation.Double)
+local factors: Array<Factor> = []
+array.push(factors, Factor { operation = Operation.Double, amount = 2 })
+local amount: int = take_factor(Factor { operation = Operation.Scale(4), amount = 5 })
+local message: Message = Message.Apply(Factor { operation = Operation.Double, amount = 6 })
+"#,
+            Some("models"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn call_hints_infer_nested_enums_and_structs() {
+        check_in_module(
+            r#"
+enum Maybe<Item>
+    None
+    Some(Item)
+end
+struct Holder<Item>
+    value: Maybe<Item>
+end
+enum Wrapped<Item>
+    Value(Holder<Item>)
+end
+function take(value: Maybe<int>)
+end
+function take_holder(value: Holder<int>)
+end
+function take_wrapped(value: Wrapped<int>)
+end
+function take_result(value: Result<int, string>)
+end
+function same<Item>(first: Item, second: Item): Item
+    return second
+end
+function forward<T>(values: Array<Maybe<T>>, holders: Array<Holder<T>>, options: Array<Option<T>>)
+    array.push(values, Maybe.None)
+    array.push(holders, Holder { value = Maybe.None })
+    array.push(options, Option.None)
+end
+take(Maybe.None)
+take((Maybe.None))
+take(Maybe.None())
+take_holder(Holder { value = Maybe.None })
+take_wrapped(Wrapped.Value(Holder { value = Maybe.None }))
+take_result(Result.Ok(1))
+take_result(Result.Err("error"))
+local values: Array<Maybe<int>> = []
+array.push(values, Maybe.None)
+local holders: Array<Holder<int>> = []
+array.push(holders, Holder { value = Maybe.None })
+local options: Array<Option<int>> = []
+array.push(options, Option.None)
+local value: Maybe<int> = same(Maybe.Some(1), Maybe.None)
+local explicit: Maybe<int> = same<Maybe<int>>(Maybe.None, Maybe.None)
+local nested: Holder<int> = same(Holder { value = Maybe.Some(1) }, Holder { value = Maybe.None })
+local callback = take_holder
+callback(Holder { value = Maybe.None })
+local called = (take)(Maybe.None)
+"#,
+            Some("models"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn generic_methods_propagate_receiver_and_argument_bindings() {
+        check_in_module(
+            r#"
+struct Holder<Item>
+    value: Option<Item>
+end
+impl<Item> Holder<Item>
+    function replace(self, value: Option<Item>): Option<Item>
+        return value
+    end
+    function choose<Next>(self, first: Next, second: Next): Next
+        return second
+    end
+end
+local holder: Holder<int> = Holder { value = Option.None }
+local replaced: Option<int> = holder:replace(Option.None)
+local chosen: Option<string> = holder:choose(Option.Some("yes"), Option.None)
+"#,
+            Some("models"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn nominal_argument_errors_show_bound_types_and_traits() {
+        let declarations = r#"
+enum Operation
+    Double
+end
+struct Factor
+    amount: int
+end
+"#;
+        let error = check_in_module(
+            &format!("{declarations}\nlocal values: Array<Operation> = []\narray.push(values, Factor {{ amount = 2 }})\n"),
+            Some("models"),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("expected 'models.Operation', got 'models.Factor'"),
+            "{message}"
+        );
+
+        let error = check(
+            "function choose<T: ToString>(first: T, second: T): T\nreturn first\nend\nchoose(1, \"wrong\")\n",
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("expected 'int', got 'string'"),
+            "{message}"
+        );
+        assert!(message.contains("T: ToString"), "{message}");
+    }
+
+    #[test]
+    fn constructor_hints_do_not_hide_invalid_argument_types() {
+        let declarations = r#"
+enum Maybe<Item>
+    None
+    Some(Item)
+end
+struct Holder<Item>
+    value: Maybe<Item>
+end
+function take(value: Maybe<int>)
+end
+function take_holder(value: Holder<int>)
+end
+"#;
+        for call in [
+            "take(Maybe.Some(\"wrong\"))",
+            "take(Maybe.None<string>())",
+            "take_holder(Holder { value = Maybe.Some(\"wrong\") })",
+            "take([1])",
+            "take_holder([1])",
+        ] {
+            assert!(
+                check_in_module(&format!("{declarations}\n{call}\n"), Some("models")).is_err(),
+                "{call}"
+            );
+        }
     }
 
     #[test]

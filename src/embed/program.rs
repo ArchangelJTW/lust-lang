@@ -1,6 +1,6 @@
 use super::async_runtime::{
-    signal_pair, AsyncRegistry, AsyncTaskEntry, AsyncTaskQueue, AsyncTaskTarget, AsyncValueFuture,
-    PendingAsyncTask,
+    AsyncRegistry, AsyncTaskEntry, AsyncTaskQueue, AsyncTaskTarget, AsyncValueFuture,
+    PendingAsyncTask, signal_pair,
 };
 use super::conversions::{
     FromLustArgs, FromLustValue, FunctionArgs, IntoLustValue, IntoTypedValue,
@@ -924,13 +924,14 @@ impl EmbeddedProgram {
             if let Some((target, expected_type, mut outcome)) = completion {
                 self.async_registry.borrow_mut().pending.remove(&id);
                 if let (Some(expected), Ok(value)) = (&expected_type, &outcome)
-                    && !self.vm.value_matches_type(value, expected) {
-                        outcome = Err(format!(
-                            "Async native must return {}, got {:?}",
-                            expected,
-                            value.type_of()
-                        ));
-                    }
+                    && !self.vm.value_matches_type(value, expected)
+                {
+                    outcome = Err(format!(
+                        "Async native must return {}, got {:?}",
+                        expected,
+                        value.type_of()
+                    ));
+                }
                 match target {
                     AsyncTaskTarget::ScriptTask(handle) => match outcome {
                         Ok(value) => {
@@ -1007,15 +1008,16 @@ fn compile_in_memory(
     let mut wrapped_items: Vec<Item> = Vec::new();
     for module in program.modules {
         if module.path != program_entry_module
-            && let Some(ref init) = module.init_function {
-                let init_name = module
-                    .imports
-                    .function_aliases
-                    .get(init)
-                    .cloned()
-                    .unwrap_or_else(|| init.clone());
-                init_funcs.push((module.path.clone(), init_name));
-            }
+            && let Some(ref init) = module.init_function
+        {
+            let init_name = module
+                .imports
+                .function_aliases
+                .get(init)
+                .cloned()
+                .unwrap_or_else(|| init.clone());
+            init_funcs.push((module.path.clone(), init_name));
+        }
         wrapped_items.push(Item::new(
             ItemKind::Module {
                 name: module.path,

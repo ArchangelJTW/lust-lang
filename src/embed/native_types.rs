@@ -1,10 +1,10 @@
+use crate::Result;
 use crate::ast::{
     EnumDef, EnumVariant, FieldOwnership, FunctionDef, FunctionParam, ImplBlock, Span, StructDef,
     StructField, TraitBound, TraitDef, TraitMethod, Type, TypeKind, Visibility,
 };
 use crate::typechecker::{FunctionSignature, TypeChecker};
 use crate::vm::VM;
-use crate::Result;
 use hashbrown::HashMap;
 use std::collections::BTreeMap;
 
@@ -239,6 +239,7 @@ impl StructBuilder {
                 trait_bounds: Vec::new(),
                 fields: Vec::new(),
                 visibility: Visibility::Public,
+                doc: None,
             },
         }
     }
@@ -282,6 +283,7 @@ impl EnumBuilder {
                 trait_bounds: Vec::new(),
                 variants: Vec::new(),
                 visibility: Visibility::Public,
+                doc: None,
             },
         }
     }
@@ -324,6 +326,7 @@ impl TraitBuilder {
                 type_params: Vec::new(),
                 methods: Vec::new(),
                 visibility: Visibility::Public,
+                doc: None,
             },
         }
     }
@@ -405,6 +408,7 @@ impl TraitMethodBuilder {
                 params: Vec::new(),
                 return_type: None,
                 default_impl: None,
+                doc: None,
             },
         }
     }
@@ -447,6 +451,7 @@ impl FunctionBuilder {
                 body: Vec::new(),
                 is_method: false,
                 visibility: Visibility::Public,
+                doc: None,
             },
         }
     }
@@ -726,10 +731,11 @@ fn format_trait_method(method: &TraitMethod) -> String {
     );
     out.push(')');
     if let Some(ret) = &method.return_type
-        && !matches!(ret.kind, TypeKind::Unit) {
-            out.push_str(": ");
-            out.push_str(&format_type(ret));
-        }
+        && !matches!(ret.kind, TypeKind::Unit)
+    {
+        out.push_str(": ");
+        out.push_str(&format_type(ret));
+    }
     out
 }
 

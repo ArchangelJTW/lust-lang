@@ -5,7 +5,7 @@ use crate::vm::{CallFrame, TaskSignal, VM};
 use alloc::rc::{Rc, Weak};
 use alloc::{vec, vec::Vec};
 use core::cell::RefCell;
-use hashbrown::{hash_map::Entry, HashMap, HashSet};
+use hashbrown::{HashMap, HashSet, hash_map::Entry};
 
 const COLLECT_INTERVAL: usize = 512;
 const REGISTRATION_THRESHOLD: usize = 256;
@@ -183,10 +183,12 @@ impl CycleCollector {
                     if registered {
                         self.pending_registrations += 1;
                     }
-                    if (registered || scan_existing) && visited.insert(key)
-                        && let Ok(values) = rc.try_borrow() {
-                            stack.extend(values.iter().cloned());
-                        }
+                    if (registered || scan_existing)
+                        && visited.insert(key)
+                        && let Ok(values) = rc.try_borrow()
+                    {
+                        stack.extend(values.iter().cloned());
+                    }
                 }
                 Value::Map(rc) => {
                     let key = (NODE_MAP, Rc::as_ptr(&rc) as usize);
@@ -194,15 +196,17 @@ impl CycleCollector {
                     if registered {
                         self.pending_registrations += 1;
                     }
-                    if (registered || scan_existing) && visited.insert(key)
-                        && let Ok(map) = rc.try_borrow() {
-                            for (map_key, value) in map.iter() {
-                                let (original, hashed) = map_key.owned_values();
-                                stack.push(original.clone());
-                                stack.push(hashed.clone());
-                                stack.push(value.clone());
-                            }
+                    if (registered || scan_existing)
+                        && visited.insert(key)
+                        && let Ok(map) = rc.try_borrow()
+                    {
+                        for (map_key, value) in map.iter() {
+                            let (original, hashed) = map_key.owned_values();
+                            stack.push(original.clone());
+                            stack.push(hashed.clone());
+                            stack.push(value.clone());
                         }
+                    }
                 }
                 Value::Struct { fields, .. } => {
                     let key = (NODE_STRUCT, Rc::as_ptr(&fields) as usize);
@@ -210,10 +214,12 @@ impl CycleCollector {
                     if registered {
                         self.pending_registrations += 1;
                     }
-                    if (registered || scan_existing) && visited.insert(key)
-                        && let Ok(values) = fields.try_borrow() {
-                            stack.extend(values.iter().cloned());
-                        }
+                    if (registered || scan_existing)
+                        && visited.insert(key)
+                        && let Ok(values) = fields.try_borrow()
+                    {
+                        stack.extend(values.iter().cloned());
+                    }
                 }
                 Value::Iterator(rc) => {
                     let key = (NODE_ITERATOR, Rc::as_ptr(&rc) as usize);
@@ -221,22 +227,24 @@ impl CycleCollector {
                     if registered {
                         self.pending_registrations += 1;
                     }
-                    if (registered || scan_existing) && visited.insert(key)
-                        && let Ok(iterator) = rc.try_borrow() {
-                            match &*iterator {
-                                IteratorState::Array { items, .. } => {
-                                    stack.extend(items.iter().cloned());
-                                }
-                                IteratorState::MapPairs { items, .. } => {
-                                    for (map_key, value) in items {
-                                        let (original, hashed) = map_key.owned_values();
-                                        stack.push(original.clone());
-                                        stack.push(hashed.clone());
-                                        stack.push(value.clone());
-                                    }
+                    if (registered || scan_existing)
+                        && visited.insert(key)
+                        && let Ok(iterator) = rc.try_borrow()
+                    {
+                        match &*iterator {
+                            IteratorState::Array { items, .. } => {
+                                stack.extend(items.iter().cloned());
+                            }
+                            IteratorState::MapPairs { items, .. } => {
+                                for (map_key, value) in items {
+                                    let (original, hashed) = map_key.owned_values();
+                                    stack.push(original.clone());
+                                    stack.push(hashed.clone());
+                                    stack.push(value.clone());
                                 }
                             }
                         }
+                    }
                 }
                 Value::Tuple(values) => {
                     let key = (NODE_TUPLE_VALUES, Rc::as_ptr(&values) as usize);

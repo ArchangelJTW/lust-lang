@@ -1,11 +1,11 @@
 use crate::ast::Item;
 #[cfg(feature = "std")]
 use crate::{
+    Span,
     ast::{FunctionDef, ItemKind, Type, TypeKind, UseTree, Visibility},
     error::{LustError, Result},
     lexer::Lexer,
     parser::Parser,
-    Span,
 };
 #[cfg(feature = "std")]
 use alloc::{format, vec};
@@ -48,12 +48,12 @@ pub struct Program {
     pub entry_module: String,
 }
 
-pub use embedded::{build_directory_map, load_program_from_embedded, EmbeddedModule};
+pub use embedded::{EmbeddedModule, build_directory_map, load_program_from_embedded};
 
+use crate::LustConfig;
 use crate::bytecode::Compiler;
 use crate::typechecker::TypeChecker;
 use crate::vm::VM;
-use crate::LustConfig;
 
 /// Compiles a Program into a VM with memory optimizations.
 /// This is designed for no_std contexts where memory is constrained (e.g., ESP32).
@@ -366,6 +366,7 @@ impl ModuleLoader {
                                 name,
                                 params,
                                 return_type,
+                                doc,
                             } => {
                                 let mut new_name = name.clone();
                                 if let Some((head, tail)) = new_name.split_once(':') {
@@ -393,10 +394,11 @@ impl ModuleLoader {
                                     name: new_name,
                                     params: params.clone(),
                                     return_type: return_type.clone(),
+                                    doc: doc.clone(),
                                 });
                             }
 
-                            crate::ast::ExternItem::Const { name, ty } => {
+                            crate::ast::ExternItem::Const { name, ty, doc } => {
                                 let qualified = if name.contains('.') {
                                     name.clone()
                                 } else {
@@ -413,6 +415,7 @@ impl ModuleLoader {
                                 rewritten.push(crate::ast::ExternItem::Const {
                                     name: qualified,
                                     ty: ty.clone(),
+                                    doc: doc.clone(),
                                 });
                             }
 
@@ -468,6 +471,7 @@ impl ModuleLoader {
                 body: pending_init_stmts,
                 is_method: false,
                 visibility: Visibility::Private,
+                doc: None,
             };
             let span = pending_init_span.unwrap_or_else(Span::dummy);
             // Place module init first so the compiler can observe module-level locals
@@ -626,19 +630,21 @@ impl ModuleLoader {
         match &expr.kind {
             ExprKind::Call { callee, args, .. } => {
                 if self.is_lua_require_callee(callee)
-                    && let Some(name) = args.first()
+                    && let Some(name) = args
+                        .first()
                         .and_then(|arg| self.extract_lua_require_name(arg))
-                        && !Self::is_lua_builtin_module_name(&name) {
-                            // `lua.require()` calls originate from transpiled Lua stubs. Unlike
-                            // Lust `use` imports, these should only pull in modules that we can
-                            // actually locate in the current module roots (extern stubs, on-disk
-                            // modules, or source overrides). This prevents optional Lua requires
-                            // (e.g. `ssl.https`) from becoming hard compile-time dependencies.
-                            let file = self.file_for_module_path(&name);
-                            if self.module_source_known(&name, &file) {
-                                deps.insert(name);
-                            }
-                        }
+                    && !Self::is_lua_builtin_module_name(&name)
+                {
+                    // `lua.require()` calls originate from transpiled Lua stubs. Unlike
+                    // Lust `use` imports, these should only pull in modules that we can
+                    // actually locate in the current module roots (extern stubs, on-disk
+                    // modules, or source overrides). This prevents optional Lua requires
+                    // (e.g. `ssl.https`) from becoming hard compile-time dependencies.
+                    let file = self.file_for_module_path(&name);
+                    if self.module_source_known(&name, &file) {
+                        deps.insert(name);
+                    }
+                }
                 self.collect_deps_from_lua_require_expr(callee, deps);
                 for arg in args {
                     self.collect_deps_from_lua_require_expr(arg, deps);

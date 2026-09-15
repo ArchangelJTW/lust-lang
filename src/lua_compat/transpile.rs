@@ -87,7 +87,11 @@ fn expr_segments(expr: &Expression) -> Option<Vec<String>> {
 /// to `lua.require(...)` calls and exporting members discovered in a trailing `return { ... }`.
 pub fn transpile_lua_stub(source: &str, module_name: &str) -> Result<String, String> {
     let ast = parse(source).map_err(|errors| {
-        let err_str = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ");
+        let err_str = errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         format!("failed to parse Lua: {err_str}")
     })?;
     let block = ast.nodes();
@@ -292,8 +296,7 @@ impl Analyzer {
                                     if let Prefix::Name(pkg) = expr.prefix() {
                                         if pkg.to_string() == "package" {
                                             if let Some(Suffix::Index(Index::Dot {
-                                                name,
-                                                ..
+                                                name, ..
                                             })) = expr.suffixes().next()
                                             {
                                                 if name.to_string() == "seeall" {
@@ -346,11 +349,7 @@ impl Analyzer {
         if let Some(method) = name.method_name() {
             parts.push(sanitize_identifier(&method.to_string()));
         }
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts)
-        }
+        if parts.is_empty() { None } else { Some(parts) }
     }
 
     fn module_parts(&self) -> Vec<String> {
@@ -924,11 +923,7 @@ impl Emitter {
                 }
             }
         }
-        if out.is_empty() {
-            None
-        } else {
-            Some(out)
-        }
+        if out.is_empty() { None } else { Some(out) }
     }
 
     fn emit_function_decl(&mut self, func: &FunctionDeclaration, exported: bool) {
@@ -1397,18 +1392,17 @@ impl Emitter {
                     let value_str = self.emit_expr(value);
 
                     // For metamethods with table values, create a shared reference
-                    let (key_str, final_value_str) = if is_metamethod
-                        && matches!(value, Expression::TableConstructor(_))
-                    {
-                        // This is a metamethod with a table literal value - create shared reference
-                        let var_name =
-                            format!("__shared_{}_{}", name, shared_metamethod_tables.len());
-                        shared_metamethod_tables
-                            .push(format!("local {} = {}", var_name, value_str));
-                        (format!("\"{}\"", name), var_name.clone())
-                    } else {
-                        (format!("\"{}\"", name), value_str)
-                    };
+                    let (key_str, final_value_str) =
+                        if is_metamethod && matches!(value, Expression::TableConstructor(_)) {
+                            // This is a metamethod with a table literal value - create shared reference
+                            let var_name =
+                                format!("__shared_{}_{}", name, shared_metamethod_tables.len());
+                            shared_metamethod_tables
+                                .push(format!("local {} = {}", var_name, value_str));
+                            (format!("\"{}\"", name), var_name.clone())
+                        } else {
+                            (format!("\"{}\"", name), value_str)
+                        };
 
                     entries.push(format!("({}, {})", key_str, final_value_str.clone()));
 

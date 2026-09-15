@@ -857,7 +857,7 @@ impl JitCompiler {
         let enum_offset = (enum_reg as i32) * (mem::size_of::<Value>() as i32);
         unsafe extern "C" {
             fn jit_get_enum_value_safe(enum_ptr: *const Value, index: usize, out: *mut Value)
-                -> u8;
+            -> u8;
         }
         let index_usize = index as usize;
         dynasm!(self.ops

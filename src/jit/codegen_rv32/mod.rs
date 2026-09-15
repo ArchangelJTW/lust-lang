@@ -25,13 +25,13 @@
 pub(super) use super::specialization::{SpecializationRegistry, SpecializedLayout};
 pub(super) use super::trace::{InlineTrace, Operand, SpecializedOpKind, ValueType};
 pub(super) use super::{CompiledTrace, Guard, GuardKind, JitData, Trace, TraceId, TraceOp};
+pub(super) use crate::Result;
 pub(super) use crate::bytecode::{Function, Value, ValueTag};
 pub(super) use crate::jit;
 pub(super) use crate::number::LustInt;
-pub(super) use crate::Result;
 pub(super) use alloc::{boxed::Box, format, string::ToString, vec::Vec};
 pub(super) use core::mem;
-pub(super) use dynasmrt::{dynasm, riscv::Assembler, DynasmApi, DynasmLabelApi};
+pub(super) use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm, riscv::Assembler};
 use hashbrown::HashMap;
 
 /// Byte offset of the data field within a Value on no_std / riscv32.

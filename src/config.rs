@@ -254,7 +254,7 @@ impl LustConfig {
                                 return Err(ConfigError::UnknownDependencyKind(
                                     name.clone(),
                                     other.to_string(),
-                                ))
+                                ));
                             }
                         },
                         None => None,

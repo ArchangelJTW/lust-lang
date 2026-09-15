@@ -6,8 +6,8 @@ pub mod optimizer;
 pub mod profiler;
 pub mod specialization;
 pub mod trace;
-use crate::bytecode::Value;
 use crate::VM;
+use crate::bytecode::Value;
 #[cfg(all(feature = "std", not(target_arch = "riscv32")))]
 pub use codegen::JitCompiler;
 #[cfg(all(feature = "rv32", target_arch = "riscv32"))]

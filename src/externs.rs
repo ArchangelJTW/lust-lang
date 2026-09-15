@@ -167,11 +167,7 @@ fn extern_files_from_exports(
                     let params = format_params(export);
                     let return_type = export.return_type();
                     if let Some(doc) = export.doc() {
-                        contents.push_str("    -- ");
-                        contents.push_str(doc);
-                        if !doc.ends_with('\n') {
-                            contents.push('\n');
-                        }
+                        contents.push_str(&crate::vm::format_doc_comment(doc, "    "));
                     }
                     contents.push_str("    function ");
                     contents.push_str(function);
@@ -184,20 +180,21 @@ fn extern_files_from_exports(
                     }
                     contents.push('\n');
                 } else if let Some(default) = &options.default_module
-                    && default == &module {
-                        let params = format_params(export);
-                        let return_type = export.return_type();
-                        contents.push_str("    function ");
-                        contents.push_str(&normalized_name);
-                        contents.push('(');
-                        contents.push_str(&params);
-                        contents.push(')');
-                        if !return_type.trim().is_empty() && return_type.trim() != "()" {
-                            contents.push_str(": ");
-                            contents.push_str(return_type);
-                        }
-                        contents.push('\n');
+                    && default == &module
+                {
+                    let params = format_params(export);
+                    let return_type = export.return_type();
+                    contents.push_str("    function ");
+                    contents.push_str(&normalized_name);
+                    contents.push('(');
+                    contents.push_str(&params);
+                    contents.push(')');
+                    if !return_type.trim().is_empty() && return_type.trim() != "()" {
+                        contents.push_str(": ");
+                        contents.push_str(return_type);
                     }
+                    contents.push('\n');
+                }
             }
             contents.push_str("end\n");
         }
@@ -224,11 +221,7 @@ fn format_params(export: &NativeExport) -> String {
         .iter()
         .map(|param| {
             let ty = param.ty().trim();
-            if ty.is_empty() {
-                "any"
-            } else {
-                ty
-            }
+            if ty.is_empty() { "any" } else { ty }
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -238,9 +231,10 @@ fn relative_stub_path(module: &str) -> PathBuf {
     let mut path = PathBuf::new();
     let mut segments: Vec<String> = module.split('.').map(|seg| seg.replace('-', "_")).collect();
     if let Some(first) = segments.first()
-        && first == "externs" {
-            segments.remove(0);
-        }
+        && first == "externs"
+    {
+        segments.remove(0);
+    }
     if let Some(first) = segments.first() {
         path.push(first);
     }
@@ -285,5 +279,32 @@ mod tests {
         assert!(contents.contains("struct Widget"));
         assert!(contents.contains("extern"));
         assert!(contents.contains("function scale(int): int"));
+    }
+
+    #[test]
+    fn with_doc_emits_doc_comment_in_stub() {
+        let mut vm = VM::with_config(&LustConfig::default());
+        vm.record_exported_native(
+            NativeExport::new(
+                "host.scale",
+                vec![NativeExportParam::new("value", "int")],
+                "int",
+            )
+            .with_doc("Scales a value.\nSecond line."),
+        );
+
+        let files = extern_files_from_vm(&vm, &DumpExternsOptions::default());
+        assert_eq!(files.len(), 1);
+        let contents = &files[0].contents;
+        assert!(
+            contents.contains("    --- Scales a value."),
+            "stub contents:\n{}",
+            contents
+        );
+        assert!(
+            contents.contains("    --- Second line."),
+            "stub contents:\n{}",
+            contents
+        );
     }
 }

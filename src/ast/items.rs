@@ -57,6 +57,7 @@ pub struct FunctionDef {
     pub body: Vec<Stmt>,
     pub is_method: bool,
     pub visibility: Visibility,
+    pub doc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +74,7 @@ pub struct StructDef {
     pub trait_bounds: Vec<TraitBound>,
     pub fields: Vec<StructField>,
     pub visibility: Visibility,
+    pub doc: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +99,7 @@ pub struct EnumDef {
     pub trait_bounds: Vec<TraitBound>,
     pub variants: Vec<EnumVariant>,
     pub visibility: Visibility,
+    pub doc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +114,7 @@ pub struct TraitDef {
     pub type_params: Vec<String>,
     pub methods: Vec<TraitMethod>,
     pub visibility: Visibility,
+    pub doc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +124,7 @@ pub struct TraitMethod {
     pub params: Vec<FunctionParam>,
     pub return_type: Option<Type>,
     pub default_impl: Option<Vec<Stmt>>,
+    pub doc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -149,10 +154,12 @@ pub enum ExternItem {
         name: String,
         params: Vec<Type>,
         return_type: Option<Type>,
+        doc: Option<String>,
     },
     Const {
         name: String,
         ty: Type,
+        doc: Option<String>,
     },
     Struct(StructDef),
     Enum(EnumDef),

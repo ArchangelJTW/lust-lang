@@ -1,4 +1,4 @@
-use super::{type_env::FunctionSignature, TypeChecker};
+use super::{TypeChecker, type_env::FunctionSignature};
 use crate::{ast::*, error::Result};
 use alloc::{
     format,
@@ -65,25 +65,26 @@ impl TypeChecker {
         };
         let mut resolved_self_type: Option<String> = None;
         if func.is_method
-            && let Some(colon_pos) = func.name.find(':') {
-                let type_name = &func.name[..colon_pos];
-                let resolved = self.resolve_type_key(type_name);
-                resolved_self_type = Some(resolved.clone());
-                let impl_block = ImplBlock {
-                    type_params: vec![],
-                    trait_name: None,
-                    target_type: Type::new(
-                        TypeKind::Named(resolved.clone()),
-                        TypeChecker::dummy_span(),
-                    ),
-                    methods: vec![func.clone()],
-                    where_clause: vec![],
-                };
-                let method_name = func.name.rsplit(':').next().unwrap_or(&func.name);
-                if self.env.lookup_method(&resolved, method_name).is_none() {
-                    self.env.register_impl(&impl_block)?;
-                }
+            && let Some(colon_pos) = func.name.find(':')
+        {
+            let type_name = &func.name[..colon_pos];
+            let resolved = self.resolve_type_key(type_name);
+            resolved_self_type = Some(resolved.clone());
+            let impl_block = ImplBlock {
+                type_params: vec![],
+                trait_name: None,
+                target_type: Type::new(
+                    TypeKind::Named(resolved.clone()),
+                    TypeChecker::dummy_span(),
+                ),
+                methods: vec![func.clone()],
+                where_clause: vec![],
+            };
+            let method_name = func.name.rsplit(':').next().unwrap_or(&func.name);
+            if self.env.lookup_method(&resolved, method_name).is_none() {
+                self.env.register_impl(&impl_block)?;
             }
+        }
 
         if self.env.lookup_function(&func.name).is_none() {
             self.env.register_function(func.name.clone(), sig)?;
@@ -96,11 +97,13 @@ impl TypeChecker {
         }
 
         self.env.push_scope();
-        if func.is_method && !func.params.iter().any(|p| p.is_self)
-            && let Some(resolved) = resolved_self_type.as_ref().cloned() {
-                let self_type = Type::new(TypeKind::Named(resolved), TypeChecker::dummy_span());
-                self.env.declare_variable("self".to_string(), self_type)?;
-            }
+        if func.is_method
+            && !func.params.iter().any(|p| p.is_self)
+            && let Some(resolved) = resolved_self_type.as_ref().cloned()
+        {
+            let self_type = Type::new(TypeKind::Named(resolved), TypeChecker::dummy_span());
+            self.env.declare_variable("self".to_string(), self_type)?;
+        }
 
         for (param, ty) in func.params.iter().zip(canonical_param_types.iter()) {
             self.env.declare_variable(param.name.clone(), ty.clone())?;
@@ -113,16 +116,17 @@ impl TypeChecker {
         }
 
         if !func.body.is_empty()
-            && let Some(last_stmt) = func.body.last() {
-                match &last_stmt.kind {
-                    StmtKind::Return(_) => {}
-                    StmtKind::Expr(expr) => {
-                        let expr_type = self.check_expr(expr)?;
-                        self.unify(&return_type, &expr_type)?;
-                    }
-                    _ => {}
+            && let Some(last_stmt) = func.body.last()
+        {
+            match &last_stmt.kind {
+                StmtKind::Return(_) => {}
+                StmtKind::Expr(expr) => {
+                    let expr_type = self.check_expr(expr)?;
+                    self.unify(&return_type, &expr_type)?;
                 }
+                _ => {}
             }
+        }
 
         self.current_function_return_type = prev_return_type;
         self.current_trait_bounds = prev_trait_bounds;
@@ -233,17 +237,17 @@ impl TypeChecker {
                             kind: TypeKind::Generic(actual_param),
                             ..
                         }) = type_args.get(index)
-                        {
-                            let traits: Vec<String> = bound
-                                .traits
-                                .iter()
-                                .map(|name| self.resolve_type_key(name))
-                                .collect();
-                            self.current_trait_bounds
-                                .entry(actual_param.clone())
-                                .or_default()
-                                .extend(traits);
-                        }
+                    {
+                        let traits: Vec<String> = bound
+                            .traits
+                            .iter()
+                            .map(|name| self.resolve_type_key(name))
+                            .collect();
+                        self.current_trait_bounds
+                            .entry(actual_param.clone())
+                            .or_default()
+                            .extend(traits);
+                    }
                 }
             }
         }
@@ -335,12 +339,13 @@ impl TypeChecker {
                     )));
                 }
                 if let Some(self_param) = impl_method.params.iter().find(|param| param.is_self)
-                    && !matches!(self_param.ty.kind, TypeKind::Infer) {
-                        return Err(self.type_error(format!(
-                            "Method '{}' in impl for '{}' must use an unannotated self parameter",
-                            trait_method.name, type_name
-                        )));
-                    }
+                    && !matches!(self_param.ty.kind, TypeKind::Infer)
+                {
+                    return Err(self.type_error(format!(
+                        "Method '{}' in impl for '{}' must use an unannotated self parameter",
+                        trait_method.name, type_name
+                    )));
+                }
                 if trait_params.len() != impl_params.len() {
                     return Err(self.type_error(format!(
                         "Method '{}' in impl for '{}' has {} parameters, but trait '{}' requires {}",
@@ -418,6 +423,7 @@ impl TypeChecker {
                     name,
                     params,
                     return_type,
+                    doc: _,
                 } => {
                     let canonical_params: Vec<Type> =
                         params.iter().map(|ty| self.canonicalize_type(ty)).collect();
@@ -434,53 +440,55 @@ impl TypeChecker {
                     };
                     self.register_external_function((name.clone(), sig.clone()))?;
                     if let Some((_struct_name_raw, method_name)) = name.split_once(':')
-                        && let Some(self_ty) = canonical_params.first() {
-                            let canonical_self = self_ty.clone();
-                            if matches!(
-                                canonical_self.kind,
-                                TypeKind::Named(_) | TypeKind::GenericInstance { .. }
-                            ) {
-                                let struct_name = match &canonical_self.kind {
-                                    TypeKind::Named(name) => name.clone(),
-                                    TypeKind::GenericInstance { name, .. } => name.clone(),
-                                    _ => unreachable!(),
-                                };
-                                let mut method_params: Vec<FunctionParam> = Vec::new();
+                        && let Some(self_ty) = canonical_params.first()
+                    {
+                        let canonical_self = self_ty.clone();
+                        if matches!(
+                            canonical_self.kind,
+                            TypeKind::Named(_) | TypeKind::GenericInstance { .. }
+                        ) {
+                            let struct_name = match &canonical_self.kind {
+                                TypeKind::Named(name) => name.clone(),
+                                TypeKind::GenericInstance { name, .. } => name.clone(),
+                                _ => unreachable!(),
+                            };
+                            let mut method_params: Vec<FunctionParam> = Vec::new();
+                            method_params.push(FunctionParam {
+                                name: "self".to_string(),
+                                ty: canonical_self.clone(),
+                                is_self: true,
+                            });
+                            for (idx, ty) in canonical_params.iter().enumerate().skip(1) {
                                 method_params.push(FunctionParam {
-                                    name: "self".to_string(),
-                                    ty: canonical_self.clone(),
-                                    is_self: true,
+                                    name: format!("arg{}", idx),
+                                    ty: ty.clone(),
+                                    is_self: false,
                                 });
-                                for (idx, ty) in canonical_params.iter().enumerate().skip(1) {
-                                    method_params.push(FunctionParam {
-                                        name: format!("arg{}", idx),
-                                        ty: ty.clone(),
-                                        is_self: false,
-                                    });
-                                }
-                                let method_def = FunctionDef {
-                                    name: format!("{}:{}", struct_name, method_name),
-                                    type_params: Vec::new(),
-                                    trait_bounds: Vec::new(),
-                                    params: method_params,
-                                    return_type: Some(canonical_return.clone()),
-                                    body: Vec::new(),
-                                    is_method: true,
-                                    visibility: Visibility::Public,
-                                };
-                                let impl_block = ImplBlock {
-                                    type_params: Vec::new(),
-                                    trait_name: None,
-                                    target_type: canonical_self.clone(),
-                                    methods: vec![method_def],
-                                    where_clause: Vec::new(),
-                                };
-                                self.register_external_impl(impl_block)?;
                             }
+                            let method_def = FunctionDef {
+                                name: format!("{}:{}", struct_name, method_name),
+                                type_params: Vec::new(),
+                                trait_bounds: Vec::new(),
+                                params: method_params,
+                                return_type: Some(canonical_return.clone()),
+                                body: Vec::new(),
+                                is_method: true,
+                                visibility: Visibility::Public,
+                                doc: None,
+                            };
+                            let impl_block = ImplBlock {
+                                type_params: Vec::new(),
+                                trait_name: None,
+                                target_type: canonical_self.clone(),
+                                methods: vec![method_def],
+                                where_clause: Vec::new(),
+                            };
+                            self.register_external_impl(impl_block)?;
                         }
+                    }
                 }
 
-                ExternItem::Const { name, ty } => {
+                ExternItem::Const { name, ty, doc: _ } => {
                     self.register_external_constant(name.clone(), ty.clone())?;
                 }
 

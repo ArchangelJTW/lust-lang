@@ -1,5 +1,5 @@
 use super::conversions::{FromLustValue, FunctionArgs, IntoTypedValue};
-use super::program::{ensure_return_type, normalize_global_name, EmbeddedProgram};
+use super::program::{EmbeddedProgram, ensure_return_type, normalize_global_name};
 use crate::ast::{Type, TypeKind};
 use crate::bytecode::{FieldStorage, LustMap, StructLayout, Value, ValueKey};
 use crate::number::{LustFloat, LustInt};
@@ -942,8 +942,8 @@ mod tests {
     use super::*;
     use crate::ast::Span;
     use crate::embed::{
-        struct_field_decl, AsyncDriver, EmbeddedProgram, FunctionBuilder, LustStructView,
-        StructBuilder,
+        AsyncDriver, EmbeddedProgram, FunctionBuilder, LustStructView, StructBuilder,
+        struct_field_decl,
     };
     use std::rc::Rc;
 
@@ -1086,9 +1086,11 @@ mod tests {
             program.call_raw("main.unwrap_loop", vec![Value::Int(0)]),
             Ok(Value::Int(140))
         ));
-        assert!(program
-            .call_raw("main.unwrap_loop", vec![Value::Int(1)])
-            .is_err());
+        assert!(
+            program
+                .call_raw("main.unwrap_loop", vec![Value::Int(1)])
+                .is_err()
+        );
 
         let counter = program
             .call_raw("main.make_counter", vec![])
@@ -1096,12 +1098,14 @@ mod tests {
         let values = Value::array(vec![Value::Int(7)]);
         program.set_memory_budget_bytes(core::mem::size_of::<Value>() * 37);
         program.reset_memory_counter();
-        assert!(program
-            .call_raw(
-                "main.budgeted_read",
-                vec![counter.clone(), values, Value::Int(0)]
-            )
-            .is_err());
+        assert!(
+            program
+                .call_raw(
+                    "main.budgeted_read",
+                    vec![counter.clone(), values, Value::Int(0)]
+                )
+                .is_err()
+        );
         assert!(matches!(
             counter.struct_get_field("n"),
             Some(Value::Int(38))
@@ -1565,9 +1569,11 @@ mod tests {
             .expect("register native");
 
         let error = program.call_raw("main.invoke", Vec::new()).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Native 'bad_native' must return int"));
+        assert!(
+            error
+                .to_string()
+                .contains("Native 'bad_native' must return int")
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ use crate::{
     ast::{BinaryOp, Expr, ExprKind, Literal, Pattern, Span, StructLiteralField, UnaryOp},
     error::{LustError, Result},
     lexer::{Token, TokenKind},
-    number::{parse_float, LustInt},
+    number::{LustInt, parse_float},
 };
 use alloc::{
     boxed::Box,
@@ -133,9 +133,10 @@ impl Parser {
         let mut expr = self.parse_term()?;
         while self.check(TokenKind::DoubleDot) {
             if let Some(next) = self.peek_ahead(1)
-                && matches!(next.kind, TokenKind::Integer | TokenKind::Float) {
-                    break;
-                }
+                && matches!(next.kind, TokenKind::Integer | TokenKind::Float)
+            {
+                break;
+            }
 
             self.advance();
             let right = self.parse_term()?;
@@ -489,9 +490,9 @@ impl Parser {
                     != previous
                         .column
                         .saturating_add(previous.lexeme.chars().count()))
-            {
-                return false;
-            }
+        {
+            return false;
+        }
         let mut depth = 0usize;
         let mut index = self.current;
         while let Some(token) = self.tokens.get(index) {
@@ -912,7 +913,7 @@ impl Parser {
                         column: token.column,
                         message: format!("Unsupported escape sequence: \\{}", escape),
                         module: None,
-                    })
+                    });
                 }
             }
         }

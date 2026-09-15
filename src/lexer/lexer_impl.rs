@@ -78,6 +78,11 @@ impl<'a> Lexer<'a> {
                 break;
             }
 
+            if let Some(token) = self.take_doc_comment() {
+                tokens.push(token);
+                continue;
+            }
+
             let token = self.next_token()?;
             tokens.push(token);
         }
@@ -113,6 +118,9 @@ impl<'a> Lexer<'a> {
         self.skip_whitespace_and_comments()?;
         if self.is_at_end() {
             return Ok(None);
+        }
+        if let Some(token) = self.take_doc_comment() {
+            return Ok(Some(token));
         }
         let token = self.next_token()?;
         Ok(Some(token))
@@ -427,16 +435,19 @@ impl<'a> Lexer<'a> {
             self.advance();
         }
 
-        if !self.is_at_end() && self.current_char() == '.'
-            && self.peek(1) != Some('.') && self.peek(1).is_some_and(|c| c.is_ascii_digit()) {
-                is_float = true;
+        if !self.is_at_end()
+            && self.current_char() == '.'
+            && self.peek(1) != Some('.')
+            && self.peek(1).is_some_and(|c| c.is_ascii_digit())
+        {
+            is_float = true;
+            value.push(self.current_char());
+            self.advance();
+            while !self.is_at_end() && self.current_char().is_ascii_digit() {
                 value.push(self.current_char());
                 self.advance();
-                while !self.is_at_end() && self.current_char().is_ascii_digit() {
-                    value.push(self.current_char());
-                    self.advance();
-                }
             }
+        }
 
         if !self.is_at_end() && (self.current_char() == 'e' || self.current_char() == 'E') {
             is_float = true;
@@ -507,6 +518,12 @@ impl<'a> Lexer<'a> {
                             continue;
                         }
 
+                        // Doc comments are exactly three dashes followed by a
+                        // space; leave them for take_doc_comment to tokenize.
+                        if self.peek(2) == Some('-') && self.peek(3) == Some(' ') {
+                            break;
+                        }
+
                         self.advance();
                         self.advance();
                         while !self.is_at_end() && self.current_char() != '\n' {
@@ -529,6 +546,37 @@ impl<'a> Lexer<'a> {
         }
 
         Ok(())
+    }
+
+    /// Scans a doc comment (`--- text`, exactly three dashes followed by a
+    /// space) at the current position into a `DocComment` token. Returns
+    /// `None` if the current position is not a doc comment.
+    fn take_doc_comment(&mut self) -> Option<Token> {
+        if self.current_char() != '-'
+            || self.peek(1) != Some('-')
+            || self.peek(2) != Some('-')
+            || self.peek(3) != Some(' ')
+        {
+            return None;
+        }
+
+        let line = self.line;
+        let column = self.column;
+        self.advance();
+        self.advance();
+        self.advance();
+        self.advance(); // the separating space
+
+        let mut text = String::new();
+        while !self.is_at_end() && self.current_char() != '\n' {
+            text.push(self.current_char());
+            self.advance();
+        }
+        while text.ends_with(' ') || text.ends_with('\t') || text.ends_with('\r') {
+            text.pop();
+        }
+
+        Some(Token::new(TokenKind::DocComment, text, line, column))
     }
 
     fn skip_block_comment(&mut self) -> Result<()> {

@@ -41,17 +41,20 @@ impl VM {
             variant,
             values,
         } = value
-            && enum_name == "LuaValue" && variant == "Table"
-                && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
-                    && let Some(map) = inner.struct_get_field("table") {
-                        return Some(map);
-                    }
+            && enum_name == "LuaValue"
+            && variant == "Table"
+            && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
+            && let Some(map) = inner.struct_get_field("table")
+        {
+            return Some(map);
+        }
 
         if let Value::Struct { name, .. } = value
             && name == "LuaTable"
-                && let Some(map) = value.struct_get_field("table") {
-                    return Some(map);
-                }
+            && let Some(map) = value.struct_get_field("table")
+        {
+            return Some(map);
+        }
 
         None
     }
@@ -62,18 +65,19 @@ impl VM {
             variant,
             values,
         } = value
-            && enum_name == "LuaValue" {
-                return match variant.as_str() {
-                    "Nil" => Value::Nil,
-                    "Bool" | "Int" | "Float" | "String" | "Table" | "Function"
-                    | "LightUserdata" | "Userdata" | "Thread" => values
-                        .as_ref()
-                        .and_then(|v| v.first())
-                        .cloned()
-                        .unwrap_or(Value::Nil),
-                    _ => value.clone(),
-                };
-            }
+            && enum_name == "LuaValue"
+        {
+            return match variant.as_str() {
+                "Nil" => Value::Nil,
+                "Bool" | "Int" | "Float" | "String" | "Table" | "Function" | "LightUserdata"
+                | "Userdata" | "Thread" => values
+                    .as_ref()
+                    .and_then(|v| v.first())
+                    .cloned()
+                    .unwrap_or(Value::Nil),
+                _ => value.clone(),
+            };
+        }
         value.clone()
     }
 
@@ -90,21 +94,24 @@ impl VM {
         loop {
             if let Some(target_depth) = self.call_until_depth
                 && self.call_stack.len() == target_depth
-                    && let Some(return_value) = self.pending_return_value.take() {
-                        self.call_until_depth = None;
-                        return Ok(return_value);
-                    }
+                && let Some(return_value) = self.pending_return_value.take()
+            {
+                self.call_until_depth = None;
+                return Ok(return_value);
+            }
 
             if let Some(return_value) = self.pending_return_value.take()
-                && let Some(dest_reg) = self.pending_return_dest.take() {
-                    self.set_register(dest_reg, return_value)?;
-                }
+                && let Some(dest_reg) = self.pending_return_dest.take()
+            {
+                self.set_register(dest_reg, return_value)?;
+            }
 
             if self.current_task.is_some()
-                && let Some(signal) = self.pending_task_signal.take() {
-                    self.last_task_signal = Some(signal);
-                    return Ok(Value::Nil);
-                }
+                && let Some(signal) = self.pending_task_signal.take()
+            {
+                self.last_task_signal = Some(signal);
+                return Ok(Value::Nil);
+            }
 
             if self.call_stack.len() > self.max_stack_depth {
                 return Err(LustError::RuntimeError {
@@ -218,8 +225,10 @@ impl VM {
                         let rsp_diff = rsp_after as isize - rsp_before as isize;
                         crate::jit::log(|| {
                             #[cfg(target_arch = "x86_64")]
-                            return format!("🎯 JIT: Trace #{} execution result: {} (RSP before: {:x}, after: {:x}, diff: {})",
-                            trace_id.0, result, rsp_before, rsp_after, rsp_diff);
+                            return format!(
+                                "🎯 JIT: Trace #{} execution result: {} (RSP before: {:x}, after: {:x}, diff: {})",
+                                trace_id.0, result, rsp_before, rsp_after, rsp_diff
+                            );
                             #[cfg(not(target_arch = "x86_64"))]
                             return format!(
                                 "🎯 JIT: Trace #{} execution result: {}",
@@ -271,9 +280,10 @@ impl VM {
                                         side_trace.execute(registers_ptr, vm_ptr, ptr::null());
                                     drop(side_trace);
                                     if side_result < 0
-                                        && let Some(error) = self.pending_jit_error.take() {
-                                            return Err(error);
-                                        }
+                                        && let Some(error) = self.pending_jit_error.take()
+                                    {
+                                        return Err(error);
+                                    }
                                     if side_result == 0 {
                                         crate::jit::log(|| {
                                             format!(
@@ -298,9 +308,10 @@ impl VM {
                                     .map(|guard| guard.bailout_ip);
 
                                 if let Some(bailout_ip) = bailout_ip
-                                    && let Some(frame) = self.call_stack.last_mut() {
-                                        frame.ip = bailout_ip;
-                                    }
+                                    && let Some(frame) = self.call_stack.last_mut()
+                                {
+                                    frame.ip = bailout_ip;
+                                }
 
                                 self.handle_guard_failure(trace_id, guard_index, func_idx)?;
                                 let reusable_exit = self
@@ -349,66 +360,66 @@ impl VM {
                     let is_side_trace = self.side_trace_context.is_some();
                     if is_side_trace {
                         if let Some(recorder) = &self.trace_recorder
-                            && !recorder.is_recording() {
-                                if !recorder.is_complete() {
-                                    self.abandon_trace_recording();
-                                    continue;
-                                }
-                                crate::jit::log(|| {
-                                    format!(
-                                        "📝 JIT: Trace recording complete - {} ops recorded",
-                                        recorder.trace.ops.len()
-                                    )
-                                });
-                                let recorder = self.trace_recorder.take().unwrap();
-                                let mut trace = recorder.finish();
-                                let side_trace_ctx = self.side_trace_context.take().unwrap();
-                                let mut optimizer = TraceOptimizer::new();
-                                let hoisted_constants = optimizer.optimize(&mut trace);
-                                let (parent_trace_id, guard_index) = side_trace_ctx;
-                                crate::jit::log(|| {
-                                    format!(
-                                        "⚙️  JIT: Compiling side trace (parent: #{}, guard: {})...",
-                                        parent_trace_id.0, guard_index
-                                    )
-                                });
-                                let trace_id = self.jit.alloc_trace_id();
-                                match JitCompiler::new().compile_trace(
-                                    &trace,
-                                    trace_id,
-                                    Some(parent_trace_id),
-                                    hoisted_constants.clone(),
-                                ) {
-                                    Ok(compiled_trace) => {
+                            && !recorder.is_recording()
+                        {
+                            if !recorder.is_complete() {
+                                self.abandon_trace_recording();
+                                continue;
+                            }
+                            crate::jit::log(|| {
+                                format!(
+                                    "📝 JIT: Trace recording complete - {} ops recorded",
+                                    recorder.trace.ops.len()
+                                )
+                            });
+                            let recorder = self.trace_recorder.take().unwrap();
+                            let mut trace = recorder.finish();
+                            let side_trace_ctx = self.side_trace_context.take().unwrap();
+                            let mut optimizer = TraceOptimizer::new();
+                            let hoisted_constants = optimizer.optimize(&mut trace);
+                            let (parent_trace_id, guard_index) = side_trace_ctx;
+                            crate::jit::log(|| {
+                                format!(
+                                    "⚙️  JIT: Compiling side trace (parent: #{}, guard: {})...",
+                                    parent_trace_id.0, guard_index
+                                )
+                            });
+                            let trace_id = self.jit.alloc_trace_id();
+                            match JitCompiler::new().compile_trace(
+                                &trace,
+                                trace_id,
+                                Some(parent_trace_id),
+                                hoisted_constants.clone(),
+                            ) {
+                                Ok(compiled_trace) => {
+                                    crate::jit::log(|| {
+                                        format!(
+                                            "✅ JIT: Side trace #{} compiled successfully!",
+                                            trace_id.0
+                                        )
+                                    });
+                                    if let Some(parent) = self.jit.get_trace_mut(parent_trace_id)
+                                        && guard_index < parent.guards.len()
+                                    {
+                                        parent.guards[guard_index].side_trace = Some(trace_id);
                                         crate::jit::log(|| {
                                             format!(
-                                                "✅ JIT: Side trace #{} compiled successfully!",
-                                                trace_id.0
+                                                "🔗 JIT: Linked side trace #{} to parent trace #{} guard #{}",
+                                                trace_id.0, parent_trace_id.0, guard_index
                                             )
                                         });
-                                        if let Some(parent) =
-                                            self.jit.get_trace_mut(parent_trace_id)
-                                            && guard_index < parent.guards.len() {
-                                                parent.guards[guard_index].side_trace =
-                                                    Some(trace_id);
-                                                crate::jit::log(|| {
-                                                    format!(
-                                                        "🔗 JIT: Linked side trace #{} to parent trace #{} guard #{}",
-                                                        trace_id.0, parent_trace_id.0, guard_index
-                                                    )
-                                                });
-                                            }
-
-                                        self.jit.store_side_trace(compiled_trace);
                                     }
 
-                                    Err(e) => {
-                                        crate::jit::log(|| {
-                                            format!("❌ JIT: Side trace compilation failed: {}", e)
-                                        });
-                                    }
+                                    self.jit.store_side_trace(compiled_trace);
+                                }
+
+                                Err(e) => {
+                                    crate::jit::log(|| {
+                                        format!("❌ JIT: Side trace compilation failed: {}", e)
+                                    });
                                 }
                             }
+                        }
                     } else {
                         if let Some(recorder) = &mut self.trace_recorder {
                             // Only finalise the recording when *this* loop is the
@@ -791,7 +802,7 @@ impl VM {
                         _ => {
                             return Err(LustError::RuntimeError {
                                 message: format!("Cannot negate {:?}", value),
-                            })
+                            });
                         }
                     };
                     self.set_register(dest, result)?;
@@ -885,10 +896,11 @@ impl VM {
                             values,
                         } = &func_value
                             && enum_name == "LuaValue"
-                                && (variant == "Table" || variant == "Userdata")
-                                && let Some(inner) = values.as_ref().and_then(|v| v.first()) {
-                                    check_value = inner;
-                                }
+                            && (variant == "Table" || variant == "Userdata")
+                            && let Some(inner) = values.as_ref().and_then(|v| v.first())
+                        {
+                            check_value = inner;
+                        }
                         // Check if it's a LuaTable/LuaUserdata struct with metamethods
                         if let Value::Struct { name, .. } = check_value {
                             (name == "LuaTable" || name == "LuaUserdata")
@@ -914,11 +926,14 @@ impl VM {
                             enum_name, variant, ..
                         } = &func_value
                             && enum_name == "LuaValue"
-                                && (variant == "Table" || variant == "Userdata")
-                            {
-                                #[cfg(feature = "std")]
-                                eprintln!("DEBUG Instruction::Call: Have LuaValue.{} but needs_call_value=false", variant);
-                            }
+                            && (variant == "Table" || variant == "Userdata")
+                        {
+                            #[cfg(feature = "std")]
+                            eprintln!(
+                                "DEBUG Instruction::Call: Have LuaValue.{} but needs_call_value=false",
+                                variant
+                            );
+                        }
                     }
 
                     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
@@ -1000,7 +1015,7 @@ impl VM {
                                     "Cannot call non-function value: {:?}",
                                     func_value
                                 ),
-                            })
+                            });
                         }
                     }
                 }
@@ -1237,7 +1252,7 @@ impl VM {
                                         field_name.as_str(),
                                         object
                                     ),
-                                })
+                                });
                             }
                         }
                     };
@@ -1299,7 +1314,7 @@ impl VM {
                                         field_name.as_str(),
                                         object
                                     ),
-                                })
+                                });
                             }
                         }
                     }
@@ -1374,7 +1389,7 @@ impl VM {
                             _ => {
                                 return Err(LustError::RuntimeError {
                                     message: format!("Cannot index {:?}", collection.type_of()),
-                                })
+                                });
                             }
                         }
                     };
@@ -1639,7 +1654,7 @@ impl VM {
                             _ => {
                                 return Err(LustError::RuntimeError {
                                     message: format!("Cannot index {:?}", collection.type_of()),
-                                })
+                                });
                             }
                         }
                     }
@@ -1679,36 +1694,38 @@ impl VM {
 
             if self.jit.enabled
                 && let Some(recorder) = &mut self.trace_recorder
-                    && recorder.is_recording() {
-                        if self.skip_next_trace_record {
-                            self.skip_next_trace_record = false;
+                && recorder.is_recording()
+            {
+                if self.skip_next_trace_record {
+                    self.skip_next_trace_record = false;
+                } else {
+                    let function = &self.functions[func_idx];
+                    let registers_opt =
+                        if let Some(frame) = self.call_stack.get(executing_frame_index) {
+                            Some(&frame.registers)
+                        } else if executing_frame_index > 0 {
+                            self.call_stack
+                                .get(executing_frame_index - 1)
+                                .map(|frame| &frame.registers)
                         } else {
-                            let function = &self.functions[func_idx];
-                            let registers_opt =
-                                if let Some(frame) = self.call_stack.get(executing_frame_index) {
-                                    Some(&frame.registers)
-                                } else if executing_frame_index > 0 {
-                                    self.call_stack
-                                        .get(executing_frame_index - 1)
-                                        .map(|frame| &frame.registers)
-                                } else {
-                                    None
-                                };
-                            if let Some(registers) = registers_opt
-                                && let Err(e) = recorder.record_instruction_at_frame(
-                                    executing_frame_index,
-                                    instruction,
-                                    ip_before_execution,
-                                    registers,
-                                    function,
-                                    func_idx,
-                                    &self.functions,
-                                ) {
-                                    crate::jit::log(|| format!("⚠️  JIT: {}", e));
-                                    self.abandon_trace_recording();
-                                }
-                        }
+                            None
+                        };
+                    if let Some(registers) = registers_opt
+                        && let Err(e) = recorder.record_instruction_at_frame(
+                            executing_frame_index,
+                            instruction,
+                            ip_before_execution,
+                            registers,
+                            function,
+                            func_idx,
+                            &self.functions,
+                        )
+                    {
+                        crate::jit::log(|| format!("⚠️  JIT: {}", e));
+                        self.abandon_trace_recording();
                     }
+                }
+            }
         }
     }
 
@@ -1798,7 +1815,7 @@ impl VM {
             _ => {
                 return Err(LustError::RuntimeError {
                     message: format!("Cannot compare {:?} and {:?}", left, right),
-                })
+                });
             }
         };
         self.set_register(dest, Value::Bool(result))
@@ -1873,7 +1890,8 @@ impl VM {
 
         if self
             .trait_impls
-            .get(&(value_type_name.to_string(), type_name.to_string())).is_some()
+            .get(&(value_type_name.to_string(), type_name.to_string()))
+            .is_some()
         {
             return true;
         }
@@ -2022,21 +2040,22 @@ impl VM {
             });
         }
         if let Some(signature) = &function.signature
-            && signature.params.len() == args.len() {
-                for (index, (value, ty)) in args.iter().zip(&signature.params).enumerate() {
-                    if !self.value_matches_type(value, ty) {
-                        return Err(LustError::RuntimeError {
-                            message: format!(
-                                "Function {} argument {} expects {}, got {:?}",
-                                function.name,
-                                index + 1,
-                                ty,
-                                value.type_of()
-                            ),
-                        });
-                    }
+            && signature.params.len() == args.len()
+        {
+            for (index, (value, ty)) in args.iter().zip(&signature.params).enumerate() {
+                if !self.value_matches_type(value, ty) {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "Function {} argument {} expects {}, got {:?}",
+                            function.name,
+                            index + 1,
+                            ty,
+                            value.type_of()
+                        ),
+                    });
                 }
             }
+        }
 
         let mut frame = CallFrame::new(function_idx, return_dest, function.register_count);
         let recursive = self
@@ -2102,9 +2121,10 @@ impl VM {
     fn invoke_hashkey(&mut self, value: &Value, type_name: &str) -> Result<Value> {
         let mut candidates = vec![format!("{}:{}", type_name, HASH_KEY_METHOD)];
         if let Some(last) = type_name.rsplit('.').next()
-            && last != type_name {
-                candidates.push(format!("{}:{}", last, HASH_KEY_METHOD));
-            }
+            && last != type_name
+        {
+            candidates.push(format!("{}:{}", last, HASH_KEY_METHOD));
+        }
 
         for candidate in candidates {
             if let Some(idx) = self.functions.iter().position(|f| f.name == candidate) {
@@ -2191,30 +2211,31 @@ impl VM {
         #[cfg(feature = "std")]
         if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some()
             && let NativeCallResult::Return(value) = &outcome
-                && let Value::Array(arr) = value {
-                    let borrowed = arr.borrow();
-                    let interesting = borrowed.len() > 1
-                        && matches!(
-                            borrowed.first(),
-                            Some(Value::Enum { enum_name, variant, .. })
-                                if enum_name == "LuaValue" && variant == "Nil"
-                        );
-                    if interesting {
-                        let func_name = self
-                            .call_stack
-                            .last()
-                            .and_then(|frame| self.functions.get(frame.function_idx))
-                            .map(|f| f.name.as_str())
-                            .unwrap_or("<unknown>");
-                        eprintln!(
-                            "[lua-socket] native return in {} dest=R{} len={} value={}",
-                            func_name,
-                            dest,
-                            borrowed.len(),
-                            value
-                        );
-                    }
-                }
+            && let Value::Array(arr) = value
+        {
+            let borrowed = arr.borrow();
+            let interesting = borrowed.len() > 1
+                && matches!(
+                    borrowed.first(),
+                    Some(Value::Enum { enum_name, variant, .. })
+                        if enum_name == "LuaValue" && variant == "Nil"
+                );
+            if interesting {
+                let func_name = self
+                    .call_stack
+                    .last()
+                    .and_then(|frame| self.functions.get(frame.function_idx))
+                    .map(|f| f.name.as_str())
+                    .unwrap_or("<unknown>");
+                eprintln!(
+                    "[lua-socket] native return in {} dest=R{} len={} value={}",
+                    func_name,
+                    dest,
+                    borrowed.len(),
+                    value
+                );
+            }
+        }
         match outcome {
             NativeCallResult::Return(value) => self.set_register(dest, value),
             NativeCallResult::Yield(value) => {
@@ -2276,10 +2297,12 @@ impl VM {
                 variant,
                 values,
             } = func
-                && enum_name == "LuaValue" && (variant == "Table" || variant == "Userdata")
-                    && let Some(inner) = values.as_ref().and_then(|vals| vals.first()) {
-                        current = inner;
-                    }
+                && enum_name == "LuaValue"
+                && (variant == "Table" || variant == "Userdata")
+                && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
+            {
+                current = inner;
+            }
 
             if let Value::Struct { name, .. } = current {
                 if name == "LuaTable" || name == "LuaUserdata" {

@@ -20,19 +20,19 @@ pub mod dependencies;
 pub mod manifest;
 pub mod registry;
 
-pub use archive::{build_package_archive, ArchiveError, PackageArchive};
+pub use archive::{ArchiveError, PackageArchive, build_package_archive};
 pub use credentials::{
-    clear_credentials, credentials_file, load_credentials, save_credentials, Credentials,
-    CredentialsError,
+    Credentials, CredentialsError, clear_credentials, credentials_file, load_credentials,
+    save_credentials,
 };
 pub use dependencies::{
-    resolve_dependencies, DependencyResolution, DependencyResolutionError, ResolvedLuaDependency,
-    ResolvedLustDependency, ResolvedRustDependency,
+    DependencyResolution, DependencyResolutionError, ResolvedLuaDependency, ResolvedLustDependency,
+    ResolvedRustDependency, resolve_dependencies,
 };
 pub use manifest::{ManifestError, ManifestKind, PackageManifest, PackageSection};
 pub use registry::{
-    DownloadedArchive, PackageDetails, PackageSearchResponse, PackageSummary, PackageVersionInfo,
-    PublishResponse, RegistryClient, RegistryError, SearchParameters, DEFAULT_BASE_URL,
+    DEFAULT_BASE_URL, DownloadedArchive, PackageDetails, PackageSearchResponse, PackageSummary,
+    PackageVersionInfo, PublishResponse, RegistryClient, RegistryError, SearchParameters,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -591,11 +591,7 @@ pub fn stub_files_from_exports(
                     let params = format_params(export);
                     let return_type = export.return_type();
                     if let Some(doc) = export.doc() {
-                        contents.push_str("    -- ");
-                        contents.push_str(doc);
-                        if !doc.ends_with('\n') {
-                            contents.push('\n');
-                        }
+                        contents.push_str(&crate::vm::format_doc_comment(doc, "    "));
                     }
                     contents.push_str("    function ");
                     contents.push_str(function);
@@ -634,11 +630,7 @@ fn format_params(export: &NativeExport) -> String {
         .iter()
         .map(|param| {
             let ty = param.ty().trim();
-            if ty.is_empty() {
-                "any"
-            } else {
-                ty
-            }
+            if ty.is_empty() { "any" } else { ty }
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -648,9 +640,10 @@ fn relative_stub_path(module: &str) -> PathBuf {
     let mut path = PathBuf::new();
     let mut segments: Vec<String> = module.split('.').map(|seg| seg.replace('-', "_")).collect();
     if let Some(first) = segments.first()
-        && first == "externs" {
-            segments.remove(0);
-        }
+        && first == "externs"
+    {
+        segments.remove(0);
+    }
     if let Some(first) = segments.first() {
         path.push(first);
     }

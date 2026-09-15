@@ -10,13 +10,13 @@ pub use conversions::{
     LustStructView,
 };
 pub use native_types::{
-    enum_variant, enum_variant_with, function_param, private_struct_field_decl, self_param,
-    struct_field_decl, trait_bound, type_named, type_unit, type_unknown, weak_struct_field_decl,
     ExternRegistry, FunctionBuilder, ImplBuilder, ModuleStub, StructBuilder, TraitBuilder,
-    TraitMethodBuilder,
+    TraitMethodBuilder, enum_variant, enum_variant_with, function_param, private_struct_field_decl,
+    self_param, struct_field_decl, trait_bound, type_named, type_unit, type_unknown,
+    weak_struct_field_decl,
 };
 pub use program::{AsyncDriver, EmbeddedBuilder, EmbeddedProgram};
 pub use values::{
-    struct_field, ArrayHandle, EnumInstance, FunctionHandle, MapHandle, StringRef, StructField,
-    StructHandle, StructInstance, TypedValue, ValueRef,
+    ArrayHandle, EnumInstance, FunctionHandle, MapHandle, StringRef, StructField, StructHandle,
+    StructInstance, TypedValue, ValueRef, struct_field,
 };

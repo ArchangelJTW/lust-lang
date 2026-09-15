@@ -45,6 +45,8 @@ pub(crate) fn format_method_signature(method: &MethodInfo) -> String {
         .map(|param| {
             if param.is_self || param.name == "self" {
                 "self".to_string()
+            } else if param.name.is_empty() {
+                param.ty.to_string()
             } else if matches!(param.ty.kind, TypeKind::Infer) {
                 param.name.clone()
             } else {
@@ -72,7 +74,14 @@ fn method_insert_text(method: &MethodInfo) -> (String, Option<InsertTextFormat>)
         let parts = params
             .iter()
             .enumerate()
-            .map(|(idx, param)| format!("${{{}:{}}}", idx + 1, param.name))
+            .map(|(idx, param)| {
+                let name = if param.name.is_empty() {
+                    format!("arg{}", idx + 1)
+                } else {
+                    param.name.clone()
+                };
+                format!("${{{}:{}}}", idx + 1, name)
+            })
             .collect::<Vec<_>>()
             .join(", ");
         (
@@ -980,6 +989,12 @@ pub(crate) fn static_method_completions(
             if let Some(format) = insert_format {
                 item.insert_text_format = Some(format);
             }
+            if let Some(doc) = &method.doc {
+                item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: doc.clone(),
+                }));
+            }
 
             items.push(item);
         }
@@ -1028,6 +1043,12 @@ pub(crate) fn instance_method_completions(
             item.insert_text = Some(insert_text);
             if let Some(format) = insert_format {
                 item.insert_text_format = Some(format);
+            }
+            if let Some(doc) = &method.doc {
+                item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: doc.clone(),
+                }));
             }
 
             items.push(item);

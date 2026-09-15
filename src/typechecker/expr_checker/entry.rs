@@ -33,13 +33,15 @@ impl TypeChecker {
             }
         }
 
-        if expr.span.start_line > 0 && !self.low_memory_mode
-            && let Some(module) = &self.current_module {
-                self.expr_types_by_module
-                    .entry(module.clone())
-                    .or_default()
-                    .insert(expr.span, ty.clone());
-            }
+        if expr.span.start_line > 0
+            && !self.low_memory_mode
+            && let Some(module) = &self.current_module
+        {
+            self.expr_types_by_module
+                .entry(module.clone())
+                .or_default()
+                .insert(expr.span, ty.clone());
+        }
 
         Ok(ty)
     }
@@ -242,10 +244,9 @@ impl TypeChecker {
                     .or_else(|| self.env.lookup_enum(enum_name))
                     .is_none()
                 {
-                    return Err(self.type_error_at(
-                        format!("Undefined enum '{}'", enum_name),
-                        expr.span,
-                    ));
+                    return Err(
+                        self.type_error_at(format!("Undefined enum '{}'", enum_name), expr.span)
+                    );
                 }
                 // Share inference and validation with the dotted constructor syntax.
                 let callee = Expr::new(

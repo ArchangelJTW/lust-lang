@@ -34,32 +34,33 @@ impl TypeChecker {
             }
         });
         if let Some(expected_elem) = expected_elem_type
-            && let TypeKind::Union(union_types) = &expected_elem.kind {
-                for elem in elements {
-                    let elem_type = self.check_expr(elem)?;
-                    let mut matches = false;
-                    for union_variant in union_types {
-                        if self.types_equal(&elem_type, union_variant) {
-                            matches = true;
-                            break;
-                        }
-                    }
-
-                    if !matches {
-                        let union_desc = union_types
-                            .iter()
-                            .map(|t| t.to_string())
-                            .collect::<Vec<_>>()
-                            .join(" | ");
-                        return Err(self.type_error(format!(
-                            "Array element type '{}' does not match any type in union [{}]",
-                            elem_type, union_desc
-                        )));
+            && let TypeKind::Union(union_types) = &expected_elem.kind
+        {
+            for elem in elements {
+                let elem_type = self.check_expr(elem)?;
+                let mut matches = false;
+                for union_variant in union_types {
+                    if self.types_equal(&elem_type, union_variant) {
+                        matches = true;
+                        break;
                     }
                 }
 
-                return Ok(expected_type.unwrap().clone());
+                if !matches {
+                    let union_desc = union_types
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    return Err(self.type_error(format!(
+                        "Array element type '{}' does not match any type in union [{}]",
+                        elem_type, union_desc
+                    )));
+                }
             }
+
+            return Ok(expected_type.unwrap().clone());
+        }
 
         if let Some(expected_elem) = expected_elem_type {
             if matches!(expected_elem.kind, TypeKind::Unknown) {
@@ -71,40 +72,41 @@ impl TypeChecker {
             }
 
             if let TypeKind::Option(inner) = &expected_elem.kind
-                && matches!(inner.kind, TypeKind::Unknown) {
-                    for elem in elements {
-                        let elem_type = self.check_expr_with_hint(elem, Some(expected_elem))?;
-                        let is_option = matches!(&elem_type.kind, TypeKind::Option(_))
-                            || matches!(&elem_type.kind, TypeKind::Named(name) if name == "Option");
-                        if !is_option {
-                            return Err(self.type_error(format!(
-                                "Expected Option type for Array<Option<unknown>>, got '{}'",
-                                elem_type
-                            )));
-                        }
+                && matches!(inner.kind, TypeKind::Unknown)
+            {
+                for elem in elements {
+                    let elem_type = self.check_expr_with_hint(elem, Some(expected_elem))?;
+                    let is_option = matches!(&elem_type.kind, TypeKind::Option(_))
+                        || matches!(&elem_type.kind, TypeKind::Named(name) if name == "Option");
+                    if !is_option {
+                        return Err(self.type_error(format!(
+                            "Expected Option type for Array<Option<unknown>>, got '{}'",
+                            elem_type
+                        )));
                     }
-
-                    return Ok(expected_type.unwrap().clone());
                 }
+
+                return Ok(expected_type.unwrap().clone());
+            }
 
             if let TypeKind::Result(ok_inner, err_inner) = &expected_elem.kind
                 && (matches!(ok_inner.kind, TypeKind::Unknown)
                     || matches!(err_inner.kind, TypeKind::Unknown))
-                {
-                    for elem in elements {
-                        let elem_type = self.check_expr_with_hint(elem, Some(expected_elem))?;
-                        let is_result = matches!(&elem_type.kind, TypeKind::Result(_, _))
-                            || matches!(&elem_type.kind, TypeKind::Named(name) if name == "Result");
-                        if !is_result {
-                            return Err(self.type_error(format!(
-                                "Expected Result type for Array<Result<unknown, ...>>, got '{}'",
-                                elem_type
-                            )));
-                        }
+            {
+                for elem in elements {
+                    let elem_type = self.check_expr_with_hint(elem, Some(expected_elem))?;
+                    let is_result = matches!(&elem_type.kind, TypeKind::Result(_, _))
+                        || matches!(&elem_type.kind, TypeKind::Named(name) if name == "Result");
+                    if !is_result {
+                        return Err(self.type_error(format!(
+                            "Expected Result type for Array<Result<unknown, ...>>, got '{}'",
+                            elem_type
+                        )));
                     }
-
-                    return Ok(expected_type.unwrap().clone());
                 }
+
+                return Ok(expected_type.unwrap().clone());
+            }
         }
 
         if let Some(expected_elem) = expected_elem_type {
@@ -137,18 +139,20 @@ impl TypeChecker {
         let mut allow_mixed_keys = false;
         let mut allow_mixed_values = false;
         if let Some(expected) = expected_type
-            && let TypeKind::Map(key, value) = &expected.kind {
-                expected_key_ty = Some(key.as_ref());
-                expected_value_ty = Some(value.as_ref());
-                allow_mixed_keys = matches!(key.kind, TypeKind::Unknown | TypeKind::Infer);
-                allow_mixed_values = matches!(value.kind, TypeKind::Unknown | TypeKind::Infer);
-            }
+            && let TypeKind::Map(key, value) = &expected.kind
+        {
+            expected_key_ty = Some(key.as_ref());
+            expected_value_ty = Some(value.as_ref());
+            allow_mixed_keys = matches!(key.kind, TypeKind::Unknown | TypeKind::Infer);
+            allow_mixed_values = matches!(value.kind, TypeKind::Unknown | TypeKind::Infer);
+        }
 
         if entries.is_empty() {
             if let Some(expected) = expected_type
-                && let TypeKind::Map(_, _) = &expected.kind {
-                    return Ok(self.canonicalize_type(expected));
-                }
+                && let TypeKind::Map(_, _) = &expected.kind
+            {
+                return Ok(self.canonicalize_type(expected));
+            }
 
             let span = Self::dummy_span();
             return Ok(Type::new(
@@ -160,8 +164,10 @@ impl TypeChecker {
             ));
         }
 
-        let key_hint = expected_key_ty.filter(|&ty| !matches!(ty.kind, TypeKind::Unknown | TypeKind::Infer));
-        let value_hint = expected_value_ty.filter(|&ty| !matches!(ty.kind, TypeKind::Unknown | TypeKind::Infer));
+        let key_hint =
+            expected_key_ty.filter(|&ty| !matches!(ty.kind, TypeKind::Unknown | TypeKind::Infer));
+        let value_hint =
+            expected_value_ty.filter(|&ty| !matches!(ty.kind, TypeKind::Unknown | TypeKind::Infer));
 
         let mut inferred_key_type: Option<Type> = None;
         let mut inferred_value_type: Option<Type> = None;
@@ -207,7 +213,8 @@ impl TypeChecker {
         let key_type = if let Some(expected) = key_hint {
             self.canonicalize_type(expected)
         } else if allow_mixed_keys {
-            expected_key_ty.map(|ty| self.canonicalize_type(ty))
+            expected_key_ty
+                .map(|ty| self.canonicalize_type(ty))
                 .unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
         } else {
             inferred_key_type.unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
@@ -215,7 +222,8 @@ impl TypeChecker {
         let value_type = if let Some(expected) = value_hint {
             self.canonicalize_type(expected)
         } else if allow_mixed_values {
-            expected_value_ty.map(|ty| self.canonicalize_type(ty))
+            expected_value_ty
+                .map(|ty| self.canonicalize_type(ty))
                 .unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
         } else {
             inferred_value_type.unwrap_or_else(|| Type::new(TypeKind::Unknown, span))
@@ -262,12 +270,13 @@ impl TypeChecker {
                 },
             ..
         }) = expected_type
-            && expected_name == &struct_def.name && type_args.len() == struct_def.type_params.len()
-            {
-                for (param, arg) in struct_def.type_params.iter().zip(type_args) {
-                    type_bindings.insert(param.clone(), arg.clone());
-                }
+            && expected_name == &struct_def.name
+            && type_args.len() == struct_def.type_params.len()
+        {
+            for (param, arg) in struct_def.type_params.iter().zip(type_args) {
+                type_bindings.insert(param.clone(), arg.clone());
             }
+        }
 
         for field in fields {
             let expected_type = struct_def
@@ -282,11 +291,8 @@ impl TypeChecker {
                     )
                 })?;
             let expected_type = self.canonicalize_type(expected_type);
-            let hint = self.generic_argument_hint(
-                &expected_type,
-                &struct_def.type_params,
-                &type_bindings,
-            );
+            let hint =
+                self.generic_argument_hint(&expected_type, &struct_def.type_params, &type_bindings);
             let actual_type = self.check_expr_with_hint(&field.value, hint.as_ref())?;
             match &expected_type.kind {
                 TypeKind::Option(inner_expected) => {

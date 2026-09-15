@@ -553,55 +553,58 @@ fn register_lua_closure(
             // Try to call the Lua function
             // If it has a lust_handle, it's a Lust function wrapped as Lua
             if let LuaValue::Function(f) = &lua_func
-                && let Some(handle) = f.lust_handle {
-                    // Call through the Lust function registry
-                    if let Some(lust_func) = lookup_lust_function(handle) {
-                        let lust_args: Result<Vec<Value>, String> = lua_args
-                            .iter()
-                            .map(|v| lua_to_lust(v, vm, Some(state_cell.clone())))
-                            .collect();
+                && let Some(handle) = f.lust_handle
+            {
+                // Call through the Lust function registry
+                if let Some(lust_func) = lookup_lust_function(handle) {
+                    let lust_args: Result<Vec<Value>, String> = lua_args
+                        .iter()
+                        .map(|v| lua_to_lust(v, vm, Some(state_cell.clone())))
+                        .collect();
 
-                        return match lust_args {
-                            Ok(converted_args) => {
-                                match vm.call_value(&lust_func, converted_args) {
-                                    Ok(ret_val) => {
-                                        let results = if let Value::Tuple(vals) = ret_val {
-                                            vals.iter().map(|v| value_to_lua(v, vm)).collect()
-                                        } else {
-                                            vec![value_to_lua(&ret_val, vm)]
-                                        };
+                    return match lust_args {
+                        Ok(converted_args) => {
+                            match vm.call_value(&lust_func, converted_args) {
+                                Ok(ret_val) => {
+                                    let results = if let Value::Tuple(vals) = ret_val {
+                                        vals.iter().map(|v| value_to_lua(v, vm)).collect()
+                                    } else {
+                                        vec![value_to_lua(&ret_val, vm)]
+                                    };
 
-                                        // Convert back to Lust values
-                                        let lust_results: Result<Vec<Value>, String> = results
-                                            .iter()
-                                            .map(|v| lua_to_lust(v, vm, Some(state_cell.clone())))
-                                            .collect();
+                                    // Convert back to Lust values
+                                    let lust_results: Result<Vec<Value>, String> = results
+                                        .iter()
+                                        .map(|v| lua_to_lust(v, vm, Some(state_cell.clone())))
+                                        .collect();
 
-                                        match lust_results {
-                                            Ok(vals) if vals.len() == 1 => Ok(
-                                                crate::bytecode::value::NativeCallResult::Return(
-                                                    vals[0].clone(),
-                                                ),
-                                            ),
-                                            Ok(vals) if vals.is_empty() => Ok(
-                                                crate::bytecode::value::NativeCallResult::Return(
-                                                    Value::Nil,
-                                                ),
-                                            ),
-                                            Ok(vals) => {
-                                                let arr = Rc::new(RefCell::new(vals));
-                                                Ok(crate::bytecode::value::NativeCallResult::Return(Value::Array(arr)))
-                                            }
-                                            Err(e) => Err(e),
+                                    match lust_results {
+                                        Ok(vals) if vals.len() == 1 => {
+                                            Ok(crate::bytecode::value::NativeCallResult::Return(
+                                                vals[0].clone(),
+                                            ))
                                         }
+                                        Ok(vals) if vals.is_empty() => {
+                                            Ok(crate::bytecode::value::NativeCallResult::Return(
+                                                Value::Nil,
+                                            ))
+                                        }
+                                        Ok(vals) => {
+                                            let arr = Rc::new(RefCell::new(vals));
+                                            Ok(crate::bytecode::value::NativeCallResult::Return(
+                                                Value::Array(arr),
+                                            ))
+                                        }
+                                        Err(e) => Err(e),
                                     }
-                                    Err(e) => Err(e.to_string()),
                                 }
+                                Err(e) => Err(e.to_string()),
                             }
-                            Err(e) => Err(e),
-                        };
-                    }
+                        }
+                        Err(e) => Err(e),
+                    };
                 }
+            }
 
             // Pure Lua closures without bytecode interpreter support
             Err("Cannot call pure Lua closures (no Lua bytecode interpreter available)".to_string())
@@ -679,13 +682,15 @@ fn lua_to_lust_cached(
         )),
         LuaValue::Function(func) => {
             if let Some(handle) = func.lust_handle
-                && let Some(inner) = lookup_lust_function(handle) {
-                    return Ok(inner);
-                }
+                && let Some(inner) = lookup_lust_function(handle)
+            {
+                return Ok(inner);
+            }
             if func.cfunc.is_some()
-                && let Some(state) = &state {
-                    return register_c_function(func, state, vm);
-                }
+                && let Some(state) = &state
+            {
+                return register_c_function(func, state, vm);
+            }
             // For Lua closures without cfunc, create a wrapper that can call them
             if let Some(state_rc) = &state {
                 return register_lua_closure(func, state_rc, vm);
@@ -755,18 +760,19 @@ fn unwrap_lua_value_for_key(value: Value) -> Value {
         variant,
         values,
     } = &value
-        && enum_name == "LuaValue" {
-            return match variant.as_str() {
-                "Nil" => Value::Nil,
-                "Bool" | "Int" | "Float" | "String" | "Table" | "Function" | "LightUserdata"
-                | "Userdata" | "Thread" => values
-                    .as_ref()
-                    .and_then(|v| v.first())
-                    .cloned()
-                    .unwrap_or(Value::Nil),
-                _ => value,
-            };
-        }
+        && enum_name == "LuaValue"
+    {
+        return match variant.as_str() {
+            "Nil" => Value::Nil,
+            "Bool" | "Int" | "Float" | "String" | "Table" | "Function" | "LightUserdata"
+            | "Userdata" | "Thread" => values
+                .as_ref()
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or(Value::Nil),
+            _ => value,
+        };
+    }
     value
 }
 
@@ -926,28 +932,29 @@ pub(crate) fn value_to_lua(value: &Value, vm: &VM) -> LuaValue {
             }
             "Table" => {
                 if let Some(values) = values
-                    && let Some(table_struct) = values.first() {
-                        let table_field = table_struct.struct_get_field("table");
-                        let meta_field = table_struct.struct_get_field("metamethods");
-                        let mut lua_table = LuaTable::new();
-                        if let Some(Value::Map(map)) = table_field {
-                            for (k, v) in map.borrow().iter() {
-                                lua_table
-                                    .entries
-                                    .insert(value_to_lua(&k.to_value(), vm), value_to_lua(v, vm));
-                            }
+                    && let Some(table_struct) = values.first()
+                {
+                    let table_field = table_struct.struct_get_field("table");
+                    let meta_field = table_struct.struct_get_field("metamethods");
+                    let mut lua_table = LuaTable::new();
+                    if let Some(Value::Map(map)) = table_field {
+                        for (k, v) in map.borrow().iter() {
+                            lua_table
+                                .entries
+                                .insert(value_to_lua(&k.to_value(), vm), value_to_lua(v, vm));
                         }
-                        if let Some(Value::Map(meta)) = meta_field {
-                            for (k, v) in meta.borrow().iter() {
-                                if let Some(key) = k.to_value().as_string() {
-                                    lua_table
-                                        .metamethods
-                                        .insert(key.to_string(), value_to_lua(v, vm));
-                                }
-                            }
-                        }
-                        return LuaValue::Table(Rc::new(RefCell::new(lua_table)));
                     }
+                    if let Some(Value::Map(meta)) = meta_field {
+                        for (k, v) in meta.borrow().iter() {
+                            if let Some(key) = k.to_value().as_string() {
+                                lua_table
+                                    .metamethods
+                                    .insert(key.to_string(), value_to_lua(v, vm));
+                            }
+                        }
+                    }
+                    return LuaValue::Table(Rc::new(RefCell::new(lua_table)));
+                }
                 LuaValue::Nil
             }
             _ => LuaValue::Nil,
@@ -1324,13 +1331,14 @@ pub fn trace_luaopen(spec: &LuaModuleSpec) -> Result<Vec<LuaOpenResult>, String>
                             LuaValue::Table(handle) => Some(handle),
                             _ => None,
                         })
-                {
-                    returns.insert(0, LuaValue::Table(table));
-                }
+            {
+                returns.insert(0, LuaValue::Table(table));
+            }
             if returns.is_empty()
-                && let Some(LuaValue::Table(handle)) = boxed.state.stack.last().cloned() {
-                    returns.push(LuaValue::Table(handle));
-                }
+                && let Some(LuaValue::Table(handle)) = boxed.state.stack.last().cloned()
+            {
+                returns.push(LuaValue::Table(handle));
+            }
             if returns.is_empty() {
                 let module_name = luaopen_module_name(entry);
                 let mut keys = vec![module_name.clone()];
@@ -1343,15 +1351,16 @@ pub fn trace_luaopen(spec: &LuaModuleSpec) -> Result<Vec<LuaOpenResult>, String>
                     .borrow()
                     .entries
                     .get(&LuaValue::String("_LOADED".to_string()))
-                    && let LuaValue::Table(tbl) = loaded {
-                        for key in &keys {
-                            let lookup = LuaValue::String(key.clone());
-                            if let Some(val) = tbl.borrow().entries.get(&lookup).cloned() {
-                                returns.push(val);
-                                break;
-                            }
+                    && let LuaValue::Table(tbl) = loaded
+                {
+                    for key in &keys {
+                        let lookup = LuaValue::String(key.clone());
+                        if let Some(val) = tbl.borrow().entries.get(&lookup).cloned() {
+                            returns.push(val);
+                            break;
                         }
                     }
+                }
             }
             if returns.is_empty() {
                 let module_name = luaopen_module_name(entry);
@@ -1492,9 +1501,10 @@ pub unsafe extern "C" fn lua_remove(L: *mut lua_State, idx: c_int) {
 pub unsafe extern "C" fn lua_insert(L: *mut lua_State, idx: c_int) {
     if let Some(state) = state_from_ptr(L) {
         if let Some(slot) = translate_index(state.stack.len(), idx)
-            && let Some(val) = state.pop() {
-                state.stack.insert(slot, val);
-            }
+            && let Some(val) = state.pop()
+        {
+            state.stack.insert(slot, val);
+        }
         state.record_call("lua_insert", vec![idx.to_string()]);
     }
 }
@@ -1643,9 +1653,10 @@ pub unsafe extern "C" fn lua_toboolean(L: *mut lua_State, idx: c_int) -> c_int {
             LUA_TNIL | LUA_TNONE => 0,
             LUA_TBOOLEAN => {
                 if let Some(state) = state_from_ptr(L)
-                    && let Some(LuaValue::Bool(b)) = value_at(state, idx) {
-                        return b as c_int;
-                    }
+                    && let Some(LuaValue::Bool(b)) = value_at(state, idx)
+                {
+                    return b as c_int;
+                }
                 0
             }
             _ => 1,
@@ -1755,9 +1766,10 @@ pub unsafe extern "C" fn lua_equal(L: *mut lua_State, idx1: c_int, idx2: c_int) 
             return 0;
         }
         if let Some(state) = state_from_ptr(L)
-            && let (Some(v1), Some(v2)) = (value_at(state, idx1), value_at(state, idx2)) {
-                return (v1 == v2) as c_int;
-            }
+            && let (Some(v1), Some(v2)) = (value_at(state, idx1), value_at(state, idx2))
+        {
+            return (v1 == v2) as c_int;
+        }
         0
     }
 }
@@ -1945,18 +1957,19 @@ pub unsafe extern "C" fn lua_settable(L: *mut lua_State, idx: c_int) {
         let value = state.pop();
         let key = state.pop();
         if let (Some(k), Some(v)) = (key, value)
-            && let Some(handle) = handle {
-                let v = match (&k, v) {
-                    (LuaValue::String(name), LuaValue::Function(mut func)) => {
-                        if func.name.is_none() {
-                            func.name = Some(name.clone());
-                        }
-                        LuaValue::Function(func)
+            && let Some(handle) = handle
+        {
+            let v = match (&k, v) {
+                (LuaValue::String(name), LuaValue::Function(mut func)) => {
+                    if func.name.is_none() {
+                        func.name = Some(name.clone());
                     }
-                    (_, other) => other,
-                };
-                handle.borrow_mut().entries.insert(k, v);
-            }
+                    LuaValue::Function(func)
+                }
+                (_, other) => other,
+            };
+            handle.borrow_mut().entries.insert(k, v);
+        }
         state.record_call("lua_settable", vec![idx.to_string()]);
     }
 }
@@ -1999,21 +2012,22 @@ pub unsafe extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c
                 CStr::from_ptr(k).to_string_lossy().to_string()
             };
             if let Some(v) = value
-                && let Some(handle) = handle {
-                    let v = match v {
-                        LuaValue::Function(mut func) => {
-                            if func.name.is_none() && !key.is_empty() {
-                                func.name = Some(key.clone());
-                            }
-                            LuaValue::Function(func)
+                && let Some(handle) = handle
+            {
+                let v = match v {
+                    LuaValue::Function(mut func) => {
+                        if func.name.is_none() && !key.is_empty() {
+                            func.name = Some(key.clone());
                         }
-                        other => other,
-                    };
-                    handle
-                        .borrow_mut()
-                        .entries
-                        .insert(LuaValue::String(key.clone()), v);
-                }
+                        LuaValue::Function(func)
+                    }
+                    other => other,
+                };
+                handle
+                    .borrow_mut()
+                    .entries
+                    .insert(LuaValue::String(key.clone()), v);
+            }
             state.record_call("lua_setfield", vec![idx.to_string(), key]);
         }
     }
@@ -2173,23 +2187,24 @@ pub unsafe extern "C" fn lua_setmetatable(L: *mut lua_State, objindex: c_int) ->
                 }
             }
         } else if matches!(meta, None | Some(LuaValue::Nil))
-            && let Some(slot) = translate_index(len_before_pop, objindex) {
-                match state.stack.get(slot) {
-                    Some(LuaValue::Table(handle)) => {
-                        handle.borrow_mut().metatable = None;
-                        handle.borrow_mut().metamethods.remove("__index");
-                        state.record_call("lua_setmetatable", vec![objindex.to_string()]);
-                        return 1;
-                    }
-                    Some(LuaValue::Userdata(userdata)) => {
-                        state.userdata_metatables.remove(&userdata.id);
-                        state.userdata_metamethods.remove(&userdata.id);
-                        state.record_call("lua_setmetatable", vec![objindex.to_string()]);
-                        return 1;
-                    }
-                    _ => {}
+            && let Some(slot) = translate_index(len_before_pop, objindex)
+        {
+            match state.stack.get(slot) {
+                Some(LuaValue::Table(handle)) => {
+                    handle.borrow_mut().metatable = None;
+                    handle.borrow_mut().metamethods.remove("__index");
+                    state.record_call("lua_setmetatable", vec![objindex.to_string()]);
+                    return 1;
                 }
+                Some(LuaValue::Userdata(userdata)) => {
+                    state.userdata_metatables.remove(&userdata.id);
+                    state.userdata_metamethods.remove(&userdata.id);
+                    state.record_call("lua_setmetatable", vec![objindex.to_string()]);
+                    return 1;
+                }
+                _ => {}
             }
+        }
     }
     0
 }
@@ -2198,17 +2213,19 @@ pub unsafe extern "C" fn lua_setmetatable(L: *mut lua_State, objindex: c_int) ->
 pub unsafe extern "C" fn lua_getmetatable(L: *mut lua_State, objindex: c_int) -> c_int {
     if let Some(state) = state_from_ptr(L) {
         if let Some(handle) = ensure_table_at(state, objindex)
-            && let Some(meta) = handle.borrow().metatable.clone() {
-                state.push(LuaValue::Table(meta));
-                state.record_call("lua_getmetatable", vec![objindex.to_string()]);
-                return 1;
-            }
+            && let Some(meta) = handle.borrow().metatable.clone()
+        {
+            state.push(LuaValue::Table(meta));
+            state.record_call("lua_getmetatable", vec![objindex.to_string()]);
+            return 1;
+        }
         if let Some(LuaValue::Userdata(userdata)) = value_at(state, objindex)
-            && let Some(meta) = state.userdata_metatables.get(&userdata.id).cloned() {
-                state.push(LuaValue::Table(meta));
-                state.record_call("lua_getmetatable", vec![objindex.to_string()]);
-                return 1;
-            }
+            && let Some(meta) = state.userdata_metatables.get(&userdata.id).cloned()
+        {
+            state.push(LuaValue::Table(meta));
+            state.record_call("lua_getmetatable", vec![objindex.to_string()]);
+            return 1;
+        }
     }
     0
 }
@@ -2607,12 +2624,13 @@ pub unsafe extern "C" fn luaL_register(
                         .borrow_mut()
                         .entries
                         .get_mut(&LuaValue::String("_LOADED".to_string()))
-                        && let LuaValue::Table(tbl) = loaded {
-                            tbl.borrow_mut().entries.insert(
-                                LuaValue::String(module.clone()),
-                                LuaValue::Table(handle.clone()),
-                            );
-                        }
+                        && let LuaValue::Table(tbl) = loaded
+                    {
+                        tbl.borrow_mut().entries.insert(
+                            LuaValue::String(module.clone()),
+                            LuaValue::Table(handle.clone()),
+                        );
+                    }
                     state.record_call("luaL_register", vec![module]);
                 } else {
                     state.record_call("luaL_register", vec!["<anonymous>".to_string()]);
@@ -2712,22 +2730,23 @@ pub unsafe extern "C" fn luaL_optlstring(
     unsafe {
         let ty = lua_type(L, idx);
         if (ty == LUA_TNONE || ty == LUA_TNIL)
-            && let Some(state) = state_from_ptr(L) {
-                if def.is_null() {
-                    if !len.is_null() {
-                        *len = 0;
-                    }
-                    state.record_call("luaL_optlstring", vec![idx.to_string()]);
-                    return core::ptr::null();
-                }
-                let default = CStr::from_ptr(def).to_string_lossy().to_string();
-                let ptr = cache_cstring(state, default.clone());
+            && let Some(state) = state_from_ptr(L)
+        {
+            if def.is_null() {
                 if !len.is_null() {
-                    *len = default.len();
+                    *len = 0;
                 }
                 state.record_call("luaL_optlstring", vec![idx.to_string()]);
-                return ptr;
+                return core::ptr::null();
             }
+            let default = CStr::from_ptr(def).to_string_lossy().to_string();
+            let ptr = cache_cstring(state, default.clone());
+            if !len.is_null() {
+                *len = default.len();
+            }
+            state.record_call("luaL_optlstring", vec![idx.to_string()]);
+            return ptr;
+        }
         lua_tolstring(L, idx, len)
     }
 }
@@ -2984,9 +3003,10 @@ pub unsafe extern "C" fn luaL_addstring(B: *mut luaL_Buffer, s: *const c_char) {
         let len = CStr::from_ptr(s).to_bytes().len();
         luaL_addlstring(B, s, len);
         if let Some(buf) = B.as_ref()
-            && let Some(state) = state_from_ptr(buf.L) {
-                state.record_call("luaL_addstring", vec![len.to_string()]);
-            }
+            && let Some(state) = state_from_ptr(buf.L)
+        {
+            state.record_call("luaL_addstring", vec![len.to_string()]);
+        }
     }
 }
 

@@ -186,13 +186,15 @@ impl TypeChecker {
                 }
             }
 
-            if binding.span.start_line > 0 && !self.low_memory_mode
-                && let Some(module) = &self.current_module {
-                    self.variable_types_by_module
-                        .entry(module.clone())
-                        .or_default()
-                        .insert(binding.span, var_type.clone());
-                }
+            if binding.span.start_line > 0
+                && !self.low_memory_mode
+                && let Some(module) = &self.current_module
+            {
+                self.variable_types_by_module
+                    .entry(module.clone())
+                    .or_default()
+                    .insert(binding.span, var_type.clone());
+            }
 
             self.env.declare_variable(binding.name.clone(), var_type)?;
         }
@@ -265,32 +267,34 @@ impl TypeChecker {
                 expanded_types[index].clone()
             };
             if let ExprKind::FieldAccess { object, field } = &target.kind
-                && let Some(inner_type) = self.weak_field_target_type(object, field)? {
-                    match self.unify(&target_type, &value_type) {
-                        Ok(_) => continue,
-                        Err(err) => {
-                            if self.types_equal(&inner_type, &value_type) {
-                                continue;
-                            } else {
-                                return Err(err);
-                            }
+                && let Some(inner_type) = self.weak_field_target_type(object, field)?
+            {
+                match self.unify(&target_type, &value_type) {
+                    Ok(_) => continue,
+                    Err(err) => {
+                        if self.types_equal(&inner_type, &value_type) {
+                            continue;
+                        } else {
+                            return Err(err);
                         }
                     }
                 }
+            }
 
             if let TypeKind::Option(inner) = &target_type.kind
                 && !matches!(value_type.kind, TypeKind::Option(_))
-                    && self.types_compatible(inner, &value_type)
-                {
-                    self.unify(inner, &value_type)?;
-                    continue;
-                }
+                && self.types_compatible(inner, &value_type)
+            {
+                self.unify(inner, &value_type)?;
+                continue;
+            }
 
             if let TypeKind::Named(name) = &target_type.kind
-                && name == "LuaValue" {
-                    // LuaValue can hold any primitive; allow without tightening types here.
-                    continue;
-                }
+                && name == "LuaValue"
+            {
+                // LuaValue can hold any primitive; allow without tightening types here.
+                continue;
+            }
 
             self.unify(&target_type, &value_type)?;
         }
@@ -437,34 +441,35 @@ impl TypeChecker {
                 check_type: target_type,
             } => {
                 if let ExprKind::Identifier(var_name) = &scrutinee.kind
-                    && let Some(current_type) = self.env.lookup_variable(var_name) {
-                        let narrowed_type = if let TypeKind::Named(name) = &target_type.kind {
-                            let resolved_trait = self.resolve_type_key(name);
-                            if self.env.lookup_trait(&resolved_trait).is_some() {
-                                Type::new(TypeKind::Trait(name.clone()), target_type.span)
-                            } else {
-                                target_type.clone()
-                            }
+                    && let Some(current_type) = self.env.lookup_variable(var_name)
+                {
+                    let narrowed_type = if let TypeKind::Named(name) = &target_type.kind {
+                        let resolved_trait = self.resolve_type_key(name);
+                        if self.env.lookup_trait(&resolved_trait).is_some() {
+                            Type::new(TypeKind::Trait(name.clone()), target_type.span)
                         } else {
                             target_type.clone()
-                        };
-                        match &current_type.kind {
-                            TypeKind::Unknown => {
-                                narrowings.push((var_name.clone(), narrowed_type));
-                            }
+                        }
+                    } else {
+                        target_type.clone()
+                    };
+                    match &current_type.kind {
+                        TypeKind::Unknown => {
+                            narrowings.push((var_name.clone(), narrowed_type));
+                        }
 
-                            TypeKind::Union(types) => {
-                                for ty in types {
-                                    if self.types_equal(ty, target_type) {
-                                        narrowings.push((var_name.clone(), target_type.clone()));
-                                        break;
-                                    }
+                        TypeKind::Union(types) => {
+                            for ty in types {
+                                if self.types_equal(ty, target_type) {
+                                    narrowings.push((var_name.clone(), target_type.clone()));
+                                    break;
                                 }
                             }
-
-                            _ => {}
                         }
+
+                        _ => {}
                     }
+                }
             }
 
             ExprKind::IsPattern {
@@ -473,35 +478,35 @@ impl TypeChecker {
             } => {
                 if let Pattern::TypeCheck(target_type) = pattern
                     && let ExprKind::Identifier(var_name) = &scrutinee.kind
-                        && let Some(current_type) = self.env.lookup_variable(var_name) {
-                            let narrowed_type = if let TypeKind::Named(name) = &target_type.kind {
-                                let resolved_trait = self.resolve_type_key(name);
-                                if self.env.lookup_trait(&resolved_trait).is_some() {
-                                    Type::new(TypeKind::Trait(name.clone()), target_type.span)
-                                } else {
-                                    target_type.clone()
-                                }
-                            } else {
-                                target_type.clone()
-                            };
-                            match &current_type.kind {
-                                TypeKind::Unknown => {
-                                    narrowings.push((var_name.clone(), narrowed_type));
-                                }
+                    && let Some(current_type) = self.env.lookup_variable(var_name)
+                {
+                    let narrowed_type = if let TypeKind::Named(name) = &target_type.kind {
+                        let resolved_trait = self.resolve_type_key(name);
+                        if self.env.lookup_trait(&resolved_trait).is_some() {
+                            Type::new(TypeKind::Trait(name.clone()), target_type.span)
+                        } else {
+                            target_type.clone()
+                        }
+                    } else {
+                        target_type.clone()
+                    };
+                    match &current_type.kind {
+                        TypeKind::Unknown => {
+                            narrowings.push((var_name.clone(), narrowed_type));
+                        }
 
-                                TypeKind::Union(types) => {
-                                    for ty in types {
-                                        if self.types_equal(ty, target_type) {
-                                            narrowings
-                                                .push((var_name.clone(), target_type.clone()));
-                                            break;
-                                        }
-                                    }
+                        TypeKind::Union(types) => {
+                            for ty in types {
+                                if self.types_equal(ty, target_type) {
+                                    narrowings.push((var_name.clone(), target_type.clone()));
+                                    break;
                                 }
-
-                                _ => {}
                             }
                         }
+
+                        _ => {}
+                    }
+                }
             }
 
             ExprKind::Binary { left, op, right } => {
@@ -787,9 +792,10 @@ impl TypeChecker {
         };
         if let Some(field) = struct_def.fields.iter().find(|f| f.name == *field_name)
             && matches!(field.ownership, FieldOwnership::Weak)
-                && let Some(inner) = &field.weak_target {
-                    return Ok(Some(self.substitute_type(inner, &type_bindings)));
-                }
+            && let Some(inner) = &field.weak_target
+        {
+            return Ok(Some(self.substitute_type(inner, &type_bindings)));
+        }
 
         Ok(None)
     }

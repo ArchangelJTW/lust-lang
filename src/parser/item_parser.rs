@@ -18,6 +18,8 @@ use alloc::{
 impl Parser {
     #[inline(never)]
     pub(super) fn parse_item(&mut self) -> Result<Item> {
+        self.collect_pending_docs();
+        let doc = self.take_pending_docs();
         let start_token = self.current_token().clone();
         let visibility = if self.match_token(&[TokenKind::Local]) {
             Visibility::Private
@@ -37,22 +39,22 @@ impl Parser {
                 #[cfg(feature = "esp32c6-logging")]
                 log::info!("  parsing function");
 
-                let func_def = self.parse_function(visibility)?;
+                let func_def = self.parse_function(visibility, doc)?;
                 ItemKind::Function(func_def)
             }
 
             TokenKind::Struct => {
-                let struct_def = self.parse_struct(visibility)?;
+                let struct_def = self.parse_struct(visibility, doc)?;
                 ItemKind::Struct(struct_def)
             }
 
             TokenKind::Enum => {
-                let enum_def = self.parse_enum(visibility)?;
+                let enum_def = self.parse_enum(visibility, doc)?;
                 ItemKind::Enum(enum_def)
             }
 
             TokenKind::Trait => {
-                let trait_def = self.parse_trait(visibility)?;
+                let trait_def = self.parse_trait(visibility, doc)?;
                 ItemKind::Trait(trait_def)
             }
 
@@ -159,6 +161,7 @@ impl Parser {
                     "C".to_string()
                 };
                 let mut items = Vec::new();
+                let mut block_doc = doc;
                 let uses_braces = if self.check(TokenKind::LeftBrace) {
                     self.advance();
                     true
@@ -171,6 +174,11 @@ impl Parser {
                     TokenKind::End
                 };
                 while !self.check(terminator) && !self.is_at_end() {
+                    self.collect_pending_docs();
+                    let mut item_doc = self.take_pending_docs();
+                    if item_doc.is_none() {
+                        item_doc = block_doc.take();
+                    }
                     match self.peek_kind() {
                         TokenKind::Function => {
                             self.advance();
@@ -209,6 +217,7 @@ impl Parser {
                                 name,
                                 params,
                                 return_type,
+                                doc: item_doc,
                             });
                         }
 
@@ -223,16 +232,20 @@ impl Parser {
                             }
                             self.consume(TokenKind::Colon, "Expected ':' after const name")?;
                             let ty = self.parse_type()?;
-                            items.push(ExternItem::Const { name, ty });
+                            items.push(ExternItem::Const {
+                                name,
+                                ty,
+                                doc: item_doc,
+                            });
                         }
 
                         TokenKind::Struct => {
-                            let struct_def = self.parse_struct(Visibility::Public)?;
+                            let struct_def = self.parse_struct(Visibility::Public, item_doc)?;
                             items.push(ExternItem::Struct(struct_def));
                         }
 
                         TokenKind::Enum => {
-                            let enum_def = self.parse_enum(Visibility::Public)?;
+                            let enum_def = self.parse_enum(Visibility::Public, item_doc)?;
                             items.push(ExternItem::Enum(enum_def));
                         }
 
@@ -264,7 +277,7 @@ impl Parser {
         Ok(Item::new(kind, self.make_span(&start_token, &end_token)))
     }
 
-    fn parse_function(&mut self, visibility: Visibility) -> Result<FunctionDef> {
+    fn parse_function(&mut self, visibility: Visibility, doc: Option<String>) -> Result<FunctionDef> {
         self.consume(TokenKind::Function, "Expected 'function'")?;
         let first_name = self.expect_identifier()?;
         let (name, is_method) = if self.match_token(&[TokenKind::Colon]) {
@@ -347,15 +360,22 @@ impl Parser {
             body,
             is_method,
             visibility,
+            doc,
         })
     }
 
-    fn parse_struct(&mut self, visibility: Visibility) -> Result<StructDef> {
+    fn parse_struct(&mut self, visibility: Visibility, doc: Option<String>) -> Result<StructDef> {
         self.consume(TokenKind::Struct, "Expected 'struct'")?;
         let name = self.expect_identifier()?;
         let (type_params, trait_bounds) = self.parse_type_params_with_bounds()?;
         let mut fields = Vec::new();
         while !self.check(TokenKind::End) && !self.is_at_end() {
+            while self.check(TokenKind::DocComment) {
+                self.advance();
+            }
+            if self.check(TokenKind::End) {
+                break;
+            }
             let field_vis = if self.match_token(&[TokenKind::Local]) {
                 Visibility::Private
             } else {
@@ -394,15 +414,22 @@ impl Parser {
             trait_bounds,
             fields,
             visibility,
+            doc,
         })
     }
 
-    fn parse_enum(&mut self, visibility: Visibility) -> Result<EnumDef> {
+    fn parse_enum(&mut self, visibility: Visibility, doc: Option<String>) -> Result<EnumDef> {
         self.consume(TokenKind::Enum, "Expected 'enum'")?;
         let name = self.expect_identifier()?;
         let (type_params, trait_bounds) = self.parse_type_params_with_bounds()?;
         let mut variants = Vec::new();
         while !self.check(TokenKind::End) && !self.is_at_end() {
+            while self.check(TokenKind::DocComment) {
+                self.advance();
+            }
+            if self.check(TokenKind::End) {
+                break;
+            }
             let variant_name = self.expect_identifier()?;
             let fields = if self.match_token(&[TokenKind::LeftParen]) {
                 let mut types = Vec::new();
@@ -432,10 +459,11 @@ impl Parser {
             trait_bounds,
             variants,
             visibility,
+            doc,
         })
     }
 
-    fn parse_trait(&mut self, visibility: Visibility) -> Result<TraitDef> {
+    fn parse_trait(&mut self, visibility: Visibility, doc: Option<String>) -> Result<TraitDef> {
         self.consume(TokenKind::Trait, "Expected 'trait'")?;
         let name = self.expect_identifier()?;
         let type_params = if self.match_token(&[TokenKind::Less]) {
@@ -453,6 +481,7 @@ impl Parser {
         };
         let mut methods = Vec::new();
         while !self.check(TokenKind::End) && !self.is_at_end() {
+            self.collect_pending_docs();
             self.consume(TokenKind::Function, "Expected 'function' in trait")?;
             let method_name = self.expect_identifier()?;
             let method_type_params = if self.match_token(&[TokenKind::Less]) {
@@ -513,12 +542,14 @@ impl Parser {
             } else {
                 None
             };
+            let method_doc = self.take_pending_docs();
             methods.push(TraitMethod {
                 name: method_name,
                 type_params: method_type_params,
                 params,
                 return_type,
                 default_impl,
+                doc: method_doc,
             });
         }
 
@@ -528,6 +559,7 @@ impl Parser {
             type_params,
             methods,
             visibility,
+            doc,
         })
     }
 
@@ -561,7 +593,9 @@ impl Parser {
             } else {
                 Visibility::Public
             };
-            let func_def = self.parse_function(visibility)?;
+            self.collect_pending_docs();
+            let method_doc = self.take_pending_docs();
+            let func_def = self.parse_function(visibility, method_doc)?;
             methods.push(func_def);
         }
 

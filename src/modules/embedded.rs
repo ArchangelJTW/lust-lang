@@ -8,11 +8,11 @@ use hashbrown::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::{
+    LustError, Result,
     ast::{ItemKind, UseTree},
     lexer::Lexer,
     modules::{LoadedModule, ModuleExports, ModuleImports, Program},
     parser::Parser,
-    LustError, Result,
 };
 
 #[derive(Debug, Clone)]
@@ -314,9 +314,10 @@ fn collect_deps_from_lua_require_expr(expr: &crate::ast::Expr, deps: &mut HashSe
         ExprKind::Call { callee, args, .. } => {
             if is_lua_require_callee(callee)
                 && let Some(name) = args.first().and_then(extract_lua_require_name)
-                    && !is_lua_builtin_module_name(&name) {
-                        deps.insert(name);
-                    }
+                && !is_lua_builtin_module_name(&name)
+            {
+                deps.insert(name);
+            }
             collect_deps_from_lua_require_expr(callee, deps);
             for arg in args {
                 collect_deps_from_lua_require_expr(arg, deps);

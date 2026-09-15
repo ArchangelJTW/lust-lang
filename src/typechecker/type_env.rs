@@ -136,6 +136,7 @@ impl TypeEnv {
                 },
             ],
             visibility: Visibility::Public,
+            doc: None,
         };
         self.structs
             .insert("TaskInfo".to_string(), task_info_struct);
@@ -162,6 +163,7 @@ impl TypeEnv {
                     },
                 ],
                 visibility: Visibility::Public,
+                doc: None,
             },
         );
         self.structs.insert(
@@ -208,6 +210,7 @@ impl TypeEnv {
                     },
                 ],
                 visibility: Visibility::Public,
+                doc: None,
             },
         );
         for name in ["LuaFunction", "LuaThread"] {
@@ -225,6 +228,7 @@ impl TypeEnv {
                         weak_target: None,
                     }],
                     visibility: Visibility::Public,
+                    doc: None,
                 },
             );
         }
@@ -274,6 +278,7 @@ impl TypeEnv {
                     },
                 ],
                 visibility: Visibility::Public,
+                doc: None,
             },
         );
         self.register_builtin_function_slice(builtins::base_functions(), dummy_span);
@@ -329,6 +334,7 @@ impl TypeEnv {
                 },
             ],
             visibility: Visibility::Public,
+            doc: None,
         };
         self.enums
             .insert("TaskStatus".to_string(), task_status_enum);
@@ -391,6 +397,7 @@ impl TypeEnv {
                 },
             ],
             visibility: Visibility::Public,
+            doc: None,
         };
         self.enums.insert("LuaValue".to_string(), lua_value_enum);
         if config.is_module_enabled("io") {
@@ -427,6 +434,7 @@ impl TypeEnv {
                 },
             ],
             visibility: Visibility::Public,
+            doc: None,
         };
         self.enums.insert("Option".to_string(), option_enum);
         let result_enum = EnumDef {
@@ -450,6 +458,7 @@ impl TypeEnv {
                 },
             ],
             visibility: Visibility::Public,
+            doc: None,
         };
         self.enums.insert("Result".to_string(), result_enum);
         let to_string_trait = TraitDef {
@@ -465,8 +474,10 @@ impl TypeEnv {
                 }],
                 return_type: Some(Type::new(TypeKind::String, dummy_span)),
                 default_impl: None,
+                doc: None,
             }],
             visibility: Visibility::Public,
+            doc: None,
         };
         self.traits.insert("ToString".to_string(), to_string_trait);
         let hash_key_trait = TraitDef {
@@ -482,8 +493,10 @@ impl TypeEnv {
                 }],
                 return_type: Some(Type::new(TypeKind::Unknown, dummy_span)),
                 default_impl: None,
+                doc: None,
             }],
             visibility: Visibility::Public,
+            doc: None,
         };
         self.traits.insert("HashKey".to_string(), hash_key_trait);
         let int_to_string_impl = ImplBlock {
@@ -731,15 +744,15 @@ impl TypeEnv {
         for existing in &self.impls {
             if let Some(trait_name) = &impl_block.trait_name
                 && existing.trait_name.as_ref() == Some(trait_name)
-                    && self.types_overlap(&existing.target_type, &impl_block.target_type)
-                {
-                    return Err(LustError::TypeError {
-                        message: format!(
-                            "Conflicting implementations of trait '{}' for type '{}'",
-                            trait_name, impl_block.target_type
-                        ),
-                    });
-                }
+                && self.types_overlap(&existing.target_type, &impl_block.target_type)
+            {
+                return Err(LustError::TypeError {
+                    message: format!(
+                        "Conflicting implementations of trait '{}' for type '{}'",
+                        trait_name, impl_block.target_type
+                    ),
+                });
+            }
 
             if self.types_overlap(&existing.target_type, &impl_block.target_type) {
                 for method in &impl_block.methods {
@@ -770,15 +783,16 @@ impl TypeEnv {
         for impl_block in &self.impls {
             if let TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } =
                 &impl_block.target_type.kind
-                && name == type_name {
-                    for method in &impl_block.methods {
-                        if method.name.ends_with(&format!(":{}", method_name))
-                            || method.name == method_name
-                        {
-                            return Some(method);
-                        }
+                && name == type_name
+            {
+                for method in &impl_block.methods {
+                    if method.name.ends_with(&format!(":{}", method_name))
+                        || method.name == method_name
+                    {
+                        return Some(method);
                     }
                 }
+            }
         }
 
         None
@@ -820,22 +834,23 @@ impl TypeEnv {
     pub fn type_implements_trait(&self, ty: &Type, trait_name: &str) -> bool {
         for impl_block in &self.impls {
             if let Some(impl_trait_name) = &impl_block.trait_name
-                && impl_trait_name == trait_name {
-                    let mut bindings = HashMap::new();
-                    if self.match_type_pattern(&impl_block.target_type, ty, &mut bindings) {
-                        let bounds_satisfied = impl_block.where_clause.iter().all(|bound| {
-                            bindings.get(&bound.type_param).is_some_and(|concrete| {
-                                bound
-                                    .traits
-                                    .iter()
-                                    .all(|required| self.type_implements_trait(concrete, required))
-                            })
-                        });
-                        if bounds_satisfied {
-                            return true;
-                        }
+                && impl_trait_name == trait_name
+            {
+                let mut bindings = HashMap::new();
+                if self.match_type_pattern(&impl_block.target_type, ty, &mut bindings) {
+                    let bounds_satisfied = impl_block.where_clause.iter().all(|bound| {
+                        bindings.get(&bound.type_param).is_some_and(|concrete| {
+                            bound
+                                .traits
+                                .iter()
+                                .all(|required| self.type_implements_trait(concrete, required))
+                        })
+                    });
+                    if bounds_satisfied {
+                        return true;
                     }
                 }
+            }
         }
 
         false
@@ -939,9 +954,10 @@ impl TypeEnv {
                 name: right_name, ..
             },
         ) = (&left.kind, &right.kind)
-            && left_name == right_name {
-                return true;
-            }
+            && left_name == right_name
+        {
+            return true;
+        }
         self.types_match(left, right)
     }
 }

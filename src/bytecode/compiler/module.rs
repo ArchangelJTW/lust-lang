@@ -49,7 +49,7 @@ impl Compiler {
                                     _ => {
                                         return Err(LustError::CompileError(
                                             "Impl block target must be a named type".to_string(),
-                                        ))
+                                        ));
                                     }
                                 };
                                 if let Some(trait_name) = &impl_block.trait_name {
@@ -251,6 +251,7 @@ impl Compiler {
                 body: script_stmts,
                 is_method: false,
                 visibility: crate::ast::Visibility::Private,
+                doc: None,
             };
             let prev = self.current_module.clone();
             if let Some(entry) = &self.entry_module {
@@ -309,9 +310,10 @@ impl Compiler {
 
     pub(super) fn is_module_level_identifier(&self, name: &str) -> bool {
         if let Some(module) = self.module_scope_name()
-            && let Some(locals) = self.module_locals.get(module) {
-                return locals.contains(name);
-            }
+            && let Some(locals) = self.module_locals.get(module)
+        {
+            return locals.contains(name);
+        }
 
         false
     }

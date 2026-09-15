@@ -2,12 +2,12 @@ pub(super) use super::specialization::{SpecializationRegistry, SpecializedLayout
 pub(super) use super::trace::InlineTrace;
 pub(super) use super::trace::ValueType;
 pub(super) use super::{CompiledTrace, Guard, GuardKind, JitData, Trace, TraceId, TraceOp};
+pub(super) use crate::Result;
 pub(super) use crate::bytecode::{Function, Value, ValueTag};
 pub(super) use crate::jit;
-pub(super) use crate::Result;
 pub(super) use alloc::{boxed::Box, vec::Vec};
 pub(super) use core::mem;
-pub(super) use dynasmrt::{dynasm, x64::Assembler, DynasmApi, DynasmLabelApi};
+pub(super) use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use hashbrown::HashMap;
 
 /// Minimum stack allocation size for traces. Individual traces can request more

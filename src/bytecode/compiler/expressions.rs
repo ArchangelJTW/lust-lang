@@ -44,9 +44,10 @@ impl Compiler {
                 let mut lookup_name = name.clone();
                 if let Some(module) = &self.current_module
                     && let Some(imports) = self.imports_by_module.get(module)
-                        && let Some(fq) = imports.function_aliases.get(name) {
-                            lookup_name = fq.clone();
-                        }
+                    && let Some(fq) = imports.function_aliases.get(name)
+                {
+                    lookup_name = fq.clone();
+                }
 
                 if let Some(&func_idx) = self.function_table.get(&lookup_name) {
                     let reg = self.allocate_register();
@@ -139,122 +140,122 @@ impl Compiler {
 
             ExprKind::Call { callee, args, .. } => {
                 if let ExprKind::FieldAccess { object, field } = &callee.kind
-                    && let ExprKind::Identifier(type_name) = &object.kind {
-                        let is_module_alias = self
-                            .current_module
-                            .as_ref()
-                            .and_then(|module| self.imports_by_module.get(module))
-                            .is_some_and(|imports| {
-                                imports.module_aliases.contains_key(type_name)
-                                    && !self.is_module_level_identifier(type_name)
-                            });
-                        let is_local = self.resolve_local(type_name).is_ok();
-                        let treat_as_static_dispatch =
-                            !is_local && (Self::looks_like_type_name(type_name) || is_module_alias);
+                    && let ExprKind::Identifier(type_name) = &object.kind
+                {
+                    let is_module_alias = self
+                        .current_module
+                        .as_ref()
+                        .and_then(|module| self.imports_by_module.get(module))
+                        .is_some_and(|imports| {
+                            imports.module_aliases.contains_key(type_name)
+                                && !self.is_module_level_identifier(type_name)
+                        });
+                    let is_local = self.resolve_local(type_name).is_ok();
+                    let treat_as_static_dispatch =
+                        !is_local && (Self::looks_like_type_name(type_name) || is_module_alias);
 
-                        if treat_as_static_dispatch {
-                            let mut candidates = Vec::new();
-                            let mut alias_candidate = format!("{}.{}", type_name, field);
-                            if let Some(module) = &self.current_module
-                                && let Some(imports) = self.imports_by_module.get(module)
-                                    && let Some(real_mod) = imports.module_aliases.get(type_name) {
-                                        alias_candidate = format!("{}.{}", real_mod, field);
-                                    }
+                    if treat_as_static_dispatch {
+                        let mut candidates = Vec::new();
+                        let mut alias_candidate = format!("{}.{}", type_name, field);
+                        if let Some(module) = &self.current_module
+                            && let Some(imports) = self.imports_by_module.get(module)
+                            && let Some(real_mod) = imports.module_aliases.get(type_name)
+                        {
+                            alias_candidate = format!("{}.{}", real_mod, field);
+                        }
 
-                            candidates.push(alias_candidate.clone());
-                            let resolved_type = self.resolve_type_name(type_name);
-                            let resolved_candidate = format!("{}.{}", resolved_type, field);
-                            if resolved_candidate != alias_candidate {
-                                candidates.push(resolved_candidate);
-                            }
+                        candidates.push(alias_candidate.clone());
+                        let resolved_type = self.resolve_type_name(type_name);
+                        let resolved_candidate = format!("{}.{}", resolved_type, field);
+                        if resolved_candidate != alias_candidate {
+                            candidates.push(resolved_candidate);
+                        }
 
-                            for static_method_name in &candidates {
-                                if let Some(&func_idx) = self.function_table.get(static_method_name)
-                                {
-                                    let func_reg = self.allocate_register();
-                                    let const_idx = self.add_constant(Value::Function(func_idx));
-                                    self.emit(Instruction::LoadConst(func_reg, const_idx), 0);
-                                    let first_arg_reg = if args.is_empty() {
-                                        0
-                                    } else {
-                                        let arg_refs: Vec<&Expr> = args.iter().collect();
-                                        self.place_exprs_consecutive(&arg_refs)?
-                                    };
-                                    let result_reg = self.allocate_register();
-                                    self.emit(
-                                        Instruction::Call(
-                                            func_reg,
-                                            first_arg_reg,
-                                            args.len() as u8,
-                                            result_reg,
-                                        ),
-                                        0,
-                                    );
-                                    return Ok(result_reg);
-                                }
-                            }
-
-                            for static_method_name in &candidates {
-                                if let Some(runtime_name) =
-                                    self.extern_value_aliases.get(static_method_name).cloned()
-                                {
-                                    let func_reg = self.allocate_register();
-                                    let name_idx = self.add_string_constant(&runtime_name);
-                                    self.emit(Instruction::LoadGlobal(func_reg, name_idx), 0);
-                                    let first_arg_reg = if args.is_empty() {
-                                        0
-                                    } else {
-                                        let arg_refs: Vec<&Expr> = args.iter().collect();
-                                        self.place_exprs_consecutive(&arg_refs)?
-                                    };
-                                    let result_reg = self.allocate_register();
-                                    self.emit(
-                                        Instruction::Call(
-                                            func_reg,
-                                            first_arg_reg,
-                                            args.len() as u8,
-                                            result_reg,
-                                        ),
-                                        0,
-                                    );
-                                    return Ok(result_reg);
-                                }
-                            }
-
-                            if Self::looks_like_type_name(type_name) {
-                                let enum_name_idx = self.add_string_constant(&resolved_type);
-                                let variant_idx = self.add_string_constant(field);
-                                if args.is_empty() {
-                                    let result_reg = self.allocate_register();
-                                    self.emit(
-                                        Instruction::NewEnumUnit(
-                                            result_reg,
-                                            enum_name_idx,
-                                            variant_idx,
-                                        ),
-                                        0,
-                                    );
-                                    return Ok(result_reg);
+                        for static_method_name in &candidates {
+                            if let Some(&func_idx) = self.function_table.get(static_method_name) {
+                                let func_reg = self.allocate_register();
+                                let const_idx = self.add_constant(Value::Function(func_idx));
+                                self.emit(Instruction::LoadConst(func_reg, const_idx), 0);
+                                let first_arg_reg = if args.is_empty() {
+                                    0
                                 } else {
                                     let arg_refs: Vec<&Expr> = args.iter().collect();
-                                    let first_value_reg =
-                                        self.place_exprs_consecutive(&arg_refs)?;
-                                    let result_reg = self.allocate_register();
-                                    self.emit(
-                                        Instruction::NewEnumVariant(
-                                            result_reg,
-                                            enum_name_idx,
-                                            variant_idx,
-                                            first_value_reg,
-                                            args.len() as u8,
-                                        ),
-                                        0,
-                                    );
-                                    return Ok(result_reg);
-                                }
+                                    self.place_exprs_consecutive(&arg_refs)?
+                                };
+                                let result_reg = self.allocate_register();
+                                self.emit(
+                                    Instruction::Call(
+                                        func_reg,
+                                        first_arg_reg,
+                                        args.len() as u8,
+                                        result_reg,
+                                    ),
+                                    0,
+                                );
+                                return Ok(result_reg);
+                            }
+                        }
+
+                        for static_method_name in &candidates {
+                            if let Some(runtime_name) =
+                                self.extern_value_aliases.get(static_method_name).cloned()
+                            {
+                                let func_reg = self.allocate_register();
+                                let name_idx = self.add_string_constant(&runtime_name);
+                                self.emit(Instruction::LoadGlobal(func_reg, name_idx), 0);
+                                let first_arg_reg = if args.is_empty() {
+                                    0
+                                } else {
+                                    let arg_refs: Vec<&Expr> = args.iter().collect();
+                                    self.place_exprs_consecutive(&arg_refs)?
+                                };
+                                let result_reg = self.allocate_register();
+                                self.emit(
+                                    Instruction::Call(
+                                        func_reg,
+                                        first_arg_reg,
+                                        args.len() as u8,
+                                        result_reg,
+                                    ),
+                                    0,
+                                );
+                                return Ok(result_reg);
+                            }
+                        }
+
+                        if Self::looks_like_type_name(type_name) {
+                            let enum_name_idx = self.add_string_constant(&resolved_type);
+                            let variant_idx = self.add_string_constant(field);
+                            if args.is_empty() {
+                                let result_reg = self.allocate_register();
+                                self.emit(
+                                    Instruction::NewEnumUnit(
+                                        result_reg,
+                                        enum_name_idx,
+                                        variant_idx,
+                                    ),
+                                    0,
+                                );
+                                return Ok(result_reg);
+                            } else {
+                                let arg_refs: Vec<&Expr> = args.iter().collect();
+                                let first_value_reg = self.place_exprs_consecutive(&arg_refs)?;
+                                let result_reg = self.allocate_register();
+                                self.emit(
+                                    Instruction::NewEnumVariant(
+                                        result_reg,
+                                        enum_name_idx,
+                                        variant_idx,
+                                        first_value_reg,
+                                        args.len() as u8,
+                                    ),
+                                    0,
+                                );
+                                return Ok(result_reg);
                             }
                         }
                     }
+                }
 
                 let first_arg_reg = if args.is_empty() {
                     0
@@ -290,15 +291,16 @@ impl Compiler {
                         index_expr = inner;
                     }
                     if self.is_checked_array_index(index_expr.span)
-                        && let ExprKind::Index { object, index } = &index_expr.kind {
-                            let obj_reg = self.compile_expr(object)?;
-                            let idx_reg = self.compile_expr(index)?;
-                            let result_reg = self.allocate_register();
-                            self.emit(Instruction::GetIndex(result_reg, obj_reg, idx_reg), 0);
-                            self.free_register(obj_reg);
-                            self.free_register(idx_reg);
-                            return Ok(result_reg);
-                        }
+                        && let ExprKind::Index { object, index } = &index_expr.kind
+                    {
+                        let obj_reg = self.compile_expr(object)?;
+                        let idx_reg = self.compile_expr(index)?;
+                        let result_reg = self.allocate_register();
+                        self.emit(Instruction::GetIndex(result_reg, obj_reg, idx_reg), 0);
+                        self.free_register(obj_reg);
+                        self.free_register(idx_reg);
+                        return Ok(result_reg);
+                    }
                 }
 
                 match method.as_str() {
@@ -351,18 +353,18 @@ impl Compiler {
             ExprKind::FieldAccess { object, field } => {
                 if let ExprKind::Identifier(enum_name) = &object.kind
                     && Self::looks_like_type_name(enum_name)
-                        && self.resolve_local(enum_name).is_err()
-                    {
-                        let resolved_enum = self.resolve_type_name(enum_name);
-                        let enum_name_idx = self.add_string_constant(&resolved_enum);
-                        let variant_idx = self.add_string_constant(field);
-                        let result_reg = self.allocate_register();
-                        self.emit(
-                            Instruction::NewEnumUnit(result_reg, enum_name_idx, variant_idx),
-                            0,
-                        );
-                        return Ok(result_reg);
-                    }
+                    && self.resolve_local(enum_name).is_err()
+                {
+                    let resolved_enum = self.resolve_type_name(enum_name);
+                    let enum_name_idx = self.add_string_constant(&resolved_enum);
+                    let variant_idx = self.add_string_constant(field);
+                    let result_reg = self.allocate_register();
+                    self.emit(
+                        Instruction::NewEnumUnit(result_reg, enum_name_idx, variant_idx),
+                        0,
+                    );
+                    return Ok(result_reg);
+                }
 
                 let obj_reg = self.compile_expr(object)?;
                 let field_idx = self.add_string_constant(field);
@@ -594,22 +596,23 @@ impl Compiler {
                     false
                 };
                 if is_likely_variant
-                    && let crate::ast::TypeKind::Named(variant_name) = &check_type.kind {
-                        let enum_name_idx = self.add_string_constant("");
-                        let variant_idx = self.add_string_constant(variant_name);
-                        let result_reg = self.allocate_register();
-                        self.emit(
-                            Instruction::IsEnumVariant(
-                                result_reg,
-                                value_reg,
-                                enum_name_idx,
-                                variant_idx,
-                            ),
-                            0,
-                        );
-                        self.free_register(value_reg);
-                        return Ok(result_reg);
-                    }
+                    && let crate::ast::TypeKind::Named(variant_name) = &check_type.kind
+                {
+                    let enum_name_idx = self.add_string_constant("");
+                    let variant_idx = self.add_string_constant(variant_name);
+                    let result_reg = self.allocate_register();
+                    self.emit(
+                        Instruction::IsEnumVariant(
+                            result_reg,
+                            value_reg,
+                            enum_name_idx,
+                            variant_idx,
+                        ),
+                        0,
+                    );
+                    self.free_register(value_reg);
+                    return Ok(result_reg);
+                }
 
                 let type_string = match &check_type.kind {
                     crate::ast::TypeKind::Named(name)
@@ -839,7 +842,7 @@ impl Compiler {
                 return Err(LustError::CompileError(format!(
                     "Binary operator '{}' is not supported by the bytecode compiler",
                     op
-                )))
+                )));
             }
         };
         let instr = match (
@@ -948,7 +951,7 @@ impl Compiler {
             _ => {
                 return Err(LustError::CompileError(
                     "Invalid assignment target".to_string(),
-                ))
+                ));
             }
         }
 

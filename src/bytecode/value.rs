@@ -131,37 +131,38 @@ fn unwrap_lua_value_for_key(value: &Value) -> Value {
         variant,
         values,
     } = value
-        && enum_name == "LuaValue" {
-            return match variant.as_str() {
-                "Nil" => Value::Nil,
-                "Bool" => values
-                    .as_ref()
-                    .and_then(|v| v.first())
-                    .cloned()
-                    .unwrap_or(Value::Bool(false)),
-                "Int" | "Number" => values
-                    .as_ref()
-                    .and_then(|v| v.first())
-                    .cloned()
-                    .unwrap_or(Value::Int(0)),
-                "String" => values
-                    .as_ref()
-                    .and_then(|v| v.first())
-                    .cloned()
-                    .unwrap_or(Value::String(Rc::new(String::new()))),
-                "Table" => values
-                    .as_ref()
-                    .and_then(|v| v.first())
-                    .cloned()
-                    .unwrap_or(Value::Nil),
-                "Function" => values
-                    .as_ref()
-                    .and_then(|v| v.first())
-                    .cloned()
-                    .unwrap_or(Value::Nil),
-                _ => value.clone(),
-            };
-        }
+        && enum_name == "LuaValue"
+    {
+        return match variant.as_str() {
+            "Nil" => Value::Nil,
+            "Bool" => values
+                .as_ref()
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or(Value::Bool(false)),
+            "Int" | "Number" => values
+                .as_ref()
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or(Value::Int(0)),
+            "String" => values
+                .as_ref()
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or(Value::String(Rc::new(String::new()))),
+            "Table" => values
+                .as_ref()
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or(Value::Nil),
+            "Function" => values
+                .as_ref()
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or(Value::Nil),
+            _ => value.clone(),
+        };
+    }
     value.clone()
 }
 
@@ -2936,10 +2937,11 @@ pub unsafe extern "C" fn jit_get_field_indexed_int_fast(
                 }
 
                 if let Ok(borrowed) = fields.try_borrow()
-                    && let Some(Value::Int(val)) = borrowed.get(field_index) {
-                        *out_ref = Value::Int(*val);
-                        return 1;
-                    }
+                    && let Some(Value::Int(val)) = borrowed.get(field_index)
+                {
+                    *out_ref = Value::Int(*val);
+                    return 1;
+                }
 
                 0
             }
@@ -2973,10 +2975,11 @@ pub unsafe extern "C" fn jit_set_field_indexed_int_fast(
                 }
 
                 if let Ok(mut borrowed) = fields.try_borrow_mut()
-                    && field_index < borrowed.len() {
-                        borrowed[field_index] = Value::Int(new_value);
-                        return 1;
-                    }
+                    && field_index < borrowed.len()
+                {
+                    borrowed[field_index] = Value::Int(new_value);
+                    return 1;
+                }
 
                 0
             }

@@ -69,26 +69,26 @@ impl TraceOptimizer {
                     &trace.ops[i + 2],
                     &trace.ops[i + 3],
                 )
-                    && tested_reg == result_reg
-                        && enum_reg == result_reg
-                        && condition_register == condition_reg
-                        && enum_name == "Result"
-                        && variant_name == "Ok"
-                    {
-                        ops.push(TraceOp::ArrayIndexOk {
-                            value_dest: *result_reg,
-                            condition_dest: *condition_reg,
-                            array: *array,
-                            index: *index,
-                        });
-                        ops.push(trace.ops[i + 2].clone());
-                        ops.push(TraceOp::Move {
-                            dest: *binding_reg,
-                            src: *result_reg,
-                        });
-                        i += 4;
-                        continue;
-                    }
+                && tested_reg == result_reg
+                && enum_reg == result_reg
+                && condition_register == condition_reg
+                && enum_name == "Result"
+                && variant_name == "Ok"
+            {
+                ops.push(TraceOp::ArrayIndexOk {
+                    value_dest: *result_reg,
+                    condition_dest: *condition_reg,
+                    array: *array,
+                    index: *index,
+                });
+                ops.push(trace.ops[i + 2].clone());
+                ops.push(TraceOp::Move {
+                    dest: *binding_reg,
+                    src: *result_reg,
+                });
+                i += 4;
+                continue;
+            }
 
             ops.push(trace.ops[i].clone());
             i += 1;
@@ -133,25 +133,25 @@ impl TraceOptimizer {
                     &trace.ops[i + 2],
                     &trace.ops[i + 3],
                 )
-                    && tested_reg == option_reg
-                        && enum_reg == option_reg
-                        && condition_register == condition_reg
-                        && enum_name == "Option"
-                        && variant_name == "Some"
-                    {
-                        ops.push(TraceOp::TypeIs {
-                            dest: *condition_reg,
-                            value: *value,
-                            type_name: type_name.clone(),
-                        });
-                        ops.push(trace.ops[i + 2].clone());
-                        ops.push(TraceOp::Move {
-                            dest: *binding_reg,
-                            src: *value,
-                        });
-                        i += 4;
-                        continue;
-                    }
+                && tested_reg == option_reg
+                && enum_reg == option_reg
+                && condition_register == condition_reg
+                && enum_name == "Option"
+                && variant_name == "Some"
+            {
+                ops.push(TraceOp::TypeIs {
+                    dest: *condition_reg,
+                    value: *value,
+                    type_name: type_name.clone(),
+                });
+                ops.push(trace.ops[i + 2].clone());
+                ops.push(TraceOp::Move {
+                    dest: *binding_reg,
+                    src: *value,
+                });
+                i += 4;
+                continue;
+            }
 
             ops.push(trace.ops[i].clone());
             i += 1;

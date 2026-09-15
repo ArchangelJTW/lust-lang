@@ -1,7 +1,7 @@
 use super::*;
+use crate::LustInt;
 use crate::bytecode::{LustMap, ValueKey};
 use crate::vm::task::TaskKind;
-use crate::LustInt;
 use alloc::{format, string::ToString};
 use core::{cell::RefCell, mem};
 impl VM {
@@ -15,7 +15,7 @@ impl VM {
             None => {
                 return Err(LustError::RuntimeError {
                     message: format!("Invalid task handle {}", task_id.as_u64()),
-                })
+                });
             }
         };
         if matches!(task.kind(), TaskKind::NativeFuture { .. }) {
@@ -346,7 +346,7 @@ impl VM {
             None => {
                 return Err(LustError::RuntimeError {
                     message: format!("Invalid task handle {}", handle.id()),
-                })
+                });
             }
         };
         match task.state {
@@ -382,7 +382,7 @@ impl VM {
             None => {
                 return Err(LustError::RuntimeError {
                     message: format!("Invalid task handle {}", handle.id()),
-                })
+                });
             }
         };
         task.reset();
@@ -424,7 +424,7 @@ impl VM {
             None => {
                 return Err(LustError::RuntimeError {
                     message: format!("Invalid task handle {}", handle.id()),
-                })
+                });
             }
         };
 
@@ -490,41 +490,42 @@ impl VM {
         if let Value::Enum {
             enum_name, variant, ..
         } = object
-            && enum_name == "LuaValue" && variant == "Userdata" {
-                if let Some(result) =
-                    self.try_call_lua_dynamic_method(object, method_name, &args)?
-                {
-                    return Ok(result);
-                }
-                #[cfg(feature = "std")]
-                if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() {
-                    let indexer = self.lua_index_metamethod(object);
-                    eprintln!(
-                        "[lua-socket] userdata missing method '{}' indexer={:?} userdata={:?}",
-                        method_name,
-                        indexer.as_ref().map(|v| v.type_of()),
-                        object
-                    );
-                }
+            && enum_name == "LuaValue"
+            && variant == "Userdata"
+        {
+            if let Some(result) = self.try_call_lua_dynamic_method(object, method_name, &args)? {
+                return Ok(result);
             }
+            #[cfg(feature = "std")]
+            if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() {
+                let indexer = self.lua_index_metamethod(object);
+                eprintln!(
+                    "[lua-socket] userdata missing method '{}' indexer={:?} userdata={:?}",
+                    method_name,
+                    indexer.as_ref().map(|v| v.type_of()),
+                    object
+                );
+            }
+        }
 
         if let Value::Struct { name, .. } = object
             && name == "LuaTable"
-                && let Some(result) =
-                    self.try_call_lua_dynamic_method(object, method_name, &args)?
-                {
-                    return Ok(result);
-                }
+            && let Some(result) = self.try_call_lua_dynamic_method(object, method_name, &args)?
+        {
+            return Ok(result);
+        }
 
         if let Value::Enum {
             enum_name,
             variant,
             values,
         } = object
-            && enum_name == "LuaValue" && variant == "Table"
-                && let Some(inner) = values.as_ref().and_then(|vals| vals.first()) {
-                    return self.call_builtin_method(inner, method_name, args);
-                }
+            && enum_name == "LuaValue"
+            && variant == "Table"
+            && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
+        {
+            return self.call_builtin_method(inner, method_name, args);
+        }
 
         let object_type_name = match object {
             Value::Struct { name, .. } => Some(name.as_str()),
@@ -708,9 +709,11 @@ impl VM {
                         let mut max_idx: LustInt = 0;
                         for key in map.keys() {
                             if let Value::Int(i) = key.to_value()
-                                && i > max_idx && i > 0 {
-                                    max_idx = i;
-                                }
+                                && i > max_idx
+                                && i > 0
+                            {
+                                max_idx = i;
+                            }
                         }
                         Ok(Value::Int(max_idx))
                     }
@@ -926,9 +929,10 @@ impl VM {
         }
 
         if let Some(direct) = self.lua_direct_index(receiver, key)
-            && !matches!(direct, Value::Nil) {
-                return Ok(direct);
-            }
+            && !matches!(direct, Value::Nil)
+        {
+            return Ok(direct);
+        }
 
         let Some(indexer) = self.lua_index_metamethod(receiver) else {
             return Ok(Value::Nil);
@@ -962,10 +966,12 @@ impl VM {
             variant,
             values,
         } = receiver
-            && enum_name == "LuaValue" && variant == "Table"
-                && let Some(inner) = values.as_ref().and_then(|vals| vals.first()) {
-                    return self.lua_direct_index(inner, key);
-                }
+            && enum_name == "LuaValue"
+            && variant == "Table"
+            && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
+        {
+            return self.lua_direct_index(inner, key);
+        }
 
         match receiver {
             Value::Struct { name, .. } if name == "LuaTable" => {
@@ -974,13 +980,13 @@ impl VM {
                 };
                 let raw_key = super::corelib::unwrap_lua_value(key.clone());
                 let lookup_key = ValueKey::from_value(&raw_key);
-                
+
                 map_rc.borrow().get(&lookup_key).cloned()
             }
             Value::Map(map_rc) => {
                 let raw_key = super::corelib::unwrap_lua_value(key.clone());
                 let lookup_key = ValueKey::from_value(&raw_key);
-                
+
                 map_rc.borrow().get(&lookup_key).cloned()
             }
             _ => None,
@@ -994,14 +1000,18 @@ impl VM {
             values,
         } = receiver
         {
-            if enum_name == "LuaValue" && variant == "Table"
-                && let Some(inner) = values.as_ref().and_then(|vals| vals.first()) {
-                    return self.lua_index_metamethod(inner);
-                }
-            if enum_name == "LuaValue" && variant == "Userdata"
-                && let Some(inner) = values.as_ref().and_then(|vals| vals.first()) {
-                    return self.lua_index_metamethod(inner);
-                }
+            if enum_name == "LuaValue"
+                && variant == "Table"
+                && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
+            {
+                return self.lua_index_metamethod(inner);
+            }
+            if enum_name == "LuaValue"
+                && variant == "Userdata"
+                && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
+            {
+                return self.lua_index_metamethod(inner);
+            }
         }
 
         let Value::Struct { name, .. } = receiver else {
@@ -1013,7 +1023,7 @@ impl VM {
         if name != "LuaTable" && name != "LuaUserdata" {
             return None;
         }
-        
+
         meta_rc
             .borrow()
             .get(&ValueKey::string("__index".to_string()))

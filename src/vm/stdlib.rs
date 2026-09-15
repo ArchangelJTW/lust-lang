@@ -1,13 +1,13 @@
-use super::corelib::{string_key, unwrap_lua_value};
 use super::VM;
+use super::corelib::{string_key, unwrap_lua_value};
+use crate::LustInt;
 use crate::bytecode::value::ValueKey;
 use crate::bytecode::{NativeCallResult, Value};
 use crate::config::LustConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::lua_compat::register_lust_function;
-use crate::LustInt;
 use rand::rngs::StdRng;
-use rand::{make_rng, RngExt, SeedableRng};
+use rand::{RngExt, SeedableRng, make_rng};
 use regex::Regex;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -82,24 +82,25 @@ fn create_type_fn() -> Value {
         if let Value::Enum {
             enum_name, variant, ..
         } = value
-            && enum_name == "LuaValue" {
-                let lua_type = match variant.as_str() {
-                    "Nil" => "nil",
-                    "Bool" => "boolean",
-                    "Int" | "Float" => "number",
-                    "String" => "string",
-                    "Table" => "table",
-                    "Function" => "function",
-                    "Userdata" | "LightUserdata" => "userdata",
-                    "Thread" => "thread",
-                    _ => "unknown",
-                };
-                return Ok(NativeCallResult::Return(Value::enum_variant(
-                    "LuaValue",
-                    "String",
-                    vec![Value::string(lua_type)],
-                )));
-            }
+            && enum_name == "LuaValue"
+        {
+            let lua_type = match variant.as_str() {
+                "Nil" => "nil",
+                "Bool" => "boolean",
+                "Int" | "Float" => "number",
+                "String" => "string",
+                "Table" => "table",
+                "Function" => "function",
+                "Userdata" | "LightUserdata" => "userdata",
+                "Thread" => "thread",
+                _ => "unknown",
+            };
+            return Ok(NativeCallResult::Return(Value::enum_variant(
+                "LuaValue",
+                "String",
+                vec![Value::string(lua_type)],
+            )));
+        }
 
         // Regular Lust types - also wrap in LuaValue for Lua compat
         let type_name = match value {
@@ -203,7 +204,7 @@ fn create_io_read_file_fn() -> Value {
             None => {
                 return Ok(NativeCallResult::Return(Value::err(Value::string(
                     "io.read_file(path) requires a string path",
-                ))))
+                ))));
             }
         };
         match fs::read_to_string(path) {
@@ -228,7 +229,7 @@ fn create_io_read_file_bytes_fn() -> Value {
             None => {
                 return Ok(NativeCallResult::Return(Value::err(Value::string(
                     "io.read_file_bytes(path) requires a string path",
-                ))))
+                ))));
             }
         };
 
@@ -261,7 +262,7 @@ fn create_io_write_file_fn() -> Value {
             None => {
                 return Ok(NativeCallResult::Return(Value::err(Value::string(
                     "io.write_file(path, contents) requires a string path",
-                ))))
+                ))));
             }
         };
         let contents = if let Some(s) = args[1].as_string() {
@@ -379,7 +380,7 @@ fn create_os_sleep_fn() -> Value {
             None => {
                 return Ok(NativeCallResult::Return(Value::err(Value::string(
                     "os.sleep(seconds) requires a float duration",
-                ))))
+                ))));
             }
         };
 
@@ -414,7 +415,7 @@ fn create_os_create_file_fn() -> Value {
             None => {
                 return Ok(NativeCallResult::Return(Value::err(Value::string(
                     "os.create_file(path) requires a string path",
-                ))))
+                ))));
             }
         };
         match fs::OpenOptions::new().write(true).create(true).open(path) {
@@ -439,7 +440,7 @@ fn create_os_create_dir_fn() -> Value {
             None => {
                 return Ok(NativeCallResult::Return(Value::err(Value::string(
                     "os.create_dir(path) requires a string path",
-                ))))
+                ))));
             }
         };
         match fs::create_dir_all(path) {
@@ -464,7 +465,7 @@ fn create_os_remove_file_fn() -> Value {
             None => {
                 return Ok(NativeCallResult::Return(Value::err(Value::string(
                     "os.remove_file(path) requires a string path",
-                ))))
+                ))));
             }
         };
         match fs::remove_file(path) {
@@ -489,7 +490,7 @@ fn create_os_remove_dir_fn() -> Value {
             None => {
                 return Ok(NativeCallResult::Return(Value::err(Value::string(
                     "os.remove_dir(path) requires a string path",
-                ))))
+                ))));
             }
         };
         match fs::remove_dir_all(path) {
@@ -514,7 +515,7 @@ fn create_os_rename_fn() -> Value {
             None => {
                 return Ok(NativeCallResult::Return(Value::err(Value::string(
                     "os.rename(from, to) requires string paths",
-                ))))
+                ))));
             }
         };
         let to = match args[1].as_string() {
@@ -522,7 +523,7 @@ fn create_os_rename_fn() -> Value {
             None => {
                 return Ok(NativeCallResult::Return(Value::err(Value::string(
                     "os.rename(from, to) requires string paths",
-                ))))
+                ))));
             }
         };
         match fs::rename(from, to) {
@@ -703,22 +704,23 @@ fn create_string_find_fn() -> Value {
         }
         let regex = lua_pattern_to_regex(pattern)?;
         if let Some(caps) = regex.captures(slice)
-            && let Some(mat) = caps.get(0) {
-                let begin = offset + mat.start();
-                let end = offset + mat.end().saturating_sub(1);
-                let mut results: Vec<Value> = vec![
-                    Value::Int((begin as LustInt) + 1),
-                    Value::Int((end as LustInt) + 1),
-                ];
-                for idx in 1..caps.len() {
-                    if let Some(c) = caps.get(idx) {
-                        results.push(Value::string(c.as_str()));
-                    } else {
-                        results.push(lua_nil());
-                    }
+            && let Some(mat) = caps.get(0)
+        {
+            let begin = offset + mat.start();
+            let end = offset + mat.end().saturating_sub(1);
+            let mut results: Vec<Value> = vec![
+                Value::Int((begin as LustInt) + 1),
+                Value::Int((end as LustInt) + 1),
+            ];
+            for idx in 1..caps.len() {
+                if let Some(c) = caps.get(idx) {
+                    results.push(Value::string(c.as_str()));
+                } else {
+                    results.push(lua_nil());
                 }
-                return return_lua_values(results);
             }
+            return return_lua_values(results);
+        }
         return_lua_values(vec![lua_nil()])
     }))
 }
@@ -2142,9 +2144,10 @@ fn table_data(value: &Value) -> Option<TableData> {
     }
 
     if let Some(map) = value.struct_get_field("table")
-        && map.as_map().is_some() {
-            return Some(TableData::Map(map));
-        }
+        && map.as_map().is_some()
+    {
+        return Some(TableData::Map(map));
+    }
 
     None
 }
@@ -2203,7 +2206,8 @@ pub(crate) fn create_table_unpack_fn() -> Value {
 
 fn create_math_random_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
-        let lower = args.first()
+        let lower = args
+            .first()
             .map(|v| unwrap_lua_value(v.clone()))
             .filter(|v| !matches!(v, Value::Nil));
         let upper = args
@@ -2230,7 +2234,8 @@ fn create_math_random_fn() -> Value {
 
 fn create_math_randomseed_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
-        let seed_val = args.first()
+        let seed_val = args
+            .first()
             .map(|v| unwrap_lua_value(v.clone()))
             .unwrap_or(Value::Int(0));
         let seed = coerce_int(&seed_val).unwrap_or(0) as u64;
@@ -2369,15 +2374,16 @@ fn render_format(fmt: &str, args: &[Value]) -> Result<String, String> {
 
 fn pad_value(value: String, width: Option<usize>, zero_pad: bool) -> String {
     if let Some(w) = width
-        && value.len() < w {
-            let mut padded = String::new();
-            let pad_char = if zero_pad { '0' } else { ' ' };
-            for _ in 0..(w - value.len()) {
-                padded.push(pad_char);
-            }
-            padded.push_str(&value);
-            return padded;
+        && value.len() < w
+    {
+        let mut padded = String::new();
+        let pad_char = if zero_pad { '0' } else { ' ' };
+        for _ in 0..(w - value.len()) {
+            padded.push(pad_char);
         }
+        padded.push_str(&value);
+        return padded;
+    }
     value
 }
 
@@ -2513,9 +2519,10 @@ fn build_template_replacement(template: &str, caps: &regex::Captures) -> String 
 
 fn to_lua_value(vm: &VM, value: Value) -> Result<Value, String> {
     if let Value::Enum { enum_name, .. } = &value
-        && enum_name == "LuaValue" {
-            return Ok(value);
-        }
+        && enum_name == "LuaValue"
+    {
+        return Ok(value);
+    }
     Ok(match value.clone() {
         Value::Nil => Value::enum_unit("LuaValue", "Nil"),
         Value::Bool(b) => Value::enum_variant("LuaValue", "Bool", vec![Value::Bool(b)]),

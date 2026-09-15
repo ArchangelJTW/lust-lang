@@ -220,11 +220,12 @@ impl TypeChecker {
                             return Some(cycle);
                         }
                     } else if on_stack.contains(neighbor)
-                        && let Some(pos) = stack.iter().position(|n| n == neighbor) {
-                            let mut cycle = stack[pos..].to_vec();
-                            cycle.push(neighbor.clone());
-                            return Some(cycle);
-                        }
+                        && let Some(pos) = stack.iter().position(|n| n == neighbor)
+                    {
+                        let mut cycle = stack[pos..].to_vec();
+                        cycle.push(neighbor.clone());
+                        return Some(cycle);
+                    }
                 }
             }
 
@@ -238,21 +239,22 @@ impl TypeChecker {
         let mut stack: Vec<String> = Vec::new();
         for name in struct_defs.keys() {
             if !visited.contains(name)
-                && let Some(cycle) = dfs(name, &graph, &mut visited, &mut on_stack, &mut stack) {
-                    let contains_weak = cycle
-                        .iter()
-                        .any(|node| struct_has_weak.get(node).copied().unwrap_or(false));
-                    if contains_weak {
-                        continue;
-                    }
-
-                    // let description = cycle.join(" -> ");
-                    break;
-                    // return Err(self.type_error(format!(
-                    //     "Strong ownership cycle detected: {}. Mark at least one field as 'ref' to break the cycle.",
-                    //     description
-                    // )));
+                && let Some(cycle) = dfs(name, &graph, &mut visited, &mut on_stack, &mut stack)
+            {
+                let contains_weak = cycle
+                    .iter()
+                    .any(|node| struct_has_weak.get(node).copied().unwrap_or(false));
+                if contains_weak {
+                    continue;
                 }
+
+                // let description = cycle.join(" -> ");
+                break;
+                // return Err(self.type_error(format!(
+                //     "Strong ownership cycle detected: {}. Mark at least one field as 'ref' to break the cycle.",
+                //     description
+                // )));
+            }
         }
 
         Ok(())
@@ -376,9 +378,10 @@ impl TypeChecker {
             if let Some(module) = parent_module {
                 for candidate in candidates {
                     if let Some((candidate_module, _)) = candidate.rsplit_once('.')
-                        && candidate_module == module {
-                            return Some(candidate.clone());
-                        }
+                        && candidate_module == module
+                    {
+                        return Some(candidate.clone());
+                    }
                 }
             }
         }
@@ -456,20 +459,21 @@ impl TypeChecker {
         let init_name = format!("__init@{}", module);
         for item in items {
             if let ItemKind::Function(func) = &item.kind
-                && func.name == init_name {
-                    for stmt in &func.body {
-                        if let StmtKind::Local {
-                            bindings,
-                            initializer,
-                        } = &stmt.kind
-                        {
-                            self.check_local_stmt(
-                                bindings.as_slice(),
-                                initializer.as_ref().map(|values| values.as_slice()),
-                            )?;
-                        }
+                && func.name == init_name
+            {
+                for stmt in &func.body {
+                    if let StmtKind::Local {
+                        bindings,
+                        initializer,
+                    } = &stmt.kind
+                    {
+                        self.check_local_stmt(
+                            bindings.as_slice(),
+                            initializer.as_ref().map(|values| values.as_slice()),
+                        )?;
                     }
                 }
+            }
         }
 
         Ok(())
@@ -482,9 +486,10 @@ impl TypeChecker {
 
         if let Some(module) = &self.current_module {
             if let Some(imports) = self.imports_by_module.get(module)
-                && let Some(fq) = imports.function_aliases.get(name) {
-                    return fq.clone();
-                }
+                && let Some(fq) = imports.function_aliases.get(name)
+            {
+                return fq.clone();
+            }
 
             let qualified = format!("{}.{}", module, name);
             if self.env.lookup_function(&qualified).is_some() {
@@ -508,9 +513,10 @@ impl TypeChecker {
 
         if let Some(module) = &self.current_module {
             if let Some(imports) = self.imports_by_module.get(module)
-                && let Some(fq) = imports.function_aliases.get(name) {
-                    return fq.clone();
-                }
+                && let Some(fq) = imports.function_aliases.get(name)
+            {
+                return fq.clone();
+            }
 
             return format!("{}.{}", module, name);
         }
@@ -521,9 +527,10 @@ impl TypeChecker {
     pub fn resolve_module_alias(&self, alias: &str) -> Option<String> {
         if let Some(module) = &self.current_module
             && let Some(imports) = self.imports_by_module.get(module)
-                && let Some(m) = imports.module_aliases.get(alias) {
-                    return Some(m.clone());
-                }
+            && let Some(m) = imports.module_aliases.get(alias)
+        {
+            return Some(m.clone());
+        }
 
         None
     }
@@ -725,7 +732,7 @@ impl TypeChecker {
             _ => {
                 return Err(self.type_error(
                     "Impl target must be a named type when registering from Rust".to_string(),
-                ))
+                ));
             }
         };
 
@@ -767,13 +774,14 @@ impl TypeChecker {
         if let Some((head, tail)) = name.split_once('.') {
             if let Some(module) = &self.current_module
                 && let Some(imports) = self.imports_by_module.get(module)
-                    && let Some(real_module) = imports.module_aliases.get(head) {
-                        if tail.is_empty() {
-                            return real_module.clone();
-                        } else {
-                            return format!("{}.{}", real_module, tail);
-                        }
-                    }
+                && let Some(real_module) = imports.module_aliases.get(head)
+            {
+                if tail.is_empty() {
+                    return real_module.clone();
+                } else {
+                    return format!("{}.{}", real_module, tail);
+                }
+            }
 
             return name.to_string();
         }
@@ -791,9 +799,10 @@ impl TypeChecker {
 
         if let Some(module) = &self.current_module {
             if let Some(imports) = self.imports_by_module.get(module)
-                && let Some(fq) = imports.type_aliases.get(name) {
-                    return fq.clone();
-                }
+                && let Some(fq) = imports.type_aliases.get(name)
+            {
+                return fq.clone();
+            }
 
             return format!("{}.{}", module, name);
         }
@@ -806,9 +815,10 @@ impl TypeChecker {
             ItemKind::Struct(s) => {
                 let mut s2 = s.clone();
                 if let Some(module) = &self.current_module
-                    && !s2.name.contains('.') {
-                        s2.name = format!("{}.{}", module, s2.name);
-                    }
+                    && !s2.name.contains('.')
+                {
+                    s2.name = format!("{}.{}", module, s2.name);
+                }
 
                 self.push_type_params(&s2.type_params)?;
                 for field in &mut s2.fields {
@@ -826,9 +836,10 @@ impl TypeChecker {
             ItemKind::Enum(e) => {
                 let mut e2 = e.clone();
                 if let Some(module) = &self.current_module
-                    && !e2.name.contains('.') {
-                        e2.name = format!("{}.{}", module, e2.name);
-                    }
+                    && !e2.name.contains('.')
+                {
+                    e2.name = format!("{}.{}", module, e2.name);
+                }
 
                 self.push_type_params(&e2.type_params)?;
                 for variant in &mut e2.variants {
@@ -847,9 +858,10 @@ impl TypeChecker {
             ItemKind::Trait(t) => {
                 let mut t2 = t.clone();
                 if let Some(module) = &self.current_module
-                    && !t2.name.contains('.') {
-                        t2.name = format!("{}.{}", module, t2.name);
-                    }
+                    && !t2.name.contains('.')
+                {
+                    t2.name = format!("{}.{}", module, t2.name);
+                }
 
                 self.push_type_params(&t2.type_params)?;
                 for method in &mut t2.methods {
@@ -876,7 +888,7 @@ impl TypeChecker {
                         ExternItem::Enum(def) => {
                             self.register_external_enum(def.clone())?;
                         }
-                        ExternItem::Const { name, ty } => {
+                        ExternItem::Const { name, ty, doc: _ } => {
                             let key = self.resolve_value_key(name);
                             self.env
                                 .register_constant(key, self.canonicalize_type(ty))?;
@@ -1054,13 +1066,14 @@ impl TypeChecker {
         bindings: &mut HashMap<String, Type>,
     ) -> Result<()> {
         if let TypeKind::Generic(name) = &expected.kind
-            && type_params.iter().any(|param| param == name) {
-                if let Some(bound) = bindings.get(name) {
-                    return self.unify(bound, actual);
-                }
-                bindings.insert(name.clone(), self.canonicalize_type(actual));
-                return Ok(());
+            && type_params.iter().any(|param| param == name)
+        {
+            if let Some(bound) = bindings.get(name) {
+                return self.unify(bound, actual);
             }
+            bindings.insert(name.clone(), self.canonicalize_type(actual));
+            return Ok(());
+        }
 
         match (&expected.kind, &actual.kind) {
             (TypeKind::Array(expected), TypeKind::Array(actual))
@@ -1539,10 +1552,10 @@ impl TypeChecker {
             (TypeKind::Trait(expected_trait), TypeKind::Trait(actual_trait))
                 if expected_trait == actual_trait =>
             {
-                return Ok(())
+                return Ok(());
             }
             (TypeKind::Trait(trait_name), _) if self.type_satisfies_trait(actual, trait_name) => {
-                return Ok(())
+                return Ok(());
             }
             (TypeKind::Union(expected_types), TypeKind::Union(actual_types)) => {
                 if expected_types.len() != actual_types.len() {
@@ -1649,7 +1662,7 @@ impl TypeChecker {
                         "Tuple type is not compatible with type '{}'",
                         actual
                     )),
-                })
+                });
             }
 
             (TypeKind::Named(name), TypeKind::Array(_))
@@ -1799,15 +1812,16 @@ impl TypeChecker {
         }
 
         if let (
-                TypeKind::Function {
-                    params: p1,
-                    return_type: r1,
-                },
-                TypeKind::Function {
-                    params: p2,
-                    return_type: r2,
-                },
-            ) = (&expected.kind, &actual.kind) {
+            TypeKind::Function {
+                params: p1,
+                return_type: r1,
+            },
+            TypeKind::Function {
+                params: p2,
+                return_type: r2,
+            },
+        ) = (&expected.kind, &actual.kind)
+        {
             if p1.len() != p2.len() {
                 return false;
             }
@@ -1878,13 +1892,12 @@ impl TypeChecker {
     }
 
     fn short_circuit_profile(&self, expr: &Expr, ty: &Type) -> ShortCircuitInfo {
-        let module_key = self
-            .current_module.as_deref()
-            .unwrap_or("");
+        let module_key = self.current_module.as_deref().unwrap_or("");
         if let Some(module_map) = self.short_circuit_info.get(module_key)
-            && let Some(info) = module_map.get(&expr.span) {
-                return info.clone();
-            }
+            && let Some(info) = module_map.get(&expr.span)
+        {
+            return info.clone();
+        }
 
         ShortCircuitInfo {
             truthy: if self.type_can_be_truthy(ty) {
@@ -1907,9 +1920,10 @@ impl TypeChecker {
     fn clear_option_for_span(&mut self, span: Span) {
         let module_key = self.current_module_key();
         if let Some(module_map) = self.short_circuit_info.get_mut(&module_key)
-            && let Some(info) = module_map.get_mut(&span) {
-                info.option_inner = None;
-            }
+            && let Some(info) = module_map.get_mut(&span)
+        {
+            info.option_inner = None;
+        }
     }
 
     fn type_can_be_truthy(&self, ty: &Type) -> bool {
@@ -2107,7 +2121,10 @@ mod tests {
         assert_eq!(checker.check_expr(&pair).unwrap().kind, pair_type.kind);
         let empty = constructor("Pair", "None", vec![]);
         assert_eq!(
-            checker.check_expr_with_hint(&empty, Some(&pair_type)).unwrap().kind,
+            checker
+                .check_expr_with_hint(&empty, Some(&pair_type))
+                .unwrap()
+                .kind,
             pair_type.kind
         );
         assert!(checker.check_expr(&empty).is_err());
@@ -2116,7 +2133,10 @@ mod tests {
             "Values",
             vec![
                 Expr::new(ExprKind::Literal(Literal::Integer(1)), span),
-                Expr::new(ExprKind::Literal(Literal::String("wrong".to_string())), span),
+                Expr::new(
+                    ExprKind::Literal(Literal::String("wrong".to_string())),
+                    span,
+                ),
             ],
         );
         assert!(checker.check_expr(&invalid).is_err());
@@ -2394,9 +2414,11 @@ end
              local value = tagged(42)\n",
         )
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Cannot infer type parameter 'Tag'"));
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot infer type parameter 'Tag'")
+        );
     }
 
     #[test]
@@ -2436,9 +2458,11 @@ end
              end\n",
         )
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Specialized generic impls are not supported"));
+        assert!(
+            error
+                .to_string()
+                .contains("Specialized generic impls are not supported")
+        );
     }
 
     #[test]
@@ -2498,9 +2522,11 @@ end
              local text: string = boxed:text()\n",
         )
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Conditional generic impls are not supported"));
+        assert!(
+            error
+                .to_string()
+                .contains("Conditional generic impls are not supported")
+        );
     }
 
     #[test]
@@ -2559,9 +2585,11 @@ end
         .unwrap();
 
         let error = check(&format!("{}local output = render(1)\n", valid)).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("does not implement required trait"));
+        assert!(
+            error
+                .to_string()
+                .contains("does not implement required trait")
+        );
     }
 
     #[test]
@@ -2691,30 +2719,35 @@ end
     #[test]
     fn method_syntax_on_primitives_is_rejected() {
         let err1 = check("local s = \"hello\"\nlocal l = s:len()\n").unwrap_err();
-        assert!(err1
-            .to_string()
-            .contains("Type 'string' does not support method syntax"));
+        assert!(
+            err1.to_string()
+                .contains("Type 'string' does not support method syntax")
+        );
 
         let err2 = check("local arr: Array<int> = [1]\narr:push(2)\n").unwrap_err();
-        assert!(err2
-            .to_string()
-            .contains("Type 'Array' does not support method syntax"));
+        assert!(
+            err2.to_string()
+                .contains("Type 'Array' does not support method syntax")
+        );
 
         let err3 =
             check("local m: Map<string, int> = { a = 1 }\nlocal v = m:get(\"a\")\n").unwrap_err();
-        assert!(err3
-            .to_string()
-            .contains("Type 'Map' does not support method syntax"));
+        assert!(
+            err3.to_string()
+                .contains("Type 'Map' does not support method syntax")
+        );
 
         let err4 = check("local x: float = 3.5\nlocal f = x:floor()\n").unwrap_err();
-        assert!(err4
-            .to_string()
-            .contains("Type 'float' does not support method syntax"));
+        assert!(
+            err4.to_string()
+                .contains("Type 'float' does not support method syntax")
+        );
 
         let err5 = check("local i: int = 5\nlocal a = i:abs()\n").unwrap_err();
-        assert!(err5
-            .to_string()
-            .contains("Type 'int' does not support method syntax"));
+        assert!(
+            err5.to_string()
+                .contains("Type 'int' does not support method syntax")
+        );
     }
 
     #[test]

@@ -75,6 +75,20 @@ local lookup: Map<string, int> = { ["apple"] = 10, orange = 20 }
 local tuple: (string, int, bool) = ("item", 42, true)
 ```
 
+### Doc Comments
+```lust
+-- Doc comments are exactly three dashes followed by a space; they attach to
+-- the declaration that follows (function, struct, enum, trait, impl method,
+-- extern declaration) and show up in LSP hover and completions.
+--- Adds two integers and returns the sum.
+function add(a: int, b: int): int
+    return a + b
+end
+
+-- Regular comments use two dashes (or more, e.g. `----`); only exactly
+-- `--- ` (three dashes plus a space) starts a doc comment.
+```
+
 ### Control Flow
 ```lust
 -- If-Elseif-Else

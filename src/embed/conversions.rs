@@ -1,7 +1,7 @@
 use super::values::{
-    matches_array_handle_type, matches_array_type, matches_function_handle_type, matches_lust_enum,
-    matches_lust_struct, matches_map_handle_type, ArrayHandle, EnumInstance, FunctionHandle,
-    MapHandle, StringRef, StructHandle, StructInstance, TypedValue, ValueRef,
+    ArrayHandle, EnumInstance, FunctionHandle, MapHandle, StringRef, StructHandle, StructInstance,
+    TypedValue, ValueRef, matches_array_handle_type, matches_array_type,
+    matches_function_handle_type, matches_lust_enum, matches_lust_struct, matches_map_handle_type,
 };
 use crate::ast::{Span, Type, TypeKind};
 use crate::bytecode::Value;
@@ -575,9 +575,7 @@ impl IntoLustValue for StructInstance {
     fn matches_lust_type(ty: &Type) -> bool {
         match &ty.kind {
             TypeKind::Unknown | TypeKind::Named(_) | TypeKind::GenericInstance { .. } => true,
-            TypeKind::Union(types) => types
-                .iter()
-                .any(<Self as IntoLustValue>::matches_lust_type),
+            TypeKind::Union(types) => types.iter().any(<Self as IntoLustValue>::matches_lust_type),
             _ => false,
         }
     }
@@ -628,9 +626,7 @@ impl FromLustValue for StructInstance {
     fn matches_lust_type(ty: &Type) -> bool {
         match &ty.kind {
             TypeKind::Unknown | TypeKind::Named(_) | TypeKind::GenericInstance { .. } => true,
-            TypeKind::Union(types) => types
-                .iter()
-                .any(<Self as FromLustValue>::matches_lust_type),
+            TypeKind::Union(types) => types.iter().any(<Self as FromLustValue>::matches_lust_type),
             _ => false,
         }
     }
@@ -682,9 +678,7 @@ impl IntoLustValue for EnumInstance {
     fn matches_lust_type(ty: &Type) -> bool {
         match &ty.kind {
             TypeKind::Unknown | TypeKind::Named(_) | TypeKind::GenericInstance { .. } => true,
-            TypeKind::Union(types) => types
-                .iter()
-                .any(<Self as IntoLustValue>::matches_lust_type),
+            TypeKind::Union(types) => types.iter().any(<Self as IntoLustValue>::matches_lust_type),
             _ => false,
         }
     }
@@ -709,9 +703,7 @@ impl FromLustValue for EnumInstance {
     fn matches_lust_type(ty: &Type) -> bool {
         match &ty.kind {
             TypeKind::Unknown | TypeKind::Named(_) | TypeKind::GenericInstance { .. } => true,
-            TypeKind::Union(types) => types
-                .iter()
-                .any(<Self as FromLustValue>::matches_lust_type),
+            TypeKind::Union(types) => types.iter().any(<Self as FromLustValue>::matches_lust_type),
             _ => false,
         }
     }

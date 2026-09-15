@@ -229,33 +229,33 @@ impl JitCompiler {
                     condition_register, ..
                 } = next
                     && self.scalar_registers.contains_key(condition_register)
-                        && Self::register_overwritten_before_read(
-                            &ops[op_index + 2..],
-                            *condition_register,
-                        )
-                        && let Some(guard) =
-                            self.compile_numeric_comparison_guard(op, next, *guard_index as usize)?
-                        {
-                            guards.push(guard);
-                            *guard_index += 1;
-                            skip_next = true;
-                            continue;
-                        }
+                    && Self::register_overwritten_before_read(
+                        &ops[op_index + 2..],
+                        *condition_register,
+                    )
+                    && let Some(guard) =
+                        self.compile_numeric_comparison_guard(op, next, *guard_index as usize)?
+                {
+                    guards.push(guard);
+                    *guard_index += 1;
+                    skip_next = true;
+                    continue;
+                }
                 if let TraceOp::LoadConst {
                     dest: constant_register,
                     ..
                 } = op
                     && self.scalar_registers.contains_key(constant_register)
-                        && Self::register_overwritten_before_read(
-                            &ops[op_index + 2..],
-                            *constant_register,
-                        )
-                        && self.compile_integer_add_immediate(op, next)?
-                    {
-                        self.update_scalar_registers(next);
-                        skip_next = true;
-                        continue;
-                    }
+                    && Self::register_overwritten_before_read(
+                        &ops[op_index + 2..],
+                        *constant_register,
+                    )
+                    && self.compile_integer_add_immediate(op, next)?
+                {
+                    self.update_scalar_registers(next);
+                    skip_next = true;
+                    continue;
+                }
             }
             match op {
                 TraceOp::LoadConst { dest, value } => {

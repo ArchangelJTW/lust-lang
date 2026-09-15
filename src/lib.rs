@@ -34,34 +34,33 @@ pub use bytecode::{Chunk, Compiler, Function, Instruction, Value};
 pub use config::{ConfigError, DependencyKind, DependencySpec, LustConfig};
 #[cfg(feature = "std")]
 pub use embed::{
-    enum_variant, enum_variant_with, function_param, private_struct_field_decl, self_param,
-    struct_field, struct_field_decl, trait_bound, type_named, type_unit, type_unknown,
-    weak_struct_field_decl, ArrayHandle, AsyncDriver, AsyncTaskQueue, EmbeddedBuilder,
-    EmbeddedProgram, EnumInstance, ExternRegistry, FromLustValue, FromStructField, FunctionArgs,
-    FunctionBuilder, FunctionHandle, ImplBuilder, IntoLustValue, MapHandle, ModuleStub, StringRef,
-    StructBuilder, StructField, StructHandle, StructInstance, TraitBuilder, TraitMethodBuilder,
-    ValueRef,
+    ArrayHandle, AsyncDriver, AsyncTaskQueue, EmbeddedBuilder, EmbeddedProgram, EnumInstance,
+    ExternRegistry, FromLustValue, FromStructField, FunctionArgs, FunctionBuilder, FunctionHandle,
+    ImplBuilder, IntoLustValue, MapHandle, ModuleStub, StringRef, StructBuilder, StructField,
+    StructHandle, StructInstance, TraitBuilder, TraitMethodBuilder, ValueRef, enum_variant,
+    enum_variant_with, function_param, private_struct_field_decl, self_param, struct_field,
+    struct_field_decl, trait_bound, type_named, type_unit, type_unknown, weak_struct_field_decl,
 };
 pub use error::{LustError, Result};
 pub use jit::{JitCompiler, JitState, JitStats};
 pub use lexer::{Lexer, Token, TokenKind};
 #[cfg(feature = "std")]
 pub use lust_macros::LustStructView;
-pub use modules::embedded::{build_directory_map, load_program_from_embedded, EmbeddedModule};
+pub use modules::embedded::{EmbeddedModule, build_directory_map, load_program_from_embedded};
 pub use modules::{
-    compile_program_with_config, LoadedModule, ModuleImports, ModuleLoader, Program,
+    LoadedModule, ModuleImports, ModuleLoader, Program, compile_program_with_config,
 };
 pub use number::{LustFloat, LustInt};
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 pub use packages::{
-    build_local_module, build_package_archive, clear_credentials, collect_stub_files,
-    credentials_file, load_credentials, load_local_module, resolve_dependencies, save_credentials,
-    stub_files_from_exports, write_stub_files, ArchiveError, BuildOptions, Credentials,
-    CredentialsError, DependencyResolution, DependencyResolutionError, DownloadedArchive,
-    LoadedRustModule, LocalBuildOutput, LocalModuleError, ManifestError, PackageArchive,
-    PackageDetails, PackageKind, PackageManager, PackageManifest, PackageSpecifier, PackageSummary,
-    PackageVersionInfo, PublishResponse, RegistryClient, RegistryError, ResolvedLuaDependency,
-    ResolvedLustDependency, ResolvedRustDependency, SearchParameters, StubFile, DEFAULT_BASE_URL,
+    ArchiveError, BuildOptions, Credentials, CredentialsError, DEFAULT_BASE_URL,
+    DependencyResolution, DependencyResolutionError, DownloadedArchive, LoadedRustModule,
+    LocalBuildOutput, LocalModuleError, ManifestError, PackageArchive, PackageDetails, PackageKind,
+    PackageManager, PackageManifest, PackageSpecifier, PackageSummary, PackageVersionInfo,
+    PublishResponse, RegistryClient, RegistryError, ResolvedLuaDependency, ResolvedLustDependency,
+    ResolvedRustDependency, SearchParameters, StubFile, build_local_module, build_package_archive,
+    clear_credentials, collect_stub_files, credentials_file, load_credentials, load_local_module,
+    resolve_dependencies, save_credentials, stub_files_from_exports, write_stub_files,
 };
 pub use parser::Parser;
 pub use typechecker::{FunctionSignature, TypeChecker, TypeCollection};

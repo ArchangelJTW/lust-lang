@@ -1,7 +1,7 @@
 #![cfg(target_arch = "wasm32")]
+use crate::LustError;
 use crate::bytecode::{NativeCallResult, Value};
 use crate::embed::EmbeddedBuilder;
-use crate::LustError;
 use std::cell::RefCell;
 use std::fmt::Write;
 use std::rc::Rc;

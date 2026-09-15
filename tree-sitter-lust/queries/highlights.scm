@@ -237,6 +237,7 @@
 
 ; Comments
 (comment) @comment
+(doc_comment) @comment.documentation
 
 ; Pattern matching
 (wildcard_pattern) @variable.builtin

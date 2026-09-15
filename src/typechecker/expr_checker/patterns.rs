@@ -62,9 +62,11 @@ impl TypeChecker {
                                     self.env
                                         .lookup_enum(&key)
                                         .or_else(|| self.env.lookup_enum(name))
-                                }.is_some() {
-                                    return Ok(());
                                 }
+                                .is_some()
+                            {
+                                return Ok(());
+                            }
 
                             if matches!(ty.kind, TypeKind::Option(_) | TypeKind::Result(_, _)) {
                                 return Ok(());
@@ -81,7 +83,7 @@ impl TypeChecker {
                         return Err(self.type_error(format!(
                             "Cannot use enum pattern on non-enum type '{}'",
                             scrutinee_type
-                        )))
+                        )));
                     }
                 };
                 let enum_def = {
@@ -149,34 +151,35 @@ impl TypeChecker {
                 check_type: target_type,
             } => {
                 if let ExprKind::Identifier(var_name) = &scrutinee.kind
-                    && let Some(current_type) = self.env.lookup_variable(var_name) {
-                        let narrowed_type = if let TypeKind::Named(name) = &target_type.kind {
-                            let resolved = self.resolve_type_key(name);
-                            if self.env.lookup_trait(&resolved).is_some() {
-                                Type::new(TypeKind::Trait(name.clone()), target_type.span)
-                            } else {
-                                target_type.clone()
-                            }
+                    && let Some(current_type) = self.env.lookup_variable(var_name)
+                {
+                    let narrowed_type = if let TypeKind::Named(name) = &target_type.kind {
+                        let resolved = self.resolve_type_key(name);
+                        if self.env.lookup_trait(&resolved).is_some() {
+                            Type::new(TypeKind::Trait(name.clone()), target_type.span)
                         } else {
                             target_type.clone()
-                        };
-                        match &current_type.kind {
-                            TypeKind::Unknown => {
-                                narrowings.push((var_name.clone(), narrowed_type));
-                            }
+                        }
+                    } else {
+                        target_type.clone()
+                    };
+                    match &current_type.kind {
+                        TypeKind::Unknown => {
+                            narrowings.push((var_name.clone(), narrowed_type));
+                        }
 
-                            TypeKind::Union(types) => {
-                                for ty in types {
-                                    if self.types_equal(ty, target_type) {
-                                        narrowings.push((var_name.clone(), target_type.clone()));
-                                        break;
-                                    }
+                        TypeKind::Union(types) => {
+                            for ty in types {
+                                if self.types_equal(ty, target_type) {
+                                    narrowings.push((var_name.clone(), target_type.clone()));
+                                    break;
                                 }
                             }
-
-                            _ => {}
                         }
+
+                        _ => {}
                     }
+                }
             }
 
             ExprKind::IsPattern {
@@ -185,25 +188,25 @@ impl TypeChecker {
             } => {
                 if let Pattern::TypeCheck(target_type) = pattern
                     && let ExprKind::Identifier(var_name) = &scrutinee.kind
-                        && let Some(current_type) = self.env.lookup_variable(var_name) {
-                            match &current_type.kind {
-                                TypeKind::Unknown => {
+                    && let Some(current_type) = self.env.lookup_variable(var_name)
+                {
+                    match &current_type.kind {
+                        TypeKind::Unknown => {
+                            narrowings.push((var_name.clone(), target_type.clone()));
+                        }
+
+                        TypeKind::Union(types) => {
+                            for ty in types {
+                                if self.types_equal(ty, target_type) {
                                     narrowings.push((var_name.clone(), target_type.clone()));
+                                    break;
                                 }
-
-                                TypeKind::Union(types) => {
-                                    for ty in types {
-                                        if self.types_equal(ty, target_type) {
-                                            narrowings
-                                                .push((var_name.clone(), target_type.clone()));
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                _ => {}
                             }
                         }
+
+                        _ => {}
+                    }
+                }
             }
 
             ExprKind::Binary { left, op, right } => {
@@ -308,7 +311,7 @@ impl TypeChecker {
                     ),
                     _ => {
                         return Err(self
-                            .type_error(format!("Expected enum type, got '{}'", scrutinee_type)))
+                            .type_error(format!("Expected enum type, got '{}'", scrutinee_type)));
                     }
                 };
                 let enum_def = {

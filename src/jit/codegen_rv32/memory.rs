@@ -759,7 +759,7 @@ impl JitCompiler {
     ) -> Result<()> {
         unsafe extern "C" {
             fn jit_get_enum_value_safe(enum_ptr: *const Value, index: usize, out: *mut Value)
-                -> u8;
+            -> u8;
         }
         self.emit_addr_in_t2(enum_reg, 0);
         dynasm!(self.ops ; .arch riscv32i ; mv a0, t2);

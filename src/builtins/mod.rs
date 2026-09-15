@@ -1,6 +1,6 @@
+use crate::FunctionSignature;
 use crate::ast::{Span, Type, TypeKind};
 use crate::lazy::StaticOnceCell;
-use crate::FunctionSignature;
 use alloc::{boxed::Box, collections::BTreeMap, string::ToString, vec, vec::Vec};
 use hashbrown::HashMap;
 
@@ -1509,9 +1509,10 @@ pub fn lookup_builtin_method(
 ) -> Option<(&'static BuiltinMethod, HashMap<&'static str, Type>)> {
     for method in builtin_methods() {
         if method.name == name
-            && let Some(bindings) = match_receiver(&method.receiver, receiver) {
-                return Some((method, bindings));
-            }
+            && let Some(bindings) = match_receiver(&method.receiver, receiver)
+        {
+            return Some((method, bindings));
+        }
     }
     None
 }

@@ -175,26 +175,28 @@ impl Compiler {
                     | Instruction::Return(_)
             )
         });
-        if straight_line && i32::from(src) > self.max_local_register_index()
+        if straight_line
+            && i32::from(src) > self.max_local_register_index()
             && let Some((instruction, ty, _, _)) = expression
                 .last()
                 .and_then(|instruction| instruction.numeric_specialization())
-                && instruction.defined_register() == Some(src) {
-                    let replacement = match instruction {
-                        Instruction::Add(_, l, r) => Some(Instruction::Add(dest, l, r)),
-                        Instruction::Sub(_, l, r) => Some(Instruction::Sub(dest, l, r)),
-                        Instruction::Mul(_, l, r) => Some(Instruction::Mul(dest, l, r)),
-                        Instruction::Div(_, l, r) => Some(Instruction::Div(dest, l, r)),
-                        Instruction::Mod(_, l, r) => Some(Instruction::Mod(dest, l, r)),
-                        Instruction::Neg(_, s) => Some(Instruction::Neg(dest, s)),
-                        _ => None,
-                    };
-                    if let Some(replacement) = replacement {
-                        *self.current_chunk_mut().instructions.last_mut().unwrap() =
-                            replacement.specialize_numeric(ty);
-                        return;
-                    }
-                }
+            && instruction.defined_register() == Some(src)
+        {
+            let replacement = match instruction {
+                Instruction::Add(_, l, r) => Some(Instruction::Add(dest, l, r)),
+                Instruction::Sub(_, l, r) => Some(Instruction::Sub(dest, l, r)),
+                Instruction::Mul(_, l, r) => Some(Instruction::Mul(dest, l, r)),
+                Instruction::Div(_, l, r) => Some(Instruction::Div(dest, l, r)),
+                Instruction::Mod(_, l, r) => Some(Instruction::Mod(dest, l, r)),
+                Instruction::Neg(_, s) => Some(Instruction::Neg(dest, s)),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                *self.current_chunk_mut().instructions.last_mut().unwrap() =
+                    replacement.specialize_numeric(ty);
+                return;
+            }
+        }
         self.emit(Instruction::Move(dest, src), 0);
     }
 

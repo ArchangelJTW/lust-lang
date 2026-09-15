@@ -1,6 +1,7 @@
-use crate::analysis::{AnalysisSnapshot, ModuleSnapshot};
+use crate::analysis::{AnalysisSnapshot, FunctionInfo, ModuleSnapshot};
 use crate::utils::{
-    compute_line_offsets, is_word_char, nth_char_byte_index, span_from_identifier, span_to_range,
+    build_hover_body, compute_line_offsets, is_word_char, nth_char_byte_index, span_from_identifier,
+    span_to_range,
 };
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
@@ -116,11 +117,12 @@ pub(crate) fn hover_for_method_call(
         .find(|m| m.name == desired_name && m.is_instance == expect_instance)?;
     let hover_span = span_from_identifier(text, start_offset, method_segment, &line_offsets);
     let signature = format_method_signature(method);
-    let mut body = format!("```lust\n{}\n```", signature);
-    body.push_str(&format!("\nDefined on `{}`", method.owner));
+    let mut metadata = Vec::new();
+    metadata.push(format!("Defined on `{}`", method.owner));
     if !method.module_path.is_empty() {
-        body.push_str(&format!("\nModule `{}`", method.module_path));
+        metadata.push(format!("Module `{}`", method.module_path));
     }
+    let body = build_hover_body(metadata, &signature, method.doc.as_deref());
 
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -129,4 +131,48 @@ pub(crate) fn hover_for_method_call(
         }),
         range: hover_span.map(span_to_range),
     })
+}
+
+pub(crate) fn hover_for_function(info: &FunctionInfo) -> Hover {
+    let def = &info.def;
+    let params = def
+        .params
+        .iter()
+        .map(|param| {
+            if param.is_self || param.name == "self" {
+                "self".to_string()
+            } else if param.name.is_empty() {
+                param.ty.to_string()
+            } else if matches!(param.ty.kind, lust::ast::TypeKind::Infer) {
+                param.name.clone()
+            } else {
+                format!("{}: {}", param.name, param.ty)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let prefix = if info.is_extern { "extern " } else { "" };
+    let mut signature =
+        format!("{prefix}function {}({})", crate::utils::simple_type_name(&def.name), params);
+    if let Some(ret) = &def.return_type {
+        signature.push_str(": ");
+        signature.push_str(&ret.to_string());
+    }
+
+    let mut metadata = Vec::new();
+    if let Some(abi) = &info.extern_abi {
+        metadata.push(format!("Extern ABI `{}`", abi));
+    }
+    if !info.module_path.is_empty() {
+        metadata.push(format!("Module `{}`", info.module_path));
+    }
+    let body = build_hover_body(metadata, &signature, def.doc.as_deref());
+
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: body,
+        }),
+        range: None,
+    }
 }

@@ -1,18 +1,18 @@
 #![cfg(feature = "std")]
+#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+use lust::LoadedRustModule;
 #[cfg(feature = "lua_transpile")]
 use lust::lua_compat::transpile::transpile_lua_stub;
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
-use lust::lua_compat::{lua_to_lust, render_table_stub, trace_luaopen, LuaModuleSpec, LuaValue};
+use lust::lua_compat::{LuaModuleSpec, LuaValue, lua_to_lust, render_table_stub, trace_luaopen};
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 use lust::packages::{
-    build_package_archive, clear_credentials, collect_rust_dependency_artifacts, credentials_file,
-    load_credentials, load_prepared_rust_dependencies, prepare_rust_dependencies,
-    resolve_dependencies, save_credentials, write_stub_files, DependencyResolution,
-    DownloadedArchive, PackageDetails, PackageManager, PackageManifest, PreparedRustDependency,
-    RegistryClient, DEFAULT_BASE_URL,
+    DEFAULT_BASE_URL, DependencyResolution, DownloadedArchive, PackageDetails, PackageManager,
+    PackageManifest, PreparedRustDependency, RegistryClient, build_package_archive,
+    clear_credentials, collect_rust_dependency_artifacts, credentials_file, load_credentials,
+    load_prepared_rust_dependencies, prepare_rust_dependencies, resolve_dependencies,
+    save_credentials, write_stub_files,
 };
-#[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
-use lust::LoadedRustModule;
 use lust::{Compiler, Item, LustConfig, ModuleLoader, Span, TypeChecker, VM};
 use std::{
     env, fs,
@@ -21,7 +21,7 @@ use std::{
     process::{self, Command},
 };
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
-use toml::{self, map::Map, Value};
+use toml::{self, Value, map::Map};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
@@ -60,7 +60,9 @@ fn main() {
         }
         #[cfg(not(feature = "lua_transpile"))]
         {
-            eprintln!("Warning: --transpile requires the lua_transpile feature; recompile with --features lua_transpile to enable.");
+            eprintln!(
+                "Warning: --transpile requires the lua_transpile feature; recompile with --features lua_transpile to enable."
+            );
             process::exit(1);
         }
     }
@@ -356,7 +358,9 @@ fn print_pkg_usage(program: &str) {
     println!("  {program} pkg sync [--registry <url>]");
     println!("  {program} pkg login [--token <token>]");
     println!("  {program} pkg logout");
-    println!("  {program} pkg publish [--manifest-path <path>] [--token <token>] [--registry <url>] [--readme <path>]");
+    println!(
+        "  {program} pkg publish [--manifest-path <path>] [--token <token>] [--registry <url>] [--readme <path>]"
+    );
 }
 
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
@@ -1309,12 +1313,12 @@ fn run_file(filename: &str, disassemble: bool) {
                                     if let LuaValue::String(name) = key
                                         && let Ok(converted) =
                                             lua_to_lust(val, &vm, result.state.clone())
-                                        {
-                                            vm.set_global(
-                                                format!("{}.{}", result.module, name),
-                                                converted,
-                                            );
-                                        }
+                                    {
+                                        vm.set_global(
+                                            format!("{}.{}", result.module, name),
+                                            converted,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1341,7 +1345,8 @@ fn run_file(filename: &str, disassemble: bool) {
                 // export a single value (usually a table).
                 let module_value = match val {
                     lust::bytecode::Value::Array(arr) => arr
-                        .borrow().first()
+                        .borrow()
+                        .first()
                         .cloned()
                         .unwrap_or(lust::bytecode::Value::Nil),
                     other => other,
@@ -1448,9 +1453,9 @@ fn compile_program(
                             if entry.path().extension().and_then(|e| e.to_str()) == Some("lust")
                                 && let Some(stem) =
                                     entry.path().file_stem().and_then(|s| s.to_str())
-                                {
-                                    prefixes.insert(stem.to_string());
-                                }
+                            {
+                                prefixes.insert(stem.to_string());
+                            }
                         }
                         _ => {}
                     }
@@ -1504,15 +1509,16 @@ fn compile_program(
     let mut init_funcs: Vec<(String, String)> = Vec::new();
     for m in &program.modules {
         if m.path != program.entry_module
-            && let Some(init) = &m.init_function {
-                let init_name = m
-                    .imports
-                    .function_aliases
-                    .get(init)
-                    .cloned()
-                    .unwrap_or_else(|| init.clone());
-                init_funcs.push((m.path.clone(), init_name));
-            }
+            && let Some(init) = &m.init_function
+        {
+            let init_name = m
+                .imports
+                .function_aliases
+                .get(init)
+                .cloned()
+                .unwrap_or_else(|| init.clone());
+            init_funcs.push((m.path.clone(), init_name));
+        }
     }
 
     Ok((functions, trait_impls, init_funcs, struct_defs))
@@ -1637,13 +1643,14 @@ fn print_source_snippet(source: &str, filename: &str, line: usize, column: Optio
 
     eprintln!(" {} | {}", line, code_line);
     if let Some(col) = column
-        && col > 0 {
-            let mut marker = String::new();
-            marker.push(' ');
-            marker.push_str(&" ".repeat(line.to_string().len()));
-            marker.push_str(" | ");
-            marker.push_str(&" ".repeat(col.saturating_sub(1)));
-            marker.push('^');
-            eprintln!("{}", marker);
-        }
+        && col > 0
+    {
+        let mut marker = String::new();
+        marker.push(' ');
+        marker.push_str(&" ".repeat(line.to_string().len()));
+        marker.push_str(" | ");
+        marker.push_str(&" ".repeat(col.saturating_sub(1)));
+        marker.push('^');
+        eprintln!("{}", marker);
+    }
 }

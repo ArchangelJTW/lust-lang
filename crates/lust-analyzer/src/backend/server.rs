@@ -1,6 +1,6 @@
 use crate::analysis::{
     choose_definition, find_type_for_position, hover_from_definition, location_from_definition,
-    AnalysisSnapshot,
+    AnalysisSnapshot, ImportedSymbolRef,
 };
 use crate::diagnostics::error_to_diagnostics;
 use crate::semantic_tokens::SEMANTIC_TOKEN_TYPES;
@@ -45,7 +45,7 @@ use super::completions::{
     struct_field_completions, CompletionKind,
 };
 use super::highlights::document_highlights;
-use super::hover::hover_for_method_call;
+use super::hover::{hover_for_function, hover_for_method_call};
 use super::inlay_hints::collect_inlay_hints_for_module;
 use super::references::find_references;
 use super::rename::{prepare_rename, rename_symbol};
@@ -703,7 +703,7 @@ impl LanguageServer for Backend {
         let word = text
             .as_ref()
             .and_then(|source| extract_word_at_position(source, position));
-        let (method_hover, def_opt, type_opt) = {
+        let (method_hover, def_opt, type_opt, imported_hover) = {
             let analysis = self.analysis.read().await;
             let Some(snapshot) = analysis.as_ref() else {
                 return Ok(None);
@@ -779,10 +779,46 @@ impl LanguageServer for Backend {
             } else {
                 None
             };
-            (method_hover, def_clone, type_opt)
+            let imported_hover = if let (Some(module), Some(word)) =
+                (module, word.as_deref())
+            {
+                snapshot
+                    .resolve_imported_symbol(module, word)
+                    .map(|symbol| match symbol {
+                        ImportedSymbolRef::Function(info) => hover_for_function(info),
+                        ImportedSymbolRef::Type(def) => hover_from_definition(def),
+                    })
+            } else {
+                None
+            };
+            (method_hover, def_clone, type_opt, imported_hover)
         };
         if let Some(hover) = method_hover {
             return Ok(Some(hover));
+        }
+
+        if let Some(hover) = imported_hover {
+            return Ok(Some(hover));
+        }
+
+        if let Some(word) = word.as_deref() {
+            let function_hover = {
+                let analysis = self.analysis.read().await;
+                analysis
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        let module_path = snapshot
+                            .module_path_for_file(&file_path)
+                            .map(|s| s.to_string());
+                        snapshot
+                            .function_info_for(word, module_path.as_deref())
+                            .map(|info| (info, snapshot.module_for_file(&file_path).is_some()))
+                    })
+                    .map(|(info, _)| hover_for_function(info))
+            };
+            if function_hover.is_some() {
+                return Ok(function_hover);
+            }
         }
 
         if let Some(def) = def_opt {

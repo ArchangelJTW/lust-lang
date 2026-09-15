@@ -263,12 +263,13 @@ impl Compiler {
             .clone()
             .or_else(|| self.entry_module.clone());
         if let Some(module) = module_name
-            && !name.contains('.') {
-                let qualified = format!("{}.{}", module, name);
-                self.extern_value_aliases
-                    .entry(qualified)
-                    .or_insert(runtime_name);
-            }
+            && !name.contains('.')
+        {
+            let qualified = format!("{}.{}", module, name);
+            self.extern_value_aliases
+                .entry(qualified)
+                .or_insert(runtime_name);
+        }
     }
 
     pub(super) fn describe_expr_kind(kind: &ExprKind) -> &'static str {
@@ -411,13 +412,14 @@ impl Compiler {
         if let Some((head, tail)) = name.split_once('.') {
             if let Some(module) = self.module_context_name()
                 && let Some(imports) = self.imports_by_module.get(module)
-                    && let Some(real_module) = imports.module_aliases.get(head) {
-                        if tail.is_empty() {
-                            return real_module.clone();
-                        } else {
-                            return format!("{}.{}", real_module, tail);
-                        }
-                    }
+                && let Some(real_module) = imports.module_aliases.get(head)
+            {
+                if tail.is_empty() {
+                    return real_module.clone();
+                } else {
+                    return format!("{}.{}", real_module, tail);
+                }
+            }
 
             return name.to_string();
         }
@@ -428,9 +430,10 @@ impl Compiler {
 
         if let Some(module) = self.module_context_name() {
             if let Some(imports) = self.imports_by_module.get(module)
-                && let Some(fq) = imports.type_aliases.get(name) {
-                    return fq.clone();
-                }
+                && let Some(fq) = imports.type_aliases.get(name)
+            {
+                return fq.clone();
+            }
 
             return format!("{}.{}", module, name);
         }
@@ -448,7 +451,7 @@ impl Default for Compiler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{intern::Interner, Lexer, Parser, TypeChecker, VM};
+    use crate::{Lexer, Parser, TypeChecker, VM, intern::Interner};
 
     fn compile_typed(source: &str, low_memory: bool) -> Vec<Function> {
         let mut interner = Interner::new();
@@ -501,39 +504,61 @@ end
                     .chunk
                     .instructions
             };
-            assert!(ops("integer")
-                .iter()
-                .any(|op| matches!(op, Instruction::AddInt(d, l, _) if d == l)));
-            assert!(ops("integer")
-                .iter()
-                .any(|op| matches!(op, Instruction::LtInt(..))));
-            assert!(ops("integer")
-                .iter()
-                .any(|op| matches!(op, Instruction::MulInt(..))));
-            assert!(!ops("integer")
-                .iter()
-                .any(|op| matches!(op, Instruction::Add(..))));
-            assert!(ops("floating")
-                .iter()
-                .any(|op| matches!(op, Instruction::AddFloat(..))));
-            assert!(ops("floating")
-                .iter()
-                .any(|op| matches!(op, Instruction::NegFloat(..))));
-            assert!(ops("floating")
-                .iter()
-                .any(|op| matches!(op, Instruction::MulFloat(..))));
-            assert!(ops("mixed")
-                .iter()
-                .any(|op| matches!(op, Instruction::AddInt(..))));
-            assert!(ops("mixed")
-                .iter()
-                .any(|op| matches!(op, Instruction::Add(..))));
-            assert!(ops("dynamic")
-                .iter()
-                .any(|op| matches!(op, Instruction::Add(..))));
-            assert!(ops("generic")
-                .iter()
-                .any(|op| matches!(op, Instruction::Eq(..))));
+            assert!(
+                ops("integer")
+                    .iter()
+                    .any(|op| matches!(op, Instruction::AddInt(d, l, _) if d == l))
+            );
+            assert!(
+                ops("integer")
+                    .iter()
+                    .any(|op| matches!(op, Instruction::LtInt(..)))
+            );
+            assert!(
+                ops("integer")
+                    .iter()
+                    .any(|op| matches!(op, Instruction::MulInt(..)))
+            );
+            assert!(
+                !ops("integer")
+                    .iter()
+                    .any(|op| matches!(op, Instruction::Add(..)))
+            );
+            assert!(
+                ops("floating")
+                    .iter()
+                    .any(|op| matches!(op, Instruction::AddFloat(..)))
+            );
+            assert!(
+                ops("floating")
+                    .iter()
+                    .any(|op| matches!(op, Instruction::NegFloat(..)))
+            );
+            assert!(
+                ops("floating")
+                    .iter()
+                    .any(|op| matches!(op, Instruction::MulFloat(..)))
+            );
+            assert!(
+                ops("mixed")
+                    .iter()
+                    .any(|op| matches!(op, Instruction::AddInt(..)))
+            );
+            assert!(
+                ops("mixed")
+                    .iter()
+                    .any(|op| matches!(op, Instruction::Add(..)))
+            );
+            assert!(
+                ops("dynamic")
+                    .iter()
+                    .any(|op| matches!(op, Instruction::Add(..)))
+            );
+            assert!(
+                ops("generic")
+                    .iter()
+                    .any(|op| matches!(op, Instruction::Eq(..)))
+            );
 
             let mut vm = VM::new();
             vm.load_functions(functions);

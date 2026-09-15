@@ -368,8 +368,7 @@ pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '.'
 }
 
-pub(crate) fn extract_word_at_position(text: &str, position: Position) -> Option<String> {
-    let line_idx = position.line as usize;
+pub(crate) fn extract_word_at_position(text: &str, position: Position) -> Option<String> {    let line_idx = position.line as usize;
     let line = text.lines().nth(line_idx)?;
     let chars: Vec<char> = line.chars().collect();
     if chars.is_empty() {
@@ -598,4 +597,19 @@ pub(crate) fn analyzer_lust_config() -> LustConfig {
     config.enable_module("io");
     config.enable_module("os");
     config
+}
+
+pub(crate) const HOVER_DIVIDER: &str = "────────────────────────────────────────";
+
+pub(crate) fn build_hover_body(metadata: Vec<String>, code: &str, doc: Option<&str>) -> String {
+    let mut parts: Vec<String> = metadata.into_iter().filter(|line| !line.is_empty()).collect();
+    if !parts.is_empty() {
+        parts.push(HOVER_DIVIDER.to_string());
+    }
+    parts.push(format!("```lust\n{code}\n```"));
+    if let Some(doc) = doc.map(str::trim).filter(|doc| !doc.is_empty()) {
+        parts.push(HOVER_DIVIDER.to_string());
+        parts.push(doc.to_string());
+    }
+    parts.join("\n\n")
 }

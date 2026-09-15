@@ -1,6 +1,6 @@
 use super::{
-    manifest::{ManifestError, ManifestKind, PackageManifest},
     PackageManager,
+    manifest::{ManifestError, ManifestKind, PackageManifest},
 };
 use crate::config::{DependencyKind, LustConfig};
 use object::{File, Object, ObjectSymbol};
@@ -109,9 +109,7 @@ pub enum DependencyResolutionError {
         #[source]
         source: object::read::Error,
     },
-    #[error(
-        "dependency '{name}' at {path} is a shared library but its kind could not be detected"
-    )]
+    #[error("dependency '{name}' at {path} is a shared library but its kind could not be detected")]
     UnknownLibraryKind { name: String, path: PathBuf },
 }
 
@@ -328,9 +326,10 @@ fn collect_lua_files_recursive(base: &Path, current: &Path, files: &mut Vec<Path
             if path.is_dir() {
                 collect_lua_files_recursive(base, &path, files);
             } else if path.extension().and_then(|s| s.to_str()) == Some("lua")
-                && let Ok(relative) = path.strip_prefix(base) {
-                    files.push(relative.to_path_buf());
-                }
+                && let Ok(relative) = path.strip_prefix(base)
+            {
+                files.push(relative.to_path_buf());
+            }
         }
     }
 }

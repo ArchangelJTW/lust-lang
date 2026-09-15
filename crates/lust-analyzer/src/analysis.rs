@@ -6,8 +6,8 @@ use crate::utils::{
 };
 use hashbrown::{HashMap, HashSet};
 use lust::ast::{
-    EnumDef, Expr, ExprKind, FunctionDef, FunctionParam, Item, ItemKind, Pattern, Stmt, StmtKind,
-    StructDef, TraitDef, Type, TypeKind, UseTree, Visibility,
+    EnumDef, Expr, ExprKind, ExternItem, FunctionDef, FunctionParam, Item, ItemKind, Pattern, Stmt,
+    StmtKind, StructDef, TraitDef, Type, TypeKind, UseTree, Visibility,
 };
 use lust::modules::{LoadedModule, ModuleImports, Program};
 use lust::{Span, TypeCollection};
@@ -193,6 +193,7 @@ pub(crate) struct TypeDefinition {
     pub(crate) file_path: PathBuf,
     pub(crate) layout: String,
     pub(crate) kind: TypeDefinitionKind,
+    pub(crate) doc: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -245,6 +246,13 @@ pub(crate) struct FunctionInfo {
     pub(crate) def: FunctionDef,
     pub(crate) span: Span,
     pub(crate) file_path: PathBuf,
+    pub(crate) is_extern: bool,
+    pub(crate) extern_abi: Option<String>,
+}
+
+pub(crate) enum ImportedSymbolRef<'a> {
+    Function(&'a FunctionInfo),
+    Type(&'a TypeDefinition),
 }
 
 #[derive(Clone)]
@@ -258,6 +266,7 @@ pub(crate) struct MethodInfo {
     pub(crate) visibility: Visibility,
     pub(crate) span: Span,
     pub(crate) file_path: PathBuf,
+    pub(crate) doc: Option<String>,
 }
 
 pub(crate) struct AnalysisSnapshot {
@@ -396,6 +405,7 @@ impl AnalysisSnapshot {
                                     visibility: method.visibility,
                                     span: item.span,
                                     file_path: file_path.clone(),
+                                    doc: method.doc.clone(),
                                 };
                                 methods_by_type
                                     .entry(qualified_type.clone())
@@ -446,6 +456,7 @@ impl AnalysisSnapshot {
                                 visibility: func.visibility,
                                 span: item.span,
                                 file_path: file_path.clone(),
+                                doc: func.doc.clone(),
                             };
                             methods_by_type
                                 .entry(qualified_type.clone())
@@ -461,12 +472,99 @@ impl AnalysisSnapshot {
                                 def: func.clone(),
                                 span: item.span,
                                 file_path: file_path.clone(),
+                                is_extern: false,
+                                extern_abi: None,
                             };
                             functions_by_simple
                                 .entry(simple_name)
                                 .or_default()
                                 .push(qualified_name.clone());
                             functions_by_qualified.insert(qualified_name, info);
+                        }
+                    }
+
+                    ItemKind::Extern { abi, items: extern_items } => {
+                        for extern_item in extern_items {
+                            let ExternItem::Function {
+                                name,
+                                params,
+                                return_type,
+                                doc,
+                            } = extern_item
+                            else {
+                                continue;
+                            };
+
+                            let unadorned = name
+                                .strip_prefix(&format!("{module_path}."))
+                                .unwrap_or(name);
+                            let Some((type_part, method_part)) = unadorned.rsplit_once(':') else {
+                                let simple_name = simple_type_name(unadorned).to_string();
+                                let qualified_name =
+                                    qualify_type_name(&module_path, &simple_name);
+                                let def = FunctionDef {
+                                    name: qualified_name.clone(),
+                                    type_params: Vec::new(),
+                                    trait_bounds: Vec::new(),
+                                    params: params
+                                        .iter()
+                                        .map(|ty| FunctionParam {
+                                            name: String::new(),
+                                            ty: ty.clone(),
+                                            is_self: false,
+                                        })
+                                        .collect(),
+                                    return_type: return_type.clone(),
+                                    body: Vec::new(),
+                                    is_method: false,
+                                    visibility: Visibility::Public,
+                                    doc: doc.clone(),
+                                };
+                                let info = FunctionInfo {
+                                    module_path: module_path.clone(),
+                                    name: simple_name.clone(),
+                                    def,
+                                    span: item.span,
+                                    file_path: file_path.clone(),
+                                    is_extern: true,
+                                    extern_abi: Some(abi.clone()),
+                                };
+                                functions_by_simple
+                                    .entry(simple_name)
+                                    .or_default()
+                                    .push(qualified_name.clone());
+                                functions_by_qualified.insert(qualified_name, info);
+                                continue;
+                            };
+
+                            let qualified_type =
+                                qualify_type_name(&module_path, type_part);
+                            let simple_owner = simple_type_name(&qualified_type).to_string();
+                            let method_name = method_part.to_string();
+                            let info = MethodInfo {
+                                owner: qualified_type.clone(),
+                                module_path: module_path.clone(),
+                                name: method_name,
+                                is_instance: true,
+                                params: params
+                                    .iter()
+                                    .map(|ty| FunctionParam {
+                                        name: String::new(),
+                                        ty: ty.clone(),
+                                        is_self: false,
+                                    })
+                                    .collect(),
+                                return_type: return_type.clone(),
+                                visibility: Visibility::Public,
+                                span: item.span,
+                                file_path: file_path.clone(),
+                                doc: doc.clone(),
+                            };
+                            methods_by_type
+                                .entry(qualified_type.clone())
+                                .or_default()
+                                .push(info.clone());
+                            methods_by_type.entry(simple_owner).or_default().push(info);
                         }
                     }
 
@@ -784,8 +882,7 @@ impl AnalysisSnapshot {
         &self,
         func_name: &str,
         module_path: Option<&str>,
-    ) -> Option<&FunctionInfo> {
-        if let Some(info) = self.functions_by_qualified.get(func_name) {
+    ) -> Option<&FunctionInfo> {        if let Some(info) = self.functions_by_qualified.get(func_name) {
             return Some(info);
         }
         let simple = simple_type_name(func_name);
@@ -806,6 +903,55 @@ impl AnalysisSnapshot {
                 }
             }
         }
+        None
+    }
+
+    pub(crate) fn resolve_imported_symbol<'a>(
+        &'a self,
+        module: &ModuleSnapshot,
+        dotted: &str,
+    ) -> Option<ImportedSymbolRef<'a>> {
+        if dotted.is_empty() {
+            return None;
+        }
+        let imports = &module.module.imports;
+
+        // Module-qualified reference such as `vector.IntVector` or `math.add`
+        // where the head is a module alias.
+        if let Some((head, tail)) = dotted.split_once('.') {
+            if let Some(real_module) = imports.module_aliases.get(head) {
+                let qualified = format!("{}.{}", real_module, tail);
+                if let Some(info) = self.functions_by_qualified.get(&qualified) {
+                    return Some(ImportedSymbolRef::Function(info));
+                }
+                if let Some(def) = self.type_index.lookup_qualified(&qualified) {
+                    return Some(ImportedSymbolRef::Type(def));
+                }
+            }
+        }
+
+        if !dotted.contains('.') {
+            // Import alias such as `use vector.make as make_vector`.
+            if let Some(qualified) = imports.function_aliases.get(dotted) {
+                if let Some(info) = self.functions_by_qualified.get(qualified) {
+                    return Some(ImportedSymbolRef::Function(info));
+                }
+            }
+            if let Some(qualified) = imports.type_aliases.get(dotted) {
+                if let Some(def) = self.type_index.lookup_qualified(qualified) {
+                    return Some(ImportedSymbolRef::Type(def));
+                }
+            }
+        } else {
+            // Fully-qualified literal such as `lib.math.add`.
+            if let Some(info) = self.functions_by_qualified.get(dotted) {
+                return Some(ImportedSymbolRef::Function(info));
+            }
+            if let Some(def) = self.type_index.lookup_qualified(dotted) {
+                return Some(ImportedSymbolRef::Type(def));
+            }
+        }
+
         None
     }
 
@@ -2182,6 +2328,7 @@ impl TypeDefinition {
             file_path: file_path.to_path_buf(),
             layout: format_struct_layout(&simple_name, def),
             kind: TypeDefinitionKind::Struct,
+            doc: def.doc.clone(),
         }
     }
 
@@ -2196,6 +2343,7 @@ impl TypeDefinition {
             file_path: file_path.to_path_buf(),
             layout: format_enum_layout(&simple_name, def),
             kind: TypeDefinitionKind::Enum,
+            doc: def.doc.clone(),
         }
     }
 
@@ -2210,6 +2358,7 @@ impl TypeDefinition {
             file_path: file_path.to_path_buf(),
             layout: format_trait_layout(&simple_name, def),
             kind: TypeDefinitionKind::Trait,
+            doc: def.doc.clone(),
         }
     }
 
@@ -2223,6 +2372,7 @@ impl TypeDefinition {
             file_path: PathBuf::new(),
             layout: format_struct_layout(&simple_name, def),
             kind: TypeDefinitionKind::Struct,
+            doc: def.doc.clone(),
         }
     }
 
@@ -2236,6 +2386,7 @@ impl TypeDefinition {
             file_path: PathBuf::new(),
             layout: format_enum_layout(&simple_name, def),
             kind: TypeDefinitionKind::Enum,
+            doc: def.doc.clone(),
         }
     }
 }
@@ -2403,10 +2554,11 @@ pub(crate) fn find_type_in_map(
 
 pub(crate) fn hover_from_definition(def: &TypeDefinition) -> Hover {
     let layout = def.layout.trim_end().to_string();
-    let mut body = format!("```lust\n{layout}\n```");
+    let mut metadata = Vec::new();
     if def.qualified_name != def.name {
-        body.push_str(&format!("\n`{}`", def.qualified_name));
+        metadata.push(format!("`{}`", def.qualified_name));
     }
+    let body = crate::utils::build_hover_body(metadata, &layout, def.doc.as_deref());
 
     Hover {
         contents: HoverContents::Markup(MarkupContent {

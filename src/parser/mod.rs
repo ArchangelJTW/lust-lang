@@ -16,11 +16,18 @@ use alloc::{
 pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
+    /// Doc comments collected from the current position, waiting to be
+    /// attached to the next declaration.
+    pending_docs: Vec<String>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, current: 0 }
+        Self {
+            tokens,
+            current: 0,
+            pending_docs: Vec::new(),
+        }
     }
 
     /// Create a parser from a lexer using streaming tokenization.
@@ -57,7 +64,11 @@ impl Parser {
         // Shrink to actual size to save memory
         tokens.shrink_to_fit();
 
-        Ok(Self { tokens, current: 0 })
+        Ok(Self {
+            tokens,
+            current: 0,
+            pending_docs: Vec::new(),
+        })
     }
 
     /// Returns the number of tokens (for debugging)
@@ -77,6 +88,7 @@ impl Parser {
         );
 
         while !self.is_at_end() {
+            self.collect_pending_docs();
             if self.is_item_start() {
                 items.push(self.parse_item()?);
             } else {
@@ -85,6 +97,11 @@ impl Parser {
 
                 let mut stmts = Vec::new();
                 while !self.is_at_end() && !self.is_item_start() {
+                    self.collect_pending_docs();
+                    if self.is_item_start() {
+                        break; // collected docs belong to the next item
+                    }
+                    self.pending_docs.clear(); // docs on plain statements are dropped
                     stmts.push(self.parse_stmt()?);
                 }
 
@@ -135,6 +152,27 @@ impl Parser {
 
     fn current_token(&self) -> &Token {
         &self.tokens[self.current]
+    }
+
+    /// Consumes any doc comment tokens at the current position, collecting
+    /// their text for the next declaration.
+    pub(super) fn collect_pending_docs(&mut self) {
+        while self.check(TokenKind::DocComment) {
+            let lexeme = self.current_token().lexeme.clone();
+            self.advance();
+            self.pending_docs.push(lexeme);
+        }
+    }
+
+    /// Returns the collected doc comments (joined with newlines) and resets
+    /// the pending buffer.
+    pub(super) fn take_pending_docs(&mut self) -> Option<String> {
+        if self.pending_docs.is_empty() {
+            return None;
+        }
+        let doc = self.pending_docs.join("\n");
+        self.pending_docs.clear();
+        Some(doc)
     }
 
     fn peek_kind(&self) -> TokenKind {
@@ -249,5 +287,152 @@ impl Parser {
 
             self.advance();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::ExternItem;
+    use crate::intern::Interner;
+    use crate::lexer::Lexer;
+
+    fn parse_source(source: &str) -> Vec<Item> {
+        let mut interner = Interner::new();
+        let mut lexer = Lexer::new(source, &mut interner);
+        let tokens = lexer.tokenize().expect("tokenize");
+        Parser::new(tokens)
+            .parse()
+            .expect("parse")
+    }
+
+    #[test]
+    fn doc_comments_attach_to_declarations() {
+        let items = parse_source(
+            "--- Adds one.\nfunction add_one(x: int): int\n    return x + 1\nend\n",
+        );
+        assert_eq!(items.len(), 1);
+        match &items[0].kind {
+            ItemKind::Function(func) => {
+                assert_eq!(func.doc.as_deref(), Some("Adds one."));
+            }
+            other => panic!("expected function item, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multiple_doc_lines_join() {
+        let items = parse_source(
+            "--- Line one.\n--- Line two.\nstruct Widget\n    x: int\nend\n",
+        );
+        match &items[0].kind {
+            ItemKind::Struct(def) => {
+                assert_eq!(def.doc.as_deref(), Some("Line one.\nLine two."));
+            }
+            other => panic!("expected struct item, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn four_dashes_is_a_regular_comment() {
+        let items = parse_source(
+            "---- not a doc\nfunction add_one(x: int): int\n    return x + 1\nend\n",
+        );
+        match &items[0].kind {
+            ItemKind::Function(func) => assert!(func.doc.is_none()),
+            other => panic!("expected function item, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn three_dashes_without_space_is_a_regular_comment() {
+        let items = parse_source(
+            "---not a doc\nfunction add_one(x: int): int\n    return x + 1\nend\n",
+        );
+        match &items[0].kind {
+            ItemKind::Function(func) => assert!(func.doc.is_none()),
+            other => panic!("expected function item, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn double_dash_is_a_regular_comment() {
+        let items = parse_source(
+            "-- not a doc\nfunction add_one(x: int): int\n    return x + 1\nend\n",
+        );
+        match &items[0].kind {
+            ItemKind::Function(func) => assert!(func.doc.is_none()),
+            other => panic!("expected function item, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn doc_comments_attach_to_impl_methods() {
+        let items = parse_source(
+            "struct Point\n    x: int\nend\nimpl Point\n    --- Constructs a point.\n    function new(x: int): Point\n        return Point { x = x }\n    end\nend\n",
+        );
+        let mut method_doc = None;
+        for item in &items {
+            if let ItemKind::Impl(impl_block) = &item.kind {
+                method_doc = impl_block.methods[0].doc.clone();
+            }
+        }
+        assert_eq!(method_doc.as_deref(), Some("Constructs a point."));
+    }
+
+    #[test]
+    fn doc_comments_attach_to_extern_functions() {
+        let items = parse_source(
+            "extern\n    --- Host callback.\n    function on_event(int)\nend\n",
+        );
+        match &items[0].kind {
+            ItemKind::Extern { items: extern_items, .. } => match &extern_items[0] {
+                ExternItem::Function { doc, .. } => {
+                    assert_eq!(doc.as_deref(), Some("Host callback."));
+                }
+                other => panic!("expected extern function, got {:?}", other),
+            },
+            other => panic!("expected extern item, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn doc_comment_before_extern_block_attaches_to_first_item() {
+        let items = parse_source(
+            "--- Host callback.\nextern\n    function on_event(int)\n    function other(int)\nend\n",
+        );
+        match &items[0].kind {
+            ItemKind::Extern { items: extern_items, .. } => {
+                match &extern_items[0] {
+                    ExternItem::Function { doc, .. } => {
+                        assert_eq!(doc.as_deref(), Some("Host callback."));
+                    }
+                    other => panic!("expected extern function, got {:?}", other),
+                }
+                match &extern_items[1] {
+                    ExternItem::Function { doc, .. } => {
+                        assert!(doc.is_none(), "second extern item should not inherit doc");
+                    }
+                    other => panic!("expected extern function, got {:?}", other),
+                }
+            }
+            other => panic!("expected extern item, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn doc_comments_do_not_leak_between_declarations() {
+        let items = parse_source(
+            "--- Doc for first.\nfunction first(): int\n    return 1\nend\nfunction second(): int\n    return 2\nend\n",
+        );
+        let docs: Vec<Option<String>> = items
+            .iter()
+            .map(|item| match &item.kind {
+                ItemKind::Function(func) => func.doc.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(docs[0].as_deref(), Some("Doc for first."));
+        assert!(docs[1].is_none());
     }
 }

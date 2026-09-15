@@ -2,7 +2,10 @@ use super::*;
 use crate::backend::completions::{
     builtin_global_completions, builtin_instance_method_completions,
 };
-use crate::analysis::{find_type_for_position, AnalysisSnapshot, ModuleSnapshot};
+use crate::analysis::{
+    find_type_for_position, hover_from_definition, AnalysisSnapshot, ImportedSymbolRef,
+    ModuleSnapshot,
+};
 use crate::utils::{
     analyzer_lust_config, base_type_name, compute_line_offsets, offset_to_position,
     position_to_offset, span_from_identifier,
@@ -14,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tower_lsp::lsp_types::{HoverContents, Position};
+use tower_lsp::lsp_types::{Hover, HoverContents, Position};
 use url::Url;
 struct TempDir {
     path: PathBuf,
@@ -1175,6 +1178,320 @@ local moved = point:translate(1, 1)
 }
 
 #[test]
+fn hover_shows_imported_function_info() {
+    let tmp = TempDir::new();
+    let main_source = r#"
+use helper.{greet, double}
+use dep.{host_double, Factor}
+
+local message = greet("world")
+local n = double(21)
+local h = host_double(4)
+local f = Factor { base = 1, multiplier = 2 }
+local applied = f:apply(3)
+
+extern
+    --- Prints a line via the host.
+    function print_line(string): int
+end
+
+local logged = print_line("hi")
+"#;
+    let helper_source = r#"
+--- Greets someone.
+function greet(name: string): string
+    return "hello " .. name
+end
+
+--- Doubles a number.
+function double(x: int): int
+    return x * 2
+end
+"#;
+    let dep_source = r#"
+extern
+    --- Doubles the input on the host.
+    function host_double(int): int
+end
+
+--- A scaling factor.
+struct Factor
+    base: int
+    multiplier: int
+end
+
+extern
+    function Factor:apply(Factor, int): Factor
+end
+"#;
+    let main_source = main_source.trim_start().to_string();
+    let helper_source = helper_source.trim_start().to_string();
+    let dep_source = dep_source.trim_start().to_string();
+    let entry_path = tmp.path().join("main.lust");
+    let helper_path = tmp.path().join("helper.lust");
+    let dep_path = tmp.path().join("dep.lust");
+    fs::write(&entry_path, &main_source).expect("write source");
+    fs::write(&helper_path, &helper_source).expect("write helper");
+    fs::write(&dep_path, &dep_source).expect("write dep");
+    let mut loader = ModuleLoader::new(tmp.path());
+    let program = loader
+        .load_program_from_entry(entry_path.to_str().expect("utf8 path"))
+        .expect("program");
+    assert!(
+        program.modules.len() >= 3,
+        "expected helper and dep modules in program, got: {:?}",
+        program.modules.iter().map(|m| m.path.as_str()).collect::<Vec<_>>()
+    );
+    let mut imports_map = HashMap::new();
+    for module in &program.modules {
+        imports_map.insert(module.path.clone(), module.imports.clone());
+    }
+
+    let mut typechecker = new_typechecker();
+    typechecker.set_imports_by_module(imports_map);
+    typechecker
+        .check_program(&program.modules)
+        .expect("typecheck");
+    let struct_defs = typechecker.struct_definitions();
+    let enum_defs = typechecker.enum_definitions();
+    let type_info = typechecker.take_type_info();
+    let snapshot =
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
+    let module_path = snapshot
+        .module_path_for_file(&entry_path)
+        .expect("module path")
+        .to_string();
+    let line_offsets = compute_line_offsets(&main_source);
+
+    let hover_contains = |hover: &Hover, needle: &str| {
+        match &hover.contents {
+            HoverContents::Markup(content) => {
+                assert!(
+                    content.value.contains(needle),
+                    "hover content: {}",
+                    content.value
+                );
+            }
+            _ => panic!("unexpected hover contents"),
+        }
+    };
+
+    // Imported functions from a regular module resolve and render.
+    for (func_name, call_site) in [("greet", "greet(\"world\")"), ("double", "double(21)")] {
+        let call_offset = main_source
+            .find(call_site)
+            .unwrap_or_else(|| panic!("find {}", call_site));
+        let position = offset_to_position(&main_source, call_offset, &line_offsets);
+        let hover = hover_for_function(
+            snapshot
+                .function_info_for(func_name, Some(module_path.as_str()))
+                .unwrap_or_else(|| panic!("function info for {}", func_name)),
+        );
+        hover_contains(&hover, &format!("function {}", func_name));
+        let _ = position;
+    }
+
+    // Imported extern functions from a dependency-style module render with
+    // their extern signature and doc comment.
+    let host_offset = main_source
+        .find("host_double(4)")
+        .expect("find host_double call");
+    let _position = offset_to_position(&main_source, host_offset, &line_offsets);
+    let host_info = snapshot
+        .function_info_for("host_double", Some(module_path.as_str()))
+        .expect("extern function info");
+    assert!(host_info.is_extern, "host_double should be marked extern");
+    let host_hover = hover_for_function(host_info);
+    hover_contains(&host_hover, "extern function host_double(int): int");
+    hover_contains(&host_hover, "Doubles the input on the host.");
+    hover_contains(&host_hover, "Module `dep`");
+    let expected_body = concat!(
+        "Extern ABI `C`\n\nModule `dep`\n\n",
+        "────────────────────────────────────────\n\n",
+        "```lust\nextern function host_double(int): int\n```\n\n",
+        "────────────────────────────────────────\n\n",
+        "Doubles the input on the host."
+    );
+    match &host_hover.contents {
+        HoverContents::Markup(content) => {
+            assert_eq!(content.value, expected_body);
+        }
+        _ => panic!("unexpected hover contents"),
+    }
+
+    // Extern methods declared as `Type:method` in stubs resolve via method
+    // hover on instance calls.
+    let module = snapshot
+        .module_for_file(&entry_path)
+        .expect("module snapshot");
+    let apply_offset = main_source
+        .rfind(":apply")
+        .expect("find apply call")
+        + 1;
+    let apply_position = offset_to_position(&main_source, apply_offset, &line_offsets);
+    let apply_hover = hover_for_method_call(
+        &snapshot,
+        module,
+        Some(module_path.as_str()),
+        &main_source,
+        apply_position,
+        "apply",
+    )
+    .expect("extern method hover");
+    hover_contains(&apply_hover, "fn apply(Factor, int) -> Factor");
+
+    // In-file extern functions get hover with docs.
+    let logged_offset = main_source
+        .rfind("print_line(\"hi\")")
+        .expect("find print_line call");
+    let _position = offset_to_position(&main_source, logged_offset, &line_offsets);
+    let print_info = snapshot
+        .function_info_for("print_line", Some(module_path.as_str()))
+        .expect("in-file extern function info");
+    assert!(print_info.is_extern, "print_line should be marked extern");
+    let print_hover = hover_for_function(print_info);
+    hover_contains(&print_hover, "extern function print_line(string): int");
+    hover_contains(&print_hover, "Prints a line via the host.");
+}
+
+#[test]
+fn hover_shows_doc_comments() {
+    let tmp = TempDir::new();
+    let source = r#"
+--- A 2D point.
+struct Point
+    x: int
+    y: int
+end
+impl Point
+    --- Moves the point by the given delta.
+    function translate(self, dx: int, dy: int): Point
+        return Point { x = self.x + dx, y = self.y + dy }
+    end
+end
+--- Adds two numbers.
+function add(a: int, b: int): int
+    return a + b
+end
+local p = Point { x = 0, y = 0 }
+local moved = p:translate(1, 1)
+local sum = add(1, 2)
+"#;
+    let source = source.trim_start().to_string();
+    let entry_path = tmp.path().join("main.lust");
+    fs::write(&entry_path, &source).expect("write source");
+    let mut loader = ModuleLoader::new(tmp.path());
+    let program = loader
+        .load_program_from_entry(entry_path.to_str().expect("utf8 path"))
+        .expect("program");
+    let mut imports_map = HashMap::new();
+    for module in &program.modules {
+        imports_map.insert(module.path.clone(), module.imports.clone());
+    }
+
+    let mut typechecker = new_typechecker();
+    typechecker.set_imports_by_module(imports_map);
+    typechecker
+        .check_program(&program.modules)
+        .expect("typecheck");
+    let struct_defs = typechecker.struct_definitions();
+    let enum_defs = typechecker.enum_definitions();
+    let type_info = typechecker.take_type_info();
+    let snapshot =
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
+    let module_path = snapshot
+        .module_path_for_file(&entry_path)
+        .expect("module path")
+        .to_string();
+    let line_offsets = compute_line_offsets(&source);
+
+    // Method hover shows the doc comment.
+    let module = snapshot
+        .module_for_file(&entry_path)
+        .expect("module snapshot");
+    let call_offset = source
+        .rfind(":translate")
+        .expect("find method call")
+        + 1;
+    let position = offset_to_position(&source, call_offset, &line_offsets);
+    let method_hover = hover_for_method_call(
+        &snapshot,
+        module,
+        Some(module_path.as_str()),
+        &source,
+        position,
+        "translate",
+    )
+    .expect("method hover");
+    match &method_hover.contents {
+        HoverContents::Markup(content) => {
+            assert!(
+                content.value.contains("Moves the point by the given delta."),
+                "hover content: {}",
+                content.value
+            );
+        }
+        _ => panic!("unexpected hover contents"),
+    }
+
+    // Function hover shows the doc comment.
+    let add_offset = source
+        .rfind("add(1, 2)")
+        .expect("find function call");
+    let position = offset_to_position(&source, add_offset, &line_offsets);
+    let function_hover = hover_for_function(
+        snapshot.function_info_for("add", Some(module_path.as_str()))
+            .expect("function info"),
+    );
+    match &function_hover.contents {
+        HoverContents::Markup(content) => {
+            assert!(
+                content.value.contains("Adds two numbers."),
+                "hover content: {}",
+                content.value
+            );
+            assert!(
+                content.value.contains("function add(a: int, b: int)"),
+                "hover content: {}",
+                content.value
+            );
+        }
+        _ => panic!("unexpected hover contents"),
+    }
+
+    // Struct hover shows the doc comment.
+    let def = snapshot
+        .definitions_by_simple("Point")
+        .and_then(|defs| defs.first())
+        .expect("point definition");
+    let type_hover = hover_from_definition(def);
+    match &type_hover.contents {
+        HoverContents::Markup(content) => {
+            assert!(
+                content.value.contains("A 2D point."),
+                "hover content: {}",
+                content.value
+            );
+        }
+        _ => panic!("unexpected hover contents"),
+    }
+}
+
+#[test]
 fn module_path_completion_suggests_modules_and_exports() {
     let tmp = TempDir::new();
     let lib_dir = tmp.path().join("lib");
@@ -2262,3 +2579,145 @@ end
 }
 
 
+
+#[test]
+fn hover_resolves_module_aliases_and_import_aliases() {
+    let tmp = TempDir::new();
+    let main_source = r#"
+use lib.math as math
+use lib.math.{Point, vector}
+use lib.math.{add, vector.length_squared, vector.make as make_vector}
+
+function describe_vector(label: string, vec: vector.IntVector)
+    println(label)
+end
+
+local p: Point = Point { x = 10, y = 20 }
+local velocity: vector.IntVector = make_vector(3, 4)
+local energy: int = length_squared(velocity)
+local origin: vector.IntVector = vector.zero()
+"#;
+    let math_source = r#"
+struct Point
+    x: int
+    y: int
+end
+
+function add(a: int, b: int): int
+    return a + b
+end
+"#;
+    let vector_source = r#"
+struct IntVector
+    x: int
+    y: int
+end
+
+function make(x: int, y: int): IntVector
+    return IntVector { x = x, y = y }
+end
+
+function zero(): IntVector
+    return IntVector { x = 0, y = 0 }
+end
+
+function length_squared(vec: IntVector): int
+    return (vec.x * vec.x) + (vec.y * vec.y)
+end
+"#;
+    let main_source = main_source.trim_start().to_string();
+    let math_source = math_source.trim_start().to_string();
+    let vector_source = vector_source.trim_start().to_string();
+    let entry_path = tmp.path().join("main.lust");
+    let math_path = tmp.path().join("lib").join("math.lust");
+    let vector_path = tmp.path().join("lib").join("math").join("vector.lust");
+    fs::create_dir_all(vector_path.parent().unwrap()).expect("mkdir");
+    fs::write(&entry_path, &main_source).expect("write main");
+    fs::write(&math_path, &math_source).expect("write math");
+    fs::write(&vector_path, &vector_source).expect("write vector");
+    let mut loader = ModuleLoader::new(tmp.path());
+    let program = loader
+        .load_program_from_entry(entry_path.to_str().expect("utf8 path"))
+        .expect("program");
+    let mut imports_map = HashMap::new();
+    for module in &program.modules {
+        imports_map.insert(module.path.clone(), module.imports.clone());
+    }
+
+    let mut typechecker = new_typechecker();
+    typechecker.set_imports_by_module(imports_map);
+    typechecker
+        .check_program(&program.modules)
+        .expect("typecheck");
+    let struct_defs = typechecker.struct_definitions();
+    let enum_defs = typechecker.enum_definitions();
+    let type_info = typechecker.take_type_info();
+    let snapshot =
+        AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &HashMap::new(),
+            struct_defs,
+            enum_defs,
+            HashSet::new(),
+        );
+    let module = snapshot
+        .module_for_file(&entry_path)
+        .expect("module snapshot");
+
+    let resolved_name = |dotted: &str| -> String {
+        match snapshot.resolve_imported_symbol(module, dotted).expect(dotted) {
+            ImportedSymbolRef::Function(info) => info.def.name.clone(),
+            ImportedSymbolRef::Type(def) => def.qualified_name.clone(),
+        }
+    };
+
+    // Import alias: `use vector.make as make_vector`.
+    assert_eq!(resolved_name("make_vector"), "lib.math.vector.make");
+    // Module-qualified type: `vector.IntVector`.
+    assert_eq!(resolved_name("vector.IntVector"), "lib.math.vector.IntVector");
+    // Module-qualified function: `vector.zero`.
+    assert_eq!(resolved_name("vector.zero"), "lib.math.vector.zero");
+    // Module alias call: `math.add`.
+    assert_eq!(resolved_name("math.add"), "lib.math.add");
+    // Direct type import: `Point`.
+    assert_eq!(resolved_name("Point"), "lib.math.Point");
+    // Direct function import: `length_squared`.
+    assert_eq!(resolved_name("length_squared"), "lib.math.vector.length_squared");
+
+    // The resolved function renders a full hover.
+    match snapshot.resolve_imported_symbol(module, "make_vector").expect("make_vector") {
+        ImportedSymbolRef::Function(info) => {
+            let hover = hover_for_function(info);
+            match &hover.contents {
+                HoverContents::Markup(content) => {
+                    assert!(
+                        content.value.contains("function make(x: int, y: int): IntVector"),
+                        "hover content: {}",
+                        content.value
+                    );
+                }
+                _ => panic!("unexpected hover contents"),
+            }
+        }
+        ImportedSymbolRef::Type(_) => panic!("make_vector should resolve to a function"),
+    }
+
+    // The resolved type renders a full hover.
+    match snapshot.resolve_imported_symbol(module, "vector.IntVector").expect("IntVector") {
+        ImportedSymbolRef::Type(def) => {
+            let hover = hover_from_definition(def);
+            match &hover.contents {
+                HoverContents::Markup(content) => {
+                    assert!(
+                        content.value.contains("struct IntVector"),
+                        "hover content: {}",
+                        content.value
+                    );
+                }
+                _ => panic!("unexpected hover contents"),
+            }
+        }
+        ImportedSymbolRef::Function(_) => panic!("IntVector should resolve to a type"),
+    }
+}

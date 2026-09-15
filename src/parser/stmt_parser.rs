@@ -9,6 +9,9 @@ use alloc::{vec, vec::Vec};
 impl Parser {
     #[inline(never)]
     pub(super) fn parse_stmt(&mut self) -> Result<Stmt> {
+        while self.check(TokenKind::DocComment) {
+            self.advance();
+        }
         let start_token = self.current_token().clone();
 
         #[cfg(feature = "esp32c6-logging")]

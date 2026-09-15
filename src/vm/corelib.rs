@@ -1,9 +1,9 @@
-use super::task::{TaskInstance, TaskKind, TaskState};
 use super::VM;
+use super::task::{TaskInstance, TaskKind, TaskState};
+use crate::LustError;
 use crate::bytecode::value::IteratorState;
 use crate::bytecode::{NativeCallResult, Value, ValueKey};
 use crate::number::{LustFloat, LustInt};
-use crate::LustError;
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
@@ -49,48 +49,50 @@ pub(super) fn unwrap_lua_value(value: Value) -> Value {
         variant,
         values,
     } = &value
-        && enum_name == "LuaValue" {
-            return match variant.as_str() {
-                "Nil" => Value::Nil,
-                "Bool" => values
+        && enum_name == "LuaValue"
+    {
+        return match variant.as_str() {
+            "Nil" => Value::Nil,
+            "Bool" => values
+                .as_ref()
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or(Value::Bool(false)),
+            "Function" => {
+                #[cfg(feature = "std")]
+                let handle = values
                     .as_ref()
-                    .and_then(|v| v.first())
-                    .cloned()
-                    .unwrap_or(Value::Bool(false)),
-                "Function" => {
-                    #[cfg(feature = "std")]
-                    let handle = values
-                        .as_ref()
-                        .and_then(|vals| vals.first())
-                        .and_then(|v| v.struct_get_field("handle"))
-                        .and_then(|v| v.as_int())
-                        .map(|i| i as usize);
-                    #[cfg(feature = "std")]
-                    if let Some(handle) = handle {
-                        #[cfg(not(target_arch = "wasm32"))]
-                        if let Some(func) = crate::lua_compat::lookup_lust_function(handle) {
-                            return func;
-                        }
-                        if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() {
-                            eprintln!("[lua-socket] unwrap missing handle={}", handle);
-                        }
+                    .and_then(|vals| vals.first())
+                    .and_then(|v| v.struct_get_field("handle"))
+                    .and_then(|v| v.as_int())
+                    .map(|i| i as usize);
+                #[cfg(feature = "std")]
+                if let Some(handle) = handle {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(func) = crate::lua_compat::lookup_lust_function(handle) {
+                        return func;
                     }
-                    Value::Nil
+                    if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() {
+                        eprintln!("[lua-socket] unwrap missing handle={}", handle);
+                    }
                 }
-                "Int" | "Float" | "String" | "Table" | "Userdata" | "LightUserdata" => values
-                    .as_ref()
-                    .and_then(|v| v.first())
-                    .cloned()
-                    .unwrap_or(Value::Nil),
-                _ => value,
-            };
-        }
+                Value::Nil
+            }
+            "Int" | "Float" | "String" | "Table" | "Userdata" | "LightUserdata" => values
+                .as_ref()
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or(Value::Nil),
+            _ => value,
+        };
+    }
     value
 }
 
 fn create_error_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
-        let message = args.first()
+        let message = args
+            .first()
             .cloned()
             .map(unwrap_lua_value)
             .map(|v| format!("{}", v))
@@ -101,7 +103,8 @@ fn create_error_fn() -> Value {
 
 fn create_assert_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
-        let cond = args.first()
+        let cond = args
+            .first()
             .cloned()
             .map(unwrap_lua_value)
             .unwrap_or(Value::Bool(false));
@@ -128,7 +131,8 @@ fn parse_base_arg(arg: Option<Value>) -> Option<u32> {
 
 fn create_tonumber_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
-        let value = args.first()
+        let value = args
+            .first()
             .cloned()
             .map(unwrap_lua_value)
             .unwrap_or(Value::Nil);
@@ -470,31 +474,28 @@ fn create_lua_module(vm: &VM) -> Value {
                     let table = unwrap_lua_value(table);
                     if let Some(metamethods) = table.struct_get_field("metamethods")
                         && let Some(map) = metamethods.as_map()
-                            && let Some(meta) =
-                                map.get(&ValueKey::string(META_KEY.to_string())).cloned()
-                            {
-                                // Lua: if metatable has __metatable, return that instead.
-                                if let Value::Enum {
-                                    enum_name,
-                                    variant,
-                                    values,
-                                } = &meta
-                                    && enum_name == "LuaValue" && variant == "Table"
-                                        && let Some(inner) =
-                                            values.as_ref().and_then(|vals| vals.first())
-                                            && let Some(Value::Map(meta_map)) =
-                                                inner.struct_get_field("table")
-                                                && let Some(protect) = meta_map
-                                                    .borrow()
-                                                    .get(&ValueKey::string(
-                                                        "__metatable".to_string(),
-                                                    ))
-                                                    .cloned()
-                                                {
-                                                    return Ok(NativeCallResult::Return(protect));
-                                                }
-                                return Ok(NativeCallResult::Return(meta));
-                            }
+                        && let Some(meta) =
+                            map.get(&ValueKey::string(META_KEY.to_string())).cloned()
+                    {
+                        // Lua: if metatable has __metatable, return that instead.
+                        if let Value::Enum {
+                            enum_name,
+                            variant,
+                            values,
+                        } = &meta
+                            && enum_name == "LuaValue"
+                            && variant == "Table"
+                            && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
+                            && let Some(Value::Map(meta_map)) = inner.struct_get_field("table")
+                            && let Some(protect) = meta_map
+                                .borrow()
+                                .get(&ValueKey::string("__metatable".to_string()))
+                                .cloned()
+                        {
+                            return Ok(NativeCallResult::Return(protect));
+                        }
+                        return Ok(NativeCallResult::Return(meta));
+                    }
                     Ok(NativeCallResult::Return(Value::enum_unit(
                         "LuaValue", "Nil",
                     )))
@@ -971,19 +972,20 @@ fn create_lua_module(vm: &VM) -> Value {
                         for entry in entries.borrow().iter() {
                             // Each entry should be a 2-element tuple
                             if let Value::Tuple(fields) = entry
-                                && fields.len() >= 2 {
-                                    let key = fields[0].clone();
-                                    let value = fields[1].clone();
+                                && fields.len() >= 2
+                            {
+                                let key = fields[0].clone();
+                                let value = fields[1].clone();
 
-                                    // Key stays as-is (for map key), value gets wrapped in LuaValue
-                                    let lua_value = to_lua_value(vm, value)?;
+                                // Key stays as-is (for map key), value gets wrapped in LuaValue
+                                let lua_value = to_lua_value(vm, value)?;
 
-                                    // Insert into the map using the unwrapped key
-                                    if let Value::Map(map) = &table_map {
-                                        use crate::bytecode::ValueKey;
-                                        map.borrow_mut().insert(ValueKey::from(key), lua_value);
-                                    }
+                                // Insert into the map using the unwrapped key
+                                if let Value::Map(map) = &table_map {
+                                    use crate::bytecode::ValueKey;
+                                    map.borrow_mut().insert(ValueKey::from(key), lua_value);
                                 }
+                            }
                         }
                     }
 
@@ -1082,16 +1084,16 @@ fn lua_value_error_message(err: LustError) -> String {
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn resolve_callable_for_pcall(value: Value) -> Result<Value, String> {
     if let Value::Struct { name, .. } = &value
-        && name == "LuaFunction" {
-            let handle = value
-                .struct_get_field("handle")
-                .and_then(|v| v.as_int())
-                .map(|v| v as usize)
-                .ok_or_else(|| "LuaFunction missing handle".to_string())?;
-            return crate::lua_compat::lookup_lust_function(handle).ok_or_else(|| {
-                format!("LuaFunction handle {} was not registered with VM", handle)
-            });
-        }
+        && name == "LuaFunction"
+    {
+        let handle = value
+            .struct_get_field("handle")
+            .and_then(|v| v.as_int())
+            .map(|v| v as usize)
+            .ok_or_else(|| "LuaFunction missing handle".to_string())?;
+        return crate::lua_compat::lookup_lust_function(handle)
+            .ok_or_else(|| format!("LuaFunction handle {} was not registered with VM", handle));
+    }
     Ok(value)
 }
 

@@ -75,6 +75,23 @@ impl NativeExport {
         self.doc.as_deref()
     }
 }
+
+/// Formats a doc string as Lust doc comments (`--- text`), one `---` line per
+/// source line, indented by `indent`.
+pub(crate) fn format_doc_comment(doc: &str, indent: &str) -> String {
+    let mut out = String::new();
+    for line in doc.lines() {
+        out.push_str(indent);
+        out.push_str("---");
+        if !line.is_empty() {
+            out.push(' ');
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 impl VM {
     pub fn new() -> Self {
         Self::with_config(&LustConfig::default())
@@ -244,14 +261,15 @@ impl VM {
                 },
             );
             if let Some(simple) = name.rsplit('.').next()
-                && (simple != "IndexError" || name == "IndexError") {
-                    self.struct_metadata.insert(
-                        simple.to_string(),
-                        RuntimeStructInfo {
-                            layout: layout.clone(),
-                        },
-                    );
-                }
+                && (simple != "IndexError" || name == "IndexError")
+            {
+                self.struct_metadata.insert(
+                    simple.to_string(),
+                    RuntimeStructInfo {
+                        layout: layout.clone(),
+                    },
+                );
+            }
         }
     }
 
@@ -326,7 +344,7 @@ impl VM {
                 None => {
                     return Err(LustError::RuntimeError {
                         message: format!("Struct '{}' has no field '{}'", struct_name, field_name),
-                    })
+                    });
                 }
             };
             let canonical = layout
@@ -341,7 +359,8 @@ impl VM {
                 .field_names()
                 .iter()
                 .enumerate()
-                .filter(|&(idx, _name)| !filled[idx]).map(|(_idx, name)| (**name).clone())
+                .filter(|&(idx, _name)| !filled[idx])
+                .map(|(_idx, name)| (**name).clone())
                 .collect();
             return Err(LustError::RuntimeError {
                 message: format!(
@@ -749,16 +768,18 @@ mod tests {
                         (a, b) => panic!("{typed}: {a:?} != {b:?}"),
                     }
                 }
-                assert!(vm
-                    .call("typed", vec![Value::Bool(true), Value::Bool(false)])
-                    .is_err());
+                assert!(
+                    vm.call("typed", vec![Value::Bool(true), Value::Bool(false)])
+                        .is_err()
+                );
                 let wrong_numeric = match kind {
                     NumericType::Int => Value::Float(1.0),
                     NumericType::Float => Value::Int(1),
                 };
-                assert!(vm
-                    .call("typed", vec![wrong_numeric.clone(), wrong_numeric])
-                    .is_err());
+                assert!(
+                    vm.call("typed", vec![wrong_numeric.clone(), wrong_numeric])
+                        .is_err()
+                );
             }
         }
     }
@@ -1072,12 +1093,13 @@ end
         vm.load_functions(vec![function]);
 
         assert!(vm.call("lua_function", vec![Value::Int(1)]).is_ok());
-        assert!(vm
-            .call(
+        assert!(
+            vm.call(
                 "lua_function",
                 vec![Value::Int(1), Value::Int(2), Value::Int(3)]
             )
-            .is_ok());
+            .is_ok()
+        );
 
         let zero_arg = typed_function(
             "zero_arg_lua_function",
@@ -1088,9 +1110,10 @@ end
             Value::array(Vec::new()),
         );
         vm.load_functions(vec![zero_arg]);
-        assert!(vm
-            .call("zero_arg_lua_function", vec![Value::Int(1)])
-            .is_ok());
+        assert!(
+            vm.call("zero_arg_lua_function", vec![Value::Int(1)])
+                .is_ok()
+        );
 
         let empty_return = typed_function(
             "empty_lua_return",
@@ -1168,7 +1191,7 @@ end
     #[test]
     fn native_callbacks_bridge_runtime_contexts_and_restore_the_previous_vm() {
         use core::cell::Cell;
-        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
 
         std::thread_local! {
             static HOST_VM: Cell<Option<*mut VM>> = const { Cell::new(None) };
@@ -1201,7 +1224,8 @@ end
         else {
             panic!("expected native callback");
         };
-        let Value::NativeFunction(panicking) = registration_vm.get_global("panic_in_callback").unwrap()
+        let Value::NativeFunction(panicking) =
+            registration_vm.get_global("panic_in_callback").unwrap()
         else {
             panic!("expected native callback");
         };
@@ -1215,7 +1239,9 @@ end
             let mut host_vm = VM::new();
             host_vm.set_global("marker", Value::Int(marker));
             HOST_VM.with(|slot| slot.set(Some(&mut host_vm)));
-            assert!(matches!(callback(&[]), Ok(NativeCallResult::Return(Value::Int(n))) if n == marker));
+            assert!(
+                matches!(callback(&[]), Ok(NativeCallResult::Return(Value::Int(n))) if n == marker)
+            );
             assert_eq!(crate::vm::current_vm_ptr(), Some(previous_ptr));
             assert!(callback(&[Value::Nil]).is_err());
             assert_eq!(crate::vm::current_vm_ptr(), Some(previous_ptr));
@@ -1248,15 +1274,19 @@ end
         }
         vm.register_exported_native(
             NativeExport::new("bad_factor", Vec::new(), "Factor"),
-            |_| VM::with_current(|vm| {
-                vm.instantiate_struct("other.Factor", Vec::new())
-                    .map(NativeCallResult::Return)
-                    .map_err(|error| error.to_string())
-            }),
+            |_| {
+                VM::with_current(|vm| {
+                    vm.instantiate_struct("other.Factor", Vec::new())
+                        .map(NativeCallResult::Return)
+                        .map_err(|error| error.to_string())
+                })
+            },
         );
         vm.pop_export_prefix();
 
-        let factor = vm.instantiate_struct("extension.Factor", Vec::new()).unwrap();
+        let factor = vm
+            .instantiate_struct("extension.Factor", Vec::new())
+            .unwrap();
         let other_factor = vm.instantiate_struct("other.Factor", Vec::new()).unwrap();
         for (name, valid, invalid) in [
             ("extension.factor", factor, other_factor),
@@ -1267,7 +1297,10 @@ end
             ),
         ] {
             let callback = vm.get_global(name).unwrap();
-            assert_eq!(vm.call_value(&callback, vec![valid.clone()]).unwrap(), valid);
+            assert_eq!(
+                vm.call_value(&callback, vec![valid.clone()]).unwrap(),
+                valid
+            );
             let error = vm.call_value(&callback, vec![invalid]).unwrap_err();
             assert!(error.to_string().contains("Native argument 1 expects"));
         }
@@ -1325,8 +1358,8 @@ end
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn jit_guard_exit_resumes_at_bailout_ip() {
-        use crate::jit::trace::{Trace, TraceOp};
         use crate::jit::TraceId;
+        use crate::jit::trace::{Trace, TraceOp};
 
         let mut function = Function::new("guard_exit", 0, false);
         function.set_register_count(2);

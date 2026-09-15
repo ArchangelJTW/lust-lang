@@ -22,6 +22,10 @@
           "end": "\\]\\]"
         },
         {
+          "name": "comment.line.documentation.lust",
+          "match": "---\\s.*$"
+        },
+        {
           "name": "comment.line.double-dash.lust",
           "begin": "--",
           "end": "$"

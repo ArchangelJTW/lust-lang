@@ -4,6 +4,7 @@ module.exports = grammar({
   extras: $ => [
     /\s/,
     $.comment,
+    $.doc_comment,
   ],
 
   word: $ => $.identifier,
@@ -72,6 +73,9 @@ module.exports = grammar({
       seq('--', /[^\n]*/),
       seq('#', /[^\n]*/),
     )),
+
+    // Doc comments: exactly three dashes followed by a space
+    doc_comment: $ => token(prec(1, seq('---', ' ', /[^\n]*/))),
 
     // Function declaration
     function_declaration: $ => seq(

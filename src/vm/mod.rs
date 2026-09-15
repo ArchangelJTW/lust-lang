@@ -15,9 +15,9 @@ pub(super) use crate::bytecode::{
 pub(super) use crate::embed::native_types::ModuleStub;
 pub(super) use crate::error::StackFrame;
 pub(super) use crate::jit::{
-    JitCompiler, JitState, TraceOptimizer, TraceRecorder, MAX_TRACE_LENGTH,
+    JitCompiler, JitState, MAX_TRACE_LENGTH, TraceOptimizer, TraceRecorder,
 };
-pub(super) use crate::number::{float_from_int, int_from_usize, LustFloat, LustInt};
+pub(super) use crate::number::{LustFloat, LustInt, float_from_int, int_from_usize};
 pub(super) use crate::{LustError, Result};
 pub(super) use alloc::{
     format,
@@ -32,6 +32,7 @@ mod api;
 mod execution;
 mod tasks;
 mod tracing;
+pub(crate) use self::api::format_doc_comment;
 pub use self::api::{NativeExport, NativeExportParam};
 #[cfg(feature = "std")]
 thread_local! {

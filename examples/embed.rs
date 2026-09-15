@@ -1,8 +1,8 @@
 use lust::embed::LustStructView as _;
 use lust::{
-    struct_field, ArrayHandle, AsyncDriver, AsyncTaskQueue, EmbeddedProgram, FromLustValue,
-    FunctionHandle, LustStructView, MapHandle, NativeExport, NativeExportParam, StringRef,
-    StructHandle, StructInstance, Value,
+    ArrayHandle, AsyncDriver, AsyncTaskQueue, EmbeddedProgram, FromLustValue, FunctionHandle,
+    LustStructView, MapHandle, NativeExport, NativeExportParam, StringRef, StructHandle,
+    StructInstance, Value, struct_field,
 };
 
 #[derive(LustStructView)]

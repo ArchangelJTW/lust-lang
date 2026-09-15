@@ -27,11 +27,12 @@ impl BudgetState {
     pub(super) fn charge_gas(&mut self, amount: u64) -> Result<()> {
         self.gas.used = self.gas.used.saturating_add(amount);
         if let Some(limit) = self.gas.limit
-            && self.gas.used > limit {
-                return Err(LustError::RuntimeError {
-                    message: format!("Out of gas (limit: {}, used: {})", limit, self.gas.used),
-                });
-            }
+            && self.gas.used > limit
+        {
+            return Err(LustError::RuntimeError {
+                message: format!("Out of gas (limit: {}, used: {})", limit, self.gas.used),
+            });
+        }
         Ok(())
     }
 

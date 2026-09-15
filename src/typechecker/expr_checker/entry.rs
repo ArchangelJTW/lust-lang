@@ -127,7 +127,23 @@ impl TypeChecker {
                 params,
                 return_type,
                 body,
-            } => self.check_lambda(params, return_type.as_ref(), body),
+            } => {
+                let lambda_type = self.check_lambda(params, return_type.as_ref(), body)?;
+                if return_type.is_none()
+                    && expr.span.start_line > 0
+                    && let TypeKind::Function {
+                        return_type: inferred,
+                        ..
+                    } = &lambda_type.kind
+                    && let Some(module) = &self.current_module
+                {
+                    self.lambda_return_types
+                        .entry(module.clone())
+                        .or_default()
+                        .insert(expr.span, (**inferred).clone());
+                }
+                Ok(lambda_type)
+            }
             ExprKind::Cast { expr, target_type } => {
                 let _expr_type = self.check_expr(expr)?;
                 let target_type = self.canonicalize_type(target_type);

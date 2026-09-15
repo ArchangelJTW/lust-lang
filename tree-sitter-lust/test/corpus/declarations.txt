@@ -140,3 +140,57 @@ end
         (expression_list
           (literal
             (boolean)))))))
+
+==================
+Extern declaration with named parameters
+==================
+
+extern "C"
+    function scale(value: int): int
+    function add(a: int, b: int, raw): int
+    function socket:connect(self: Socket, addr: string)
+end
+
+---
+
+(source_file
+  (extern_declaration
+    abi: (string)
+    (extern_function
+      name: (identifier)
+      parameters: (extern_parameter_list
+        (extern_parameter
+          name: (identifier)
+          type: (type_annotation
+            (primitive_type))))
+      return_type: (type_annotation
+        (primitive_type)))
+    (extern_function
+      name: (identifier)
+      parameters: (extern_parameter_list
+        (extern_parameter
+          name: (identifier)
+          type: (type_annotation
+            (primitive_type)))
+        (extern_parameter
+          name: (identifier)
+          type: (type_annotation
+            (primitive_type)))
+        (extern_parameter
+          (type_annotation
+            (identifier))))
+      return_type: (type_annotation
+        (primitive_type)))
+    (extern_function
+      name: (method_identifier
+        receiver: (identifier)
+        method: (identifier))
+      parameters: (extern_parameter_list
+        (extern_parameter
+          name: (identifier)
+          type: (type_annotation
+            (identifier)))
+        (extern_parameter
+          name: (identifier)
+          type: (type_annotation
+            (primitive_type)))))))

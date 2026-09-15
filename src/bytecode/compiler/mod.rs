@@ -42,6 +42,7 @@ pub struct Compiler {
     pub(super) stdlib_symbols: HashSet<String>,
     option_coercions: HashMap<String, HashSet<Span>>,
     checked_array_indices: HashMap<String, HashSet<Span>>,
+    lambda_return_types: HashMap<String, HashMap<Span, Type>>,
     numeric_types: HashMap<String, HashMap<Span, NumericType>>,
     function_signatures: HashMap<String, FunctionSignature>,
     minimal_runtime_types: bool,
@@ -84,6 +85,7 @@ impl Compiler {
             stdlib_symbols: HashSet::new(),
             option_coercions: HashMap::new(),
             checked_array_indices: HashMap::new(),
+            lambda_return_types: HashMap::new(),
             numeric_types: HashMap::new(),
             function_signatures: HashMap::new(),
             minimal_runtime_types: false,
@@ -170,6 +172,17 @@ impl Compiler {
 
     pub fn set_checked_array_indices(&mut self, map: HashMap<String, HashSet<Span>>) {
         self.checked_array_indices = map;
+    }
+
+    pub fn set_lambda_return_types(&mut self, map: HashMap<String, HashMap<Span, Type>>) {
+        self.lambda_return_types = map;
+    }
+
+    pub(super) fn lambda_return_type(&self, span: Span) -> Option<Type> {
+        self.lambda_return_types
+            .get(self.current_module.as_deref().unwrap_or(""))?
+            .get(&span)
+            .cloned()
     }
 
     pub fn set_numeric_types(&mut self, map: HashMap<String, HashMap<Span, NumericType>>) {

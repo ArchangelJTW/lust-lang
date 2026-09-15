@@ -425,8 +425,10 @@ impl TypeChecker {
                     return_type,
                     doc: _,
                 } => {
-                    let canonical_params: Vec<Type> =
-                        params.iter().map(|ty| self.canonicalize_type(ty)).collect();
+                    let canonical_params: Vec<Type> = params
+                        .iter()
+                        .map(|param| self.canonicalize_type(&param.ty))
+                        .collect();
                     let canonical_return = return_type
                         .clone()
                         .map(|ty| self.canonicalize_type(&ty))
@@ -460,7 +462,10 @@ impl TypeChecker {
                             });
                             for (idx, ty) in canonical_params.iter().enumerate().skip(1) {
                                 method_params.push(FunctionParam {
-                                    name: format!("arg{}", idx),
+                                    name: params[idx]
+                                        .name
+                                        .clone()
+                                        .unwrap_or_else(|| format!("arg{}", idx)),
                                     ty: ty.clone(),
                                     is_self: false,
                                 });

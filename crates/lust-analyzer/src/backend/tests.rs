@@ -1182,13 +1182,14 @@ fn hover_shows_imported_function_info() {
     let tmp = TempDir::new();
     let main_source = r#"
 use helper.{greet, double}
-use dep.{host_double, Factor}
+use dep.{host_double, side_panel, Factor}
 
 local message = greet("world")
 local n = double(21)
 local h = host_double(4)
 local f = Factor { base = 1, multiplier = 2 }
 local applied = f:apply(3)
+side_panel("left", h)
 
 extern
     --- Prints a line via the host.
@@ -1212,6 +1213,8 @@ end
 extern
     --- Doubles the input on the host.
     function host_double(int): int
+    --- Run draw inside a side panel; side is "left" or "right".
+    function side_panel(side: string, draw: unknown)
 end
 
 --- A scaling factor.
@@ -1312,6 +1315,18 @@ end
     hover_contains(&host_hover, "extern function host_double(int): int");
     hover_contains(&host_hover, "Doubles the input on the host.");
     hover_contains(&host_hover, "Module `dep`");
+
+    // Named extern params show up in hover signatures.
+    let panel_info = snapshot
+        .function_info_for("side_panel", Some(module_path.as_str()))
+        .expect("named extern function info");
+    assert!(panel_info.is_extern, "side_panel should be marked extern");
+    let panel_hover = hover_for_function(panel_info);
+    hover_contains(
+        &panel_hover,
+        "extern function side_panel(side: string, draw: unknown)",
+    );
+    hover_contains(&panel_hover, "Run draw inside a side panel");
     let expected_body = concat!(
         "Extern ABI `C`\n\nModule `dep`\n\n",
         "────────────────────────────────────────\n\n",

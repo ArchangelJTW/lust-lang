@@ -255,11 +255,20 @@ module.exports = grammar({
     extern_parameter_list: $ => seq(
       '(',
       optional(seq(
-        $.type_annotation,
-        repeat(seq(',', $.type_annotation)),
+        $.extern_parameter,
+        repeat(seq(',', $.extern_parameter)),
         optional(',')
       )),
       ')'
+    ),
+
+    extern_parameter: $ => choice(
+      $.type_annotation,
+      seq(
+        field('name', $.identifier),
+        ':',
+        field('type', $.type_annotation)
+      )
     ),
 
     extern_const: $ => seq(

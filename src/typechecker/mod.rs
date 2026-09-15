@@ -33,6 +33,7 @@ pub struct TypeChecker {
     expr_types_by_module: HashMap<String, HashMap<Span, Type>>,
     variable_types_by_module: HashMap<String, HashMap<Span, Type>>,
     numeric_types_by_module: HashMap<String, HashMap<Span, NumericType>>,
+    lambda_return_types: HashMap<String, HashMap<Span, Type>>,
     short_circuit_info: HashMap<String, HashMap<Span, ShortCircuitInfo>>,
     checked_array_indices: HashMap<String, HashSet<Span>>,
     low_memory_mode: bool,
@@ -75,6 +76,7 @@ impl TypeChecker {
             expr_types_by_module: HashMap::new(),
             variable_types_by_module: HashMap::new(),
             numeric_types_by_module: HashMap::new(),
+            lambda_return_types: HashMap::new(),
             short_circuit_info: HashMap::new(),
             checked_array_indices: HashMap::new(),
             low_memory_mode: config.low_memory_mode(),
@@ -425,6 +427,12 @@ impl TypeChecker {
 
     pub fn take_checked_array_indices(&mut self) -> HashMap<String, HashSet<Span>> {
         mem::take(&mut self.checked_array_indices)
+    }
+
+    /// Inferred return types for lambdas without an explicit return annotation,
+    /// keyed by module and lambda expression span.
+    pub fn take_lambda_return_types(&mut self) -> HashMap<String, HashMap<Span, Type>> {
+        mem::take(&mut self.lambda_return_types)
     }
 
     pub fn function_signatures(&self) -> HashMap<String, type_env::FunctionSignature> {

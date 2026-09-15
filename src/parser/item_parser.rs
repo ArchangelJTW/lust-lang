@@ -1,9 +1,9 @@
 use super::Parser;
 use crate::{
     ast::{
-        EnumDef, EnumVariant, ExternItem, FieldOwnership, FunctionDef, FunctionParam, ImplBlock,
-        Item, ItemKind, StructDef, StructField, TraitBound, TraitDef, TraitMethod, Type, TypeKind,
-        Visibility,
+        EnumDef, EnumVariant, ExternItem, ExternParam, FieldOwnership, FunctionDef, FunctionParam,
+        ImplBlock, Item, ItemKind, StructDef, StructField, TraitBound, TraitDef, TraitMethod, Type,
+        TypeKind, Visibility,
     },
     error::Result,
     lexer::TokenKind,
@@ -201,9 +201,9 @@ impl Parser {
                             self.consume(TokenKind::LeftParen, "Expected '(' after function name")?;
                             let mut params = Vec::new();
                             if !self.check(TokenKind::RightParen) {
-                                params.push(self.parse_type()?);
+                                params.push(self.parse_extern_param()?);
                                 while self.match_token(&[TokenKind::Comma]) {
-                                    params.push(self.parse_type()?);
+                                    params.push(self.parse_extern_param()?);
                                 }
                             }
 
@@ -609,8 +609,23 @@ impl Parser {
         })
     }
 
-    fn parse_type_params_with_bounds(&mut self) -> Result<(Vec<String>, Vec<TraitBound>)> {
-        if !self.match_token(&[TokenKind::Less]) {
+    fn parse_extern_param(&mut self) -> Result<ExternParam> {
+        let name = if self.check(TokenKind::Identifier)
+            && self
+                .peek_ahead(1)
+                .is_some_and(|token| token.kind == TokenKind::Colon)
+        {
+            let param_name = self.expect_identifier()?;
+            self.consume(TokenKind::Colon, "Expected ':' after parameter name")?;
+            Some(param_name)
+        } else {
+            None
+        };
+        let ty = self.parse_type()?;
+        Ok(ExternParam { name, ty })
+    }
+
+    fn parse_type_params_with_bounds(&mut self) -> Result<(Vec<String>, Vec<TraitBound>)> {        if !self.match_token(&[TokenKind::Less]) {
             return Ok((vec![], vec![]));
         }
 

@@ -146,6 +146,9 @@
 (extern_function
   name: (scoped_type_identifier) @function)
 
+(extern_parameter
+  name: (identifier) @variable.parameter)
+
 (extern_const
   name: (identifier) @constant)
 

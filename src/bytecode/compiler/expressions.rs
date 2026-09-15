@@ -503,7 +503,10 @@ impl Compiler {
                 let lambda_name = format!("<lambda@{}>", lambda_func_idx);
                 let lambda_func = self.new_function(&lambda_name, params.len() as u8, false);
                 self.functions.push(lambda_func);
-                self.try_set_lambda_signature(lambda_func_idx, params, return_type);
+                let lambda_return = return_type
+                    .clone()
+                    .or_else(|| self.lambda_return_type(expr.span));
+                self.try_set_lambda_signature(lambda_func_idx, params, &lambda_return);
                 let saved_func_idx = self.current_function;
                 let saved_scopes = self.scopes.clone();
                 let saved_next_reg = self.next_register;

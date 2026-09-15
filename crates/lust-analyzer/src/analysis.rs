@@ -508,9 +508,9 @@ impl AnalysisSnapshot {
                                     trait_bounds: Vec::new(),
                                     params: params
                                         .iter()
-                                        .map(|ty| FunctionParam {
-                                            name: String::new(),
-                                            ty: ty.clone(),
+                                        .map(|param| FunctionParam {
+                                            name: param.name.clone().unwrap_or_default(),
+                                            ty: param.ty.clone(),
                                             is_self: false,
                                         })
                                         .collect(),
@@ -548,9 +548,9 @@ impl AnalysisSnapshot {
                                 is_instance: true,
                                 params: params
                                     .iter()
-                                    .map(|ty| FunctionParam {
-                                        name: String::new(),
-                                        ty: ty.clone(),
+                                    .map(|param| FunctionParam {
+                                        name: param.name.clone().unwrap_or_default(),
+                                        ty: param.ty.clone(),
                                         is_self: false,
                                     })
                                     .collect(),

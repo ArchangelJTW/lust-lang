@@ -149,10 +149,16 @@ pub enum Visibility {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ExternParam {
+    pub name: Option<String>,
+    pub ty: Type,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ExternItem {
     Function {
         name: String,
-        params: Vec<Type>,
+        params: Vec<ExternParam>,
         return_type: Option<Type>,
         doc: Option<String>,
     },

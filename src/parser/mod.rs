@@ -435,4 +435,27 @@ mod tests {
         assert_eq!(docs[0].as_deref(), Some("Doc for first."));
         assert!(docs[1].is_none());
     }
+
+    #[test]
+    fn extern_function_params_may_be_named() {
+        let items = parse_source(
+            "extern\n    function on_event(kind: string, count: int, raw): int\nend\n",
+        );
+        match &items[0].kind {
+            ItemKind::Extern { items: extern_items, .. } => match &extern_items[0] {
+                ExternItem::Function { name, params, .. } => {
+                    assert_eq!(name, "on_event");
+                    assert_eq!(params.len(), 3);
+                    assert_eq!(params[0].name.as_deref(), Some("kind"));
+                    assert_eq!(params[0].ty.to_string(), "string");
+                    assert_eq!(params[1].name.as_deref(), Some("count"));
+                    assert_eq!(params[1].ty.to_string(), "int");
+                    assert_eq!(params[2].name, None);
+                    assert_eq!(params[2].ty.to_string(), "raw");
+                }
+                other => panic!("expected extern function, got {:?}", other),
+            },
+            other => panic!("expected extern item, got {:?}", other),
+        }
+    }
 }

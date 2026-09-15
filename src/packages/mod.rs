@@ -630,7 +630,13 @@ fn format_params(export: &NativeExport) -> String {
         .iter()
         .map(|param| {
             let ty = param.ty().trim();
-            if ty.is_empty() { "any" } else { ty }
+            let ty = if ty.is_empty() { "any" } else { ty };
+            let name = param.name().trim();
+            if name.is_empty() {
+                ty.to_string()
+            } else {
+                format!("{}: {}", name, ty)
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")

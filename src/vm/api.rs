@@ -1310,6 +1310,126 @@ end
     }
 
     #[test]
+    fn exported_function_types_accept_closures_without_explicit_return() {
+        let mut program = crate::EmbeddedProgram::builder()
+            .module(
+                "main",
+                r#"
+                    extern
+                        function call_it(fn: function())
+                    end
+
+                    function main()
+                        call_it(function()
+                            local unused = 1
+                        end)
+                    end
+                "#,
+            )
+            .entry_module("main")
+            .compile()
+            .expect("compile");
+
+        let called = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = called.clone();
+        program.vm_mut().register_exported_native(
+            crate::NativeExport::new(
+                "main.call_it",
+                vec![crate::NativeExportParam::new("fn", "function()")],
+                "()",
+            ),
+            move |args| {
+                match &args[0] {
+                    Value::Function(_) | Value::Closure { .. } | Value::NativeFunction(_) => {}
+                    other => {
+                        return Err(format!("expected a callable, got {:?}", other.type_of()));
+                    }
+                }
+                crate::VM::with_current(|vm| {
+                    vm.call_value(&args[0], Vec::new())
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })?;
+                flag.set(true);
+                Ok(NativeCallResult::Return(Value::Nil))
+            },
+        );
+
+        program.call_raw("main.main", Vec::new()).expect("call");
+        assert!(called.get(), "callback should have been invoked");
+    }
+
+    #[test]
+    fn exported_function_types_reject_closures_that_return_a_value() {
+        let result = crate::EmbeddedProgram::builder()
+            .module(
+                "main",
+                r#"
+                    extern
+                        function call_it(fn: function())
+                    end
+
+                    function main()
+                        call_it(function()
+                            return 5
+                        end)
+                    end
+                "#,
+            )
+            .entry_module("main")
+            .compile();
+
+        let error = match result {
+            Ok(_) => panic!("expected compile error"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            error.contains("expected 'function(): ()', got 'function(): int'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn exported_function_types_match_explicit_signatures() {
+        let mut program = crate::EmbeddedProgram::builder()
+            .module(
+                "main",
+                r#"
+                    extern
+                        function call_it(fn: function(int): int): int
+                    end
+
+                    function main(): int
+                        return call_it(function(n: int): int
+                            return n * 2
+                        end)
+                    end
+                "#,
+            )
+            .entry_module("main")
+            .compile()
+            .expect("compile");
+
+        program.vm_mut().register_exported_native(
+            crate::NativeExport::new(
+                "main.call_it",
+                vec![crate::NativeExportParam::new("fn", "function(int): int")],
+                "int",
+            ),
+            |args| {
+                crate::VM::with_current(|vm| {
+                    vm.call_value(&args[0], vec![Value::Int(21)])
+                        .map(NativeCallResult::Return)
+                        .map_err(|error| error.to_string())
+                })
+            },
+        );
+
+        let result = program.call_raw("main.main", Vec::new()).expect("call");
+        assert_eq!(result.as_int(), Some(42));
+    }
+
+    #[test]
     fn exported_native_results_are_checked_against_metadata() {
         let mut vm = VM::new();
         vm.register_exported_native(NativeExport::new("bad_native", Vec::new(), "int"), |_| {

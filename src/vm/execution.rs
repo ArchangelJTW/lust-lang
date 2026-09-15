@@ -2173,11 +2173,33 @@ impl VM {
             return true;
         }
 
-        self.functions
+        let Some(signature) = self
+            .functions
             .get(func_idx)
             .and_then(|func| func.signature.as_ref())
-            .map(|signature| signature.to_string() == type_name)
-            .unwrap_or(false)
+        else {
+            return false;
+        };
+
+        let rendered = signature.to_string();
+        if rendered == type_name {
+            return true;
+        }
+
+        let (Some(rendered_params), Some(expected_params)) = (
+            function_type_params(&rendered),
+            function_type_params(type_name),
+        ) else {
+            return false;
+        };
+        if rendered_params != expected_params {
+            return false;
+        }
+
+        match &signature.return_type.kind {
+            TypeKind::Unit => !type_string_declares_return(type_name),
+            _ => false,
+        }
     }
 
     pub(super) fn get_register(&self, reg: Register) -> Result<&Value> {
@@ -2448,4 +2470,44 @@ impl VM {
             }),
         }
     }
+}
+
+fn type_string_declares_return(type_name: &str) -> bool {
+    if !type_name.starts_with("function(") {
+        return true;
+    }
+    let bytes = type_name.as_bytes();
+    let mut depth = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return bytes[index + 1..].first() == Some(&b':');
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn function_type_params(type_name: &str) -> Option<&str> {
+    let rest = type_name.strip_prefix("function(")?;
+    let bytes = rest.as_bytes();
+    let mut depth = 1usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&rest[..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }

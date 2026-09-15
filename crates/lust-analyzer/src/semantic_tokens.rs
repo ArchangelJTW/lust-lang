@@ -244,8 +244,8 @@ fn collect_tokens_from_item(
                         return_type,
                         ..
                     } => {
-                        for ty in params {
-                            collect_tokens_from_type(ty, text, line_offsets, tokens, seen);
+                        for param in params {
+                            collect_tokens_from_type(&param.ty, text, line_offsets, tokens, seen);
                         }
 
                         if let Some(ret) = return_type {

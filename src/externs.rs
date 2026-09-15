@@ -221,7 +221,13 @@ fn format_params(export: &NativeExport) -> String {
         .iter()
         .map(|param| {
             let ty = param.ty().trim();
-            if ty.is_empty() { "any" } else { ty }
+            let ty = if ty.is_empty() { "any" } else { ty };
+            let name = param.name().trim();
+            if name.is_empty() {
+                ty.to_string()
+            } else {
+                format!("{}: {}", name, ty)
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -278,7 +284,29 @@ mod tests {
         let contents = fs::read_to_string(destination).expect("read output");
         assert!(contents.contains("struct Widget"));
         assert!(contents.contains("extern"));
-        assert!(contents.contains("function scale(int): int"));
+        assert!(contents.contains("function scale(value: int): int"));
+    }
+
+    #[test]
+    fn stubs_include_named_params() {
+        let mut vm = VM::with_config(&LustConfig::default());
+        vm.record_exported_native(NativeExport::new(
+            "host.side_panel",
+            vec![
+                NativeExportParam::new("side", "string"),
+                NativeExportParam::new("draw", "unknown"),
+            ],
+            "()",
+        ));
+
+        let files = extern_files_from_vm(&vm, &DumpExternsOptions::default());
+        assert_eq!(files.len(), 1);
+        let contents = &files[0].contents;
+        assert!(
+            contents.contains("function side_panel(side: string, draw: unknown)"),
+            "stub contents:\n{}",
+            contents
+        );
     }
 
     #[test]

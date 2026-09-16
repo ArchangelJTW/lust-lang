@@ -1,0 +1,4 @@
+local a: int = 5
+local b: string = "x"
+local c: int = a + b
+println(c)

@@ -146,6 +146,7 @@ impl JitCompiler {
         let unbox_fn = jit_unbox_array_int as *const ();
 
         dynasm!(self.ops
+            ; .arch x64
             // Zero the (ptr, len, cap) triple before attempting the unbox.
             //
             // If the unbox fails we jump to the bailout label, but the bailout
@@ -215,6 +216,7 @@ impl JitCompiler {
         let rebox_fn = jit_rebox_array_int as *const ();
 
         dynasm!(self.ops
+            ; .arch x64
             // Arg 1: vec_ptr
             ; mov rdi, [rbp + stack_offset]
 
@@ -277,6 +279,7 @@ impl JitCompiler {
         let push_fn = jit_vec_int_push as *const ();
 
         dynasm!(self.ops
+            ; .arch x64
             // Arg 1: address of vec_ptr (on stack)
             ; lea rdi, [rbp + stack_offset]
 
@@ -319,6 +322,7 @@ impl JitCompiler {
 
         let stack_offset = spec_value.stack_offset;
         dynasm!(self.ops
+            ; .arch x64
             // Read vec_len from JIT stack
             ; mov rax, [rbp + stack_offset + 8]
         );
@@ -377,6 +381,7 @@ impl JitCompiler {
         let drop_fn = jit_drop_vec_int as *const ();
 
         dynasm!(self.ops
+            ; .arch x64
             // Arg 1: vec_ptr
             ; mov rdi, [rbp + stack_offset]
 

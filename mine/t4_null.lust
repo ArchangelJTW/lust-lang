@@ -1,0 +1,10 @@
+function find(xs: Array<int>, target: int): Option<int>
+    for i, v in ipairs(xs) do
+        if v == target then return Option.Some(i) end
+    end
+    return Option.None
+end
+local r = find([1, 2, 3], 5)
+println(r)
+local n: int = r
+println(n + 1)

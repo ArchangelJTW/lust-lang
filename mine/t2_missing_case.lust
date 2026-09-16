@@ -1,0 +1,11 @@
+enum Shape
+    Circle(int),
+    Square(int)
+end
+function area(s: Shape): int
+    if s is Circle(r) then
+        return 3 * r * r
+    end
+    return 0
+end
+println(area(Shape.Square(2)))

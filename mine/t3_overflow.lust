@@ -1,0 +1,5 @@
+local big: int = 9223372036854775807
+local more: int = big + 1
+println(more)
+println(10 / 4)
+println(-7 % 3)

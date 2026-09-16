@@ -6,7 +6,10 @@ fn main() {
 
     // Export symbols from the CLI binary so dlopen'ed Lua 5.1 modules can
     // resolve lua_* shims (e.g., luasocket core) at runtime.
-    if target_family == "unix" && target_env != "msvc" {
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "macos" {
+        println!("cargo:rustc-link-arg-bin=lust=-Wl,-export_dynamic");
+    } else if target_family == "unix" && target_env != "msvc" {
         println!("cargo:rustc-link-arg-bin=lust=-Wl,-export-dynamic");
     }
 }

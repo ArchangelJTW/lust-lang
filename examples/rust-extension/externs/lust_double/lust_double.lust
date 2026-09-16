@@ -4,7 +4,7 @@ struct Factor
 end
 
 extern
-    function Factor:apply(Factor, int): int
-    function host_double(int): int
-    function make_factor(int, int): Factor
+    function Factor:apply(self: Factor, value: int): int
+    function host_double(value: int): int
+    function make_factor(base: int, multiplier: int): Factor
 end

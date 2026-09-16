@@ -18,7 +18,7 @@ tokio = { version = "1.53.1", features = [
 ] }
 tower-lsp = "0.20.0"
 url = "2.5.8"
-lust = { path = "../..", version = "3.5.5", package = "lust-rs" }
+lust = { path = "../..", version = "3.5.6", package = "lust-rs" }
 hashbrown = { version = "0.17.1", default-features = false, features = [
   "default-hasher",
   "equivalent",

@@ -3,6 +3,7 @@ impl JitCompiler {
     pub(super) fn compile_neg(&mut self, dest: u8, src: u8) -> Result<()> {
         let src_offset = (src as i32) * (mem::size_of::<Value>() as i32);
         dynasm!(self.ops
+            ; .arch x64
             ; mov al, [r12 + src_offset]
             ; cmp al, 3
             ; je >float_path
@@ -17,11 +18,13 @@ impl JitCompiler {
         );
         self.store_xmm0_as_float(dest);
         dynasm!(self.ops
+            ; .arch x64
             ; jmp >done
             ; store_int:
         );
         self.store_from_rax(dest, 2);
         dynasm!(self.ops
+            ; .arch x64
             ; done:
         );
         Ok(())
@@ -31,6 +34,7 @@ impl JitCompiler {
         let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
         let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
         dynasm!(self.ops
+            ; .arch x64
             ; mov al, [r12 + lhs_offset]
             ; cmp al, 0
             ; je >false_result
@@ -63,6 +67,7 @@ impl JitCompiler {
         let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
         let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
         dynasm!(self.ops
+            ; .arch x64
             ; mov al, [r12 + lhs_offset]
             ; cmp al, 0
             ; je >check_rhs
@@ -94,6 +99,7 @@ impl JitCompiler {
     pub(super) fn compile_not(&mut self, dest: u8, src: u8) -> Result<()> {
         let src_offset = (src as i32) * (mem::size_of::<Value>() as i32);
         dynasm!(self.ops
+            ; .arch x64
             ; mov al, [r12 + src_offset]
             ; cmp al, 0
             ; je >true_result
@@ -127,6 +133,7 @@ impl JitCompiler {
         }
 
         dynasm!(self.ops
+            ; .arch x64
             ; mov rdi, r13
             ; lea rsi, [r12 + lhs_offset]
             ; lea rdx, [r12 + rhs_offset]

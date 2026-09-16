@@ -3,6 +3,7 @@ impl JitCompiler {
     pub(super) fn load_to_rax(&mut self, vm_reg: u8) {
         let offset = (vm_reg as i32) * (mem::size_of::<Value>() as i32);
         dynasm!(self.ops
+            ; .arch x64
             ; mov rax, [r12 + offset + 8]
         );
     }
@@ -10,6 +11,7 @@ impl JitCompiler {
     pub(super) fn load_to_rbx(&mut self, vm_reg: u8) {
         let offset = (vm_reg as i32) * (mem::size_of::<Value>() as i32);
         dynasm!(self.ops
+            ; .arch x64
             ; mov rbx, [r12 + offset + 8]
         );
     }
@@ -23,12 +25,14 @@ impl JitCompiler {
         };
         if self.scalar_registers.get(&vm_reg) == Some(&stored_type) {
             dynasm!(self.ops
+                ; .arch x64
                 ; mov QWORD [r12 + offset + 8], rax
             );
             return;
         }
         if self.scalar_registers.contains_key(&vm_reg) {
             dynasm!(self.ops
+                ; .arch x64
                 ; mov BYTE [r12 + offset], discriminant as i8
                 ; mov QWORD [r12 + offset + 8], rax
             );
@@ -41,6 +45,7 @@ impl JitCompiler {
                     fn jit_replace_bool(dest: *mut Value, value: u8) -> u8;
                 }
                 dynasm!(self.ops
+                    ; .arch x64
                     ; cmp BYTE [r12 + offset], scalar_max_tag
                     ; ja >replace_owned
                     ; mov BYTE [r12 + offset], discriminant as i8
@@ -59,6 +64,7 @@ impl JitCompiler {
                     fn jit_replace_int(dest: *mut Value, value: crate::number::LustInt) -> u8;
                 }
                 dynasm!(self.ops
+                    ; .arch x64
                     ; cmp BYTE [r12 + offset], scalar_max_tag
                     ; ja >replace_owned
                     ; mov BYTE [r12 + offset], discriminant as i8
@@ -81,12 +87,14 @@ impl JitCompiler {
         let float_tag = ValueTag::Float.as_u8() as i8;
         if self.scalar_registers.get(&vm_reg) == Some(&ValueType::Float) {
             dynasm!(self.ops
+                ; .arch x64
                 ; movq QWORD [r12 + offset + 8], xmm0
             );
             return;
         }
         if self.scalar_registers.contains_key(&vm_reg) {
             dynasm!(self.ops
+                ; .arch x64
                 ; mov BYTE [r12 + offset], float_tag
                 ; movq QWORD [r12 + offset + 8], xmm0
             );
@@ -97,6 +105,7 @@ impl JitCompiler {
             fn jit_replace_float_bits(dest: *mut Value, bits: u64) -> u8;
         }
         dynasm!(self.ops
+            ; .arch x64
             ; movq rsi, xmm0
             ; cmp BYTE [r12 + offset], scalar_max_tag
             ; ja >replace_owned

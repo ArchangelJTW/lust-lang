@@ -75,6 +75,7 @@ impl JitCompiler {
         self.fail_stack.push(fail_label);
         crate::jit::log(|| format!("🔧 JIT: Emitting prologue with sub rsp, {}", stack_size));
         dynasm!(self.ops
+            ; .arch x64
             ; push rbp
             ; mov rbp, rsp
             ; push rbx
@@ -90,6 +91,7 @@ impl JitCompiler {
         for slot in 0..Self::count_specialized_slots(trace) as i32 {
             let offset = SPECIALIZED_BASE_OFFSET - slot * SPECIALIZED_SLOT_SIZE;
             dynasm!(self.ops
+                ; .arch x64
                 ; mov QWORD [rbp + offset], 0
                 ; mov QWORD [rbp + offset + 8], 0
                 ; mov QWORD [rbp + offset + 16], 0
@@ -106,6 +108,7 @@ impl JitCompiler {
         // Create a loop_start label AFTER preamble, BEFORE loop body
         let loop_start_label = self.ops.new_dynamic_label();
         dynasm!(self.ops
+            ; .arch x64
             ; => loop_start_label
             ; loop_start:
         );
@@ -116,12 +119,14 @@ impl JitCompiler {
 
         // At end of loop body, jump back to loop_start to loop
         dynasm!(self.ops
+            ; .arch x64
             ; jmp => loop_start_label
         );
 
         let unwind_label = self.ops.new_dynamic_label();
         let fail_return_label = self.ops.new_dynamic_label();
         dynasm!(self.ops
+            ; .arch x64
             ; => exit_label
             ; exit:
             // Postamble helpers may overwrite eax. Preserve the exit reason in
@@ -143,10 +148,12 @@ impl JitCompiler {
         self.fail_stack.pop();
 
         dynasm!(self.ops
+            ; .arch x64
             ; mov eax, r14d
         );
 
         dynasm!(self.ops
+            ; .arch x64
             ; add rsp, stack_size
             ; pop r15
             ; pop r14
@@ -699,6 +706,7 @@ impl JitCompiler {
                     });
                     let current_guard_index = *guard_index;
                     dynasm!(self.ops
+                        ; .arch x64
                         ; mov eax, DWORD (current_guard_index + 1)
                         ; jmp => exit_label
                     );
@@ -772,13 +780,14 @@ impl JitCompiler {
 
         self.load_to_rax(source);
         if *immediate == 1 {
-            dynasm!(self.ops ; inc rax);
+            dynasm!(self.ops ; .arch x64 ; inc rax);
         } else if *immediate == -1 {
-            dynasm!(self.ops ; dec rax);
+            dynasm!(self.ops ; .arch x64 ; dec rax);
         } else if let Ok(immediate) = i32::try_from(*immediate) {
-            dynasm!(self.ops ; add rax, immediate);
+            dynasm!(self.ops ; .arch x64 ; add rax, immediate);
         } else {
             dynasm!(self.ops
+                ; .arch x64
                 ; mov rcx, QWORD *immediate
                 ; add rax, rcx
             );
@@ -844,29 +853,29 @@ impl JitCompiler {
         let guard_ok = self.ops.new_dynamic_label();
         if self.load_numeric_comparison_operands(lhs, rhs, lhs_type, rhs_type) {
             let guard_fail = self.ops.new_dynamic_label();
-            dynasm!(self.ops ; ucomisd xmm0, xmm1);
+            dynasm!(self.ops ; .arch x64 ; ucomisd xmm0, xmm1);
             // Every ordered comparison is false for NaN. CF/ZF alone would
             // incorrectly treat unordered operands as less-than or equal.
             if *expect_truthy {
-                dynasm!(self.ops ; jp =>guard_fail);
+                dynasm!(self.ops ; .arch x64 ; jp =>guard_fail);
             } else {
-                dynasm!(self.ops ; jp =>guard_ok);
+                dynasm!(self.ops ; .arch x64 ; jp =>guard_ok);
             }
             match (comparison_kind, *expect_truthy) {
-                (0, true) | (3, false) => dynasm!(self.ops ; jb =>guard_ok),
-                (1, true) | (2, false) => dynasm!(self.ops ; jbe =>guard_ok),
-                (2, true) | (1, false) => dynasm!(self.ops ; ja =>guard_ok),
-                (3, true) | (0, false) => dynasm!(self.ops ; jae =>guard_ok),
+                (0, true) | (3, false) => dynasm!(self.ops ; .arch x64 ; jb =>guard_ok),
+                (1, true) | (2, false) => dynasm!(self.ops ; .arch x64 ; jbe =>guard_ok),
+                (2, true) | (1, false) => dynasm!(self.ops ; .arch x64 ; ja =>guard_ok),
+                (3, true) | (0, false) => dynasm!(self.ops ; .arch x64 ; jae =>guard_ok),
                 _ => unreachable!(),
             }
-            dynasm!(self.ops ; =>guard_fail);
+            dynasm!(self.ops ; .arch x64 ; =>guard_fail);
         } else {
-            dynasm!(self.ops ; cmp rax, rcx);
+            dynasm!(self.ops ; .arch x64 ; cmp rax, rcx);
             match (comparison_kind, *expect_truthy) {
-                (0, true) | (3, false) => dynasm!(self.ops ; jl =>guard_ok),
-                (1, true) | (2, false) => dynasm!(self.ops ; jle =>guard_ok),
-                (2, true) | (1, false) => dynasm!(self.ops ; jg =>guard_ok),
-                (3, true) | (0, false) => dynasm!(self.ops ; jge =>guard_ok),
+                (0, true) | (3, false) => dynasm!(self.ops ; .arch x64 ; jl =>guard_ok),
+                (1, true) | (2, false) => dynasm!(self.ops ; .arch x64 ; jle =>guard_ok),
+                (2, true) | (1, false) => dynasm!(self.ops ; .arch x64 ; jg =>guard_ok),
+                (3, true) | (0, false) => dynasm!(self.ops ; .arch x64 ; jge =>guard_ok),
                 _ => unreachable!(),
             }
         }
@@ -874,11 +883,12 @@ impl JitCompiler {
         // The interpreter resumes at the branch bytecode, which reads this
         // register. Materialize only the uncommon failed result.
         let failed_value = i64::from(!*expect_truthy);
-        dynasm!(self.ops ; mov rax, QWORD failed_value);
+        dynasm!(self.ops ; .arch x64 ; mov rax, QWORD failed_value);
         self.store_from_rax(condition_register, ValueTag::Bool.as_u8());
         let guard_return_value = (guard_index + 1) as i32;
         let exit_label = self.current_exit_label();
         dynasm!(self.ops
+            ; .arch x64
             ; mov eax, DWORD guard_return_value
             ; jmp =>exit_label
             ; =>guard_ok
@@ -1317,26 +1327,31 @@ impl JitCompiler {
 
             // Save inline metadata (frame size, caller registers, previous inline frame).
             dynasm!(self.ops
+                ; .arch x64
                 ; sub rsp, metadata_size
             );
             dynasm!(self.ops
+                ; .arch x64
                 ; mov eax, DWORD frame_size as _
                 ; mov [rsp], rax
                 ; mov [rsp + 8], r12
                 ; mov [rsp + 16], r15
             );
             dynasm!(self.ops
+                ; .arch x64
                 ; mov eax, DWORD align_adjust as _
                 ; mov [rsp + 24], rax
                 ; mov r15, rsp
             );
             if align_adjust != 0 {
                 dynasm!(self.ops
+                    ; .arch x64
                     ; sub rsp, align_adjust
                 );
             }
             // Allocate space for callee registers.
             dynasm!(self.ops
+                ; .arch x64
                 ; sub rsp, frame_size
                 ; mov r12, rsp
             );
@@ -1344,6 +1359,7 @@ impl JitCompiler {
             for reg in 0..trace.register_count {
                 let offset = reg as i32 * value_size;
                 dynasm!(self.ops
+                    ; .arch x64
                     ; lea rdi, [r12 + offset]
                     ; mov rax, QWORD jit_init_nil as *const () as _
                     ; call rax
@@ -1355,6 +1371,7 @@ impl JitCompiler {
                 let src_offset = (*src_reg as i32) * value_size;
                 let dest_offset = (arg_index as i32) * value_size;
                 dynasm!(self.ops
+                    ; .arch x64
                     ; mov r14, [r15 + 8]
                     ; lea rdi, [r14 + src_offset]
                     ; lea rsi, [r12 + dest_offset]
@@ -1374,6 +1391,7 @@ impl JitCompiler {
                 let ret_offset = (ret_reg as i32) * value_size;
                 let dest_offset = (dest as i32) * value_size;
                 dynasm!(self.ops
+                    ; .arch x64
                     ; mov r14, [r15 + 8]
                     ; lea rdi, [r12 + ret_offset]
                     ; lea rsi, [r14 + dest_offset]
@@ -1383,6 +1401,7 @@ impl JitCompiler {
                     ; jz =>inline_fail
                 );
                 dynasm!(self.ops
+                    ; .arch x64
                     ; mov rdi, r12
                     ; mov esi, DWORD frame_value_count
                     ; mov rax, QWORD jit_drop_values as *const () as _
@@ -1390,6 +1409,7 @@ impl JitCompiler {
                     ; add rsp, frame_size
                 );
                 dynasm!(self.ops
+                    ; .arch x64
                     ; mov eax, DWORD [r15 + 24]
                     ; add rsp, rax
                     ; mov r12, [r15 + 8]
@@ -1399,6 +1419,7 @@ impl JitCompiler {
                 );
             } else {
                 dynasm!(self.ops
+                    ; .arch x64
                     ; mov rdi, r12
                     ; mov esi, DWORD frame_value_count
                     ; mov rax, QWORD jit_drop_values as *const () as _
@@ -1406,6 +1427,7 @@ impl JitCompiler {
                     ; add rsp, frame_size
                 );
                 dynasm!(self.ops
+                    ; .arch x64
                     ; mov eax, DWORD [r15 + 24]
                     ; add rsp, rax
                     ; mov r12, [r15 + 8]
@@ -1414,11 +1436,13 @@ impl JitCompiler {
                 );
                 self.compile_load_const(dest, &Value::Nil)?;
                 dynasm!(self.ops
+                    ; .arch x64
                     ; jmp => inline_end
                 );
             }
 
             dynasm!(self.ops
+                ; .arch x64
                 ; => inline_fail
                 ; mov rdi, r12
                 ; mov esi, DWORD frame_value_count
@@ -1429,6 +1453,7 @@ impl JitCompiler {
                 ; add rsp, rbx
             );
             dynasm!(self.ops
+            ; .arch x64
             ; mov eax, DWORD [r15 + 24]
             ; add rsp, rax
             ; mov r12, [r15 + 8]

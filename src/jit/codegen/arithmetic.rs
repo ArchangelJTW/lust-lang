@@ -12,6 +12,7 @@ impl JitCompiler {
             self.load_to_rax(lhs);
             self.load_to_rbx(rhs);
             dynasm!(self.ops
+                ; .arch x64
                 ; add rax, rbx
             );
             self.store_from_rax(dest, 2);
@@ -22,6 +23,7 @@ impl JitCompiler {
             let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
             let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
             dynasm!(self.ops
+                ; .arch x64
                 ; movsd xmm0, [r12 + lhs_offset + 8]
                 ; movsd xmm1, [r12 + rhs_offset + 8]
                 ; addsd xmm0, xmm1
@@ -34,6 +36,7 @@ impl JitCompiler {
             let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
             let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
             dynasm!(self.ops
+                ; .arch x64
                 ; mov rax, [r12 + lhs_offset + 8]
                 ; cvtsi2sd xmm0, rax
                 ; movsd xmm1, [r12 + rhs_offset + 8]
@@ -47,6 +50,7 @@ impl JitCompiler {
             let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
             let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
             dynasm!(self.ops
+                ; .arch x64
                 ; movsd xmm0, [r12 + lhs_offset + 8]
                 ; mov rax, [r12 + rhs_offset + 8]
                 ; cvtsi2sd xmm1, rax
@@ -63,6 +67,7 @@ impl JitCompiler {
         let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
         let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
         dynasm!(self.ops
+            ; .arch x64
             ; mov al, [r12 + lhs_offset]
             ; cmp al, 3
             ; je >float_path
@@ -96,11 +101,13 @@ impl JitCompiler {
         );
         self.store_xmm0_as_float(dest);
         dynasm!(self.ops
+            ; .arch x64
             ; jmp >done
             ; store_int:
         );
         self.store_from_rax(dest, 2);
         dynasm!(self.ops
+            ; .arch x64
             ; done:
         );
         Ok(())
@@ -118,6 +125,7 @@ impl JitCompiler {
             self.load_to_rax(lhs);
             self.load_to_rbx(rhs);
             dynasm!(self.ops
+                ; .arch x64
                 ; sub rax, rbx
             );
             self.store_from_rax(dest, 2);
@@ -128,6 +136,7 @@ impl JitCompiler {
             let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
             let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
             dynasm!(self.ops
+                ; .arch x64
                 ; movsd xmm0, [r12 + lhs_offset + 8]
                 ; movsd xmm1, [r12 + rhs_offset + 8]
                 ; subsd xmm0, xmm1
@@ -140,6 +149,7 @@ impl JitCompiler {
             let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
             let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
             dynasm!(self.ops
+                ; .arch x64
                 ; mov rax, [r12 + lhs_offset + 8]
                 ; cvtsi2sd xmm0, rax
                 ; movsd xmm1, [r12 + rhs_offset + 8]
@@ -153,6 +163,7 @@ impl JitCompiler {
             let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
             let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
             dynasm!(self.ops
+                ; .arch x64
                 ; movsd xmm0, [r12 + lhs_offset + 8]
                 ; mov rax, [r12 + rhs_offset + 8]
                 ; cvtsi2sd xmm1, rax
@@ -169,6 +180,7 @@ impl JitCompiler {
         let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
         let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
         dynasm!(self.ops
+            ; .arch x64
             ; mov al, [r12 + lhs_offset]
             ; cmp al, 3
             ; je >float_path
@@ -202,11 +214,13 @@ impl JitCompiler {
         );
         self.store_xmm0_as_float(dest);
         dynasm!(self.ops
+            ; .arch x64
             ; jmp >done
             ; store_int:
         );
         self.store_from_rax(dest, 2);
         dynasm!(self.ops
+            ; .arch x64
             ; done:
         );
         Ok(())
@@ -224,6 +238,7 @@ impl JitCompiler {
             self.load_to_rax(lhs);
             self.load_to_rbx(rhs);
             dynasm!(self.ops
+                ; .arch x64
                 ; imul rax, rbx
             );
             self.store_from_rax(dest, 2);
@@ -234,6 +249,7 @@ impl JitCompiler {
             let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
             let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
             dynasm!(self.ops
+                ; .arch x64
                 ; movsd xmm0, [r12 + lhs_offset + 8]
                 ; movsd xmm1, [r12 + rhs_offset + 8]
                 ; mulsd xmm0, xmm1
@@ -246,6 +262,7 @@ impl JitCompiler {
             let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
             let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
             dynasm!(self.ops
+                ; .arch x64
                 ; mov rax, [r12 + lhs_offset + 8]
                 ; cvtsi2sd xmm0, rax
                 ; movsd xmm1, [r12 + rhs_offset + 8]
@@ -259,6 +276,7 @@ impl JitCompiler {
             let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
             let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
             dynasm!(self.ops
+                ; .arch x64
                 ; movsd xmm0, [r12 + lhs_offset + 8]
                 ; mov rax, [r12 + rhs_offset + 8]
                 ; cvtsi2sd xmm1, rax
@@ -275,6 +293,7 @@ impl JitCompiler {
         let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
         let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
         dynasm!(self.ops
+            ; .arch x64
             ; mov al, [r12 + lhs_offset]
             ; cmp al, 3
             ; je >float_path
@@ -308,11 +327,13 @@ impl JitCompiler {
         );
         self.store_xmm0_as_float(dest);
         dynasm!(self.ops
+            ; .arch x64
             ; jmp >done
             ; store_int:
         );
         self.store_from_rax(dest, 2);
         dynasm!(self.ops
+            ; .arch x64
             ; done:
         );
         Ok(())
@@ -330,6 +351,7 @@ impl JitCompiler {
             self.load_to_rax(lhs);
             self.load_to_rbx(rhs);
             dynasm!(self.ops
+                ; .arch x64
                 ; test rbx, rbx
                 ; jz >fail
                 ; cqo
@@ -343,6 +365,7 @@ impl JitCompiler {
             let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
             let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
             dynasm!(self.ops
+                ; .arch x64
                 ; movsd xmm0, [r12 + lhs_offset + 8]
                 ; movsd xmm1, [r12 + rhs_offset + 8]
                 ; divsd xmm0, xmm1
@@ -355,6 +378,7 @@ impl JitCompiler {
             let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
             let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
             dynasm!(self.ops
+                ; .arch x64
                 ; mov rax, [r12 + lhs_offset + 8]
                 ; cvtsi2sd xmm0, rax
                 ; movsd xmm1, [r12 + rhs_offset + 8]
@@ -368,6 +392,7 @@ impl JitCompiler {
             let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
             let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
             dynasm!(self.ops
+                ; .arch x64
                 ; movsd xmm0, [r12 + lhs_offset + 8]
                 ; mov rax, [r12 + rhs_offset + 8]
                 ; cvtsi2sd xmm1, rax
@@ -384,6 +409,7 @@ impl JitCompiler {
         let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
         let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
         dynasm!(self.ops
+            ; .arch x64
             ; mov al, [r12 + lhs_offset]
             ; cmp al, 3
             ; je >float_path
@@ -420,11 +446,13 @@ impl JitCompiler {
         );
         self.store_xmm0_as_float(dest);
         dynasm!(self.ops
+            ; .arch x64
             ; jmp >done
             ; store_int:
         );
         self.store_from_rax(dest, 2);
         dynasm!(self.ops
+            ; .arch x64
             ; done:
         );
         Ok(())
@@ -442,6 +470,7 @@ impl JitCompiler {
             self.load_to_rax(lhs);
             self.load_to_rbx(rhs);
             dynasm!(self.ops
+                ; .arch x64
                 ; test rbx, rbx
                 ; jz >fail
                 ; cqo
@@ -459,6 +488,7 @@ impl JitCompiler {
         let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
         let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
         dynasm!(self.ops
+            ; .arch x64
             ; mov rax, [r12 + lhs_offset + 8]
             ; mov rbx, [r12 + rhs_offset + 8]
             ; test rbx, rbx

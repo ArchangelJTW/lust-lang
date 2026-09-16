@@ -17,7 +17,11 @@ use core::cell::RefCell;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::{ptr, slice, str};
-use hashbrown::{DefaultHashBuilder, HashMap};
+// FixedState (not hashbrown's DefaultHashBuilder/foldhash RandomState): RandomState
+// resolves its global seed from a per-crate-copy static, so maps created by the host
+// binary are unreadable by extension cdylibs that statically link their own copy.
+use foldhash::fast::FixedState as DefaultHashBuilder;
+use hashbrown::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TaskHandle(pub u64);
 impl TaskHandle {

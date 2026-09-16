@@ -27,7 +27,11 @@ pub(super) use alloc::{
     vec::Vec,
 };
 use core::cell::RefCell;
-use hashbrown::{DefaultHashBuilder, HashMap};
+// FixedState (not hashbrown's DefaultHashBuilder/foldhash RandomState): RandomState
+// resolves its global seed from a per-crate-copy static, so maps created by the host
+// binary are unreadable by extension cdylibs that statically link their own copy.
+use foldhash::fast::FixedState as DefaultHashBuilder;
+use hashbrown::HashMap;
 mod api;
 mod execution;
 mod tasks;

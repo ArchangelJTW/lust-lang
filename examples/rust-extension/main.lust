@@ -5,6 +5,9 @@ use lust_double.nested.host_quadruple
 local factors: Array<Factor> = []
 local operations: Array<Operation> = []
 
+local something = 3.5
+println("something: " .. math.floor(something))
+
 function build_examples()
     array.clear(factors)
     array.clear(operations)

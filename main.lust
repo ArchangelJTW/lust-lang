@@ -1,0 +1,15 @@
+use lust_fn_test.*
+
+local volume = 0.75
+
+function draw()
+    horizontal(function()
+        label("Volume: " .. tostring(math.floor(volume)))
+    end)
+end
+
+function main()
+    draw()
+end
+
+main()

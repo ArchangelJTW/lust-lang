@@ -821,13 +821,14 @@ dependencies = [
 
 [[package]]
 name = "lust-rs"
-version = "3.5.5"
+version = "3.5.6"
 dependencies = [
  "console_error_panic_hook",
  "dirs",
  "dynasm",
  "dynasmrt",
  "esp-println",
+ "foldhash",
  "full_moon",
  "getrandom 0.4.3",
  "hashbrown 0.17.1",

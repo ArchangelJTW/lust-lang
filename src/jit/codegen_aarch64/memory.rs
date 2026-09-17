@@ -39,6 +39,26 @@ impl JitCompiler {
     }
 
     pub(super) fn compile_move(&mut self, dest: u8, src: u8) -> Result<()> {
+        // A pinned destination is only ever written with a scalar of its
+        // own type (see pins::plan), so the move is a register copy; the
+        // helper below would update memory and leave the pin stale.
+        if let Some(pin) = self.active_pin(dest) {
+            match pin.ty {
+                ValueType::Float => {
+                    self.load_payload_f(0, src);
+                    self.store_d0_as_float(dest);
+                }
+                ValueType::Int => {
+                    self.load_payload(0, src);
+                    self.store_from_x0(dest, ValueTag::Int.as_u8());
+                }
+                _ => {
+                    self.load_payload(0, src);
+                    self.store_from_x0(dest, ValueTag::Bool.as_u8());
+                }
+            }
+            return Ok(());
+        }
         unsafe extern "C" {
             fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
         }

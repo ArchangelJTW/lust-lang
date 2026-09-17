@@ -9,6 +9,7 @@
 //   x20 – VM pointer            (x1 on entry)          callee-saved
 //   x21 – inline-frame chain head (0 = none)           callee-saved
 //   x22 – exit code preserved across the postamble     callee-saved
+//   x23..x28, d8..d15 – pinned VM registers (see pins.rs)  callee-saved
 //   x0  – primary scratch / helper result ("rax")
 //   x9  – secondary scratch ("rbx")
 //   x10 – tertiary scratch ("rcx")
@@ -28,7 +29,9 @@
 //   [x29 - 16]  saved x19
 //   [x29 - 24]  saved x22
 //   [x29 - 32]  saved x21
-//   [x29 - 32 - stack_size, x29 - 32)  local area (specialized slots)
+//   [x29 - 80, x29 - 32)   saved x23..x28
+//   [x29 - 144, x29 - 80)  saved d8..d15
+//   [x29 - 144 - stack_size, x29 - 144)  local area (specialized slots)
 //
 // Exits restore `sp` from x29, so an exit taken from inside an inlined call
 // frame (which lives below the local area) unwinds correctly. The exit path
@@ -51,8 +54,10 @@ use hashbrown::HashMap;
 /// Must be a multiple of 16 to keep `sp` aligned.
 pub(super) const MIN_JIT_STACK_SIZE: i32 = 512;
 
-/// Bytes of callee-saved registers stored below x29 (x19/x20 and x21/x22).
-pub(super) const SAVED_BELOW_FP: i32 = 32;
+/// Bytes of callee-saved registers stored below x29: x19..x28 (5 pairs)
+/// and d8..d15 (4 pairs). x23..x28 and d8..d15 hold pinned VM registers
+/// (see `pins`).
+pub(super) const SAVED_BELOW_FP: i32 = 32 + 48 + 64;
 
 /// Offset from x29 of the first specialized slot. Slots grow downward from
 /// just below the saved registers.
@@ -79,6 +84,7 @@ mod comparisons;
 mod guards;
 mod logic;
 mod memory;
+mod pins;
 mod registers;
 mod specialization;
 
@@ -103,6 +109,13 @@ pub struct JitCompiler {
     pub(super) specialized_values: HashMap<usize, SpecializedValue>,
     /// Registers proven to contain non-owning scalar values at this point.
     pub(super) scalar_registers: HashMap<u8, ValueType>,
+    /// VM registers held in machine registers for the loop body.
+    pins: HashMap<u8, pins::Pin>,
+    /// Pins apply only while compiling the loop body (not the preamble,
+    /// postamble, or inline-call bodies, which address other storage).
+    pin_active: bool,
+    /// Carried pins whose machine value may be newer than memory.
+    dirty_pins: Vec<u8>,
     /// Next ID for specialized values
     #[allow(dead_code)]
     pub(super) next_specialized_id: usize,

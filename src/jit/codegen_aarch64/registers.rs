@@ -12,6 +12,79 @@ pub(super) fn reg_offset(vm_reg: u8) -> i32 {
 }
 
 impl JitCompiler {
+    /// The pin for a VM register, if pins are in effect at this point.
+    pub(super) fn active_pin(&self, vm_reg: u8) -> Option<pins::Pin> {
+        if self.pin_active {
+            self.pins.get(&vm_reg).copied()
+        } else {
+            None
+        }
+    }
+
+    fn pin_tag(pin: &pins::Pin) -> u8 {
+        match pin.ty {
+            ValueType::Bool => ValueTag::Bool.as_u8(),
+            ValueType::Int => ValueTag::Int.as_u8(),
+            ValueType::Float => ValueTag::Float.as_u8(),
+            _ => unreachable!("only scalars are pinned"),
+        }
+    }
+
+    fn mark_dirty(&mut self, vm_reg: u8) {
+        if !self.dirty_pins.contains(&vm_reg) {
+            self.dirty_pins.push(vm_reg);
+        }
+    }
+
+    /// Write a pinned register's payload to the VM register array. The tag
+    /// is never written: for a proven pin memory already holds it, and for
+    /// a not-yet-guarded carried pin the payload bits are the ones loaded
+    /// from memory, so the store changes nothing.
+    pub(super) fn emit_pin_writeback(&mut self, vm_reg: u8, pin: pins::Pin) {
+        let offset = (reg_offset(vm_reg) + 8) as u32;
+        match pin.ty {
+            ValueType::Float => dynasm!(self.ops ; .arch aarch64 ; str D(pin.reg), [x19, #offset]),
+            _ => dynasm!(self.ops ; .arch aarch64 ; str X(pin.reg), [x19, #offset]),
+        }
+    }
+
+    /// Load a carried pin's payload bits from the VM register array (loop
+    /// prologue). No type check: see `emit_pin_writeback`.
+    pub(super) fn emit_pin_load(&mut self, vm_reg: u8, pin: pins::Pin) {
+        let offset = (reg_offset(vm_reg) + 8) as u32;
+        match pin.ty {
+            ValueType::Float => dynasm!(self.ops ; .arch aarch64 ; ldr D(pin.reg), [x19, #offset]),
+            // Bools are read through the low byte; the full word keeps the
+            // write-back bit-identical.
+            _ => dynasm!(self.ops ; .arch aarch64 ; ldr X(pin.reg), [x19, #offset]),
+        }
+    }
+
+    /// Flush every carried pin that may be newer than memory.
+    pub(super) fn flush_dirty_pins(&mut self) {
+        let dirty = mem::take(&mut self.dirty_pins);
+        for vm_reg in dirty {
+            if let Some(pin) = self.pins.get(&vm_reg).copied() {
+                self.emit_pin_writeback(vm_reg, pin);
+            }
+        }
+    }
+
+    /// Write back every carried pin (trace exit, after inline frames are
+    /// unwound so x19 is the trace's own register array again).
+    pub(super) fn emit_writeback_carried_pins(&mut self) {
+        let mut carried: Vec<(u8, pins::Pin)> = self
+            .pins
+            .iter()
+            .filter(|(_, pin)| pin.class == pins::PinClass::Carried)
+            .map(|(r, pin)| (*r, *pin))
+            .collect();
+        carried.sort_by_key(|(r, _)| *r);
+        for (vm_reg, pin) in carried {
+            self.emit_pin_writeback(vm_reg, pin);
+        }
+    }
+
     // ── Immediates ────────────────────────────────────────────────────────
 
     /// X(reg) = value, via movz + movk (skipping zero halves after the first).
@@ -103,8 +176,21 @@ impl JitCompiler {
         self.emit_add_imm(dst, 19, reg_offset(vm_reg));
     }
 
-    /// W(w) = discriminant byte of registers[vm_reg]
+    /// W(w) = discriminant byte of registers[vm_reg]. For a pinned register
+    /// the tag is a compile-time constant (reads only happen after the type
+    /// is proven; stores use `load_tag_from_memory`).
     pub(super) fn load_tag(&mut self, w: u8, vm_reg: u8) {
+        if let Some(pin) = self.active_pin(vm_reg) {
+            let tag = Self::pin_tag(&pin) as u32;
+            dynasm!(self.ops ; .arch aarch64 ; movz W(w), #tag);
+            return;
+        }
+        self.load_tag_from_memory(w, vm_reg);
+    }
+
+    /// W(w) = the discriminant byte actually in memory, pinned or not. The
+    /// first write to a write-through pin may replace an owned value.
+    pub(super) fn load_tag_from_memory(&mut self, w: u8, vm_reg: u8) {
         let offset = reg_offset(vm_reg);
         if offset <= IMM12_MAX {
             let offset = offset as u32;
@@ -117,6 +203,13 @@ impl JitCompiler {
 
     /// W(w) = low payload byte of registers[vm_reg] (bool payload)
     pub(super) fn load_bool_payload(&mut self, w: u8, vm_reg: u8) {
+        if let Some(pin) = self.active_pin(vm_reg) {
+            match pin.ty {
+                ValueType::Float => dynasm!(self.ops ; .arch aarch64 ; fmov W(w), S(pin.reg)),
+                _ => dynasm!(self.ops ; .arch aarch64 ; and WSP(w), W(pin.reg), #0xff),
+            }
+            return;
+        }
         let offset = reg_offset(vm_reg) + 8;
         if offset <= IMM12_MAX {
             let offset = offset as u32;
@@ -143,6 +236,13 @@ impl JitCompiler {
 
     /// X(x) = 64-bit payload of registers[vm_reg]
     pub(super) fn load_payload(&mut self, x: u8, vm_reg: u8) {
+        if let Some(pin) = self.active_pin(vm_reg) {
+            match pin.ty {
+                ValueType::Float => dynasm!(self.ops ; .arch aarch64 ; fmov X(x), D(pin.reg)),
+                _ => dynasm!(self.ops ; .arch aarch64 ; mov X(x), X(pin.reg)),
+            }
+            return;
+        }
         let offset = (reg_offset(vm_reg) + 8) as u32;
         dynasm!(self.ops ; .arch aarch64 ; ldr X(x), [x19, #offset]);
     }
@@ -155,12 +255,25 @@ impl JitCompiler {
 
     /// D(d) = float payload of registers[vm_reg]
     pub(super) fn load_payload_f(&mut self, d: u8, vm_reg: u8) {
+        if let Some(pin) = self.active_pin(vm_reg) {
+            match pin.ty {
+                ValueType::Float => dynasm!(self.ops ; .arch aarch64 ; fmov D(d), D(pin.reg)),
+                _ => dynasm!(self.ops ; .arch aarch64 ; fmov D(d), X(pin.reg)),
+            }
+            return;
+        }
         let offset = (reg_offset(vm_reg) + 8) as u32;
         dynasm!(self.ops ; .arch aarch64 ; ldr D(d), [x19, #offset]);
     }
 
     /// D(d) = float(int payload of registers[vm_reg]); clobbers x11
     pub(super) fn load_payload_int_as_f(&mut self, d: u8, vm_reg: u8) {
+        if let Some(pin) = self.active_pin(vm_reg)
+            && pin.ty != ValueType::Float
+        {
+            dynasm!(self.ops ; .arch aarch64 ; scvtf D(d), X(pin.reg));
+            return;
+        }
         self.load_payload(11, vm_reg);
         dynasm!(self.ops ; .arch aarch64 ; scvtf D(d), x11);
     }
@@ -205,6 +318,15 @@ impl JitCompiler {
             2 => ValueType::Int,
             _ => unreachable!("unsupported scalar Value discriminant"),
         };
+        if let Some(pin) = self.active_pin(vm_reg) {
+            assert_eq!(pin.ty, stored_type, "pinned register written with another type");
+            dynasm!(self.ops ; .arch aarch64 ; mov X(pin.reg), x0);
+            if pin.class == pins::PinClass::Carried {
+                self.mark_dirty(vm_reg);
+                return;
+            }
+            // Local pins write through so memory is always current.
+        }
         if self.scalar_registers.get(&vm_reg) == Some(&stored_type) {
             self.store_payload(vm_reg, 0);
             return;
@@ -230,7 +352,7 @@ impl JitCompiler {
             }
             _ => unreachable!("unsupported scalar Value discriminant"),
         };
-        self.load_tag(9, vm_reg);
+        self.load_tag_from_memory(9, vm_reg);
         dynasm!(self.ops
             ; .arch aarch64
             ; cmp w9, #scalar_max_tag
@@ -256,6 +378,14 @@ impl JitCompiler {
     /// that previously lived there.
     pub(super) fn store_d0_as_float(&mut self, vm_reg: u8) {
         let float_tag = ValueTag::Float.as_u8();
+        if let Some(pin) = self.active_pin(vm_reg) {
+            assert_eq!(pin.ty, ValueType::Float, "pinned register written with another type");
+            dynasm!(self.ops ; .arch aarch64 ; fmov D(pin.reg), d0);
+            if pin.class == pins::PinClass::Carried {
+                self.mark_dirty(vm_reg);
+                return;
+            }
+        }
         if self.scalar_registers.get(&vm_reg) == Some(&ValueType::Float) {
             let offset = (reg_offset(vm_reg) + 8) as u32;
             dynasm!(self.ops ; .arch aarch64 ; str d0, [x19, #offset]);
@@ -271,7 +401,7 @@ impl JitCompiler {
         unsafe extern "C" {
             fn jit_replace_float_bits(dest: *mut Value, bits: u64) -> u8;
         }
-        self.load_tag(9, vm_reg);
+        self.load_tag_from_memory(9, vm_reg);
         dynasm!(self.ops
             ; .arch aarch64
             ; fmov x1, d0

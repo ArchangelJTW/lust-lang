@@ -17,7 +17,9 @@ impl JitCompiler {
         };
         let expected_discriminant = expected_tag.as_u8() as u32;
         let guard_return_value = (guard_index + 1) as i32;
-        self.load_tag(0, register);
+        // A guard is the proof of a register's type; it must look at memory
+        // even when the register is pinned.
+        self.load_tag_from_memory(0, register);
         dynasm!(self.ops
             ; .arch aarch64
             ; cmp w0, #expected_discriminant

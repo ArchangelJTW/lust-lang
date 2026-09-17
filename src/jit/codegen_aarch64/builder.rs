@@ -13,6 +13,9 @@ impl JitCompiler {
             specialization_registry: SpecializationRegistry::new(),
             specialized_values: HashMap::new(),
             scalar_registers: HashMap::new(),
+            pins: HashMap::new(),
+            pin_active: false,
+            dirty_pins: Vec::new(),
             next_specialized_id: 0,
         }
     }
@@ -61,14 +64,28 @@ impl JitCompiler {
     ) -> Result<CompiledTrace> {
         self.scalar_registers.clear();
         self.last_fail_island = self.ops.offset().0;
+        self.pins = pins::plan(&hoisted_constants, &trace.preamble, &trace.ops);
+        self.pin_active = false;
+        self.dirty_pins.clear();
         let stack_size = Self::compute_stack_size(trace);
         let mut guards = Vec::new();
         let mut guard_index = 0i32;
+        // Exits from the preamble and the loop prologue: nothing pinned yet.
         let exit_label = self.ops.new_dynamic_label();
+        // Exits from the loop body: write pinned registers back first.
+        let exit_pinned_label = self.ops.new_dynamic_label();
+        let after_unwind_label = self.ops.new_dynamic_label();
+        let epilogue_label = self.ops.new_dynamic_label();
         let fail_label = self.ops.new_dynamic_label();
         self.exit_stack.push(exit_label);
         self.fail_stack.push(fail_label);
-        crate::jit::log(|| format!("🔧 JIT(aarch64): Emitting prologue with sub sp, {}", stack_size));
+        crate::jit::log(|| {
+            format!(
+                "🔧 JIT(aarch64): Emitting prologue with sub sp, {} ({} pinned registers)",
+                stack_size,
+                self.pins.len()
+            )
+        });
 
         // Entry: x0 = *mut Value (registers), x1 = *mut VM, x2 = *const Function
         dynasm!(self.ops
@@ -77,6 +94,13 @@ impl JitCompiler {
             ; mov x29, sp
             ; stp x19, x20, [sp, -16]!
             ; stp x21, x22, [sp, -16]!
+            ; stp x23, x24, [sp, -16]!
+            ; stp x25, x26, [sp, -16]!
+            ; stp x27, x28, [sp, -16]!
+            ; stp d8, d9, [sp, -16]!
+            ; stp d10, d11, [sp, -16]!
+            ; stp d12, d13, [sp, -16]!
+            ; stp d14, d15, [sp, -16]!
         );
         self.emit_sub_sp(stack_size);
         dynasm!(self.ops
@@ -103,6 +127,36 @@ impl JitCompiler {
         jit::log(|| format!("🔧 JIT: Compiling preamble ({} ops)", trace.preamble.len()));
         self.compile_ops(&trace.preamble, &mut guard_index, &mut guards)?;
 
+        // `>fail` references so far (preamble) bind here: nothing to write back.
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b >preamble_fail_skip
+            ; fail:
+            ; b => fail_label
+            ; preamble_fail_skip:
+        );
+
+        // Loop prologue: load carried pins.
+        let mut pinned: Vec<(u8, pins::Pin)> = self.pins.iter().map(|(r, p)| (*r, *p)).collect();
+        pinned.sort_by_key(|(r, _)| *r);
+        for (vm_reg, pin) in &pinned {
+            if pin.class == pins::PinClass::Carried {
+                self.emit_pin_load(*vm_reg, *pin);
+            }
+        }
+        let has_pins = !self.pins.is_empty();
+        if has_pins {
+            self.pin_active = true;
+            // Iteration two onwards arrives with every carried pin possibly
+            // newer than memory.
+            self.dirty_pins = pinned
+                .iter()
+                .filter(|(_, p)| p.class == pins::PinClass::Carried)
+                .map(|(r, _)| *r)
+                .collect();
+            self.exit_stack.push(exit_pinned_label);
+        }
+
         // Create a loop_start label AFTER preamble, BEFORE loop body
         let loop_start_label = self.ops.new_dynamic_label();
         dynasm!(self.ops
@@ -120,33 +174,45 @@ impl JitCompiler {
             ; .arch aarch64
             ; b => loop_start_label
         );
+        if has_pins {
+            self.exit_stack.pop();
+        }
+        self.pin_active = false;
+
+        // `>fail` references from the body bind here.
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; fail:
+            ; movn w0, 0
+            ; b => exit_pinned_label
+        );
 
         unsafe extern "C" {
             fn jit_drop_values(values: *mut Value, len: usize);
         }
-        let unwound_label = self.ops.new_dynamic_label();
+        // Body exits: preserve the exit code, unwind inline frames so x19 is
+        // the trace's own register array again, then write pinned registers
+        // back to it.
         dynasm!(self.ops
             ; .arch aarch64
+            ; => exit_pinned_label
+            ; mov w22, w0
+        );
+        self.emit_unwind_inline_frames(jit_drop_values as *const ());
+        self.emit_writeback_carried_pins();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b => after_unwind_label
             ; => exit_label
             ; exit:
             // Postamble helpers may overwrite w0. Preserve the exit reason in
             // a callee-saved register until specialized state is materialized.
             ; mov w22, w0
-            // Drain any inline-call frames left on the chain. Each record is
-            // { value_count, saved_x19, prev_x21 }; the callee registers live
-            // directly below it and must be dropped before we abandon them.
-            ; unwind:
-            ; cbz x21, => unwound_label
-            ; mov x0, x19
-            ; ldr x1, [x21]
         );
-        self.emit_call(jit_drop_values as *const ());
+        self.emit_unwind_inline_frames(jit_drop_values as *const ());
         dynasm!(self.ops
             ; .arch aarch64
-            ; ldr x19, [x21, 8]
-            ; ldr x21, [x21, 16]
-            ; b <unwind
-            ; => unwound_label
+            ; => after_unwind_label
         );
 
         // Compile postamble (executed once at trace exit)
@@ -168,13 +234,27 @@ impl JitCompiler {
         dynasm!(self.ops
             ; .arch aarch64
             ; mov w0, w22
+            ; => epilogue_label
             ; sub sp, x29, #saved_below_fp
+            ; ldp d14, d15, [sp], 16
+            ; ldp d12, d13, [sp], 16
+            ; ldp d10, d11, [sp], 16
+            ; ldp d8, d9, [sp], 16
+            ; ldp x27, x28, [sp], 16
+            ; ldp x25, x26, [sp], 16
+            ; ldp x23, x24, [sp], 16
             ; ldp x21, x22, [sp], 16
             ; ldp x19, x20, [sp], 16
             ; ldp x29, x30, [sp], 16
             ; ret
-            ; => fail_label
+            // A failing postamble must not run the postamble again: return
+            // -1 straight through the epilogue. `>fail` references from the
+            // postamble bind here.
             ; fail:
+            ; movn w0, 0
+            ; b => epilogue_label
+            // Failures before anything is pinned (preamble).
+            ; => fail_label
             ; movn w0, 0
             ; b => exit_label
         );
@@ -221,6 +301,28 @@ impl JitCompiler {
             hoisted_constants,
         })
     }
+    /// Drain the inline-call frame chain in x21. Each record is
+    /// { value_count, saved_x19, prev_x21 }; the callee registers live
+    /// directly below it and must be dropped before we abandon them.
+    fn emit_unwind_inline_frames(&mut self, drop_values: *const ()) {
+        let done = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; unwind:
+            ; cbz x21, => done
+            ; mov x0, x19
+            ; ldr x1, [x21]
+        );
+        self.emit_call(drop_values);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x19, [x21, 8]
+            ; ldr x21, [x21, 16]
+            ; b <unwind
+            ; => done
+        );
+    }
+
     fn compile_ops(
         &mut self,
         ops: &[TraceOp],
@@ -231,6 +333,23 @@ impl JitCompiler {
         for (op_index, op) in ops.iter().enumerate() {
             if skip_next {
                 skip_next = false;
+                continue;
+            }
+            if self.pin_active && pins::op_touches_register_memory(op) {
+                self.flush_dirty_pins();
+            }
+            // A type guard on a pin whose type is proven at entry is
+            // redundant: only typed writes reach it. Other pins keep their
+            // guard, which is what proves their type.
+            if let TraceOp::Guard {
+                register,
+                expected_type,
+            } = op
+                && self
+                    .active_pin(*register)
+                    .is_some_and(|pin| pin.proven_at_entry && pin.ty == *expected_type)
+            {
+                self.update_scalar_registers(op);
                 continue;
             }
             if let Some(next) = ops.get(op_index + 1) {
@@ -514,9 +633,15 @@ impl JitCompiler {
                     callee,
                     trace,
                 } => {
+                    // The callee body addresses its own frame: pins are
+                    // suspended, and memory must be current on entry.
                     let outer_scalar_registers = mem::take(&mut self.scalar_registers);
-                    self.compile_inline_call(*dest, *callee, trace, guard_index, guards)?;
+                    let outer_pin_active = self.pin_active;
+                    self.pin_active = false;
+                    let result = self.compile_inline_call(*dest, *callee, trace, guard_index, guards);
+                    self.pin_active = outer_pin_active;
                     self.scalar_registers = outer_scalar_registers;
+                    result?;
                 }
 
                 TraceOp::CallMethod {

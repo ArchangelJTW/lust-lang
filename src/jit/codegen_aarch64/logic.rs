@@ -1,6 +1,29 @@
 use super::*;
 impl JitCompiler {
     pub(super) fn compile_neg(&mut self, dest: u8, src: u8) -> Result<()> {
+        // With the operand's type known (a pin, or scalar tracking) emit just
+        // that path. A pinned destination always has a known operand type,
+        // and the runtime-dispatched version below would store both types.
+        let known = self
+            .active_pin(src)
+            .map(|pin| pin.ty)
+            .or_else(|| self.scalar_registers.get(&src).copied())
+            .or_else(|| self.active_pin(dest).map(|pin| pin.ty));
+        match known {
+            Some(ValueType::Int) => {
+                self.load_payload(0, src);
+                dynasm!(self.ops ; .arch aarch64 ; neg x0, x0);
+                self.store_from_x0(dest, ValueTag::Int.as_u8());
+                return Ok(());
+            }
+            Some(ValueType::Float) => {
+                self.load_payload_f(0, src);
+                dynasm!(self.ops ; .arch aarch64 ; fneg d0, d0);
+                self.store_d0_as_float(dest);
+                return Ok(());
+            }
+            _ => {}
+        }
         let float_tag = ValueTag::Float.as_u8() as u32;
         self.load_tag(0, src);
         dynasm!(self.ops

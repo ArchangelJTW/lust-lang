@@ -590,7 +590,7 @@ impl VM {
                                 message: "Division by zero".to_string(),
                             })
                         } else {
-                            Ok(Value::Int(a / b))
+                            Ok(Value::Int(a.wrapping_div(b)))
                         }
                     })?;
                 }
@@ -601,7 +601,7 @@ impl VM {
                                 message: "Modulo by zero".to_string(),
                             })
                         } else {
-                            Ok(Value::Int(a % b))
+                            Ok(Value::Int(a.wrapping_rem(b)))
                         }
                     })?;
                 }
@@ -727,7 +727,7 @@ impl VM {
                                     message: "Division by zero".to_string(),
                                 })
                             } else {
-                                Ok(Value::Int(a / b))
+                                Ok(Value::Int(a.wrapping_div(*b)))
                             }
                         }
 
@@ -752,7 +752,7 @@ impl VM {
                                     message: "Modulo by zero".to_string(),
                                 })
                             } else {
-                                Ok(Value::Int(a % b))
+                                Ok(Value::Int(a.wrapping_rem(*b)))
                             }
                         }
 

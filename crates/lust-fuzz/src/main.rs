@@ -149,7 +149,7 @@ fn resident_bytes() -> Option<u64> {
 /// the machine starts swapping. Memory is the real guard; the time limit is
 /// generous because background-QoS workers on efficiency cores are several
 /// times slower than a foreground run.
-const MAX_CASE_SECONDS: f64 = 60.0;
+const MAX_CASE_SECONDS: f64 = 120.0;
 const MAX_RESIDENT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 fn main() {

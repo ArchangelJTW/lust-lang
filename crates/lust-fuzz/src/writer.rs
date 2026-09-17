@@ -529,6 +529,8 @@ struct FuncSig {
     name: String,
     params: Vec<Ty>,
     ret: Ty,
+    /// Estimated iterations one call performs (its own loops and calls).
+    work: i64,
 }
 
 struct Gen {
@@ -547,7 +549,16 @@ struct Gen {
     /// Arrays currently being iterated by an enclosing `for … in`: pushing
     /// to one never terminates (the loop walks the live array).
     iterating: Vec<String>,
+    /// Product of the enclosing loops' iteration counts: new loops are
+    /// sized so a program's total work stays bounded (see `MAX_WORK`).
+    iter_scale: i64,
+    /// Work estimate of the function being generated: the largest loop
+    /// product reached plus the work of every call it makes, scaled.
+    cur_work: i64,
 }
+
+/// Rough cap on loop iterations (plus called work) a program may execute.
+const MAX_WORK: i64 = 60_000;
 
 const FLOAT_LITS: &[&str] = &[
     "0.0", "0.5", "1.0", "1.5", "2.25", "3.0", "10.0", "0.1", "100.5", "1234.75", "0.001", "7.0",
@@ -566,6 +577,8 @@ pub fn program(seed: u64, size: u32) -> Program {
         in_func: false,
         budget: (size as i64) * 24,
         iterating: Vec::new(),
+        iter_scale: 1,
+        cur_work: 0,
     };
     let mut funcs = Vec::new();
     let func_count = g.rng.below(size as u64 + 1) as usize;
@@ -637,6 +650,8 @@ impl Gen {
         }
         let ret = *self.rng.pick(&scalar);
         self.in_func = true;
+        self.iter_scale = 1;
+        self.cur_work = 0;
         // Straight-line helpers are inlinable by the trace recorder; helpers
         // with control flow are called out of line. Both are worth having.
         let straight = self.rng.chance(0.5);
@@ -665,10 +680,14 @@ impl Gen {
         let ret_expr = self.expr(ret, 2);
         self.size = saved_size;
         self.in_func = false;
+        self.iter_scale = 1;
+        let work = self.cur_work.max(1);
+        self.cur_work = 0;
         self.funcs.push(FuncSig {
             name: name.clone(),
             params: params.iter().map(|(_, t)| *t).collect(),
             ret,
+            work,
         });
         Func {
             name,
@@ -798,19 +817,29 @@ impl Gen {
         Some(Stmt::SetField { obj, field, expr })
     }
 
+    /// Largest iteration count a new loop may have here without the
+    /// program's total work exceeding MAX_WORK.
+    fn max_iterations(&self) -> i64 {
+        (MAX_WORK / self.iter_scale.max(1)).clamp(2, 40)
+    }
+
     fn while_loop(&mut self) -> Stmt {
         let counter = self.fresh("i");
         // Bias towards enough iterations to make the loop hot.
+        let max = self.max_iterations();
         let bound = if self.rng.chance(0.8) {
-            self.rng.range(6, 40)
+            self.rng.range(6.min(max), max)
         } else {
-            self.rng.range(0, 5)
+            self.rng.range(0, 5.min(max))
         };
         self.scopes.push(Vec::new());
         self.declare(&counter, Ty::Int, true);
+        self.iter_scale *= bound.max(1);
+        self.cur_work = self.cur_work.max(self.iter_scale);
         self.loop_depth += 1;
         let body = self.block(false);
         self.loop_depth -= 1;
+        self.iter_scale /= bound.max(1);
         self.scopes.pop();
         Stmt::While {
             counter,
@@ -821,15 +850,19 @@ impl Gen {
 
     fn while_cond_loop(&mut self) -> Stmt {
         let counter = self.fresh("i");
-        let bound = self.rng.range(6, 40);
+        let max = self.max_iterations();
+        let bound = self.rng.range(6.min(max), max);
         // The extra condition may read variables the body changes, so the
         // loop can end early; the counter still bounds it.
         let cond = self.expr(Ty::Bool, 2);
         self.scopes.push(Vec::new());
         self.declare(&counter, Ty::Int, true);
+        self.iter_scale *= bound.max(1);
+        self.cur_work = self.cur_work.max(self.iter_scale);
         self.loop_depth += 1;
         let body = self.block(false);
         self.loop_depth -= 1;
+        self.iter_scale /= bound.max(1);
         self.scopes.pop();
         Stmt::WhileCond {
             counter,
@@ -849,9 +882,13 @@ impl Gen {
         self.scopes.push(Vec::new());
         self.declare(&var, Ty::Int, true);
         self.iterating.push(arr.clone());
+        // Arrays stay small (pushes are bounded by the loops around them).
+        self.iter_scale *= 8;
+        self.cur_work = self.cur_work.max(self.iter_scale);
         self.loop_depth += 1;
         let body = self.block(false);
         self.loop_depth -= 1;
+        self.iter_scale /= 8;
         self.iterating.pop();
         self.scopes.pop();
         Some(Stmt::ForIn { arr, var, body })
@@ -874,16 +911,21 @@ impl Gen {
     fn for_loop(&mut self) -> Stmt {
         let var = self.fresh("k");
         let lo = self.rng.range(-5, 5);
+        let max = self.max_iterations();
         let hi = if self.rng.chance(0.8) {
-            lo + self.rng.range(5, 30)
+            lo + self.rng.range(5.min(max), max)
         } else {
-            lo + self.rng.range(-2, 4)
+            lo + self.rng.range(-2, 4.min(max))
         };
+        let count = (hi - lo + 1).max(1);
         self.scopes.push(Vec::new());
         self.declare(&var, Ty::Int, true);
+        self.iter_scale *= count;
+        self.cur_work = self.cur_work.max(self.iter_scale);
         self.loop_depth += 1;
         let body = self.block(false);
         self.loop_depth -= 1;
+        self.iter_scale /= count;
         self.scopes.pop();
         Stmt::For { var, lo, hi, body }
     }
@@ -1079,11 +1121,19 @@ impl Gen {
     }
 
     fn call_returning(&mut self, ty: Ty, depth: u32) -> Option<Expr> {
-        let candidates: Vec<FuncSig> = self.funcs.iter().filter(|f| f.ret == ty).cloned().collect();
+        // A call here runs `iter_scale` times; keep the total within budget.
+        let scale = self.iter_scale.max(1);
+        let candidates: Vec<FuncSig> = self
+            .funcs
+            .iter()
+            .filter(|f| f.ret == ty && scale.saturating_mul(f.work) <= MAX_WORK)
+            .cloned()
+            .collect();
         if candidates.is_empty() {
             return None;
         }
         let f = self.rng.pick(&candidates).clone();
+        self.cur_work += scale * f.work;
         let args = f.params.iter().map(|t| self.expr(*t, depth.saturating_sub(1))).collect();
         Some(Expr::Call(f.name, args))
     }

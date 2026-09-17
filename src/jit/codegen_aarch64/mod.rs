@@ -62,6 +62,13 @@ pub(super) const SPECIALIZED_SLOT_SIZE: i32 = 32;
 /// Local-area bytes needed before the first specialized slot.
 pub(super) const SPECIALIZED_STACK_BASE: i32 = 32;
 
+/// Conditional branches and `cbz` reach only ±1 MB. Traces can exceed that
+/// (thousands of specialized ops), so `compile_ops` plants a local `fail:`
+/// island — a plain `b` (±128 MB) on to the next `fail:` — whenever this
+/// many bytes have been emitted since the last one, keeping every `>fail`
+/// reference within reach of the island that follows it.
+pub(super) const FAIL_ISLAND_INTERVAL: usize = 900 * 1024;
+
 /// Size of the metadata block pushed for each inlined call frame:
 /// { value_count: u64, saved_x19: *mut Value, prev_x21: *const u8, pad }
 pub(super) const INLINE_METADATA_SIZE: i32 = 32;
@@ -87,6 +94,8 @@ pub struct JitCompiler {
     fail_stack: Vec<dynasmrt::DynamicLabel>,
     exit_stack: Vec<dynasmrt::DynamicLabel>,
     inline_depth: usize,
+    /// Code offset of the last fail island (see `FAIL_ISLAND_INTERVAL`).
+    last_fail_island: usize,
     /// Registry for type specializations
     #[allow(dead_code)]
     pub(super) specialization_registry: SpecializationRegistry,

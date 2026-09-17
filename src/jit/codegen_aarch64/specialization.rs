@@ -131,7 +131,6 @@ impl JitCompiler {
                 out_cap: *mut usize,
             ) -> u8;
         }
-        let fail_label = self.current_fail_label();
 
         // Zero the (ptr, len, cap) triple before attempting the unbox: the
         // bailout path still runs the postamble, which reboxes from these
@@ -148,11 +147,7 @@ impl JitCompiler {
         );
         self.emit_reg_addr(0, source_reg);
         self.emit_call(jit_unbox_array_int as *const ());
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; and w0, w0, 0xff
-            ; cbz w0, => fail_label
-        );
+        self.emit_fail_if_w0_zero();
 
         Ok(())
     }
@@ -177,7 +172,6 @@ impl JitCompiler {
                 out_value_ptr: *mut Value,
             ) -> u8;
         }
-        let fail_label = self.current_fail_label();
 
         self.emit_slot_addr(11, stack_offset);
         dynasm!(self.ops
@@ -188,11 +182,7 @@ impl JitCompiler {
         );
         self.emit_reg_addr(3, dest_reg);
         self.emit_call(jit_rebox_array_int as *const ());
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; and w0, w0, 0xff
-            ; cbz w0, => fail_label
-        );
+        self.emit_fail_if_w0_zero();
         // Rebox consumes the raw Vec allocation. Clear the metadata so a
         // duplicated cleanup path is a harmless no-op rather than a second
         // Vec::from_raw_parts over freed storage.
@@ -227,7 +217,6 @@ impl JitCompiler {
                 value: LustInt,
             ) -> u8;
         }
-        let fail_label = self.current_fail_label();
 
         self.emit_slot_addr(0, stack_offset);
         dynasm!(self.ops
@@ -237,11 +226,7 @@ impl JitCompiler {
         );
         self.load_payload(3, value_reg);
         self.emit_call(jit_vec_int_push as *const ());
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; and w0, w0, 0xff
-            ; cbz w0, => fail_label
-        );
+        self.emit_fail_if_w0_zero();
 
         Ok(())
     }

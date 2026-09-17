@@ -9,18 +9,12 @@ impl JitCompiler {
             fail_stack: Vec::new(),
             exit_stack: Vec::new(),
             inline_depth: 0,
+            last_fail_island: 0,
             specialization_registry: SpecializationRegistry::new(),
             specialized_values: HashMap::new(),
             scalar_registers: HashMap::new(),
             next_specialized_id: 0,
         }
-    }
-
-    pub(super) fn current_fail_label(&self) -> dynasmrt::DynamicLabel {
-        *self
-            .fail_stack
-            .last()
-            .expect("JIT fail label stack is empty")
     }
 
     pub(super) fn current_exit_label(&self) -> dynasmrt::DynamicLabel {
@@ -66,6 +60,7 @@ impl JitCompiler {
         hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
         self.scalar_registers.clear();
+        self.last_fail_island = self.ops.offset().0;
         let stack_size = Self::compute_stack_size(trace);
         let mut guards = Vec::new();
         let mut guard_index = 0i32;
@@ -183,6 +178,9 @@ impl JitCompiler {
             ; movn w0, 0
             ; b => exit_label
         );
+        crate::jit::log(|| {
+            format!("📏 JIT(aarch64): trace code size {} bytes", self.ops.offset().0)
+        });
         let ops = mem::replace(&mut self.ops, Assembler::new().unwrap());
         let exec_buffer = ops.finalize().unwrap();
         let entry_point = exec_buffer.ptr(dynasmrt::AssemblyOffset(0));
@@ -744,9 +742,28 @@ impl JitCompiler {
                 TraceOp::Return { .. } => {}
             }
             self.update_scalar_registers(op);
+            self.maybe_emit_fail_island();
         }
 
         Ok(())
+    }
+
+    /// Plant a `fail:` island if the code since the last one is getting
+    /// close to the reach of a conditional branch (see FAIL_ISLAND_INTERVAL).
+    /// Only ever called between ops, so no op's own local labels are split.
+    fn maybe_emit_fail_island(&mut self) {
+        let here = self.ops.offset().0;
+        if here - self.last_fail_island < FAIL_ISLAND_INTERVAL {
+            return;
+        }
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b >fail_island_skip
+            ; fail:
+            ; b >fail
+            ; fail_island_skip:
+        );
+        self.last_fail_island = self.ops.offset().0;
     }
 
     fn compile_integer_add_immediate(

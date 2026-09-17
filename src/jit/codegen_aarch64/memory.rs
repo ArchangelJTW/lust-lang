@@ -139,9 +139,12 @@ impl JitCompiler {
         );
         self.emit_reg_addr(0, array);
         self.emit_call(jit_array_len_safe as *const ());
+        // `tbnz` only reaches ±32 KB; traces can be larger, so branch on
+        // the flags instead (`b.cond` reaches ±1 MB like every other exit).
         dynasm!(self.ops
             ; .arch aarch64
-            ; tbnz x0, 63, >fail
+            ; cmp x0, 0
+            ; b.lt >fail
         );
         self.store_from_x0(dest, ValueTag::Int.as_u8());
         Ok(())

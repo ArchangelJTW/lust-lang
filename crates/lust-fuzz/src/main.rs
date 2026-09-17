@@ -78,7 +78,18 @@ fn usage() -> ! {
     std::process::exit(64)
 }
 
+thread_local! {
+    static CURRENT_SEED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn main() {
+    // The workspace builds with panic=abort, so a panic inside an engine
+    // takes the whole run down; at least say which seed did it.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("\n=== panic while running seed {} ===", CURRENT_SEED.with(|c| c.get()));
+        default_hook(info);
+    }));
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         usage();
@@ -116,6 +127,7 @@ fn main() {
             print!("{}", writer::render(&writer::program(s.first_seed, s.size)));
         }
         "replay" => {
+            CURRENT_SEED.with(|c| c.set(s.first_seed));
             let program = writer::program(s.first_seed, s.size);
             let source = writer::render(&program);
             print!("{source}");
@@ -158,6 +170,7 @@ fn run(s: &Settings) {
                         break;
                     }
                     let seed = s.first_seed + k;
+                    CURRENT_SEED.with(|c| c.set(seed));
                     let program = writer::program(seed, s.size);
                     let started = Instant::now();
                     let result = run_case(&program, seed, &mut stats);

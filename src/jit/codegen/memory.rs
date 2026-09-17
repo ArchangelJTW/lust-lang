@@ -505,6 +505,7 @@ impl JitCompiler {
                 args_ptr: *const Value,
                 arg_count: u8,
                 dest_reg: u8,
+                out: *mut Value,
             ) -> u8;
             fn jit_current_registers(vm_ptr: *mut crate::VM) -> *mut Value;
         }
@@ -516,6 +517,17 @@ impl JitCompiler {
             ; lea rdx, [r12 + first_arg_offset]
             ; mov ecx, DWORD arg_count_i32
             ; mov r8d, DWORD dest_i32
+        );
+        // Inside an inlined frame the destination lives on our stack: hand
+        // the helper its address. At depth zero the VM frame may move.
+        if self.inline_depth > 0 {
+            let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
+            dynasm!(self.ops ; .arch x64 ; lea r9, [r12 + dest_offset]);
+        } else {
+            dynasm!(self.ops ; .arch x64 ; xor r9d, r9d);
+        }
+        dynasm!(self.ops
+            ; .arch x64
             ; mov rax, QWORD jit_call_function_safe as *const () as _
             ; call rax
             ; test al, al
@@ -555,6 +567,7 @@ impl JitCompiler {
                 args_ptr: *const Value,
                 arg_count: u8,
                 dest_reg: u8,
+                out: *mut Value,
             ) -> u8;
             fn jit_current_registers(vm_ptr: *mut crate::VM) -> *mut Value;
         }
@@ -562,6 +575,7 @@ impl JitCompiler {
         let (method_name_ptr, method_name_len) = self.retain_string(method_name);
         let first_arg_offset = (first_arg as i32) * (mem::size_of::<Value>() as i32);
         let arg_count_i32 = arg_count as i32;
+        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
         dynasm!(self.ops
             ; .arch x64
             ; mov rdi, r13
@@ -573,6 +587,15 @@ impl JitCompiler {
             ; sub rsp, 16
             ; mov rax, QWORD dest_i32 as i64
             ; mov [rsp], rax
+        );
+        // Eighth argument: result pointer for an inlined frame, else null.
+        if self.inline_depth > 0 {
+            dynasm!(self.ops ; .arch x64 ; lea rax, [r12 + dest_offset] ; mov [rsp + 8], rax);
+        } else {
+            dynasm!(self.ops ; .arch x64 ; mov QWORD [rsp + 8], 0);
+        }
+        dynasm!(self.ops
+            ; .arch x64
             ; mov rax, QWORD jit_call_method_safe as *const () as _
             ; call rax
             ; add rsp, 16

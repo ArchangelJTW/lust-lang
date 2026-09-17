@@ -2320,12 +2320,18 @@ pub unsafe extern "C" fn jit_call_native_safe(
 }
 
 #[unsafe(no_mangle)]
+/// Call a Lust function from generated code. The result goes to `out` when
+/// it is non-null (a register of an inlined frame on the JIT stack, whose
+/// address is stable), otherwise to register `dest_reg` of the VM's current
+/// frame, looked up after the call because the call may reallocate the
+/// register file.
 pub unsafe extern "C" fn jit_call_function_safe(
     vm_ptr: *mut VM,
     callee_ptr: *const Value,
     args_ptr: *const Value,
     arg_count: u8,
     dest_reg: u8,
+    out: *mut Value,
 ) -> u8 {
     unsafe {
         if vm_ptr.is_null() || callee_ptr.is_null() {
@@ -2364,6 +2370,10 @@ pub unsafe extern "C" fn jit_call_function_safe(
         match call_result {
             Ok(value) => {
                 vm.observe_value_graph(&value);
+                if !out.is_null() {
+                    *out = value;
+                    return 1;
+                }
                 // Get current registers pointer AFTER the call (it may have reallocated)
                 let vm = &mut *vm_ptr;
                 if let Some(frame) = vm.call_stack.last_mut() {
@@ -2633,6 +2643,9 @@ pub unsafe extern "C" fn jit_get_enum_value_safe(
 }
 
 #[unsafe(no_mangle)]
+/// Call a builtin method from generated code. Result delivery follows
+/// `jit_call_function_safe`: `out` when non-null, else `dest_reg` of the
+/// VM's current frame.
 pub unsafe extern "C" fn jit_call_method_safe(
     vm_ptr: *mut VM,
     object_ptr: *const Value,
@@ -2641,6 +2654,7 @@ pub unsafe extern "C" fn jit_call_method_safe(
     args_ptr: *const Value,
     arg_count: u8,
     dest_reg: u8,
+    out: *mut Value,
 ) -> u8 {
     unsafe {
         if vm_ptr.is_null() || object_ptr.is_null() || method_name_ptr.is_null() {
@@ -2674,6 +2688,10 @@ pub unsafe extern "C" fn jit_call_method_safe(
         crate::vm::pop_vm_ptr();
         match outcome {
             Ok(val) => {
+                if !out.is_null() {
+                    *out = val;
+                    return 1;
+                }
                 let vm = &mut *vm_ptr;
                 if let Some(frame) = vm.call_stack.last_mut() {
                     if (dest_reg as usize) < frame.registers.len() {

@@ -407,6 +407,7 @@ impl JitCompiler {
                 args_ptr: *const Value,
                 arg_count: u8,
                 dest_reg: u8,
+                out: *mut Value,
             ) -> u8;
         }
 
@@ -415,10 +416,24 @@ impl JitCompiler {
         self.emit_reg_addr(2, first_arg);
         self.emit_mov_imm32(3, arg_count as u32);
         self.emit_mov_imm32(4, dest as u32);
+        self.emit_call_result_out(5, dest);
         self.emit_call(jit_call_function_safe as *const ());
         self.emit_fail_if_w0_zero();
         self.emit_reload_registers_base();
         Ok(())
+    }
+
+    /// Where a call helper should deliver its result. Inside an inlined
+    /// frame the destination register lives on the JIT stack, so its address
+    /// is stable and is passed directly. At depth zero the VM may reallocate
+    /// its register file during the call, so the helper writes the result by
+    /// index into the current frame instead (and x19 is reloaded after).
+    fn emit_call_result_out(&mut self, x: u8, dest: u8) {
+        if self.inline_depth > 0 {
+            self.emit_reg_addr(x, dest);
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; mov X(x), xzr);
+        }
     }
 
     /// The VM may have reallocated its register file during a call; refresh
@@ -456,6 +471,7 @@ impl JitCompiler {
                 args_ptr: *const Value,
                 arg_count: u8,
                 dest_reg: u8,
+                out: *mut Value,
             ) -> u8;
         }
 
@@ -467,6 +483,7 @@ impl JitCompiler {
         self.emit_reg_addr(4, first_arg);
         self.emit_mov_imm32(5, arg_count as u32);
         self.emit_mov_imm32(6, dest as u32);
+        self.emit_call_result_out(7, dest);
         self.emit_call(jit_call_method_safe as *const ());
         self.emit_fail_if_w0_zero();
         self.emit_reload_registers_base();

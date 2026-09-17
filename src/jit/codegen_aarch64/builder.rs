@@ -65,6 +65,18 @@ impl JitCompiler {
         self.scalar_registers.clear();
         self.last_fail_island = self.ops.offset().0;
         self.pins = pins::plan(&hoisted_constants, &trace.preamble, &trace.ops);
+        crate::jit::log(|| {
+            let mut text = format!("📋 JIT(aarch64): trace {:?} preamble:\n", trace_id);
+            for op in &trace.preamble {
+                text.push_str(&format!("    {op:?}\n"));
+            }
+            text.push_str("  body:\n");
+            for op in &trace.ops {
+                text.push_str(&format!("    {op:?}\n"));
+            }
+            text.push_str(&format!("  pins: {:?}", self.pins));
+            text
+        });
         self.pin_active = false;
         self.dirty_pins.clear();
         let stack_size = Self::compute_stack_size(trace);

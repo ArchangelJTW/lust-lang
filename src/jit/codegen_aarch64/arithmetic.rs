@@ -1,0 +1,214 @@
+use super::*;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl JitCompiler {
+    /// x0 = x0 <op> x9 for integer operands. Division by zero fails the trace.
+    fn emit_int_op(&mut self, op: BinOp) {
+        match op {
+            BinOp::Add => dynasm!(self.ops ; .arch aarch64 ; add x0, x0, x9),
+            BinOp::Sub => dynasm!(self.ops ; .arch aarch64 ; sub x0, x0, x9),
+            BinOp::Mul => dynasm!(self.ops ; .arch aarch64 ; mul x0, x0, x9),
+            BinOp::Div => dynasm!(self.ops
+                ; .arch aarch64
+                ; cbz x9, >fail
+                ; sdiv x0, x0, x9
+            ),
+        }
+    }
+
+    /// d0 = d0 <op> d1
+    fn emit_float_op(&mut self, op: BinOp) {
+        match op {
+            BinOp::Add => dynasm!(self.ops ; .arch aarch64 ; fadd d0, d0, d1),
+            BinOp::Sub => dynasm!(self.ops ; .arch aarch64 ; fsub d0, d0, d1),
+            BinOp::Mul => dynasm!(self.ops ; .arch aarch64 ; fmul d0, d0, d1),
+            BinOp::Div => dynasm!(self.ops ; .arch aarch64 ; fdiv d0, d0, d1),
+        }
+    }
+
+    fn compile_binary_specialized(
+        &mut self,
+        dest: u8,
+        lhs: u8,
+        rhs: u8,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
+        op: BinOp,
+    ) -> Result<()> {
+        if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
+            self.load_payload(0, lhs);
+            self.load_payload(9, rhs);
+            self.emit_int_op(op);
+            self.store_from_x0(dest, ValueTag::Int.as_u8());
+            return Ok(());
+        }
+
+        let numeric = |ty: ValueType| matches!(ty, ValueType::Int | ValueType::Float);
+        if numeric(lhs_type) && numeric(rhs_type) {
+            if lhs_type == ValueType::Int {
+                self.load_payload_int_as_f(0, lhs);
+            } else {
+                self.load_payload_f(0, lhs);
+            }
+            if rhs_type == ValueType::Int {
+                self.load_payload_int_as_f(1, rhs);
+            } else {
+                self.load_payload_f(1, rhs);
+            }
+            self.emit_float_op(op);
+            self.store_d0_as_float(dest);
+            return Ok(());
+        }
+
+        self.compile_binary_generic(dest, lhs, rhs, op)
+    }
+
+    /// Runtime-dispatched numeric operation: if either operand is a Float the
+    /// result is a Float (ints are converted), otherwise both are treated as
+    /// Int payloads. Mirrors the x86_64 backend's generic path.
+    fn compile_binary_generic(&mut self, dest: u8, lhs: u8, rhs: u8, op: BinOp) -> Result<()> {
+        let float_tag = ValueTag::Float.as_u8() as u32;
+        let int_tag = ValueTag::Int.as_u8() as u32;
+        self.load_tag(0, lhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #float_tag
+            ; b.eq >float_path
+        );
+        self.load_tag(0, rhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #float_tag
+            ; b.eq >float_path
+        );
+        self.load_payload(0, lhs);
+        self.load_payload(9, rhs);
+        self.emit_int_op(op);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b >store_int
+            ; float_path:
+        );
+        self.load_tag(0, lhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #int_tag
+            ; b.ne >lhs_is_float
+        );
+        self.load_payload_int_as_f(0, lhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b >rhs_check
+            ; lhs_is_float:
+        );
+        self.load_payload_f(0, lhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; rhs_check:
+        );
+        self.load_tag(0, rhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #int_tag
+            ; b.ne >rhs_is_float
+        );
+        self.load_payload_int_as_f(1, rhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b >do_float_op
+            ; rhs_is_float:
+        );
+        self.load_payload_f(1, rhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; do_float_op:
+        );
+        self.emit_float_op(op);
+        self.store_d0_as_float(dest);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b >arith_done
+            ; store_int:
+        );
+        self.store_from_x0(dest, ValueTag::Int.as_u8());
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; arith_done:
+        );
+        Ok(())
+    }
+
+    pub(super) fn compile_add_specialized(
+        &mut self,
+        dest: u8,
+        lhs: u8,
+        rhs: u8,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
+    ) -> Result<()> {
+        self.compile_binary_specialized(dest, lhs, rhs, lhs_type, rhs_type, BinOp::Add)
+    }
+
+    pub(super) fn compile_sub_specialized(
+        &mut self,
+        dest: u8,
+        lhs: u8,
+        rhs: u8,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
+    ) -> Result<()> {
+        self.compile_binary_specialized(dest, lhs, rhs, lhs_type, rhs_type, BinOp::Sub)
+    }
+
+    pub(super) fn compile_mul_specialized(
+        &mut self,
+        dest: u8,
+        lhs: u8,
+        rhs: u8,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
+    ) -> Result<()> {
+        self.compile_binary_specialized(dest, lhs, rhs, lhs_type, rhs_type, BinOp::Mul)
+    }
+
+    pub(super) fn compile_div_specialized(
+        &mut self,
+        dest: u8,
+        lhs: u8,
+        rhs: u8,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
+    ) -> Result<()> {
+        self.compile_binary_specialized(dest, lhs, rhs, lhs_type, rhs_type, BinOp::Div)
+    }
+
+    pub(super) fn compile_mod_specialized(
+        &mut self,
+        dest: u8,
+        lhs: u8,
+        rhs: u8,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
+    ) -> Result<()> {
+        // Only integer modulo is lowered natively; any other combination reads
+        // both payloads as integers, exactly like the x86_64 backend.
+        let _ = (lhs_type, rhs_type);
+        self.load_payload(0, lhs);
+        self.load_payload(9, rhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cbz x9, >fail
+            ; sdiv x10, x0, x9
+            ; msub x0, x10, x9, x0
+        );
+        self.store_from_x0(dest, ValueTag::Int.as_u8());
+        Ok(())
+    }
+}

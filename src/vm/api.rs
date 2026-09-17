@@ -899,7 +899,7 @@ end
                     .unwrap(),
                 Value::Int(5050)
             );
-            if jit && cfg!(target_arch = "x86_64") {
+            if jit && cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
                 assert!(program.jit_stats().root_traces_compiled >= 2);
                 assert!(program.jit_stats().native_trace_entries >= 2);
             }
@@ -1475,7 +1475,7 @@ end
         ));
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn jit_guard_exit_resumes_at_bailout_ip() {
         use crate::jit::TraceId;
@@ -1525,7 +1525,7 @@ end
         ));
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn counting_loop() -> Function {
         let mut function = Function::new("count", 1, false);
         function.set_register_count(5);
@@ -1542,7 +1542,7 @@ end
         function
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn recursive_sum(function_idx: usize) -> Function {
         let mut function = Function::new("sum_down", 1, false);
         function.set_register_count(9);
@@ -1563,7 +1563,7 @@ end
         function
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn loop_calling_recursive_sum() -> Function {
         let mut function = Function::new("sum_in_loop", 1, false);
         function.set_register_count(11);
@@ -1589,7 +1589,7 @@ end
         function
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn nested_counting_loop() -> Function {
         let mut function = Function::new("nested_count", 0, false);
         function.set_register_count(9);
@@ -1617,7 +1617,7 @@ end
         function
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn hot_loop_compiles_executes_and_reuses_its_trace() {
         let mut vm = VM::new();
@@ -1640,7 +1640,7 @@ end
         assert!(second.native_trace_entries > first.native_trace_entries);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn short_hot_loop_retries_recording_on_a_later_call() {
         let mut vm = VM::new();
@@ -1664,7 +1664,7 @@ end
         assert!(second.native_trace_entries > 0);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn pure_recursion_is_profiled_without_becoming_a_loop_trace() {
         let mut vm = VM::new();
@@ -1682,7 +1682,7 @@ end
         assert_eq!(stats.native_trace_entries, 0);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn hot_loop_can_trace_across_an_opaque_recursive_call() {
         let mut vm = VM::new();
@@ -1698,7 +1698,7 @@ end
         assert!(stats.recursive_calls > 0);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn nested_loop_recording_does_not_mix_enclosing_backedges() {
         let mut vm = VM::new();

@@ -1,5 +1,7 @@
-#[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
 pub mod codegen;
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+pub mod codegen_aarch64;
 #[cfg(all(feature = "rv32", target_arch = "riscv32"))]
 pub mod codegen_rv32;
 pub mod optimizer;
@@ -8,12 +10,14 @@ pub mod specialization;
 pub mod trace;
 use crate::VM;
 use crate::bytecode::Value;
-#[cfg(all(feature = "std", not(target_arch = "riscv32")))]
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
 pub use codegen::JitCompiler;
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+pub use codegen_aarch64::JitCompiler;
 #[cfg(all(feature = "rv32", target_arch = "riscv32"))]
 pub use codegen_rv32::JitCompiler;
 #[cfg(not(any(
-    all(feature = "std", not(target_arch = "riscv32")),
+    all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
     all(feature = "rv32", target_arch = "riscv32")
 )))]
 pub struct JitCompiler;
@@ -23,7 +27,7 @@ pub use optimizer::TraceOptimizer;
 pub use profiler::{HotSpot, Profiler};
 pub use trace::{Trace, TraceOp, TraceRecorder};
 #[cfg(not(any(
-    all(feature = "std", not(target_arch = "riscv32")),
+    all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
     all(feature = "rv32", target_arch = "riscv32")
 )))]
 impl JitCompiler {
@@ -39,7 +43,7 @@ impl JitCompiler {
         _hoisted_constants: Vec<(u8, Value)>,
     ) -> crate::Result<CompiledTrace> {
         Err(crate::LustError::RuntimeError {
-            message: "JIT is unavailable: enable `std` (x86_64) or `rv32` (riscv32)".into(),
+            message: "JIT is unavailable: enable `std` (x86_64/aarch64) or `rv32` (riscv32)".into(),
         })
     }
 }
@@ -73,7 +77,7 @@ pub struct CompiledTrace {
     pub id: TraceId,
     entry: extern "C" fn(*mut Value, *mut VM, *const crate::bytecode::Function) -> i32,
     #[cfg(any(
-        all(feature = "std", not(target_arch = "riscv32")),
+        all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
         all(feature = "rv32", target_arch = "riscv32")
     ))]
     _executable: dynasmrt::ExecutableBuffer,
@@ -183,8 +187,7 @@ impl JitState {
     pub fn new() -> Self {
         let enabled = cfg!(all(
             feature = "std",
-            not(target_arch = "riscv32"),
-            target_arch = "x86_64"
+            any(target_arch = "x86_64", target_arch = "aarch64")
         )) || cfg!(all(feature = "rv32", target_arch = "riscv32"));
         Self {
             profiler: Profiler::new(),

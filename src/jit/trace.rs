@@ -2573,7 +2573,7 @@ mod tests {
         assert!(!recorder.is_recording());
     }
 
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn compiled_typed_arithmetic_bails_before_reading_wrong_payloads() {
         let functions = vec![crate::bytecode::Function::new("typed_guard", 0, false)];

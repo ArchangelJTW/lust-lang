@@ -20,6 +20,9 @@ pub enum Ty {
     ArrInt,
     Struct,
     OptInt,
+    Str,
+    /// `unknown`: a dynamically typed value; only `is` and `as` read it.
+    Unknown,
 }
 
 impl Ty {
@@ -31,6 +34,8 @@ impl Ty {
             Ty::ArrInt => "Array<int>",
             Ty::Struct => "P",
             Ty::OptInt => "Option<int>",
+            Ty::Str => "string",
+            Ty::Unknown => "unknown",
         }
     }
 }
@@ -95,6 +100,25 @@ pub enum Expr {
     StructLit(Box<Expr>, Box<Expr>, Box<Expr>),
     Some(Box<Expr>),
     None,
+    StrLit(&'static str),
+    /// `a .. b` on strings
+    Concat(Box<Expr>, Box<Expr>),
+    /// `tostring(e)`
+    ToString(Box<Expr>),
+    /// `string.len(s)`
+    StrLen(String),
+    /// `obj:method(args)` on the struct
+    MethodCall(String, &'static str, Vec<Expr>),
+    /// `array.get(arr, idx)` → Option<int>
+    ArrayGet(String, Box<Expr>),
+    /// `array.pop(arr)` → Option<int>
+    ArrayPop(String),
+    /// `math.tofloat(e):unwrap_or(0.0)`
+    ToFloat(Box<Expr>),
+    /// `u is int`
+    TypeIs(String, &'static str),
+    /// `(u as int)` → Option<int>
+    Cast(String, &'static str),
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +171,25 @@ pub enum Stmt {
     IfSome {
         opt: String,
         var: String,
+        body: Vec<Stmt>,
+    },
+    /// `if opt is Some(v) then body end`
+    IfIsSome {
+        opt: String,
+        var: String,
+        body: Vec<Stmt>,
+    },
+    /// `for v in arr do body end`
+    ForIn {
+        arr: String,
+        var: String,
+        body: Vec<Stmt>,
+    },
+    /// `while counter < bound and cond do ... end`; the counter still bounds it.
+    WhileCond {
+        counter: String,
+        bound: i64,
+        cond: Expr,
         body: Vec<Stmt>,
     },
 }
@@ -249,6 +292,43 @@ fn render_expr(e: &Expr, out: &mut String) {
             out.push(')');
         }
         Expr::None => out.push_str("Option.None"),
+        Expr::StrLit(s) => out.push_str(&format!("\"{s}\"")),
+        Expr::Concat(a, b) => {
+            out.push('(');
+            render_expr(a, out);
+            out.push_str(" .. ");
+            render_expr(b, out);
+            out.push(')');
+        }
+        Expr::ToString(e) => {
+            out.push_str("tostring(");
+            render_expr(e, out);
+            out.push(')');
+        }
+        Expr::StrLen(s) => out.push_str(&format!("string.len({s})")),
+        Expr::MethodCall(obj, name, args) => {
+            out.push_str(&format!("{obj}:{name}("));
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                render_expr(a, out);
+            }
+            out.push(')');
+        }
+        Expr::ArrayGet(a, idx) => {
+            out.push_str(&format!("array.get({a}, "));
+            render_expr(idx, out);
+            out.push(')');
+        }
+        Expr::ArrayPop(a) => out.push_str(&format!("array.pop({a})")),
+        Expr::ToFloat(e) => {
+            out.push_str("math.tofloat(");
+            render_expr(e, out);
+            out.push_str("):unwrap_or(0.0)");
+        }
+        Expr::TypeIs(u, ty) => out.push_str(&format!("({u} is {ty})")),
+        Expr::Cast(u, ty) => out.push_str(&format!("({u} as {ty})")),
     }
 }
 
@@ -344,6 +424,34 @@ fn render_stmt(s: &Stmt, out: &mut Out) {
             out.indent -= 1;
             out.line("end");
         }
+        Stmt::IfIsSome { opt, var, body } => {
+            out.line(&format!("if {opt} is Some({var}) then"));
+            out.indent += 1;
+            render_block(body, out);
+            out.indent -= 1;
+            out.line("end");
+        }
+        Stmt::ForIn { arr, var, body } => {
+            out.line(&format!("for {var} in {arr} do"));
+            out.indent += 1;
+            render_block(body, out);
+            out.indent -= 1;
+            out.line("end");
+        }
+        Stmt::WhileCond {
+            counter,
+            bound,
+            cond,
+            body,
+        } => {
+            out.line(&format!("local {counter}: int = 0"));
+            out.line(&format!("while {counter} < {bound} and {} do", expr_text(cond)));
+            out.indent += 1;
+            out.line(&format!("{counter} = {counter} + 1"));
+            render_block(body, out);
+            out.indent -= 1;
+            out.line("end");
+        }
     }
 }
 
@@ -357,6 +465,27 @@ pub fn render(p: &Program) -> String {
     out.line("a: int");
     out.line("b: float");
     out.line("c: bool");
+    out.indent -= 1;
+    out.line("end");
+    out.line("");
+    out.line("impl P");
+    out.indent += 1;
+    out.line("function get(self): int");
+    out.indent += 1;
+    out.line("return self.a * 2");
+    out.indent -= 1;
+    out.line("end");
+    out.line("function bump(self, d: int): int");
+    out.indent += 1;
+    out.line("self.a = self.a + d");
+    out.line("return self.a");
+    out.indent -= 1;
+    out.line("end");
+    out.line("function scale(self, k: float): float");
+    out.indent += 1;
+    out.line("return self.b * k");
+    out.indent -= 1;
+    out.line("end");
     out.indent -= 1;
     out.line("end");
     out.line("");
@@ -415,6 +544,9 @@ struct Gen {
     in_func: bool,
     /// Remaining statements this program may still write.
     budget: i64,
+    /// Arrays currently being iterated by an enclosing `for … in`: pushing
+    /// to one never terminates (the loop walks the live array).
+    iterating: Vec<String>,
 }
 
 const FLOAT_LITS: &[&str] = &[
@@ -433,6 +565,7 @@ pub fn program(seed: u64, size: u32) -> Program {
         size,
         in_func: false,
         budget: (size as i64) * 24,
+        iterating: Vec::new(),
     };
     let mut funcs = Vec::new();
     let func_count = g.rng.below(size as u64 + 1) as usize;
@@ -457,6 +590,15 @@ impl Gen {
             .iter()
             .flatten()
             .filter(|v| v.ty == ty)
+            .cloned()
+            .collect()
+    }
+
+    fn counters(&self) -> Vec<Var> {
+        self.scopes
+            .iter()
+            .flatten()
+            .filter(|v| v.ty == Ty::Int && v.fixed)
             .cloned()
             .collect()
     }
@@ -593,26 +735,31 @@ impl Gen {
                     Some(self.local())
                 }
             }
-            46..=58 if !deep => Some(self.while_loop()),
-            59..=66 if !deep => Some(self.for_loop()),
-            67..=78 if !deep => Some(self.if_stmt()),
+            46..=55 if !deep => Some(self.while_loop()),
+            56..=59 if !deep => Some(self.while_cond_loop()),
+            60..=65 if !deep => Some(self.for_loop()),
+            66..=68 if !deep => self.for_in_loop(),
+            69..=78 if !deep => Some(self.if_stmt()),
             79..=81 if self.loop_depth > 0 => Some(self.break_or_continue()),
-            82..=86 => self.push(),
-            87..=91 if !deep => self.if_index(),
-            92..=95 if !deep => self.if_some(),
+            82..=85 => self.push(),
+            86..=89 if !deep => self.if_index(),
+            90..=92 if !deep => self.if_some(),
+            93..=95 if !deep => self.if_is_some(),
             96..=99 => self.set_field(),
             _ => Some(self.local()),
         }
     }
 
     fn local(&mut self) -> Stmt {
-        let ty = match self.rng.below(10) {
+        let ty = match self.rng.below(14) {
             0..=3 => Ty::Int,
             4..=5 => Ty::Float,
             6 => Ty::Bool,
             7 => Ty::ArrInt,
             8 => Ty::Struct,
-            _ => Ty::OptInt,
+            9..=10 => Ty::OptInt,
+            11..=12 => Ty::Str,
+            _ => Ty::Unknown,
         };
         let name = self.fresh(match ty {
             Ty::Int => "n",
@@ -621,6 +768,8 @@ impl Gen {
             Ty::ArrInt => "arr",
             Ty::Struct => "p",
             Ty::OptInt => "o",
+            Ty::Str => "s",
+            Ty::Unknown => "u",
         });
         let init = self.expr(ty, 2);
         self.declare(&name, ty, false);
@@ -628,7 +777,7 @@ impl Gen {
     }
 
     fn assign(&mut self) -> Option<Stmt> {
-        let ty = *self.rng.pick(&[Ty::Int, Ty::Int, Ty::Float, Ty::Bool, Ty::OptInt]);
+        let ty = *self.rng.pick(&[Ty::Int, Ty::Int, Ty::Float, Ty::Bool, Ty::OptInt, Ty::Str]);
         let vars = self.mutable_vars_of(ty);
         if vars.is_empty() {
             return Some(self.local());
@@ -668,6 +817,58 @@ impl Gen {
             bound,
             body,
         }
+    }
+
+    fn while_cond_loop(&mut self) -> Stmt {
+        let counter = self.fresh("i");
+        let bound = self.rng.range(6, 40);
+        // The extra condition may read variables the body changes, so the
+        // loop can end early; the counter still bounds it.
+        let cond = self.expr(Ty::Bool, 2);
+        self.scopes.push(Vec::new());
+        self.declare(&counter, Ty::Int, true);
+        self.loop_depth += 1;
+        let body = self.block(false);
+        self.loop_depth -= 1;
+        self.scopes.pop();
+        Stmt::WhileCond {
+            counter,
+            bound,
+            cond,
+            body,
+        }
+    }
+
+    fn for_in_loop(&mut self) -> Option<Stmt> {
+        let vars = self.vars_of(Ty::ArrInt);
+        if vars.is_empty() {
+            return Some(self.for_loop());
+        }
+        let arr = self.rng.pick(&vars).name.clone();
+        let var = self.fresh("e");
+        self.scopes.push(Vec::new());
+        self.declare(&var, Ty::Int, true);
+        self.iterating.push(arr.clone());
+        self.loop_depth += 1;
+        let body = self.block(false);
+        self.loop_depth -= 1;
+        self.iterating.pop();
+        self.scopes.pop();
+        Some(Stmt::ForIn { arr, var, body })
+    }
+
+    fn if_is_some(&mut self) -> Option<Stmt> {
+        let vars = self.vars_of(Ty::OptInt);
+        if vars.is_empty() {
+            return Some(self.local());
+        }
+        let opt = self.rng.pick(&vars).name.clone();
+        let var = self.fresh("w");
+        self.scopes.push(Vec::new());
+        self.declare(&var, Ty::Int, true);
+        let body = self.block(false);
+        self.scopes.pop();
+        Some(Stmt::IfIsSome { opt, var, body })
     }
 
     fn for_loop(&mut self) -> Stmt {
@@ -719,8 +920,17 @@ impl Gen {
         }
     }
 
+    /// Arrays that may be resized here: not the ones an enclosing
+    /// `for … in` is walking.
+    fn resizable_arrays(&self) -> Vec<Var> {
+        self.vars_of(Ty::ArrInt)
+            .into_iter()
+            .filter(|v| !self.iterating.contains(&v.name))
+            .collect()
+    }
+
     fn push(&mut self) -> Option<Stmt> {
-        let vars = self.vars_of(Ty::ArrInt);
+        let vars = self.resizable_arrays();
         if vars.is_empty() {
             return Some(self.local());
         }
@@ -780,14 +990,73 @@ impl Gen {
                 Box::new(self.float_expr(1)),
                 Box::new(self.bool_expr(1)),
             ),
-            Ty::OptInt => {
-                if self.rng.chance(0.7) {
-                    Expr::Some(Box::new(self.int_expr(1)))
-                } else {
-                    Expr::None
+            Ty::OptInt => match self.rng.below(10) {
+                0..=4 => Expr::Some(Box::new(self.int_expr(1))),
+                5..=6 => Expr::None,
+                7 => {
+                    let arrays = self.vars_of(Ty::ArrInt);
+                    match arrays.is_empty() {
+                        true => Expr::None,
+                        false => Expr::ArrayGet(
+                            self.rng.pick(&arrays).name.clone(),
+                            Box::new(self.int_expr(1)),
+                        ),
+                    }
                 }
+                8 => {
+                    let arrays = self.resizable_arrays();
+                    match arrays.is_empty() {
+                        true => Expr::None,
+                        false => Expr::ArrayPop(self.rng.pick(&arrays).name.clone()),
+                    }
+                }
+                _ => {
+                    let unknowns = self.vars_of(Ty::Unknown);
+                    match unknowns.is_empty() {
+                        true => Expr::None,
+                        false => Expr::Cast(self.rng.pick(&unknowns).name.clone(), "int"),
+                    }
+                }
+            },
+            Ty::Str => self.str_expr(depth),
+            Ty::Unknown => {
+                let ty = *self.rng.pick(&[Ty::Int, Ty::Float, Ty::Bool, Ty::Str]);
+                self.expr(ty, 1)
             }
         }
+    }
+
+    fn str_expr(&mut self, depth: u32) -> Expr {
+        const LITS: &[&str] = &["", "a", "ab", "hello", "x y", "0", "-1"];
+        if depth == 0 || self.rng.chance(0.3) {
+            return if self.rng.chance(0.5) {
+                self.var_or(Ty::Str, |g| Expr::StrLit(g.rng.pick(LITS)))
+            } else {
+                Expr::StrLit(self.rng.pick(LITS))
+            };
+        }
+        match self.rng.below(10) {
+            0..=4 => {
+                // Only the left operand may be a string variable, so each
+                // assignment grows a string by at most a constant: `s = s ..
+                // s` in a loop would need exponential memory.
+                let l = self.str_expr(0);
+                let r = self.str_piece(depth - 1);
+                Expr::Concat(Box::new(l), Box::new(r))
+            }
+            _ => self.str_piece(depth - 1),
+        }
+    }
+
+    /// A string of bounded length: a literal or a tostring of a scalar.
+    fn str_piece(&mut self, depth: u32) -> Expr {
+        const LITS: &[&str] = &["", "a", "ab", "hello", "x y", "0", "-1"];
+        if self.rng.chance(0.4) {
+            return Expr::StrLit(self.rng.pick(LITS));
+        }
+        let ty = *self.rng.pick(&[Ty::Int, Ty::Float, Ty::Bool]);
+        let inner = self.expr(ty, depth);
+        Expr::ToString(Box::new(inner))
     }
 
     fn int_lit(&mut self) -> Expr {
@@ -840,11 +1109,23 @@ impl Gen {
                     BinOp::Mod,
                 ]);
                 let l = self.int_expr(depth - 1);
-                let r = if matches!(op, BinOp::Div | BinOp::Mod) && self.rng.chance(0.9) {
-                    // Keep the divisor a non-zero literal most of the time;
-                    // the rest exercises the division-by-zero error path.
-                    let d = self.rng.range(-9, 9);
-                    Expr::Int(if d == 0 { 7 } else { d })
+                let r = if matches!(op, BinOp::Div | BinOp::Mod) {
+                    let roll = self.rng.below(100);
+                    let counters = self.counters();
+                    if roll < 8 && !counters.is_empty() {
+                        // `counter - k`: zero part-way through the loop, so
+                        // the error surfaces after the trace is already hot.
+                        let c = self.rng.pick(&counters).name.clone();
+                        let k = self.rng.range(1, 12);
+                        Expr::Bin(Box::new(Expr::Var(c)), BinOp::Sub, Box::new(Expr::Int(k)))
+                    } else if roll < 92 {
+                        // Keep the divisor a non-zero literal most of the time;
+                        // the rest exercises the division-by-zero error path.
+                        let d = self.rng.range(-9, 9);
+                        Expr::Int(if d == 0 { 7 } else { d })
+                    } else {
+                        self.int_expr(depth - 1)
+                    }
                 } else {
                     self.int_expr(depth - 1)
                 };
@@ -868,7 +1149,7 @@ impl Gen {
                     }
                 }
             }
-            80..=84 => {
+            80..=82 => {
                 let vars = self.vars_of(Ty::ArrInt);
                 if vars.is_empty() {
                     self.int_lit()
@@ -876,12 +1157,34 @@ impl Gen {
                     Expr::ArrLen(self.rng.pick(&vars).name.clone())
                 }
             }
-            85..=89 => {
+            83..=84 => {
+                let vars = self.vars_of(Ty::Str);
+                if vars.is_empty() {
+                    self.int_lit()
+                } else {
+                    Expr::StrLen(self.rng.pick(&vars).name.clone())
+                }
+            }
+            85..=87 => {
                 let vars = self.vars_of(Ty::Struct);
                 if vars.is_empty() {
                     self.int_lit()
                 } else {
                     Expr::Field(self.rng.pick(&vars).name.clone(), "a")
+                }
+            }
+            88..=89 => {
+                let vars = self.vars_of(Ty::Struct);
+                if vars.is_empty() {
+                    self.int_lit()
+                } else {
+                    let obj = self.rng.pick(&vars).name.clone();
+                    if self.rng.chance(0.5) {
+                        Expr::MethodCall(obj, "get", Vec::new())
+                    } else {
+                        let d = self.int_expr(depth - 1);
+                        Expr::MethodCall(obj, "bump", vec![d])
+                    }
                 }
             }
             90..=93 => {
@@ -936,12 +1239,26 @@ impl Gen {
                 let inner = self.float_expr(depth - 1);
                 negate(inner, Expr::Float("0.0"))
             }
-            80..=89 => {
+            80..=84 => {
                 let vars = self.vars_of(Ty::Struct);
                 if vars.is_empty() {
                     self.float_lit()
                 } else {
                     Expr::Field(self.rng.pick(&vars).name.clone(), "b")
+                }
+            }
+            85..=87 => {
+                let inner = self.int_expr(depth - 1);
+                Expr::ToFloat(Box::new(inner))
+            }
+            88..=89 => {
+                let vars = self.vars_of(Ty::Struct);
+                if vars.is_empty() {
+                    self.float_lit()
+                } else {
+                    let obj = self.rng.pick(&vars).name.clone();
+                    let k = self.float_expr(depth - 1);
+                    Expr::MethodCall(obj, "scale", vec![k])
                 }
             }
             _ => self
@@ -989,12 +1306,27 @@ impl Gen {
                 let r = self.bool_expr(depth - 1);
                 Expr::Bin(Box::new(l), op, Box::new(r))
             }
-            87..=90 => {
+            87..=88 => {
                 let vars = self.vars_of(Ty::Struct);
                 if vars.is_empty() {
                     Expr::Bool(self.rng.chance(0.5))
                 } else {
                     Expr::Field(self.rng.pick(&vars).name.clone(), "c")
+                }
+            }
+            89 => {
+                let op = *self.rng.pick(&[BinOp::Eq, BinOp::Ne]);
+                let l = self.str_expr(depth - 1);
+                let r = self.str_expr(depth - 1);
+                Expr::Bin(Box::new(l), op, Box::new(r))
+            }
+            90 => {
+                let vars = self.vars_of(Ty::Unknown);
+                if vars.is_empty() {
+                    Expr::Bool(self.rng.chance(0.5))
+                } else {
+                    let ty = *self.rng.pick(&["int", "float", "bool", "string"]);
+                    Expr::TypeIs(self.rng.pick(&vars).name.clone(), ty)
                 }
             }
             91..=94 => {
@@ -1019,8 +1351,13 @@ fn contains_math(e: &Expr) -> bool {
         Expr::Math(..) => true,
         Expr::Bin(l, _, r) => contains_math(l) || contains_math(r),
         Expr::Neg(x) | Expr::Not(x) | Expr::Some(x) => contains_math(x),
-        Expr::Call(_, args) | Expr::ArrLit(args) => args.iter().any(contains_math),
-        Expr::UnwrapOr(_, d) => contains_math(d),
+        Expr::Call(_, args) | Expr::ArrLit(args) | Expr::MethodCall(_, _, args) => {
+            args.iter().any(contains_math)
+        }
+        Expr::UnwrapOr(_, d) | Expr::ToString(d) | Expr::ToFloat(d) | Expr::ArrayGet(_, d) => {
+            contains_math(d)
+        }
+        Expr::Concat(l, r) => contains_math(l) || contains_math(r),
         Expr::StructLit(a, b, c) => contains_math(a) || contains_math(b) || contains_math(c),
         _ => false,
     }
@@ -1066,9 +1403,12 @@ fn collect_paths(block: &[Stmt], prefix: Vec<usize>, paths: &mut Vec<Vec<usize>>
 fn children(s: &Stmt) -> Vec<&Vec<Stmt>> {
     match s {
         Stmt::While { body, .. }
+        | Stmt::WhileCond { body, .. }
         | Stmt::For { body, .. }
+        | Stmt::ForIn { body, .. }
         | Stmt::IfIndex { body, .. }
-        | Stmt::IfSome { body, .. } => vec![body],
+        | Stmt::IfSome { body, .. }
+        | Stmt::IfIsSome { body, .. } => vec![body],
         Stmt::If {
             branches,
             otherwise,
@@ -1086,9 +1426,12 @@ fn children(s: &Stmt) -> Vec<&Vec<Stmt>> {
 fn children_mut(s: &mut Stmt) -> Vec<&mut Vec<Stmt>> {
     match s {
         Stmt::While { body, .. }
+        | Stmt::WhileCond { body, .. }
         | Stmt::For { body, .. }
+        | Stmt::ForIn { body, .. }
         | Stmt::IfIndex { body, .. }
-        | Stmt::IfSome { body, .. } => vec![body],
+        | Stmt::IfSome { body, .. }
+        | Stmt::IfIsSome { body, .. } => vec![body],
         Stmt::If {
             branches,
             otherwise,
@@ -1157,7 +1500,7 @@ fn shrink_loops_in(block: &mut [Stmt]) -> bool {
     let mut changed = false;
     for s in block.iter_mut() {
         match s {
-            Stmt::While { bound, body, .. } => {
+            Stmt::While { bound, body, .. } | Stmt::WhileCond { bound, body, .. } => {
                 if *bound > 6 {
                     *bound = (*bound / 2).max(6);
                     changed = true;

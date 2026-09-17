@@ -116,6 +116,11 @@ pub struct JitCompiler {
     pin_active: bool,
     /// Carried pins whose machine value may be newer than memory.
     dirty_pins: Vec<u8>,
+    /// Bytecode ip of the instruction the ops being compiled came from
+    /// (from the last `At` marker), if known.
+    current_fail_ip: Option<usize>,
+    /// Resume ips for failure exits, indexed by fail-stub number.
+    fail_sites: Vec<usize>,
     /// Next ID for specialized values
     #[allow(dead_code)]
     pub(super) next_specialized_id: usize,

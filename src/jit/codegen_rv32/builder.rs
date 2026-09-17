@@ -234,6 +234,7 @@ impl JitCompiler {
             _data: data,
             trace: trace.clone(),
             guards,
+            fail_sites: Vec::new(),
             parent,
             side_traces: Vec::new(),
             hoisted_constants,

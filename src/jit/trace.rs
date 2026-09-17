@@ -63,6 +63,14 @@ pub struct InlineTrace {
 
 #[derive(Debug, Clone)]
 pub enum TraceOp {
+    /// Marks the bytecode instruction the following ops came from. Emits no
+    /// code; a backend uses it as the resume point when one of those ops
+    /// fails, so the interpreter re-executes exactly the failing instruction
+    /// (and raises its error) instead of restarting the loop iteration with
+    /// half of its side effects already applied.
+    At {
+        ip: usize,
+    },
     LoadConst {
         dest: Register,
         value: Value,
@@ -396,6 +404,9 @@ pub struct TraceRecorder {
     root_frame_index: usize,
     guarded_registers: HashSet<Register>,
     inline_stack: Vec<InlineContext>,
+    /// Bytecode ip of the instruction being recorded, not yet written as an
+    /// `At` marker (see `flush_marker`).
+    pending_marker: Option<usize>,
     op_count: usize,
     /// Track which registers contain specialized values (register -> (specialized_id, layout))
     specialized_registers:
@@ -445,6 +456,7 @@ impl TraceRecorder {
             root_frame_index: 0,
             guarded_registers: HashSet::new(),
             inline_stack: Vec::new(),
+            pending_marker: None,
             op_count: 0,
             specialized_registers: HashMap::new(),
             next_specialized_id: 0,
@@ -596,6 +608,7 @@ impl TraceRecorder {
     /// rebox path removes its own tracking entry before pushing the op.
     fn written_register(op: &TraceOp) -> Option<Register> {
         match op {
+            TraceOp::At { .. } => None,
             TraceOp::LoadConst { dest, .. }
             | TraceOp::Move { dest, .. }
             | TraceOp::Add { dest, .. }
@@ -646,7 +659,22 @@ impl TraceRecorder {
         }
     }
 
+    /// Write the pending `At` marker, if any, without counting it as a trace
+    /// op or touching specialization tracking.
+    fn flush_marker(&mut self) {
+        let Some(ip) = self.pending_marker.take() else {
+            return;
+        };
+        let op = TraceOp::At { ip };
+        if let Some(ctx) = self.inline_stack.last_mut() {
+            ctx.ops.push(op);
+        } else {
+            self.trace.ops.push(op);
+        }
+    }
+
     fn push_op(&mut self, op: TraceOp) {
+        self.flush_marker();
         // A specialization describes the array a register held at trace entry.
         // The instant the trace writes something else into that register the
         // specialization is stale, and the postamble rebox would otherwise dump
@@ -1051,6 +1079,11 @@ impl TraceRecorder {
             }
             self.forget_guard(dest);
         }
+
+        // `current_ip` is the ip after the fetch; the instruction itself is one
+        // before it (the same convention as guard bailout ips). The marker is
+        // written lazily, in front of the first op this instruction records.
+        self.pending_marker = Some(current_ip.saturating_sub(1));
 
         // Reuse the numeric trace IR, but retain the bytecode's input contract.
         // Host mutation and trace entry still require guards before payload loads.
@@ -2658,7 +2691,7 @@ mod tests {
 
         assert!(matches!(
             recorder.trace.ops.as_slice(),
-            [TraceOp::NewArray { count: 0, .. }]
+            [TraceOp::At { .. }, TraceOp::NewArray { count: 0, .. }]
         ));
         assert!(recorder.specialized_registers.is_empty());
     }

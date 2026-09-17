@@ -88,6 +88,10 @@ pub struct CompiledTrace {
     _data: Vec<JitData>,
     pub trace: Trace,
     pub guards: Vec<Guard>,
+    /// Resume ips for failure exits: a trace result of `-(k + 2)` means the
+    /// op recorded from bytecode ip `fail_sites[k]` failed; the interpreter
+    /// re-executes that instruction. `-1` is a failure without a known site.
+    pub fail_sites: Vec<usize>,
     pub parent: Option<TraceId>,
     pub side_traces: Vec<TraceId>,
     pub hoisted_constants: Vec<(u8, Value)>,

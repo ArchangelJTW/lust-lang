@@ -335,11 +335,27 @@ impl VM {
                             if let Some(error) = self.pending_jit_error.take() {
                                 return Err(error);
                             }
+                            // A result of -(k + 2) names the failing op's
+                            // instruction: resume there, so the interpreter
+                            // re-executes it (raising its error) with the
+                            // trace's earlier side effects intact. A bare -1
+                            // has no site and restarts the iteration.
+                            let resume_ip = if result <= -2 {
+                                self.jit
+                                    .get_trace(trace_id)
+                                    .and_then(|trace| trace.fail_sites.get((-result - 2) as usize))
+                                    .copied()
+                            } else {
+                                None
+                            };
                             crate::jit::log(|| {
-                                "⚠️  JIT: Trace execution failed (unknown error)".to_string()
+                                format!(
+                                    "⚠️  JIT: Trace execution failed (result {result}), resuming at ip {:?}",
+                                    resume_ip
+                                )
                             });
                             if let Some(frame) = self.call_stack.last_mut() {
-                                frame.ip = loop_start_ip;
+                                frame.ip = resume_ip.unwrap_or(loop_start_ip);
                             }
 
                             self.jit.evict_root_trace(func_idx, loop_start_ip);

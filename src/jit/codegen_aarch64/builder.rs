@@ -16,6 +16,8 @@ impl JitCompiler {
             pins: HashMap::new(),
             pin_active: false,
             dirty_pins: Vec::new(),
+            current_fail_ip: None,
+            fail_sites: Vec::new(),
             next_specialized_id: 0,
         }
     }
@@ -79,6 +81,8 @@ impl JitCompiler {
         });
         self.pin_active = false;
         self.dirty_pins.clear();
+        self.current_fail_ip = None;
+        self.fail_sites.clear();
         let stack_size = Self::compute_stack_size(trace);
         let mut guards = Vec::new();
         let mut guard_index = 0i32;
@@ -170,6 +174,7 @@ impl JitCompiler {
         }
 
         // Create a loop_start label AFTER preamble, BEFORE loop body
+        self.current_fail_ip = None;
         let loop_start_label = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
@@ -234,6 +239,7 @@ impl JitCompiler {
                 trace.postamble.len()
             )
         });
+        self.current_fail_ip = None;
         self.compile_ops(&trace.postamble, &mut guard_index, &mut guards)?;
 
         // Now pop the label stacks after everything is compiled
@@ -308,10 +314,72 @@ impl JitCompiler {
             _data: data,
             trace: trace.clone(),
             guards,
+            fail_sites: mem::take(&mut self.fail_sites),
             parent,
             side_traces: Vec::new(),
             hoisted_constants,
         })
+    }
+
+    /// After an op that can branch to `>fail`: bind those branches to a stub
+    /// that exits with this op's fail-site code, so the interpreter resumes
+    /// at the instruction the op came from. Without a known ip the branches
+    /// fall through to the trace's generic `fail:` (-1).
+    fn emit_fail_stub(&mut self) {
+        let Some(ip) = self.current_fail_ip else {
+            return;
+        };
+        let code = -((self.fail_sites.len() as i32) + 2);
+        self.fail_sites.push(ip);
+        let exit_label = self.current_exit_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b >fail_stub_skip
+            ; fail:
+        );
+        self.emit_mov_imm_i32(0, code);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b => exit_label
+            ; fail_stub_skip:
+        );
+    }
+
+    /// Ops that can branch to `>fail`.
+    fn op_may_fail(op: &TraceOp) -> bool {
+        matches!(
+            op,
+            TraceOp::LoadConst { .. }
+                | TraceOp::Div { .. }
+                | TraceOp::Mod { .. }
+                | TraceOp::Concat { .. }
+                | TraceOp::GetIndex { .. }
+                | TraceOp::TryGetIndex { .. }
+                | TraceOp::ArrayIndexOk { .. }
+                | TraceOp::ArrayLen { .. }
+                | TraceOp::CallNative { .. }
+                | TraceOp::CallFunction { .. }
+                | TraceOp::InlineCall { .. }
+                | TraceOp::CallMethod { .. }
+                | TraceOp::GetField { .. }
+                | TraceOp::SetField { .. }
+                | TraceOp::NewArray { .. }
+                | TraceOp::NewStruct { .. }
+                | TraceOp::NewEnumUnit { .. }
+                | TraceOp::NewEnumVariant { .. }
+                | TraceOp::TryCast { .. }
+                | TraceOp::GetEnumValue { .. }
+                | TraceOp::Unbox { .. }
+                | TraceOp::Rebox { .. }
+                | TraceOp::DropSpecialized { .. }
+                | TraceOp::SpecializedOp { .. }
+        ) && !matches!(
+            op,
+            TraceOp::LoadConst {
+                value: Value::Int(_) | Value::Float(_) | Value::Bool(_),
+                ..
+            }
+        )
     }
     /// Drain the inline-call frame chain in x21. Each record is
     /// { value_count, saved_x19, prev_x21 }; the callee registers live
@@ -341,10 +409,17 @@ impl JitCompiler {
         guard_index: &mut i32,
         guards: &mut Vec<Guard>,
     ) -> Result<()> {
-        let mut skip_next = false;
+        let mut skip_through: Option<usize> = None;
         for (op_index, op) in ops.iter().enumerate() {
-            if skip_next {
-                skip_next = false;
+            if skip_through.is_some_and(|last| op_index <= last) {
+                continue;
+            }
+            if let TraceOp::At { ip } = op {
+                // Inside an inlined body the markers carry the callee's ips;
+                // a failure there resumes at the call itself.
+                if self.inline_depth == 0 {
+                    self.current_fail_ip = Some(*ip);
+                }
                 continue;
             }
             if self.pin_active && pins::op_touches_register_memory(op) {
@@ -364,13 +439,17 @@ impl JitCompiler {
                 self.update_scalar_registers(op);
                 continue;
             }
-            if let Some(next) = ops.get(op_index + 1) {
+            // Fusion looks at the next real op; `At` markers are transparent.
+            let next_index = (op_index + 1..ops.len())
+                .find(|&j| !matches!(ops[j], TraceOp::At { .. }));
+            if let Some(next_index) = next_index {
+                let next = &ops[next_index];
                 if let TraceOp::GuardLoopContinue {
                     condition_register, ..
                 } = next
                     && self.scalar_registers.contains_key(condition_register)
                     && Self::register_overwritten_before_read(
-                        &ops[op_index + 2..],
+                        &ops[next_index + 1..],
                         *condition_register,
                     )
                     && let Some(guard) =
@@ -378,7 +457,7 @@ impl JitCompiler {
                 {
                     guards.push(guard);
                     *guard_index += 1;
-                    skip_next = true;
+                    skip_through = Some(next_index);
                     continue;
                 }
                 if let TraceOp::LoadConst {
@@ -387,17 +466,18 @@ impl JitCompiler {
                 } = op
                     && self.scalar_registers.contains_key(constant_register)
                     && Self::register_overwritten_before_read(
-                        &ops[op_index + 2..],
+                        &ops[next_index + 1..],
                         *constant_register,
                     )
                     && self.compile_integer_add_immediate(op, next)?
                 {
                     self.update_scalar_registers(next);
-                    skip_next = true;
+                    skip_through = Some(next_index);
                     continue;
                 }
             }
             match op {
+                TraceOp::At { .. } => unreachable!("markers are consumed above"),
                 TraceOp::LoadConst { dest, value } => {
                     self.compile_load_const(*dest, value)?;
                 }
@@ -879,6 +959,9 @@ impl JitCompiler {
                 TraceOp::Return { .. } => {}
             }
             self.update_scalar_registers(op);
+            if Self::op_may_fail(op) {
+                self.emit_fail_stub();
+            }
             self.maybe_emit_fail_island();
         }
 
@@ -1114,7 +1197,7 @@ impl JitCompiler {
         let in_args =
             |first: u8, count: u8| register >= first && register < first.saturating_add(count);
         match op {
-            TraceOp::LoadConst { .. } => false,
+            TraceOp::At { .. } | TraceOp::LoadConst { .. } => false,
             TraceOp::Move { src, .. } | TraceOp::Neg { src, .. } => *src == register,
             TraceOp::Add { lhs, rhs, .. }
             | TraceOp::Sub { lhs, rhs, .. }
@@ -1245,6 +1328,9 @@ impl JitCompiler {
     }
 
     fn update_scalar_registers(&mut self, op: &TraceOp) {
+        if matches!(op, TraceOp::At { .. }) {
+            return;
+        }
         let scalar_type = |ty: ValueType| {
             matches!(ty, ValueType::Bool | ValueType::Int | ValueType::Float).then_some(ty)
         };
@@ -1257,6 +1343,7 @@ impl JitCompiler {
         };
 
         match op {
+            TraceOp::At { .. } => {}
             TraceOp::LoadConst { dest, value } => {
                 let ty = match value {
                     Value::Bool(_) => Some(ValueType::Bool),

@@ -189,6 +189,14 @@ impl JitState {
             feature = "std",
             any(target_arch = "x86_64", target_arch = "aarch64")
         )) || cfg!(all(feature = "rv32", target_arch = "riscv32"));
+        // `LUST_JIT=0` (or `off`) is a kill switch for differential testing
+        // against the interpreter; it overrides every configuration path.
+        #[cfg(feature = "std")]
+        let enabled = enabled
+            && !matches!(
+                std::env::var("LUST_JIT").as_deref(),
+                Ok("0") | Ok("off") | Ok("false")
+            );
         Self {
             profiler: Profiler::new(),
             traces: HashMap::new(),

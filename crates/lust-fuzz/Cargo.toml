@@ -1,0 +1,13 @@
+[package]
+name = "lust-fuzz"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Differential fuzzer: random Lust programs run through the interpreter and the JIT"
+
+[[bin]]
+name = "lust-fuzz"
+path = "src/main.rs"
+
+[dependencies]
+lust = { path = "../..", package = "lust-rs" }

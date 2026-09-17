@@ -326,8 +326,7 @@ impl VM {
                                         )
                                     });
                                 if !reusable_exit || loop_in_hierarchy {
-                                    self.jit.root_traces.remove(&(func_idx, loop_start_ip));
-                                    self.jit.schedule_root_retry(func_idx, loop_start_ip);
+                                    self.jit.evict_root_trace(func_idx, loop_start_ip);
                                 }
                                 continue;
                             }
@@ -343,8 +342,7 @@ impl VM {
                                 frame.ip = loop_start_ip;
                             }
 
-                            self.jit.root_traces.remove(&(func_idx, loop_start_ip));
-                            self.jit.schedule_root_retry(func_idx, loop_start_ip);
+                            self.jit.evict_root_trace(func_idx, loop_start_ip);
                             // Re-dispatch from the loop header we just installed.
                             //
                             // Falling through instead would let the interpreter

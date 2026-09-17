@@ -197,18 +197,133 @@ impl JitCompiler {
         lhs_type: ValueType,
         rhs_type: ValueType,
     ) -> Result<()> {
-        // Only integer modulo is lowered natively; any other combination reads
-        // both payloads as integers, exactly like the x86_64 backend.
-        let _ = (lhs_type, rhs_type);
-        self.load_payload(0, lhs);
-        self.load_payload(9, rhs);
+        if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
+            self.load_payload(0, lhs);
+            self.load_payload(9, rhs);
+            self.emit_int_mod();
+            self.store_from_x0(dest, ValueTag::Int.as_u8());
+            return Ok(());
+        }
+
+        let numeric = |ty: ValueType| matches!(ty, ValueType::Int | ValueType::Float);
+        if numeric(lhs_type) && numeric(rhs_type) {
+            if lhs_type == ValueType::Int {
+                self.load_payload_int_as_f(0, lhs);
+            } else {
+                self.load_payload_f(0, lhs);
+            }
+            if rhs_type == ValueType::Int {
+                self.load_payload_int_as_f(1, rhs);
+            } else {
+                self.load_payload_f(1, rhs);
+            }
+            self.emit_float_mod();
+            self.store_d0_as_float(dest);
+            return Ok(());
+        }
+
+        self.compile_mod_generic(dest, lhs, rhs)
+    }
+
+    /// x0 = x0 % x9 with the interpreter's semantics: sign of the dividend,
+    /// modulo by zero fails the trace so the interpreter raises the error.
+    fn emit_int_mod(&mut self) {
         dynasm!(self.ops
             ; .arch aarch64
             ; cbz x9, >fail
             ; sdiv x10, x0, x9
             ; msub x0, x10, x9, x0
         );
+    }
+
+    /// d0 = d0 % d1 as Rust's `f64 % f64` (libm `fmod`: exact, sign of the
+    /// dividend, NaN for NaN or infinite dividends). A zero divisor fails
+    /// the trace like the interpreter's "Modulo by zero"; NaN is not equal
+    /// to zero and falls through to fmod, again like the interpreter.
+    fn emit_float_mod(&mut self) {
+        unsafe extern "C" {
+            fn fmod(a: f64, b: f64) -> f64;
+        }
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; fcmp d1, 0.0
+            ; b.eq >fail
+        );
+        self.emit_call(fmod as *const ());
+    }
+
+    /// Runtime-dispatched modulo for operands of unknown static type: a
+    /// Float on either side selects the float path (ints converted),
+    /// otherwise both payloads are integers.
+    fn compile_mod_generic(&mut self, dest: u8, lhs: u8, rhs: u8) -> Result<()> {
+        let float_tag = ValueTag::Float.as_u8() as u32;
+        let int_tag = ValueTag::Int.as_u8() as u32;
+        self.load_tag(0, lhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #float_tag
+            ; b.eq >float_path
+        );
+        self.load_tag(0, rhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #float_tag
+            ; b.eq >float_path
+        );
+        self.load_payload(0, lhs);
+        self.load_payload(9, rhs);
+        self.emit_int_mod();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b >store_int
+            ; float_path:
+        );
+        self.load_tag(0, lhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #int_tag
+            ; b.ne >lhs_is_float
+        );
+        self.load_payload_int_as_f(0, lhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b >rhs_check
+            ; lhs_is_float:
+        );
+        self.load_payload_f(0, lhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; rhs_check:
+        );
+        self.load_tag(0, rhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #int_tag
+            ; b.ne >rhs_is_float
+        );
+        self.load_payload_int_as_f(1, rhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b >do_float_mod
+            ; rhs_is_float:
+        );
+        self.load_payload_f(1, rhs);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; do_float_mod:
+        );
+        self.emit_float_mod();
+        self.store_d0_as_float(dest);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b >mod_done
+            ; store_int:
+        );
         self.store_from_x0(dest, ValueTag::Int.as_u8());
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; mod_done:
+        );
         Ok(())
     }
 }

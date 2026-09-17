@@ -71,6 +71,10 @@ pub const UNROLL_FACTOR: usize = 32;
 /// How many times to unroll a loop during trace recording
 pub const LOOP_UNROLL_COUNT: usize = 32;
 const MAX_ROOT_RETRY_SHIFT: u32 = 5;
+/// Cap on the eviction backoff: a root trace that keeps exiting is retried
+/// after 1, 2, 4, ... 2^16 backedges, so a site that never stabilises costs
+/// O(log n) compiles rather than one every few iterations.
+const MAX_ROOT_EVICTION_SHIFT: u32 = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TraceId(pub usize);
 pub struct CompiledTrace {
@@ -178,6 +182,10 @@ pub struct JitState {
     pub root_traces: HashMap<(usize, usize), TraceId>,
     next_root_recording: HashMap<(usize, usize), u32>,
     root_recording_failures: HashMap<(usize, usize), u32>,
+    /// Times a compiled root trace at this site was evicted after a guard
+    /// exit. Unlike recording failures this is never reset by a successful
+    /// compile, so the retry delay keeps growing for a site that thrashes.
+    root_evictions: HashMap<(usize, usize), u32>,
     next_trace_id: usize,
     pub enabled: bool,
     stats: JitStats,
@@ -203,6 +211,7 @@ impl JitState {
             root_traces: HashMap::new(),
             next_root_recording: HashMap::new(),
             root_recording_failures: HashMap::new(),
+            root_evictions: HashMap::new(),
             next_trace_id: 0,
             enabled,
             stats: JitStats::default(),
@@ -243,11 +252,51 @@ impl JitState {
 
     pub fn store_root_trace(&mut self, func_idx: usize, ip: usize, trace: CompiledTrace) {
         let id = trace.id;
-        self.root_traces.insert((func_idx, ip), id);
+        if let Some(previous) = self.root_traces.insert((func_idx, ip), id) {
+            self.drop_trace_tree(previous);
+        }
         self.traces.insert(id, Rc::new(trace));
         self.next_root_recording.remove(&(func_idx, ip));
         self.root_recording_failures.remove(&(func_idx, ip));
         self.stats.root_traces_compiled = self.stats.root_traces_compiled.saturating_add(1);
+    }
+
+    /// Forget the root trace at a site because its guards keep failing.
+    /// The compiled code and every side trace hanging off it are freed;
+    /// the site is retried with a delay that doubles on each eviction.
+    pub(crate) fn evict_root_trace(&mut self, func_idx: usize, ip: usize) {
+        if let Some(id) = self.root_traces.remove(&(func_idx, ip)) {
+            self.drop_trace_tree(id);
+        }
+        let count = self.profiler.get_count(func_idx, ip);
+        let evictions = self
+            .root_evictions
+            .entry((func_idx, ip))
+            .and_modify(|value| *value = value.saturating_add(1))
+            .or_insert(1);
+        let retry_delay = 1u32 << evictions.saturating_sub(1).min(MAX_ROOT_EVICTION_SHIFT);
+        let next = count.saturating_add(retry_delay);
+        let entry = self.next_root_recording.entry((func_idx, ip)).or_insert(0);
+        *entry = (*entry).max(next);
+    }
+
+    /// Drop a compiled trace and, recursively, the side traces its guards
+    /// link to. Traces are only ever entered through `root_traces` or a
+    /// parent's guard, so nothing else can reach them afterwards.
+    fn drop_trace_tree(&mut self, id: TraceId) {
+        let Some(trace) = self.traces.remove(&id) else {
+            return;
+        };
+        let children: Vec<TraceId> = trace
+            .guards
+            .iter()
+            .filter_map(|guard| guard.side_trace)
+            .chain(trace.side_traces.iter().copied())
+            .collect();
+        drop(trace);
+        for child in children {
+            self.drop_trace_tree(child);
+        }
     }
 
     pub fn store_side_trace(&mut self, trace: CompiledTrace) {
@@ -329,6 +378,7 @@ impl JitState {
         self.root_traces.clear();
         self.next_root_recording.clear();
         self.root_recording_failures.clear();
+        self.root_evictions.clear();
         self.next_trace_id = 0;
         self.stats = JitStats::default();
     }

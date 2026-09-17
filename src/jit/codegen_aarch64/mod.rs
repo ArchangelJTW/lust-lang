@@ -671,6 +671,101 @@ mod tests {
     }
 
     #[test]
+    fn generated_float_modulo_matches_interpreter_semantics() {
+        // (lhs, rhs, expected) — Rust `%` on f64 (fmod): sign of the dividend.
+        let cases = [
+            (Value::Float(7.5), Value::Float(2.0), 1.5),
+            (Value::Float(-7.5), Value::Float(2.0), -1.5),
+            (Value::Float(7.5), Value::Float(-2.0), 1.5),
+            (Value::Int(7), Value::Float(2.5), 2.0),
+            (Value::Float(7.5), Value::Int(2), 1.5),
+            (Value::Float(1e300), Value::Float(3.0), 1e300 % 3.0),
+        ];
+        for (lhs, rhs, expected) in cases {
+            let value_type = |value: &Value| match value {
+                Value::Int(_) => ValueType::Int,
+                Value::Float(_) => ValueType::Float,
+                _ => unreachable!(),
+            };
+            let trace = Trace {
+                function_idx: 0,
+                start_ip: 0,
+                preamble: Vec::new(),
+                ops: vec![
+                    TraceOp::Mod {
+                        dest: 0,
+                        lhs: 1,
+                        rhs: 2,
+                        lhs_type: value_type(&lhs),
+                        rhs_type: value_type(&rhs),
+                    },
+                    TraceOp::NestedLoopCall {
+                        function_idx: 0,
+                        loop_start_ip: 0,
+                        bailout_ip: 0,
+                    },
+                ],
+                postamble: Vec::new(),
+                inputs: vec![1, 2],
+                outputs: vec![0],
+            };
+            let compiled = JitCompiler::new()
+                .compile_trace(&trace, TraceId(0), None, Vec::new())
+                .unwrap();
+            let mut registers = vec![Value::Nil, lhs.clone(), rhs.clone()];
+            let result = compiled.execute(
+                registers.as_mut_ptr(),
+                core::ptr::null_mut(),
+                core::ptr::null(),
+            );
+            assert_eq!(result, 1, "{lhs:?} % {rhs:?}");
+            assert_eq!(registers[0], Value::Float(expected), "{lhs:?} % {rhs:?}");
+        }
+
+        // Modulo by zero and NaN follow the interpreter: zero fails the
+        // trace (the interpreter raises), NaN propagates.
+        let run = |lhs: Value, rhs: Value| {
+            let trace = Trace {
+                function_idx: 0,
+                start_ip: 0,
+                preamble: Vec::new(),
+                ops: vec![
+                    TraceOp::Mod {
+                        dest: 0,
+                        lhs: 1,
+                        rhs: 2,
+                        lhs_type: ValueType::Float,
+                        rhs_type: ValueType::Float,
+                    },
+                    TraceOp::NestedLoopCall {
+                        function_idx: 0,
+                        loop_start_ip: 0,
+                        bailout_ip: 0,
+                    },
+                ],
+                postamble: Vec::new(),
+                inputs: vec![1, 2],
+                outputs: vec![0],
+            };
+            let compiled = JitCompiler::new()
+                .compile_trace(&trace, TraceId(0), None, Vec::new())
+                .unwrap();
+            let mut registers = vec![Value::Nil, lhs, rhs];
+            let result = compiled.execute(
+                registers.as_mut_ptr(),
+                core::ptr::null_mut(),
+                core::ptr::null(),
+            );
+            (result, registers.remove(0))
+        };
+        assert_eq!(run(Value::Float(1.0), Value::Float(0.0)).0, -1);
+        assert_eq!(run(Value::Float(1.0), Value::Float(-0.0)).0, -1);
+        let (result, value) = run(Value::Float(1.0), Value::Float(f64::NAN));
+        assert_eq!(result, 1);
+        assert!(matches!(value, Value::Float(f) if f.is_nan()));
+    }
+
+    #[test]
     fn generated_scalar_comparisons_match_value_semantics() {
         let trace = Trace {
             function_idx: 0,

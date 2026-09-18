@@ -162,12 +162,14 @@ milliseconds, single run each:
 | methods   |    2208 |      536 |     27 |     210 |
 | strings   |   14844 |    13982 |  26942 |    7287 |
 | fib       |     271 |      270 |     20 |      37 |
-| nested    |     543 |      626 |     27 |      75 |
+| nested    |     522 |       22 |     29 |      75 |
 | floatmath |     810 |       54 |     34 |      92 |
 
 The interpreter numbers were 3-90x worse before the fixes to cycle
 collection cost, call-frame copying and argument checking on this branch
 (fib: 3724 ms; `array` at 1,000,000 elements did not finish in thirty
-minutes). Remaining gaps against Lua: recursion and calls (frame setup),
-nested loops (only innermost loops run natively), and `strings`, where every
-engine is quadratic in `s = s .. x`.
+minutes). `nested` was 626 ms with the JIT before nested loops ran natively from the
+outer trace (each outer iteration used to exit to the interpreter, and the
+inner loop's trace was recompiled every time). Remaining gaps against Lua:
+recursion and calls (frame setup), and `strings`, where every engine is
+quadratic in `s = s .. x`.

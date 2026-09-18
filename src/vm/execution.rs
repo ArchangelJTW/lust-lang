@@ -318,6 +318,16 @@ impl VM {
                                     .and_then(|trace| trace.guards.get(guard_index))
                                     .map(|guard| guard.bailout_ip);
 
+                                crate::jit::log(|| {
+                                    let kind = self
+                                        .jit
+                                        .get_trace(trace_id)
+                                        .and_then(|trace| trace.guards.get(guard_index))
+                                        .map(|guard| format!("{:?}", guard.kind));
+                                    format!(
+                                        "↩️  JIT: guard #{guard_index} exit {kind:?} → ip {bailout_ip:?}"
+                                    )
+                                });
                                 // A nested loop's trace may have bailed out
                                 // somewhere other than the guard's own ip.
                                 let bailout_ip = self.nested_loop_exit_ip.take().or(bailout_ip);
@@ -2168,19 +2178,7 @@ impl VM {
         }
 
         let register_count = function.register_count;
-        let mut frame = match self.frame_pool.pop() {
-            Some(mut frame) => {
-                // Pooled frames come back with every register they used
-                // reset to Nil (see `recycle_frame`); only the bookkeeping
-                // needs setting.
-                frame.function_idx = function_idx;
-                frame.ip = 0;
-                frame.base_register = 0;
-                frame.return_dest = return_dest;
-                frame
-            }
-            None => CallFrame::new(function_idx, return_dest, register_count),
-        };
+        let mut frame = self.take_frame(function_idx, return_dest, register_count);
         let recursive = self
             .call_stack
             .iter()
@@ -2197,6 +2195,28 @@ impl VM {
             self.arg_scratch = args;
         }
         Ok(frame)
+    }
+
+    /// A frame for `function_idx`, from the pool when one is available.
+    pub(super) fn take_frame(
+        &mut self,
+        function_idx: usize,
+        return_dest: Option<Register>,
+        register_count: u8,
+    ) -> Box<CallFrame> {
+        match self.frame_pool.pop() {
+            Some(mut frame) => {
+                // Pooled frames come back with every register they used
+                // reset to Nil (see `recycle_frame`); only the bookkeeping
+                // needs setting.
+                frame.function_idx = function_idx;
+                frame.ip = 0;
+                frame.base_register = 0;
+                frame.return_dest = return_dest;
+                frame
+            }
+            None => CallFrame::new(function_idx, return_dest, register_count),
+        }
     }
 
     /// An O(1) argument check for calls the typechecker already validated:

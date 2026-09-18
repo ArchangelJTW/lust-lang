@@ -16,10 +16,21 @@ impl JitCompiler {
             pins: HashMap::new(),
             pin_active: false,
             dirty_pins: Vec::new(),
+            trace_start_ip: 0,
             current_fail_ip: None,
             fail_sites: Vec::new(),
             next_specialized_id: 0,
         }
+    }
+
+    /// Where the interpreter resumes when a guard that is not a branch
+    /// (type, function identity, struct layout) fails: the instruction the
+    /// guard was recorded for, so it is re-executed with the value the guard
+    /// rejected. Inside an inlined body the ip is the call's, since the
+    /// callee frame is torn down on exit; the call then runs in the
+    /// interpreter.
+    pub(super) fn guard_bailout_ip(&self) -> usize {
+        self.current_fail_ip.unwrap_or(self.trace_start_ip)
     }
 
     pub(super) fn current_exit_label(&self) -> dynasmrt::DynamicLabel {
@@ -65,6 +76,7 @@ impl JitCompiler {
         hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
         self.scalar_registers.clear();
+        self.trace_start_ip = trace.start_ip;
         self.last_fail_island = self.ops.offset().0;
         self.pins = pins::plan(&hoisted_constants, &trace.preamble, &trace.ops);
         crate::jit::log(|| {
@@ -133,6 +145,7 @@ impl JitCompiler {
                 ; str xzr, [x11]
                 ; str xzr, [x11, 8]
                 ; str xzr, [x11, 16]
+                ; str xzr, [x11, 24]
             );
         }
         for (dest, value) in &hoisted_constants {
@@ -204,18 +217,15 @@ impl JitCompiler {
             ; b => exit_pinned_label
         );
 
-        unsafe extern "C" {
-            fn jit_drop_values(values: *mut Value, len: usize);
-        }
-        // Body exits: preserve the exit code, unwind inline frames so x19 is
-        // the trace's own register array again, then write pinned registers
-        // back to it.
+        // Body exits: preserve the exit code, turn any inline frames into
+        // interpreter frames so x19 is the trace's own register array again,
+        // then write pinned registers back to it.
         dynasm!(self.ops
             ; .arch aarch64
             ; => exit_pinned_label
             ; mov w22, w0
         );
-        self.emit_unwind_inline_frames(jit_drop_values as *const ());
+        self.emit_unwind_inline_frames();
         self.emit_writeback_carried_pins();
         dynasm!(self.ops
             ; .arch aarch64
@@ -226,7 +236,7 @@ impl JitCompiler {
             // a callee-saved register until specialized state is materialized.
             ; mov w22, w0
         );
-        self.emit_unwind_inline_frames(jit_drop_values as *const ());
+        self.emit_unwind_inline_frames();
         dynasm!(self.ops
             ; .arch aarch64
             ; => after_unwind_label
@@ -381,25 +391,31 @@ impl JitCompiler {
             }
         )
     }
-    /// Drain the inline-call frame chain in x21. Each record is
-    /// { value_count, saved_x19, prev_x21 }; the callee registers live
-    /// directly below it and must be dropped before we abandon them.
-    fn emit_unwind_inline_frames(&mut self, drop_values: *const ()) {
-        let done = self.ops.new_dynamic_label();
+    /// Hand the inline-call frame chain in x21 to the interpreter (see
+    /// `jit_materialize_inline_frames`): the callee frames become real
+    /// frames and execution resumes inside the innermost one. Leaves x19 =
+    /// the trace's own register array and x21 = 0. No-op without a chain.
+    fn emit_unwind_inline_frames(&mut self) {
+        unsafe extern "C" {
+            fn jit_materialize_inline_frames(
+                vm: *mut VM,
+                record: *const u8,
+                regs: *mut Value,
+            ) -> *mut Value;
+        }
         dynasm!(self.ops
             ; .arch aarch64
-            ; unwind:
-            ; cbz x21, => done
-            ; mov x0, x19
-            ; ldr x1, [x21]
+            ; cbz x21, >unwind_done
+            ; mov x0, x20
+            ; mov x1, x21
+            ; mov x2, x19
         );
-        self.emit_call(drop_values);
+        self.emit_call(jit_materialize_inline_frames as *const ());
         dynasm!(self.ops
             ; .arch aarch64
-            ; ldr x19, [x21, 8]
-            ; ldr x21, [x21, 16]
-            ; b <unwind
-            ; => done
+            ; mov x19, x0
+            ; mov x21, xzr
+            ; unwind_done:
         );
     }
 
@@ -416,10 +432,9 @@ impl JitCompiler {
             }
             if let TraceOp::At { ip } = op {
                 // Inside an inlined body the markers carry the callee's ips;
-                // a failure there resumes at the call itself.
-                if self.inline_depth == 0 {
-                    self.current_fail_ip = Some(*ip);
-                }
+                // an exit there resumes inside the callee, whose frame the
+                // exit path materializes.
+                self.current_fail_ip = Some(*ip);
                 continue;
             }
             if self.pin_active && pins::op_touches_register_memory(op) {
@@ -1553,8 +1568,10 @@ impl JitCompiler {
                 fn jit_drop_values(values: *mut Value, len: usize);
             }
 
-            // Push inline metadata { value_count, caller x19, previous x21 }
-            // and link it into the unwind chain.
+            // Push the inline record (see `JitInlineRecord`). It is linked
+            // into the unwind chain only once the frame below it is fully
+            // built, so a failure while building it exits cleanly.
+            let caller_resume_ip = self.current_fail_ip.map_or(0, |ip| ip + 1);
             dynasm!(self.ops
                 ; .arch aarch64
                 ; sub sp, sp, #metadata_size
@@ -1565,38 +1582,60 @@ impl JitCompiler {
                 ; str x0, [sp]
                 ; str x19, [sp, 8]
                 ; str x21, [sp, 16]
-                ; mov x21, sp
+                ; str xzr, [sp, 24]
             );
-            // Allocate space for callee registers.
+            self.emit_mov_imm64(0, trace.function_idx as u64);
+            dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 32]);
+            self.emit_mov_imm64(0, dest as u64);
+            dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 40]);
+            self.emit_mov_imm64(0, callee as u64);
+            dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 48]);
+            self.emit_mov_imm64(0, caller_resume_ip as u64);
+            dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 56]);
+            // Allocate space for callee registers and initialise every one
+            // to Nil (discriminant 0) — what `jit_init_nil` does, without a
+            // call per register — so the argument moves below find nothing to
+            // drop. x19 still addresses the caller's registers here.
             self.emit_sub_sp(frame_size);
+            let nil_tag = ValueTag::Nil.as_u8() as u32;
+            dynasm!(self.ops ; .arch aarch64 ; movz w13, #nil_tag);
+            for reg in 0..trace.register_count {
+                dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
+                self.emit_add_imm(11, 11, super::registers::reg_offset(reg));
+                dynasm!(self.ops ; .arch aarch64 ; strb w13, [x11]);
+            }
+
+            // Copy positional arguments into the callee frame.
+            for (arg_index, src_reg) in trace.arg_registers.iter().enumerate() {
+                let dest_offset = (arg_index as i32) * value_size;
+                self.emit_reg_addr(0, *src_reg);
+                dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
+                self.emit_add_imm(1, 11, dest_offset);
+                self.emit_call(jit_move_safe as *const ());
+                self.emit_fail_if_w0_zero();
+            }
+            // A failed argument move resumes at the call, in the caller.
+            self.emit_fail_stub();
+
             dynasm!(self.ops
                 ; .arch aarch64
                 ; mov x19, sp
             );
+            // Link the record into the unwind chain.
+            dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
+            self.emit_add_imm(21, 11, frame_size);
 
-            // Initialise every callee register to Nil (discriminant 0). This is
-            // exactly what `jit_init_nil` does, without a call per register.
-            for reg in 0..trace.register_count {
-                self.store_tag_imm(reg, ValueTag::Nil.as_u8());
-            }
-
-            // Copy positional arguments into callee registers.
-            for (arg_index, src_reg) in trace.arg_registers.iter().enumerate() {
-                let src_offset = (*src_reg as i32) * value_size;
-                dynasm!(self.ops
-                    ; .arch aarch64
-                    ; ldr x11, [x21, 8]
-                );
-                self.emit_add_imm(0, 11, src_offset);
-                self.emit_reg_addr(1, arg_index as u8);
-                self.emit_call(jit_move_safe as *const ());
-                self.emit_fail_if_w0_zero();
-            }
-
+            let call_ip = self.current_fail_ip;
             let inline_result = self.compile_ops(&trace.body, guard_index, guards);
             inline_result?;
+            // A failed result move exits from the callee frame at its last
+            // instruction; everything after the frame is popped is the
+            // caller's again.
+            let callee_last_ip = self.current_fail_ip;
+            self.current_fail_ip = call_ip;
 
             if let Some(ret_reg) = trace.return_register {
+                self.current_fail_ip = callee_last_ip;
                 let dest_offset = (dest as i32) * value_size;
                 dynasm!(self.ops
                     ; .arch aarch64
@@ -1606,6 +1645,8 @@ impl JitCompiler {
                 self.emit_add_imm(1, 11, dest_offset);
                 self.emit_call(jit_move_safe as *const ());
                 self.emit_fail_if_w0_zero();
+                self.emit_fail_stub();
+                self.current_fail_ip = call_ip;
             }
 
             // Drop callee registers and pop the frame + metadata.

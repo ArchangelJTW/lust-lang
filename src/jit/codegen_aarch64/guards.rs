@@ -33,7 +33,7 @@ impl JitCompiler {
         );
         Ok(Guard {
             index: guard_index,
-            bailout_ip: 0,
+            bailout_ip: self.guard_bailout_ip(),
             kind: match expected_type {
                 ValueType::Int => GuardKind::IntType { register },
                 ValueType::Float => GuardKind::FloatType { register },
@@ -128,7 +128,7 @@ impl JitCompiler {
         };
         Ok(Guard {
             index: guard_index,
-            bailout_ip: 0,
+            bailout_ip: self.guard_bailout_ip(),
             kind,
             fail_count: 0,
             side_trace: None,
@@ -165,7 +165,7 @@ impl JitCompiler {
         );
         Ok(Guard {
             index: guard_index,
-            bailout_ip: 0,
+            bailout_ip: self.guard_bailout_ip(),
             kind: GuardKind::NativeFunction {
                 register,
                 expected: expected_ptr,
@@ -200,7 +200,7 @@ impl JitCompiler {
         );
         Ok(Guard {
             index: guard_index,
-            bailout_ip: 0,
+            bailout_ip: self.guard_bailout_ip(),
             kind: GuardKind::StructLayout { register, layout },
             fail_count: 0,
             side_trace: None,

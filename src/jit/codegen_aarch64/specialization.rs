@@ -1,5 +1,6 @@
 use super::*;
 use crate::jit::trace::{Operand, SpecializedOpKind};
+use crate::bytecode::value::JitVecSlot;
 use crate::number::LustInt;
 
 fn is_int_vec(layout: &SpecializedLayout) -> Option<bool> {
@@ -117,35 +118,19 @@ impl JitCompiler {
             )
         });
 
-        // Allocate stack space for Vec metadata (ptr, len, cap) = 24 bytes
-        let stack_offset = self.allocate_specialized_stack(24, 8);
+        // Allocate a slot for the Vec raw parts and the array reference.
+        let stack_offset = self.allocate_specialized_stack(32, 8);
         self.specialized_values
             .insert(specialized_id, SpecializedValue { stack_offset });
 
-        // Call jit_unbox_array_int(array_ptr, out_vec_ptr, out_len, out_cap)
+        // jit_unbox_array_int(array_ptr, slot): the helper releases whatever
+        // the slot held (an earlier unbox in an unrolled iteration) and leaves
+        // it empty on failure, so the postamble's rebox is a no-op then.
         unsafe extern "C" {
-            fn jit_unbox_array_int(
-                array_value_ptr: *const Value,
-                out_vec_ptr: *mut *mut LustInt,
-                out_len: *mut usize,
-                out_cap: *mut usize,
-            ) -> u8;
+            fn jit_unbox_array_int(array_value_ptr: *const Value, slot: *mut JitVecSlot) -> u8;
         }
-
-        // Zero the (ptr, len, cap) triple before attempting the unbox: the
-        // bailout path still runs the postamble, which reboxes from these
-        // slots, and the rebox helper's null check turns zeroed slots into a
-        // no-op instead of a `capacity overflow` abort on stack garbage.
-        self.emit_slot_addr(1, stack_offset);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; str xzr, [x1]
-            ; str xzr, [x1, 8]
-            ; str xzr, [x1, 16]
-            ; add x2, x1, 8
-            ; add x3, x1, 16
-        );
         self.emit_reg_addr(0, source_reg);
+        self.emit_slot_addr(1, stack_offset);
         self.emit_call(jit_unbox_array_int as *const ());
         self.emit_fail_if_w0_zero();
 
@@ -163,36 +148,16 @@ impl JitCompiler {
 
         let stack_offset = self.slot_offset(specialized_id, "value")?;
 
-        // Call jit_rebox_array_int(vec_ptr, vec_len, vec_cap, out_value_ptr)
+        // jit_rebox_array_int(slot): publishes into the array the slot was
+        // unboxed from and empties the slot. `dest_reg` is where the recorder
+        // last saw that array; the value itself is found through the slot.
+        let _ = dest_reg;
         unsafe extern "C" {
-            fn jit_rebox_array_int(
-                vec_ptr: *mut LustInt,
-                vec_len: usize,
-                vec_cap: usize,
-                out_value_ptr: *mut Value,
-            ) -> u8;
+            fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8;
         }
-
-        self.emit_slot_addr(11, stack_offset);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; ldr x0, [x11]
-            ; ldr x1, [x11, 8]
-            ; ldr x2, [x11, 16]
-        );
-        self.emit_reg_addr(3, dest_reg);
+        self.emit_slot_addr(0, stack_offset);
         self.emit_call(jit_rebox_array_int as *const ());
         self.emit_fail_if_w0_zero();
-        // Rebox consumes the raw Vec allocation. Clear the metadata so a
-        // duplicated cleanup path is a harmless no-op rather than a second
-        // Vec::from_raw_parts over freed storage.
-        self.emit_slot_addr(11, stack_offset);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; str xzr, [x11]
-            ; str xzr, [x11, 8]
-            ; str xzr, [x11, 16]
-        );
 
         Ok(())
     }
@@ -274,18 +239,10 @@ impl JitCompiler {
 
         let stack_offset = self.slot_offset(vec_id, "vec")?;
 
-        // Call jit_drop_vec_int(vec_ptr, vec_len, vec_cap)
         unsafe extern "C" {
-            fn jit_drop_vec_int(vec_ptr: *mut LustInt, vec_len: usize, vec_cap: usize);
+            fn jit_drop_vec_int(slot: *mut JitVecSlot);
         }
-
-        self.emit_slot_addr(11, stack_offset);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; ldr x0, [x11]
-            ; ldr x1, [x11, 8]
-            ; ldr x2, [x11, 16]
-        );
+        self.emit_slot_addr(0, stack_offset);
         self.emit_call(jit_drop_vec_int as *const ());
 
         Ok(())

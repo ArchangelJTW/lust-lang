@@ -53,8 +53,8 @@ pub(super) const SAVED_REGS_SIZE: i32 = 32;
 /// pad so each slot stays 4-byte aligned.
 pub(super) const SPECIALIZED_BASE_OFFSET: i32 = -(SAVED_REGS_SIZE + 4);
 
-/// Bytes per specialized Vec slot: ptr (4) + len (4) + cap (4) = 12, rounded
-/// to 16 for alignment.
+/// Bytes per specialized Vec slot: a `JitVecSlot` — ptr (4) + len (4) +
+/// cap (4) + array reference (4).
 pub(super) const SPECIALIZED_SLOT_SIZE: i32 = 16;
 
 mod arithmetic;

@@ -420,6 +420,8 @@ pub struct TraceRecorder {
     /// Bytecode ip of the instruction being recorded, not yet written as an
     /// `At` marker (see `flush_marker`).
     pending_marker: Option<usize>,
+    /// Bytecode ip of the instruction being recorded.
+    current_ip: usize,
     op_count: usize,
     /// Track which registers contain specialized values (register -> (specialized_id, layout))
     specialized_registers:
@@ -463,6 +465,9 @@ struct InlineContext {
     return_register: Option<Register>,
     is_closure: bool,
     upvalues_ptr: Option<*const ()>,
+    /// Ip of the call instruction in the caller: the `InlineCall` op's
+    /// marker, and where the caller resumes if the call must be redone.
+    call_ip: usize,
 }
 
 impl TraceRecorder {
@@ -485,6 +490,7 @@ impl TraceRecorder {
             guarded_registers: HashSet::new(),
             inline_stack: Vec::new(),
             pending_marker: None,
+            current_ip: 0,
             op_count: 0,
             specialized_registers: HashMap::new(),
             next_specialized_id: 0,
@@ -1048,11 +1054,15 @@ impl TraceRecorder {
             return_register: None,
             is_closure,
             upvalues_ptr,
+            call_ip: self.current_ip,
         });
     }
 
     fn finalize_inline_context(&mut self) -> Option<TraceOp> {
         let context = self.inline_stack.pop()?;
+        // The callee's `Return` left its own ip pending; the `InlineCall` op
+        // belongs to the call instruction.
+        self.pending_marker = Some(context.call_ip);
         let trace = InlineTrace {
             function_idx: context.function_idx,
             register_count: context.register_count,
@@ -1175,7 +1185,8 @@ impl TraceRecorder {
         // `current_ip` is the ip after the fetch; the instruction itself is one
         // before it (the same convention as guard bailout ips). The marker is
         // written lazily, in front of the first op this instruction records.
-        self.pending_marker = Some(current_ip.saturating_sub(1));
+        self.current_ip = current_ip.saturating_sub(1);
+        self.pending_marker = Some(self.current_ip);
 
         // Reuse the numeric trace IR, but retain the bytecode's input contract.
         // Host mutation and trace entry still require guards before payload loads.

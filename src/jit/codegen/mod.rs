@@ -15,13 +15,20 @@ use hashbrown::HashMap;
 /// Must stay (8 mod 16) to preserve SysV stack alignment guarantees.
 pub(super) const MIN_JIT_STACK_SIZE: i32 = 504;
 
-/// Base offset for specialized value allocations (must avoid saved registers at rbp-40)
-pub(super) const SPECIALIZED_BASE_OFFSET: i32 = -64;
-/// Size (in bytes) reserved per specialized value (ptr + len + cap + padding)
+/// Base offset of the first specialized slot. Slot k occupies
+/// [rbp + base - 32k, rbp + base - 32k + 32), all of it below the saved
+/// callee-saved registers at rbp-8 through rbp-40.
+pub(super) const SPECIALIZED_BASE_OFFSET: i32 = -72;
+/// Size (in bytes) reserved per specialized value: a `JitVecSlot`
+/// (vec ptr + len + cap + array reference).
 pub(super) const SPECIALIZED_SLOT_SIZE: i32 = 32;
-/// Extra stack space required before the first specialized slot to avoid the
-/// saved callee-saved registers (rbp-8 through rbp-40).
-pub(super) const SPECIALIZED_STACK_BASE: i32 = 64;
+/// Stack space below the saved registers that the slots need before the
+/// first one starts.
+pub(super) const SPECIALIZED_STACK_BASE: i32 = 72;
+/// Size of the record pushed for each inlined call frame: a
+/// `crate::vm::JitInlineRecord` (value_count, caller r12, previous r15,
+/// reserved, function_idx, return_dest, callee_reg, caller_resume_ip).
+pub(super) const INLINE_METADATA_SIZE: i32 = 64;
 mod arithmetic;
 mod builder;
 mod comparisons;
@@ -39,7 +46,6 @@ pub(super) struct SpecializedValue {
 pub struct JitCompiler {
     pub(super) ops: Assembler,
     pub(super) data: Vec<JitData>,
-    fail_stack: Vec<dynasmrt::DynamicLabel>,
     exit_stack: Vec<dynasmrt::DynamicLabel>,
     inline_depth: usize,
     /// Registry for type specializations
@@ -49,6 +55,9 @@ pub struct JitCompiler {
     pub(super) specialized_values: HashMap<usize, SpecializedValue>,
     /// Registers proven to contain non-owning scalar values at this point.
     pub(super) scalar_registers: HashMap<u8, ValueType>,
+    /// Loop-header ip of the trace being compiled: where a guard that fails
+    /// before any instruction of the body has run resumes.
+    pub(super) trace_start_ip: usize,
     /// Bytecode ip of the instruction the ops being compiled came from
     /// (from the last `At` marker), if known.
     current_fail_ip: Option<usize>,

@@ -62,7 +62,8 @@ pub(super) const SAVED_BELOW_FP: i32 = 32 + 48 + 64;
 /// Offset from x29 of the first specialized slot. Slots grow downward from
 /// just below the saved registers.
 pub(super) const SPECIALIZED_BASE_OFFSET: i32 = -(SAVED_BELOW_FP + 32);
-/// Size (in bytes) reserved per specialized value (ptr + len + cap + padding)
+/// Size (in bytes) reserved per specialized value: a `JitVecSlot`
+/// (vec ptr + len + cap + array reference).
 pub(super) const SPECIALIZED_SLOT_SIZE: i32 = 32;
 /// Local-area bytes needed before the first specialized slot.
 pub(super) const SPECIALIZED_STACK_BASE: i32 = 32;
@@ -74,9 +75,10 @@ pub(super) const SPECIALIZED_STACK_BASE: i32 = 32;
 /// reference within reach of the island that follows it.
 pub(super) const FAIL_ISLAND_INTERVAL: usize = 900 * 1024;
 
-/// Size of the metadata block pushed for each inlined call frame:
-/// { value_count: u64, saved_x19: *mut Value, prev_x21: *const u8, pad }
-pub(super) const INLINE_METADATA_SIZE: i32 = 32;
+/// Size of the record pushed for each inlined call frame: a
+/// `crate::vm::JitInlineRecord` (value_count, caller x19, previous x21,
+/// reserved, function_idx, return_dest, callee_reg, caller_resume_ip).
+pub(super) const INLINE_METADATA_SIZE: i32 = 64;
 
 mod arithmetic;
 mod builder;
@@ -116,6 +118,9 @@ pub struct JitCompiler {
     pin_active: bool,
     /// Carried pins whose machine value may be newer than memory.
     dirty_pins: Vec<u8>,
+    /// Loop-header ip of the trace being compiled: where a guard that fails
+    /// before any instruction of the body has run resumes.
+    pub(super) trace_start_ip: usize,
     /// Bytecode ip of the instruction the ops being compiled came from
     /// (from the last `At` marker), if known.
     current_fail_ip: Option<usize>,

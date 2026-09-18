@@ -1710,130 +1710,123 @@ pub unsafe extern "C" fn jit_array_push_safe(
     }
 }
 
-/// Unbox Array<int> from Value to Vec<LustInt> for specialized JIT operations
-/// IMPORTANT: This takes ownership of the array's data. The original Vec<Value> is emptied.
-/// Returns 1 on success, 0 on failure
-/// Outputs: vec_ptr (pointer to data), vec_len, vec_cap
+/// A specialized `Array<int>` slot on the JIT stack: the raw parts of a
+/// `Vec<LustInt>` copy of the elements, plus a strong reference to the
+/// array it was copied from. Traces read and push through the copy; the
+/// rebox publishes it back into that same array object, wherever the
+/// register that held the array has moved on to by then. Zeroed = empty.
+#[cfg(feature = "std")]
+type ArrayRef = Rc<RefCell<Vec<Value>>>;
+
+#[cfg(feature = "std")]
+#[repr(C)]
+pub struct JitVecSlot {
+    ptr: *mut LustInt,
+    len: usize,
+    cap: usize,
+    array: *const RefCell<Vec<Value>>,
+}
+
+#[cfg(feature = "std")]
+impl JitVecSlot {
+    /// Take the slot's contents, leaving it zeroed.
+    ///
+    /// # Safety
+    /// The slot holds either zeros or what `jit_unbox_array_int` stored.
+    unsafe fn take(&mut self) -> (Option<Vec<LustInt>>, Option<ArrayRef>) {
+        let vec = if self.ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { Vec::from_raw_parts(self.ptr, self.len, self.cap) })
+        };
+        let array = if self.array.is_null() {
+            None
+        } else {
+            Some(unsafe { Rc::from_raw(self.array) })
+        };
+        self.ptr = ptr::null_mut();
+        self.len = 0;
+        self.cap = 0;
+        self.array = ptr::null();
+        (vec, array)
+    }
+}
+
+/// Unbox `Array<int>` into `slot`: copy the elements into a `Vec<LustInt>`
+/// and keep a reference to the array. Whatever the slot held before (an
+/// earlier unbox in an unrolled iteration) is released first; on failure
+/// the slot is left empty. Returns 1 on success, 0 on failure.
+///
+/// # Safety
+/// `array_value_ptr` points at a live `Value` and `slot` at a slot that
+/// holds zeros or what an earlier call stored.
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_unbox_array_int(
     array_value_ptr: *const Value,
-    out_vec_ptr: *mut *mut LustInt,
-    out_len: *mut usize,
-    out_cap: *mut usize,
+    slot: *mut JitVecSlot,
 ) -> u8 {
     unsafe {
-        if array_value_ptr.is_null()
-            || out_vec_ptr.is_null()
-            || out_len.is_null()
-            || out_cap.is_null()
-        {
+        if array_value_ptr.is_null() || slot.is_null() {
             return 0;
         }
+        let slot = &mut *slot;
+        drop(slot.take());
 
-        let array_value = &*array_value_ptr;
-        match array_value {
-            Value::Array(arr_rc) => {
-                // Get exclusive access to the inner vector
-                let cell_ptr = arr_rc.as_ptr();
-                let vec_ref = &mut *cell_ptr;
+        let Value::Array(arr_rc) = &*array_value_ptr else {
+            return 0;
+        };
+        // Copy the elements out; do NOT move them. Moving left the source
+        // array empty for the span of the trace, and anything that re-entered
+        // the runtime mid-trace (a nested `for elem in arr`) saw a hollowed-out
+        // array. A runtime re-entry mid-trace can still see values that
+        // predate pushes made by the trace; closing that hole needs escape
+        // analysis so such arrays are never specialized at all.
+        let vec_ref = &*arr_rc.as_ptr();
+        if vec_ref.iter().any(|value| !matches!(value, Value::Int(_))) {
+            return 0;
+        }
+        let mut specialized_vec: Vec<LustInt> = vec_ref
+            .iter()
+            .map(|value| match value {
+                Value::Int(value) => *value,
+                _ => unreachable!("array element types were validated above"),
+            })
+            .collect();
+        slot.len = specialized_vec.len();
+        slot.cap = specialized_vec.capacity();
+        slot.ptr = specialized_vec.as_mut_ptr();
+        core::mem::forget(specialized_vec);
+        slot.array = Rc::into_raw(Rc::clone(arr_rc));
+        1
+    }
+}
 
-                // Copy the elements out; do NOT move them.  This used to be a
-                // `mem::replace(vec_ref, Vec::new())`, which left the source array
-                // empty for the entire span of the trace and relied on the postamble
-                // rebox to put the elements back.  Anything that re-entered the
-                // runtime mid-trace then observed a zero-length array: a nested
-                // `for elem in arr` built its iterator from the hollowed-out array
-                // and failed with "Array index 2 out of bounds (length: 0)".
-                //
-                // Copying is affordable because unboxing happens once per trace
-                // entry, not per iteration, and it is sound because no trace op
-                // overwrites the boxed array in place — `VecPush` only appends to the
-                // specialized buffer, and the rebox publishes the result.  A runtime
-                // re-entry mid-trace can still see values that predate pushes made
-                // by the trace; closing that hole needs escape analysis so such
-                // arrays are never specialized at all.
-                if vec_ref.iter().any(|value| !matches!(value, Value::Int(_))) {
-                    return 0;
-                }
-                let mut specialized_vec: Vec<LustInt> = vec_ref
-                    .iter()
-                    .map(|value| match value {
-                        Value::Int(value) => *value,
-                        _ => unreachable!("array element types were validated above"),
-                    })
-                    .collect();
-
-                // Extract Vec metadata
-                let len = specialized_vec.len();
-                let cap = specialized_vec.capacity();
-                let ptr = specialized_vec.as_mut_ptr();
-
-                // Prevent Vec from being dropped
-                core::mem::forget(specialized_vec);
-
-                // Write outputs
-                ptr::write(out_vec_ptr, ptr);
-                ptr::write(out_len, len);
-                ptr::write(out_cap, cap);
-
-                // The original Rc<RefCell<Vec<Value>>> keeps its contents; the rebox
-                // overwrites them with whatever the trace produced.
-
+/// Rebox: write the slot's elements back into the array they were unboxed
+/// from and empty the slot. An empty slot (nothing unboxed on this path) is
+/// a no-op. Returns 1 on success, 0 on a malformed slot.
+///
+/// # Safety
+/// `slot` points at a slot that holds zeros or what `jit_unbox_array_int`
+/// stored.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8 {
+    unsafe {
+        if slot.is_null() {
+            return 0;
+        }
+        let (vec, array) = (*slot).take();
+        match (vec, array) {
+            (Some(vec), Some(array)) => {
+                *array.as_ptr() = vec.into_iter().map(Value::Int).collect();
                 1
             }
+            (None, None) => 1,
             _ => 0,
         }
     }
 }
-
-/// Rebox Vec<LustInt> back to Array Value
-/// IMPORTANT: Writes the specialized vec data back into the EXISTING Rc<RefCell<Vec<Value>>>
-/// This ensures the original array is updated, not replaced
-#[cfg(feature = "std")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jit_rebox_array_int(
-    vec_ptr: *mut LustInt,
-    vec_len: usize,
-    vec_cap: usize,
-    array_value_ptr: *mut Value,
-) -> u8 {
-    unsafe {
-        if array_value_ptr.is_null() {
-            return 0;
-        }
-        if vec_ptr.is_null() {
-            return u8::from(vec_len == 0 && vec_cap == 0);
-        }
-
-        // Reconstruct Vec<LustInt> from raw parts
-        let specialized_vec = Vec::from_raw_parts(vec_ptr, vec_len, vec_cap);
-
-        // Get the existing Array value
-        let array_value = &mut *array_value_ptr;
-        match array_value {
-            Value::Array(arr_rc) => {
-                // Get exclusive access to the inner vector (should be empty from unbox)
-                let cell_ptr = arr_rc.as_ptr();
-                let vec_ref = &mut *cell_ptr;
-
-                // Convert Vec<LustInt> back to Vec<Value> and write into the existing RefCell
-                *vec_ref = specialized_vec.into_iter().map(Value::Int).collect();
-
-                1
-            }
-            _ => {
-                // This shouldn't happen - the register should still contain the Array
-                // But if it doesn't, create a new array
-                let value_vec: Vec<Value> = specialized_vec.into_iter().map(Value::Int).collect();
-                let array_value_new = Value::array(value_vec);
-                replace_value(array_value_ptr, array_value_new);
-                1
-            }
-        }
-    }
-}
-
 /// Specialized push operation for Vec<LustInt>
 /// Directly pushes LustInt to the specialized vector
 #[cfg(feature = "std")]
@@ -1880,17 +1873,19 @@ pub unsafe extern "C" fn jit_vec_int_push(
 /// WARNING: This should NOT be called! Specialized values that get invalidated
 /// during loop recording don't actually exist on the stack during execution.
 #[cfg(feature = "std")]
+/// Drop a specialized slot without publishing it (its value was
+/// invalidated during recording).
+///
+/// # Safety
+/// `slot` points at a slot that holds zeros or what `jit_unbox_array_int`
+/// stored.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jit_drop_vec_int(vec_ptr: *mut LustInt, vec_len: usize, vec_cap: usize) {
-    eprintln!(
-        "🗑️  jit_drop_vec_int: ptr={:p}, len={}, cap={}",
-        vec_ptr, vec_len, vec_cap
-    );
-    eprintln!("🗑️  jit_drop_vec_int: THIS SHOULD NOT BE CALLED - THE VEC DATA IS STALE!");
-
-    // DO NOT drop - the Vec data on the stack is stale from trace recording
-    // The actual arrays are managed by their Rc<RefCell<>> wrappers
-    eprintln!("🗑️  jit_drop_vec_int: skipping drop (would cause corruption)");
+pub unsafe extern "C" fn jit_drop_vec_int(slot: *mut JitVecSlot) {
+    unsafe {
+        if !slot.is_null() {
+            drop((*slot).take());
+        }
+    }
 }
 
 #[cfg(feature = "std")]
@@ -3151,22 +3146,63 @@ mod jit_replacement_tests {
     }
 
     #[cfg(feature = "std")]
+    fn empty_slot() -> JitVecSlot {
+        JitVecSlot {
+            ptr: core::ptr::null_mut(),
+            len: 0,
+            cap: 0,
+            array: core::ptr::null(),
+        }
+    }
+
+    #[cfg(feature = "std")]
     #[test]
     fn failed_array_specialization_restores_original_values() {
-        let mut value = Value::array(vec![Value::Int(1), Value::string("not an int")]);
-        let mut data = core::ptr::null_mut();
-        let mut len = 0;
-        let mut cap = 0;
+        let value = Value::array(vec![Value::Int(1), Value::string("not an int")]);
+        let mut slot = empty_slot();
 
-        let result = unsafe { jit_unbox_array_int(&value, &mut data, &mut len, &mut cap) };
+        let result = unsafe { jit_unbox_array_int(&value, &mut slot) };
 
         assert_eq!(result, 0);
-        assert_eq!(
-            unsafe { jit_rebox_array_int(data, len, cap, &mut value) },
-            1
-        );
+        assert!(slot.ptr.is_null() && slot.array.is_null());
+        assert_eq!(unsafe { jit_rebox_array_int(&mut slot) }, 1);
         assert_eq!(value.array_len(), Some(2));
         assert!(matches!(value.array_get(0), Some(Value::Int(1))));
         assert!(matches!(value.array_get(1), Some(Value::String(_))));
+    }
+
+    /// The rebox publishes into the array that was unboxed, not into
+    /// whatever register the trace last held it in: a guard exit taken while
+    /// that register holds something else must leave the register alone.
+    #[cfg(feature = "std")]
+    #[test]
+    fn rebox_publishes_into_the_unboxed_array() {
+        let value = Value::array(vec![Value::Int(1), Value::Int(2)]);
+        let Value::Array(rc) = &value else { unreachable!() };
+        let mut slot = empty_slot();
+        assert_eq!(unsafe { jit_unbox_array_int(&value, &mut slot) }, 1);
+        assert_eq!(Rc::strong_count(rc), 2);
+
+        // A push through the specialized copy, then a rebox.
+        let mut vec = unsafe { Vec::from_raw_parts(slot.ptr, slot.len, slot.cap) };
+        vec.push(3);
+        slot.len = vec.len();
+        slot.cap = vec.capacity();
+        slot.ptr = vec.as_mut_ptr();
+        core::mem::forget(vec);
+        assert_eq!(unsafe { jit_rebox_array_int(&mut slot) }, 1);
+
+        assert_eq!(value.array_len(), Some(3));
+        assert!(matches!(value.array_get(2), Some(Value::Int(3))));
+        assert_eq!(Rc::strong_count(rc), 1);
+        assert!(slot.ptr.is_null() && slot.array.is_null());
+
+        // Unboxing again over a slot that was never reboxed releases the old
+        // copy and reference instead of leaking them.
+        assert_eq!(unsafe { jit_unbox_array_int(&value, &mut slot) }, 1);
+        assert_eq!(unsafe { jit_unbox_array_int(&value, &mut slot) }, 1);
+        assert_eq!(Rc::strong_count(rc), 2);
+        unsafe { jit_drop_vec_int(&mut slot) };
+        assert_eq!(Rc::strong_count(rc), 1);
     }
 }

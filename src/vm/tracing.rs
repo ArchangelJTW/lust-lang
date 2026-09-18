@@ -275,3 +275,88 @@ pub unsafe extern "C" fn jit_run_nested_loop(
         return 1;
     }
 }
+
+/// The record a trace pushes for each inlined call, kept in a chain from
+/// the innermost frame outward (x21 on aarch64, r15 on x86_64). The callee
+/// registers live directly below it. Layout is shared with the backends'
+/// `compile_inline_call`.
+#[repr(C)]
+pub struct JitInlineRecord {
+    /// Registers the callee frame holds.
+    pub value_count: usize,
+    /// The caller's register array (the trace's own for the outermost
+    /// record, the enclosing inline frame's otherwise).
+    pub caller_regs: *mut Value,
+    /// The enclosing inline record, null for the outermost.
+    pub prev: *const JitInlineRecord,
+    /// Backend-private (x86_64 keeps its alignment padding here).
+    pub reserved: usize,
+    pub function_idx: usize,
+    /// Caller register the callee's result goes to.
+    pub return_dest: usize,
+    /// Caller register holding the callee value (a closure's upvalues come
+    /// from it).
+    pub callee_reg: usize,
+    /// Where the caller continues once the callee returns: the instruction
+    /// after the call.
+    pub caller_resume_ip: usize,
+}
+
+/// Turn the inline-call frames a trace is exiting from into interpreter
+/// frames, so execution resumes inside the callee rather than re-running
+/// the call. `record` is the innermost record and `regs` its frame's
+/// registers; each frame's values are moved into a real `CallFrame`. The
+/// frames are pushed outermost first, each caller's ip set to its resume
+/// ip; the innermost frame's ip is set afterwards by the guard-exit or
+/// fail-site path, exactly as for the trace's own frame. Returns the
+/// trace's own register array. With no VM (backend unit tests) the values
+/// are dropped instead.
+///
+/// # Safety
+/// `record` is a chain of records the trace pushed, `regs` the innermost
+/// frame's registers, and `vm` null or the VM executing the trace.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_materialize_inline_frames(
+    vm: *mut VM,
+    record: *const JitInlineRecord,
+    regs: *mut Value,
+) -> *mut Value {
+    let mut chain = Vec::new();
+    let mut record = record;
+    let mut regs = regs;
+    while !record.is_null() {
+        let r = unsafe { &*record };
+        chain.push((r, regs));
+        regs = r.caller_regs;
+        record = r.prev;
+    }
+    let root_regs = regs;
+    if vm.is_null() {
+        for (r, regs) in chain {
+            for i in 0..r.value_count {
+                unsafe { core::ptr::drop_in_place(regs.add(i)) };
+            }
+        }
+        return root_regs;
+    }
+    let vm = unsafe { &mut *vm };
+    for (r, regs) in chain.into_iter().rev() {
+        let register_count = vm
+            .functions
+            .get(r.function_idx)
+            .map(|f| f.register_count)
+            .unwrap_or(r.value_count as u8);
+        let mut frame = vm.take_frame(r.function_idx, Some(r.return_dest as Register), register_count);
+        for i in 0..r.value_count {
+            frame.registers[i] = unsafe { core::ptr::read(regs.add(i)) };
+        }
+        if let Value::Closure { upvalues, .. } = unsafe { &*r.caller_regs.add(r.callee_reg) } {
+            frame.upvalues = upvalues.iter().map(|uv| uv.get()).collect();
+        }
+        if let Some(caller) = vm.call_stack.last_mut() {
+            caller.ip = r.caller_resume_ip;
+        }
+        vm.call_stack.push(frame);
+    }
+    root_regs
+}

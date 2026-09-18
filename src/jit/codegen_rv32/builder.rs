@@ -131,9 +131,11 @@ impl JitCompiler {
             let offset = SPECIALIZED_BASE_OFFSET - slot * SPECIALIZED_SLOT_SIZE;
             let offset4 = offset + 4;
             let offset8 = offset + 8;
+            let offset12 = offset + 12;
             dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, offset]);
             dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, offset4]);
             dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, offset8]);
+            dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, offset12]);
         }
 
         // Hoisted constants

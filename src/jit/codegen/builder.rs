@@ -6,23 +6,26 @@ impl JitCompiler {
         Self {
             ops: Assembler::new().unwrap(),
             data: Vec::new(),
-            fail_stack: Vec::new(),
             exit_stack: Vec::new(),
             inline_depth: 0,
             specialization_registry: SpecializationRegistry::new(),
             specialized_values: HashMap::new(),
             scalar_registers: HashMap::new(),
+            trace_start_ip: 0,
             current_fail_ip: None,
             fail_sites: Vec::new(),
             next_specialized_id: 0,
         }
     }
 
-    pub(super) fn current_fail_label(&self) -> dynasmrt::DynamicLabel {
-        *self
-            .fail_stack
-            .last()
-            .expect("JIT fail label stack is empty")
+    /// Where the interpreter resumes when a guard that is not a branch
+    /// (type, function identity, struct layout) fails: the instruction the
+    /// guard was recorded for, so it is re-executed with the value the guard
+    /// rejected. Inside an inlined body the ip is the call's, since the
+    /// callee frame is torn down on exit; the call then runs in the
+    /// interpreter.
+    pub(super) fn guard_bailout_ip(&self) -> usize {
+        self.current_fail_ip.unwrap_or(self.trace_start_ip)
     }
 
     pub(super) fn current_exit_label(&self) -> dynasmrt::DynamicLabel {
@@ -68,6 +71,7 @@ impl JitCompiler {
         hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
         self.scalar_registers.clear();
+        self.trace_start_ip = trace.start_ip;
         self.current_fail_ip = None;
         self.fail_sites.clear();
         let stack_size = Self::compute_stack_size(trace);
@@ -76,7 +80,6 @@ impl JitCompiler {
         let exit_label = self.ops.new_dynamic_label();
         let fail_label = self.ops.new_dynamic_label();
         self.exit_stack.push(exit_label);
-        self.fail_stack.push(fail_label);
         crate::jit::log(|| format!("🔧 JIT: Emitting prologue with sub rsp, {}", stack_size));
         dynasm!(self.ops
             ; .arch x64
@@ -99,6 +102,7 @@ impl JitCompiler {
                 ; mov QWORD [rbp + offset], 0
                 ; mov QWORD [rbp + offset + 8], 0
                 ; mov QWORD [rbp + offset + 16], 0
+                ; mov QWORD [rbp + offset + 24], 0
             );
         }
         for (dest, value) in &hoisted_constants {
@@ -128,8 +132,10 @@ impl JitCompiler {
             ; jmp => loop_start_label
         );
 
-        let unwind_label = self.ops.new_dynamic_label();
-        let fail_return_label = self.ops.new_dynamic_label();
+        // Body exits: preserve the exit code, then turn any inline-call
+        // frames into interpreter frames so r12 is the trace's own register
+        // array again before the postamble runs (a guard inside an inlined
+        // body exits from here with the callee frame still on the stack).
         dynasm!(self.ops
             ; .arch x64
             ; => exit_label
@@ -138,6 +144,7 @@ impl JitCompiler {
             // a callee-saved register until specialized state is materialized.
             ; mov r14d, eax
         );
+        self.emit_unwind_inline_frames();
 
         // Compile postamble (executed once at trace exit)
         jit::log(|| {
@@ -151,16 +158,19 @@ impl JitCompiler {
 
         // Now pop the label stacks after everything is compiled
         self.exit_stack.pop();
-        self.fail_stack.pop();
 
         dynasm!(self.ops
             ; .arch x64
             ; mov eax, r14d
         );
 
+        // Epilogue: rsp is recovered from the frame pointer (five pushes sit
+        // below the saved rbp), so the exit path is valid regardless of how
+        // deep an inline frame we came from. A bare failure (-1) takes the
+        // same exit, which unwinds the inline frames.
         dynasm!(self.ops
             ; .arch x64
-            ; add rsp, stack_size
+            ; lea rsp, [rbp - 40]
             ; pop r15
             ; pop r14
             ; pop r13
@@ -171,17 +181,6 @@ impl JitCompiler {
             ; => fail_label
             ; fail:
             ; mov eax, DWORD -1
-            ; => unwind_label
-            ; test r15, r15
-            ; je => fail_return_label
-            ; mov eax, DWORD [r15]
-            ; mov rbx, rax
-            ; add rsp, rbx
-            ; mov r12, [r15 + 8]
-            ; mov r15, [r15 + 16]
-            ; add rsp, 24
-            ; jmp => unwind_label
-            ; => fail_return_label
             ; jmp => exit_label
         );
         let ops = mem::replace(&mut self.ops, Assembler::new().unwrap());
@@ -226,6 +225,36 @@ impl JitCompiler {
         })
     }
 
+    /// Hand the inline-call frame chain in r15 to the interpreter (see
+    /// `jit_materialize_inline_frames`): the callee frames become real
+    /// frames and execution resumes inside the innermost one. Leaves r12 =
+    /// the trace's own register array and r15 = 0. No-op without a chain.
+    /// Only registers are restored here — rsp is recovered from rbp by the
+    /// epilogue.
+    fn emit_unwind_inline_frames(&mut self) {
+        unsafe extern "C" {
+            fn jit_materialize_inline_frames(
+                vm: *mut VM,
+                record: *const u8,
+                regs: *mut Value,
+            ) -> *mut Value;
+        }
+        let done = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch x64
+            ; test r15, r15
+            ; jz => done
+            ; mov rdi, r13
+            ; mov rsi, r15
+            ; mov rdx, r12
+            ; mov rax, QWORD jit_materialize_inline_frames as *const () as _
+            ; call rax
+            ; mov r12, rax
+            ; xor r15, r15
+            ; => done
+        );
+    }
+
     fn compile_ops(
         &mut self,
         ops: &[TraceOp],
@@ -239,10 +268,9 @@ impl JitCompiler {
             }
             if let TraceOp::At { ip } = op {
                 // Inside an inlined body the markers carry the callee's ips;
-                // a failure there unwinds to the outer fail path instead.
-                if self.inline_depth == 0 {
-                    self.current_fail_ip = Some(*ip);
-                }
+                // an exit there resumes inside the callee, whose frame the
+                // exit path materializes.
+                self.current_fail_ip = Some(*ip);
                 continue;
             }
             // Fusion looks at the next real op; `At` markers are transparent.
@@ -761,22 +789,10 @@ impl JitCompiler {
 
     /// After an op that can branch to `>fail`: bind those branches to a stub
     /// that exits with this op's fail-site code, so the interpreter resumes
-    /// at the instruction the op came from. Inside an inlined body the stub
-    /// instead jumps to the inline fail path, which unwinds the frame and
-    /// reaches the trace's generic `fail:` (-1); the same holds for ops
-    /// without a known ip.
+    /// at the instruction the op came from (inside an inlined body, in the
+    /// callee frame the exit path materializes). Without a known ip the
+    /// branches fall through to the trace's generic `fail:` (-1).
     fn emit_fail_stub(&mut self) {
-        if self.inline_depth > 0 {
-            let inline_fail = self.current_fail_label();
-            dynasm!(self.ops
-                ; .arch x64
-                ; jmp >fail_stub_skip
-                ; fail:
-                ; jmp => inline_fail
-                ; fail_stub_skip:
-            );
-            return;
-        }
         let Some(ip) = self.current_fail_ip else {
             return;
         };
@@ -1402,82 +1418,81 @@ impl JitCompiler {
             });
 
             let value_size = mem::size_of::<Value>() as i32;
-            let frame_size = trace.register_count as i32 * value_size;
             let frame_value_count = trace.register_count as i32;
-            let align_adjust = ((16 - (frame_size & 15)) & 15) as i32;
-            let metadata_size = 32i32;
-            let outer_fail = self.current_fail_label();
-            let inline_fail = self.ops.new_dynamic_label();
+            // Round the frame up so rsp stays 16-byte aligned.
+            let frame_size = (frame_value_count * value_size + 15) & !15;
+            let metadata_size = INLINE_METADATA_SIZE;
             let inline_end = self.ops.new_dynamic_label();
             unsafe extern "C" {
                 fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
-                fn jit_init_nil(dest: *mut Value) -> u8;
                 fn jit_drop_values(values: *mut Value, len: usize);
             }
 
-            // Save inline metadata (frame size, caller registers, previous inline frame).
+            // Push the inline record (see `JitInlineRecord`). It is linked
+            // into the unwind chain only once the frame below it is fully
+            // built, so a failure while building it exits cleanly.
+            let caller_resume_ip = self.current_fail_ip.map_or(0, |ip| ip + 1);
             dynasm!(self.ops
                 ; .arch x64
                 ; sub rsp, metadata_size
-            );
-            dynasm!(self.ops
-                ; .arch x64
-                ; mov eax, DWORD frame_size as _
-                ; mov [rsp], rax
+                ; mov QWORD [rsp], frame_value_count
                 ; mov [rsp + 8], r12
                 ; mov [rsp + 16], r15
-            );
-            dynasm!(self.ops
-                ; .arch x64
-                ; mov eax, DWORD align_adjust as _
-                ; mov [rsp + 24], rax
-                ; mov r15, rsp
-            );
-            if align_adjust != 0 {
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; sub rsp, align_adjust
-                );
-            }
-            // Allocate space for callee registers.
-            dynasm!(self.ops
-                ; .arch x64
+                ; mov QWORD [rsp + 24], 0
+                ; mov rax, QWORD trace.function_idx as _
+                ; mov [rsp + 32], rax
+                ; mov QWORD [rsp + 40], dest as i32
+                ; mov QWORD [rsp + 48], callee as i32
+                ; mov rax, QWORD caller_resume_ip as _
+                ; mov [rsp + 56], rax
+                // Allocate the callee frame and initialise every register to
+                // Nil (discriminant 0), so the argument moves below find
+                // nothing to drop. r12 still addresses the caller's registers.
                 ; sub rsp, frame_size
-                ; mov r12, rsp
             );
-
             for reg in 0..trace.register_count {
                 let offset = reg as i32 * value_size;
                 dynasm!(self.ops
                     ; .arch x64
-                    ; lea rdi, [r12 + offset]
-                    ; mov rax, QWORD jit_init_nil as *const () as _
-                    ; call rax
+                    ; mov BYTE [rsp + offset], 0
                 );
             }
 
-            // Copy positional arguments into callee registers.
+            // Copy positional arguments into the callee frame.
             for (arg_index, src_reg) in trace.arg_registers.iter().enumerate() {
                 let src_offset = (*src_reg as i32) * value_size;
                 let dest_offset = (arg_index as i32) * value_size;
                 dynasm!(self.ops
                     ; .arch x64
-                    ; mov r14, [r15 + 8]
-                    ; lea rdi, [r14 + src_offset]
-                    ; lea rsi, [r12 + dest_offset]
+                    ; lea rdi, [r12 + src_offset]
+                    ; lea rsi, [rsp + dest_offset]
                     ; mov rax, QWORD jit_move_safe as *const () as _
                     ; call rax
                     ; test al, al
-                    ; jz =>inline_fail
+                    ; jz >fail
                 );
             }
+            // A failed argument move resumes at the call, in the caller.
+            self.emit_fail_stub();
 
-            self.fail_stack.push(inline_fail);
+            // Point r12 at the callee frame and link the record.
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov r12, rsp
+                ; lea r15, [rsp + frame_size]
+            );
+
+            let call_ip = self.current_fail_ip;
             let inline_result = self.compile_ops(&trace.body, guard_index, guards);
-            self.fail_stack.pop();
             inline_result?;
+            // A failed result move exits from the callee frame at its last
+            // instruction; everything after the frame is popped is the
+            // caller's again.
+            let callee_last_ip = self.current_fail_ip;
+            self.current_fail_ip = call_ip;
 
             if let Some(ret_reg) = trace.return_register {
+                self.current_fail_ip = callee_last_ip;
                 let ret_offset = (ret_reg as i32) * value_size;
                 let dest_offset = (dest as i32) * value_size;
                 dynasm!(self.ops
@@ -1488,69 +1503,30 @@ impl JitCompiler {
                     ; mov rax, QWORD jit_move_safe as *const () as _
                     ; call rax
                     ; test al, al
-                    ; jz =>inline_fail
+                    ; jz >fail
                 );
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov rdi, r12
-                    ; mov esi, DWORD frame_value_count
-                    ; mov rax, QWORD jit_drop_values as *const () as _
-                    ; call rax
-                    ; add rsp, frame_size
-                );
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov eax, DWORD [r15 + 24]
-                    ; add rsp, rax
-                    ; mov r12, [r15 + 8]
-                    ; mov r15, [r15 + 16]
-                    ; add rsp, metadata_size
-                    ; jmp => inline_end
-                );
-            } else {
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov rdi, r12
-                    ; mov esi, DWORD frame_value_count
-                    ; mov rax, QWORD jit_drop_values as *const () as _
-                    ; call rax
-                    ; add rsp, frame_size
-                );
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov eax, DWORD [r15 + 24]
-                    ; add rsp, rax
-                    ; mov r12, [r15 + 8]
-                    ; mov r15, [r15 + 16]
-                    ; add rsp, metadata_size
-                );
-                self.compile_load_const(dest, &Value::Nil)?;
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; jmp => inline_end
-                );
+                self.emit_fail_stub();
+                self.current_fail_ip = call_ip;
             }
 
+            // Drop callee registers and pop the frame + record.
             dynasm!(self.ops
                 ; .arch x64
-                ; => inline_fail
                 ; mov rdi, r12
                 ; mov esi, DWORD frame_value_count
                 ; mov rax, QWORD jit_drop_values as *const () as _
                 ; call rax
-                ; mov eax, DWORD [r15]
-                ; mov rbx, rax
-                ; add rsp, rbx
+                ; lea rsp, [r15 + metadata_size]
+                ; mov r12, [r15 + 8]
+                ; mov r15, [r15 + 16]
             );
+
+            if trace.return_register.is_none() {
+                self.compile_load_const(dest, &Value::Nil)?;
+            }
             dynasm!(self.ops
-            ; .arch x64
-            ; mov eax, DWORD [r15 + 24]
-            ; add rsp, rax
-            ; mov r12, [r15 + 8]
-            ; mov r15, [r15 + 16]
-            ; add rsp, metadata_size
-            ; jmp => outer_fail
-            ; => inline_end
+                ; .arch x64
+                ; => inline_end
             );
 
             Ok(())

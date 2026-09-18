@@ -8,6 +8,7 @@
 // All helper functions accept at most 4 args — they fit in a0-a3.
 
 use super::*;
+use crate::bytecode::value::JitVecSlot;
 
 impl JitCompiler {
     /// Compile Unbox — convert a Value into a specialized representation.
@@ -147,35 +148,21 @@ impl JitCompiler {
     ///
     /// Calls: `jit_unbox_array_int(array_ptr, out_vec_ptr, out_len, out_cap) -> u8`
     fn compile_unbox_array_int(&mut self, specialized_id: usize, source_reg: u8) -> Result<()> {
+        // jit_unbox_array_int(array_ptr, slot): the helper releases whatever
+        // the slot held (an earlier unbox in an unrolled iteration) and leaves
+        // it empty on failure, so the postamble's rebox is a no-op then.
         unsafe extern "C" {
-            fn jit_unbox_array_int(
-                array_value_ptr: *const Value,
-                out_vec_ptr: *mut *mut LustInt,
-                out_len: *mut usize,
-                out_cap: *mut usize,
-            ) -> u8;
+            fn jit_unbox_array_int(array_value_ptr: *const Value, slot: *mut JitVecSlot) -> u8;
         }
 
         let stack_offset = self.allocate_specialized_stack();
         self.specialized_values
             .insert(specialized_id, SpecializedValue { stack_offset });
 
-        // a0 = &array_value (source_reg in register array)
+        // a0 = &array_value (source_reg in register array), a1 = slot
         self.emit_addr_in_t2(source_reg, 0);
         dynasm!(self.ops ; .arch riscv32i ; mv a0, t2);
-
-        // a1 = &vec_ptr  on JIT stack (s0 + stack_offset + 0)
-        // a2 = &vec_len  on JIT stack (s0 + stack_offset + 4)
-        // a3 = &vec_cap  on JIT stack (s0 + stack_offset + 8)
-        let off0 = stack_offset;
-        let off4 = stack_offset + 4;
-        let off8 = stack_offset + 8;
-        dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, off0]);
-        dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, off4]);
-        dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, off8]);
-        dynasm!(self.ops ; .arch riscv32i ; addi a1, s0, off0);
-        dynasm!(self.ops ; .arch riscv32i ; addi a2, s0, off4);
-        dynasm!(self.ops ; .arch riscv32i ; addi a3, s0, off8);
+        dynasm!(self.ops ; .arch riscv32i ; addi a1, s0, stack_offset);
 
         self.emit_load_fn_ptr(jit_unbox_array_int as *const ());
         self.emit_call_t0();
@@ -187,17 +174,16 @@ impl JitCompiler {
         Ok(())
     }
 
-    /// Rebox Array<int> — reconstruct a Value::Array from Vec<LustInt> parts.
+    /// Rebox Array<int>: publish the slot's elements into the array it was
+    /// unboxed from and empty the slot.
     ///
-    /// Calls: `jit_rebox_array_int(vec_ptr, vec_len, vec_cap, out_value_ptr) -> u8`
+    /// Calls: `jit_rebox_array_int(slot) -> u8`
     fn compile_rebox_array_int(&mut self, dest_reg: u8, specialized_id: usize) -> Result<()> {
+        // `dest_reg` is where the recorder last saw the array; the value
+        // itself is found through the slot.
+        let _ = dest_reg;
         unsafe extern "C" {
-            fn jit_rebox_array_int(
-                vec_ptr: *mut LustInt,
-                vec_len: usize,
-                vec_cap: usize,
-                out_value_ptr: *mut Value,
-            ) -> u8;
+            fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8;
         }
 
         let stack_offset = self
@@ -208,27 +194,12 @@ impl JitCompiler {
             })?
             .stack_offset;
 
-        let off0 = stack_offset;
-        let off4 = stack_offset + 4;
-        let off8 = stack_offset + 8;
-
-        // a0 = vec_ptr, a1 = vec_len, a2 = vec_cap
-        dynasm!(self.ops ; .arch riscv32i ; lw a0, [s0, off0]);
-        dynasm!(self.ops ; .arch riscv32i ; lw a1, [s0, off4]);
-        dynasm!(self.ops ; .arch riscv32i ; lw a2, [s0, off8]);
-
-        // a3 = &dest_reg Value
-        self.emit_addr_in_t2(dest_reg, 0);
-        dynasm!(self.ops ; .arch riscv32i ; mv a3, t2);
-
+        dynasm!(self.ops ; .arch riscv32i ; addi a0, s0, stack_offset);
         self.emit_load_fn_ptr(jit_rebox_array_int as *const ());
         self.emit_call_t0();
 
         let fail = self.current_fail_label();
         dynasm!(self.ops ; .arch riscv32i ; beqz a0, => fail);
-        dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, off0]);
-        dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, off4]);
-        dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, off8]);
 
         Ok(())
     }
@@ -298,10 +269,10 @@ impl JitCompiler {
 
     /// Drop a Vec<LustInt> without reboxing it (cleanup on bailout).
     ///
-    /// Calls: `jit_drop_vec_int(vec_ptr, vec_len, vec_cap)`
+    /// Calls: `jit_drop_vec_int(slot)`
     fn compile_drop_vec_int(&mut self, vec_id: usize) -> Result<()> {
         unsafe extern "C" {
-            fn jit_drop_vec_int(vec_ptr: *mut LustInt, vec_len: usize, vec_cap: usize);
+            fn jit_drop_vec_int(slot: *mut JitVecSlot);
         }
 
         let stack_offset = self
@@ -312,14 +283,7 @@ impl JitCompiler {
             })?
             .stack_offset;
 
-        let off0 = stack_offset;
-        let off4 = stack_offset + 4;
-        let off8 = stack_offset + 8;
-
-        dynasm!(self.ops ; .arch riscv32i ; lw a0, [s0, off0]);
-        dynasm!(self.ops ; .arch riscv32i ; lw a1, [s0, off4]);
-        dynasm!(self.ops ; .arch riscv32i ; lw a2, [s0, off8]);
-
+        dynasm!(self.ops ; .arch riscv32i ; addi a0, s0, stack_offset);
         self.emit_load_fn_ptr(jit_drop_vec_int as *const ());
         self.emit_call_t0();
 

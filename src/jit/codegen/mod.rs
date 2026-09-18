@@ -49,6 +49,11 @@ pub struct JitCompiler {
     pub(super) specialized_values: HashMap<usize, SpecializedValue>,
     /// Registers proven to contain non-owning scalar values at this point.
     pub(super) scalar_registers: HashMap<u8, ValueType>,
+    /// Bytecode ip of the instruction the ops being compiled came from
+    /// (from the last `At` marker), if known.
+    current_fail_ip: Option<usize>,
+    /// Resume ips for failure exits, indexed by fail-stub number.
+    fail_sites: Vec<usize>,
     /// Next ID for specialized values
     #[allow(dead_code)]
     pub(super) next_specialized_id: usize,

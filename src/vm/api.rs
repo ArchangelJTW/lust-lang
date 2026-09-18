@@ -107,6 +107,8 @@ impl VM {
             globals: HashMap::new(),
             map_hasher: DefaultHashBuilder::default(),
             call_stack: Vec::new(),
+            frame_pool: Vec::new(),
+            method_cache: hashbrown::HashMap::new(),
             max_stack_depth: 1000,
             pending_return_value: None,
             pending_return_dest: None,
@@ -191,8 +193,13 @@ impl VM {
     }
 
     pub(super) fn maybe_collect_cycles(&mut self) {
+        // The trigger check is on every register write; only an actual
+        // collection needs the collector taken out to borrow the VM.
+        if !self.cycle_collector.should_collect() {
+            return;
+        }
         let mut collector = mem::take(&mut self.cycle_collector);
-        collector.maybe_collect(self);
+        collector.collect(self);
         self.cycle_collector = collector;
     }
 

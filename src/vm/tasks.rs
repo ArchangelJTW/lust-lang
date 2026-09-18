@@ -145,7 +145,7 @@ impl VM {
         &mut self,
         func: Value,
         args: Vec<Value>,
-    ) -> Result<CallFrame> {
+    ) -> Result<Box<CallFrame>> {
         match func {
             Value::Function(func_idx) => self.make_call_frame(func_idx, None, args, Vec::new()),
 

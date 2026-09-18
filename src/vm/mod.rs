@@ -170,7 +170,17 @@ pub struct VM {
     pub(super) natives: HashMap<String, Value>,
     pub(super) globals: HashMap<String, Value>,
     pub(super) map_hasher: DefaultHashBuilder,
-    pub(super) call_stack: Vec<CallFrame>,
+    /// Frames are boxed: a `CallFrame` carries 16 KB of inline registers,
+    /// and moving that into and out of the stack on every call dominated
+    /// call cost. Returned frames go to `frame_pool` for reuse.
+    pub(super) call_stack: Vec<Box<CallFrame>>,
+    /// Recycled frames with their registers already reset to Nil.
+    pub(super) frame_pool: Vec<Box<CallFrame>>,
+    /// Resolved user-defined struct methods per call site:
+    /// (struct layout, calling function, method-name constant) -> function.
+    /// Resolution otherwise formats a mangled name and scans every function
+    /// by string on each call.
+    pub(super) method_cache: hashbrown::HashMap<(usize, usize, u16), usize>,
     pub(super) max_stack_depth: usize,
     pub(super) pending_return_value: Option<Value>,
     pub(super) pending_return_dest: Option<Register>,
@@ -210,14 +220,17 @@ pub(super) struct CallFrame {
     pub(super) upvalues: Vec<Value>,
 }
 
+/// Upper bound on recycled frames kept around (each holds 16 KB).
+pub(super) const FRAME_POOL_LIMIT: usize = 64;
+
 impl CallFrame {
     #[allow(unused_variables)]
     pub(super) fn new(
         function_idx: usize,
         return_dest: Option<Register>,
         register_count: u8,
-    ) -> Self {
-        Self {
+    ) -> Box<Self> {
+        Box::new(Self {
             function_idx,
             ip: 0,
             #[cfg(feature = "std")]
@@ -227,7 +240,20 @@ impl CallFrame {
             base_register: 0,
             return_dest,
             upvalues: Vec::new(),
+        })
+    }
+
+    /// Reset a frame that ran `function_idx` (which used the first
+    /// `register_count` registers) so it can be handed out again.
+    pub(super) fn reset(&mut self, function_idx: usize, return_dest: Option<Register>, register_count: u8) {
+        for value in &mut self.registers[..register_count as usize] {
+            *value = Value::Nil;
         }
+        self.function_idx = function_idx;
+        self.ip = 0;
+        self.base_register = 0;
+        self.return_dest = return_dest;
+        self.upvalues.clear();
     }
 }
 

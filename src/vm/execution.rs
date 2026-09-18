@@ -135,7 +135,9 @@ impl VM {
             let (instruction, ip_before_execution, func_idx) = {
                 let func = &self.functions[frame.function_idx];
                 if frame.ip >= func.chunk.instructions.len() {
-                    self.call_stack.pop();
+                    if let Some(frame) = self.call_stack.pop() {
+                        self.recycle_frame(frame);
+                    }
                     if self.call_stack.is_empty() {
                         return Ok(Value::Nil);
                     }
@@ -1043,7 +1045,9 @@ impl VM {
                     let frame = self.call_stack.last().unwrap();
                     let return_dest = frame.return_dest;
                     self.validate_function_return(frame.function_idx, &return_value)?;
-                    self.call_stack.pop();
+                    if let Some(frame) = self.call_stack.pop() {
+                        self.recycle_frame(frame);
+                    }
                     if self.call_stack.is_empty() {
                         return Ok(return_value);
                     }
@@ -1473,6 +1477,29 @@ impl VM {
                     dest_reg,
                 ) => {
                     let object = self.get_register(obj_reg)?.clone();
+                    // Fast path: a user-defined struct method already resolved
+                    // at this call site.
+                    if let Value::Struct { layout, .. } = &object {
+                        let key = (
+                            Rc::as_ptr(layout) as usize,
+                            func_idx,
+                            method_name_idx as u16,
+                        );
+                        if let Some(&target) = self.method_cache.get(&key) {
+                            let mut args = Vec::with_capacity(1 + arg_count as usize);
+                            args.push(object.clone());
+                            for i in 0..arg_count {
+                                args.push(self.get_register(first_arg + i)?.clone());
+                            }
+                            let frame =
+                                self.make_call_frame(target, Some(dest_reg), args, Vec::new())?;
+                            if self.trace_recorder.is_some() {
+                                self.abandon_trace_recording();
+                            }
+                            self.call_stack.push(frame);
+                            continue;
+                        }
+                    }
                     let method_name = {
                         let func = &self.functions[self.call_stack.last().unwrap().function_idx];
                         func.chunk.constants[method_name_idx as usize]
@@ -1492,6 +1519,13 @@ impl VM {
                         if let Some(func_idx) =
                             self.functions.iter().position(|f| f.name == mangled_name)
                         {
+                            if let Value::Struct { layout, .. } = &object {
+                                let caller = self.call_stack.last().unwrap().function_idx;
+                                self.method_cache.insert(
+                                    (Rc::as_ptr(layout) as usize, caller, method_name_idx as u16),
+                                    func_idx,
+                                );
+                            }
                             let mut args = Vec::with_capacity(1 + arg_count as usize);
                             args.push(object.clone());
                             for i in 0..arg_count {
@@ -2020,7 +2054,7 @@ impl VM {
         return_dest: Option<Register>,
         mut args: Vec<Value>,
         upvalues: Vec<Value>,
-    ) -> Result<CallFrame> {
+    ) -> Result<Box<CallFrame>> {
         let function = self
             .functions
             .get(function_idx)
@@ -2071,7 +2105,20 @@ impl VM {
             }
         }
 
-        let mut frame = CallFrame::new(function_idx, return_dest, function.register_count);
+        let register_count = function.register_count;
+        let mut frame = match self.frame_pool.pop() {
+            Some(mut frame) => {
+                // Pooled frames come back with every register they used
+                // reset to Nil (see `recycle_frame`); only the bookkeeping
+                // needs setting.
+                frame.function_idx = function_idx;
+                frame.ip = 0;
+                frame.base_register = 0;
+                frame.return_dest = return_dest;
+                frame
+            }
+            None => CallFrame::new(function_idx, return_dest, register_count),
+        };
         let recursive = self
             .call_stack
             .iter()
@@ -2083,6 +2130,21 @@ impl VM {
             frame.registers[index] = arg;
         }
         Ok(frame)
+    }
+
+    /// Keep a popped frame for reuse, with the registers it used reset to
+    /// Nil (dropping their values now, as dropping the frame would have).
+    pub(super) fn recycle_frame(&mut self, mut frame: Box<CallFrame>) {
+        if self.frame_pool.len() >= super::FRAME_POOL_LIMIT {
+            return;
+        }
+        let register_count = self
+            .functions
+            .get(frame.function_idx)
+            .map(|f| f.register_count)
+            .unwrap_or(u8::MAX);
+        frame.reset(frame.function_idx, None, register_count);
+        self.frame_pool.push(frame);
     }
 
     fn validate_function_return(&self, function_idx: usize, value: &Value) -> Result<()> {
@@ -2245,7 +2307,7 @@ impl VM {
         outcome: NativeCallResult,
     ) -> Result<()> {
         #[cfg(feature = "std")]
-        if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some()
+        if lua_socket_trace_enabled()
             && let NativeCallResult::Return(value) = &outcome
             && let Value::Array(arr) = value
         {
@@ -2418,7 +2480,9 @@ impl VM {
                     Err(err) => {
                         let annotated = self.annotate_runtime_error(err);
                         while self.call_stack.len() > stack_depth_before {
-                            self.call_stack.pop();
+                            if let Some(frame) = self.call_stack.pop() {
+                                self.recycle_frame(frame);
+                            }
                         }
                         self.pending_return_value = saved_pending_return_value;
                         self.pending_return_dest = saved_pending_return_dest;
@@ -2452,7 +2516,9 @@ impl VM {
                     Err(err) => {
                         let annotated = self.annotate_runtime_error(err);
                         while self.call_stack.len() > stack_depth_before {
-                            self.call_stack.pop();
+                            if let Some(frame) = self.call_stack.pop() {
+                                self.recycle_frame(frame);
+                            }
                         }
                         self.pending_return_value = saved_pending_return_value;
                         self.pending_return_dest = saved_pending_return_dest;
@@ -2524,4 +2590,12 @@ fn function_type_params(type_name: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// `LUST_LUA_SOCKET_TRACE` is consulted on every native call; read the
+/// environment once rather than per call.
+#[cfg(feature = "std")]
+fn lua_socket_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some())
 }

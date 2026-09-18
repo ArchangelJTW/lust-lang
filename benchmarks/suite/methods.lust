@@ -1,0 +1,17 @@
+struct Counter
+    value: int
+end
+impl Counter
+    function bump(self, d: int): int
+        self.value = self.value + d
+        return self.value
+    end
+end
+local c: Counter = Counter { value = 0 }
+local last: int = 0
+local i: int = 0
+while i < 10000000 do
+    last = c:bump(i)
+    i = i + 1
+end
+println(last)

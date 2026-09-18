@@ -142,3 +142,32 @@ static lowering described above. RISC-V codegen has not been modified.
   reports before and after: 1,148 `MATCH_OK`, 107 existing `FRONTEND` failures.
   Those frontend failures are not counted as passing tests; dedicated native
   code tests and the typed benchmark cover floating-point behavior here.
+
+## Cross-language suite (`benchmarks/suite`)
+
+`benchmarks/suite/run.sh` runs eight small programs — struct fields, array
+indexing, function calls, struct method calls, string building, recursive
+fib, nested loops, float math — through the Lust interpreter (`LUST_JIT=0`),
+the Lust JIT, LuaJIT and Lua, checking that all outputs agree. Each program
+has a `.lust` and an equivalent `.lua`.
+
+Measured on an Apple M5 (native aarch64 backend, branch `aarch64-jit`),
+milliseconds, single run each:
+
+| program   | lust-vm | lust-jit | luajit | lua 5.5 |
+|-----------|--------:|---------:|-------:|--------:|
+| fields    |    1211 |      178 |     54 |     114 |
+| array     |    1896 |      380 |     57 |      75 |
+| calls     |    1314 |      360 |     27 |     131 |
+| methods   |    2208 |      536 |     27 |     210 |
+| strings   |   14844 |    13982 |  26942 |    7287 |
+| fib       |     271 |      270 |     20 |      37 |
+| nested    |     543 |      626 |     27 |      75 |
+| floatmath |     810 |       54 |     34 |      92 |
+
+The interpreter numbers were 3-90x worse before the fixes to cycle
+collection cost, call-frame copying and argument checking on this branch
+(fib: 3724 ms; `array` at 1,000,000 elements did not finish in thirty
+minutes). Remaining gaps against Lua: recursion and calls (frame setup),
+nested loops (only innermost loops run natively), and `strings`, where every
+engine is quadratic in `s = s .. x`.

@@ -20,6 +20,7 @@ impl JitCompiler {
         let guard_return_value = (guard_index + 1) as i32;
         let exit_label = self.current_exit_label();
         dynasm!(self.ops
+            ; .arch x64
             ; mov al, [r12 + offset]
             ; cmp al, BYTE expected_discriminant
             ; jne >guard_fail
@@ -100,6 +101,7 @@ impl JitCompiler {
         let reg_index = register as i32;
         let exit_label = self.current_exit_label();
         dynasm!(self.ops
+            ; .arch x64
             ; lea rdi, [r12 + offset]
             ; mov esi, DWORD kind_flag
             ; mov rdx, QWORD function_idx as _
@@ -154,6 +156,7 @@ impl JitCompiler {
         let reg_index = register as i32;
         let exit_label = self.current_exit_label();
         dynasm!(self.ops
+            ; .arch x64
             ; lea rdi, [r12 + offset]
             ; mov rsi, QWORD expected_ptr as _
             ; mov edx, DWORD reg_index
@@ -195,9 +198,10 @@ impl JitCompiler {
             fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
         }
         if self.scalar_registers.get(&condition_register) == Some(&ValueType::Bool) {
-            dynasm!(self.ops ; cmp BYTE [r12 + cond_offset + 8], 0);
+            dynasm!(self.ops ; .arch x64 ; cmp BYTE [r12 + cond_offset + 8], 0);
         } else {
             dynasm!(self.ops
+                ; .arch x64
                 ; mov al, BYTE [r12 + cond_offset]
                 ; cmp al, scalar_max_tag
                 ; ja >generic_truthiness
@@ -220,6 +224,7 @@ impl JitCompiler {
         }
         if expect_truthy {
             dynasm!(self.ops
+                ; .arch x64
                 ; jnz >guard_ok
                 ; mov eax, DWORD guard_return_value
                 ; jmp => exit_label
@@ -227,6 +232,7 @@ impl JitCompiler {
             );
         } else {
             dynasm!(self.ops
+                ; .arch x64
                 ; jz >guard_ok
                 ; mov eax, DWORD guard_return_value
                 ; jmp => exit_label

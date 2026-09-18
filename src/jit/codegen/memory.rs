@@ -4,6 +4,7 @@ impl JitCompiler {
         match value {
             Value::Int(i) => {
                 dynasm!(self.ops
+                    ; .arch x64
                     ; mov rax, QWORD *i as _
                 );
                 self.store_from_rax(dest, 2);
@@ -13,6 +14,7 @@ impl JitCompiler {
             Value::Float(f) => {
                 let f_bits = f.to_bits();
                 dynasm!(self.ops
+                    ; .arch x64
                     ; mov rax, QWORD f_bits as _
                     ; movq xmm0, rax
                 );
@@ -23,6 +25,7 @@ impl JitCompiler {
             Value::Bool(b) => {
                 let bool_val = if *b { 1i64 } else { 0i64 };
                 dynasm!(self.ops
+                    ; .arch x64
                     ; mov rax, QWORD bool_val
                 );
                 self.store_from_rax(dest, 1);
@@ -42,6 +45,7 @@ impl JitCompiler {
             fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
         }
         dynasm!(self.ops
+            ; .arch x64
             ; mov rdi, QWORD src_ptr as _
             ; lea rsi, [r12 + offset]
             ; mov rax, QWORD jit_move_safe as *const () as _
@@ -59,6 +63,7 @@ impl JitCompiler {
             fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
         }
         dynasm!(self.ops
+            ; .arch x64
             ; lea rdi, [r12 + src_offset]
             ; lea rsi, [r12 + dest_offset]
             ; mov rax, QWORD jit_move_safe as *const () as _
@@ -81,6 +86,7 @@ impl JitCompiler {
         }
 
         dynasm!(self.ops
+            ; .arch x64
             ; mov al, [r12 + array_offset]
             ; cmp al, 5
             ; jne >fail
@@ -113,6 +119,7 @@ impl JitCompiler {
         }
 
         dynasm!(self.ops
+            ; .arch x64
             ; mov rdi, r13
             ; lea rsi, [r12 + array_offset]
             ; lea rdx, [r12 + index_offset]
@@ -147,6 +154,7 @@ impl JitCompiler {
         }
 
         dynasm!(self.ops
+            ; .arch x64
             ; lea rdi, [r12 + array_offset]
             ; lea rsi, [r12 + index_offset]
             ; lea rdx, [r12 + value_offset]
@@ -166,6 +174,7 @@ impl JitCompiler {
         }
 
         dynasm!(self.ops
+            ; .arch x64
             ; mov al, [r12 + array_offset]
             ; cmp al, 5
             ; jne >fail
@@ -206,6 +215,7 @@ impl JitCompiler {
 
         if let Some(index) = field_index {
             dynasm!(self.ops
+                ; .arch x64
                 ; lea rdi, [r12 + object_offset]
                 ; mov rsi, QWORD index as _
                 ; lea rdx, [r12 + dest_offset]
@@ -217,6 +227,7 @@ impl JitCompiler {
         } else {
             let (field_name_ptr, field_name_len) = self.retain_string(field_name);
             dynasm!(self.ops
+                ; .arch x64
                 ; lea rdi, [r12 + object_offset]
                 ; mov rsi, QWORD field_name_ptr as _
                 ; mov rdx, QWORD field_name_len as _
@@ -266,6 +277,7 @@ impl JitCompiler {
             // Use specialized helpers based on whether field is weak or strong
             if _is_weak {
                 dynasm!(self.ops
+                    ; .arch x64
                     ; lea rdi, [r12 + object_offset]
                     ; mov rsi, QWORD index as _
                     ; lea rdx, [r12 + value_offset]
@@ -284,6 +296,7 @@ impl JitCompiler {
                     ) -> u8;
                 }
                 dynasm!(self.ops
+                    ; .arch x64
                     ; lea rdi, [r12 + object_offset]
                     ; mov rsi, QWORD index as _
                     ; lea rdx, [r12 + value_offset]
@@ -296,6 +309,7 @@ impl JitCompiler {
         } else {
             let (field_name_ptr, field_name_len) = self.retain_string(field_name);
             dynasm!(self.ops
+                ; .arch x64
                 ; lea rdi, [r12 + object_offset]
                 ; mov rsi, QWORD field_name_ptr as _
                 ; mov rdx, QWORD field_name_len as _
@@ -332,6 +346,7 @@ impl JitCompiler {
 
         // r12 is callee-saved per System V ABI, so we don't need to save it
         dynasm!(self.ops
+            ; .arch x64
             ; mov rdi, r13                           // vm_ptr
             ; lea rsi, [r12 + first_elem_offset]     // elements_ptr (ignored if count == 0)
             ; mov rdx, QWORD count_usize as _        // element_count
@@ -359,6 +374,7 @@ impl JitCompiler {
 
         // Guards have already verified the type, so directly call the helper
         dynasm!(self.ops
+            ; .arch x64
             ; mov rdi, r13
             ; lea rsi, [r12 + array_offset]
             ; lea rdx, [r12 + value_offset]
@@ -380,6 +396,7 @@ impl JitCompiler {
         }
 
         dynasm!(self.ops
+            ; .arch x64
             ; lea rdi, [r12 + enum_offset]
             ; lea rsi, [r12 + dest_offset]
             ; mov rax, QWORD jit_enum_is_some_safe as *const () as _
@@ -404,6 +421,7 @@ impl JitCompiler {
         }
 
         dynasm!(self.ops
+            ; .arch x64
             ; mov rdi, r13
             ; lea rsi, [r12 + enum_offset]
             ; lea rdx, [r12 + dest_offset]
@@ -441,6 +459,7 @@ impl JitCompiler {
         }
 
         dynasm!(self.ops
+            ; .arch x64
             ; mov rdi, r13
             ; lea rsi, [r12 + callee_offset]
             ; mov rdx, QWORD expected_ptr as _
@@ -491,6 +510,7 @@ impl JitCompiler {
         }
 
         dynasm!(self.ops
+            ; .arch x64
             ; mov rdi, r13
             ; lea rsi, [r12 + callee_offset]
             ; lea rdx, [r12 + first_arg_offset]
@@ -504,6 +524,7 @@ impl JitCompiler {
 
         if self.inline_depth == 0 {
             dynasm!(self.ops
+                ; .arch x64
                 ; mov rdi, r13
                 ; mov rax, QWORD jit_current_registers as *const () as _
                 ; call rax
@@ -542,6 +563,7 @@ impl JitCompiler {
         let first_arg_offset = (first_arg as i32) * (mem::size_of::<Value>() as i32);
         let arg_count_i32 = arg_count as i32;
         dynasm!(self.ops
+            ; .arch x64
             ; mov rdi, r13
             ; lea rsi, [r12 + object_offset]
             ; mov rdx, QWORD method_name_ptr as _
@@ -560,6 +582,7 @@ impl JitCompiler {
 
         if self.inline_depth == 0 {
             dynasm!(self.ops
+                ; .arch x64
                 ; mov rdi, r13
                 ; mov rax, QWORD jit_current_registers as *const () as _
                 ; call rax
@@ -611,6 +634,7 @@ impl JitCompiler {
             (false, 0)
         };
         dynasm!(self.ops
+            ; .arch x64
             ; mov rdi, r13
             ; mov rsi, QWORD struct_name_ptr as _
             ; mov rdx, QWORD struct_name_len as _
@@ -619,14 +643,17 @@ impl JitCompiler {
         );
         if has_fields {
             dynasm!(self.ops
+                ; .arch x64
                 ; lea r9, [r12 + first_field_offset]
             );
         } else {
             dynasm!(self.ops
+                ; .arch x64
                 ; xor r9d, r9d
             );
         }
         dynasm!(self.ops
+            ; .arch x64
             ; sub rsp, 16
             ; mov rax, QWORD field_count as _
             ; mov [rsp], rax
@@ -640,6 +667,7 @@ impl JitCompiler {
         );
         if self.inline_depth == 0 {
             dynasm!(self.ops
+                ; .arch x64
                 ; mov rdi, r13
                 ; mov rax, QWORD jit_current_registers as *const () as _
                 ; call rax
@@ -671,6 +699,7 @@ impl JitCompiler {
         let (enum_name_ptr, enum_name_len) = self.retain_string(enum_name);
         let (variant_name_ptr, variant_name_len) = self.retain_string(variant_name);
         dynasm!(self.ops
+            ; .arch x64
             ; mov rdi, r13
             ; mov rsi, QWORD enum_name_ptr as _
             ; mov rdx, QWORD enum_name_len as _
@@ -716,6 +745,7 @@ impl JitCompiler {
             (0, 0)
         };
         dynasm!(self.ops
+            ; .arch x64
             ; mov rdi, r13
             ; mov rsi, QWORD enum_name_ptr as _
             ; mov rdx, QWORD enum_name_len as _
@@ -756,6 +786,7 @@ impl JitCompiler {
         let (enum_name_ptr, enum_name_len) = self.retain_string(enum_name);
         let (variant_name_ptr, variant_name_len) = self.retain_string(variant_name);
         dynasm!(self.ops
+            ; .arch x64
             ; lea rdi, [r12 + value_offset]
             ; mov rsi, QWORD enum_name_ptr as _
             ; mov rdx, QWORD enum_name_len as _
@@ -783,13 +814,14 @@ impl JitCompiler {
             _ => None,
         };
         if type_name == "unknown" {
-            dynasm!(self.ops ; mov rax, QWORD 1);
+            dynasm!(self.ops ; .arch x64 ; mov rax, QWORD 1);
             self.store_from_rax(dest, 1);
             return Ok(());
         }
         if let Some(tag) = direct_tag {
             let tag = tag.as_u8() as i8;
             dynasm!(self.ops
+                ; .arch x64
                 ; cmp BYTE [r12 + value_offset], tag
                 ; sete al
                 ; movzx rax, al
@@ -808,6 +840,7 @@ impl JitCompiler {
         }
         let (type_name_ptr, type_name_len) = self.retain_string(type_name);
         dynasm!(self.ops
+            ; .arch x64
             ; mov rdi, r13
             ; lea rsi, [r12 + value_offset]
             ; mov rdx, QWORD type_name_ptr as _
@@ -834,6 +867,7 @@ impl JitCompiler {
         }
         let (type_name_ptr, type_name_len) = self.retain_string(type_name);
         dynasm!(self.ops
+            ; .arch x64
             ; mov rdi, r13
             ; lea rsi, [r12 + value_offset]
             ; mov rdx, QWORD type_name_ptr as _
@@ -861,6 +895,7 @@ impl JitCompiler {
         }
         let index_usize = index as usize;
         dynasm!(self.ops
+            ; .arch x64
             ; lea rdi, [r12 + enum_offset]
             ; mov rsi, QWORD index_usize as _
             ; lea rdx, [r12 + dest_offset]

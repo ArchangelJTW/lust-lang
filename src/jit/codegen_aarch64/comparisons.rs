@@ -1,32 +1,53 @@
 use super::*;
 
+/// Where a comparison's operands ended up.
+#[derive(Clone, Copy)]
+pub(super) enum Compare {
+    /// Signed integer compare of X(a) with X(b).
+    Int(u8, u8),
+    /// Float compare of D(a) with D(b).
+    Float(u8, u8),
+}
+
 impl JitCompiler {
-    /// Load comparison operands. Returns true when they were loaded into
-    /// d0/d1 (float compare), false when loaded into x0/x10 (int compare).
-    pub(super) fn load_numeric_comparison_operands(
+    /// Place comparison operands: pinned registers are used in place, others
+    /// load into x0/x10 (ints) or d0/d1 (floats, ints converted).
+    pub(super) fn compare_operands(
         &mut self,
         lhs: u8,
         rhs: u8,
         lhs_type: ValueType,
         rhs_type: ValueType,
-    ) -> bool {
+    ) -> Compare {
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
-            self.load_payload(0, lhs);
-            self.load_payload(10, rhs);
-            return false;
+            let a = self.operand_x(lhs, 0);
+            let b = self.operand_x(rhs, 10);
+            return Compare::Int(a, b);
         }
+        let a = self.operand_numeric_d(lhs, lhs_type, 0);
+        let b = self.operand_numeric_d(rhs, rhs_type, 1);
+        Compare::Float(a, b)
+    }
 
-        if lhs_type == ValueType::Int {
-            self.load_payload_int_as_f(0, lhs);
-        } else {
-            self.load_payload_f(0, lhs);
+    /// Emit the `cmp`/`fcmp` for placed operands.
+    pub(super) fn emit_compare(&mut self, cmp: Compare) {
+        match cmp {
+            Compare::Int(a, b) => dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b)),
+            Compare::Float(a, b) => dynasm!(self.ops ; .arch aarch64 ; fcmp D(a), D(b)),
         }
-        if rhs_type == ValueType::Int {
-            self.load_payload_int_as_f(1, rhs);
-        } else {
-            self.load_payload_f(1, rhs);
+    }
+
+    /// Materialize a condition as a Bool into registers[dest]: straight into
+    /// a carried pin, otherwise via x0 and the store path. `cond` is the
+    /// AArch64 condition code number (cset encodes the inverse of it).
+    fn finish_bool(&mut self, dest: u8, emit_cset: impl FnOnce(&mut Self, u8)) {
+        match self.direct_dest_x(dest) {
+            Some(d) => emit_cset(self, d),
+            None => {
+                emit_cset(self, 0);
+                self.store_from_x0(dest, ValueTag::Bool.as_u8());
+            }
         }
-        true
     }
 
     // Ordered float comparisons must be false when either operand is NaN.
@@ -45,12 +66,12 @@ impl JitCompiler {
         lhs_type: ValueType,
         rhs_type: ValueType,
     ) -> Result<()> {
-        if self.load_numeric_comparison_operands(lhs, rhs, lhs_type, rhs_type) {
-            dynasm!(self.ops ; .arch aarch64 ; fcmp d0, d1 ; cset x0, mi);
-        } else {
-            dynasm!(self.ops ; .arch aarch64 ; cmp x0, x10 ; cset x0, lt);
+        let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
+        self.emit_compare(cmp);
+        match cmp {
+            Compare::Float(..) => self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), mi)),
+            Compare::Int(..) => self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), lt)),
         }
-        self.store_from_x0(dest, ValueTag::Bool.as_u8());
         Ok(())
     }
 
@@ -62,12 +83,12 @@ impl JitCompiler {
         lhs_type: ValueType,
         rhs_type: ValueType,
     ) -> Result<()> {
-        if self.load_numeric_comparison_operands(lhs, rhs, lhs_type, rhs_type) {
-            dynasm!(self.ops ; .arch aarch64 ; fcmp d0, d1 ; cset x0, ls);
-        } else {
-            dynasm!(self.ops ; .arch aarch64 ; cmp x0, x10 ; cset x0, le);
+        let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
+        self.emit_compare(cmp);
+        match cmp {
+            Compare::Float(..) => self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), ls)),
+            Compare::Int(..) => self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), le)),
         }
-        self.store_from_x0(dest, ValueTag::Bool.as_u8());
         Ok(())
     }
 
@@ -79,12 +100,9 @@ impl JitCompiler {
         lhs_type: ValueType,
         rhs_type: ValueType,
     ) -> Result<()> {
-        if self.load_numeric_comparison_operands(lhs, rhs, lhs_type, rhs_type) {
-            dynasm!(self.ops ; .arch aarch64 ; fcmp d0, d1 ; cset x0, gt);
-        } else {
-            dynasm!(self.ops ; .arch aarch64 ; cmp x0, x10 ; cset x0, gt);
-        }
-        self.store_from_x0(dest, ValueTag::Bool.as_u8());
+        let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
+        self.emit_compare(cmp);
+        self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), gt));
         Ok(())
     }
 
@@ -96,12 +114,47 @@ impl JitCompiler {
         lhs_type: ValueType,
         rhs_type: ValueType,
     ) -> Result<()> {
-        if self.load_numeric_comparison_operands(lhs, rhs, lhs_type, rhs_type) {
-            dynasm!(self.ops ; .arch aarch64 ; fcmp d0, d1 ; cset x0, ge);
-        } else {
-            dynasm!(self.ops ; .arch aarch64 ; cmp x0, x10 ; cset x0, ge);
+        let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
+        self.emit_compare(cmp);
+        self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), ge));
+        Ok(())
+    }
+
+    fn compile_equality(
+        &mut self,
+        dest: u8,
+        lhs: u8,
+        rhs: u8,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
+        equal: bool,
+    ) -> Result<()> {
+        if lhs_type != rhs_type {
+            let value = u32::from(!equal);
+            self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; movz X(d), #value));
+            return Ok(());
         }
-        self.store_from_x0(dest, ValueTag::Bool.as_u8());
+        match lhs_type {
+            ValueType::Float => {
+                let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
+                self.emit_compare(cmp);
+            }
+            ValueType::Bool => {
+                self.load_bool_payload(0, lhs);
+                self.load_bool_payload(10, rhs);
+                dynasm!(self.ops ; .arch aarch64 ; cmp w0, w10);
+            }
+            _ => {
+                let a = self.operand_x(lhs, 0);
+                let b = self.operand_x(rhs, 10);
+                dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b));
+            }
+        }
+        if equal {
+            self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), eq));
+        } else {
+            self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), ne));
+        }
         Ok(())
     }
 
@@ -113,22 +166,7 @@ impl JitCompiler {
         lhs_type: ValueType,
         rhs_type: ValueType,
     ) -> Result<()> {
-        if lhs_type != rhs_type {
-            dynasm!(self.ops ; .arch aarch64 ; mov x0, xzr);
-        } else if lhs_type == ValueType::Float {
-            self.load_numeric_comparison_operands(lhs, rhs, lhs_type, rhs_type);
-            dynasm!(self.ops ; .arch aarch64 ; fcmp d0, d1 ; cset x0, eq);
-        } else if lhs_type == ValueType::Bool {
-            self.load_bool_payload(0, lhs);
-            self.load_bool_payload(10, rhs);
-            dynasm!(self.ops ; .arch aarch64 ; cmp w0, w10 ; cset x0, eq);
-        } else {
-            self.load_payload(0, lhs);
-            self.load_payload(10, rhs);
-            dynasm!(self.ops ; .arch aarch64 ; cmp x0, x10 ; cset x0, eq);
-        }
-        self.store_from_x0(dest, ValueTag::Bool.as_u8());
-        Ok(())
+        self.compile_equality(dest, lhs, rhs, lhs_type, rhs_type, true)
     }
 
     pub(super) fn compile_ne(
@@ -139,21 +177,6 @@ impl JitCompiler {
         lhs_type: ValueType,
         rhs_type: ValueType,
     ) -> Result<()> {
-        if lhs_type != rhs_type {
-            dynasm!(self.ops ; .arch aarch64 ; movz x0, 1);
-        } else if lhs_type == ValueType::Float {
-            self.load_numeric_comparison_operands(lhs, rhs, lhs_type, rhs_type);
-            dynasm!(self.ops ; .arch aarch64 ; fcmp d0, d1 ; cset x0, ne);
-        } else if lhs_type == ValueType::Bool {
-            self.load_bool_payload(0, lhs);
-            self.load_bool_payload(10, rhs);
-            dynasm!(self.ops ; .arch aarch64 ; cmp w0, w10 ; cset x0, ne);
-        } else {
-            self.load_payload(0, lhs);
-            self.load_payload(10, rhs);
-            dynasm!(self.ops ; .arch aarch64 ; cmp x0, x10 ; cset x0, ne);
-        }
-        self.store_from_x0(dest, ValueTag::Bool.as_u8());
-        Ok(())
+        self.compile_equality(dest, lhs, rhs, lhs_type, rhs_type, false)
     }
 }

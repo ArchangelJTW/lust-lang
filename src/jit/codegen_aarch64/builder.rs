@@ -469,7 +469,8 @@ impl JitCompiler {
                         &ops[next_index + 1..],
                         *constant_register,
                     )
-                    && self.compile_integer_add_immediate(op, next)?
+                    && (self.compile_integer_add_immediate(op, next)?
+                        || self.compile_float_op_immediate(op, next)?)
                 {
                     self.update_scalar_registers(next);
                     skip_through = Some(next_index);
@@ -1016,18 +1017,21 @@ impl JitCompiler {
             return Ok(false);
         };
 
-        self.load_payload(0, source);
+        let a = self.operand_x(source, 0);
+        let d = self.direct_dest_x(*dest).unwrap_or(0);
         if (0..=4095).contains(immediate) {
             let imm = *immediate as u32;
-            dynasm!(self.ops ; .arch aarch64 ; add x0, x0, #imm);
+            dynasm!(self.ops ; .arch aarch64 ; add XSP(d), XSP(a), #imm);
         } else if (-4095..0).contains(immediate) {
             let imm = (-*immediate) as u32;
-            dynasm!(self.ops ; .arch aarch64 ; sub x0, x0, #imm);
+            dynasm!(self.ops ; .arch aarch64 ; sub XSP(d), XSP(a), #imm);
         } else {
             self.emit_mov_imm64(10, *immediate as u64);
-            dynasm!(self.ops ; .arch aarch64 ; add x0, x0, x10);
+            dynasm!(self.ops ; .arch aarch64 ; add X(d), X(a), x10);
         }
-        self.store_from_x0(*dest, ValueTag::Int.as_u8());
+        if d == 0 {
+            self.store_from_x0(*dest, ValueTag::Int.as_u8());
+        }
         Ok(true)
     }
 
@@ -1086,12 +1090,13 @@ impl JitCompiler {
         }
 
         let guard_ok = self.ops.new_dynamic_label();
-        if self.load_numeric_comparison_operands(lhs, rhs, lhs_type, rhs_type) {
+        let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
+        self.emit_compare(cmp);
+        if matches!(cmp, super::comparisons::Compare::Float(..)) {
             // Every ordered comparison is false for NaN. AArch64 condition
             // codes already treat the unordered result correctly, and the
             // complement of each ordered condition is true for NaN, so the
             // failing direction needs no separate unordered check.
-            dynasm!(self.ops ; .arch aarch64 ; fcmp d0, d1);
             match (comparison_kind, *expect_truthy) {
                 (0, true) => dynasm!(self.ops ; .arch aarch64 ; b.mi =>guard_ok),
                 (1, true) => dynasm!(self.ops ; .arch aarch64 ; b.ls =>guard_ok),
@@ -1104,7 +1109,6 @@ impl JitCompiler {
                 _ => unreachable!(),
             }
         } else {
-            dynasm!(self.ops ; .arch aarch64 ; cmp x0, x10);
             match (comparison_kind, *expect_truthy) {
                 (0, true) | (3, false) => dynasm!(self.ops ; .arch aarch64 ; b.lt =>guard_ok),
                 (1, true) | (2, false) => dynasm!(self.ops ; .arch aarch64 ; b.le =>guard_ok),

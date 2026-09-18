@@ -30,7 +30,7 @@ impl JitCompiler {
         }
     }
 
-    fn mark_dirty(&mut self, vm_reg: u8) {
+    pub(super) fn mark_dirty(&mut self, vm_reg: u8) {
         if !self.dirty_pins.contains(&vm_reg) {
             self.dirty_pins.push(vm_reg);
         }
@@ -83,6 +83,73 @@ impl JitCompiler {
         for (vm_reg, pin) in carried {
             self.emit_pin_writeback(vm_reg, pin);
         }
+    }
+
+    // ── Direct operands ───────────────────────────────────────────────────
+    //
+    // Ops read pinned registers in place instead of copying them through
+    // x0/d0, and write a carried pin in place instead of through x0/d0 and
+    // a store. (Write-through pins still go through the store path so
+    // memory is updated.)
+
+    /// X register holding the int/bool payload of registers[vm_reg]: the
+    /// pin itself, or `scratch` after loading into it.
+    pub(super) fn operand_x(&mut self, vm_reg: u8, scratch: u8) -> u8 {
+        if let Some(pin) = self.active_pin(vm_reg)
+            && pin.ty != ValueType::Float
+        {
+            return pin.reg;
+        }
+        self.load_payload(scratch, vm_reg);
+        scratch
+    }
+
+    /// D register holding the float payload of registers[vm_reg].
+    pub(super) fn operand_d(&mut self, vm_reg: u8, scratch: u8) -> u8 {
+        if let Some(pin) = self.active_pin(vm_reg)
+            && pin.ty == ValueType::Float
+        {
+            return pin.reg;
+        }
+        self.load_payload_f(scratch, vm_reg);
+        scratch
+    }
+
+    /// D register holding registers[vm_reg]'s int payload converted to float.
+    pub(super) fn operand_int_as_d(&mut self, vm_reg: u8, scratch: u8) -> u8 {
+        self.load_payload_int_as_f(scratch, vm_reg);
+        scratch
+    }
+
+    /// D register holding registers[vm_reg] as a float, converting an int.
+    pub(super) fn operand_numeric_d(&mut self, vm_reg: u8, ty: ValueType, scratch: u8) -> u8 {
+        if ty == ValueType::Int {
+            self.operand_int_as_d(vm_reg, scratch)
+        } else {
+            self.operand_d(vm_reg, scratch)
+        }
+    }
+
+    /// The X register a result for registers[vm_reg] can be written into
+    /// directly (a carried int/bool pin), marking it dirty.
+    pub(super) fn direct_dest_x(&mut self, vm_reg: u8) -> Option<u8> {
+        let pin = self.active_pin(vm_reg)?;
+        if pin.ty == ValueType::Float || pin.class != pins::PinClass::Carried {
+            return None;
+        }
+        self.mark_dirty(vm_reg);
+        Some(pin.reg)
+    }
+
+    /// The D register a float result for registers[vm_reg] can be written
+    /// into directly (a carried float pin), marking it dirty.
+    pub(super) fn direct_dest_d(&mut self, vm_reg: u8) -> Option<u8> {
+        let pin = self.active_pin(vm_reg)?;
+        if pin.ty != ValueType::Float || pin.class != pins::PinClass::Carried {
+            return None;
+        }
+        self.mark_dirty(vm_reg);
+        Some(pin.reg)
     }
 
     // ── Immediates ────────────────────────────────────────────────────────

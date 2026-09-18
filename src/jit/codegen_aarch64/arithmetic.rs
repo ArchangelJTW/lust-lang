@@ -9,28 +9,149 @@ enum BinOp {
 }
 
 impl JitCompiler {
-    /// x0 = x0 <op> x9 for integer operands. Division by zero fails the trace.
-    fn emit_int_op(&mut self, op: BinOp) {
+    /// X(d) = X(a) <op> X(b) for integer operands. Division by zero fails
+    /// the trace.
+    fn emit_int_op_regs(&mut self, op: BinOp, d: u8, a: u8, b: u8) {
         match op {
-            BinOp::Add => dynasm!(self.ops ; .arch aarch64 ; add x0, x0, x9),
-            BinOp::Sub => dynasm!(self.ops ; .arch aarch64 ; sub x0, x0, x9),
-            BinOp::Mul => dynasm!(self.ops ; .arch aarch64 ; mul x0, x0, x9),
+            BinOp::Add => dynasm!(self.ops ; .arch aarch64 ; add X(d), X(a), X(b)),
+            BinOp::Sub => dynasm!(self.ops ; .arch aarch64 ; sub X(d), X(a), X(b)),
+            BinOp::Mul => dynasm!(self.ops ; .arch aarch64 ; mul X(d), X(a), X(b)),
             BinOp::Div => dynasm!(self.ops
                 ; .arch aarch64
-                ; cbz x9, >fail
-                ; sdiv x0, x0, x9
+                ; cbz X(b), >fail
+                ; sdiv X(d), X(a), X(b)
             ),
+        }
+    }
+
+    /// x0 = x0 <op> x9 for integer operands. Division by zero fails the trace.
+    fn emit_int_op(&mut self, op: BinOp) {
+        self.emit_int_op_regs(op, 0, 0, 9);
+    }
+
+    /// D(d) = D(a) <op> D(b)
+    fn emit_float_op_regs(&mut self, op: BinOp, d: u8, a: u8, b: u8) {
+        match op {
+            BinOp::Add => dynasm!(self.ops ; .arch aarch64 ; fadd D(d), D(a), D(b)),
+            BinOp::Sub => dynasm!(self.ops ; .arch aarch64 ; fsub D(d), D(a), D(b)),
+            BinOp::Mul => dynasm!(self.ops ; .arch aarch64 ; fmul D(d), D(a), D(b)),
+            BinOp::Div => dynasm!(self.ops ; .arch aarch64 ; fdiv D(d), D(a), D(b)),
         }
     }
 
     /// d0 = d0 <op> d1
     fn emit_float_op(&mut self, op: BinOp) {
-        match op {
-            BinOp::Add => dynasm!(self.ops ; .arch aarch64 ; fadd d0, d0, d1),
-            BinOp::Sub => dynasm!(self.ops ; .arch aarch64 ; fsub d0, d0, d1),
-            BinOp::Mul => dynasm!(self.ops ; .arch aarch64 ; fmul d0, d0, d1),
-            BinOp::Div => dynasm!(self.ops ; .arch aarch64 ; fdiv d0, d0, d1),
+        self.emit_float_op_regs(op, 0, 0, 1);
+    }
+
+    /// Integer result of `X(a) <op> X(b)` into registers[dest]: straight
+    /// into a carried pin, otherwise via x0 and the store path.
+    fn finish_int_op(&mut self, op: BinOp, dest: u8, a: u8, b: u8) {
+        match self.direct_dest_x(dest) {
+            Some(d) => self.emit_int_op_regs(op, d, a, b),
+            None => {
+                self.emit_int_op_regs(op, 0, a, b);
+                self.store_from_x0(dest, ValueTag::Int.as_u8());
+            }
         }
+    }
+
+    /// Float result of `D(a) <op> D(b)` into registers[dest].
+    fn finish_float_op(&mut self, op: BinOp, dest: u8, a: u8, b: u8) {
+        match self.direct_dest_d(dest) {
+            Some(d) => self.emit_float_op_regs(op, d, a, b),
+            None => {
+                self.emit_float_op_regs(op, 0, a, b);
+                self.store_d0_as_float(dest);
+            }
+        }
+    }
+
+    /// Fuse `LoadConst <number>` with a following float `Add/Sub/Mul/Div`
+    /// that consumes it, when the constant register is dead afterwards: the
+    /// constant is materialized in d1 and never stored. The constant may be
+    /// an Int used in a mixed operation; it is converted at compile time.
+    pub(super) fn compile_float_op_immediate(
+        &mut self,
+        load: &TraceOp,
+        arithmetic: &TraceOp,
+    ) -> Result<bool> {
+        let TraceOp::LoadConst {
+            dest: constant_register,
+            value,
+        } = load
+        else {
+            return Ok(false);
+        };
+        let constant = match value {
+            Value::Float(f) => *f,
+            Value::Int(i) => *i as f64,
+            _ => return Ok(false),
+        };
+        let (op, dest, lhs, rhs, lhs_type, rhs_type) = match arithmetic {
+            TraceOp::Add {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => (BinOp::Add, *dest, *lhs, *rhs, *lhs_type, *rhs_type),
+            TraceOp::Sub {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => (BinOp::Sub, *dest, *lhs, *rhs, *lhs_type, *rhs_type),
+            TraceOp::Mul {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => (BinOp::Mul, *dest, *lhs, *rhs, *lhs_type, *rhs_type),
+            TraceOp::Div {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => (BinOp::Div, *dest, *lhs, *rhs, *lhs_type, *rhs_type),
+            _ => return Ok(false),
+        };
+        let numeric = |ty: ValueType| matches!(ty, ValueType::Int | ValueType::Float);
+        if !numeric(lhs_type) || !numeric(rhs_type) {
+            return Ok(false);
+        }
+        // Only float results: (Int, Int) stays on the integer path.
+        if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
+            return Ok(false);
+        }
+        let constant_is_lhs = lhs == *constant_register && rhs != *constant_register;
+        let constant_is_rhs = rhs == *constant_register && lhs != *constant_register;
+        if !constant_is_lhs && !constant_is_rhs {
+            return Ok(false);
+        }
+        let (other, other_type) = if constant_is_lhs {
+            (rhs, rhs_type)
+        } else {
+            (lhs, lhs_type)
+        };
+        // The constant's annotated type must match what we materialize.
+        let constant_type = if constant_is_lhs { lhs_type } else { rhs_type };
+        if constant_type != ValueType::Float && !matches!(value, Value::Int(_)) {
+            return Ok(false);
+        }
+
+        self.emit_mov_imm64(0, constant.to_bits());
+        dynasm!(self.ops ; .arch aarch64 ; fmov d1, x0);
+        let o = self.operand_numeric_d(other, other_type, 0);
+        if constant_is_lhs {
+            self.finish_float_op(op, dest, 1, o);
+        } else {
+            self.finish_float_op(op, dest, o, 1);
+        }
+        Ok(true)
     }
 
     fn compile_binary_specialized(
@@ -43,27 +164,17 @@ impl JitCompiler {
         op: BinOp,
     ) -> Result<()> {
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
-            self.load_payload(0, lhs);
-            self.load_payload(9, rhs);
-            self.emit_int_op(op);
-            self.store_from_x0(dest, ValueTag::Int.as_u8());
+            let a = self.operand_x(lhs, 0);
+            let b = self.operand_x(rhs, 9);
+            self.finish_int_op(op, dest, a, b);
             return Ok(());
         }
 
         let numeric = |ty: ValueType| matches!(ty, ValueType::Int | ValueType::Float);
         if numeric(lhs_type) && numeric(rhs_type) {
-            if lhs_type == ValueType::Int {
-                self.load_payload_int_as_f(0, lhs);
-            } else {
-                self.load_payload_f(0, lhs);
-            }
-            if rhs_type == ValueType::Int {
-                self.load_payload_int_as_f(1, rhs);
-            } else {
-                self.load_payload_f(1, rhs);
-            }
-            self.emit_float_op(op);
-            self.store_d0_as_float(dest);
+            let a = self.operand_numeric_d(lhs, lhs_type, 0);
+            let b = self.operand_numeric_d(rhs, rhs_type, 1);
+            self.finish_float_op(op, dest, a, b);
             return Ok(());
         }
 
@@ -198,42 +309,55 @@ impl JitCompiler {
         rhs_type: ValueType,
     ) -> Result<()> {
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
-            self.load_payload(0, lhs);
-            self.load_payload(9, rhs);
-            self.emit_int_mod();
-            self.store_from_x0(dest, ValueTag::Int.as_u8());
+            let a = self.operand_x(lhs, 0);
+            let b = self.operand_x(rhs, 9);
+            match self.direct_dest_x(dest) {
+                Some(d) => self.emit_int_mod_regs(d, a, b),
+                None => {
+                    self.emit_int_mod_regs(0, a, b);
+                    self.store_from_x0(dest, ValueTag::Int.as_u8());
+                }
+            }
             return Ok(());
         }
 
         let numeric = |ty: ValueType| matches!(ty, ValueType::Int | ValueType::Float);
         if numeric(lhs_type) && numeric(rhs_type) {
-            if lhs_type == ValueType::Int {
-                self.load_payload_int_as_f(0, lhs);
-            } else {
-                self.load_payload_f(0, lhs);
+            // fmod takes its arguments in d0/d1 and returns in d0.
+            let a = self.operand_numeric_d(lhs, lhs_type, 0);
+            let b = self.operand_numeric_d(rhs, rhs_type, 1);
+            if a != 0 {
+                dynasm!(self.ops ; .arch aarch64 ; fmov d0, D(a));
             }
-            if rhs_type == ValueType::Int {
-                self.load_payload_int_as_f(1, rhs);
-            } else {
-                self.load_payload_f(1, rhs);
+            if b != 1 {
+                dynasm!(self.ops ; .arch aarch64 ; fmov d1, D(b));
             }
             self.emit_float_mod();
-            self.store_d0_as_float(dest);
+            match self.direct_dest_d(dest) {
+                Some(d) => dynasm!(self.ops ; .arch aarch64 ; fmov D(d), d0),
+                None => self.store_d0_as_float(dest),
+            }
             return Ok(());
         }
 
         self.compile_mod_generic(dest, lhs, rhs)
     }
 
-    /// x0 = x0 % x9 with the interpreter's semantics: sign of the dividend,
-    /// modulo by zero fails the trace so the interpreter raises the error.
-    fn emit_int_mod(&mut self) {
+    /// X(d) = X(a) % X(b) with the interpreter's semantics: sign of the
+    /// dividend, modulo by zero fails the trace so the interpreter raises the
+    /// error. x10 is scratch.
+    fn emit_int_mod_regs(&mut self, d: u8, a: u8, b: u8) {
         dynasm!(self.ops
             ; .arch aarch64
-            ; cbz x9, >fail
-            ; sdiv x10, x0, x9
-            ; msub x0, x10, x9, x0
+            ; cbz X(b), >fail
+            ; sdiv x10, X(a), X(b)
+            ; msub X(d), x10, X(b), X(a)
         );
+    }
+
+    /// x0 = x0 % x9 (see `emit_int_mod_regs`).
+    fn emit_int_mod(&mut self) {
+        self.emit_int_mod_regs(0, 0, 9);
     }
 
     /// d0 = d0 % d1 as Rust's `f64 % f64` (libm `fmod`: exact, sign of the

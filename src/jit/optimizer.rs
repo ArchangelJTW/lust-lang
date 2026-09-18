@@ -34,13 +34,40 @@ impl TraceOptimizer {
         self.hoisted_constants.clone()
     }
 
+    /// Separate `At` markers from the ops they precede, so a pass can match
+    /// consecutive ops. `join_markers` puts each marker back in front of
+    /// whatever its op became.
+    fn split_markers(ops: &[TraceOp]) -> (Vec<TraceOp>, Vec<Option<usize>>) {
+        let mut bare = Vec::with_capacity(ops.len());
+        let mut markers = Vec::with_capacity(ops.len());
+        let mut pending = None;
+        for op in ops {
+            if let TraceOp::At { ip } = op {
+                pending = Some(*ip);
+            } else {
+                bare.push(op.clone());
+                markers.push(pending.take());
+            }
+        }
+        (bare, markers)
+    }
+
+    fn push_marker(ops: &mut Vec<TraceOp>, marker: Option<usize>) {
+        if let Some(ip) = marker {
+            ops.push(TraceOp::At { ip });
+        }
+    }
+
     /// A checked index immediately matched as `Ok(value)` can keep its
     /// discriminant and payload in registers instead of allocating a Result.
     fn fuse_try_get_index_patterns(&mut self, trace: &mut Trace) {
+        let (bare, markers) = Self::split_markers(&trace.ops);
         let mut ops = Vec::with_capacity(trace.ops.len());
         let mut i = 0;
-        while i < trace.ops.len() {
-            if i + 3 < trace.ops.len()
+        while i < bare.len() {
+            // Whatever op i becomes, it belongs to op i's instruction.
+            Self::push_marker(&mut ops, markers[i]);
+            if i + 3 < bare.len()
                 && let (
                     TraceOp::TryGetIndex {
                         dest: result_reg,
@@ -63,12 +90,7 @@ impl TraceOptimizer {
                         enum_reg,
                         index: 0,
                     },
-                ) = (
-                    &trace.ops[i],
-                    &trace.ops[i + 1],
-                    &trace.ops[i + 2],
-                    &trace.ops[i + 3],
-                )
+                ) = (&bare[i], &bare[i + 1], &bare[i + 2], &bare[i + 3])
                 && tested_reg == result_reg
                 && enum_reg == result_reg
                 && condition_register == condition_reg
@@ -81,7 +103,7 @@ impl TraceOptimizer {
                     array: *array,
                     index: *index,
                 });
-                ops.push(trace.ops[i + 2].clone());
+                ops.push(bare[i + 2].clone());
                 ops.push(TraceOp::Move {
                     dest: *binding_reg,
                     src: *result_reg,
@@ -90,7 +112,7 @@ impl TraceOptimizer {
                 continue;
             }
 
-            ops.push(trace.ops[i].clone());
+            ops.push(bare[i].clone());
             i += 1;
         }
         trace.ops = ops;
@@ -101,10 +123,12 @@ impl TraceOptimizer {
     /// Option only to test and unpack it is redundant: the type test is the
     /// discriminant, and the successful payload is the original value.
     fn fuse_try_cast_patterns(&mut self, trace: &mut Trace) {
+        let (bare, markers) = Self::split_markers(&trace.ops);
         let mut ops = Vec::with_capacity(trace.ops.len());
         let mut i = 0;
-        while i < trace.ops.len() {
-            if i + 3 < trace.ops.len()
+        while i < bare.len() {
+            Self::push_marker(&mut ops, markers[i]);
+            if i + 3 < bare.len()
                 && let (
                     TraceOp::TryCast {
                         dest: option_reg,
@@ -127,12 +151,7 @@ impl TraceOptimizer {
                         enum_reg,
                         index: 0,
                     },
-                ) = (
-                    &trace.ops[i],
-                    &trace.ops[i + 1],
-                    &trace.ops[i + 2],
-                    &trace.ops[i + 3],
-                )
+                ) = (&bare[i], &bare[i + 1], &bare[i + 2], &bare[i + 3])
                 && tested_reg == option_reg
                 && enum_reg == option_reg
                 && condition_register == condition_reg
@@ -144,7 +163,7 @@ impl TraceOptimizer {
                     value: *value,
                     type_name: type_name.clone(),
                 });
-                ops.push(trace.ops[i + 2].clone());
+                ops.push(bare[i + 2].clone());
                 ops.push(TraceOp::Move {
                     dest: *binding_reg,
                     src: *value,
@@ -153,7 +172,7 @@ impl TraceOptimizer {
                 continue;
             }
 
-            ops.push(trace.ops[i].clone());
+            ops.push(bare[i].clone());
             i += 1;
         }
         trace.ops = ops;

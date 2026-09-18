@@ -181,6 +181,8 @@ pub struct VM {
     /// Resolution otherwise formats a mangled name and scans every function
     /// by string on each call.
     pub(super) method_cache: hashbrown::HashMap<(usize, usize, u16), usize>,
+    /// Reused buffer for call arguments, so a call allocates nothing.
+    pub(super) arg_scratch: Vec<Value>,
     pub(super) max_stack_depth: usize,
     pub(super) pending_return_value: Option<Value>,
     pub(super) pending_return_dest: Option<Register>,

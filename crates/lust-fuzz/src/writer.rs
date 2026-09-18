@@ -11,6 +11,7 @@
 //! function returns, so the two engines' outputs can be compared directly.
 
 use crate::rng::Rng;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ty {
@@ -555,6 +556,9 @@ struct Gen {
     /// Work estimate of the function being generated: the largest loop
     /// product reached plus the work of every call it makes, scaled.
     cur_work: i64,
+    /// Upper bound on each array variable's length: its literal size plus
+    /// every push site times the loop scale that site runs under.
+    array_bounds: HashMap<String, i64>,
 }
 
 /// Rough cap on loop iterations (plus called work) a program may execute.
@@ -579,6 +583,7 @@ pub fn program(seed: u64, size: u32) -> Program {
         iterating: Vec::new(),
         iter_scale: 1,
         cur_work: 0,
+        array_bounds: HashMap::new(),
     };
     let mut funcs = Vec::new();
     let func_count = g.rng.below(size as u64 + 1) as usize;
@@ -791,6 +796,9 @@ impl Gen {
             Ty::Unknown => "u",
         });
         let init = self.expr(ty, 2);
+        if let Expr::ArrLit(items) = &init {
+            self.array_bounds.insert(name.clone(), items.len() as i64);
+        }
         self.declare(&name, ty, false);
         Stmt::Local { name, ty, init }
     }
@@ -882,13 +890,19 @@ impl Gen {
         self.scopes.push(Vec::new());
         self.declare(&var, Ty::Int, true);
         self.iterating.push(arr.clone());
-        // Arrays stay small (pushes are bounded by the loops around them).
-        self.iter_scale *= 8;
+        // The array may be as long as every push site could have made it.
+        let factor = self.array_bounds.get(&arr).copied().unwrap_or(1).max(1);
+        if self.iter_scale.saturating_mul(factor) > MAX_WORK {
+            self.iterating.pop();
+            self.scopes.pop();
+            return Some(self.for_loop());
+        }
+        self.iter_scale *= factor;
         self.cur_work = self.cur_work.max(self.iter_scale);
         self.loop_depth += 1;
         let body = self.block(false);
         self.loop_depth -= 1;
-        self.iter_scale /= 8;
+        self.iter_scale /= factor;
         self.iterating.pop();
         self.scopes.pop();
         Some(Stmt::ForIn { arr, var, body })
@@ -978,6 +992,8 @@ impl Gen {
         }
         let arr = self.rng.pick(&vars).name.clone();
         let expr = self.expr(Ty::Int, 2);
+        let bound = self.array_bounds.entry(arr.clone()).or_insert(0);
+        *bound = (*bound + self.iter_scale).min(MAX_WORK);
         Some(Stmt::Push { arr, expr })
     }
 

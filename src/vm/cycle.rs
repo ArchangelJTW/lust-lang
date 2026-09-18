@@ -9,11 +9,16 @@ use hashbrown::{HashMap, HashSet, hash_map::Entry};
 
 /// Base triggers for a collection: this many register writes, or this many
 /// newly registered containers. Both are raised in proportion to the size of
-/// the heap the previous collection had to walk (see `maybe_collect`), so a
+/// the heap the previous collection had to walk (see `should_collect`), so a
 /// program holding a large array is not charged a full heap traversal every
-/// few hundred instructions.
-const COLLECT_INTERVAL: usize = 512;
+/// few hundred instructions. Allocation is the trigger that matters; the
+/// step trigger only catches cycles closed by mutation of existing values,
+/// so it runs rarely — a collection has a fixed cost (graph snapshot,
+/// hash maps) even when there is almost nothing to walk.
+const COLLECT_INTERVAL: usize = 1 << 16;
 const REGISTRATION_THRESHOLD: usize = 256;
+/// Steps granted per value the previous collection visited.
+const STEPS_PER_WORK_UNIT: usize = 4;
 
 type NodeKey = (u8, usize);
 const NODE_ARRAY: u8 = 1;
@@ -95,7 +100,7 @@ impl CycleCollector {
         // size. Spacing collections by that cost keeps the amortized charge
         // per step and per allocation bounded; small heaps still collect at
         // the base rate.
-        let step_interval = COLLECT_INTERVAL.max(self.last_collect_work);
+        let step_interval = COLLECT_INTERVAL.max(self.last_collect_work * STEPS_PER_WORK_UNIT);
         let registration_threshold = REGISTRATION_THRESHOLD.max(self.containers.len());
         self.steps_since_collect >= step_interval
             || self.pending_registrations >= registration_threshold

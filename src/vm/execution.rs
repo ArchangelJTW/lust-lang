@@ -1,6 +1,15 @@
 use super::*;
 use crate::bytecode::ValueKey;
 use core::ptr;
+
+/// How thoroughly a call's arguments are checked against the signature.
+#[derive(Clone, Copy)]
+enum ArgCheck {
+    /// Full validation, including container contents (host and dynamic calls).
+    Deep,
+    /// Kinds only; the typechecker proved the rest (bytecode calls).
+    Shallow,
+}
 impl VM {
     fn is_loop_in_hierarchy(
         &self,
@@ -981,13 +990,18 @@ impl VM {
                     }
                     match func_value {
                         Value::Function(func_idx) => {
-                            let mut args = Vec::new();
+                            let mut args = core::mem::take(&mut self.arg_scratch);
+                            args.clear();
                             for i in 0..arg_count {
                                 args.push(self.get_register(first_arg + i)?.clone());
                             }
 
-                            let frame =
-                                self.make_call_frame(func_idx, Some(dest_reg), args, Vec::new())?;
+                            let frame = self.make_checked_call_frame(
+                                func_idx,
+                                Some(dest_reg),
+                                args,
+                                Vec::new(),
+                            )?;
                             self.call_stack.push(frame);
                         }
 
@@ -995,14 +1009,15 @@ impl VM {
                             function_idx: func_idx,
                             upvalues,
                         } => {
-                            let mut args = Vec::new();
+                            let mut args = core::mem::take(&mut self.arg_scratch);
+                            args.clear();
                             for i in 0..arg_count {
                                 args.push(self.get_register(first_arg + i)?.clone());
                             }
 
                             let upvalue_values: Vec<Value> =
                                 upvalues.iter().map(|uv| uv.get()).collect();
-                            let frame = self.make_call_frame(
+                            let frame = self.make_checked_call_frame(
                                 func_idx,
                                 Some(dest_reg),
                                 args,
@@ -1486,13 +1501,18 @@ impl VM {
                             method_name_idx as u16,
                         );
                         if let Some(&target) = self.method_cache.get(&key) {
-                            let mut args = Vec::with_capacity(1 + arg_count as usize);
+                            let mut args = core::mem::take(&mut self.arg_scratch);
+                            args.clear();
                             args.push(object.clone());
                             for i in 0..arg_count {
                                 args.push(self.get_register(first_arg + i)?.clone());
                             }
-                            let frame =
-                                self.make_call_frame(target, Some(dest_reg), args, Vec::new())?;
+                            let frame = self.make_checked_call_frame(
+                                target,
+                                Some(dest_reg),
+                                args,
+                                Vec::new(),
+                            )?;
                             if self.trace_recorder.is_some() {
                                 self.abandon_trace_recording();
                             }
@@ -2048,12 +2068,38 @@ impl VM {
         }
     }
 
+    /// Build a frame for a call whose arguments the typechecker has already
+    /// proven: only the argument kinds are checked (O(1) per argument).
+    pub(super) fn make_checked_call_frame(
+        &mut self,
+        function_idx: usize,
+        return_dest: Option<Register>,
+        args: Vec<Value>,
+        upvalues: Vec<Value>,
+    ) -> Result<Box<CallFrame>> {
+        self.make_call_frame_with(function_idx, return_dest, args, upvalues, ArgCheck::Shallow)
+    }
+
+    /// Build a frame for a call from the host or a dynamic value: every
+    /// argument is validated in full against the signature, including the
+    /// elements of containers.
     pub(super) fn make_call_frame(
+        &mut self,
+        function_idx: usize,
+        return_dest: Option<Register>,
+        args: Vec<Value>,
+        upvalues: Vec<Value>,
+    ) -> Result<Box<CallFrame>> {
+        self.make_call_frame_with(function_idx, return_dest, args, upvalues, ArgCheck::Deep)
+    }
+
+    fn make_call_frame_with(
         &mut self,
         function_idx: usize,
         return_dest: Option<Register>,
         mut args: Vec<Value>,
         upvalues: Vec<Value>,
+        check: ArgCheck,
     ) -> Result<Box<CallFrame>> {
         let function = self
             .functions
@@ -2091,7 +2137,11 @@ impl VM {
             && signature.params.len() == args.len()
         {
             for (index, (value, ty)) in args.iter().zip(&signature.params).enumerate() {
-                if !self.value_matches_type(value, ty) {
+                let ok = match check {
+                    ArgCheck::Deep => self.value_matches_type(value, ty),
+                    ArgCheck::Shallow => Self::value_matches_type_shallow(value, ty),
+                };
+                if !ok {
                     return Err(LustError::RuntimeError {
                         message: format!(
                             "Function {} argument {} expects {}, got {:?}",
@@ -2125,11 +2175,35 @@ impl VM {
             .any(|existing| existing.function_idx == function_idx);
         self.jit.record_function_call(function_idx, recursive);
         frame.upvalues = upvalues;
-        for (index, arg) in args.into_iter().enumerate() {
+        for (index, arg) in args.drain(..).enumerate() {
             self.observe_value_graph(&arg);
             frame.registers[index] = arg;
         }
+        // Keep the (now empty) argument buffer so the next call allocates
+        // nothing.
+        if args.capacity() > self.arg_scratch.capacity() {
+            self.arg_scratch = args;
+        }
         Ok(frame)
+    }
+
+    /// An O(1) argument check for calls the typechecker already validated:
+    /// scalar kinds and container kinds are verified, contents are not.
+    /// Anything the checker treats dynamically (`unknown`, generics,
+    /// unions, function types, Lua values) is accepted; typed instructions
+    /// still guard the payloads they read.
+    fn value_matches_type_shallow(value: &Value, ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::Int => matches!(value, Value::Int(_)),
+            TypeKind::Float => matches!(value, Value::Float(_)),
+            TypeKind::String => matches!(value, Value::String(_)),
+            TypeKind::Bool => matches!(value, Value::Bool(_)),
+            TypeKind::Unit => matches!(value, Value::Nil),
+            TypeKind::Array(_) => matches!(value, Value::Array(_)),
+            TypeKind::Map(..) => matches!(value, Value::Map(_)),
+            TypeKind::Tuple(_) => matches!(value, Value::Tuple(_)),
+            _ => true,
+        }
     }
 
     /// Keep a popped frame for reuse, with the registers it used reset to
@@ -2159,7 +2233,10 @@ impl VM {
             if is_empty_lua_return {
                 return Ok(());
             }
-            if !self.value_matches_type(value, &signature.return_type) {
+            // A return executes bytecode the typechecker validated; check
+            // the kind only. Container contents are checked where they are
+            // read, by typed instructions.
+            if !Self::value_matches_type_shallow(value, &signature.return_type) {
                 return Err(LustError::RuntimeError {
                     message: format!(
                         "Function {} must return {}, got {:?}",

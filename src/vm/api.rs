@@ -109,6 +109,7 @@ impl VM {
             call_stack: Vec::new(),
             frame_pool: Vec::new(),
             method_cache: hashbrown::HashMap::new(),
+            arg_scratch: Vec::new(),
             max_stack_depth: 1000,
             pending_return_value: None,
             pending_return_dest: None,

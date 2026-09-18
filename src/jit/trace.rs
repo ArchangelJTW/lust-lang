@@ -203,6 +203,12 @@ pub enum TraceOp {
         register: Register,
         function: TracedNativeFn,
     },
+    /// The register holds a struct of exactly this layout (identity of its
+    /// `StructLayout`), so a method resolved for it stays valid.
+    GuardStructLayout {
+        register: Register,
+        layout: *const (),
+    },
     GuardFunction {
         register: Register,
         function_idx: usize,
@@ -647,6 +653,7 @@ impl TraceRecorder {
             | TraceOp::ArrayIndexOk { .. }
             | TraceOp::Guard { .. }
             | TraceOp::GuardNativeFunction { .. }
+            | TraceOp::GuardStructLayout { .. }
             | TraceOp::GuardFunction { .. }
             | TraceOp::GuardClosure { .. }
             | TraceOp::GuardLoopContinue { .. }
@@ -1006,9 +1013,14 @@ impl TraceRecorder {
             function,
             function_idx,
             functions,
+            false,
         )
     }
 
+    /// `frame_pushed`: the instruction was a call that pushed a new frame,
+    /// so the executing frame's registers are still exactly as they were
+    /// before it (the destination is written only when the callee returns).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_instruction_at_frame(
         &mut self,
         frame_index: usize,
@@ -1018,6 +1030,7 @@ impl TraceRecorder {
         function: &crate::bytecode::Function,
         function_idx: usize,
         functions: &[crate::bytecode::Function],
+        frame_pushed: bool,
     ) -> Result<(), LustError> {
         if !self.recording {
             return Ok(());
@@ -1068,7 +1081,7 @@ impl TraceRecorder {
                                 | Instruction::Neg(..)
                         )
                     });
-            if instruction.reads_register(dest) && !preserves_numeric_inputs {
+            if instruction.reads_register(dest) && !preserves_numeric_inputs && !frame_pushed {
                 self.stop_recording();
                 return Err(LustError::RuntimeError {
                     message: format!(
@@ -1546,6 +1559,58 @@ impl TraceRecorder {
                                     method_name
                                 )
                             });
+                        }
+                    }
+                }
+
+                // A user-defined struct method: resolve it the way the
+                // interpreter does and inline it like a call, with the
+                // receiver as the first argument. The receiver's layout is
+                // guarded because trait dispatch can bring different structs
+                // to one call site.
+                if let Value::Struct { name, layout, .. } = &registers[obj_reg as usize] {
+                    let mangled = format!("{}:{}", name, method_name);
+                    if let Some(function_idx) = functions.iter().position(|f| f.name == mangled) {
+                        let callee_fn = &functions[function_idx];
+                        let total_args = arg_count as usize + 1;
+                        if self.should_inline(function_idx, callee_fn)
+                            && callee_fn.register_count > 0
+                            && total_args <= callee_fn.register_count as usize
+                        {
+                            self.push_op(TraceOp::GuardStructLayout {
+                                register: obj_reg,
+                                layout: Rc::as_ptr(layout) as *const (),
+                            });
+                            self.mark_guarded(obj_reg);
+                            for i in 0..arg_count {
+                                let arg_reg = first_arg + i;
+                                if let Some(ty) = Self::get_value_type(&registers[arg_reg as usize])
+                                    && !self.is_guarded(arg_reg)
+                                {
+                                    self.push_op(TraceOp::Guard {
+                                        register: arg_reg,
+                                        expected_type: ty,
+                                    });
+                                    self.mark_guarded(arg_reg);
+                                }
+                            }
+                            let mut arg_registers = Vec::with_capacity(total_args);
+                            arg_registers.push(obj_reg);
+                            for i in 0..arg_count {
+                                arg_registers.push(first_arg + i);
+                            }
+                            self.push_inline_context(
+                                function_idx,
+                                callee_fn.register_count,
+                                dest_reg,
+                                obj_reg,
+                                first_arg,
+                                arg_count,
+                                arg_registers,
+                                false,
+                                None,
+                            );
+                            return Ok(());
                         }
                     }
                 }

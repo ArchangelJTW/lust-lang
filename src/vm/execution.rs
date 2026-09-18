@@ -100,7 +100,7 @@ impl VM {
     }
 
     pub(super) fn run(&mut self) -> Result<Value> {
-        loop {
+        'dispatch: loop {
             if let Some(target_depth) = self.call_until_depth
                 && self.call_stack.len() == target_depth
                 && let Some(return_value) = self.pending_return_value.take()
@@ -1490,7 +1490,7 @@ impl VM {
                     first_arg,
                     arg_count,
                     dest_reg,
-                ) => {
+                ) => 'method: {
                     let object = self.get_register(obj_reg)?.clone();
                     // Fast path: a user-defined struct method already resolved
                     // at this call site.
@@ -1513,11 +1513,10 @@ impl VM {
                                 args,
                                 Vec::new(),
                             )?;
-                            if self.trace_recorder.is_some() {
-                                self.abandon_trace_recording();
-                            }
+                            // Fall through to the trace recorder below: it
+                            // inlines user-defined struct methods like calls.
                             self.call_stack.push(frame);
-                            continue;
+                            break 'method;
                         }
                     }
                     let method_name = {
@@ -1553,11 +1552,8 @@ impl VM {
                             }
                             let frame =
                                 self.make_call_frame(func_idx, Some(dest_reg), args, Vec::new())?;
-                            if self.trace_recorder.is_some() {
-                                self.abandon_trace_recording();
-                            }
                             self.call_stack.push(frame);
-                            continue;
+                            break 'method;
                         }
 
                         let mut candidate_names = vec![mangled_name.clone()];
@@ -1599,7 +1595,7 @@ impl VM {
                             }
                         }
                         if handled {
-                            continue;
+                            continue 'dispatch;
                         }
                     }
 
@@ -1778,6 +1774,7 @@ impl VM {
                         } else {
                             None
                         };
+                    let frame_pushed = self.call_stack.len() > executing_frame_index + 1;
                     if let Some(registers) = registers_opt
                         && let Err(e) = recorder.record_instruction_at_frame(
                             executing_frame_index,
@@ -1787,6 +1784,7 @@ impl VM {
                             function,
                             func_idx,
                             &self.functions,
+                            frame_pushed,
                         )
                     {
                         crate::jit::log(|| format!("⚠️  JIT: {}", e));

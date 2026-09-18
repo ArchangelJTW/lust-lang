@@ -638,6 +638,16 @@ impl JitCompiler {
                     self.compile_array_len(*dest, *array)?;
                 }
 
+                TraceOp::GuardStructLayout { register, layout } => {
+                    let guard = self.compile_guard_struct_layout(
+                        *register,
+                        *layout,
+                        *guard_index as usize,
+                    )?;
+                    guards.push(guard);
+                    *guard_index += 1;
+                }
+
                 TraceOp::GuardNativeFunction { register, function } => {
                     let expected_ptr = function.pointer();
                     crate::jit::log(|| format!("🔒 JIT: guard native reg {}", register));
@@ -1170,6 +1180,7 @@ impl JitCompiler {
                 | TraceOp::ArrayIndexOk { .. }
                 | TraceOp::ArrayLen { .. }
                 | TraceOp::GuardNativeFunction { .. }
+                | TraceOp::GuardStructLayout { .. }
                 | TraceOp::GuardFunction { .. }
                 | TraceOp::GuardClosure { .. }
                 | TraceOp::CallNative { .. }
@@ -1225,6 +1236,7 @@ impl JitCompiler {
             }
             TraceOp::ArrayLen { array, .. } => *array == register,
             TraceOp::GuardNativeFunction { register: source, .. }
+            | TraceOp::GuardStructLayout { register: source, .. }
             | TraceOp::GuardFunction { register: source, .. }
             | TraceOp::GuardClosure { register: source, .. }
             | TraceOp::Guard {
@@ -1475,6 +1487,7 @@ impl JitCompiler {
             }
             TraceOp::SetField { .. }
             | TraceOp::GuardNativeFunction { .. }
+            | TraceOp::GuardStructLayout { .. }
             | TraceOp::GuardFunction { .. }
             | TraceOp::GuardClosure { .. }
             | TraceOp::GuardLoopContinue { .. }

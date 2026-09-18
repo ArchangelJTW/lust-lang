@@ -2088,6 +2088,20 @@ pub unsafe extern "C" fn jit_guard_native_function(
     }
 }
 
+/// Does the value hold a struct whose layout is `expected`?
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_guard_struct_layout(value_ptr: *const Value, expected: *const ()) -> u8 {
+    unsafe {
+        if value_ptr.is_null() {
+            return 0;
+        }
+        match &*value_ptr {
+            Value::Struct { layout, .. } => u8::from(Rc::as_ptr(layout) as *const () == expected),
+            _ => 0,
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_guard_function_identity(
     value_ptr: *const Value,

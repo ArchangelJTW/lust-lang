@@ -174,6 +174,38 @@ impl JitCompiler {
         })
     }
 
+    pub(super) fn compile_guard_struct_layout(
+        &mut self,
+        register: u8,
+        layout: *const (),
+        guard_index: usize,
+    ) -> Result<Guard> {
+        let guard_return_value = (guard_index + 1) as i32;
+        unsafe extern "C" {
+            fn jit_guard_struct_layout(value_ptr: *const Value, expected: *const ()) -> u8;
+        }
+        self.emit_reg_addr(0, register);
+        self.emit_mov_imm64(1, layout as usize as u64);
+        self.emit_call(jit_guard_struct_layout as *const ());
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; and w0, w0, 0xff
+            ; cbnz w0, >guard_ok
+        );
+        self.emit_guard_exit(guard_return_value);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; guard_ok:
+        );
+        Ok(Guard {
+            index: guard_index,
+            bailout_ip: 0,
+            kind: GuardKind::StructLayout { register, layout },
+            fail_count: 0,
+            side_trace: None,
+        })
+    }
+
     pub(super) fn compile_truth_guard(
         &mut self,
         condition_register: u8,

@@ -156,6 +156,10 @@ pub enum GuardKind {
         register: u8,
         expected: *const (),
     },
+    StructLayout {
+        register: u8,
+        layout: *const (),
+    },
     Function {
         register: u8,
         function_idx: usize,

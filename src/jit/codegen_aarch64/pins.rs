@@ -182,6 +182,7 @@ fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
         }
         TraceOp::SetField { .. }
         | TraceOp::GuardNativeFunction { .. }
+        | TraceOp::GuardStructLayout { .. }
         | TraceOp::GuardFunction { .. }
         | TraceOp::GuardClosure { .. }
         | TraceOp::GuardLoopContinue { .. }
@@ -384,6 +385,7 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
             e.native_writes.push((*dest, Some(ValueType::Int)));
         }
         TraceOp::GuardNativeFunction { register, .. }
+        | TraceOp::GuardStructLayout { register, .. }
         | TraceOp::GuardFunction { register, .. }
         | TraceOp::GuardClosure { register, .. } => e.reads.push((*register, None)),
         TraceOp::CallNative {

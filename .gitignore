@@ -8,3 +8,4 @@ examples/rust-extension/extensions/triple/target
 tree-sitter-lust/target
 /scripts
 vsc-extension/package-lock.json
+mine/

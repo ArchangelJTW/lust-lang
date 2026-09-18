@@ -143,79 +143,135 @@ impl VM {
         }
     }
 
+    /// Count a guard exit. Nested loops run through their own root trace
+    /// from inside the outer trace (`jit_run_nested_loop`), so no guard kind
+    /// grows a side trace any more; the side-trace recording that used to
+    /// start here after `SIDE_EXIT_THRESHOLD` failures produced a loop trace
+    /// whose completion left the frame's ip at the outer back-edge rather
+    /// than at the inner loop's exit.
     pub(super) fn handle_guard_failure(
         &mut self,
         trace_id: crate::jit::TraceId,
         guard_index: usize,
         _func_idx: usize,
     ) -> Result<()> {
-        use crate::jit::{GuardKind, SIDE_EXIT_THRESHOLD};
         if !self.jit.enabled {
             return Ok(());
         }
+        if let Some(trace) = self.jit.get_trace_mut(trace_id)
+            && let Some(guard) = trace.guards.get_mut(guard_index)
+        {
+            guard.fail_count += 1;
+            crate::jit::log(|| {
+                format!(
+                    "⚠️  JIT: Guard #{} failed (count: {})",
+                    guard_index, guard.fail_count
+                )
+            });
+        }
+        Ok(())
+    }
+}
 
-        let should_record_side_trace = if let Some(trace) = self.jit.get_trace_mut(trace_id) {
-            if guard_index < trace.guards.len() {
-                let guard = &mut trace.guards[guard_index];
-                guard.fail_count += 1;
-                crate::jit::log(|| {
-                    format!(
-                        "⚠️  JIT: Guard #{} failed (count: {})",
-                        guard_index, guard.fail_count
-                    )
-                });
-                if guard.fail_count >= SIDE_EXIT_THRESHOLD {
-                    if let GuardKind::NestedLoop {
-                        function_idx,
-                        loop_start_ip,
-                    } = guard.kind
-                    {
-                        if guard.side_trace.is_none() {
-                            crate::jit::log(|| {
-                                format!(
-                                    "🔥 JIT: Hot side exit detected (guard #{}, failed {} times)",
-                                    guard_index, guard.fail_count
-                                )
-                            });
-                            crate::jit::log(|| {
-                                format!(
-                                    "🌳 JIT: Will compile side trace for nested loop at func {} ip {}...",
-                                    function_idx, loop_start_ip
-                                )
-                            });
-                            Some((function_idx, loop_start_ip))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
+/// Run the nested loop at `(function_idx, loop_start_ip)` of the frame whose
+/// registers are `registers` through the loop's own root trace, from inside
+/// the outer loop's native code.
+///
+/// Returns 0 when the loop ran to its normal exit and execution can carry
+/// on natively at `resume_ip`. Returns 1 when the interpreter has to take
+/// over: the outer trace exits through its `NestedLoop` guard, whose bailout
+/// ip is the inner back-edge (the interpreter then runs the loop itself,
+/// compiling it when it gets hot), unless `nested_loop_exit_ip` says where
+/// the inner trace bailed out instead. An error raised by the
+/// inner trace is left in `pending_jit_error` for the guard-exit path.
+///
+/// # Safety
+/// `vm` is null (from backend unit tests) or the VM executing the outer
+/// trace, and `registers` is that VM's current frame.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_run_nested_loop(
+    vm: *mut VM,
+    registers: *mut Value,
+    function_idx: usize,
+    loop_start_ip: usize,
+    resume_ip: usize,
+) -> i32 {
+    use crate::jit::GuardKind;
+    if vm.is_null() {
+        return 1;
+    }
+    let vm = unsafe { &mut *vm };
+    let Some(trace_id) = vm
+        .jit
+        .root_traces
+        .get(&(function_idx, loop_start_ip))
+        .copied()
+    else {
+        return 1;
+    };
+    loop {
+        let Some(trace) = vm.jit.trace_handle(trace_id) else {
+            return 1;
+        };
+        let cost = trace.trace.ops.len() + trace.trace.preamble.len() + trace.trace.postamble.len();
+        if let Err(error) = vm.budgets.charge_gas(core::cmp::max(1, cost) as u64) {
+            vm.pending_jit_error = Some(error);
+            return 1;
+        }
+        vm.jit.record_native_entry();
+        vm.pending_jit_error = None;
+        let result = trace.execute(registers, vm as *mut VM, core::ptr::null());
+        drop(trace);
+        if result == 0 {
+            if vm.current_task.is_some() && vm.pending_task_signal.is_some() {
+                // Let the interpreter's back-edge handling see the signal.
+                return 1;
             }
+            continue;
+        }
+        if result > 0 {
+            let guard_index = (result - 1) as usize;
+            vm.jit.record_guard_exit();
+            let guard = vm
+                .jit
+                .get_trace(trace_id)
+                .and_then(|trace| trace.guards.get(guard_index))
+                .map(|guard| (guard.bailout_ip, guard.kind.clone()));
+            let _ = vm.handle_guard_failure(trace_id, guard_index, function_idx);
+            let Some((bailout_ip, kind)) = guard else {
+                return 1;
+            };
+            let reusable_exit = matches!(
+                kind,
+                GuardKind::Truthy { .. } | GuardKind::Falsy { .. } | GuardKind::NestedLoop { .. }
+            );
+            if !reusable_exit {
+                vm.jit.evict_root_trace(function_idx, loop_start_ip);
+            }
+            if reusable_exit && bailout_ip == resume_ip {
+                return 0;
+            }
+            // A `NestedLoop` exit of the inner trace comes from a deeper
+            // level of this helper, which has already recorded where the
+            // interpreter resumes.
+            if !matches!(kind, GuardKind::NestedLoop { .. }) || vm.nested_loop_exit_ip.is_none() {
+                vm.nested_loop_exit_ip = Some(bailout_ip);
+            }
+            return 1;
+        }
+        // Failure: same recovery as an interpreter-entered trace (see the
+        // dispatch loop), with the resume ip handed to the guard-exit path.
+        vm.jit.record_execution_failure();
+        let resume = if result <= -2 {
+            vm.jit
+                .get_trace(trace_id)
+                .and_then(|trace| trace.fail_sites.get((-result - 2) as usize))
+                .copied()
         } else {
             None
         };
-        if let Some((function_idx, loop_start_ip)) = should_record_side_trace
-            && self.trace_recorder.is_none()
-        {
-            self.side_trace_context = Some((trace_id, guard_index));
-            let mut recorder =
-                TraceRecorder::new(function_idx, loop_start_ip, crate::jit::MAX_TRACE_LENGTH);
-            recorder.set_root_frame_index(self.call_stack.len().saturating_sub(1));
-            // Specialize loop-invariant values at side trace entry
-            {
-                let frame = self.call_stack.last().unwrap();
-                let func = &self.functions[function_idx];
-                recorder.specialize_trace_inputs(&frame.registers, func);
-            }
-            self.trace_recorder = Some(recorder);
-            self.jit.recording_started();
-        }
-
-        Ok(())
+        vm.nested_loop_exit_ip = Some(resume.unwrap_or(loop_start_ip));
+        vm.jit.evict_root_trace(function_idx, loop_start_ip);
+        return 1;
     }
 }

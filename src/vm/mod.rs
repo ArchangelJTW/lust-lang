@@ -189,6 +189,10 @@ pub struct VM {
     pub(super) pending_jit_error: Option<LustError>,
     pub(super) trace_recorder: Option<TraceRecorder>,
     pub(super) side_trace_context: Option<(crate::jit::TraceId, usize)>,
+    /// Set by `jit_run_nested_loop` when the inner loop's trace bailed out
+    /// somewhere other than its normal exit: the ip the interpreter resumes
+    /// at instead of the outer guard's own bailout ip.
+    pub(super) nested_loop_exit_ip: Option<usize>,
     pub(super) skip_next_trace_record: bool,
     pub(super) trait_impls: HashMap<(String, String), bool>,
     pub(super) struct_tostring_cache: HashMap<usize, Rc<String>>,
@@ -293,6 +297,7 @@ impl Drop for VM {
         self.last_task_signal = None;
         self.trace_recorder = None;
         self.side_trace_context = None;
+        self.nested_loop_exit_ip = None;
         self.task_manager = TaskManager::new();
 
         collector.collect(self);

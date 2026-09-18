@@ -579,6 +579,7 @@ impl JitCompiler {
                     function_idx,
                     loop_start_ip,
                     bailout_ip,
+                    ..
                 } => {
                     // Nested loop: exit to interpreter so it can be compiled later.
                     let exit_label = self.current_exit_label();

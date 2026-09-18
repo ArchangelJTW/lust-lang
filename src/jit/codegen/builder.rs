@@ -708,37 +708,16 @@ impl JitCompiler {
                     function_idx,
                     loop_start_ip,
                     bailout_ip,
+                    resume_ip,
                 } => {
-                    // Nested loop call - this will be replaced with a direct call to
-                    // the compiled inner loop trace once it's compiled.
-                    // For now, exit to interpreter which will:
-                    // 1. Run the loop in interpreter
-                    // 2. Eventually compile it as a hot trace
-                    // 3. Later, this guard can become a side trace that calls the compiled loop
-
-                    let exit_label = self.current_exit_label();
-                    jit::log(|| {
-                        format!(
-                            "🔗 JIT: Nested loop at func {} ip {} - exiting to interpreter (guard #{})",
-                            function_idx, loop_start_ip, *guard_index
-                        )
-                    });
-                    guards.push(Guard {
-                        index: *guard_index as usize,
-                        bailout_ip: *bailout_ip,
-                        kind: GuardKind::NestedLoop {
-                            function_idx: *function_idx,
-                            loop_start_ip: *loop_start_ip,
-                        },
-                        fail_count: 0,
-                        side_trace: None,
-                    });
-                    let current_guard_index = *guard_index;
-                    dynasm!(self.ops
-                        ; .arch x64
-                        ; mov eax, DWORD (current_guard_index + 1)
-                        ; jmp => exit_label
+                    let guard = self.compile_nested_loop_call(
+                        *function_idx,
+                        *loop_start_ip,
+                        *bailout_ip,
+                        *resume_ip,
+                        *guard_index as usize,
                     );
+                    guards.push(guard);
                     *guard_index += 1;
                 }
 
@@ -1150,10 +1129,10 @@ impl JitCompiler {
             TraceOp::SpecializedOp { operands, .. } => operands.iter().any(|operand| {
                 matches!(operand, crate::jit::trace::Operand::Register(source) if *source == register)
             }),
-            TraceOp::NewEnumUnit { .. }
-            | TraceOp::NestedLoopCall { .. }
-            | TraceOp::Rebox { .. }
-            | TraceOp::DropSpecialized { .. } => false,
+            TraceOp::NestedLoopCall { .. } => true,
+            TraceOp::NewEnumUnit { .. } | TraceOp::Rebox { .. } | TraceOp::DropSpecialized { .. } => {
+                false
+            }
         }
     }
 
@@ -1351,10 +1330,11 @@ impl JitCompiler {
             | TraceOp::GuardFunction { .. }
             | TraceOp::GuardClosure { .. }
             | TraceOp::GuardLoopContinue { .. }
-            | TraceOp::NestedLoopCall { .. }
             | TraceOp::Return { .. }
             | TraceOp::Unbox { .. }
             | TraceOp::DropSpecialized { .. } => {}
+            // The inner loop may have written any register.
+            TraceOp::NestedLoopCall { .. } => self.scalar_registers.clear(),
         }
     }
 

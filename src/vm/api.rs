@@ -116,6 +116,7 @@ impl VM {
             pending_jit_error: None,
             trace_recorder: None,
             side_trace_context: None,
+            nested_loop_exit_ip: None,
             skip_next_trace_record: false,
             trait_impls: HashMap::new(),
             struct_tostring_cache: HashMap::new(),

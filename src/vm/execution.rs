@@ -318,13 +318,26 @@ impl VM {
                                     .and_then(|trace| trace.guards.get(guard_index))
                                     .map(|guard| guard.bailout_ip);
 
+                                // A nested loop's trace may have bailed out
+                                // somewhere other than the guard's own ip.
+                                let bailout_ip = self.nested_loop_exit_ip.take().or(bailout_ip);
                                 if let Some(bailout_ip) = bailout_ip
                                     && let Some(frame) = self.call_stack.last_mut()
                                 {
                                     frame.ip = bailout_ip;
                                 }
+                                if let Some(error) = self.pending_jit_error.take() {
+                                    return Err(error);
+                                }
 
                                 self.handle_guard_failure(trace_id, guard_index, func_idx)?;
+                                // A loop-condition exit is how a trace normally
+                                // ends, and a nested-loop exit is where an outer
+                                // trace hands the inner loop to its own trace;
+                                // both resume at a known ip with the registers
+                                // written back, so the trace stays valid for the
+                                // next entry. Any other guard failure means the
+                                // trace assumed something that no longer holds.
                                 let reusable_exit = self
                                     .jit
                                     .get_trace(trace_id)
@@ -334,9 +347,10 @@ impl VM {
                                             guard.kind,
                                             crate::jit::GuardKind::Truthy { .. }
                                                 | crate::jit::GuardKind::Falsy { .. }
+                                                | crate::jit::GuardKind::NestedLoop { .. }
                                         )
                                     });
-                                if !reusable_exit || loop_in_hierarchy {
+                                if !reusable_exit {
                                     self.jit.evict_root_trace(func_idx, loop_start_ip);
                                 }
                                 continue;

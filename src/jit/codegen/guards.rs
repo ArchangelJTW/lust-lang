@@ -1,4 +1,5 @@
 use super::*;
+use crate::VM;
 impl JitCompiler {
     pub(super) fn compile_guard(
         &mut self,
@@ -213,6 +214,62 @@ impl JitCompiler {
             fail_count: 0,
             side_trace: None,
         })
+    }
+
+    /// Run a nested loop through its own root trace (see
+    /// `jit_run_nested_loop`) and carry on at `resume_ip`; when the helper
+    /// says the interpreter has to take over, exit through this guard.
+    /// Inside an inlined body the guard exit is taken unconditionally: the
+    /// inner loop then runs from the materialized frame.
+    pub(super) fn compile_nested_loop_call(
+        &mut self,
+        function_idx: usize,
+        loop_start_ip: usize,
+        bailout_ip: usize,
+        resume_ip: usize,
+        guard_index: usize,
+    ) -> Guard {
+        let guard_return_value = (guard_index + 1) as i32;
+        unsafe extern "C" {
+            fn jit_run_nested_loop(
+                vm: *mut VM,
+                registers: *mut Value,
+                function_idx: usize,
+                loop_start_ip: usize,
+                resume_ip: usize,
+            ) -> i32;
+        }
+        let exit_label = self.current_exit_label();
+        if self.inline_depth == 0 {
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov rdi, r13
+                ; mov rsi, r12
+                ; mov rdx, QWORD function_idx as _
+                ; mov rcx, QWORD loop_start_ip as _
+                ; mov r8, QWORD resume_ip as _
+                ; mov rax, QWORD jit_run_nested_loop as *const () as _
+                ; call rax
+                ; test eax, eax
+                ; jz >loop_done
+            );
+        }
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov eax, DWORD guard_return_value
+            ; jmp => exit_label
+            ; loop_done:
+        );
+        Guard {
+            index: guard_index,
+            bailout_ip,
+            kind: GuardKind::NestedLoop {
+                function_idx,
+                loop_start_ip,
+            },
+            fail_count: 0,
+            side_trace: None,
+        }
     }
 
     pub(super) fn compile_truth_guard(

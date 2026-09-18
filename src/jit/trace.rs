@@ -314,10 +314,17 @@ pub enum TraceOp {
         expect_truthy: bool,
         bailout_ip: usize,
     },
+    /// Run the inner loop `[loop_start_ip, bailout_ip]` of `function_idx` to
+    /// completion through its own root trace, then continue at `resume_ip`,
+    /// the instruction the recording resumed at after the inner loop ended.
+    /// Exits to the interpreter at `bailout_ip` (the inner back-edge) when
+    /// the inner loop has no trace, and wherever the inner trace bails out
+    /// otherwise.
     NestedLoopCall {
         function_idx: usize,
         loop_start_ip: usize,
         bailout_ip: usize,
+        resume_ip: usize,
     },
     Return {
         value: Option<Register>,
@@ -425,6 +432,21 @@ pub struct TraceRecorder {
     loop_iterations: HashMap<(usize, usize), usize>,
     /// Track specialized values that were unboxed but later invalidated (need cleanup/drop)
     leaked_specialized_values: Vec<(usize, crate::jit::specialization::SpecializedLayout)>,
+    /// While execution is inside a nested loop that a `NestedLoopCall` will
+    /// run through its own trace, nothing is recorded (see `skip_nested`).
+    nested_skip: Option<NestedSkip>,
+}
+
+/// The nested loop currently being skipped: its bytecode range in
+/// `function_idx`, and where its `NestedLoopCall` op sits so the ip the
+/// recording resumes at can be patched in once the loop is left.
+#[derive(Debug, Clone, Copy)]
+struct NestedSkip {
+    function_idx: usize,
+    loop_start_ip: usize,
+    backedge_ip: usize,
+    inline_depth: usize,
+    op_index: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -469,6 +491,7 @@ impl TraceRecorder {
             specialization_registry: crate::jit::specialization::SpecializationRegistry::new(),
             loop_iterations: HashMap::new(),
             leaked_specialized_values: Vec::new(),
+            nested_skip: None,
         }
     }
 
@@ -562,6 +585,51 @@ impl TraceRecorder {
                 }
             }
         }
+    }
+
+    /// A nested loop is not recorded into the trace that contains it: the
+    /// `NestedLoopCall` op runs it through the inner loop's own root trace.
+    /// Returns `true` while the instruction is inside the skipped loop. The
+    /// first instruction outside it is where the outer trace resumes; that
+    /// ip is patched into the op, and every type fact is forgotten, since
+    /// the inner loop may have written any register.
+    fn skip_nested(
+        &mut self,
+        instruction: Instruction,
+        current_ip: usize,
+        function_idx: usize,
+    ) -> Result<bool, LustError> {
+        let Some(skip) = self.nested_skip else {
+            return Ok(false);
+        };
+        let ip = current_ip.saturating_sub(1);
+        if function_idx == skip.function_idx
+            && (skip.loop_start_ip..=skip.backedge_ip).contains(&ip)
+        {
+            if matches!(instruction, Instruction::Return(_)) {
+                // Leaves the frame from inside the loop; the trace cannot
+                // continue past the loop.
+                self.stop_recording();
+            }
+            return Ok(true);
+        }
+        self.nested_skip = None;
+        let ops = if skip.inline_depth == 0 {
+            &mut self.trace.ops
+        } else {
+            &mut self.inline_stack[skip.inline_depth - 1].ops
+        };
+        match ops.get_mut(skip.op_index) {
+            Some(TraceOp::NestedLoopCall { resume_ip, .. }) => *resume_ip = ip,
+            _ => {
+                self.stop_recording();
+                return Err(LustError::RuntimeError {
+                    message: "Trace aborted: lost the NestedLoopCall being skipped".to_string(),
+                });
+            }
+        }
+        self.current_guard_set_mut().clear();
+        Ok(false)
     }
 
     fn current_function_idx(&self) -> usize {
@@ -678,6 +746,13 @@ impl TraceRecorder {
         } else {
             self.trace.ops.push(op);
         }
+    }
+
+    fn current_ops_len(&self) -> usize {
+        self.inline_stack
+            .last()
+            .map(|ctx| ctx.ops.len())
+            .unwrap_or(self.trace.ops.len())
     }
 
     fn push_op(&mut self, op: TraceOp) {
@@ -1064,6 +1139,10 @@ impl TraceRecorder {
             return Err(LustError::RuntimeError {
                 message: "Trace aborted: execution left the traced function".to_string(),
             });
+        }
+
+        if self.skip_nested(instruction, current_ip, function_idx)? {
+            return Ok(());
         }
 
         if let Some(dest) = instruction.defined_register() {
@@ -2277,11 +2356,23 @@ impl TraceRecorder {
                             // Rebox all specialized values before calling nested trace
                             self.rebox_all_specialized_values();
 
-                            // Emit NestedLoopCall which will eventually call the compiled inner trace
+                            // The inner loop runs through its own root trace; its
+                            // remaining iterations are not recorded here. The
+                            // resume ip is patched in when execution leaves it.
                             self.push_op(TraceOp::NestedLoopCall {
                                 function_idx,
                                 loop_start_ip: jump_target,
                                 bailout_ip,
+                                resume_ip: 0,
+                            });
+                            let inline_depth = self.inline_stack.len();
+                            let op_index = self.current_ops_len() - 1;
+                            self.nested_skip = Some(NestedSkip {
+                                function_idx,
+                                loop_start_ip: jump_target,
+                                backedge_ip: bailout_ip,
+                                inline_depth,
+                                op_index,
                             });
                             Ok(())
                         }

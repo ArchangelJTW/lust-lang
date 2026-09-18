@@ -521,7 +521,6 @@ pub(super) fn op_touches_register_memory(op: &TraceOp) -> bool {
             | TraceOp::Not { .. }
             | TraceOp::Guard { .. }
             | TraceOp::GuardLoopContinue { .. }
-            | TraceOp::NestedLoopCall { .. }
             | TraceOp::Return { .. }
     )
 }
@@ -536,6 +535,14 @@ pub(super) fn plan(
     // `LUST_JIT_NOPIN=1` disables pinning, for bisecting and benchmarking.
     #[cfg(feature = "std")]
     if std::env::var_os("LUST_JIT_NOPIN").is_some() {
+        return HashMap::new();
+    }
+    // A nested loop runs through its own trace and may write any register
+    // of this frame, so nothing can stay in a machine register across it.
+    if body
+        .iter()
+        .any(|op| matches!(op, TraceOp::NestedLoopCall { .. }))
+    {
         return HashMap::new();
     }
     let mut entry_env: HashMap<u8, ValueType> = HashMap::new();

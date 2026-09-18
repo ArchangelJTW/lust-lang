@@ -194,6 +194,16 @@ impl TraceOptimizer {
         let mut clobbered: HashSet<Register> = HashSet::new();
         let mut const_value: HashMap<Register, Value> = HashMap::new();
 
+        // A nested loop runs through its own trace and may write any
+        // register of this frame, so nothing in such a body is invariant.
+        if trace
+            .ops
+            .iter()
+            .any(|op| matches!(op, TraceOp::NestedLoopCall { .. }))
+        {
+            return;
+        }
+
         for op in &trace.ops {
             match op {
                 TraceOp::CallNative { callee, .. }
@@ -338,6 +348,9 @@ impl TraceOptimizer {
                 }
             } else if let TraceOp::Rebox { dest_reg, .. } = &op {
                 known_types.remove(dest_reg);
+            } else if let TraceOp::NestedLoopCall { .. } = &op {
+                // The inner loop may have written any register.
+                known_types.clear();
             }
 
             ops.push(op);
@@ -422,7 +435,7 @@ impl TraceOptimizer {
         if trace
             .ops
             .iter()
-            .any(|op| matches!(op, TraceOp::InlineCall { .. }))
+            .any(|op| matches!(op, TraceOp::InlineCall { .. } | TraceOp::NestedLoopCall { .. }))
         {
             return;
         }

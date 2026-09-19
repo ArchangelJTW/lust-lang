@@ -138,7 +138,7 @@ impl JitCompiler {
             }
         };
 
-        let reg_offset = (source_reg as i32) * 64;
+        let reg_offset = (source_reg as i32) * mem::size_of::<Value>() as i32;
 
         // jit_unbox_array_int(array_ptr, slot): the helper releases whatever
         // the slot held (an earlier unbox in an unrolled iteration) and leaves
@@ -217,7 +217,7 @@ impl JitCompiler {
                 })?;
 
         let stack_offset = spec_value.stack_offset;
-        let value_offset = (value_reg as i32) * 64 + 8; // +8 to skip tag, get int value
+        let value_offset = (value_reg as i32) * mem::size_of::<Value>() as i32 + 8; // +8 to skip tag, get int value
 
         // Call jit_vec_int_push(vec_ptr_addr, len_addr, cap_addr, value)
         unsafe extern "C" {

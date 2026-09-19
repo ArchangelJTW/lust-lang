@@ -572,7 +572,7 @@ impl JitCompiler {
             ; jz => interp_return
             ; mov rsi, [r15 + 8]
             ; mov rax, [r15 + 40]
-            ; shl rax, 6
+            ; imul rax, rax, mem::size_of::<Value>() as i32
             ; add rsi, rax
         );
         // A scalar result of known type is stored directly when the

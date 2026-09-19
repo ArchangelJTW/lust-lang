@@ -1923,17 +1923,16 @@ impl JitCompiler {
                         self.emit_reg_addr(11, *src_reg);
                         dynasm!(self.ops ; .arch aarch64 ; mov x9, sp);
                         self.emit_add_imm(9, 9, dest_offset);
-                        dynasm!(self.ops
-                            ; .arch aarch64
-                            ; ldp x0, x1, [x11]
-                            ; stp x0, x1, [x9]
-                            ; ldp x0, x1, [x11, 16]
-                            ; stp x0, x1, [x9, 16]
-                            ; ldp x0, x1, [x11, 32]
-                            ; stp x0, x1, [x9, 32]
-                            ; ldp x0, x1, [x11, 48]
-                            ; stp x0, x1, [x9, 48]
-                        );
+                        // A bitwise copy of the whole Value, 16 bytes at a
+                        // time (its size is a multiple of 16).
+                        for chunk in (0..value_size).step_by(16) {
+                            let offset = chunk;
+                            dynasm!(self.ops
+                                ; .arch aarch64
+                                ; ldp x0, x1, [x11, #offset]
+                                ; stp x0, x1, [x9, #offset]
+                            );
+                        }
                     }
                     _ => {
                         helper_copied.push(arg_index as u8);

@@ -116,7 +116,7 @@ fn probe() -> Option<RcVecLayout> {
     let array_words = words(&array_value as *const Value as *const u8, 8);
     let array_rc_offset = unique_position(&array_words, inner as usize)? * 8;
     let struct_value = Value::Struct {
-        name: alloc::string::String::from("probe"),
+        name: "probe".into(),
         layout: Rc::new(crate::bytecode::StructLayout::new(
             alloc::string::String::from("probe"),
             Vec::new(),

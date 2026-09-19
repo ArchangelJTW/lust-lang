@@ -177,7 +177,7 @@ pub struct VM {
     /// `TraceOp::GuardGlobals`).
     pub(crate) globals_version: u64,
     pub(super) map_hasher: DefaultHashBuilder,
-    /// Frames are boxed: a `CallFrame` carries 16 KB of inline registers,
+    /// Frames are boxed: a `CallFrame` carries 12 KB of inline registers,
     /// and moving that into and out of the stack on every call dominated
     /// call cost. Returned frames go to `frame_pool` for reuse.
     pub(super) call_stack: Vec<Box<CallFrame>>,
@@ -345,7 +345,7 @@ impl CallMeta {
     }
 }
 
-/// Upper bound on recycled frames kept around (each holds 16 KB).
+/// Upper bound on recycled frames kept around (each holds 12 KB).
 pub(super) const FRAME_POOL_LIMIT: usize = 64;
 
 impl CallFrame {

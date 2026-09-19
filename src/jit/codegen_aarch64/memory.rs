@@ -201,6 +201,7 @@ impl JitCompiler {
             let rc_offset = layout.array_rc_offset as u32;
             let len_offset = layout.len_offset as u32;
             let ptr_offset = layout.ptr_offset as u32;
+            let value_size = mem::size_of::<Value>() as u32;
             let done = self.ops.new_dynamic_label();
             let out_of_range = self.ops.new_dynamic_label();
             let slow = self.ops.new_dynamic_label();
@@ -219,7 +220,8 @@ impl JitCompiler {
                 ; cmp x12, x10
                 ; b.hs => out_of_range
                 ; ldr x10, [x9, #ptr_offset]
-                ; add x10, x10, x12, lsl #6
+                ; movz w13, #value_size
+                ; madd x10, x12, x13, x10
                 ; ldrb w9, [x10]
             );
             if let Some(ty) = value_type {

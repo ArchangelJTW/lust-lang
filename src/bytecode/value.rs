@@ -571,6 +571,107 @@ impl StructLayout {
     }
 }
 
+/// A struct or enum type name carried by a value: shared, so cloning the
+/// value (every register move does) is a reference-count bump instead of
+/// a string allocation. Compares and formats like the `str` it holds.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Name(Rc<str>);
+
+impl Name {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::ops::Deref for Name {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for Name {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::borrow::Borrow<str> for Name {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for Name {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for Name {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl PartialEq<String> for Name {
+    fn eq(&self, other: &String) -> bool {
+        &*self.0 == other.as_str()
+    }
+}
+
+impl PartialEq<Name> for str {
+    fn eq(&self, other: &Name) -> bool {
+        self == &*other.0
+    }
+}
+
+impl PartialEq<Name> for String {
+    fn eq(&self, other: &Name) -> bool {
+        self.as_str() == &*other.0
+    }
+}
+
+impl fmt::Display for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
+impl From<String> for Name {
+    fn from(s: String) -> Self {
+        Name(Rc::from(s))
+    }
+}
+
+impl From<&String> for Name {
+    fn from(s: &String) -> Self {
+        Name(Rc::from(s.as_str()))
+    }
+}
+
+impl From<&str> for Name {
+    fn from(s: &str) -> Self {
+        Name(Rc::from(s))
+    }
+}
+
+impl From<Name> for String {
+    fn from(name: Name) -> Self {
+        name.0.to_string()
+    }
+}
+
+// The JIT copies values 16 bytes at a time and lays registers out at
+// `size_of::<Value>()` strides; both need the size to stay a multiple of 16.
+const _: () = assert!(core::mem::size_of::<Value>() % 16 == 0);
+
 #[repr(C, u8)]
 #[derive(Clone)]
 pub enum Value {
@@ -583,14 +684,14 @@ pub enum Value {
     Tuple(Rc<Vec<Value>>),
     Map(Rc<RefCell<LustMap>>),
     Struct {
-        name: String,
+        name: Name,
         layout: Rc<StructLayout>,
         fields: Rc<RefCell<Vec<Value>>>,
     },
     WeakStruct(WeakStructRef),
     Enum {
-        enum_name: String,
-        variant: String,
+        enum_name: Name,
+        variant: Name,
         values: Option<Rc<Vec<Value>>>,
     },
     Function(usize),
@@ -605,15 +706,19 @@ pub enum Value {
 
 #[derive(Debug, Clone)]
 pub struct WeakStructRef {
-    name: String,
+    name: Name,
     layout: Rc<StructLayout>,
     fields: Weak<RefCell<Vec<Value>>>,
 }
 
 impl WeakStructRef {
-    pub fn new(name: String, layout: Rc<StructLayout>, fields: &Rc<RefCell<Vec<Value>>>) -> Self {
+    pub fn new(
+        name: impl Into<Name>,
+        layout: Rc<StructLayout>,
+        fields: &Rc<RefCell<Vec<Value>>>,
+    ) -> Self {
         Self {
-            name,
+            name: name.into(),
             layout,
             fields: Rc::downgrade(fields),
         }
@@ -1068,7 +1173,7 @@ impl Value {
         }
     }
 
-    pub fn enum_unit(enum_name: impl Into<String>, variant: impl Into<String>) -> Self {
+    pub fn enum_unit(enum_name: impl Into<Name>, variant: impl Into<Name>) -> Self {
         Value::Enum {
             enum_name: enum_name.into(),
             variant: variant.into(),
@@ -1077,8 +1182,8 @@ impl Value {
     }
 
     pub fn enum_variant(
-        enum_name: impl Into<String>,
-        variant: impl Into<String>,
+        enum_name: impl Into<Name>,
+        variant: impl Into<Name>,
         values: Vec<Value>,
     ) -> Self {
         Value::Enum {

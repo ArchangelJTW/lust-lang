@@ -400,7 +400,7 @@ impl StructHandle {
     }
 
     fn from_parts(
-        name: &String,
+        name: &crate::bytecode::value::Name,
         layout: &Rc<StructLayout>,
         fields: &Rc<RefCell<Vec<Value>>>,
     ) -> Self {
@@ -409,7 +409,7 @@ impl StructHandle {
             layout: layout.clone(),
             fields: fields.clone(),
         };
-        Self::from_instance(StructInstance::new(name.clone(), value))
+        Self::from_instance(StructInstance::new(name.to_string(), value))
     }
 
     pub fn from_value(value: Value) -> Result<Self> {

@@ -386,7 +386,7 @@ impl VM {
         }
 
         Ok(Value::Struct {
-            name: struct_name.to_string(),
+            name: struct_name.into(),
             layout,
             fields: Rc::new(RefCell::new(ordered)),
         })
@@ -1076,7 +1076,7 @@ end
             Value::Int(7),
         );
         let lua_table = Value::Struct {
-            name: "LuaTable".to_string(),
+            name: "LuaTable".into(),
             layout: Rc::new(StructLayout::new(
                 "LuaTable".to_string(),
                 Vec::new(),

@@ -898,7 +898,7 @@ mod tests {
         ));
         let fields = Rc::new(RefCell::new(vec![Value::Nil]));
         let value = Value::Struct {
-            name: "Node".to_string(),
+            name: "Node".into(),
             layout: layout.clone(),
             fields: fields.clone(),
         };

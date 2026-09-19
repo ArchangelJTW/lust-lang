@@ -2473,9 +2473,9 @@ impl VM {
             Value::Array(_) => "Array".to_string(),
             Value::Tuple(_) => "Tuple".to_string(),
             Value::Map(_) => "Map".to_string(),
-            Value::Struct { name, .. } => name.clone(),
+            Value::Struct { name, .. } => name.to_string(),
             Value::WeakStruct(weak) => weak.struct_name().to_string(),
-            Value::Enum { enum_name, .. } => enum_name.clone(),
+            Value::Enum { enum_name, .. } => enum_name.to_string(),
             Value::Function(_) | Value::NativeFunction(_) | Value::Closure { .. } => {
                 "function".to_string()
             }

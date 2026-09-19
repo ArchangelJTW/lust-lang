@@ -576,6 +576,7 @@ impl JitCompiler {
         _guard_index: &mut i32,
         _guards: &mut Vec<Guard>,
     ) -> Result<()> {
+        let value_size = mem::size_of::<Value>() as u32;
         unsafe extern "C" {
             fn jit_return_value(src: *mut Value, dest: *mut Value);
             fn jit_drop_values(values: *mut Value, len: usize);
@@ -591,7 +592,8 @@ impl JitCompiler {
             ; cbz x21, => interp_return
             ; ldr x11, [x21, 8]
             ; ldr x9, [x21, 40]
-            ; add x1, x11, x9, lsl #6
+            ; movz w10, #value_size
+            ; madd x1, x9, x10, x11
         );
         // A scalar result of known type is stored directly when the
         // caller's register holds nothing owned (it usually holds Nil or

@@ -225,7 +225,7 @@ impl JitCompiler {
                 ; cmp r8, [r9 + len_offset]
                 ; jae => out_of_range
                 ; mov r10, [r9 + ptr_offset]
-                ; shl r8, 6
+                ; imul r8, r8, value_size
                 ; add r10, r8
             );
             if let Some(ty) = value_type {

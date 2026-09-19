@@ -1,0 +1,11 @@
+local total: int = 0
+local i: int = 0
+while i < 3000 do
+    local j: int = 0
+    while j < 3000 do
+        total = total + (i * j) % 7
+        j = j + 1
+    end
+    i = i + 1
+end
+println(total)

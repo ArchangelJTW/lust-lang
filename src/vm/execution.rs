@@ -1,6 +1,15 @@
 use super::*;
 use crate::bytecode::ValueKey;
 use core::ptr;
+
+/// How thoroughly a call's arguments are checked against the signature.
+#[derive(Clone, Copy)]
+enum ArgCheck {
+    /// Full validation, including container contents (host and dynamic calls).
+    Deep,
+    /// Kinds only; the typechecker proved the rest (bytecode calls).
+    Shallow,
+}
 impl VM {
     fn is_loop_in_hierarchy(
         &self,
@@ -91,7 +100,7 @@ impl VM {
     }
 
     pub(super) fn run(&mut self) -> Result<Value> {
-        loop {
+        'dispatch: loop {
             if let Some(target_depth) = self.call_until_depth
                 && self.call_stack.len() == target_depth
                 && let Some(return_value) = self.pending_return_value.take()
@@ -100,7 +109,8 @@ impl VM {
                 return Ok(return_value);
             }
 
-            if let Some(return_value) = self.pending_return_value.take()
+            if self.pending_return_value.is_some()
+                && let Some(return_value) = self.pending_return_value.take()
                 && let Some(dest_reg) = self.pending_return_dest.take()
             {
                 self.set_register(dest_reg, return_value)?;
@@ -111,12 +121,6 @@ impl VM {
             {
                 self.last_task_signal = Some(signal);
                 return Ok(Value::Nil);
-            }
-
-            if self.call_stack.len() > self.max_stack_depth {
-                return Err(LustError::RuntimeError {
-                    message: "Stack overflow".to_string(),
-                });
             }
 
             let executing_frame_index =
@@ -135,7 +139,9 @@ impl VM {
             let (instruction, ip_before_execution, func_idx) = {
                 let func = &self.functions[frame.function_idx];
                 if frame.ip >= func.chunk.instructions.len() {
-                    self.call_stack.pop();
+                    if let Some(frame) = self.call_stack.pop() {
+                        self.recycle_frame(frame);
+                    }
                     if self.call_stack.is_empty() {
                         return Ok(Value::Nil);
                     }
@@ -165,11 +171,10 @@ impl VM {
                 let backedge_ip = ip_before_execution.saturating_sub(1);
                 let loop_in_hierarchy =
                     self.is_loop_in_hierarchy(func_idx, loop_start_ip, backedge_ip);
-                if self.side_trace_context.is_none()
-                    && self
-                        .trace_recorder
-                        .as_ref()
-                        .is_some_and(|recorder| !recorder.is_recording())
+                if self
+                    .trace_recorder
+                    .as_ref()
+                    .is_some_and(|recorder| !recorder.is_recording())
                 {
                     self.abandon_trace_recording();
                 }
@@ -252,99 +257,87 @@ impl VM {
                         } else if result > 0 {
                             self.jit.record_guard_exit();
                             let guard_index = (result - 1) as usize;
-                            let side_trace_id = self
+                            let bailout_ip = self
                                 .jit
                                 .get_trace(trace_id)
-                                .and_then(|t| t.guards.get(guard_index))
-                                .and_then(|g| g.side_trace);
-                            if let Some(side_trace_id) = side_trace_id {
-                                crate::jit::log(|| {
-                                    format!(
-                                        "🌳 JIT: Executing side trace #{} for guard #{}",
-                                        side_trace_id.0, guard_index
+                                .and_then(|trace| trace.guards.get(guard_index))
+                                .map(|guard| guard.bailout_ip);
+
+                            crate::jit::log(|| {
+                                let kind = self
+                                    .jit
+                                    .get_trace(trace_id)
+                                    .and_then(|trace| trace.guards.get(guard_index))
+                                    .map(|guard| format!("{:?}", guard.kind));
+                                format!(
+                                    "↩️  JIT: guard #{guard_index} exit {kind:?} → ip {bailout_ip:?}"
+                                )
+                            });
+                            // A nested loop's trace may have bailed out
+                            // somewhere other than the guard's own ip.
+                            let bailout_ip = self.nested_loop_exit_ip.take().or(bailout_ip);
+                            if let Some(bailout_ip) = bailout_ip
+                                && let Some(frame) = self.call_stack.last_mut()
+                            {
+                                frame.ip = bailout_ip;
+                            }
+                            if let Some(error) = self.pending_jit_error.take() {
+                                return Err(error);
+                            }
+
+                            self.handle_guard_failure(trace_id, guard_index, func_idx)?;
+                            // A loop-condition exit is how a trace normally
+                            // ends, and a nested-loop exit is where an outer
+                            // trace hands the inner loop to its own trace;
+                            // both resume at a known ip with the registers
+                            // written back, so the trace stays valid for the
+                            // next entry. Any other guard failure means the
+                            // trace assumed something that no longer holds.
+                            let reusable_exit = self
+                                .jit
+                                .get_trace(trace_id)
+                                .and_then(|trace| trace.guards.get(guard_index))
+                                .is_some_and(|guard| {
+                                    matches!(
+                                        guard.kind,
+                                        crate::jit::GuardKind::Truthy { .. }
+                                            | crate::jit::GuardKind::Falsy { .. }
+                                            | crate::jit::GuardKind::NestedLoop { .. }
                                     )
                                 });
-                                let frame = self.call_stack.last_mut().unwrap();
-                                let registers_ptr = frame.registers.as_mut_ptr();
-                                if let Some(side_trace) = self.jit.trace_handle(side_trace_id) {
-                                    let side_trace_gas_cost = {
-                                        let cost = side_trace.trace.ops.len()
-                                            + side_trace.trace.preamble.len()
-                                            + side_trace.trace.postamble.len();
-                                        core::cmp::max(1, cost) as u64
-                                    };
-                                    self.budgets.charge_gas(side_trace_gas_cost)?;
-                                    let vm_ptr = self as *mut VM;
-                                    self.pending_jit_error = None;
-                                    let side_result =
-                                        side_trace.execute(registers_ptr, vm_ptr, ptr::null());
-                                    drop(side_trace);
-                                    if side_result < 0
-                                        && let Some(error) = self.pending_jit_error.take()
-                                    {
-                                        return Err(error);
-                                    }
-                                    if side_result == 0 {
-                                        crate::jit::log(|| {
-                                            format!(
-                                                "✅ JIT: Side trace #{} executed successfully",
-                                                side_trace_id.0
-                                            )
-                                        });
-                                    } else {
-                                        crate::jit::log(|| {
-                                            format!(
-                                                "⚠️  JIT: Side trace #{} failed, falling back to interpreter",
-                                                side_trace_id.0
-                                            )
-                                        });
-                                    }
-                                }
-                            } else {
-                                let bailout_ip = self
-                                    .jit
-                                    .get_trace(trace_id)
-                                    .and_then(|trace| trace.guards.get(guard_index))
-                                    .map(|guard| guard.bailout_ip);
-
-                                if let Some(bailout_ip) = bailout_ip
-                                    && let Some(frame) = self.call_stack.last_mut()
-                                {
-                                    frame.ip = bailout_ip;
-                                }
-
-                                self.handle_guard_failure(trace_id, guard_index, func_idx)?;
-                                let reusable_exit = self
-                                    .jit
-                                    .get_trace(trace_id)
-                                    .and_then(|trace| trace.guards.get(guard_index))
-                                    .is_some_and(|guard| {
-                                        matches!(
-                                            guard.kind,
-                                            crate::jit::GuardKind::Truthy { .. }
-                                                | crate::jit::GuardKind::Falsy { .. }
-                                        )
-                                    });
-                                if !reusable_exit || loop_in_hierarchy {
-                                    self.jit.root_traces.remove(&(func_idx, loop_start_ip));
-                                    self.jit.schedule_root_retry(func_idx, loop_start_ip);
-                                }
-                                continue;
+                            if !reusable_exit {
+                                self.jit.evict_root_trace(func_idx, loop_start_ip);
                             }
+                            continue;
                         } else {
                             self.jit.record_execution_failure();
                             if let Some(error) = self.pending_jit_error.take() {
                                 return Err(error);
                             }
+                            // A result of -(k + 2) names the failing op's
+                            // instruction: resume there, so the interpreter
+                            // re-executes it (raising its error) with the
+                            // trace's earlier side effects intact. A bare -1
+                            // has no site and restarts the iteration.
+                            let resume_ip = if result <= -2 {
+                                self.jit
+                                    .get_trace(trace_id)
+                                    .and_then(|trace| trace.fail_sites.get((-result - 2) as usize))
+                                    .copied()
+                            } else {
+                                None
+                            };
                             crate::jit::log(|| {
-                                "⚠️  JIT: Trace execution failed (unknown error)".to_string()
+                                format!(
+                                    "⚠️  JIT: Trace execution failed (result {result}), resuming at ip {:?}",
+                                    resume_ip
+                                )
                             });
                             if let Some(frame) = self.call_stack.last_mut() {
-                                frame.ip = loop_start_ip;
+                                frame.ip = resume_ip.unwrap_or(loop_start_ip);
                             }
 
-                            self.jit.root_traces.remove(&(func_idx, loop_start_ip));
-                            self.jit.schedule_root_retry(func_idx, loop_start_ip);
+                            self.jit.evict_root_trace(func_idx, loop_start_ip);
                             // Re-dispatch from the loop header we just installed.
                             //
                             // Falling through instead would let the interpreter
@@ -357,159 +350,103 @@ impl VM {
                         }
                     }
                 } else {
-                    let is_side_trace = self.side_trace_context.is_some();
-                    if is_side_trace {
-                        if let Some(recorder) = &self.trace_recorder
-                            && !recorder.is_recording()
-                        {
-                            if !recorder.is_complete() {
-                                self.abandon_trace_recording();
-                                continue;
-                            }
+                    if let Some(recorder) = &mut self.trace_recorder {
+                        // Only finalise the recording when *this* loop is the
+                        // one being recorded.  With a nested loop the inner
+                        // back-edge reaches this handler while the recorder is
+                        // still part-way through the outer loop's body; taking
+                        // that partial body and installing it under the inner
+                        // loop's key produced a trace that re-initialised the
+                        // inner induction variable, never advanced the outer
+                        // one, and therefore never terminated.
+                        let recording_this_loop = recorder.trace.function_idx == func_idx
+                            && recorder.trace.start_ip == loop_start_ip;
+                        if recorder.is_recording() && recording_this_loop {
                             crate::jit::log(|| {
                                 format!(
                                     "📝 JIT: Trace recording complete - {} ops recorded",
                                     recorder.trace.ops.len()
                                 )
                             });
-                            let recorder = self.trace_recorder.take().unwrap();
+                            let mut recorder = self.trace_recorder.take().unwrap();
+                            recorder.complete_nested_skip_at(backedge_ip);
+                            if !recorder.is_recording() {
+                                self.jit.recording_aborted(func_idx, loop_start_ip);
+                                continue;
+                            }
                             let mut trace = recorder.finish();
-                            let side_trace_ctx = self.side_trace_context.take().unwrap();
                             let mut optimizer = TraceOptimizer::new();
                             let hoisted_constants = optimizer.optimize(&mut trace);
-                            let (parent_trace_id, guard_index) = side_trace_ctx;
-                            crate::jit::log(|| {
-                                format!(
-                                    "⚙️  JIT: Compiling side trace (parent: #{}, guard: {})...",
-                                    parent_trace_id.0, guard_index
-                                )
-                            });
+                            crate::jit::log(|| "⚙️  JIT: Compiling root trace...".to_string());
                             let trace_id = self.jit.alloc_trace_id();
                             match JitCompiler::new().compile_trace(
                                 &trace,
                                 trace_id,
-                                Some(parent_trace_id),
                                 hoisted_constants.clone(),
                             ) {
                                 Ok(compiled_trace) => {
                                     crate::jit::log(|| {
                                         format!(
-                                            "✅ JIT: Side trace #{} compiled successfully!",
+                                            "✅ JIT: Trace #{} compiled successfully!",
                                             trace_id.0
                                         )
                                     });
-                                    if let Some(parent) = self.jit.get_trace_mut(parent_trace_id)
-                                        && guard_index < parent.guards.len()
-                                    {
-                                        parent.guards[guard_index].side_trace = Some(trace_id);
-                                        crate::jit::log(|| {
-                                            format!(
-                                                "🔗 JIT: Linked side trace #{} to parent trace #{} guard #{}",
-                                                trace_id.0, parent_trace_id.0, guard_index
-                                            )
-                                        });
-                                    }
-
-                                    self.jit.store_side_trace(compiled_trace);
+                                    crate::jit::log(|| {
+                                        "🚀 JIT: Future iterations will use native code!"
+                                            .to_string()
+                                    });
+                                    self.jit.store_root_trace(
+                                        func_idx,
+                                        loop_start_ip,
+                                        compiled_trace,
+                                    );
                                 }
 
                                 Err(e) => {
                                     crate::jit::log(|| {
-                                        format!("❌ JIT: Side trace compilation failed: {}", e)
+                                        format!("❌ JIT: Trace compilation failed: {}", e)
                                     });
+                                    self.jit.recording_aborted(func_idx, loop_start_ip);
                                 }
                             }
                         }
-                    } else {
-                        if let Some(recorder) = &mut self.trace_recorder {
-                            // Only finalise the recording when *this* loop is the
-                            // one being recorded.  With a nested loop the inner
-                            // back-edge reaches this handler while the recorder is
-                            // still part-way through the outer loop's body; taking
-                            // that partial body and installing it under the inner
-                            // loop's key produced a trace that re-initialised the
-                            // inner induction variable, never advanced the outer
-                            // one, and therefore never terminated.
-                            let recording_this_loop = recorder.trace.function_idx == func_idx
-                                && recorder.trace.start_ip == loop_start_ip;
-                            if recorder.is_recording() && recording_this_loop {
-                                crate::jit::log(|| {
-                                    format!(
-                                        "📝 JIT: Trace recording complete - {} ops recorded",
-                                        recorder.trace.ops.len()
-                                    )
-                                });
-                                let recorder = self.trace_recorder.take().unwrap();
-                                let mut trace = recorder.finish();
-                                let mut optimizer = TraceOptimizer::new();
-                                let hoisted_constants = optimizer.optimize(&mut trace);
-                                crate::jit::log(|| "⚙️  JIT: Compiling root trace...".to_string());
-                                let trace_id = self.jit.alloc_trace_id();
-                                match JitCompiler::new().compile_trace(
-                                    &trace,
-                                    trace_id,
-                                    None,
-                                    hoisted_constants.clone(),
-                                ) {
-                                    Ok(compiled_trace) => {
-                                        crate::jit::log(|| {
-                                            format!(
-                                                "✅ JIT: Trace #{} compiled successfully!",
-                                                trace_id.0
-                                            )
-                                        });
-                                        crate::jit::log(|| {
-                                            "🚀 JIT: Future iterations will use native code!"
-                                                .to_string()
-                                        });
-                                        self.jit.store_root_trace(
-                                            func_idx,
-                                            loop_start_ip,
-                                            compiled_trace,
-                                        );
-                                    }
+                    }
 
-                                    Err(e) => {
-                                        crate::jit::log(|| {
-                                            format!("❌ JIT: Trace compilation failed: {}", e)
-                                        });
-                                        self.jit.recording_aborted(func_idx, loop_start_ip);
-                                    }
-                                }
-                            }
-                        }
-
-                        if self.trace_recorder.is_none()
-                            && !self
-                                .jit
-                                .root_traces
-                                .contains_key(&(func_idx, loop_start_ip))
-                            && self.jit.should_record_root(
-                                func_idx,
-                                loop_start_ip,
-                                count,
-                                crate::jit::HOT_THRESHOLD + u32::from(loop_in_hierarchy),
+                    if self.trace_recorder.is_none()
+                        && !self
+                            .jit
+                            .root_traces
+                            .contains_key(&(func_idx, loop_start_ip))
+                        && self.jit.should_record_root(
+                            func_idx,
+                            loop_start_ip,
+                            count,
+                            crate::jit::HOT_THRESHOLD + u32::from(loop_in_hierarchy),
+                        )
+                    {
+                        crate::jit::log(|| {
+                            format!(
+                                "🔥 JIT: Hot loop detected at func {} ip {} - starting trace recording!",
+                                func_idx, loop_start_ip
                             )
+                        });
+                        let mut recorder =
+                            TraceRecorder::new(func_idx, loop_start_ip, MAX_TRACE_LENGTH);
+                        recorder.set_root_frame_index(self.call_stack.len().saturating_sub(1));
+                        recorder.set_intrinsics(&self.jit.intrinsics);
+                        // Specialize loop-invariant values at trace entry
+                        if !self
+                            .jit
+                            .no_specialize_sites
+                            .contains(&(func_idx, loop_start_ip))
                         {
-                            crate::jit::log(|| {
-                                format!(
-                                    "🔥 JIT: Hot loop detected at func {} ip {} - starting trace recording!",
-                                    func_idx, loop_start_ip
-                                )
-                            });
-                            let mut recorder =
-                                TraceRecorder::new(func_idx, loop_start_ip, MAX_TRACE_LENGTH);
-                            recorder.set_root_frame_index(self.call_stack.len().saturating_sub(1));
-                            // Specialize loop-invariant values at trace entry
-                            {
-                                let frame = self.call_stack.last().unwrap();
-                                let func = &self.functions[func_idx];
-                                recorder.specialize_trace_inputs(&frame.registers, func);
-                            }
-                            self.trace_recorder = Some(recorder);
-                            self.jit.recording_started();
-                            self.skip_next_trace_record = true;
+                            let frame = self.call_stack.last().unwrap();
+                            let func = &self.functions[func_idx];
+                            recorder.specialize_trace_inputs(&frame.registers, func);
                         }
+                        self.trace_recorder = Some(recorder);
+                        self.jit.recording_started();
+                        self.skip_next_trace_record = true;
                     }
                 }
             }
@@ -527,7 +464,7 @@ impl VM {
                 Instruction::LoadConst(dest, const_idx) => {
                     let constant = {
                         let func = &self.functions[func_idx];
-                        func.chunk.constants[const_idx as usize].clone()
+                        func.chunk.constants[const_idx as usize].fast_clone()
                     };
                     self.set_register(dest, constant)?;
                 }
@@ -569,6 +506,7 @@ impl VM {
                         })?;
                     let value = self.get_register(src)?.clone();
                     self.globals.insert(name.to_string(), value);
+                    self.globals_version = self.globals_version.wrapping_add(1);
                 }
 
                 Instruction::Move(dest, src) => {
@@ -592,7 +530,7 @@ impl VM {
                                 message: "Division by zero".to_string(),
                             })
                         } else {
-                            Ok(Value::Int(a / b))
+                            Ok(Value::Int(a.wrapping_div(b)))
                         }
                     })?;
                 }
@@ -603,7 +541,7 @@ impl VM {
                                 message: "Modulo by zero".to_string(),
                             })
                         } else {
-                            Ok(Value::Int(a % b))
+                            Ok(Value::Int(a.wrapping_rem(b)))
                         }
                     })?;
                 }
@@ -729,7 +667,7 @@ impl VM {
                                     message: "Division by zero".to_string(),
                                 })
                             } else {
-                                Ok(Value::Int(a / b))
+                                Ok(Value::Int(a.wrapping_div(*b)))
                             }
                         }
 
@@ -754,7 +692,7 @@ impl VM {
                                     message: "Modulo by zero".to_string(),
                                 })
                             } else {
-                                Ok(Value::Int(a % b))
+                                Ok(Value::Int(a.wrapping_rem(*b)))
                             }
                         }
 
@@ -862,7 +800,11 @@ impl VM {
 
                 Instruction::JumpIf(cond, offset) => {
                     let condition = self.get_register(cond)?;
-                    if condition.is_truthy() {
+                    let truthy = match condition {
+                        Value::Bool(b) => *b,
+                        other => other.is_truthy(),
+                    };
+                    if truthy {
                         let frame = self.call_stack.last_mut().unwrap();
                         frame.ip = (frame.ip as isize + offset as isize) as usize;
                     }
@@ -870,9 +812,27 @@ impl VM {
 
                 Instruction::JumpIfNot(cond, offset) => {
                     let condition = self.get_register(cond)?;
-                    if !condition.is_truthy() {
+                    let truthy = match condition {
+                        Value::Bool(b) => *b,
+                        other => other.is_truthy(),
+                    };
+                    if !truthy {
                         let frame = self.call_stack.last_mut().unwrap();
                         frame.ip = (frame.ip as isize + offset as isize) as usize;
+                    }
+                }
+
+                Instruction::Call(func_reg, first_arg, arg_count, dest_reg)
+                    if self.plain_function_callee(func_reg) =>
+                {
+                    let frame = self.bytecode_call_frame(func_reg, first_arg, arg_count, dest_reg)?;
+                    let callee_idx = frame.function_idx;
+                    self.call_stack.push(frame);
+                    if self.jit.enabled
+                        && self.trace_recorder.is_none()
+                        && let Some(finished) = self.run_compiled_function(callee_idx)?
+                    {
+                        return Ok(finished);
                     }
                 }
 
@@ -965,13 +925,18 @@ impl VM {
                     }
                     match func_value {
                         Value::Function(func_idx) => {
-                            let mut args = Vec::new();
+                            let mut args = core::mem::take(&mut self.arg_scratch);
+                            args.clear();
                             for i in 0..arg_count {
                                 args.push(self.get_register(first_arg + i)?.clone());
                             }
 
-                            let frame =
-                                self.make_call_frame(func_idx, Some(dest_reg), args, Vec::new())?;
+                            let frame = self.make_checked_call_frame(
+                                func_idx,
+                                Some(dest_reg),
+                                args,
+                                Vec::new(),
+                            )?;
                             self.call_stack.push(frame);
                         }
 
@@ -979,14 +944,15 @@ impl VM {
                             function_idx: func_idx,
                             upvalues,
                         } => {
-                            let mut args = Vec::new();
+                            let mut args = core::mem::take(&mut self.arg_scratch);
+                            args.clear();
                             for i in 0..arg_count {
                                 args.push(self.get_register(first_arg + i)?.clone());
                             }
 
                             let upvalue_values: Vec<Value> =
                                 upvalues.iter().map(|uv| uv.get()).collect();
-                            let frame = self.make_call_frame(
+                            let frame = self.make_checked_call_frame(
                                 func_idx,
                                 Some(dest_reg),
                                 args,
@@ -1024,18 +990,11 @@ impl VM {
                     let return_value = if value_reg == 255 {
                         Value::Nil
                     } else {
-                        self.get_register(value_reg)?.clone()
+                        self.get_register(value_reg)?.fast_clone()
                     };
-                    let frame = self.call_stack.last().unwrap();
-                    let return_dest = frame.return_dest;
-                    self.validate_function_return(frame.function_idx, &return_value)?;
-                    self.call_stack.pop();
-                    if self.call_stack.is_empty() {
-                        return Ok(return_value);
+                    if let Some(finished) = self.finish_return(return_value)? {
+                        return Ok(finished);
                     }
-
-                    self.pending_return_value = Some(return_value);
-                    self.pending_return_dest = return_dest;
                 }
 
                 Instruction::NewArray(dest, first_elem, count) => {
@@ -1457,8 +1416,41 @@ impl VM {
                     first_arg,
                     arg_count,
                     dest_reg,
-                ) => {
+                ) => 'method: {
                     let object = self.get_register(obj_reg)?.clone();
+                    // Fast path: a user-defined struct method already resolved
+                    // at this call site.
+                    if let Value::Struct { layout, .. } = &object {
+                        let key = (
+                            Rc::as_ptr(layout) as usize,
+                            func_idx,
+                            method_name_idx as u16,
+                        );
+                        if let Some(&target) = self.method_cache.get(&key) {
+                            let mut args = core::mem::take(&mut self.arg_scratch);
+                            args.clear();
+                            args.push(object.clone());
+                            for i in 0..arg_count {
+                                args.push(self.get_register(first_arg + i)?.clone());
+                            }
+                            let frame = self.make_checked_call_frame(
+                                target,
+                                Some(dest_reg),
+                                args,
+                                Vec::new(),
+                            )?;
+                            // Fall through to the trace recorder below: it
+                            // inlines user-defined struct methods like calls.
+                            self.call_stack.push(frame);
+                            if self.jit.enabled
+                                && self.trace_recorder.is_none()
+                                && let Some(finished) = self.run_compiled_function(target)?
+                            {
+                                return Ok(finished);
+                            }
+                            break 'method;
+                        }
+                    }
                     let method_name = {
                         let func = &self.functions[self.call_stack.last().unwrap().function_idx];
                         func.chunk.constants[method_name_idx as usize]
@@ -1478,6 +1470,13 @@ impl VM {
                         if let Some(func_idx) =
                             self.functions.iter().position(|f| f.name == mangled_name)
                         {
+                            if let Value::Struct { layout, .. } = &object {
+                                let caller = self.call_stack.last().unwrap().function_idx;
+                                self.method_cache.insert(
+                                    (Rc::as_ptr(layout) as usize, caller, method_name_idx as u16),
+                                    func_idx,
+                                );
+                            }
                             let mut args = Vec::with_capacity(1 + arg_count as usize);
                             args.push(object.clone());
                             for i in 0..arg_count {
@@ -1485,11 +1484,8 @@ impl VM {
                             }
                             let frame =
                                 self.make_call_frame(func_idx, Some(dest_reg), args, Vec::new())?;
-                            if self.trace_recorder.is_some() {
-                                self.abandon_trace_recording();
-                            }
                             self.call_stack.push(frame);
-                            continue;
+                            break 'method;
                         }
 
                         let mut candidate_names = vec![mangled_name.clone()];
@@ -1531,7 +1527,7 @@ impl VM {
                             }
                         }
                         if handled {
-                            continue;
+                            continue 'dispatch;
                         }
                     }
 
@@ -1710,6 +1706,8 @@ impl VM {
                         } else {
                             None
                         };
+                    let frame_pushed = self.call_stack.len() > executing_frame_index + 1;
+                    recorder.globals_version = self.globals_version;
                     if let Some(registers) = registers_opt
                         && let Err(e) = recorder.record_instruction_at_frame(
                             executing_frame_index,
@@ -1719,6 +1717,7 @@ impl VM {
                             function,
                             func_idx,
                             &self.functions,
+                            frame_pushed,
                         )
                     {
                         crate::jit::log(|| format!("⚠️  JIT: {}", e));
@@ -2000,13 +1999,323 @@ impl VM {
         }
     }
 
+    /// The tail of `Instruction::Return` once the value is in hand: check
+    /// it against the signature, pop the frame and deliver the value to
+    /// the caller. Returns the value itself when the call stack is now
+    /// empty and `run` should hand it back.
+    fn finish_return(&mut self, return_value: Value) -> Result<Option<Value>> {
+        let frame = self.call_stack.last().unwrap();
+        let return_dest = frame.return_dest;
+        self.validate_function_return(frame.function_idx, &return_value)?;
+        if let Some(frame) = self.call_stack.pop() {
+            self.recycle_frame(frame);
+        }
+        if self.call_stack.is_empty() {
+            return Ok(Some(return_value));
+        }
+
+        // Deliver straight into the caller unless this return ends a host
+        // call into the VM, which `run` hands back from the top of the
+        // loop.
+        if self.call_until_depth == Some(self.call_stack.len()) {
+            self.pending_return_value = Some(return_value);
+            self.pending_return_dest = return_dest;
+        } else if let Some(dest) = return_dest {
+            self.set_register(dest, return_value)?;
+        }
+        Ok(None)
+    }
+
+    /// Run the frame just pushed for `func_idx` through the function's
+    /// compiled code, compiling it first when it has just become hot (see
+    /// `jit::function`). Does nothing when there is no code. Afterwards
+    /// the call stack is wherever the native code left it: the frame
+    /// popped (it returned; `Some` when that emptied the stack), or one or
+    /// more frames — native callees materialized on exit included —
+    /// positioned at the instruction the interpreter continues from.
+    ///
+    /// Only the backends that implement `JitCompiler::compile_function`
+    /// (x86_64 and aarch64, with `std`) have function code; elsewhere the
+    /// interpreter runs every call itself and loops are still traced.
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    fn run_compiled_function(&mut self, func_idx: usize) -> Result<Option<Value>> {
+        let code = match self.jit.function_code(func_idx) {
+            Some(code) => code,
+            None => {
+                if !self.jit.record_function_entry(func_idx) {
+                    return Ok(None);
+                }
+                self.compile_function(func_idx);
+                match self.jit.function_code(func_idx) {
+                    Some(code) => code,
+                    None => return Ok(None),
+                }
+            }
+        };
+
+        // Native-to-native calls grow the machine stack; give them at most
+        // `NATIVE_STACK_RESERVE` below here before they hand calls to the
+        // interpreter, whose frames live on the heap.
+        let marker = 0u8;
+        let sp = &marker as *const u8 as usize;
+        let limit = sp.saturating_sub(crate::jit::NATIVE_STACK_RESERVE);
+        crate::jit::JIT_STACK_LIMIT.with(|cell| {
+            let current = cell.get();
+            if current == 0 || limit < current {
+                cell.set(limit);
+            }
+        });
+
+        let cost = code.trace.ops.len();
+        self.budgets.charge_gas(core::cmp::max(1, cost) as u64)?;
+        self.jit.record_native_entry();
+        self.pending_jit_error = None;
+        crate::jit::JIT_EXIT_INFO.with(|cell| cell.set(usize::MAX));
+        let budget = self.max_stack_depth.saturating_sub(self.call_stack.len());
+        crate::jit::JIT_DEPTH_BUDGET.with(|cell| cell.set(budget));
+        let registers_ptr = self.call_stack.last_mut().unwrap().registers.as_mut_ptr();
+        let vm_ptr = self as *mut VM;
+        let result = code.execute(registers_ptr, vm_ptr, ptr::null());
+        crate::jit::log(|| format!("🎯 JIT: function {} native result {}", func_idx, result));
+        drop(code);
+
+        if (crate::jit::FUNCTION_RETURN_BASE..crate::jit::NATIVE_RETURNED).contains(&result) {
+            let reg = (result - crate::jit::FUNCTION_RETURN_BASE) as usize;
+            let return_value = if reg == 255 {
+                Value::Nil
+            } else {
+                self.call_stack.last().unwrap().registers[reg].fast_clone()
+            };
+            return self.finish_return(return_value);
+        }
+
+        // An exit, from this function or a native callee whose frames are
+        // now on the call stack: resume the innermost frame where the
+        // exiting site said.
+        let info = crate::jit::JIT_EXIT_INFO.with(|cell| cell.get());
+        if info == usize::MAX {
+            // Every exit stub of function code records its site; an exit
+            // without one is a compiler bug. Evict the code and resume at
+            // the function's entry, which at least keeps the interpreter
+            // consistent.
+            debug_assert!(false, "function {func_idx} exited with {result} and no exit info");
+            crate::jit::log(|| {
+                format!("❌ JIT: function {func_idx} exited with {result} and no exit info")
+            });
+            self.jit.evict_function_code(func_idx);
+            if let Some(frame) = self.call_stack.last_mut() {
+                frame.ip = 0;
+            }
+            return Ok(None);
+        }
+        let ip = info & ((1usize << crate::jit::EXIT_KIND_SHIFT) - 1);
+        let kind = info >> crate::jit::EXIT_KIND_SHIFT;
+        if let Some(error) = self.pending_jit_error.take() {
+            return Err(error);
+        }
+        let frame = self.call_stack.last_mut().unwrap();
+        let exited_idx = frame.function_idx;
+        frame.ip = ip;
+        crate::jit::log(|| {
+            format!(
+                "↩️  JIT: function {} exit kind {} → func {} ip {}",
+                func_idx, kind, exited_idx, ip
+            )
+        });
+        match kind {
+            crate::jit::EXIT_KIND_HANDOFF | crate::jit::EXIT_KIND_FAIL => {}
+            _ => {
+                self.jit.record_guard_exit();
+                self.jit.evict_function_code(exited_idx);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Translate and compile `func_idx` (see `jit::function`), or mark it
+    /// as not compilable.
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    fn compile_function(&mut self, func_idx: usize) {
+        use crate::jit::function::{Context, FunctionSig, translate};
+        let sig_of = |meta: &CallMeta, function: &Function| FunctionSig {
+            params: meta.params.iter().map(|kind| kind.value_type()).collect(),
+            ret: meta.return_kind.value_type(),
+            lua_function: meta.lua_function,
+            register_count: function.register_count,
+            param_types: match &function.signature {
+                Some(signature) if signature.params.len() == function.param_count as usize => {
+                    signature
+                        .params
+                        .iter()
+                        .map(|ty| Some(ty.kind.clone()))
+                        .collect()
+                }
+                _ => alloc::vec![None; function.param_count as usize],
+            },
+            written_registers: crate::jit::function::written_registers(function),
+            returned_registers: crate::jit::function::returned_registers(function),
+        };
+        let Some((function, meta)) = self.functions.get(func_idx).zip(self.call_meta.get(func_idx))
+        else {
+            return;
+        };
+        let sig = sig_of(meta, function);
+        let functions = &self.functions;
+        let call_meta = &self.call_meta;
+        let callee_sig = |idx: usize| {
+            functions
+                .get(idx)
+                .zip(call_meta.get(idx))
+                .map(|(function, meta)| sig_of(meta, function))
+        };
+        let struct_metadata = &self.struct_metadata;
+        let layout_of = |name: &str| struct_metadata.get(name).map(|info| info.layout.clone());
+        let function_named = |name: &str| functions.iter().position(|f| f.name == name);
+        let globals = &self.globals;
+        let natives = &self.natives;
+        let global = |name: &str| globals.get(name).or_else(|| natives.get(name)).cloned();
+        let ctx = Context {
+            callee_sig: &callee_sig,
+            layout_of: &layout_of,
+            function_named: &function_named,
+            global: &global,
+            globals_version: self.globals_version,
+            intrinsics: &self.jit.intrinsics,
+        };
+        let Some(trace) = translate(function, func_idx, &sig, &ctx) else {
+            crate::jit::log(|| format!("🚫 JIT: function {} is not compilable", func_idx));
+            self.jit.function_not_compilable(func_idx);
+            return;
+        };
+        let trace_id = self.jit.alloc_trace_id();
+        let register_count = function.register_count;
+        let entry_table = self.jit.function_entry_table();
+        match JitCompiler::new().compile_function(&trace, trace_id, register_count, entry_table) {
+            Ok(code) => {
+                crate::jit::log(|| format!("✅ JIT: function {} compiled", func_idx));
+                self.jit.store_function_code(func_idx, code);
+            }
+            Err(e) => {
+                crate::jit::log(|| format!("❌ JIT: function {} compile failed: {}", func_idx, e));
+                self.jit.function_not_compilable(func_idx);
+            }
+        }
+    }
+
+    /// Targets without a whole-function backend: the call stays
+    /// interpreted (see the compiled version above).
+    #[cfg(not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    fn run_compiled_function(&mut self, _func_idx: usize) -> Result<Option<Value>> {
+        Ok(None)
+    }
+
+    /// Is the callee register a plain bytecode function (not a closure,
+    /// native, Lua value or callable table) whose call can take the fast
+    /// path?
+    #[inline]
+    fn plain_function_callee(&self, func_reg: Register) -> bool {
+        let Some(frame) = self.call_stack.last() else {
+            return false;
+        };
+        match frame.registers[func_reg as usize] {
+            Value::Function(idx) => self
+                .call_meta
+                .get(idx)
+                .is_some_and(|meta| !meta.lua_function),
+            _ => false,
+        }
+    }
+
+    /// The fast path of `Instruction::Call` for a plain bytecode callee:
+    /// same checks as `make_call_frame_with` with `ArgCheck::Shallow`, but
+    /// the arguments are copied straight from the caller's registers into
+    /// the new frame, with no intermediate buffer and no per-call signature
+    /// walk. `plain_function_callee` must have said yes.
+    fn bytecode_call_frame(
+        &mut self,
+        func_reg: Register,
+        first_arg: Register,
+        arg_count: u8,
+        dest_reg: Register,
+    ) -> Result<Box<CallFrame>> {
+        let caller = self.call_stack.len() - 1;
+        let Value::Function(function_idx) = self.call_stack[caller].registers[func_reg as usize]
+        else {
+            unreachable!("plain_function_callee checked the callee");
+        };
+        let function = &self.functions[function_idx];
+        if arg_count != function.param_count {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Function {} expects {} arguments, got {}",
+                    function.name, function.param_count, arg_count
+                ),
+            });
+        }
+        let register_count = function.register_count;
+        let mut frame = self.take_frame(function_idx, Some(dest_reg), register_count)?;
+        for index in 0..arg_count as usize {
+            let value = &self.call_stack[caller].registers[first_arg.wrapping_add(index as u8) as usize];
+            let expected = self.call_meta[function_idx].params[index];
+            if !expected.matches(value) {
+                let function = &self.functions[function_idx];
+                let ty = function
+                    .signature
+                    .as_ref()
+                    .map(|signature| signature.params[index].to_string())
+                    .unwrap_or_default();
+                let message = format!(
+                    "Function {} argument {} expects {}, got {:?}",
+                    function.name,
+                    index + 1,
+                    ty,
+                    value.type_of()
+                );
+                self.recycle_frame(frame);
+                return Err(LustError::RuntimeError { message });
+            }
+            self.cycle_collector.register_graph(value);
+            frame.registers[index] = value.fast_clone();
+        }
+        let recursive = self
+            .call_stack
+            .iter()
+            .any(|existing| existing.function_idx == function_idx);
+        self.jit.record_function_call(recursive);
+        Ok(frame)
+    }
+
+    pub(super) fn make_checked_call_frame(
+        &mut self,
+        function_idx: usize,
+        return_dest: Option<Register>,
+        args: Vec<Value>,
+        upvalues: Vec<Value>,
+    ) -> Result<Box<CallFrame>> {
+        self.make_call_frame_with(function_idx, return_dest, args, upvalues, ArgCheck::Shallow)
+    }
+
+    /// Build a frame for a call from the host or a dynamic value: every
+    /// argument is validated in full against the signature, including the
+    /// elements of containers.
     pub(super) fn make_call_frame(
+        &mut self,
+        function_idx: usize,
+        return_dest: Option<Register>,
+        args: Vec<Value>,
+        upvalues: Vec<Value>,
+    ) -> Result<Box<CallFrame>> {
+        self.make_call_frame_with(function_idx, return_dest, args, upvalues, ArgCheck::Deep)
+    }
+
+    fn make_call_frame_with(
         &mut self,
         function_idx: usize,
         return_dest: Option<Register>,
         mut args: Vec<Value>,
         upvalues: Vec<Value>,
-    ) -> Result<CallFrame> {
+        check: ArgCheck,
+    ) -> Result<Box<CallFrame>> {
         let function = self
             .functions
             .get(function_idx)
@@ -2043,7 +2352,11 @@ impl VM {
             && signature.params.len() == args.len()
         {
             for (index, (value, ty)) in args.iter().zip(&signature.params).enumerate() {
-                if !self.value_matches_type(value, ty) {
+                let ok = match check {
+                    ArgCheck::Deep => self.value_matches_type(value, ty),
+                    ArgCheck::Shallow => Self::value_matches_type_shallow(value, ty),
+                };
+                if !ok {
                     return Err(LustError::RuntimeError {
                         message: format!(
                             "Function {} argument {} expects {}, got {:?}",
@@ -2057,44 +2370,112 @@ impl VM {
             }
         }
 
-        let mut frame = CallFrame::new(function_idx, return_dest, function.register_count);
+        let register_count = function.register_count;
+        let mut frame = self.take_frame(function_idx, return_dest, register_count)?;
         let recursive = self
             .call_stack
             .iter()
             .any(|existing| existing.function_idx == function_idx);
-        self.jit.record_function_call(function_idx, recursive);
+        self.jit.record_function_call(recursive);
         frame.upvalues = upvalues;
-        for (index, arg) in args.into_iter().enumerate() {
+        for (index, arg) in args.drain(..).enumerate() {
             self.observe_value_graph(&arg);
             frame.registers[index] = arg;
+        }
+        // Keep the (now empty) argument buffer so the next call allocates
+        // nothing.
+        if args.capacity() > self.arg_scratch.capacity() {
+            self.arg_scratch = args;
         }
         Ok(frame)
     }
 
-    fn validate_function_return(&self, function_idx: usize, value: &Value) -> Result<()> {
-        let function = &self.functions[function_idx];
-        if let Some(signature) = &function.signature {
-            let is_empty_lua_return = matches!(value, Value::Nil)
-                && matches!(
-                    &signature.return_type.kind,
-                    TypeKind::Array(inner)
-                        if matches!(&inner.kind, TypeKind::Named(name) if name == "LuaValue")
-                );
-            if is_empty_lua_return {
-                return Ok(());
-            }
-            if !self.value_matches_type(value, &signature.return_type) {
-                return Err(LustError::RuntimeError {
-                    message: format!(
-                        "Function {} must return {}, got {:?}",
-                        function.name,
-                        signature.return_type,
-                        value.type_of()
-                    ),
-                });
-            }
+    /// A frame for `function_idx`, from the pool when one is available.
+    /// Fails when pushing it would exceed the stack depth limit (checked
+    /// here, where the stack grows, rather than on every instruction).
+    pub(super) fn take_frame(
+        &mut self,
+        function_idx: usize,
+        return_dest: Option<Register>,
+        register_count: u8,
+    ) -> Result<Box<CallFrame>> {
+        if self.call_stack.len() >= self.max_stack_depth {
+            return Err(LustError::RuntimeError {
+                message: "Stack overflow".to_string(),
+            });
         }
-        Ok(())
+        Ok(match self.frame_pool.pop() {
+            Some(mut frame) => {
+                // Pooled frames come back with every register they used
+                // reset to Nil (see `recycle_frame`); only the bookkeeping
+                // needs setting.
+                frame.function_idx = function_idx;
+                frame.ip = 0;
+                frame.base_register = 0;
+                frame.return_dest = return_dest;
+                frame
+            }
+            None => CallFrame::new(function_idx, return_dest, register_count),
+        })
+    }
+
+    /// An O(1) argument check for calls the typechecker already validated:
+    /// scalar kinds and container kinds are verified, contents are not.
+    /// Anything the checker treats dynamically (`unknown`, generics,
+    /// unions, function types, Lua values) is accepted; typed instructions
+    /// still guard the payloads they read.
+    fn value_matches_type_shallow(value: &Value, ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::Int => matches!(value, Value::Int(_)),
+            TypeKind::Float => matches!(value, Value::Float(_)),
+            TypeKind::String => matches!(value, Value::String(_)),
+            TypeKind::Bool => matches!(value, Value::Bool(_)),
+            TypeKind::Unit => matches!(value, Value::Nil),
+            TypeKind::Array(_) => matches!(value, Value::Array(_)),
+            TypeKind::Map(..) => matches!(value, Value::Map(_)),
+            TypeKind::Tuple(_) => matches!(value, Value::Tuple(_)),
+            _ => true,
+        }
+    }
+
+    /// Keep a popped frame for reuse, with the registers it used reset to
+    /// Nil (dropping their values now, as dropping the frame would have).
+    pub(super) fn recycle_frame(&mut self, mut frame: Box<CallFrame>) {
+        if self.frame_pool.len() >= super::FRAME_POOL_LIMIT {
+            return;
+        }
+        let register_count = self
+            .functions
+            .get(frame.function_idx)
+            .map(|f| f.register_count)
+            .unwrap_or(u8::MAX);
+        frame.reset(frame.function_idx, None, register_count);
+        self.frame_pool.push(frame);
+    }
+
+    fn validate_function_return(&self, function_idx: usize, value: &Value) -> Result<()> {
+        // A return executes bytecode the typechecker validated; check the
+        // kind only (precomputed in `CallMeta`). Container contents are
+        // checked where they are read, by typed instructions.
+        let meta = &self.call_meta[function_idx];
+        if meta.return_kind.matches(value)
+            || (meta.lua_multi_return && matches!(value, Value::Nil))
+        {
+            return Ok(());
+        }
+        let function = &self.functions[function_idx];
+        Err(LustError::RuntimeError {
+            message: format!(
+                "Function {} must return {}, got {:?}",
+                function.name,
+                function
+                    .signature
+                    .as_ref()
+                    .map(|signature| signature.return_type.to_string())
+                    .unwrap_or_default(),
+                value.type_of()
+            ),
+        })
     }
 
     fn value_trait_name(&self, value: &Value) -> String {
@@ -2107,9 +2488,9 @@ impl VM {
             Value::Array(_) => "Array".to_string(),
             Value::Tuple(_) => "Tuple".to_string(),
             Value::Map(_) => "Map".to_string(),
-            Value::Struct { name, .. } => name.clone(),
+            Value::Struct { name, .. } => name.to_string(),
             Value::WeakStruct(weak) => weak.struct_name().to_string(),
-            Value::Enum { enum_name, .. } => enum_name.clone(),
+            Value::Enum { enum_name, .. } => enum_name.to_string(),
             Value::Function(_) | Value::NativeFunction(_) | Value::Closure { .. } => {
                 "function".to_string()
             }
@@ -2212,15 +2593,22 @@ impl VM {
         Ok(&frame.registers[reg as usize])
     }
 
+    #[inline]
     pub(super) fn set_register(&mut self, reg: Register, value: Value) -> Result<()> {
-        self.observe_value(&value);
+        self.cycle_collector.register_value(&value);
         let frame = self
             .call_stack
             .last_mut()
             .ok_or_else(|| LustError::RuntimeError {
                 message: "Empty call stack".to_string(),
             })?;
-        frame.registers[reg as usize] = value;
+        let slot = &mut frame.registers[reg as usize];
+        if slot.is_plain() {
+            // SAFETY: the old value owns nothing, so it needs no drop.
+            unsafe { core::ptr::write(slot, value) };
+        } else {
+            *slot = value;
+        }
         self.maybe_collect_cycles();
         Ok(())
     }
@@ -2231,7 +2619,7 @@ impl VM {
         outcome: NativeCallResult,
     ) -> Result<()> {
         #[cfg(feature = "std")]
-        if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some()
+        if lua_socket_trace_enabled()
             && let NativeCallResult::Return(value) = &outcome
             && let Value::Array(arr) = value
         {
@@ -2397,14 +2785,24 @@ impl VM {
                 self.call_stack.push(frame);
                 let previous_target = self.call_until_depth;
                 self.call_until_depth = Some(stack_depth_before);
-                let run_result = self.run();
+                // Compiled code for the function runs it now; `run` then
+                // either hands back the pending return value or carries on
+                // interpreting from wherever the native code exited.
+                let native = if self.jit.enabled && self.trace_recorder.is_none() {
+                    self.run_compiled_function(*func_idx).map(|_| ())
+                } else {
+                    Ok(())
+                };
+                let run_result = native.and_then(|()| self.run());
                 self.call_until_depth = previous_target;
                 match run_result {
                     Ok(value) => Ok(value),
                     Err(err) => {
                         let annotated = self.annotate_runtime_error(err);
                         while self.call_stack.len() > stack_depth_before {
-                            self.call_stack.pop();
+                            if let Some(frame) = self.call_stack.pop() {
+                                self.recycle_frame(frame);
+                            }
                         }
                         self.pending_return_value = saved_pending_return_value;
                         self.pending_return_dest = saved_pending_return_dest;
@@ -2438,7 +2836,9 @@ impl VM {
                     Err(err) => {
                         let annotated = self.annotate_runtime_error(err);
                         while self.call_stack.len() > stack_depth_before {
-                            self.call_stack.pop();
+                            if let Some(frame) = self.call_stack.pop() {
+                                self.recycle_frame(frame);
+                            }
                         }
                         self.pending_return_value = saved_pending_return_value;
                         self.pending_return_dest = saved_pending_return_dest;
@@ -2510,4 +2910,12 @@ fn function_type_params(type_name: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// `LUST_LUA_SOCKET_TRACE` is consulted on every native call; read the
+/// environment once rather than per call.
+#[cfg(feature = "std")]
+fn lua_socket_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some())
 }

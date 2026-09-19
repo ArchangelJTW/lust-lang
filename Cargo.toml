@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/lust-analyzer", "crates/lust-macros"]
+members = [".", "crates/lust-analyzer", "crates/lust-macros", "crates/lust-fuzz"]
 exclude = ["examples/rust-extension/extensions/**", "tree-sitter-lust"]
 
 [package]

@@ -41,7 +41,6 @@ impl JitCompiler {
                 _ => GuardKind::IntType { register }, // other types don't have specialized guard kinds
             },
             fail_count: 0,
-            side_trace: None,
         })
     }
 
@@ -134,7 +133,6 @@ impl JitCompiler {
             bailout_ip: 0,
             kind,
             fail_count: 0,
-            side_trace: None,
         })
     }
 
@@ -179,7 +177,6 @@ impl JitCompiler {
                 expected: expected_ptr,
             },
             fail_count: 0,
-            side_trace: None,
         })
     }
 
@@ -234,7 +231,6 @@ impl JitCompiler {
             bailout_ip,
             kind,
             fail_count: 0,
-            side_trace: None,
         })
     }
 }

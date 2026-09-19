@@ -103,16 +103,21 @@ impl VM {
             jit: JitState::new(),
             budgets: BudgetState::default(),
             functions: Vec::new(),
+            call_meta: Vec::new(),
             natives: HashMap::new(),
             globals: HashMap::new(),
+            globals_version: 0,
             map_hasher: DefaultHashBuilder::default(),
             call_stack: Vec::new(),
+            frame_pool: Vec::new(),
+            method_cache: hashbrown::HashMap::new(),
+            arg_scratch: Vec::new(),
             max_stack_depth: 1000,
             pending_return_value: None,
             pending_return_dest: None,
             pending_jit_error: None,
             trace_recorder: None,
-            side_trace_context: None,
+            nested_loop_exit_ip: None,
             skip_next_trace_record: false,
             trait_impls: HashMap::new(),
             struct_tostring_cache: HashMap::new(),
@@ -143,6 +148,7 @@ impl VM {
         for (name, func) in super::stdlib::create_stdlib(config, &vm) {
             vm.register_native(name, func);
         }
+        vm.register_jit_intrinsics();
 
         vm
     }
@@ -190,9 +196,15 @@ impl VM {
         self.cycle_collector.register_graph(value);
     }
 
+    #[inline]
     pub(super) fn maybe_collect_cycles(&mut self) {
+        // The trigger check is on every register write; only an actual
+        // collection needs the collector taken out to borrow the VM.
+        if !self.cycle_collector.should_collect() {
+            return;
+        }
         let mut collector = mem::take(&mut self.cycle_collector);
-        collector.maybe_collect(self);
+        collector.collect(self);
         self.cycle_collector = collector;
     }
 
@@ -219,6 +231,8 @@ impl VM {
             }
         }
         self.jit.invalidate_compiled_code();
+        self.jit.reset_function_tables(functions.len());
+        self.call_meta = functions.iter().map(CallMeta::of).collect();
         self.functions = functions;
     }
 
@@ -372,7 +386,7 @@ impl VM {
         }
 
         Ok(Value::Struct {
-            name: struct_name.to_string(),
+            name: struct_name.into(),
             layout,
             fields: Rc::new(RefCell::new(ordered)),
         })
@@ -409,6 +423,7 @@ impl VM {
                 self.globals.insert(name, other);
             }
         }
+        self.globals_version = self.globals_version.wrapping_add(1);
     }
 
     #[allow(dead_code)]
@@ -563,6 +578,7 @@ impl VM {
 
     pub fn clear_native_functions(&mut self) {
         self.natives.clear();
+        self.globals_version = self.globals_version.wrapping_add(1);
         #[cfg(feature = "std")]
         self.exported_type_stubs.clear();
     }
@@ -612,6 +628,7 @@ impl VM {
         self.observe_value(&value);
         self.globals.insert(name.clone(), value);
         self.natives.remove(&name);
+        self.globals_version = self.globals_version.wrapping_add(1);
         self.maybe_collect_cycles();
     }
 
@@ -631,7 +648,6 @@ impl VM {
         let saved_pending_task_signal = self.pending_task_signal.clone();
         let saved_last_task_signal = self.last_task_signal.clone();
         let saved_trace_recorder = self.trace_recorder.take();
-        let saved_side_trace_context = self.side_trace_context.take();
         let saved_skip_next_trace_record = self.skip_next_trace_record;
         let saved_call_until_depth = self.call_until_depth;
         self.skip_next_trace_record = false;
@@ -642,7 +658,6 @@ impl VM {
             self.abandon_trace_recording();
         }
         self.trace_recorder = saved_trace_recorder;
-        self.side_trace_context = saved_side_trace_context;
         self.skip_next_trace_record = saved_skip_next_trace_record;
         self.call_until_depth = saved_call_until_depth;
         match result {
@@ -899,7 +914,7 @@ end
                     .unwrap(),
                 Value::Int(5050)
             );
-            if jit && cfg!(target_arch = "x86_64") {
+            if jit && cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
                 assert!(program.jit_stats().root_traces_compiled >= 2);
                 assert!(program.jit_stats().native_trace_entries >= 2);
             }
@@ -1061,7 +1076,7 @@ end
             Value::Int(7),
         );
         let lua_table = Value::Struct {
-            name: "LuaTable".to_string(),
+            name: "LuaTable".into(),
             layout: Rc::new(StructLayout::new(
                 "LuaTable".to_string(),
                 Vec::new(),
@@ -1461,13 +1476,11 @@ end
         let mut vm = VM::new();
         vm.load_functions(vec![failing, succeeding]);
         vm.trace_recorder = Some(TraceRecorder::new(99, 7, 32));
-        vm.side_trace_context = Some((crate::jit::TraceId(4), 2));
         vm.skip_next_trace_record = true;
 
         assert!(vm.call("failing", Vec::new()).is_err());
         assert!(vm.call_stack.is_empty());
         assert!(vm.trace_recorder.is_some());
-        assert_eq!(vm.side_trace_context, Some((crate::jit::TraceId(4), 2)));
         assert!(vm.skip_next_trace_record);
         assert!(matches!(
             vm.call("succeeding", Vec::new()),
@@ -1475,7 +1488,7 @@ end
         ));
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn jit_guard_exit_resumes_at_bailout_ip() {
         use crate::jit::TraceId;
@@ -1501,6 +1514,8 @@ end
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![TraceOp::GuardLoopContinue {
                 condition_register: 0,
@@ -1512,7 +1527,7 @@ end
             outputs: Vec::new(),
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
 
         let mut vm = VM::new();
@@ -1525,7 +1540,7 @@ end
         ));
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn counting_loop() -> Function {
         let mut function = Function::new("count", 1, false);
         function.set_register_count(5);
@@ -1542,7 +1557,7 @@ end
         function
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn recursive_sum(function_idx: usize) -> Function {
         let mut function = Function::new("sum_down", 1, false);
         function.set_register_count(9);
@@ -1563,7 +1578,7 @@ end
         function
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn loop_calling_recursive_sum() -> Function {
         let mut function = Function::new("sum_in_loop", 1, false);
         function.set_register_count(11);
@@ -1589,7 +1604,7 @@ end
         function
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn nested_counting_loop() -> Function {
         let mut function = Function::new("nested_count", 0, false);
         function.set_register_count(9);
@@ -1617,7 +1632,7 @@ end
         function
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn hot_loop_compiles_executes_and_reuses_its_trace() {
         let mut vm = VM::new();
@@ -1640,7 +1655,7 @@ end
         assert!(second.native_trace_entries > first.native_trace_entries);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn short_hot_loop_retries_recording_on_a_later_call() {
         let mut vm = VM::new();
@@ -1664,7 +1679,7 @@ end
         assert!(second.native_trace_entries > 0);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn pure_recursion_is_profiled_without_becoming_a_loop_trace() {
         let mut vm = VM::new();
@@ -1682,7 +1697,7 @@ end
         assert_eq!(stats.native_trace_entries, 0);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn hot_loop_can_trace_across_an_opaque_recursive_call() {
         let mut vm = VM::new();
@@ -1698,7 +1713,7 @@ end
         assert!(stats.recursive_calls > 0);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn nested_loop_recording_does_not_mix_enclosing_backedges() {
         let mut vm = VM::new();

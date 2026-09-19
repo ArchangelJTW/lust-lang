@@ -1,5 +1,6 @@
 use super::*;
 use crate::jit::trace::{Operand, SpecializedOpKind};
+use crate::bytecode::value::JitVecSlot;
 use crate::number::LustInt;
 
 impl JitCompiler {
@@ -124,60 +125,37 @@ impl JitCompiler {
             )
         });
 
-        // Allocate stack space for Vec metadata (ptr, len, cap) = 24 bytes
-        let stack_offset = self.allocate_specialized_stack(24, 8);
+        // One slot per specialized id: an unrolled body unboxes the same id
+        // once per copy, and every copy must fill the slot the rebox reads
+        // (a fresh slot per copy left all but the last one unreleased).
+        let stack_offset = match self.specialized_values.get(&specialized_id) {
+            Some(existing) => existing.stack_offset,
+            None => {
+                let stack_offset = self.allocate_specialized_stack(32, 8);
+                self.specialized_values
+                    .insert(specialized_id, SpecializedValue { stack_offset });
+                stack_offset
+            }
+        };
 
-        // Store specialized value info
-        self.specialized_values
-            .insert(specialized_id, SpecializedValue { stack_offset });
+        let reg_offset = (source_reg as i32) * mem::size_of::<Value>() as i32;
 
-        // Calculate register address: r12 + (source_reg * 64)
-        let reg_offset = (source_reg as i32) * 64;
-
-        // Call jit_unbox_array_int(array_ptr, out_vec_ptr, out_len, out_cap)
+        // jit_unbox_array_int(array_ptr, slot): the helper releases whatever
+        // the slot held (an earlier unbox in an unrolled iteration) and leaves
+        // it empty on failure, so the postamble's rebox is a no-op then.
         unsafe extern "C" {
-            fn jit_unbox_array_int(
-                array_value_ptr: *const Value,
-                out_vec_ptr: *mut *mut LustInt,
-                out_len: *mut usize,
-                out_cap: *mut usize,
-            ) -> u8;
+            fn jit_unbox_array_int(array_value_ptr: *const Value, slot: *mut JitVecSlot) -> u8;
         }
         let unbox_fn = jit_unbox_array_int as *const ();
 
         dynasm!(self.ops
             ; .arch x64
-            // Zero the (ptr, len, cap) triple before attempting the unbox.
-            //
-            // If the unbox fails we jump to the bailout label, but the bailout
-            // path still runs the postamble, which reboxes from these very
-            // slots.  Left uninitialised they hold stack garbage, and a garbage
-            // `len` reaches `Vec::with_capacity` inside the rebox helper as a
-            // `capacity overflow` abort.  Zeroed, the helper's null check on
-            // `vec_ptr` makes the rebox a no-op instead.
-            ; mov QWORD [rbp + stack_offset], 0
-            ; mov QWORD [rbp + stack_offset + 8], 0
-            ; mov QWORD [rbp + stack_offset + 16], 0
-
-            // Arg 1: array_ptr = r12 + reg_offset
             ; lea rdi, [r12 + reg_offset]
-
-            // Arg 2: out_vec_ptr = rbp + stack_offset
             ; lea rsi, [rbp + stack_offset]
-
-            // Arg 3: out_len = rbp + stack_offset + 8
-            ; lea rdx, [rbp + stack_offset + 8]
-
-            // Arg 4: out_cap = rbp + stack_offset + 16
-            ; lea rcx, [rbp + stack_offset + 16]
-
-            // Call helper
             ; mov rax, QWORD unbox_fn as i64
             ; call rax
-
-            // Check return value (al = 0 means failure)
             ; test al, al
-            ; jz => self.current_fail_label()
+            ; jz >fail
         );
 
         Ok(())
@@ -201,48 +179,22 @@ impl JitCompiler {
 
         let stack_offset = spec_value.stack_offset;
 
-        // Calculate destination register address
-        let reg_offset = (dest_reg as i32) * 64;
-
-        // Call jit_rebox_array_int(vec_ptr, vec_len, vec_cap, out_value_ptr)
+        // jit_rebox_array_int(slot): publishes into the array the slot was
+        // unboxed from and empties the slot. `dest_reg` is where the recorder
+        // last saw that array; the value itself is found through the slot.
+        let _ = dest_reg;
         unsafe extern "C" {
-            fn jit_rebox_array_int(
-                vec_ptr: *mut LustInt,
-                vec_len: usize,
-                vec_cap: usize,
-                out_value_ptr: *mut Value,
-            ) -> u8;
+            fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8;
         }
         let rebox_fn = jit_rebox_array_int as *const ();
 
         dynasm!(self.ops
             ; .arch x64
-            // Arg 1: vec_ptr
-            ; mov rdi, [rbp + stack_offset]
-
-            // Arg 2: vec_len
-            ; mov rsi, [rbp + stack_offset + 8]
-
-            // Arg 3: vec_cap
-            ; mov rdx, [rbp + stack_offset + 16]
-
-            // Arg 4: out_value_ptr = r12 + reg_offset
-            ; lea rcx, [r12 + reg_offset]
-
-            // Call helper
+            ; lea rdi, [rbp + stack_offset]
             ; mov rax, QWORD rebox_fn as i64
             ; call rax
-
-            // Check return value
             ; test al, al
-            ; jz => self.current_fail_label()
-
-            // Rebox consumes the raw Vec allocation. Clear the metadata so a
-            // duplicated cleanup path is a harmless no-op rather than a second
-            // Vec::from_raw_parts over freed storage.
-            ; mov QWORD [rbp + stack_offset], 0
-            ; mov QWORD [rbp + stack_offset + 8], 0
-            ; mov QWORD [rbp + stack_offset + 16], 0
+            ; jz >fail
         );
 
         Ok(())
@@ -265,7 +217,7 @@ impl JitCompiler {
                 })?;
 
         let stack_offset = spec_value.stack_offset;
-        let value_offset = (value_reg as i32) * 64 + 8; // +8 to skip tag, get int value
+        let value_offset = (value_reg as i32) * mem::size_of::<Value>() as i32 + 8; // +8 to skip tag, get int value
 
         // Call jit_vec_int_push(vec_ptr_addr, len_addr, cap_addr, value)
         unsafe extern "C" {
@@ -298,7 +250,7 @@ impl JitCompiler {
 
             // Check return value
             ; test al, al
-            ; jz => self.current_fail_label()
+            ; jz >fail
         );
 
         Ok(())
@@ -374,24 +326,14 @@ impl JitCompiler {
 
         let stack_offset = spec_value.stack_offset;
 
-        // Call jit_drop_vec_int(vec_ptr, vec_len, vec_cap)
         unsafe extern "C" {
-            fn jit_drop_vec_int(vec_ptr: *mut LustInt, vec_len: usize, vec_cap: usize);
+            fn jit_drop_vec_int(slot: *mut JitVecSlot);
         }
         let drop_fn = jit_drop_vec_int as *const ();
 
         dynasm!(self.ops
             ; .arch x64
-            // Arg 1: vec_ptr
-            ; mov rdi, [rbp + stack_offset]
-
-            // Arg 2: vec_len
-            ; mov rsi, [rbp + stack_offset + 8]
-
-            // Arg 3: vec_cap
-            ; mov rdx, [rbp + stack_offset + 16]
-
-            // Call helper
+            ; lea rdi, [rbp + stack_offset]
             ; mov rax, QWORD drop_fn as i64
             ; call rax
         );
@@ -406,7 +348,7 @@ impl JitCompiler {
         // [rbp - 8]: rbx, [rbp - 16]: r12, [rbp - 24]: r13, [rbp - 32]: r14, [rbp - 40]: r15
         // Allocated space: [rbp - 41] to [rbp - (40 + stack_size)]
         //
-        // SPECIALIZED_BASE_OFFSET (-64) avoids overwriting saved registers
+        // SPECIALIZED_BASE_OFFSET keeps every slot below the saved registers
         // Vec needs ptr, len, cap = 24 bytes
         // Each additional specialized value uses 32 bytes (24 for data + 8 padding for alignment)
         let allocation_offset = self.specialized_values.len() as i32 * SPECIALIZED_SLOT_SIZE;

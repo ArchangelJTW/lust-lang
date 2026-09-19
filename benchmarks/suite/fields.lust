@@ -1,0 +1,12 @@
+struct Point
+    x: int
+    y: int
+end
+local point: Point = Point { x = 0, y = 0 }
+local i: int = 1
+while i <= 10000000 do
+    point.x = i
+    point.y = point.y + i
+    i = i + 1
+end
+println(point.y)

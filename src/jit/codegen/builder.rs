@@ -6,21 +6,33 @@ impl JitCompiler {
         Self {
             ops: Assembler::new().unwrap(),
             data: Vec::new(),
-            fail_stack: Vec::new(),
             exit_stack: Vec::new(),
             inline_depth: 0,
             specialization_registry: SpecializationRegistry::new(),
             specialized_values: HashMap::new(),
             scalar_registers: HashMap::new(),
+            pending_scalar: None,
+            trace_start_ip: 0,
+            function_mode: false,
+            function_frame: (0, true),
+            function_entry_table: 0,
+            function_epilogue: None,
+            function_labels: HashMap::new(),
+            exit_is_handoff: false,
+            current_fail_ip: None,
+            fail_sites: Vec::new(),
             next_specialized_id: 0,
         }
     }
 
-    pub(super) fn current_fail_label(&self) -> dynasmrt::DynamicLabel {
-        *self
-            .fail_stack
-            .last()
-            .expect("JIT fail label stack is empty")
+    /// Where the interpreter resumes when a guard that is not a branch
+    /// (type, function identity, struct layout) fails: the instruction the
+    /// guard was recorded for, so it is re-executed with the value the guard
+    /// rejected. Inside an inlined body the ip is the call's, since the
+    /// callee frame is torn down on exit; the call then runs in the
+    /// interpreter.
+    pub(super) fn guard_bailout_ip(&self) -> usize {
+        self.current_fail_ip.unwrap_or(self.trace_start_ip)
     }
 
     pub(super) fn current_exit_label(&self) -> dynasmrt::DynamicLabel {
@@ -28,6 +40,24 @@ impl JitCompiler {
             .exit_stack
             .last()
             .expect("JIT exit label stack is empty")
+    }
+
+    /// Keep an interned name alive with the code; returns the address a
+    /// value holding that name carries (see `Name::inner_ptr`).
+    pub(super) fn retain_name(&mut self, text: &str) -> usize {
+        let name = crate::bytecode::value::Name::from(text);
+        let ptr = name.inner_ptr() as usize;
+        self.data.push(JitData::Name(name));
+        ptr
+    }
+
+    /// Keep a map key alive with the code (a field name looked up in a
+    /// map, built once here rather than per lookup).
+    pub(super) fn retain_key(&mut self, name: &str) -> *const crate::bytecode::ValueKey {
+        let key = Box::new(crate::bytecode::ValueKey::from(name));
+        let ptr = key.as_ref() as *const crate::bytecode::ValueKey;
+        self.data.push(JitData::Key(key));
+        ptr
     }
 
     pub(super) fn retain_value(&mut self, value: Value) -> *const Value {
@@ -58,22 +88,88 @@ impl JitCompiler {
         ptr
     }
 
+    /// Compile whole-function code (see `jit::function`). `entry_table` is
+    /// the address of the compiled-function entry table, which the code
+    /// reads at each `CallDirect`.
+    pub fn compile_function(
+        &mut self,
+        trace: &Trace,
+        trace_id: TraceId,
+        register_count: u8,
+        entry_table: usize,
+    ) -> Result<CompiledTrace> {
+        self.function_mode = true;
+        self.function_frame = (register_count, trace.frame_may_own);
+        self.function_entry_table = entry_table;
+        self.function_labels.clear();
+        let result = self.compile_trace(trace, trace_id, Vec::new());
+        self.function_mode = false;
+        result
+    }
+
+    pub(super) fn function_label(&mut self, id: usize) -> dynasmrt::DynamicLabel {
+        if let Some(label) = self.function_labels.get(&id) {
+            return *label;
+        }
+        let label = self.ops.new_dynamic_label();
+        self.function_labels.insert(id, label);
+        label
+    }
+
+    /// Generic exit with a guard return value (guard_index + 1). Function
+    /// code also records where and why it left (see `JIT_EXIT_INFO`), since
+    /// the result propagates through native callers unchanged.
+    pub(super) fn emit_guard_exit(&mut self, guard_return_value: i32) {
+        let exit_label = self.current_exit_label();
+        if self.function_mode {
+            let kind = if self.exit_is_handoff {
+                jit::EXIT_KIND_HANDOFF
+            } else {
+                jit::EXIT_KIND_GUARD
+            };
+            let ip = self.current_fail_ip.unwrap_or(usize::MAX >> 16);
+            self.emit_exit_info(ip, kind);
+        }
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov eax, DWORD guard_return_value
+            ; jmp => exit_label
+        );
+    }
+
+    /// `JIT_EXIT_INFO = ip | kind << EXIT_KIND_SHIFT`.
+    pub(super) fn emit_exit_info(&mut self, ip: usize, kind: usize) {
+        let info = (ip & ((1usize << jit::EXIT_KIND_SHIFT) - 1)) | (kind << jit::EXIT_KIND_SHIFT);
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov rax, QWORD jit::exit_info_cell() as _
+            ; mov rcx, QWORD info as _
+            ; mov [rax], rcx
+        );
+    }
+
     pub fn compile_trace(
         &mut self,
         trace: &Trace,
         trace_id: TraceId,
-        parent: Option<TraceId>,
         hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
         self.scalar_registers.clear();
+        self.trace_start_ip = trace.start_ip;
+        self.current_fail_ip = None;
+        self.fail_sites.clear();
         let stack_size = Self::compute_stack_size(trace);
         let mut guards = Vec::new();
         let mut guard_index = 0i32;
         let exit_label = self.ops.new_dynamic_label();
         let fail_label = self.ops.new_dynamic_label();
+        let epilogue_label = self.ops.new_dynamic_label();
+        self.function_epilogue = Some(epilogue_label);
         self.exit_stack.push(exit_label);
-        self.fail_stack.push(fail_label);
         crate::jit::log(|| format!("🔧 JIT: Emitting prologue with sub rsp, {}", stack_size));
+        // Entry: rdi = registers, rsi = VM, rdx = the inline record a native
+        // caller pushed for this frame (function mode; null from the
+        // interpreter). Traces are only ever entered by the interpreter.
         dynasm!(self.ops
             ; .arch x64
             ; push rbp
@@ -84,10 +180,14 @@ impl JitCompiler {
             ; push r14
             ; push r15
             ; sub rsp, stack_size
-            ; xor r15, r15
             ; mov r12, rdi
             ; mov r13, rsi
         );
+        if self.function_mode {
+            dynasm!(self.ops ; .arch x64 ; mov r15, rdx);
+        } else {
+            dynasm!(self.ops ; .arch x64 ; xor r15, r15);
+        }
         for slot in 0..Self::count_specialized_slots(trace) as i32 {
             let offset = SPECIALIZED_BASE_OFFSET - slot * SPECIALIZED_SLOT_SIZE;
             dynasm!(self.ops
@@ -95,6 +195,7 @@ impl JitCompiler {
                 ; mov QWORD [rbp + offset], 0
                 ; mov QWORD [rbp + offset + 8], 0
                 ; mov QWORD [rbp + offset + 16], 0
+                ; mov QWORD [rbp + offset + 24], 0
             );
         }
         for (dest, value) in &hoisted_constants {
@@ -105,7 +206,20 @@ impl JitCompiler {
         jit::log(|| format!("🔧 JIT: Compiling preamble ({} ops)", trace.preamble.len()));
         self.compile_ops(&trace.preamble, &mut guard_index, &mut guards)?;
 
+        // `>fail` references so far (preamble) bind here: a failed unbox at
+        // entry is a bare failure (-1), restarting the iteration; left
+        // pending they would bind to the body's first fail stub and resume
+        // at that instruction instead.
+        dynasm!(self.ops
+            ; .arch x64
+            ; jmp >preamble_fail_skip
+            ; fail:
+            ; jmp => fail_label
+            ; preamble_fail_skip:
+        );
+
         // Create a loop_start label AFTER preamble, BEFORE loop body
+        self.current_fail_ip = None;
         let loop_start_label = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch x64
@@ -117,14 +231,26 @@ impl JitCompiler {
         let compile_result = self.compile_ops(&trace.ops, &mut guard_index, &mut guards);
         compile_result?;
 
-        // At end of loop body, jump back to loop_start to loop
-        dynasm!(self.ops
-            ; .arch x64
-            ; jmp => loop_start_label
-        );
+        if self.function_mode {
+            // Every path through function code ends in a `Return`; falling
+            // off the end is a compiler bug, reported as a bare failure.
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov eax, DWORD -1
+                ; jmp => exit_label
+            );
+        } else {
+            // At end of loop body, jump back to loop_start to loop
+            dynasm!(self.ops
+                ; .arch x64
+                ; jmp => loop_start_label
+            );
+        }
 
-        let unwind_label = self.ops.new_dynamic_label();
-        let fail_return_label = self.ops.new_dynamic_label();
+        // Body exits: preserve the exit code, then turn any inline-call
+        // frames into interpreter frames so r12 is the trace's own register
+        // array again before the postamble runs (a guard inside an inlined
+        // body exits from here with the callee frame still on the stack).
         dynasm!(self.ops
             ; .arch x64
             ; => exit_label
@@ -133,6 +259,7 @@ impl JitCompiler {
             // a callee-saved register until specialized state is materialized.
             ; mov r14d, eax
         );
+        self.emit_unwind_inline_frames();
 
         // Compile postamble (executed once at trace exit)
         jit::log(|| {
@@ -141,20 +268,26 @@ impl JitCompiler {
                 trace.postamble.len()
             )
         });
+        self.current_fail_ip = None;
         self.compile_ops(&trace.postamble, &mut guard_index, &mut guards)?;
+        self.publish_remaining_specialized(trace)?;
 
         // Now pop the label stacks after everything is compiled
         self.exit_stack.pop();
-        self.fail_stack.pop();
 
         dynasm!(self.ops
             ; .arch x64
             ; mov eax, r14d
         );
 
+        // Epilogue: rsp is recovered from the frame pointer (five pushes sit
+        // below the saved rbp), so the exit path is valid regardless of how
+        // deep an inline frame we came from. A bare failure (-1) takes the
+        // same exit, which unwinds the inline frames.
         dynasm!(self.ops
             ; .arch x64
-            ; add rsp, stack_size
+            ; => epilogue_label
+            ; lea rsp, [rbp - 40]
             ; pop r15
             ; pop r14
             ; pop r13
@@ -165,17 +298,6 @@ impl JitCompiler {
             ; => fail_label
             ; fail:
             ; mov eax, DWORD -1
-            ; => unwind_label
-            ; test r15, r15
-            ; je => fail_return_label
-            ; mov eax, DWORD [r15]
-            ; mov rbx, rax
-            ; add rsp, rbx
-            ; mov r12, [r15 + 8]
-            ; mov r15, [r15 + 16]
-            ; add rsp, 24
-            ; jmp => unwind_label
-            ; => fail_return_label
             ; jmp => exit_label
         );
         let ops = mem::replace(&mut self.ops, Assembler::new().unwrap());
@@ -194,7 +316,7 @@ impl JitCompiler {
                 path.push(format!(
                     "jit_trace_{}_{}.bin",
                     trace_id.0,
-                    parent.map(|p| p.0).unwrap_or(trace.function_idx)
+                    trace.function_idx
                 ));
                 if let Err(err) = fs::write(&path, bytes) {
                     crate::jit::log(|| {
@@ -213,10 +335,78 @@ impl JitCompiler {
             _data: data,
             trace: trace.clone(),
             guards,
-            parent,
-            side_traces: Vec::new(),
+            fail_sites: mem::take(&mut self.fail_sites),
             hoisted_constants,
         })
+    }
+
+    /// Hand the inline-call frame chain in r15 to the interpreter (see
+    /// `jit_materialize_inline_frames`): the callee frames become real
+    /// frames and execution resumes inside the innermost one. Leaves r12 =
+    /// the trace's own register array and r15 = 0. No-op without a chain.
+    /// Only registers are restored here — rsp is recovered from rbp by the
+    /// epilogue.
+    fn emit_unwind_inline_frames(&mut self) {
+        unsafe extern "C" {
+            fn jit_materialize_inline_frames(
+                vm: *mut VM,
+                record: *const u8,
+                regs: *mut Value,
+            ) -> *mut Value;
+        }
+        let done = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch x64
+            ; test r15, r15
+            ; jz => done
+            ; mov rdi, r13
+            ; mov rsi, r15
+            ; mov rdx, r12
+            ; mov rax, QWORD jit_materialize_inline_frames as *const () as _
+            ; call rax
+            ; mov r12, rax
+            ; xor r15, r15
+            ; => done
+        );
+    }
+
+    /// After the postamble: publish and release every specialized slot the
+    /// postamble did not rebox. A slot whose register the trace overwrote
+    /// is dropped from the recorder's tracking (no `Rebox` is generated for
+    /// it), but its unbox still runs on every entry, so left alone it
+    /// leaked its copy and kept the array alive. Reboxing an empty slot is
+    /// a no-op, so this is safe for the slots the postamble did handle.
+    fn publish_remaining_specialized(&mut self, trace: &Trace) -> Result<()> {
+        let reboxed: Vec<usize> = trace
+            .postamble
+            .iter()
+            .filter_map(|op| match op {
+                TraceOp::Rebox { specialized_id, .. } => Some(*specialized_id),
+                _ => None,
+            })
+            .collect();
+        let layouts: Vec<(usize, SpecializedLayout)> = trace
+            .preamble
+            .iter()
+            .chain(trace.ops.iter())
+            .filter_map(|op| match op {
+                TraceOp::Unbox {
+                    specialized_id,
+                    layout,
+                    ..
+                } if !reboxed.contains(specialized_id) => Some((*specialized_id, layout.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut done = Vec::new();
+        for (id, layout) in layouts {
+            if done.contains(&id) || !self.specialized_values.contains_key(&id) {
+                continue;
+            }
+            done.push(id);
+            self.compile_rebox(0, id, &layout)?;
+        }
+        Ok(())
     }
 
     fn compile_ops(
@@ -225,19 +415,29 @@ impl JitCompiler {
         guard_index: &mut i32,
         guards: &mut Vec<Guard>,
     ) -> Result<()> {
-        let mut skip_next = false;
+        let mut skip_through: Option<usize> = None;
         for (op_index, op) in ops.iter().enumerate() {
-            if skip_next {
-                skip_next = false;
+            if skip_through.is_some_and(|last| op_index <= last) {
                 continue;
             }
-            if let Some(next) = ops.get(op_index + 1) {
+            if let TraceOp::At { ip } = op {
+                // Inside an inlined body the markers carry the callee's ips;
+                // an exit there resumes inside the callee, whose frame the
+                // exit path materializes.
+                self.current_fail_ip = Some(*ip);
+                continue;
+            }
+            // Fusion looks at the next real op; `At` markers are transparent.
+            let next_index = (op_index + 1..ops.len())
+                .find(|&j| !matches!(ops[j], TraceOp::At { .. }));
+            if let Some(next_index) = next_index {
+                let next = &ops[next_index];
                 if let TraceOp::GuardLoopContinue {
                     condition_register, ..
                 } = next
                     && self.scalar_registers.contains_key(condition_register)
                     && Self::register_overwritten_before_read(
-                        &ops[op_index + 2..],
+                        &ops[next_index + 1..],
                         *condition_register,
                     )
                     && let Some(guard) =
@@ -245,7 +445,7 @@ impl JitCompiler {
                 {
                     guards.push(guard);
                     *guard_index += 1;
-                    skip_next = true;
+                    skip_through = Some(next_index);
                     continue;
                 }
                 if let TraceOp::LoadConst {
@@ -254,17 +454,18 @@ impl JitCompiler {
                 } = op
                     && self.scalar_registers.contains_key(constant_register)
                     && Self::register_overwritten_before_read(
-                        &ops[op_index + 2..],
+                        &ops[next_index + 1..],
                         *constant_register,
                     )
                     && self.compile_integer_add_immediate(op, next)?
                 {
                     self.update_scalar_registers(next);
-                    skip_next = true;
+                    skip_through = Some(next_index);
                     continue;
                 }
             }
             match op {
+                TraceOp::At { .. } => unreachable!("markers are consumed above"),
                 TraceOp::LoadConst { dest, value } => {
                     self.compile_load_const(*dest, value)?;
                 }
@@ -416,12 +617,29 @@ impl JitCompiler {
                     condition_dest,
                     array,
                     index,
+                    value_type,
                 } => {
-                    self.compile_array_index_ok(*value_dest, *condition_dest, *array, *index)?;
+                    self.compile_array_index_ok(
+                        *value_dest,
+                        *condition_dest,
+                        *array,
+                        *index,
+                        *value_type,
+                    )?;
                 }
 
                 TraceOp::ArrayLen { dest, array } => {
                     self.compile_array_len(*dest, *array)?;
+                }
+
+                TraceOp::GuardStructLayout { register, layout } => {
+                    let guard = self.compile_guard_struct_layout(
+                        *register,
+                        *layout,
+                        *guard_index as usize,
+                    )?;
+                    guards.push(guard);
+                    *guard_index += 1;
                 }
 
                 TraceOp::GuardNativeFunction { register, function } => {
@@ -430,8 +648,16 @@ impl JitCompiler {
                     let guard = self.compile_guard_native_function(
                         *register,
                         expected_ptr,
+                        function.inner_ptr(),
                         *guard_index as usize,
                     )?;
+                    guards.push(guard);
+                    *guard_index += 1;
+                }
+
+                TraceOp::GuardGlobals { version } => {
+                    crate::jit::log(|| format!("🔒 JIT: guard globals version {}", version));
+                    let guard = self.compile_guard_globals(*version, *guard_index as usize);
                     guards.push(guard);
                     *guard_index += 1;
                 }
@@ -512,9 +738,28 @@ impl JitCompiler {
                     callee,
                     trace,
                 } => {
+                    // Arguments of known scalar type are copied natively and
+                    // seed the callee's environment; the result's type comes
+                    // back the same way.
+                    let arg_types: Vec<Option<ValueType>> = trace
+                        .arg_registers
+                        .iter()
+                        .map(|reg| self.scalar_registers.get(reg).copied())
+                        .collect();
                     let outer_scalar_registers = mem::take(&mut self.scalar_registers);
-                    self.compile_inline_call(*dest, *callee, trace, guard_index, guards)?;
+                    let result =
+                        self.compile_inline_call(*dest, *callee, trace, &arg_types, guard_index, guards);
                     self.scalar_registers = outer_scalar_registers;
+                    let result_type = result?;
+                    self.update_scalar_registers(op);
+                    self.pending_scalar = None;
+                    if let Some(ty) = result_type {
+                        self.scalar_registers.insert(*dest, ty);
+                    }
+                    if Self::op_may_fail(op) {
+                        self.emit_fail_stub();
+                    }
+                    continue;
                 }
 
                 TraceOp::CallMethod {
@@ -654,10 +899,15 @@ impl JitCompiler {
                     register,
                     expected_type,
                 } => {
-                    let guard =
-                        self.compile_guard(*register, *expected_type, *guard_index as usize)?;
-                    guards.push(guard);
-                    *guard_index += 1;
+                    // A guard on a register the static environment already
+                    // knows to hold that scalar is redundant: only typed
+                    // writes reach the environment.
+                    if self.scalar_registers.get(register) != Some(expected_type) {
+                        let guard =
+                            self.compile_guard(*register, *expected_type, *guard_index as usize)?;
+                        guards.push(guard);
+                        *guard_index += 1;
+                    }
                 }
 
                 TraceOp::GuardLoopContinue {
@@ -679,37 +929,16 @@ impl JitCompiler {
                     function_idx,
                     loop_start_ip,
                     bailout_ip,
+                    resume_ip,
                 } => {
-                    // Nested loop call - this will be replaced with a direct call to
-                    // the compiled inner loop trace once it's compiled.
-                    // For now, exit to interpreter which will:
-                    // 1. Run the loop in interpreter
-                    // 2. Eventually compile it as a hot trace
-                    // 3. Later, this guard can become a side trace that calls the compiled loop
-
-                    let exit_label = self.current_exit_label();
-                    jit::log(|| {
-                        format!(
-                            "🔗 JIT: Nested loop at func {} ip {} - exiting to interpreter (guard #{})",
-                            function_idx, loop_start_ip, *guard_index
-                        )
-                    });
-                    guards.push(Guard {
-                        index: *guard_index as usize,
-                        bailout_ip: *bailout_ip,
-                        kind: GuardKind::NestedLoop {
-                            function_idx: *function_idx,
-                            loop_start_ip: *loop_start_ip,
-                        },
-                        fail_count: 0,
-                        side_trace: None,
-                    });
-                    let current_guard_index = *guard_index;
-                    dynasm!(self.ops
-                        ; .arch x64
-                        ; mov eax, DWORD (current_guard_index + 1)
-                        ; jmp => exit_label
+                    let guard = self.compile_nested_loop_call(
+                        *function_idx,
+                        *loop_start_ip,
+                        *bailout_ip,
+                        *resume_ip,
+                        *guard_index as usize,
                     );
+                    guards.push(guard);
                     *guard_index += 1;
                 }
 
@@ -740,12 +969,137 @@ impl JitCompiler {
                     self.compile_specialized_op(op, operands)?;
                 }
 
-                TraceOp::Return { .. } => {}
+                TraceOp::Return { value } => {
+                    if self.function_mode && self.inline_depth == 0 {
+                        self.compile_function_return(*value)?;
+                    }
+                }
+
+                TraceOp::Label { id, scalars } => {
+                    let label = self.function_label(*id);
+                    dynasm!(self.ops ; .arch x64 ; => label);
+                    self.scalar_registers = scalars.iter().copied().collect();
+                }
+
+                TraceOp::Jump { label } => {
+                    let label = self.function_label(*label);
+                    dynasm!(self.ops ; .arch x64 ; jmp => label);
+                }
+
+                TraceOp::BranchIf {
+                    condition_register,
+                    expect_truthy,
+                    label,
+                } => {
+                    self.compile_branch_if(*condition_register, *expect_truthy, *label);
+                }
+
+                TraceOp::CallDirect {
+                    dest,
+                    callee,
+                    receiver,
+                    function_idx,
+                    first_arg,
+                    arg_count,
+                    callee_registers,
+                    call_ip,
+                    resume_ip,
+                    alias_mask,
+                    result_type,
+                } => {
+                    self.compile_call_direct(
+                        *dest,
+                        *callee,
+                        *receiver,
+                        *function_idx,
+                        *first_arg,
+                        *arg_count,
+                        *callee_registers,
+                        *call_ip,
+                        *resume_ip,
+                        *alias_mask,
+                        *result_type,
+                        guard_index,
+                        guards,
+                    )?;
+                }
             }
             self.update_scalar_registers(op);
+            if let Some((reg, ty)) = self.pending_scalar.take() {
+                self.scalar_registers.insert(reg, ty);
+            }
+            if Self::op_may_fail(op) {
+                self.emit_fail_stub();
+            }
         }
 
         Ok(())
+    }
+
+    /// After an op that can branch to `>fail`: bind those branches to a stub
+    /// that exits with this op's fail-site code, so the interpreter resumes
+    /// at the instruction the op came from (inside an inlined body, in the
+    /// callee frame the exit path materializes). Without a known ip the
+    /// branches fall through to the trace's generic `fail:` (-1).
+    pub(super) fn emit_fail_stub(&mut self) {
+        let Some(ip) = self.current_fail_ip else {
+            return;
+        };
+        let code = -((self.fail_sites.len() as i32) + 2);
+        self.fail_sites.push(ip);
+        let exit_label = self.current_exit_label();
+        dynasm!(self.ops
+            ; .arch x64
+            ; jmp >fail_stub_skip
+            ; fail:
+        );
+        if self.function_mode {
+            self.emit_exit_info(ip, jit::EXIT_KIND_FAIL);
+        }
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov eax, DWORD code
+            ; jmp => exit_label
+            ; fail_stub_skip:
+        );
+    }
+
+    /// Ops that can branch to `>fail`.
+    fn op_may_fail(op: &TraceOp) -> bool {
+        matches!(
+            op,
+            TraceOp::LoadConst { .. }
+                | TraceOp::Div { .. }
+                | TraceOp::Mod { .. }
+                | TraceOp::Concat { .. }
+                | TraceOp::GetIndex { .. }
+                | TraceOp::TryGetIndex { .. }
+                | TraceOp::ArrayIndexOk { .. }
+                | TraceOp::ArrayLen { .. }
+                | TraceOp::CallNative { .. }
+                | TraceOp::CallFunction { .. }
+                | TraceOp::InlineCall { .. }
+                | TraceOp::CallDirect { .. }
+                | TraceOp::CallMethod { .. }
+                | TraceOp::GetField { .. }
+                | TraceOp::SetField { .. }
+                | TraceOp::NewArray { .. }
+                | TraceOp::NewStruct { .. }
+                | TraceOp::NewEnumUnit { .. }
+                | TraceOp::NewEnumVariant { .. }
+                | TraceOp::TryCast { .. }
+                | TraceOp::GetEnumValue { .. }
+                | TraceOp::Unbox { .. }
+                | TraceOp::Rebox { .. }
+                | TraceOp::DropSpecialized { .. }
+                | TraceOp::SpecializedOp { .. }
+        ) && !matches!(
+            op,
+            TraceOp::LoadConst {
+                value: Value::Int(_) | Value::Float(_) | Value::Bool(_),
+                ..
+            }
+        )
     }
 
     fn compile_integer_add_immediate(
@@ -886,11 +1240,12 @@ impl JitCompiler {
         dynasm!(self.ops ; .arch x64 ; mov rax, QWORD failed_value);
         self.store_from_rax(condition_register, ValueTag::Bool.as_u8());
         let guard_return_value = (guard_index + 1) as i32;
-        let exit_label = self.current_exit_label();
         dynasm!(self.ops
             ; .arch x64
-            ; mov eax, DWORD guard_return_value
-            ; jmp =>exit_label
+        );
+        self.emit_guard_exit(guard_return_value);
+        dynasm!(self.ops
+            ; .arch x64
             ; =>guard_ok
         );
 
@@ -907,7 +1262,6 @@ impl JitCompiler {
                 }
             },
             fail_count: 0,
-            side_trace: None,
         }))
     }
 
@@ -937,6 +1291,8 @@ impl JitCompiler {
                 | TraceOp::ArrayIndexOk { .. }
                 | TraceOp::ArrayLen { .. }
                 | TraceOp::GuardNativeFunction { .. }
+                | TraceOp::GuardGlobals { .. }
+                | TraceOp::GuardStructLayout { .. }
                 | TraceOp::GuardFunction { .. }
                 | TraceOp::GuardClosure { .. }
                 | TraceOp::CallNative { .. }
@@ -961,6 +1317,10 @@ impl JitCompiler {
                 | TraceOp::Rebox { .. }
                 | TraceOp::DropSpecialized { .. }
                 | TraceOp::SpecializedOp { .. }
+                | TraceOp::Label { .. }
+                | TraceOp::Jump { .. }
+                | TraceOp::BranchIf { .. }
+                | TraceOp::CallDirect { .. }
         )
     }
 
@@ -968,7 +1328,7 @@ impl JitCompiler {
         let in_args =
             |first: u8, count: u8| register >= first && register < first.saturating_add(count);
         match op {
-            TraceOp::LoadConst { .. } => false,
+            TraceOp::At { .. } | TraceOp::LoadConst { .. } | TraceOp::GuardGlobals { .. } => false,
             TraceOp::Move { src, .. } | TraceOp::Neg { src, .. } => *src == register,
             TraceOp::Add { lhs, rhs, .. }
             | TraceOp::Sub { lhs, rhs, .. }
@@ -992,6 +1352,7 @@ impl JitCompiler {
             }
             TraceOp::ArrayLen { array, .. } => *array == register,
             TraceOp::GuardNativeFunction { register: source, .. }
+            | TraceOp::GuardStructLayout { register: source, .. }
             | TraceOp::GuardFunction { register: source, .. }
             | TraceOp::GuardClosure { register: source, .. }
             | TraceOp::Guard {
@@ -1045,10 +1406,25 @@ impl JitCompiler {
             TraceOp::SpecializedOp { operands, .. } => operands.iter().any(|operand| {
                 matches!(operand, crate::jit::trace::Operand::Register(source) if *source == register)
             }),
-            TraceOp::NewEnumUnit { .. }
-            | TraceOp::NestedLoopCall { .. }
-            | TraceOp::Rebox { .. }
-            | TraceOp::DropSpecialized { .. } => false,
+            TraceOp::NestedLoopCall { .. } => true,
+            TraceOp::NewEnumUnit { .. } | TraceOp::Rebox { .. } | TraceOp::DropSpecialized { .. } => {
+                false
+            }
+            TraceOp::Label { .. } | TraceOp::Jump { .. } => false,
+            TraceOp::BranchIf {
+                condition_register, ..
+            } => *condition_register == register,
+            TraceOp::CallDirect {
+                callee,
+                receiver,
+                first_arg,
+                arg_count,
+                ..
+            } => {
+                *callee == register
+                    || *receiver == Some(register)
+                    || in_args(*first_arg, *arg_count)
+            }
         }
     }
 
@@ -1084,6 +1460,7 @@ impl JitCompiler {
             | TraceOp::CallNative { dest, .. }
             | TraceOp::CallFunction { dest, .. }
             | TraceOp::InlineCall { dest, .. }
+            | TraceOp::CallDirect { dest, .. }
             | TraceOp::CallMethod { dest, .. }
             | TraceOp::GetField { dest, .. }
             | TraceOp::NewArray { dest, .. }
@@ -1099,6 +1476,9 @@ impl JitCompiler {
     }
 
     fn update_scalar_registers(&mut self, op: &TraceOp) {
+        if matches!(op, TraceOp::At { .. }) {
+            return;
+        }
         let scalar_type = |ty: ValueType| {
             matches!(ty, ValueType::Bool | ValueType::Int | ValueType::Float).then_some(ty)
         };
@@ -1111,6 +1491,7 @@ impl JitCompiler {
         };
 
         match op {
+            TraceOp::At { .. } => {}
             TraceOp::LoadConst { dest, value } => {
                 let ty = match value {
                     Value::Bool(_) => Some(ValueType::Bool),
@@ -1238,13 +1619,21 @@ impl JitCompiler {
             }
             TraceOp::SetField { .. }
             | TraceOp::GuardNativeFunction { .. }
+            | TraceOp::GuardGlobals { .. }
+            | TraceOp::GuardStructLayout { .. }
             | TraceOp::GuardFunction { .. }
             | TraceOp::GuardClosure { .. }
             | TraceOp::GuardLoopContinue { .. }
-            | TraceOp::NestedLoopCall { .. }
             | TraceOp::Return { .. }
             | TraceOp::Unbox { .. }
             | TraceOp::DropSpecialized { .. } => {}
+            // The inner loop may have written any register.
+            TraceOp::NestedLoopCall { .. } => self.scalar_registers.clear(),
+            // Set by the `Label` arm itself.
+            TraceOp::Label { .. } | TraceOp::Jump { .. } | TraceOp::BranchIf { .. } => {}
+            TraceOp::CallDirect {
+                dest, result_type, ..
+            } => set(&mut self.scalar_registers, *dest, *result_type),
         }
     }
 
@@ -1266,26 +1655,37 @@ impl JitCompiler {
         size
     }
 
+    /// Distinct specialized ids: each gets one slot, however many times an
+    /// unrolled body unboxes it.
     fn count_specialized_slots(trace: &Trace) -> usize {
-        trace
+        let mut ids: Vec<usize> = trace
             .preamble
             .iter()
             .chain(trace.ops.iter())
             .chain(trace.postamble.iter())
-            .filter(|op| matches!(op, TraceOp::Unbox { .. }))
-            .count()
+            .filter_map(|op| match op {
+                TraceOp::Unbox { specialized_id, .. } => Some(*specialized_id),
+                _ => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
     }
 
+    /// Returns the scalar type of the value delivered to `dest`, when the
+    /// callee's environment proves one.
     fn compile_inline_call(
         &mut self,
         dest: u8,
         callee: u8,
         trace: &InlineTrace,
+        arg_types: &[Option<ValueType>],
         guard_index: &mut i32,
         guards: &mut Vec<Guard>,
-    ) -> Result<()> {
+    ) -> Result<Option<ValueType>> {
         self.inline_depth += 1;
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<Option<ValueType>> {
             if trace.register_count == 0 {
                 crate::jit::log(|| {
                     format!(
@@ -1293,7 +1693,7 @@ impl JitCompiler {
                         trace.function_idx
                     )
                 });
-                return self.compile_call_function(
+                self.compile_call_function(
                     dest,
                     callee,
                     trace.function_idx,
@@ -1301,7 +1701,8 @@ impl JitCompiler {
                     trace.arg_count,
                     trace.is_closure,
                     trace.upvalues_ptr,
-                );
+                )?;
+                return Ok(None);
             }
 
             crate::jit::log(|| {
@@ -1312,158 +1713,235 @@ impl JitCompiler {
             });
 
             let value_size = mem::size_of::<Value>() as i32;
-            let frame_size = trace.register_count as i32 * value_size;
             let frame_value_count = trace.register_count as i32;
-            let align_adjust = ((16 - (frame_size & 15)) & 15) as i32;
-            let metadata_size = 32i32;
-            let outer_fail = self.current_fail_label();
-            let inline_fail = self.ops.new_dynamic_label();
+            // Round the frame up so rsp stays 16-byte aligned.
+            let frame_size = (frame_value_count * value_size + 15) & !15;
+            let metadata_size = INLINE_METADATA_SIZE;
             let inline_end = self.ops.new_dynamic_label();
             unsafe extern "C" {
                 fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
-                fn jit_init_nil(dest: *mut Value) -> u8;
                 fn jit_drop_values(values: *mut Value, len: usize);
             }
 
-            // Save inline metadata (frame size, caller registers, previous inline frame).
+            // Push the inline record (see `JitInlineRecord`). It is linked
+            // into the unwind chain only once the frame below it is fully
+            // built, so a failure while building it exits cleanly.
+            let caller_resume_ip = self.current_fail_ip.map_or(0, |ip| ip + trace.resume_offset);
+            // An argument of unknown type whose callee register the body
+            // never writes is aliased: its bits are copied without touching
+            // the reference count, and the register is neither dropped at
+            // teardown nor moved out on exit (the record's mask tells
+            // `jit_materialize_inline_frames` to clone it instead). The
+            // caller's register keeps the value alive throughout, since the
+            // body only ever writes its own frame.
+            let alias_mask: u64 = trace
+                .arg_registers
+                .iter()
+                .enumerate()
+                .filter(|(arg_index, _)| {
+                    !matches!(
+                        arg_types.get(*arg_index).copied().flatten(),
+                        Some(ValueType::Int | ValueType::Bool | ValueType::Float)
+                    ) && *arg_index < 64
+                        && !trace
+                            .body
+                            .iter()
+                            .any(|op| Self::op_writes_register(op, *arg_index as u8))
+                })
+                .map(|(arg_index, _)| 1u64 << arg_index)
+                .fold(0, |mask, bit| mask | bit);
             dynasm!(self.ops
                 ; .arch x64
                 ; sub rsp, metadata_size
-            );
-            dynasm!(self.ops
-                ; .arch x64
-                ; mov eax, DWORD frame_size as _
-                ; mov [rsp], rax
+                ; mov QWORD [rsp], frame_value_count
                 ; mov [rsp + 8], r12
                 ; mov [rsp + 16], r15
-            );
-            dynasm!(self.ops
-                ; .arch x64
-                ; mov eax, DWORD align_adjust as _
+                ; mov rax, QWORD alias_mask as _
                 ; mov [rsp + 24], rax
-                ; mov r15, rsp
-            );
-            if align_adjust != 0 {
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; sub rsp, align_adjust
-                );
-            }
-            // Allocate space for callee registers.
-            dynasm!(self.ops
-                ; .arch x64
+                ; mov rax, QWORD trace.function_idx as _
+                ; mov [rsp + 32], rax
+                ; mov QWORD [rsp + 40], dest as i32
+                ; mov QWORD [rsp + 48], callee as i32
+                ; mov rax, QWORD caller_resume_ip as _
+                ; mov [rsp + 56], rax
+                // Allocate the callee frame and initialise every register to
+                // Nil (discriminant 0), so the argument moves below find
+                // nothing to drop. r12 still addresses the caller's registers.
                 ; sub rsp, frame_size
-                ; mov r12, rsp
             );
-
             for reg in 0..trace.register_count {
                 let offset = reg as i32 * value_size;
                 dynasm!(self.ops
                     ; .arch x64
-                    ; lea rdi, [r12 + offset]
-                    ; mov rax, QWORD jit_init_nil as *const () as _
-                    ; call rax
+                    ; mov BYTE [rsp + offset], 0
                 );
             }
 
-            // Copy positional arguments into callee registers.
+            // Copy positional arguments into the callee frame. A scalar of
+            // known type is a tag + payload store into the fresh Nil slot,
+            // an aliased argument a bit copy; anything else goes through the
+            // helper, which clones it.
+            let mut helper_copied: Vec<u8> = Vec::new();
             for (arg_index, src_reg) in trace.arg_registers.iter().enumerate() {
                 let src_offset = (*src_reg as i32) * value_size;
                 let dest_offset = (arg_index as i32) * value_size;
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov r14, [r15 + 8]
-                    ; lea rdi, [r14 + src_offset]
-                    ; lea rsi, [r12 + dest_offset]
-                    ; mov rax, QWORD jit_move_safe as *const () as _
-                    ; call rax
-                    ; test al, al
-                    ; jz =>inline_fail
-                );
+                match arg_types.get(arg_index).copied().flatten() {
+                    Some(ty @ (ValueType::Int | ValueType::Bool | ValueType::Float)) => {
+                        let tag = match ty {
+                            ValueType::Int => ValueTag::Int,
+                            ValueType::Bool => ValueTag::Bool,
+                            _ => ValueTag::Float,
+                        }
+                        .as_u8() as i8;
+                        dynasm!(self.ops
+                            ; .arch x64
+                            ; mov rax, [r12 + src_offset + 8]
+                            ; mov BYTE [rsp + dest_offset], tag
+                            ; mov [rsp + dest_offset + 8], rax
+                        );
+                    }
+                    _ if alias_mask & (1u64 << arg_index) != 0 => {
+                        for word in (0..value_size).step_by(8) {
+                            dynasm!(self.ops
+                                ; .arch x64
+                                ; mov rax, [r12 + src_offset + word]
+                                ; mov [rsp + dest_offset + word], rax
+                            );
+                        }
+                    }
+                    _ => {
+                        helper_copied.push(arg_index as u8);
+                        dynasm!(self.ops
+                            ; .arch x64
+                            ; lea rdi, [r12 + src_offset]
+                            ; lea rsi, [rsp + dest_offset]
+                            ; mov rax, QWORD jit_move_safe as *const () as _
+                            ; call rax
+                            ; test al, al
+                            ; jz >fail
+                        );
+                    }
+                }
+            }
+            // A failed argument move resumes at the call, in the caller.
+            self.emit_fail_stub();
+            for (arg_index, ty) in arg_types.iter().enumerate() {
+                if let Some(ty @ (ValueType::Int | ValueType::Bool | ValueType::Float)) = ty {
+                    self.scalar_registers.insert(arg_index as u8, *ty);
+                }
             }
 
-            self.fail_stack.push(inline_fail);
-            let inline_result = self.compile_ops(&trace.body, guard_index, guards);
-            self.fail_stack.pop();
-            inline_result?;
-
-            if let Some(ret_reg) = trace.return_register {
-                let ret_offset = (ret_reg as i32) * value_size;
-                let dest_offset = (dest as i32) * value_size;
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov r14, [r15 + 8]
-                    ; lea rdi, [r12 + ret_offset]
-                    ; lea rsi, [r14 + dest_offset]
-                    ; mov rax, QWORD jit_move_safe as *const () as _
-                    ; call rax
-                    ; test al, al
-                    ; jz =>inline_fail
-                );
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov rdi, r12
-                    ; mov esi, DWORD frame_value_count
-                    ; mov rax, QWORD jit_drop_values as *const () as _
-                    ; call rax
-                    ; add rsp, frame_size
-                );
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov eax, DWORD [r15 + 24]
-                    ; add rsp, rax
-                    ; mov r12, [r15 + 8]
-                    ; mov r15, [r15 + 16]
-                    ; add rsp, metadata_size
-                    ; jmp => inline_end
-                );
-            } else {
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov rdi, r12
-                    ; mov esi, DWORD frame_value_count
-                    ; mov rax, QWORD jit_drop_values as *const () as _
-                    ; call rax
-                    ; add rsp, frame_size
-                );
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov eax, DWORD [r15 + 24]
-                    ; add rsp, rax
-                    ; mov r12, [r15 + 8]
-                    ; mov r15, [r15 + 16]
-                    ; add rsp, metadata_size
-                );
-                self.compile_load_const(dest, &Value::Nil)?;
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; jmp => inline_end
-                );
-            }
-
+            // Point r12 at the callee frame and link the record.
             dynasm!(self.ops
                 ; .arch x64
-                ; => inline_fail
-                ; mov rdi, r12
-                ; mov esi, DWORD frame_value_count
-                ; mov rax, QWORD jit_drop_values as *const () as _
-                ; call rax
-                ; mov eax, DWORD [r15]
-                ; mov rbx, rax
-                ; add rsp, rbx
-            );
-            dynasm!(self.ops
-            ; .arch x64
-            ; mov eax, DWORD [r15 + 24]
-            ; add rsp, rax
-            ; mov r12, [r15 + 8]
-            ; mov r15, [r15 + 16]
-            ; add rsp, metadata_size
-            ; jmp => outer_fail
-            ; => inline_end
+                ; mov r12, rsp
+                ; lea r15, [rsp + frame_size]
             );
 
-            Ok(())
+            let call_ip = self.current_fail_ip;
+            let inline_result = self.compile_ops(&trace.body, guard_index, guards);
+            inline_result?;
+            // A failed result move exits from the callee frame at its last
+            // instruction; everything after the frame is popped is the
+            // caller's again.
+            let callee_last_ip = self.current_fail_ip;
+            self.current_fail_ip = call_ip;
+
+            // The result: a scalar of known type rides in r14 (callee-saved,
+            // unused until the exit path) across the frame teardown and is
+            // stored into the caller's register afterwards; anything else is
+            // moved by the helper while the callee frame is still live.
+            let result_type = trace.return_register.and_then(|ret_reg| {
+                self.scalar_registers
+                    .get(&ret_reg)
+                    .copied()
+                    .filter(|ty| matches!(ty, ValueType::Int | ValueType::Bool | ValueType::Float))
+            });
+            if let Some(ret_reg) = trace.return_register {
+                let ret_offset = (ret_reg as i32) * value_size;
+                if let Some(ty) = result_type {
+                    if ty == ValueType::Bool {
+                        dynasm!(self.ops ; .arch x64 ; movzx r14d, BYTE [r12 + ret_offset + 8]);
+                    } else {
+                        dynasm!(self.ops ; .arch x64 ; mov r14, [r12 + ret_offset + 8]);
+                    }
+                } else {
+                    self.current_fail_ip = callee_last_ip;
+                    let dest_offset = (dest as i32) * value_size;
+                    dynasm!(self.ops
+                        ; .arch x64
+                        ; mov r14, [r15 + 8]
+                        ; lea rdi, [r12 + ret_offset]
+                        ; lea rsi, [r14 + dest_offset]
+                        ; mov rax, QWORD jit_move_safe as *const () as _
+                        ; call rax
+                        ; test al, al
+                        ; jz >fail
+                    );
+                    self.emit_fail_stub();
+                    self.current_fail_ip = call_ip;
+                }
+            }
+
+            // Drop callee registers — unless every one of them is a scalar,
+            // an alias, or was never written (still Nil) — and pop the frame
+            // + record. Aliased registers are blanked first so the drop
+            // leaves the caller's value alone.
+            let may_own = (0..trace.register_count).any(|reg| {
+                !self.scalar_registers.contains_key(&reg)
+                    && (helper_copied.contains(&reg)
+                        || trace.body.iter().any(|op| Self::op_writes_register(op, reg)))
+            });
+            if may_own {
+                for reg in 0..trace.register_count.min(64) {
+                    if alias_mask & (1u64 << reg) != 0 {
+                        let offset = reg as i32 * value_size;
+                        dynasm!(self.ops ; .arch x64 ; mov BYTE [r12 + offset], 0);
+                    }
+                }
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; mov rdi, r12
+                    ; mov esi, DWORD frame_value_count
+                    ; mov rax, QWORD jit_drop_values as *const () as _
+                    ; call rax
+                );
+            }
+            dynasm!(self.ops
+                ; .arch x64
+                ; lea rsp, [r15 + metadata_size]
+                ; mov r12, [r15 + 8]
+                ; mov r15, [r15 + 16]
+            );
+
+            // Back in the caller's frame: the caller's environment is
+            // restored by our caller, so store through the generic path
+            // (which drops whatever `dest` held).
+            self.scalar_registers.clear();
+            match result_type {
+                Some(ValueType::Float) => {
+                    dynasm!(self.ops ; .arch x64 ; movq xmm0, r14);
+                    self.store_xmm0_as_float(dest);
+                }
+                Some(ValueType::Int) => {
+                    dynasm!(self.ops ; .arch x64 ; mov rax, r14);
+                    self.store_from_rax(dest, ValueTag::Int.as_u8());
+                }
+                Some(ValueType::Bool) => {
+                    dynasm!(self.ops ; .arch x64 ; mov rax, r14);
+                    self.store_from_rax(dest, ValueTag::Bool.as_u8());
+                }
+                _ => {}
+            }
+            if trace.return_register.is_none() {
+                self.compile_load_const(dest, &Value::Nil)?;
+            }
+            dynasm!(self.ops
+                ; .arch x64
+                ; => inline_end
+            );
+
+            Ok(result_type)
         })();
         self.inline_depth -= 1;
         result

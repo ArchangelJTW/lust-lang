@@ -1,0 +1,20 @@
+local arr: Array<int> = []
+local i: int = 0
+while i < 1000000 do
+    array.push(arr, i)
+    i = i + 1
+end
+local total: int = 0
+local pass: int = 0
+while pass < 10 do
+    local j: int = 0
+    local n: int = array.len(arr)
+    while j < n do
+        if arr[j] is Ok(v) then
+            total = total + v
+        end
+        j = j + 1
+    end
+    pass = pass + 1
+end
+println(total)

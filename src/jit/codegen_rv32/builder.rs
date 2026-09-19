@@ -77,7 +77,6 @@ impl JitCompiler {
         &mut self,
         trace: &Trace,
         trace_id: TraceId,
-        parent: Option<TraceId>,
         hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
         let frame_size = Self::compute_frame_size(trace);
@@ -131,9 +130,11 @@ impl JitCompiler {
             let offset = SPECIALIZED_BASE_OFFSET - slot * SPECIALIZED_SLOT_SIZE;
             let offset4 = offset + 4;
             let offset8 = offset + 8;
+            let offset12 = offset + 12;
             dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, offset]);
             dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, offset4]);
             dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, offset8]);
+            dynasm!(self.ops ; .arch riscv32i ; sw zero, [s0, offset12]);
         }
 
         // Hoisted constants
@@ -177,6 +178,7 @@ impl JitCompiler {
         // Postamble (rebox / cleanup, executed at every exit)
         jit::log(|| format!("🔧 RV32 JIT: postamble ({} ops)", trace.postamble.len()));
         self.compile_ops(&trace.postamble, &mut guard_index, &mut guards)?;
+        self.publish_remaining_specialized(trace)?;
 
         self.exit_stack.pop();
         self.fail_stack.pop();
@@ -234,10 +236,48 @@ impl JitCompiler {
             _data: data,
             trace: trace.clone(),
             guards,
-            parent,
-            side_traces: Vec::new(),
+            fail_sites: Vec::new(),
             hoisted_constants,
         })
+    }
+
+    /// After the postamble: publish and release every specialized slot the
+    /// postamble did not rebox. A slot whose register the trace overwrote
+    /// is dropped from the recorder's tracking (no `Rebox` is generated for
+    /// it), but its unbox still runs on every entry, so left alone it
+    /// leaked its copy and kept the array alive. Reboxing an empty slot is
+    /// a no-op, so this is safe for the slots the postamble did handle.
+    fn publish_remaining_specialized(&mut self, trace: &Trace) -> Result<()> {
+        let reboxed: Vec<usize> = trace
+            .postamble
+            .iter()
+            .filter_map(|op| match op {
+                TraceOp::Rebox { specialized_id, .. } => Some(*specialized_id),
+                _ => None,
+            })
+            .collect();
+        let layouts: Vec<(usize, SpecializedLayout)> = trace
+            .preamble
+            .iter()
+            .chain(trace.ops.iter())
+            .filter_map(|op| match op {
+                TraceOp::Unbox {
+                    specialized_id,
+                    layout,
+                    ..
+                } if !reboxed.contains(specialized_id) => Some((*specialized_id, layout.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut done = Vec::new();
+        for (id, layout) in layouts {
+            if done.contains(&id) || !self.specialized_values.contains_key(&id) {
+                continue;
+            }
+            done.push(id);
+            self.compile_rebox(0, id, &layout)?;
+        }
+        Ok(())
     }
 
     fn compile_ops(
@@ -343,6 +383,7 @@ impl JitCompiler {
                     condition_dest,
                     array,
                     index,
+                    ..
                 } => {
                     self.compile_array_index_ok(*value_dest, *condition_dest, *array, *index)?;
                 }
@@ -578,6 +619,7 @@ impl JitCompiler {
                     function_idx,
                     loop_start_ip,
                     bailout_ip,
+                    ..
                 } => {
                     // Nested loop: exit to interpreter so it can be compiled later.
                     let exit_label = self.current_exit_label();
@@ -590,7 +632,6 @@ impl JitCompiler {
                             loop_start_ip: *loop_start_ip,
                         },
                         fail_count: 0,
-                        side_trace: None,
                     });
                     dynasm!(self.ops
                         ; .arch riscv32i
@@ -599,8 +640,47 @@ impl JitCompiler {
                     );
                     *guard_index += 1;
                 }
+                TraceOp::GuardGlobals { version } => {
+                    // `VM::globals_version` is a u64; compare both halves.
+                    let offset = core::mem::offset_of!(crate::vm::VM, globals_version) as i32;
+                    let lo = *version as u32 as i32;
+                    let hi = (*version >> 32) as u32 as i32;
+                    let exit_label = self.current_exit_label();
+                    let current_guard_index = *guard_index;
+                    guards.push(Guard {
+                        index: current_guard_index as usize,
+                        bailout_ip: 0,
+                        kind: GuardKind::Globals { version: *version },
+                        fail_count: 0,
+                    });
+                    dynasm!(self.ops
+                        ; .arch riscv32i
+                        ; li t1, offset
+                        ; add t1, t1, s3
+                        ; lw t2, [t1, 0]
+                        ; li t3, lo
+                        ; bne t2, t3, >guard_fail
+                        ; lw t2, [t1, 4]
+                        ; li t3, hi
+                        ; beq t2, t3, >guard_ok
+                        ; guard_fail:
+                        ; li a0, current_guard_index + 1
+                        ; j => exit_label
+                        ; guard_ok:
+                    );
+                    *guard_index += 1;
+                }
                 TraceOp::Return { .. } => {
                     // Return ops are handled by the epilogue; no codegen needed here.
+                }
+                TraceOp::Label { .. }
+                | TraceOp::Jump { .. }
+                | TraceOp::BranchIf { .. }
+                | TraceOp::CallDirect { .. } => {
+                    return Err(crate::LustError::RuntimeError {
+                        message: "whole-function compilation is not supported on riscv32"
+                            .to_string(),
+                    });
                 }
             }
         }

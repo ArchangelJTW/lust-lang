@@ -1,0 +1,72 @@
+-- `array.push` / `array.len` through the module table inside hot loops.
+-- The push loop runs on the unboxed copy of `arr`; the loops below hand the
+-- array to natives and functions that the copy cannot follow, so those
+-- traces must give the specialization up.
+local arr: Array<int> = []
+local i: int = 0
+while i < 5000 do
+    array.push(arr, i * 2)
+    i = i + 1
+end
+println(array.len(arr))
+
+-- Specialized write, then the boxed array escapes to a native.
+local j: int = 0
+local popped: int = 0
+while j < 300 do
+    array.push(arr, j)
+    if array.pop(arr) is Some(v) then
+        popped = popped + v
+    end
+    j = j + 1
+end
+println(popped)
+println(array.len(arr))
+
+-- Specialized read, then the boxed array escapes to a Lust function.
+function sum_tail(a: Array<int>, from: int): int
+    local s: int = 0
+    local k: int = from
+    while k < array.len(a) do
+        if a[k] is Ok(v) then
+            s = s + v
+        end
+        k = k + 1
+    end
+    return s
+end
+
+local acc: int = 0
+local m: int = 0
+while m < 200 do
+    if arr[m] is Ok(v) then
+        acc = acc + v
+    end
+    acc = acc + sum_tail(arr, 4990)
+    m = m + 1
+end
+println(acc)
+
+-- The pushed values must all be there.
+local check: int = 0
+local n: int = 0
+while n < array.len(arr) do
+    if arr[n] is Ok(v) then
+        check = check + v
+    end
+    n = n + 1
+end
+println(check)
+
+-- A push in a loop nested in another hot loop: the outer trace records the
+-- inner body once and then hands the loop to its own trace, so the outer
+-- trace must not keep an unboxed copy of the array.
+local nested: Array<int> = [28]
+local o: int = 0
+while o < 10 do
+    o = o + 1
+    for k = (0 - 3), 5 do
+        array.push(nested, k)
+    end
+end
+println(array.len(nested))

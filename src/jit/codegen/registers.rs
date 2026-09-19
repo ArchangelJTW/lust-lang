@@ -23,6 +23,13 @@ impl JitCompiler {
             2 => ValueType::Int,
             _ => unreachable!("unsupported scalar Value discriminant"),
         };
+        // A Bool arrives as a byte in al; whatever the upper bits hold (an
+        // 8-byte payload load of a Bool, say) must not reach the payload
+        // or the `u8` helper argument, which the ABI lets the callee read
+        // as a full register.
+        if stored_type == ValueType::Bool {
+            dynasm!(self.ops ; .arch x64 ; movzx eax, al);
+        }
         if self.scalar_registers.get(&vm_reg) == Some(&stored_type) {
             dynasm!(self.ops
                 ; .arch x64

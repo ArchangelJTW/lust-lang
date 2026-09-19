@@ -1,0 +1,197 @@
+-- Functions called often enough to be compiled whole, using what the
+-- function compiler learned to handle: struct fields and methods, arrays,
+-- strings, globals and natives, function values, enums, and loops.
+
+struct Node
+    value: int
+    weight: float
+    left: Option<Node>
+    right: Option<Node>
+end
+
+impl Node
+    function total(self): int
+        return self.value * 2
+    end
+    function bump(self, d: int): int
+        self.value = self.value + d
+        return self.value
+    end
+end
+
+function build(depth: int, seed: int): Node
+    if depth == 0 then
+        return Node { value = seed, weight = 0.5, left = Option.None, right = Option.None }
+    end
+    local l: Node = build(depth - 1, seed * 2)
+    local r: Node = build(depth - 1, seed * 2 + 1)
+    return Node { value = seed, weight = 1.5, left = Option.Some(l), right = Option.Some(r) }
+end
+
+function sum(n: Node): int
+    local s: int = n.value + n:total()
+    if n.left is Some(l) then
+        s = s + sum(l)
+    end
+    if n.right is Some(r) then
+        s = s + sum(r)
+    end
+    return s
+end
+
+function weigh(n: Node): float
+    local w: float = n.weight
+    if n.left is Some(l) then
+        w = w + weigh(l)
+    end
+    if n.right is Some(r) then
+        w = w + weigh(r)
+    end
+    return w
+end
+
+function bump_all(n: Node, d: int): int
+    local b: int = n:bump(d)
+    if n.left is Some(l) then
+        b = b + bump_all(l, d)
+    end
+    if n.right is Some(r) then
+        b = b + bump_all(r, d)
+    end
+    return b
+end
+
+-- Loops inside a compiled function: while, for, break, early return.
+function count_below(arr: Array<int>, limit: int): int
+    local c: int = 0
+    local i: int = 0
+    while i < array.len(arr) do
+        if arr[i] is Ok(v) then
+            if v < limit then
+                c = c + 1
+            end
+        end
+        i = i + 1
+    end
+    return c
+end
+
+function first_over(arr: Array<int>, limit: int): int
+    for i = 0, array.len(arr) - 1 do
+        if arr[i] is Ok(v) then
+            if v > limit then
+                return i
+            end
+        end
+    end
+    return -1
+end
+
+function nested_sum(rows: int, cols: int): int
+    local s: int = 0
+    local r: int = 0
+    while r < rows do
+        local c: int = 0
+        while c < cols do
+            if c == 3 then
+                break
+            end
+            s = s + r * c
+            c = c + 1
+        end
+        r = r + 1
+    end
+    return s
+end
+
+-- Strings, natives and globals.
+function label(n: int): string
+    local s: string = "n=" .. tostring(n)
+    if n % 2 == 0 then
+        s = s .. " even"
+    end
+    return s .. " abs=" .. tostring(math.abs(0 - n))
+end
+
+-- Function values and closures as parameters.
+function apply_twice(f: function(int): int, x: int): int
+    return f(f(x))
+end
+
+function double(x: int): int
+    return x * 2
+end
+
+-- Enums built and matched.
+function safe_div(a: int, b: int): Option<int>
+    if b == 0 then
+        return Option.None
+    end
+    return Option.Some(a / b)
+end
+
+function div_or(a: int, b: int, fallback: int): int
+    if safe_div(a, b) is Some(v) then
+        return v
+    end
+    return fallback
+end
+
+local tree: Node = build(6, 1)
+local acc: int = 0
+local facc: float = 0.0
+local i: int = 0
+while i < 40 do
+    acc = acc + sum(tree)
+    facc = facc + weigh(tree)
+    acc = acc + bump_all(tree, 1)
+    i = i + 1
+end
+println(acc)
+println(facc)
+
+local data: Array<int> = []
+local k: int = 0
+while k < 50 do
+    array.push(data, (k * 7) % 23)
+    k = k + 1
+end
+local counts: int = 0
+local firsts: int = 0
+local nested: int = 0
+local j: int = 0
+while j < 60 do
+    counts = counts + count_below(data, j % 20)
+    firsts = firsts + first_over(data, j % 25)
+    nested = nested + nested_sum(j % 5, j % 7)
+    j = j + 1
+end
+println(counts)
+println(firsts)
+println(nested)
+
+local text: string = ""
+local m: int = 0
+while m < 40 do
+    text = label(m)
+    m = m + 1
+end
+println(text)
+
+local applied: int = 0
+local offset: int = 3
+local add_offset: function(int): int = function(x: int): int return x + offset end
+local q: int = 0
+while q < 40 do
+    applied = applied + apply_twice(double, q) + apply_twice(add_offset, q)
+    q = q + 1
+end
+println(applied)
+
+local divs: int = 0
+local d: int = 0
+while d < 40 do
+    divs = divs + div_or(100, d % 4, -1)
+    d = d + 1
+end
+println(divs)

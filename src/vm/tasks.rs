@@ -145,7 +145,7 @@ impl VM {
         &mut self,
         func: Value,
         args: Vec<Value>,
-    ) -> Result<CallFrame> {
+    ) -> Result<Box<CallFrame>> {
         match func {
             Value::Function(func_idx) => self.make_call_frame(func_idx, None, args, Vec::new()),
 
@@ -302,7 +302,9 @@ impl VM {
                 wrapper.chunk.patch_jump(jump_idx, loop_start);
 
                 let new_idx = self.functions.len();
+                self.call_meta.push(super::CallMeta::of(&wrapper));
                 self.functions.push(wrapper);
+                self.jit.push_function_slot();
                 new_idx
             }
         };

@@ -1,0 +1,72 @@
+-- The function a loop calls changes after 150 iterations. A failing
+-- function-identity guard must resume at the call, not restart `run`
+-- (log.n would then overshoot 200), whether the guard sits in the trace
+-- itself, inside an inlined callee, or two inlined calls deep.
+function inc(x: int): int
+    return x + 1
+end
+function dbl(x: int): int
+    return x * 2
+end
+function pick(i: int): function(int): int
+    if i > 150 then
+        return dbl
+    end
+    return inc
+end
+struct Log
+    n: int
+    m: int
+end
+function inner(log: Log, f: function(int): int, x: int): int
+    log.n = log.n + 1
+    return f(x)
+end
+function outer(log: Log, f: function(int): int, x: int): int
+    log.m = log.m + 1
+    local r: int = inner(log, f, x)
+    log.m = log.m + 10
+    return r
+end
+function direct(log: Log): int
+    local total: int = 0
+    local i: int = 0
+    while i < 200 do
+        local f: function(int): int = pick(i)
+        total = total + f(i)
+        log.n = log.n + 1
+        i = i + 1
+    end
+    return total
+end
+function inlined(log: Log): int
+    local total: int = 0
+    local i: int = 0
+    while i < 200 do
+        total = total + inner(log, pick(i), i)
+        i = i + 1
+    end
+    return total
+end
+function twice_inlined(log: Log, marks: Log): int
+    local total: int = 0
+    local i: int = 0
+    while i < 200 do
+        total = total + outer(log, pick(i), i)
+        marks.n = marks.n * 3 % 1000003 + log.n + log.m
+        i = i + 1
+    end
+    return total
+end
+local a: Log = Log { n = 0, m = 0 }
+println(direct(a))
+println(a.n)
+local b: Log = Log { n = 0, m = 0 }
+println(inlined(b))
+println(b.n)
+local c: Log = Log { n = 0, m = 0 }
+local marks: Log = Log { n = 0, m = 0 }
+println(twice_inlined(c, marks))
+println(c.n)
+println(c.m)
+println(marks.n)

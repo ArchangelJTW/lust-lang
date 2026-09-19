@@ -1,0 +1,7 @@
+local s: string = ""
+local i: int = 0
+while i < 100000 do
+    s = s .. tostring(i % 10)
+    i = i + 1
+end
+println(string.len(s))

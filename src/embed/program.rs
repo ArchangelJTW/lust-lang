@@ -593,8 +593,8 @@ impl EmbeddedProgram {
             type_name.clone(),
             variant_name.clone(),
             Value::Enum {
-                enum_name: type_name,
-                variant: variant_name,
+                enum_name: type_name.into(),
+                variant: variant_name.into(),
                 values: coerced_values,
             },
         ))

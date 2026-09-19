@@ -12,6 +12,12 @@ impl JitCompiler {
             specialized_values: HashMap::new(),
             scalar_registers: HashMap::new(),
             trace_start_ip: 0,
+            function_mode: false,
+            function_frame: (0, true),
+            function_entry_table: 0,
+            function_epilogue: None,
+            function_labels: HashMap::new(),
+            exit_is_handoff: false,
             current_fail_ip: None,
             fail_sites: Vec::new(),
             next_specialized_id: 0,
@@ -63,6 +69,66 @@ impl JitCompiler {
         ptr
     }
 
+    /// Compile whole-function code (see `jit::function`). `entry_table` is
+    /// the address of the compiled-function entry table, which the code
+    /// reads at each `CallDirect`.
+    pub fn compile_function(
+        &mut self,
+        trace: &Trace,
+        trace_id: TraceId,
+        register_count: u8,
+        entry_table: usize,
+    ) -> Result<CompiledTrace> {
+        self.function_mode = true;
+        self.function_frame = (register_count, trace.frame_may_own);
+        self.function_entry_table = entry_table;
+        self.function_labels.clear();
+        let result = self.compile_trace(trace, trace_id, Vec::new());
+        self.function_mode = false;
+        result
+    }
+
+    pub(super) fn function_label(&mut self, id: usize) -> dynasmrt::DynamicLabel {
+        if let Some(label) = self.function_labels.get(&id) {
+            return *label;
+        }
+        let label = self.ops.new_dynamic_label();
+        self.function_labels.insert(id, label);
+        label
+    }
+
+    /// Generic exit with a guard return value (guard_index + 1). Function
+    /// code also records where and why it left (see `JIT_EXIT_INFO`), since
+    /// the result propagates through native callers unchanged.
+    pub(super) fn emit_guard_exit(&mut self, guard_return_value: i32) {
+        let exit_label = self.current_exit_label();
+        if self.function_mode {
+            let kind = if self.exit_is_handoff {
+                jit::EXIT_KIND_HANDOFF
+            } else {
+                jit::EXIT_KIND_GUARD
+            };
+            let ip = self.current_fail_ip.unwrap_or(usize::MAX >> 16);
+            self.emit_exit_info(ip, kind);
+        }
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov eax, DWORD guard_return_value
+            ; jmp => exit_label
+        );
+    }
+
+    /// `JIT_EXIT_INFO = ip | kind << EXIT_KIND_SHIFT`.
+    pub(super) fn emit_exit_info(&mut self, ip: usize, kind: usize) {
+        let info = (ip & ((1usize << jit::EXIT_KIND_SHIFT) - 1)) | (kind << jit::EXIT_KIND_SHIFT);
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov rax, QWORD jit::exit_info_cell() as _
+            ; mov rcx, QWORD info as _
+            ; mov [rax], rcx
+        );
+    }
+
     pub fn compile_trace(
         &mut self,
         trace: &Trace,
@@ -78,8 +144,13 @@ impl JitCompiler {
         let mut guard_index = 0i32;
         let exit_label = self.ops.new_dynamic_label();
         let fail_label = self.ops.new_dynamic_label();
+        let epilogue_label = self.ops.new_dynamic_label();
+        self.function_epilogue = Some(epilogue_label);
         self.exit_stack.push(exit_label);
         crate::jit::log(|| format!("🔧 JIT: Emitting prologue with sub rsp, {}", stack_size));
+        // Entry: rdi = registers, rsi = VM, rdx = the inline record a native
+        // caller pushed for this frame (function mode; null from the
+        // interpreter). Traces are only ever entered by the interpreter.
         dynasm!(self.ops
             ; .arch x64
             ; push rbp
@@ -90,10 +161,14 @@ impl JitCompiler {
             ; push r14
             ; push r15
             ; sub rsp, stack_size
-            ; xor r15, r15
             ; mov r12, rdi
             ; mov r13, rsi
         );
+        if self.function_mode {
+            dynasm!(self.ops ; .arch x64 ; mov r15, rdx);
+        } else {
+            dynasm!(self.ops ; .arch x64 ; xor r15, r15);
+        }
         for slot in 0..Self::count_specialized_slots(trace) as i32 {
             let offset = SPECIALIZED_BASE_OFFSET - slot * SPECIALIZED_SLOT_SIZE;
             dynasm!(self.ops
@@ -112,6 +187,18 @@ impl JitCompiler {
         jit::log(|| format!("🔧 JIT: Compiling preamble ({} ops)", trace.preamble.len()));
         self.compile_ops(&trace.preamble, &mut guard_index, &mut guards)?;
 
+        // `>fail` references so far (preamble) bind here: a failed unbox at
+        // entry is a bare failure (-1), restarting the iteration; left
+        // pending they would bind to the body's first fail stub and resume
+        // at that instruction instead.
+        dynasm!(self.ops
+            ; .arch x64
+            ; jmp >preamble_fail_skip
+            ; fail:
+            ; jmp => fail_label
+            ; preamble_fail_skip:
+        );
+
         // Create a loop_start label AFTER preamble, BEFORE loop body
         self.current_fail_ip = None;
         let loop_start_label = self.ops.new_dynamic_label();
@@ -125,11 +212,21 @@ impl JitCompiler {
         let compile_result = self.compile_ops(&trace.ops, &mut guard_index, &mut guards);
         compile_result?;
 
-        // At end of loop body, jump back to loop_start to loop
-        dynasm!(self.ops
-            ; .arch x64
-            ; jmp => loop_start_label
-        );
+        if self.function_mode {
+            // Every path through function code ends in a `Return`; falling
+            // off the end is a compiler bug, reported as a bare failure.
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov eax, DWORD -1
+                ; jmp => exit_label
+            );
+        } else {
+            // At end of loop body, jump back to loop_start to loop
+            dynasm!(self.ops
+                ; .arch x64
+                ; jmp => loop_start_label
+            );
+        }
 
         // Body exits: preserve the exit code, then turn any inline-call
         // frames into interpreter frames so r12 is the trace's own register
@@ -170,6 +267,7 @@ impl JitCompiler {
         // same exit, which unwinds the inline frames.
         dynasm!(self.ops
             ; .arch x64
+            ; => epilogue_label
             ; lea rsp, [rbp - 40]
             ; pop r15
             ; pop r14
@@ -836,7 +934,54 @@ impl JitCompiler {
                     self.compile_specialized_op(op, operands)?;
                 }
 
-                TraceOp::Return { .. } => {}
+                TraceOp::Return { value } => {
+                    if self.function_mode && self.inline_depth == 0 {
+                        self.compile_function_return(*value)?;
+                    }
+                }
+
+                TraceOp::Label { id, scalars } => {
+                    let label = self.function_label(*id);
+                    dynasm!(self.ops ; .arch x64 ; => label);
+                    self.scalar_registers = scalars.iter().copied().collect();
+                }
+
+                TraceOp::Jump { label } => {
+                    let label = self.function_label(*label);
+                    dynasm!(self.ops ; .arch x64 ; jmp => label);
+                }
+
+                TraceOp::BranchIf {
+                    condition_register,
+                    expect_truthy,
+                    label,
+                } => {
+                    self.compile_branch_if(*condition_register, *expect_truthy, *label);
+                }
+
+                TraceOp::CallDirect {
+                    dest,
+                    callee,
+                    function_idx,
+                    first_arg,
+                    arg_count,
+                    callee_registers,
+                    call_ip,
+                    result_type,
+                } => {
+                    self.compile_call_direct(
+                        *dest,
+                        *callee,
+                        *function_idx,
+                        *first_arg,
+                        *arg_count,
+                        *callee_registers,
+                        *call_ip,
+                        *result_type,
+                        guard_index,
+                        guards,
+                    )?;
+                }
             }
             self.update_scalar_registers(op);
             if Self::op_may_fail(op) {
@@ -852,7 +997,7 @@ impl JitCompiler {
     /// at the instruction the op came from (inside an inlined body, in the
     /// callee frame the exit path materializes). Without a known ip the
     /// branches fall through to the trace's generic `fail:` (-1).
-    fn emit_fail_stub(&mut self) {
+    pub(super) fn emit_fail_stub(&mut self) {
         let Some(ip) = self.current_fail_ip else {
             return;
         };
@@ -863,6 +1008,12 @@ impl JitCompiler {
             ; .arch x64
             ; jmp >fail_stub_skip
             ; fail:
+        );
+        if self.function_mode {
+            self.emit_exit_info(ip, jit::EXIT_KIND_FAIL);
+        }
+        dynasm!(self.ops
+            ; .arch x64
             ; mov eax, DWORD code
             ; jmp => exit_label
             ; fail_stub_skip:
@@ -884,6 +1035,7 @@ impl JitCompiler {
                 | TraceOp::CallNative { .. }
                 | TraceOp::CallFunction { .. }
                 | TraceOp::InlineCall { .. }
+                | TraceOp::CallDirect { .. }
                 | TraceOp::CallMethod { .. }
                 | TraceOp::GetField { .. }
                 | TraceOp::SetField { .. }
@@ -1044,11 +1196,12 @@ impl JitCompiler {
         dynasm!(self.ops ; .arch x64 ; mov rax, QWORD failed_value);
         self.store_from_rax(condition_register, ValueTag::Bool.as_u8());
         let guard_return_value = (guard_index + 1) as i32;
-        let exit_label = self.current_exit_label();
         dynasm!(self.ops
             ; .arch x64
-            ; mov eax, DWORD guard_return_value
-            ; jmp =>exit_label
+        );
+        self.emit_guard_exit(guard_return_value);
+        dynasm!(self.ops
+            ; .arch x64
             ; =>guard_ok
         );
 
@@ -1119,6 +1272,10 @@ impl JitCompiler {
                 | TraceOp::Rebox { .. }
                 | TraceOp::DropSpecialized { .. }
                 | TraceOp::SpecializedOp { .. }
+                | TraceOp::Label { .. }
+                | TraceOp::Jump { .. }
+                | TraceOp::BranchIf { .. }
+                | TraceOp::CallDirect { .. }
         )
     }
 
@@ -1208,6 +1365,16 @@ impl JitCompiler {
             TraceOp::NewEnumUnit { .. } | TraceOp::Rebox { .. } | TraceOp::DropSpecialized { .. } => {
                 false
             }
+            TraceOp::Label { .. } | TraceOp::Jump { .. } => false,
+            TraceOp::BranchIf {
+                condition_register, ..
+            } => *condition_register == register,
+            TraceOp::CallDirect {
+                callee,
+                first_arg,
+                arg_count,
+                ..
+            } => *callee == register || in_args(*first_arg, *arg_count),
         }
     }
 
@@ -1243,6 +1410,7 @@ impl JitCompiler {
             | TraceOp::CallNative { dest, .. }
             | TraceOp::CallFunction { dest, .. }
             | TraceOp::InlineCall { dest, .. }
+            | TraceOp::CallDirect { dest, .. }
             | TraceOp::CallMethod { dest, .. }
             | TraceOp::GetField { dest, .. }
             | TraceOp::NewArray { dest, .. }
@@ -1410,6 +1578,11 @@ impl JitCompiler {
             | TraceOp::DropSpecialized { .. } => {}
             // The inner loop may have written any register.
             TraceOp::NestedLoopCall { .. } => self.scalar_registers.clear(),
+            // Set by the `Label` arm itself.
+            TraceOp::Label { .. } | TraceOp::Jump { .. } | TraceOp::BranchIf { .. } => {}
+            TraceOp::CallDirect {
+                dest, result_type, ..
+            } => set(&mut self.scalar_registers, *dest, *result_type),
         }
     }
 

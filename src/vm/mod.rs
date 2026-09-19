@@ -295,6 +295,19 @@ impl ShallowKind {
     }
 }
 
+impl ShallowKind {
+    /// The JIT's scalar type for this kind, when it is one.
+    pub(super) fn value_type(self) -> Option<crate::jit::trace::ValueType> {
+        use crate::jit::trace::ValueType;
+        match self {
+            Self::Int => Some(ValueType::Int),
+            Self::Float => Some(ValueType::Float),
+            Self::Bool => Some(ValueType::Bool),
+            _ => None,
+        }
+    }
+}
+
 impl CallMeta {
     pub(super) fn of(function: &Function) -> Self {
         use crate::ast::TypeKind;

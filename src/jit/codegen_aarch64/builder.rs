@@ -17,6 +17,12 @@ impl JitCompiler {
             pin_active: false,
             dirty_pins: Vec::new(),
             trace_start_ip: 0,
+            function_mode: false,
+            function_frame: (0, true),
+            function_entry_table: 0,
+            function_epilogue: None,
+            function_labels: HashMap::new(),
+            exit_is_handoff: false,
             current_fail_ip: None,
             fail_sites: Vec::new(),
             next_specialized_id: 0,
@@ -68,6 +74,34 @@ impl JitCompiler {
         ptr
     }
 
+    /// Compile whole-function code (see `jit::function`). `entry_table` is
+    /// the address of the compiled-function entry table, which the code
+    /// reads at each `CallDirect`.
+    pub fn compile_function(
+        &mut self,
+        trace: &Trace,
+        trace_id: TraceId,
+        register_count: u8,
+        entry_table: usize,
+    ) -> Result<CompiledTrace> {
+        self.function_mode = true;
+        self.function_frame = (register_count, trace.frame_may_own);
+        self.function_entry_table = entry_table;
+        self.function_labels.clear();
+        let result = self.compile_trace(trace, trace_id, Vec::new());
+        self.function_mode = false;
+        result
+    }
+
+    pub(super) fn function_label(&mut self, id: usize) -> dynasmrt::DynamicLabel {
+        if let Some(label) = self.function_labels.get(&id) {
+            return *label;
+        }
+        let label = self.ops.new_dynamic_label();
+        self.function_labels.insert(id, label);
+        label
+    }
+
     pub fn compile_trace(
         &mut self,
         trace: &Trace,
@@ -77,7 +111,11 @@ impl JitCompiler {
         self.scalar_registers.clear();
         self.trace_start_ip = trace.start_ip;
         self.last_fail_island = self.ops.offset().0;
-        self.pins = pins::plan(&hoisted_constants, &trace.preamble, &trace.ops);
+        self.pins = if self.function_mode {
+            HashMap::new()
+        } else {
+            pins::plan(&hoisted_constants, &trace.preamble, &trace.ops)
+        };
         crate::jit::log(|| {
             let mut text = format!("📋 JIT(aarch64): trace {:?} preamble:\n", trace_id);
             for op in &trace.preamble {
@@ -121,21 +159,42 @@ impl JitCompiler {
             ; mov x29, sp
             ; stp x19, x20, [sp, -16]!
             ; stp x21, x22, [sp, -16]!
-            ; stp x23, x24, [sp, -16]!
-            ; stp x25, x26, [sp, -16]!
-            ; stp x27, x28, [sp, -16]!
-            ; stp d8, d9, [sp, -16]!
-            ; stp d10, d11, [sp, -16]!
-            ; stp d12, d13, [sp, -16]!
-            ; stp d14, d15, [sp, -16]!
         );
+        // Function code never pins, so x25..x28 and d8..d15 stay untouched
+        // and need no saving; x23 and x24 hold the native stack limit and
+        // the entry table for the function's calls.
+        if self.function_mode {
+            dynasm!(self.ops ; .arch aarch64 ; stp x23, x24, [sp, -16]!);
+        } else {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; stp x23, x24, [sp, -16]!
+                ; stp x25, x26, [sp, -16]!
+                ; stp x27, x28, [sp, -16]!
+                ; stp d8, d9, [sp, -16]!
+                ; stp d10, d11, [sp, -16]!
+                ; stp d12, d13, [sp, -16]!
+                ; stp d14, d15, [sp, -16]!
+            );
+        }
         self.emit_sub_sp(stack_size);
+        // Entry: x0 = registers, x1 = VM, x2 = the inline record a native
+        // caller pushed for this frame (function mode; null from the
+        // interpreter). Traces are only ever entered by the interpreter.
         dynasm!(self.ops
             ; .arch aarch64
             ; mov x19, x0
             ; mov x20, x1
-            ; mov x21, xzr
         );
+        if self.function_mode {
+            dynasm!(self.ops ; .arch aarch64 ; mov x21, x2);
+            self.emit_mov_imm64(23, jit::stack_limit_cell() as u64);
+            self.emit_mov_imm64(24, self.function_entry_table as u64);
+            dynasm!(self.ops ; .arch aarch64 ; ldr x23, [x23]);
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; mov x21, xzr);
+        }
+        self.function_epilogue = Some(epilogue_label);
         for slot in 0..Self::count_specialized_slots(trace) as i32 {
             let offset = SPECIALIZED_BASE_OFFSET - slot * SPECIALIZED_SLOT_SIZE;
             self.emit_slot_addr(11, offset);
@@ -194,15 +253,25 @@ impl JitCompiler {
             ; loop_start:
         );
 
-        // Compile main trace body (the loop)
+        // Compile main trace body (the loop), or the function body.
         let compile_result = self.compile_ops(&trace.ops, &mut guard_index, &mut guards);
         compile_result?;
 
-        // At end of loop body, jump back to loop_start to loop
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; b => loop_start_label
-        );
+        if self.function_mode {
+            // Every path through function code ends in a `Return`; falling
+            // off the end is a compiler bug, reported as a bare failure.
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; movn w0, 0
+                ; b => exit_label
+            );
+        } else {
+            // At end of loop body, jump back to loop_start to loop
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; b => loop_start_label
+            );
+        }
         if has_pins {
             self.exit_stack.pop();
         }
@@ -258,19 +327,33 @@ impl JitCompiler {
 
         // Epilogue: sp is recovered from the frame pointer, so the exit path
         // is valid regardless of how deep an inline frame we came from.
-        let saved_below_fp = SAVED_BELOW_FP as u32;
+        let saved_below_fp = if self.function_mode {
+            48u32
+        } else {
+            SAVED_BELOW_FP as u32
+        };
         dynasm!(self.ops
             ; .arch aarch64
             ; mov w0, w22
             ; => epilogue_label
             ; sub sp, x29, #saved_below_fp
-            ; ldp d14, d15, [sp], 16
-            ; ldp d12, d13, [sp], 16
-            ; ldp d10, d11, [sp], 16
-            ; ldp d8, d9, [sp], 16
-            ; ldp x27, x28, [sp], 16
-            ; ldp x25, x26, [sp], 16
-            ; ldp x23, x24, [sp], 16
+        );
+        if self.function_mode {
+            dynasm!(self.ops ; .arch aarch64 ; ldp x23, x24, [sp], 16);
+        } else {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldp d14, d15, [sp], 16
+                ; ldp d12, d13, [sp], 16
+                ; ldp d10, d11, [sp], 16
+                ; ldp d8, d9, [sp], 16
+                ; ldp x27, x28, [sp], 16
+                ; ldp x25, x26, [sp], 16
+                ; ldp x23, x24, [sp], 16
+            );
+        }
+        dynasm!(self.ops
+            ; .arch aarch64
             ; ldp x21, x22, [sp], 16
             ; ldp x19, x20, [sp], 16
             ; ldp x29, x30, [sp], 16
@@ -333,7 +416,7 @@ impl JitCompiler {
     /// that exits with this op's fail-site code, so the interpreter resumes
     /// at the instruction the op came from. Without a known ip the branches
     /// fall through to the trace's generic `fail:` (-1).
-    fn emit_fail_stub(&mut self) {
+    pub(super) fn emit_fail_stub(&mut self) {
         let Some(ip) = self.current_fail_ip else {
             return;
         };
@@ -345,6 +428,9 @@ impl JitCompiler {
             ; b >fail_stub_skip
             ; fail:
         );
+        if self.function_mode {
+            self.emit_exit_info(ip, jit::EXIT_KIND_FAIL);
+        }
         self.emit_mov_imm_i32(0, code);
         dynasm!(self.ops
             ; .arch aarch64
@@ -368,6 +454,7 @@ impl JitCompiler {
                 | TraceOp::CallNative { .. }
                 | TraceOp::CallFunction { .. }
                 | TraceOp::InlineCall { .. }
+                | TraceOp::CallDirect { .. }
                 | TraceOp::CallMethod { .. }
                 | TraceOp::GetField { .. }
                 | TraceOp::SetField { .. }
@@ -1020,7 +1107,54 @@ impl JitCompiler {
                     self.compile_specialized_op(op, operands)?;
                 }
 
-                TraceOp::Return { .. } => {}
+                TraceOp::Return { value } => {
+                    if self.function_mode && self.inline_depth == 0 {
+                        self.compile_function_return(*value, guard_index, guards)?;
+                    }
+                }
+
+                TraceOp::Label { id, scalars } => {
+                    let label = self.function_label(*id);
+                    dynasm!(self.ops ; .arch aarch64 ; => label);
+                    self.scalar_registers = scalars.iter().copied().collect();
+                }
+
+                TraceOp::Jump { label } => {
+                    let label = self.function_label(*label);
+                    dynasm!(self.ops ; .arch aarch64 ; b => label);
+                }
+
+                TraceOp::BranchIf {
+                    condition_register,
+                    expect_truthy,
+                    label,
+                } => {
+                    self.compile_branch_if(*condition_register, *expect_truthy, *label);
+                }
+
+                TraceOp::CallDirect {
+                    dest,
+                    callee,
+                    function_idx,
+                    first_arg,
+                    arg_count,
+                    callee_registers,
+                    call_ip,
+                    result_type,
+                } => {
+                    self.compile_call_direct(
+                        *dest,
+                        *callee,
+                        *function_idx,
+                        *first_arg,
+                        *arg_count,
+                        *callee_registers,
+                        *call_ip,
+                        *result_type,
+                        guard_index,
+                        guards,
+                    )?;
+                }
             }
             self.update_scalar_registers(op);
             if Self::op_may_fail(op) {
@@ -1257,6 +1391,10 @@ impl JitCompiler {
                 | TraceOp::Rebox { .. }
                 | TraceOp::DropSpecialized { .. }
                 | TraceOp::SpecializedOp { .. }
+                | TraceOp::Label { .. }
+                | TraceOp::Jump { .. }
+                | TraceOp::BranchIf { .. }
+                | TraceOp::CallDirect { .. }
         )
     }
 
@@ -1346,6 +1484,16 @@ impl JitCompiler {
             TraceOp::NewEnumUnit { .. } | TraceOp::Rebox { .. } | TraceOp::DropSpecialized { .. } => {
                 false
             }
+            TraceOp::Label { .. } | TraceOp::Jump { .. } => false,
+            TraceOp::BranchIf {
+                condition_register, ..
+            } => *condition_register == register,
+            TraceOp::CallDirect {
+                callee,
+                first_arg,
+                arg_count,
+                ..
+            } => *callee == register || in_args(*first_arg, *arg_count),
         }
     }
 
@@ -1381,6 +1529,7 @@ impl JitCompiler {
             | TraceOp::CallNative { dest, .. }
             | TraceOp::CallFunction { dest, .. }
             | TraceOp::InlineCall { dest, .. }
+            | TraceOp::CallDirect { dest, .. }
             | TraceOp::CallMethod { dest, .. }
             | TraceOp::GetField { dest, .. }
             | TraceOp::NewArray { dest, .. }
@@ -1548,6 +1697,11 @@ impl JitCompiler {
             | TraceOp::DropSpecialized { .. } => {}
             // The inner loop may have written any register.
             TraceOp::NestedLoopCall { .. } => self.scalar_registers.clear(),
+            // Set by the `Label` arm itself.
+            TraceOp::Label { .. } | TraceOp::Jump { .. } | TraceOp::BranchIf { .. } => {}
+            TraceOp::CallDirect {
+                dest, result_type, ..
+            } => set(&mut self.scalar_registers, *dest, *result_type),
         }
     }
 

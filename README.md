@@ -203,10 +203,19 @@ loop nests run natively end to end.
 
 Straight-line Lust functions and struct methods are inlined into the trace;
 other calls are opaque operations inside it, so a hot loop stays native while a
-branch-heavy or recursive callee executes through the interpreter. Pure direct
-or mutual recursion has no backward jump, so the recursive function itself is
-not compiled; general recursion requires a separate finite-function JIT mode
-rather than the cyclic loop-trace compiler.
+branch-heavy callee executes through the interpreter.
+
+Loop-free functions are also compiled whole after thirty calls: their bytecode
+is translated statically, every branch included, and the code calls other
+compiled functions natively — frames on the machine stack, arguments and
+results copied directly — so direct and mutual recursion run native end to
+end. A function using something the function compiler does not handle yet
+(loops, field access, arrays, strings, closures, native calls) keeps running
+in the interpreter, with its loops traced as before; a compiled caller hands
+such a call, or one that would exhaust the native stack, back to the
+interpreter at the call instruction. Exits from any depth of native calls
+turn the native frames into interpreter frames first, so errors and stack
+traces look the same either way.
 
 Environment switches, read once at VM creation:
 
@@ -214,6 +223,8 @@ Environment switches, read once at VM creation:
   semantics; use this to check a result against it).
 - `LUST_JIT_NOPIN=1` keeps the JIT but disables register pinning on aarch64,
   for bisecting and benchmarking.
+- `LUST_JIT_NOFN=1` keeps loop traces but disables whole-function
+  compilation.
 
 Two tools check the JIT against the interpreter, and should be run on every
 backend change:

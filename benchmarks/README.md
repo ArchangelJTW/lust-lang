@@ -156,14 +156,14 @@ milliseconds, single run each:
 
 | program   | lust-vm | lust-jit | luajit | lua 5.5 |
 |-----------|--------:|---------:|-------:|--------:|
-| fields    |    1114 |      185 |     63 |     119 |
-| array     |    1811 |      358 |     59 |      79 |
-| calls     |     855 |      159 |     30 |     122 |
-| methods   |    1876 |      387 |     27 |     215 |
-| strings   |   13864 |    14241 |  26467 |    7286 |
-| fib       |     182 |      184 |     21 |      37 |
-| nested    |     407 |       22 |     28 |      76 |
-| floatmath |     590 |       53 |     37 |      90 |
+| fields    |    1101 |      182 |     58 |     114 |
+| array     |    1746 |      357 |     55 |      72 |
+| calls     |     856 |      158 |     29 |     125 |
+| methods   |    1893 |      377 |     29 |     218 |
+| strings   |   14367 |    14116 |  26420 |    7197 |
+| fib       |     178 |       35 |     21 |      35 |
+| nested    |     374 |       22 |     29 |      74 |
+| floatmath |     567 |       53 |     36 |      91 |
 
 The interpreter numbers were 3-90x worse before the fixes to cycle
 collection cost, call-frame copying and argument checking on this branch
@@ -174,6 +174,7 @@ inner loop's trace was recompiled every time). `calls` was 367 ms and
 `methods` 562 ms with the JIT before inlined calls copied scalar arguments
 and results natively and aliased struct arguments instead of cloning them;
 `fib` 271 ms before the interpreter's call path stopped re-deriving the
-callee's signature on every call. Remaining gaps against Lua: recursion
-(the JIT does not compile recursive functions), and `strings`, where every
-engine is quadratic in `s = s .. x`.
+callee's signature on every call, and 178 ms before loop-free functions were
+compiled whole with native calls between them (`fib(34)`: 1.08 s interpreted,
+0.12 s compiled, Lua 5.5 0.13 s, LuaJIT 0.02 s). Remaining gap against Lua:
+`strings`, where every engine is quadratic in `s = s .. x`.

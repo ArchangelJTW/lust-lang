@@ -1493,6 +1493,26 @@ pub unsafe extern "C" fn jit_init_nil(dest: *mut Value) -> u8 {
     }
 }
 
+/// A compiled function's `Return`: move `src` (null = Nil) into `dest`,
+/// dropping what `dest` held and leaving `src` Nil so the frame's drop
+/// pass does not see the value twice.
+///
+/// # Safety
+/// `dest` points at a live `Value`; `src` is null or points at one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_return_value(src: *mut Value, dest: *mut Value) {
+    unsafe {
+        let value = if src.is_null() {
+            Value::Nil
+        } else {
+            let value = ptr::read(src);
+            ptr::write(src, Value::Nil);
+            value
+        };
+        replace_value(dest, value);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_drop_values(values: *mut Value, len: usize) {
     unsafe {
@@ -2394,14 +2414,12 @@ pub unsafe extern "C" fn jit_call_function_safe(
         let vm = &mut *vm_ptr;
         push_vm_ptr(vm_ptr);
 
-        // Temporarily disable JIT to prevent recursive JIT execution
-        let jit_was_enabled = vm.jit.enabled;
-        vm.jit.enabled = false;
-
+        // The callee runs with the JIT on: its loops get their own traces
+        // and its body its own compiled code. Nothing in the trace that
+        // made this call depends on the JIT being idle meanwhile — it holds
+        // its own code alive and has written every register back.
         let call_result = vm.call_value(&callee, args);
 
-        // Restore JIT state
-        vm.jit.enabled = jit_was_enabled;
         pop_vm_ptr();
 
         match call_result {

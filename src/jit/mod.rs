@@ -1,5 +1,6 @@
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 pub mod codegen;
+pub mod function;
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 pub mod codegen_aarch64;
 #[cfg(all(feature = "rv32", target_arch = "riscv32"))]
@@ -64,6 +65,50 @@ where
 }
 
 pub const HOT_THRESHOLD: u32 = 5;
+/// Calls to a bytecode function before its whole body is compiled.
+pub const FUNCTION_HOT_THRESHOLD: u32 = 30;
+/// Result of compiled function code entered from the interpreter whose
+/// `Return` reached: `FUNCTION_RETURN_BASE + register` (255 = Nil).
+pub const FUNCTION_RETURN_BASE: i32 = 1 << 20;
+/// Result of compiled function code called natively by other compiled code
+/// when it returned normally (anything else is an exit to propagate).
+pub const NATIVE_RETURNED: i32 = 1 << 30;
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// Lowest machine stack address native-to-native calls may grow to. Set
+    /// by the VM before entering function code; a call that would go below
+    /// it is handed to the interpreter instead. Per thread: compiled code
+    /// embeds the address of its own thread's cell (a VM never changes
+    /// threads).
+    pub static JIT_STACK_LIMIT: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    /// Where the interpreter resumes after function code exits (any depth
+    /// of native calls in): the exiting site's bytecode ip in the low 48
+    /// bits, its kind in the high bits (`EXIT_KIND_*`). Set by the exit
+    /// stubs of function code just before they leave.
+    pub static JIT_EXIT_INFO: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Address of this thread's `JIT_STACK_LIMIT` cell, for compiled code.
+#[cfg(feature = "std")]
+pub fn stack_limit_cell() -> usize {
+    JIT_STACK_LIMIT.with(|cell| cell as *const _ as usize)
+}
+
+/// Address of this thread's `JIT_EXIT_INFO` cell, for compiled code.
+#[cfg(feature = "std")]
+pub fn exit_info_cell() -> usize {
+    JIT_EXIT_INFO.with(|cell| cell as *const _ as usize)
+}
+/// Machine stack kept free below the interpreter's entry into function
+/// code before native calls hand over to the interpreter.
+pub const NATIVE_STACK_RESERVE: usize = 1 << 20;
+pub const EXIT_KIND_SHIFT: u32 = 48;
+/// A guard on something the code assumed: the function's code is evicted.
+pub const EXIT_KIND_GUARD: usize = 0;
+/// A call handed to the interpreter (no compiled callee / stack limit).
+pub const EXIT_KIND_HANDOFF: usize = 1;
+/// A failing op: the interpreter re-executes it and raises its error.
+pub const EXIT_KIND_FAIL: usize = 2;
 pub const MAX_TRACE_LENGTH: usize = 2000; // Increased to allow more loop unrolling
 pub const UNROLL_FACTOR: usize = 32;
 /// How many times to unroll a loop during trace recording
@@ -159,6 +204,11 @@ pub enum GuardKind {
         register: u8,
         function_idx: usize,
     },
+    /// Compiled function code handing a call to the interpreter (no compiled
+    /// callee, or the native stack limit reached): resumes at the call.
+    Call {
+        function_idx: usize,
+    },
     Closure {
         register: u8,
         function_idx: usize,
@@ -171,6 +221,7 @@ pub struct JitStats {
     pub recordings_started: u64,
     pub recordings_aborted: u64,
     pub root_traces_compiled: u64,
+    pub functions_compiled: u64,
     pub native_trace_entries: u64,
     pub guard_exits: u64,
     pub execution_failures: u64,
@@ -191,6 +242,19 @@ pub struct JitState {
     next_trace_id: usize,
     pub enabled: bool,
     stats: JitStats,
+    /// Whole-function code by function index (see `function`).
+    function_code: Vec<Option<Rc<CompiledTrace>>>,
+    /// Entry points of `function_code`, read by compiled callers at each
+    /// `CallDirect` (0 = none). Allocated once per function table so the
+    /// addresses compiled code embeds stay valid until the table is
+    /// replaced, which invalidates all code.
+    function_entries: Box<[core::sync::atomic::AtomicUsize]>,
+    /// Calls seen per function, for the compile threshold.
+    function_calls: Vec<u32>,
+    /// Per function: `u32::MAX` = not compilable; otherwise the call count
+    /// at which compiling may next be attempted.
+    function_next_compile: Vec<u32>,
+    function_evictions: Vec<u32>,
 }
 
 impl JitState {
@@ -217,7 +281,96 @@ impl JitState {
             next_trace_id: 0,
             enabled,
             stats: JitStats::default(),
+            function_code: Vec::new(),
+            function_entries: Box::new([]),
+            function_calls: Vec::new(),
+            function_next_compile: Vec::new(),
+            function_evictions: Vec::new(),
         }
+    }
+
+    /// Size the per-function tables for a new function table. Called by
+    /// `VM::load_functions` after invalidation.
+    pub(crate) fn reset_function_tables(&mut self, count: usize) {
+        self.function_code = alloc::vec![None; count];
+        self.function_entries = (0..count)
+            .map(|_| core::sync::atomic::AtomicUsize::new(0))
+            .collect();
+        self.function_calls = alloc::vec![0; count];
+        self.function_next_compile = alloc::vec![FUNCTION_HOT_THRESHOLD; count];
+        self.function_evictions = alloc::vec![0; count];
+    }
+
+    /// One more function appended to the table (task wrappers).
+    pub(crate) fn push_function_slot(&mut self) {
+        let count = self.function_code.len() + 1;
+        // Entry addresses embedded so far stay valid only if the table is
+        // not moved; a grown table invalidates function code.
+        self.function_code = alloc::vec![None; count];
+        self.function_entries = (0..count)
+            .map(|_| core::sync::atomic::AtomicUsize::new(0))
+            .collect();
+        self.function_calls = alloc::vec![0; count];
+        self.function_next_compile = alloc::vec![FUNCTION_HOT_THRESHOLD; count];
+        self.function_evictions = alloc::vec![0; count];
+    }
+
+    pub(crate) fn function_code(&self, func_idx: usize) -> Option<Rc<CompiledTrace>> {
+        self.function_code.get(func_idx).and_then(|c| c.clone())
+    }
+
+    pub(crate) fn function_entry_table(&self) -> usize {
+        self.function_entries.as_ptr() as usize
+    }
+
+    /// Count a call; true when the function should be compiled now.
+    /// `LUST_JIT_NOFN=1` disables whole-function compilation (loop traces
+    /// stay on), for bisecting.
+    pub(crate) fn record_function_entry(&mut self, func_idx: usize) -> bool {
+        #[cfg(feature = "std")]
+        {
+            static NOFN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *NOFN.get_or_init(|| std::env::var_os("LUST_JIT_NOFN").is_some()) {
+                return false;
+            }
+        }
+        let Some(count) = self.function_calls.get_mut(func_idx) else {
+            return false;
+        };
+        *count = count.saturating_add(1);
+        self.function_next_compile
+            .get(func_idx)
+            .is_some_and(|next| *next != u32::MAX && *count >= *next)
+    }
+
+    pub(crate) fn store_function_code(&mut self, func_idx: usize, code: CompiledTrace) {
+        let entry = code.entry as usize;
+        self.function_code[func_idx] = Some(Rc::new(code));
+        self.function_entries[func_idx].store(entry, core::sync::atomic::Ordering::Release);
+        self.stats.functions_compiled = self.stats.functions_compiled.saturating_add(1);
+    }
+
+    /// The function cannot be compiled: never try again.
+    pub(crate) fn function_not_compilable(&mut self, func_idx: usize) {
+        if let Some(next) = self.function_next_compile.get_mut(func_idx) {
+            *next = u32::MAX;
+        }
+    }
+
+    /// Forget a function's code after an unexpected guard failure; retried
+    /// after a delay that doubles per eviction.
+    pub(crate) fn evict_function_code(&mut self, func_idx: usize) {
+        if let Some(slot) = self.function_code.get_mut(func_idx) {
+            *slot = None;
+        }
+        if let Some(entry) = self.function_entries.get(func_idx) {
+            entry.store(0, core::sync::atomic::Ordering::Release);
+        }
+        let evictions = &mut self.function_evictions[func_idx];
+        *evictions = evictions.saturating_add(1);
+        let delay = 1u32 << evictions.saturating_sub(1).min(MAX_ROOT_EVICTION_SHIFT);
+        let count = self.function_calls[func_idx];
+        self.function_next_compile[func_idx] = count.saturating_add(delay.max(FUNCTION_HOT_THRESHOLD));
     }
 
     pub fn alloc_trace_id(&mut self) -> TraceId {
@@ -353,6 +506,8 @@ impl JitState {
         self.root_evictions.clear();
         self.next_trace_id = 0;
         self.stats = JitStats::default();
+        let count = self.function_code.len();
+        self.reset_function_tables(count);
     }
 }
 

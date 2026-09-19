@@ -487,6 +487,8 @@ mod tests {
         let mut trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::TryCast {
@@ -541,6 +543,8 @@ mod tests {
         let mut trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::TryGetIndex {
@@ -598,6 +602,8 @@ mod tests {
         let mut trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {

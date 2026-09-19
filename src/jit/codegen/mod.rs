@@ -58,6 +58,22 @@ pub struct JitCompiler {
     /// Loop-header ip of the trace being compiled: where a guard that fails
     /// before any instruction of the body has run resumes.
     pub(super) trace_start_ip: usize,
+    /// Compiling whole-function code (see `jit::function`): no loop,
+    /// `Return` returns, `CallDirect` calls other compiled functions.
+    function_mode: bool,
+    /// Function mode: (frame register count, may any register own a value
+    /// at return) of the function being compiled.
+    function_frame: (u8, bool),
+    /// Function mode: address of the compiled-function entry table.
+    function_entry_table: usize,
+    /// Function mode: the epilogue, for propagating an exit that happened
+    /// inside a native callee.
+    function_epilogue: Option<dynasmrt::DynamicLabel>,
+    /// Branch targets of the function being compiled, by bytecode ip.
+    function_labels: HashMap<usize, dynasmrt::DynamicLabel>,
+    /// Function mode: the exit being emitted hands a call to the
+    /// interpreter rather than reporting a failed guard.
+    exit_is_handoff: bool,
     /// Bytecode ip of the instruction the ops being compiled came from
     /// (from the last `At` marker), if known.
     current_fail_ip: Option<usize>,
@@ -111,6 +127,8 @@ mod tests {
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::LoadConst {
@@ -149,6 +167,8 @@ mod tests {
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![TraceOp::Guard {
                 register: 0,
@@ -177,6 +197,8 @@ mod tests {
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -310,6 +332,8 @@ mod tests {
                         let mut trace = Trace {
                             function_idx: 0,
                             start_ip: 0,
+                            is_function: false,
+                            frame_may_own: true,
                             preamble: vec![TraceOp::Guard {
                                 register: 2,
                                 expected_type: ValueType::Bool,
@@ -376,6 +400,8 @@ mod tests {
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Lt {
@@ -447,6 +473,8 @@ mod tests {
         let comparison_trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -501,6 +529,8 @@ mod tests {
         let constant_trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -560,6 +590,8 @@ mod tests {
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![TraceOp::Div {
                 dest: 0,
@@ -591,6 +623,8 @@ mod tests {
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Div {
@@ -639,6 +673,8 @@ mod tests {
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Lt {

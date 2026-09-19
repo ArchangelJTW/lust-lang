@@ -19,7 +19,6 @@ impl JitCompiler {
         };
         let expected_discriminant = expected_tag.as_u8() as i8;
         let guard_return_value = (guard_index + 1) as i32;
-        let exit_label = self.current_exit_label();
         dynasm!(self.ops
             ; .arch x64
             ; mov al, [r12 + offset]
@@ -27,8 +26,10 @@ impl JitCompiler {
             ; jne >guard_fail
             ; jmp >guard_ok
             ; guard_fail:
-            ; mov eax, DWORD guard_return_value
-            ; jmp => exit_label
+        );
+        self.emit_guard_exit(guard_return_value);
+        dynasm!(self.ops
+            ; .arch x64
             ; guard_ok:
         );
         Ok(Guard {
@@ -99,7 +100,6 @@ impl JitCompiler {
         }
         let kind_flag: i32 = if is_closure { 1 } else { 0 };
         let reg_index = register as i32;
-        let exit_label = self.current_exit_label();
         dynasm!(self.ops
             ; .arch x64
             ; lea rdi, [r12 + offset]
@@ -113,8 +113,10 @@ impl JitCompiler {
             ; jz >guard_fail
             ; jmp >guard_ok
             ; guard_fail:
-            ; mov eax, DWORD guard_return_value
-            ; jmp => exit_label
+        );
+        self.emit_guard_exit(guard_return_value);
+        dynasm!(self.ops
+            ; .arch x64
             ; guard_ok:
         );
         let kind = if is_closure {
@@ -153,7 +155,6 @@ impl JitCompiler {
             ) -> u8;
         }
         let reg_index = register as i32;
-        let exit_label = self.current_exit_label();
         dynasm!(self.ops
             ; .arch x64
             ; lea rdi, [r12 + offset]
@@ -165,8 +166,10 @@ impl JitCompiler {
             ; jz >guard_fail
             ; jmp >guard_ok
             ; guard_fail:
-            ; mov eax, DWORD guard_return_value
-            ; jmp => exit_label
+        );
+        self.emit_guard_exit(guard_return_value);
+        dynasm!(self.ops
+            ; .arch x64
             ; guard_ok:
         );
         Ok(Guard {
@@ -191,7 +194,6 @@ impl JitCompiler {
         unsafe extern "C" {
             fn jit_guard_struct_layout(value_ptr: *const Value, expected: *const ()) -> u8;
         }
-        let exit_label = self.current_exit_label();
         dynasm!(self.ops
             ; .arch x64
             ; lea rdi, [r12 + offset]
@@ -200,8 +202,10 @@ impl JitCompiler {
             ; call rax
             ; test al, al
             ; jnz >guard_ok
-            ; mov eax, DWORD guard_return_value
-            ; jmp => exit_label
+        );
+        self.emit_guard_exit(guard_return_value);
+        dynasm!(self.ops
+            ; .arch x64
             ; guard_ok:
         );
         Ok(Guard {
@@ -235,7 +239,6 @@ impl JitCompiler {
                 resume_ip: usize,
             ) -> i32;
         }
-        let exit_label = self.current_exit_label();
         if self.inline_depth == 0 {
             dynasm!(self.ops
                 ; .arch x64
@@ -252,8 +255,10 @@ impl JitCompiler {
         }
         dynasm!(self.ops
             ; .arch x64
-            ; mov eax, DWORD guard_return_value
-            ; jmp => exit_label
+        );
+        self.emit_guard_exit(guard_return_value);
+        dynasm!(self.ops
+            ; .arch x64
             ; loop_done:
         );
         Guard {
@@ -276,7 +281,6 @@ impl JitCompiler {
     ) -> Result<Guard> {
         let cond_offset = (condition_register as i32) * (mem::size_of::<Value>() as i32);
         let guard_return_value = (guard_index + 1) as i32;
-        let exit_label = self.current_exit_label();
         let bool_tag = ValueTag::Bool.as_u8() as i8;
         let scalar_max_tag = ValueTag::Float.as_u8() as i8;
         unsafe extern "C" {
@@ -311,16 +315,20 @@ impl JitCompiler {
             dynasm!(self.ops
                 ; .arch x64
                 ; jnz >guard_ok
-                ; mov eax, DWORD guard_return_value
-                ; jmp => exit_label
+            );
+            self.emit_guard_exit(guard_return_value);
+            dynasm!(self.ops
+                ; .arch x64
                 ; guard_ok:
             );
         } else {
             dynasm!(self.ops
                 ; .arch x64
                 ; jz >guard_ok
-                ; mov eax, DWORD guard_return_value
-                ; jmp => exit_label
+            );
+            self.emit_guard_exit(guard_return_value);
+            dynasm!(self.ops
+                ; .arch x64
                 ; guard_ok:
             );
         }
@@ -339,5 +347,255 @@ impl JitCompiler {
             kind,
             fail_count: 0,
         })
+    }
+}
+
+// ── Function code: branches, native calls, returns ─────────────────────
+impl JitCompiler {
+    /// Branch to the function label when the register's truthiness equals
+    /// `expect_truthy`.
+    pub(super) fn compile_branch_if(&mut self, register: u8, expect_truthy: bool, label: usize) {
+        let label = self.function_label(label);
+        let offset = (register as i32) * (mem::size_of::<Value>() as i32);
+        if self.scalar_registers.get(&register) == Some(&ValueType::Bool) {
+            dynasm!(self.ops ; .arch x64 ; mov rax, [r12 + offset + 8]);
+        } else {
+            unsafe extern "C" {
+                fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
+            }
+            dynasm!(self.ops
+                ; .arch x64
+                ; lea rdi, [r12 + offset]
+                ; mov rax, QWORD jit_value_is_truthy as *const () as _
+                ; call rax
+                ; movzx eax, al
+            );
+        }
+        dynasm!(self.ops ; .arch x64 ; test rax, rax);
+        if expect_truthy {
+            dynasm!(self.ops ; .arch x64 ; jnz => label);
+        } else {
+            dynasm!(self.ops ; .arch x64 ; jz => label);
+        }
+    }
+
+    /// Call another bytecode function's compiled code natively (see the
+    /// aarch64 backend for the protocol): record + frame pushed exactly as
+    /// for an inlined call, `call` its entry with rdx = the record, pop,
+    /// check the result; without a compiled callee or with the native
+    /// stack nearly full, exit through a `Call` guard and let the
+    /// interpreter perform the call.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn compile_call_direct(
+        &mut self,
+        dest: u8,
+        callee: u8,
+        function_idx: usize,
+        first_arg: u8,
+        arg_count: u8,
+        callee_registers: u8,
+        call_ip: usize,
+        result_type: Option<ValueType>,
+        guard_index: &mut i32,
+        guards: &mut Vec<Guard>,
+    ) -> Result<()> {
+        unsafe extern "C" {
+            fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
+        }
+        let value_size = mem::size_of::<Value>() as i32;
+        let frame_value_count = callee_registers as i32;
+        let frame_size = (frame_value_count * value_size + 15) & !15;
+        let metadata_size = INLINE_METADATA_SIZE;
+        let to_interpreter = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        let epilogue = self
+            .function_epilogue
+            .expect("function code is compiled inside compile_trace");
+        let _ = result_type;
+        let slot = self.function_entry_table + function_idx * mem::size_of::<usize>();
+        dynasm!(self.ops
+            ; .arch x64
+            // Native stack limit (see `JIT_STACK_LIMIT`).
+            ; mov rax, QWORD jit::stack_limit_cell() as _
+            ; mov rax, [rax]
+            ; cmp rsp, rax
+            ; jb => to_interpreter
+            // The callee's entry point, if it has compiled code.
+            ; mov rax, QWORD slot as _
+            ; mov rbx, [rax]
+            ; test rbx, rbx
+            ; jz => to_interpreter
+            // The record (see `JitInlineRecord`).
+            ; sub rsp, metadata_size
+            ; mov QWORD [rsp], frame_value_count
+            ; mov [rsp + 8], r12
+            ; mov [rsp + 16], r15
+            ; mov QWORD [rsp + 24], 0
+            ; mov rax, QWORD function_idx as _
+            ; mov [rsp + 32], rax
+            ; mov QWORD [rsp + 40], dest as i32
+            ; mov QWORD [rsp + 48], callee as i32
+            ; mov rax, QWORD (call_ip + 1) as _
+            ; mov [rsp + 56], rax
+            // The callee frame: every register Nil, then the arguments.
+            ; sub rsp, frame_size
+        );
+        for reg in 0..callee_registers {
+            let offset = reg as i32 * value_size;
+            dynasm!(self.ops ; .arch x64 ; mov BYTE [rsp + offset], 0);
+        }
+        for index in 0..arg_count {
+            let src_reg = first_arg.wrapping_add(index);
+            let src_offset = (src_reg as i32) * value_size;
+            let dest_offset = i32::from(index) * value_size;
+            match self.scalar_registers.get(&src_reg).copied() {
+                Some(ty @ (ValueType::Int | ValueType::Bool | ValueType::Float)) => {
+                    let tag = match ty {
+                        ValueType::Int => ValueTag::Int,
+                        ValueType::Bool => ValueTag::Bool,
+                        _ => ValueTag::Float,
+                    }
+                    .as_u8() as i8;
+                    dynasm!(self.ops
+                        ; .arch x64
+                        ; mov rax, [r12 + src_offset + 8]
+                        ; mov BYTE [rsp + dest_offset], tag
+                        ; mov [rsp + dest_offset + 8], rax
+                    );
+                }
+                _ => {
+                    dynasm!(self.ops
+                        ; .arch x64
+                        ; lea rdi, [r12 + src_offset]
+                        ; lea rsi, [rsp + dest_offset]
+                        ; mov rax, QWORD jit_move_safe as *const () as _
+                        ; call rax
+                        ; test al, al
+                        ; jz >fail
+                    );
+                }
+            }
+        }
+        // A failed argument move resumes at the call, in this frame.
+        self.emit_fail_stub();
+
+        let returned = jit::NATIVE_RETURNED;
+        dynasm!(self.ops
+            ; .arch x64
+            // Enter the callee: rdi = its registers, rsi = VM, rdx = record.
+            ; mov rdi, rsp
+            ; mov rsi, r13
+            ; lea rdx, [rsp + frame_size]
+            ; call rbx
+            // Pop the frame and record; the callee's epilogue restored
+            // rbx, r12..r15.
+            ; add rsp, frame_size + metadata_size
+            ; cmp eax, DWORD returned
+            ; je => done
+            // Anything else is an exit that already materialized every
+            // frame (ours included): propagate it.
+            ; jmp => epilogue
+            ; => to_interpreter
+        );
+        let guard_return_value = *guard_index + 1;
+        self.exit_is_handoff = true;
+        self.emit_guard_exit(guard_return_value);
+        self.exit_is_handoff = false;
+        guards.push(Guard {
+            index: *guard_index as usize,
+            bailout_ip: call_ip,
+            kind: GuardKind::Call { function_idx },
+            fail_count: 0,
+        });
+        *guard_index += 1;
+        dynasm!(self.ops ; .arch x64 ; => done);
+        Ok(())
+    }
+
+    /// `Return` of function code (see the aarch64 backend).
+    pub(super) fn compile_function_return(&mut self, value: Option<u8>) -> Result<()> {
+        unsafe extern "C" {
+            fn jit_return_value(src: *mut Value, dest: *mut Value);
+            fn jit_drop_values(values: *mut Value, len: usize);
+        }
+        let (register_count, may_own) = self.function_frame;
+        let epilogue = self
+            .function_epilogue
+            .expect("function code is compiled inside compile_trace");
+        let exit_label = self.current_exit_label();
+        let interp_return = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch x64
+            ; test r15, r15
+            ; jz => interp_return
+            ; mov rsi, [r15 + 8]
+            ; mov rax, [r15 + 40]
+            ; shl rax, 6
+            ; add rsi, rax
+        );
+        // A scalar result of known type is stored directly when the
+        // caller's register holds nothing owned; the helper handles the
+        // rest.
+        let scalar = value.and_then(|reg| {
+            self.scalar_registers
+                .get(&reg)
+                .copied()
+                .filter(|ty| matches!(ty, ValueType::Int | ValueType::Bool | ValueType::Float))
+                .map(|ty| (reg, ty))
+        });
+        let stored = self.ops.new_dynamic_label();
+        if let Some((reg, ty)) = scalar {
+            let tag = match ty {
+                ValueType::Int => ValueTag::Int,
+                ValueType::Bool => ValueTag::Bool,
+                _ => ValueTag::Float,
+            }
+            .as_u8() as i8;
+            let scalar_max_tag = ValueTag::Float.as_u8() as i8;
+            let offset = (reg as i32) * (mem::size_of::<Value>() as i32);
+            dynasm!(self.ops
+                ; .arch x64
+                ; cmp BYTE [rsi], scalar_max_tag
+                ; ja >owned
+                ; mov rax, [r12 + offset + 8]
+                ; mov BYTE [rsi], tag
+                ; mov [rsi + 8], rax
+                ; jmp => stored
+                ; owned:
+            );
+        }
+        match value {
+            Some(reg) => {
+                let offset = (reg as i32) * (mem::size_of::<Value>() as i32);
+                dynasm!(self.ops ; .arch x64 ; lea rdi, [r12 + offset]);
+            }
+            None => dynasm!(self.ops ; .arch x64 ; xor edi, edi),
+        }
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov rax, QWORD jit_return_value as *const () as _
+            ; call rax
+            ; => stored
+        );
+        if may_own {
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov rdi, r12
+                ; mov esi, DWORD i32::from(register_count)
+                ; mov rax, QWORD jit_drop_values as *const () as _
+                ; call rax
+            );
+        }
+        let returned = jit::NATIVE_RETURNED;
+        let code = jit::FUNCTION_RETURN_BASE + i32::from(value.unwrap_or(255));
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov eax, DWORD returned
+            ; jmp => epilogue
+            ; => interp_return
+            ; mov eax, DWORD code
+            ; jmp => exit_label
+        );
+        Ok(())
     }
 }

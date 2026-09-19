@@ -90,7 +90,8 @@ fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
         }
     };
     match op {
-        TraceOp::At { .. } => {}
+        TraceOp::At { .. } | TraceOp::Label { .. } | TraceOp::Jump { .. } | TraceOp::BranchIf { .. } => {}
+        TraceOp::CallDirect { dest, .. } => set(env, *dest, None),
         TraceOp::LoadConst { dest, value } => set(env, *dest, const_type(value)),
         TraceOp::Move { dest, src } => {
             let ty = env.get(src).copied();
@@ -243,7 +244,21 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
     let typed = |ty: ValueType| scalar(ty);
     let range = |first: u8, count: u8| (first..first.saturating_add(count)).map(|r| (r, None));
     match op {
-        TraceOp::At { .. } => {}
+        TraceOp::At { .. } | TraceOp::Label { .. } | TraceOp::Jump { .. } => {}
+        TraceOp::BranchIf {
+            condition_register, ..
+        } => e.reads.push((*condition_register, None)),
+        TraceOp::CallDirect {
+            dest,
+            callee,
+            first_arg,
+            arg_count,
+            ..
+        } => {
+            e.reads.push((*callee, None));
+            e.reads.extend(range(*first_arg, *arg_count));
+            e.helper_writes.push(*dest);
+        }
         TraceOp::LoadConst { dest, value } => match const_type(value) {
             Some(ty) => e.native_writes.push((*dest, Some(ty))),
             None => e.helper_writes.push(*dest),

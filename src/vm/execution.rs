@@ -820,7 +820,14 @@ impl VM {
                     if self.plain_function_callee(func_reg) =>
                 {
                     let frame = self.bytecode_call_frame(func_reg, first_arg, arg_count, dest_reg)?;
+                    let callee_idx = frame.function_idx;
                     self.call_stack.push(frame);
+                    if self.jit.enabled
+                        && self.trace_recorder.is_none()
+                        && let Some(finished) = self.run_compiled_function(callee_idx)?
+                    {
+                        return Ok(finished);
+                    }
                 }
 
                 Instruction::Call(func_reg, first_arg, arg_count, dest_reg) => {
@@ -979,24 +986,8 @@ impl VM {
                     } else {
                         self.get_register(value_reg)?.fast_clone()
                     };
-                    let frame = self.call_stack.last().unwrap();
-                    let return_dest = frame.return_dest;
-                    self.validate_function_return(frame.function_idx, &return_value)?;
-                    if let Some(frame) = self.call_stack.pop() {
-                        self.recycle_frame(frame);
-                    }
-                    if self.call_stack.is_empty() {
-                        return Ok(return_value);
-                    }
-
-                    // Deliver straight into the caller unless this return
-                    // ends a host call into the VM, which `run` hands back
-                    // from the top of the loop.
-                    if self.call_until_depth == Some(self.call_stack.len()) {
-                        self.pending_return_value = Some(return_value);
-                        self.pending_return_dest = return_dest;
-                    } else if let Some(dest) = return_dest {
-                        self.set_register(dest, return_value)?;
+                    if let Some(finished) = self.finish_return(return_value)? {
+                        return Ok(finished);
                     }
                 }
 
@@ -1995,6 +1986,175 @@ impl VM {
         }
     }
 
+    /// The tail of `Instruction::Return` once the value is in hand: check
+    /// it against the signature, pop the frame and deliver the value to
+    /// the caller. Returns the value itself when the call stack is now
+    /// empty and `run` should hand it back.
+    fn finish_return(&mut self, return_value: Value) -> Result<Option<Value>> {
+        let frame = self.call_stack.last().unwrap();
+        let return_dest = frame.return_dest;
+        self.validate_function_return(frame.function_idx, &return_value)?;
+        if let Some(frame) = self.call_stack.pop() {
+            self.recycle_frame(frame);
+        }
+        if self.call_stack.is_empty() {
+            return Ok(Some(return_value));
+        }
+
+        // Deliver straight into the caller unless this return ends a host
+        // call into the VM, which `run` hands back from the top of the
+        // loop.
+        if self.call_until_depth == Some(self.call_stack.len()) {
+            self.pending_return_value = Some(return_value);
+            self.pending_return_dest = return_dest;
+        } else if let Some(dest) = return_dest {
+            self.set_register(dest, return_value)?;
+        }
+        Ok(None)
+    }
+
+    /// Run the frame just pushed for `func_idx` through the function's
+    /// compiled code, compiling it first when it has just become hot (see
+    /// `jit::function`). Does nothing when there is no code. Afterwards
+    /// the call stack is wherever the native code left it: the frame
+    /// popped (it returned; `Some` when that emptied the stack), or one or
+    /// more frames — native callees materialized on exit included —
+    /// positioned at the instruction the interpreter continues from.
+    fn run_compiled_function(&mut self, func_idx: usize) -> Result<Option<Value>> {
+        let code = match self.jit.function_code(func_idx) {
+            Some(code) => code,
+            None => {
+                if !self.jit.record_function_entry(func_idx) {
+                    return Ok(None);
+                }
+                self.compile_function(func_idx);
+                match self.jit.function_code(func_idx) {
+                    Some(code) => code,
+                    None => return Ok(None),
+                }
+            }
+        };
+
+        // Native-to-native calls grow the machine stack; give them at most
+        // `NATIVE_STACK_RESERVE` below here before they hand calls to the
+        // interpreter, whose frames live on the heap.
+        let marker = 0u8;
+        let sp = &marker as *const u8 as usize;
+        let limit = sp.saturating_sub(crate::jit::NATIVE_STACK_RESERVE);
+        crate::jit::JIT_STACK_LIMIT.with(|cell| {
+            let current = cell.get();
+            if current == 0 || limit < current {
+                cell.set(limit);
+            }
+        });
+
+        let cost = code.trace.ops.len();
+        self.budgets.charge_gas(core::cmp::max(1, cost) as u64)?;
+        self.jit.record_native_entry();
+        self.pending_jit_error = None;
+        crate::jit::JIT_EXIT_INFO.with(|cell| cell.set(usize::MAX));
+        let registers_ptr = self.call_stack.last_mut().unwrap().registers.as_mut_ptr();
+        let vm_ptr = self as *mut VM;
+        let result = code.execute(registers_ptr, vm_ptr, ptr::null());
+        crate::jit::log(|| format!("🎯 JIT: function {} native result {}", func_idx, result));
+        drop(code);
+
+        if (crate::jit::FUNCTION_RETURN_BASE..crate::jit::NATIVE_RETURNED).contains(&result) {
+            let reg = (result - crate::jit::FUNCTION_RETURN_BASE) as usize;
+            let return_value = if reg == 255 {
+                Value::Nil
+            } else {
+                self.call_stack.last().unwrap().registers[reg].fast_clone()
+            };
+            return self.finish_return(return_value);
+        }
+
+        // An exit, from this function or a native callee whose frames are
+        // now on the call stack: resume the innermost frame where the
+        // exiting site said.
+        let info = crate::jit::JIT_EXIT_INFO.with(|cell| cell.get());
+        if info == usize::MAX {
+            // Every exit stub of function code records its site; an exit
+            // without one is a compiler bug. Evict the code and resume at
+            // the function's entry, which at least keeps the interpreter
+            // consistent.
+            debug_assert!(false, "function {func_idx} exited with {result} and no exit info");
+            crate::jit::log(|| {
+                format!("❌ JIT: function {func_idx} exited with {result} and no exit info")
+            });
+            self.jit.evict_function_code(func_idx);
+            if let Some(frame) = self.call_stack.last_mut() {
+                frame.ip = 0;
+            }
+            return Ok(None);
+        }
+        let ip = info & ((1usize << crate::jit::EXIT_KIND_SHIFT) - 1);
+        let kind = info >> crate::jit::EXIT_KIND_SHIFT;
+        if let Some(error) = self.pending_jit_error.take() {
+            return Err(error);
+        }
+        let frame = self.call_stack.last_mut().unwrap();
+        let exited_idx = frame.function_idx;
+        frame.ip = ip;
+        crate::jit::log(|| {
+            format!(
+                "↩️  JIT: function {} exit kind {} → func {} ip {}",
+                func_idx, kind, exited_idx, ip
+            )
+        });
+        match kind {
+            crate::jit::EXIT_KIND_HANDOFF | crate::jit::EXIT_KIND_FAIL => {}
+            _ => {
+                self.jit.record_guard_exit();
+                self.jit.evict_function_code(exited_idx);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Translate and compile `func_idx` (see `jit::function`), or mark it
+    /// as not compilable.
+    fn compile_function(&mut self, func_idx: usize) {
+        use crate::jit::function::{FunctionSig, translate};
+        let sig_of = |meta: &CallMeta, function: &Function| FunctionSig {
+            params: meta.params.iter().map(|kind| kind.value_type()).collect(),
+            ret: meta.return_kind.value_type(),
+            lua_function: meta.lua_function,
+            register_count: function.register_count,
+        };
+        let Some((function, meta)) = self.functions.get(func_idx).zip(self.call_meta.get(func_idx))
+        else {
+            return;
+        };
+        let sig = sig_of(meta, function);
+        let functions = &self.functions;
+        let call_meta = &self.call_meta;
+        let callee_sig = |idx: usize| {
+            functions
+                .get(idx)
+                .zip(call_meta.get(idx))
+                .map(|(function, meta)| sig_of(meta, function))
+        };
+        let Some(trace) = translate(function, func_idx, &sig, &callee_sig) else {
+            crate::jit::log(|| format!("🚫 JIT: function {} is not compilable", func_idx));
+            self.jit.function_not_compilable(func_idx);
+            return;
+        };
+        let trace_id = self.jit.alloc_trace_id();
+        let register_count = function.register_count;
+        let entry_table = self.jit.function_entry_table();
+        match JitCompiler::new().compile_function(&trace, trace_id, register_count, entry_table) {
+            Ok(code) => {
+                crate::jit::log(|| format!("✅ JIT: function {} compiled", func_idx));
+                self.jit.store_function_code(func_idx, code);
+            }
+            Err(e) => {
+                crate::jit::log(|| format!("❌ JIT: function {} compile failed: {}", func_idx, e));
+                self.jit.function_not_compilable(func_idx);
+            }
+        }
+    }
+
     /// Is the callee register a plain bytecode function (not a closure,
     /// native, Lua value or callable table) whose call can take the fast
     /// path?
@@ -2571,7 +2731,15 @@ impl VM {
                 self.call_stack.push(frame);
                 let previous_target = self.call_until_depth;
                 self.call_until_depth = Some(stack_depth_before);
-                let run_result = self.run();
+                // Compiled code for the function runs it now; `run` then
+                // either hands back the pending return value or carries on
+                // interpreting from wherever the native code exited.
+                let native = if self.jit.enabled && self.trace_recorder.is_none() {
+                    self.run_compiled_function(*func_idx).map(|_| ())
+                } else {
+                    Ok(())
+                };
+                let run_result = native.and_then(|()| self.run());
                 self.call_until_depth = previous_target;
                 match run_result {
                     Ok(value) => Ok(value),

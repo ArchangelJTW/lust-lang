@@ -32,10 +32,37 @@ impl JitCompiler {
                 Ok(())
             }
 
-            Value::String(_) => self.copy_owned_constant(dest, value),
+            // Plain values that own nothing: tag + payload, with the old
+            // value dropped only if it owned something.
+            Value::Nil => self.store_plain_constant(dest, 0, value),
+            Value::Function(idx) => self.store_plain_constant(dest, *idx as u64, value),
 
             _ => self.copy_owned_constant(dest, value),
         }
+    }
+
+    fn store_plain_constant(&mut self, dest: u8, payload: u64, value: &Value) -> Result<()> {
+        let offset = (dest as i32) * (mem::size_of::<Value>() as i32);
+        let scalar_max_tag = ValueTag::Float.as_u8() as i8;
+        // The discriminant byte of `#[repr(C, u8)] Value` (`ValueTag` is a
+        // coarser classification and numbers `Function` differently).
+        // SAFETY: reading the first byte of a live `Value`.
+        let tag = unsafe { *(value as *const Value as *const u8) } as i8;
+        let done = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch x64
+            ; cmp BYTE [r12 + offset], scalar_max_tag
+            ; ja >owned
+            ; mov rax, QWORD payload as _
+            ; mov BYTE [r12 + offset], tag
+            ; mov [r12 + offset + 8], rax
+            ; jmp => done
+            ; owned:
+        );
+        self.copy_owned_constant(dest, value)?;
+        dynasm!(self.ops ; .arch x64 ; => done);
+        self.scalar_registers.remove(&dest);
+        Ok(())
     }
 
     fn copy_owned_constant(&mut self, dest: u8, value: &Value) -> Result<()> {

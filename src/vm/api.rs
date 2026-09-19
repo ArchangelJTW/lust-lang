@@ -229,6 +229,7 @@ impl VM {
             }
         }
         self.jit.invalidate_compiled_code();
+        self.jit.reset_function_tables(functions.len());
         self.call_meta = functions.iter().map(CallMeta::of).collect();
         self.functions = functions;
     }
@@ -1508,6 +1509,8 @@ end
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![TraceOp::GuardLoopContinue {
                 condition_register: 0,

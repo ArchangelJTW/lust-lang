@@ -16,6 +16,7 @@ pub enum Outcome {
 pub struct Answer {
     pub outcome: Outcome,
     pub root_traces: u64,
+    pub functions: u64,
     pub native_entries: u64,
     pub guard_exits: u64,
     pub execution_failures: u64,
@@ -28,8 +29,9 @@ impl Answer {
             Outcome::Failed(e) => format!("error: {e}"),
         };
         format!(
-            "{what}  [traces {}, native entries {}, guard exits {}, failures {}]",
+            "{what}  [traces {}, functions {}, native entries {}, guard exits {}, failures {}]",
             self.root_traces,
+            self.functions,
             self.native_entries,
             self.guard_exits,
             self.execution_failures
@@ -57,6 +59,7 @@ pub fn run(source: &str, jit: bool) -> Result<Answer, String> {
     Ok(Answer {
         outcome,
         root_traces: stats.root_traces_compiled,
+        functions: stats.functions_compiled,
         native_entries: stats.native_trace_entries,
         guard_exits: stats.guard_exits,
         execution_failures: stats.execution_failures,

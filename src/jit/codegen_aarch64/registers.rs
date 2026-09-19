@@ -368,11 +368,30 @@ impl JitCompiler {
         );
     }
 
-    /// Generic exit with a guard return value (guard_index + 1).
+    /// Generic exit with a guard return value (guard_index + 1). Function
+    /// code also records where and why it left (see `JIT_EXIT_INFO`), since
+    /// the result propagates through native callers unchanged.
     pub(super) fn emit_guard_exit(&mut self, guard_return_value: i32) {
         let exit_label = self.current_exit_label();
+        if self.function_mode {
+            let kind = if self.exit_is_handoff {
+                jit::EXIT_KIND_HANDOFF
+            } else {
+                jit::EXIT_KIND_GUARD
+            };
+            let ip = self.current_fail_ip.unwrap_or(usize::MAX >> 16);
+            self.emit_exit_info(ip, kind);
+        }
         self.emit_mov_imm_i32(0, guard_return_value);
         dynasm!(self.ops ; .arch aarch64 ; b =>exit_label);
+    }
+
+    /// `JIT_EXIT_INFO = ip | kind << EXIT_KIND_SHIFT`.
+    pub(super) fn emit_exit_info(&mut self, ip: usize, kind: usize) {
+        let info = (ip & ((1usize << jit::EXIT_KIND_SHIFT) - 1)) | (kind << jit::EXIT_KIND_SHIFT);
+        self.emit_mov_imm64(11, jit::exit_info_cell() as u64);
+        self.emit_mov_imm64(12, info as u64);
+        dynasm!(self.ops ; .arch aarch64 ; str x12, [x11]);
     }
 
     // ── Scalar stores (port of store_from_rax / store_xmm0_as_float) ──────

@@ -38,6 +38,12 @@ impl fmt::Debug for TracedNativeFn {
 pub struct Trace {
     pub function_idx: usize,
     pub start_ip: usize,
+    /// Compiled function code (not a loop trace): the body runs once from
+    /// the function's entry, and `Return` ops return.
+    pub is_function: bool,
+    /// Function code only: may some register hold an owned value when the
+    /// function returns? If not, the frame needs no drop pass.
+    pub frame_may_own: bool,
     /// Operations executed once at trace entry (unboxing, guards, etc.)
     pub preamble: Vec<TraceOp>,
     /// Operations in the trace loop body
@@ -329,6 +335,40 @@ pub enum TraceOp {
     Return {
         value: Option<Register>,
     },
+    /// A branch target in compiled function code (see `jit::function`).
+    /// `scalars` is the static type environment every path into the label
+    /// agrees on.
+    Label {
+        id: usize,
+        scalars: Vec<(Register, ValueType)>,
+    },
+    Jump {
+        label: usize,
+    },
+    /// Branch to `label` when the register's truthiness equals
+    /// `expect_truthy`.
+    BranchIf {
+        condition_register: Register,
+        expect_truthy: bool,
+        label: usize,
+    },
+    /// A call from compiled function code to a bytecode function whose
+    /// identity is known at compile time. Runs the callee's compiled code
+    /// natively when it has some, otherwise exits to the interpreter at
+    /// `call_ip` (the interpreter performs the call and carries on).
+    CallDirect {
+        dest: Register,
+        callee: Register,
+        function_idx: usize,
+        first_arg: Register,
+        arg_count: u8,
+        /// Registers the callee's frame needs.
+        callee_registers: u8,
+        call_ip: usize,
+        /// The callee's declared return kind when scalar (its compiled code
+        /// guards its return value against it).
+        result_type: Option<ValueType>,
+    },
     /// Unbox a Value into specialized representation
     Unbox {
         specialized_id: usize,
@@ -476,6 +516,8 @@ impl TraceRecorder {
             trace: Trace {
                 function_idx,
                 start_ip,
+                is_function: false,
+                frame_may_own: true,
                 preamble: Vec::new(),
                 ops: Vec::new(),
                 postamble: Vec::new(),
@@ -707,7 +749,11 @@ impl TraceRecorder {
     /// rebox path removes its own tracking entry before pushing the op.
     fn written_register(op: &TraceOp) -> Option<Register> {
         match op {
-            TraceOp::At { .. } => None,
+            TraceOp::At { .. }
+            | TraceOp::Label { .. }
+            | TraceOp::Jump { .. }
+            | TraceOp::BranchIf { .. } => None,
+            TraceOp::CallDirect { dest, .. } => Some(*dest),
             TraceOp::LoadConst { dest, .. }
             | TraceOp::Move { dest, .. }
             | TraceOp::Add { dest, .. }

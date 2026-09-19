@@ -1,0 +1,80 @@
+-- Whole-function compilation: loop-free functions run natively and call
+-- each other natively. Recursion goes deep enough to cross the native
+-- stack reserve (calls are then handed to the interpreter), a callee with
+-- a loop is never compiled (its calls are handed over too), a runtime
+-- error inside compiled code surfaces normally, and mutual recursion works.
+function fib(n: int): int
+    if n < 2 then
+        return n
+    end
+    return fib(n - 1) + fib(n - 2)
+end
+function down(n: int): int
+    if n == 0 then
+        return 0
+    end
+    return down(n - 1) + 1
+end
+function looped(n: int): int
+    local s: int = 0
+    local i: int = 0
+    while i < n do
+        s = s + i
+        i = i + 1
+    end
+    return s
+end
+function calls_looped(n: int): int
+    return looped(n) + looped(n + 1)
+end
+function even(n: int): bool
+    if n == 0 then
+        return true
+    end
+    return odd(n - 1)
+end
+function odd(n: int): bool
+    if n == 0 then
+        return false
+    end
+    return even(n - 1)
+end
+function divides(a: int, b: int): int
+    local q: int = a / b
+    if q > 3 then
+        return q
+    end
+    return q * 2
+end
+function scale(x: float, k: float): float
+    if k < 0.0 then
+        return -x * k
+    end
+    return x * k
+end
+println(fib(22))
+println(down(900))
+local total: int = 0
+local i: int = 0
+while i < 200 do
+    total = total + calls_looped(i % 7) + divides(i + 40, 3)
+    if even(i) then
+        total = total + 1
+    end
+    i = i + 1
+end
+println(total)
+local f: float = 0.0
+local j: int = 0
+while j < 100 do
+    f = f + scale(1.5, 2.0 - j)
+    j = j + 1
+end
+println(f)
+local k: int = 0
+while k < 40 do
+    total = total + divides(k, k + 1)
+    k = k + 1
+end
+println(total)
+println(divides(9, 0))

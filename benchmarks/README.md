@@ -145,9 +145,10 @@ static lowering described above. RISC-V codegen has not been modified.
 
 ## Cross-language suite (`benchmarks/suite`)
 
-`benchmarks/suite/run.sh` runs eight small programs — struct fields, array
+`benchmarks/suite/run.sh` runs nine small programs — struct fields, array
 indexing, function calls, struct method calls, string building, recursive
-fib, nested loops, float math — through the Lust interpreter (`LUST_JIT=0`),
+fib, nested loops, float math, tree recursion over structs plus an
+array-scanning function — through the Lust interpreter (`LUST_JIT=0`),
 the Lust JIT, LuaJIT and Lua, checking that all outputs agree. Each program
 has a `.lust` and an equivalent `.lua`.
 
@@ -156,14 +157,15 @@ milliseconds, single run each:
 
 | program   | lust-vm | lust-jit | luajit | lua 5.5 |
 |-----------|--------:|---------:|-------:|--------:|
-| fields    |    1109 |       46 |     57 |     123 |
-| array     |    1735 |      246 |     60 |      76 |
-| calls     |     843 |      165 |     28 |     131 |
-| methods   |    1869 |       76 |     29 |     218 |
-| strings   |   13012 |    14936 |  29290 |    7314 |
-| fib       |     176 |       37 |     21 |      37 |
-| nested    |     365 |       23 |     27 |      78 |
-| floatmath |     551 |       55 |     36 |      89 |
+| fields    |     755 |       46 |     62 |     120 |
+| array     |    1556 |      231 |     61 |      76 |
+| calls     |     787 |      152 |     31 |     127 |
+| methods   |    1377 |       77 |     31 |     216 |
+| strings   |   17629 |    17193 |  29455 |    7348 |
+| fib       |     175 |       36 |     20 |      37 |
+| nested    |     368 |       24 |     29 |      79 |
+| floatmath |     539 |       57 |     38 |      90 |
+| tree      |    1133 |      191 |     39 |      54 |
 
 The interpreter numbers were 3-90x worse before the fixes to cycle
 collection cost, call-frame copying and argument checking on this branch
@@ -181,6 +183,14 @@ compiled whole with native calls between them (`fib(34)`: 1.08 s interpreted,
 instead of through runtime helpers; `array` was 357 ms before its push loop
 could be traced at all (a loop calling `array.push` — a global read — used
 to abort recording every time) and its element reads were typed inline
-loads. Remaining gaps against Lua: `strings`, where every engine is
-quadratic in `s = s .. x`, and `array`, where each iteration still moves
-its values through the VM's register memory.
+loads. `tree` (added with whole-function compilation of loops, fields and
+enums) was 620 ms with loop-free-only function compilation and 8 s or
+worse before the cycle collector's graph scan stopped being quadratic;
+sharing struct and enum names (so a value clone no longer allocates) took
+the interpreter from 1560 to 1133 ms and shrank `Value` to 48 bytes, which
+is where the interpreter's `fields` and `methods` gains come from.
+Remaining gaps against Lua: `strings`, where every engine is quadratic in
+`s = s .. x`; `array`, where each iteration still moves its values through
+the VM's register memory; and `tree`, where reading an `Option<Node>` field
+and matching it still clones and drops the enum and the struct through
+runtime helpers.

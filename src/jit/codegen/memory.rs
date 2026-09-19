@@ -825,9 +825,10 @@ impl JitCompiler {
             ; mov ecx, DWORD arg_count_i32
             ; mov r8d, DWORD dest_i32
         );
-        // Inside an inlined frame the destination lives on our stack: hand
-        // the helper its address. At depth zero the VM frame may move.
-        if self.inline_depth > 0 {
+        // Inside an inlined frame the destination lives on our stack, and
+        // function code's frame is wherever r12 points: hand the helper
+        // its address. At depth zero in a trace the VM frame may move.
+        if self.inline_depth > 0 || self.function_mode {
             let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
             dynasm!(self.ops ; .arch x64 ; lea r9, [r12 + dest_offset]);
         } else {
@@ -842,7 +843,7 @@ impl JitCompiler {
             ; jz >fail
         );
 
-        if self.inline_depth == 0 {
+        if self.inline_depth == 0 && !self.function_mode {
             dynasm!(self.ops
                 ; .arch x64
                 ; mov rdi, r13
@@ -897,7 +898,7 @@ impl JitCompiler {
             ; mov [rsp], rax
         );
         // Eighth argument: result pointer for an inlined frame, else null.
-        if self.inline_depth > 0 {
+        if self.inline_depth > 0 || self.function_mode {
             dynasm!(self.ops ; .arch x64 ; lea rax, [r12 + dest_offset] ; mov [rsp + 8], rax);
         } else {
             dynasm!(self.ops ; .arch x64 ; mov QWORD [rsp + 8], 0);
@@ -911,7 +912,7 @@ impl JitCompiler {
             ; jz >fail
         );
 
-        if self.inline_depth == 0 {
+        if self.inline_depth == 0 && !self.function_mode {
             dynasm!(self.ops
                 ; .arch x64
                 ; mov rdi, r13
@@ -996,7 +997,7 @@ impl JitCompiler {
             ; test al, al
             ; jz >fail
         );
-        if self.inline_depth == 0 {
+        if self.inline_depth == 0 && !self.function_mode {
             dynasm!(self.ops
                 ; .arch x64
                 ; mov rdi, r13

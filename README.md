@@ -216,17 +216,20 @@ the trace's duration (`array.push` / `array.len` on it become native
 operations); when the array also escapes to a native or a non-inlined call,
 the recording is abandoned and the site is recorded again without unboxing.
 
-Loop-free functions are also compiled whole after thirty calls: their bytecode
-is translated statically, every branch included, and the code calls other
-compiled functions natively — frames on the machine stack, arguments and
-results copied directly — so direct and mutual recursion run native end to
-end. A function using something the function compiler does not handle yet
-(loops, field access, arrays, strings, closures, native calls) keeps running
-in the interpreter, with its loops traced as before; a compiled caller hands
-such a call, or one that would exhaust the native stack, back to the
-interpreter at the call instruction. Exits from any depth of native calls
-turn the native frames into interpreter frames first, so errors and stack
-traces look the same either way.
+Functions are also compiled whole after thirty calls: their bytecode is
+translated statically, every branch and loop included (types flow to a
+fixpoint around loops), and the code calls other compiled functions and
+struct methods natively — frames on the machine stack, arguments and results
+copied directly — so direct and mutual recursion run native end to end.
+Struct fields (through the layout the parameter's declared type names,
+guarded once), arrays, strings, enums, globals, natives and function-valued
+arguments are handled; a function using something the function compiler
+does not (closures, upvalues, tuples, `unknown`-typed arithmetic) keeps
+running in the interpreter, with its loops traced as before. A compiled
+caller hands a call to an uncompiled function, or one that would exhaust
+the native stack, back to the interpreter at the call instruction. Exits
+from any depth of native calls turn the native frames into interpreter
+frames first, so errors and stack traces look the same either way.
 
 Environment switches, read once at VM creation:
 

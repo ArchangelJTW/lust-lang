@@ -6,7 +6,7 @@ LUST=${1:-"$D/../../target/release/lust"}
 ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
 has() { command -v "$1" > /dev/null 2>&1; }
 printf "%-10s %10s %10s %10s %10s   %s\n" program lust-vm lust-jit luajit lua outputs
-for f in fields array calls methods strings fib nested floatmath; do
+for f in fields array calls methods strings fib nested floatmath tree; do
   s=$(ms); o1=$(LUST_JIT=0 "$LUST" "$D/$f.lust" 2>&1 | tail -1); t1=$(( $(ms) - s ))
   s=$(ms); o2=$("$LUST" "$D/$f.lust" 2>&1 | tail -1); t2=$(( $(ms) - s ))
   t3=-; t4=-; o3=$o2

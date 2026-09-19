@@ -252,11 +252,13 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
         TraceOp::CallDirect {
             dest,
             callee,
+            receiver,
             first_arg,
             arg_count,
             ..
         } => {
             e.reads.push((*callee, None));
+            e.reads.extend(receiver.map(|r| (r, None)));
             e.reads.extend(range(*first_arg, *arg_count));
             e.helper_writes.push(*dest);
         }

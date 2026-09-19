@@ -1,25 +1,32 @@
-//! Whole-function compilation: turn a loop-free bytecode function into
-//! trace IR by walking its instructions statically, every branch included,
-//! instead of recording one executed path.
+//! Whole-function compilation: turn a bytecode function into trace IR by
+//! walking its instructions statically, every branch included, instead of
+//! recording one executed path.
 //!
-//! Only a subset of the instruction set is handled — constants, moves,
-//! typed arithmetic and comparisons, forward branches, calls to statically
-//! known bytecode functions, returns. A function using anything else is
-//! not compiled (its loops still get their own root traces). Types come
-//! from the typed opcodes, the callee signatures and a forward dataflow
-//! over the (acyclic) control flow; a `Guard` is emitted wherever a typed
-//! instruction reads a register the analysis cannot prove.
+//! Constants, moves, arithmetic and comparisons, branches and loops,
+//! calls to statically known bytecode functions and to struct methods,
+//! struct fields, arrays, strings, enums, globals (as version-guarded
+//! snapshots) and natives are handled; a function using anything else
+//! (closures, upvalues, tuples, maps by index) is not compiled. Types come
+//! from the typed opcodes, the declared parameter types, struct layouts
+//! and a forward dataflow over the control flow, run to a fixpoint around
+//! loops; a `Guard` is emitted wherever a typed instruction reads a
+//! register the analysis cannot prove.
 //!
 //! The result is executed by the backends' function mode: `Label`,
 //! `Jump` and `BranchIf` are real control flow, `CallDirect` pushes a
 //! frame and calls the callee's compiled code natively (or exits to the
 //! interpreter at the call when there is none), and `Return` returns.
+//! Ops whose helper can fail (an out-of-range index, a non-array) exit to
+//! the interpreter at their instruction, which re-executes it.
 
-use super::trace::{Trace, TraceOp, ValueType};
-use crate::bytecode::{Function, Instruction, Register, Value};
+use super::trace::{Trace, TraceOp, TracedNativeFn, ValueType};
+use crate::ast::TypeKind;
+use crate::bytecode::{Function, Instruction, Register, StructLayout, Value};
 use crate::number::NumericType;
+use alloc::rc::Rc;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 /// What the translator needs to know about a bytecode function: its
 /// scalar parameter kinds and scalar return kind, when declared.
@@ -31,10 +38,31 @@ pub struct FunctionSig {
     pub lua_function: bool,
     /// Registers the function's frame uses.
     pub register_count: u8,
+    /// The declared parameter types, when the function has a signature.
+    pub param_types: Vec<Option<TypeKind>>,
+}
+
+/// What the translator can ask the VM about.
+pub struct Context<'a> {
+    pub callee_sig: &'a dyn Fn(usize) -> Option<FunctionSig>,
+    /// The layout registered for a struct type name.
+    pub layout_of: &'a dyn Fn(&str) -> Option<Rc<StructLayout>>,
+    /// The index of the bytecode function with this (mangled) name.
+    pub function_named: &'a dyn Fn(&str) -> Option<usize>,
+    /// The current value of a global.
+    pub global: &'a dyn Fn(&str) -> Option<Value>,
+    /// `VM::globals_version` now; the snapshots are valid while it holds.
+    pub globals_version: u64,
+    /// Natives with a native-code equivalent (`JitState::intrinsics`).
+    pub intrinsics: &'a HashMap<usize, super::Intrinsic>,
 }
 
 /// Largest function (in instructions) worth compiling whole.
 pub const MAX_FUNCTION_LENGTH: usize = 512;
+
+/// Passes over a function with loops before the environment must have
+/// settled (facts only ever disappear, so this is generous).
+const MAX_FIXPOINT_PASSES: usize = 8;
 
 #[derive(Clone, Default)]
 struct Env {
@@ -42,6 +70,26 @@ struct Env {
     /// Registers known to hold a given bytecode function (loaded from a
     /// constant), so a call through them needs no identity guard.
     functions: HashMap<Register, usize>,
+    /// Registers holding a struct of a known layout, and whether a
+    /// `GuardStructLayout` has established that on this path.
+    layouts: HashMap<Register, (Rc<StructLayout>, bool)>,
+    /// Registers holding an array whose elements are of a scalar type.
+    elements: HashMap<Register, ValueType>,
+    /// Registers holding a snapshot of a global (a module table, a native)
+    /// taken under the globals guard.
+    constants: HashMap<Register, Value>,
+    /// Registers whose native function identity a guard has established.
+    natives_guarded: HashSet<Register>,
+    /// A `GuardGlobals` is in force on this path.
+    globals_guarded: bool,
+}
+
+fn same_constant(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Map(x), Value::Map(y)) => Rc::ptr_eq(x, y),
+        (Value::NativeFunction(x), Value::NativeFunction(y)) => Rc::ptr_eq(x, y),
+        _ => false,
+    }
 }
 
 impl Env {
@@ -55,6 +103,10 @@ impl Env {
             }
         }
         self.functions.remove(&reg);
+        self.layouts.remove(&reg);
+        self.elements.remove(&reg);
+        self.constants.remove(&reg);
+        self.natives_guarded.remove(&reg);
     }
 
     /// Facts both environments agree on.
@@ -72,7 +124,67 @@ impl Env {
                 .filter(|(reg, idx)| other.functions.get(*reg) == Some(*idx))
                 .map(|(reg, idx)| (*reg, *idx))
                 .collect(),
+            layouts: self
+                .layouts
+                .iter()
+                .filter_map(|(reg, (layout, guarded))| {
+                    let (other_layout, other_guarded) = other.layouts.get(reg)?;
+                    Rc::ptr_eq(layout, other_layout)
+                        .then(|| (*reg, (Rc::clone(layout), *guarded && *other_guarded)))
+                })
+                .collect(),
+            elements: self
+                .elements
+                .iter()
+                .filter(|(reg, ty)| other.elements.get(*reg) == Some(*ty))
+                .map(|(reg, ty)| (*reg, *ty))
+                .collect(),
+            constants: self
+                .constants
+                .iter()
+                .filter(|(reg, value)| {
+                    other
+                        .constants
+                        .get(*reg)
+                        .is_some_and(|o| same_constant(value, o))
+                })
+                .map(|(reg, value)| (*reg, value.clone()))
+                .collect(),
+            natives_guarded: self
+                .natives_guarded
+                .intersection(&other.natives_guarded)
+                .copied()
+                .collect(),
+            globals_guarded: self.globals_guarded && other.globals_guarded,
         }
+    }
+
+    /// Does `self` know everything `other` knows (so a label environment
+    /// computed as `other` still holds when arriving with `self`)?
+    fn covers(&self, other: &Env) -> bool {
+        self.merge(other).same_facts(other)
+    }
+
+    fn same_facts(&self, other: &Env) -> bool {
+        self.scalars == other.scalars
+            && self.functions == other.functions
+            && self.layouts.len() == other.layouts.len()
+            && self.layouts.iter().all(|(reg, (layout, guarded))| {
+                other
+                    .layouts
+                    .get(reg)
+                    .is_some_and(|(o, g)| Rc::ptr_eq(layout, o) && guarded == g)
+            })
+            && self.elements == other.elements
+            && self.constants.len() == other.constants.len()
+            && self.constants.iter().all(|(reg, value)| {
+                other
+                    .constants
+                    .get(reg)
+                    .is_some_and(|o| same_constant(value, o))
+            })
+            && self.natives_guarded == other.natives_guarded
+            && self.globals_guarded == other.globals_guarded
     }
 
     fn label_scalars(&self) -> Vec<(Register, ValueType)> {
@@ -103,19 +215,53 @@ fn is_scalar(ty: ValueType) -> bool {
     matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool)
 }
 
+fn scalar_kind(kind: &TypeKind) -> Option<ValueType> {
+    match kind {
+        TypeKind::Int => Some(ValueType::Int),
+        TypeKind::Float => Some(ValueType::Float),
+        TypeKind::Bool => Some(ValueType::Bool),
+        _ => None,
+    }
+}
+
 fn jump_target(ip: usize, offset: i16) -> Option<usize> {
     let target = ip as i64 + 1 + i64::from(offset);
     usize::try_from(target).ok()
 }
 
+/// Every ip some jump lands on.
+fn jump_targets(instructions: &[Instruction]) -> Option<HashSet<usize>> {
+    let mut targets = HashSet::new();
+    for (ip, instruction) in instructions.iter().enumerate() {
+        let offset = match instruction {
+            Instruction::Jump(offset)
+            | Instruction::JumpIf(_, offset)
+            | Instruction::JumpIfNot(_, offset) => *offset,
+            _ => continue,
+        };
+        let target = jump_target(ip, offset)?;
+        if target >= instructions.len() {
+            return None;
+        }
+        targets.insert(target);
+    }
+    Some(targets)
+}
+
 struct Translator<'a> {
     function: &'a Function,
     sig: &'a FunctionSig,
-    callee_sig: &'a dyn Fn(usize) -> Option<FunctionSig>,
+    ctx: &'a Context<'a>,
     ops: Vec<TraceOp>,
     env: Env,
-    /// Environment arriving at each forward-jump target from its jumps.
+    /// Environment arriving at each forward-jump target from the jumps
+    /// to it seen so far.
     incoming: HashMap<usize, Env>,
+    /// Environment the previous pass settled on for each loop header.
+    loop_envs: &'a HashMap<usize, Env>,
+    /// Back-edge environments seen in this pass.
+    back_edges: HashMap<usize, Env>,
+    targets: &'a HashSet<usize>,
     reachable: bool,
     frame_may_own: bool,
 }
@@ -138,12 +284,72 @@ impl<'a> Translator<'a> {
         self.env.write(reg, ty);
     }
 
+    /// The register now holds a value of this declared type.
+    fn write_typed(&mut self, reg: Register, kind: &TypeKind) {
+        self.write(reg, scalar_kind(kind));
+        self.note_type(reg, kind);
+    }
+
+    /// Non-scalar facts a declared type gives about a register.
+    fn note_type(&mut self, reg: Register, kind: &TypeKind) {
+        match kind {
+            TypeKind::Named(name) => {
+                if let Some(layout) = (self.ctx.layout_of)(name) {
+                    self.env.layouts.insert(reg, (layout, false));
+                }
+            }
+            TypeKind::Array(element) => {
+                if let Some(ty) = scalar_kind(&element.kind) {
+                    self.env.elements.insert(reg, ty);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn constant_string(&self, index: u16) -> Option<String> {
+        self.function
+            .chunk
+            .constants
+            .get(index as usize)?
+            .as_string()
+            .map(|s| s.to_string())
+    }
+
+    /// The layout a register's struct is known to have, guarded on this
+    /// path from here on.
+    fn guarded_layout(&mut self, reg: Register) -> Option<Rc<StructLayout>> {
+        let (layout, guarded) = self.env.layouts.get(&reg)?.clone();
+        if !guarded {
+            self.ops.push(TraceOp::GuardStructLayout {
+                register: reg,
+                layout: Rc::as_ptr(&layout) as *const (),
+            });
+            self.env.layouts.insert(reg, (Rc::clone(&layout), true));
+        }
+        Some(layout)
+    }
+
     fn note_jump(&mut self, target: usize) {
         let merged = match self.incoming.get(&target) {
             Some(existing) => existing.merge(&self.env),
             None => self.env.clone(),
         };
         self.incoming.insert(target, merged);
+    }
+
+    fn note_back_edge(&mut self, target: usize) {
+        let merged = match self.back_edges.get(&target) {
+            Some(existing) => existing.merge(&self.env),
+            None => self.env.clone(),
+        };
+        self.back_edges.insert(target, merged);
+    }
+
+    /// Something the analysis cannot see is about to run: the globals may
+    /// change, so the next global read needs a fresh guard.
+    fn opaque_call(&mut self) {
+        self.env.globals_guarded = false;
     }
 
     fn binary(
@@ -284,6 +490,53 @@ impl<'a> Translator<'a> {
         Some(())
     }
 
+    /// A call to a bytecode function whose index is known, with the
+    /// arguments in `first_arg..` and an optional receiver before them.
+    #[allow(clippy::too_many_arguments)]
+    fn call_direct(
+        &mut self,
+        ip: usize,
+        function_idx: usize,
+        callee: Register,
+        receiver: Option<Register>,
+        first_arg: Register,
+        arg_count: u8,
+        dest: Register,
+    ) -> Option<()> {
+        let sig = (self.ctx.callee_sig)(function_idx)?;
+        let total = arg_count as usize + usize::from(receiver.is_some());
+        if sig.lua_function || sig.params.len() != total || sig.register_count == 0 {
+            return None;
+        }
+        let mut sources = Vec::with_capacity(total);
+        sources.extend(receiver);
+        for index in 0..arg_count {
+            sources.push(first_arg.wrapping_add(index));
+        }
+        for (reg, kind) in sources.iter().zip(sig.params.iter()) {
+            if let Some(kind) = kind
+                && is_scalar(*kind)
+            {
+                self.guard(*reg, *kind);
+            }
+        }
+        let result_type = sig.ret.filter(|ty| is_scalar(*ty));
+        self.ops.push(TraceOp::CallDirect {
+            dest,
+            callee,
+            receiver,
+            function_idx,
+            first_arg,
+            arg_count,
+            callee_registers: sig.register_count,
+            call_ip: ip,
+            result_type,
+        });
+        self.opaque_call();
+        self.write(dest, result_type);
+        Some(())
+    }
+
     fn instruction(&mut self, ip: usize, instruction: Instruction) -> Option<()> {
         let constants = &self.function.chunk.constants;
         match instruction {
@@ -317,25 +570,75 @@ impl<'a> Translator<'a> {
                     self.env.functions.insert(dest, idx);
                 }
             }
+            Instruction::LoadGlobal(dest, name_idx) => {
+                let name = self.constant_string(name_idx)?;
+                let value = (self.ctx.global)(&name)?;
+                if !self.env.globals_guarded {
+                    self.ops.push(TraceOp::GuardGlobals {
+                        version: self.ctx.globals_version,
+                    });
+                    self.env.globals_guarded = true;
+                }
+                let ty = scalar_of(&value);
+                self.ops.push(TraceOp::LoadConst {
+                    dest,
+                    value: value.clone(),
+                });
+                self.write(dest, ty);
+                match &value {
+                    Value::Function(idx) => {
+                        self.env.functions.insert(dest, *idx);
+                    }
+                    Value::Map(_) | Value::NativeFunction(_) => {
+                        self.env.constants.insert(dest, value);
+                    }
+                    _ => {}
+                }
+            }
             Instruction::Move(dest, src) => {
                 let ty = self.env.scalars.get(&src).copied();
                 let function = self.env.functions.get(&src).copied();
+                let layout = self.env.layouts.get(&src).cloned();
+                let elements = self.env.elements.get(&src).copied();
+                let constant = self.env.constants.get(&src).cloned();
+                let native_guarded = self.env.natives_guarded.contains(&src);
                 self.ops.push(TraceOp::Move { dest, src });
                 self.write(dest, ty);
                 if let Some(idx) = function {
                     self.env.functions.insert(dest, idx);
+                }
+                if let Some(layout) = layout {
+                    self.env.layouts.insert(dest, layout);
+                }
+                if let Some(elements) = elements {
+                    self.env.elements.insert(dest, elements);
+                }
+                if let Some(constant) = constant {
+                    self.env.constants.insert(dest, constant);
+                }
+                if native_guarded {
+                    self.env.natives_guarded.insert(dest);
                 }
             }
             Instruction::Not(dest, src) => {
                 self.ops.push(TraceOp::Not { dest, src });
                 self.write(dest, Some(ValueType::Bool));
             }
+            Instruction::And(dest, lhs, rhs) => {
+                self.ops.push(TraceOp::And { dest, lhs, rhs });
+                self.write(dest, None);
+            }
+            Instruction::Or(dest, lhs, rhs) => {
+                self.ops.push(TraceOp::Or { dest, lhs, rhs });
+                self.write(dest, None);
+            }
             Instruction::Jump(offset) => {
                 let target = jump_target(ip, offset)?;
                 if target <= ip {
-                    return None;
-                }
-                if target != ip + 1 {
+                    self.note_back_edge(target);
+                    self.ops.push(TraceOp::Jump { label: target });
+                    self.reachable = false;
+                } else if target != ip + 1 {
                     self.note_jump(target);
                     self.ops.push(TraceOp::Jump { label: target });
                     self.reachable = false;
@@ -343,45 +646,95 @@ impl<'a> Translator<'a> {
             }
             Instruction::JumpIf(cond, offset) | Instruction::JumpIfNot(cond, offset) => {
                 let target = jump_target(ip, offset)?;
-                if target <= ip {
-                    return None;
-                }
                 let expect_truthy = matches!(instruction, Instruction::JumpIf(..));
-                if target != ip + 1 {
+                if target <= ip {
+                    self.note_back_edge(target);
+                } else if target != ip + 1 {
                     self.note_jump(target);
-                    self.ops.push(TraceOp::BranchIf {
-                        condition_register: cond,
-                        expect_truthy,
-                        label: target,
-                    });
+                } else {
+                    return Some(());
                 }
+                self.ops.push(TraceOp::BranchIf {
+                    condition_register: cond,
+                    expect_truthy,
+                    label: target,
+                });
             }
             Instruction::Call(callee, first_arg, arg_count, dest) => {
-                let function_idx = *self.env.functions.get(&callee)?;
-                let sig = (self.callee_sig)(function_idx)?;
-                if sig.lua_function || sig.params.len() != arg_count as usize {
-                    return None;
+                if let Some(function_idx) = self.env.functions.get(&callee).copied() {
+                    return self.call_direct(
+                        ip,
+                        function_idx,
+                        callee,
+                        None,
+                        first_arg,
+                        arg_count,
+                        dest,
+                    );
                 }
-                for (index, kind) in sig.params.iter().enumerate() {
-                    let reg = first_arg.wrapping_add(index as u8);
-                    if let Some(kind) = kind
-                        && is_scalar(*kind)
-                    {
-                        self.guard(reg, *kind);
+                if let Some(Value::NativeFunction(native)) = self.env.constants.get(&callee) {
+                    // A native from a global (or a module table): its
+                    // identity is guarded, since the table is mutable.
+                    let traced = TracedNativeFn::new(Rc::clone(native));
+                    if !self.env.natives_guarded.contains(&callee) {
+                        self.ops.push(TraceOp::GuardNativeFunction {
+                            register: callee,
+                            function: traced.clone(),
+                        });
+                        self.env.natives_guarded.insert(callee);
                     }
+                    let intrinsic = self
+                        .ctx
+                        .intrinsics
+                        .get(&(Rc::as_ptr(native) as *const () as usize))
+                        .copied();
+                    if intrinsic == Some(super::Intrinsic::ArrayLen) && arg_count == 1 {
+                        // `array.len(a)`, with the native's identity guarded
+                        // above: the length read inline.
+                        self.ops.push(TraceOp::ArrayLen {
+                            dest,
+                            array: first_arg,
+                        });
+                        self.write(dest, Some(ValueType::Int));
+                        return Some(());
+                    }
+                    self.ops.push(TraceOp::CallNative {
+                        dest,
+                        callee,
+                        function: traced,
+                        first_arg,
+                        arg_count,
+                    });
+                } else {
+                    // A function value of unknown identity (a parameter, a
+                    // closure): the runtime calls it.
+                    self.ops.push(TraceOp::CallFunction {
+                        dest,
+                        callee,
+                        function_idx: 0,
+                        first_arg,
+                        arg_count,
+                        is_closure: false,
+                        upvalues_ptr: None,
+                    });
                 }
-                let result_type = sig.ret.filter(|ty| is_scalar(*ty));
-                self.ops.push(TraceOp::CallDirect {
-                    dest,
-                    callee,
+                self.opaque_call();
+                self.write(dest, None);
+            }
+            Instruction::CallMethod(object, name_idx, first_arg, arg_count, dest) => {
+                let method = self.constant_string(name_idx)?;
+                let layout = self.guarded_layout(object)?;
+                let mangled = alloc::format!("{}:{}", layout.name(), method);
+                let function_idx = (self.ctx.function_named)(&mangled)?;
+                return self.call_direct(
+                    ip,
                     function_idx,
+                    object,
+                    Some(object),
                     first_arg,
                     arg_count,
-                    callee_registers: sig.register_count,
-                    call_ip: ip,
-                    result_type,
-                });
-                self.write(dest, result_type);
+                    dest,
+                );
             }
             Instruction::Return(value) => {
                 if value == 255 {
@@ -395,6 +748,229 @@ impl<'a> Translator<'a> {
                     self.ops.push(TraceOp::Return { value: Some(value) });
                 }
                 self.reachable = false;
+            }
+            Instruction::GetField(dest, object, name_idx) => {
+                let field_name = self.constant_string(name_idx)?;
+                if let Some(Value::Map(map)) = self.env.constants.get(&object) {
+                    // A module table: the entry read now is what a call
+                    // through the result will guard on.
+                    let entry = map
+                        .borrow()
+                        .get(&crate::bytecode::ValueKey::from(field_name.as_str()))
+                        .cloned();
+                    self.ops.push(TraceOp::GetField {
+                        dest,
+                        object,
+                        field_name,
+                        field_index: None,
+                        value_type: None,
+                        is_weak: false,
+                    });
+                    self.write(dest, None);
+                    if let Some(entry @ Value::NativeFunction(_)) = entry {
+                        self.env.constants.insert(dest, entry);
+                    }
+                    return Some(());
+                }
+                match self.guarded_layout(object) {
+                    Some(layout) => {
+                        let index = layout.index_of_str(&field_name)?;
+                        let kind = layout.field_type(index).kind.clone();
+                        let is_weak = layout.is_weak(index);
+                        let value_type = scalar_kind(&kind);
+                        self.ops.push(TraceOp::GetField {
+                            dest,
+                            object,
+                            field_name,
+                            field_index: Some(index),
+                            value_type,
+                            is_weak,
+                        });
+                        self.write_typed(dest, &kind);
+                    }
+                    None => {
+                        self.ops.push(TraceOp::GetField {
+                            dest,
+                            object,
+                            field_name,
+                            field_index: None,
+                            value_type: None,
+                            is_weak: false,
+                        });
+                        self.write(dest, None);
+                    }
+                }
+            }
+            Instruction::SetField(object, name_idx, value) => {
+                let field_name = self.constant_string(name_idx)?;
+                let value_type = self.env.scalars.get(&value).copied();
+                let (field_index, is_weak) = match self.guarded_layout(object) {
+                    Some(layout) => {
+                        let index = layout.index_of_str(&field_name)?;
+                        (Some(index), layout.is_weak(index))
+                    }
+                    None => (None, false),
+                };
+                self.ops.push(TraceOp::SetField {
+                    object,
+                    field_name,
+                    value,
+                    field_index,
+                    value_type,
+                    is_weak,
+                });
+            }
+            Instruction::ArrayLen(dest, array) => {
+                self.ops.push(TraceOp::ArrayLen { dest, array });
+                self.write(dest, Some(ValueType::Int));
+            }
+            Instruction::GetIndex(dest, array, index) => {
+                self.guard(index, ValueType::Int);
+                self.ops.push(TraceOp::GetIndex { dest, array, index });
+                let element = self.env.elements.get(&array).copied();
+                self.write(dest, element);
+            }
+            Instruction::TryGetIndex(dest, array, index) => {
+                // The checked read is only compiled in its matched form,
+                // `if a[i] is Ok(v)`: TryGetIndex, IsEnumVariant, JumpIfNot,
+                // GetEnumValue, which becomes one ArrayIndexOk plus the
+                // branch and the binding move.
+                let instructions = &self.function.chunk.instructions;
+                let (
+                    Some(Instruction::IsEnumVariant(cond, tested, enum_idx, variant_idx)),
+                    Some(Instruction::JumpIfNot(branch_cond, offset)),
+                    Some(Instruction::GetEnumValue(binding, enum_reg, 0)),
+                ) = (
+                    instructions.get(ip + 1),
+                    instructions.get(ip + 2),
+                    instructions.get(ip + 3),
+                )
+                else {
+                    return None;
+                };
+                let (cond, binding, offset) = (*cond, *binding, *offset);
+                if *tested != dest
+                    || *branch_cond != cond
+                    || *enum_reg != dest
+                    || self.constant_string(*enum_idx)? != "Result"
+                    || self.constant_string(*variant_idx)? != "Ok"
+                    || (ip + 1..=ip + 3).any(|at| self.targets.contains(&at))
+                {
+                    return None;
+                }
+                let target = jump_target(ip + 2, offset)?;
+                if target <= ip + 2 {
+                    return None;
+                }
+                let value_type = self.env.elements.get(&array).copied();
+                self.guard(index, ValueType::Int);
+                self.ops.push(TraceOp::ArrayIndexOk {
+                    value_dest: dest,
+                    condition_dest: cond,
+                    array,
+                    index,
+                    value_type,
+                });
+                self.write(dest, value_type);
+                self.write(cond, Some(ValueType::Bool));
+                self.ops.push(TraceOp::At { ip: ip + 2 });
+                self.note_jump(target);
+                self.ops.push(TraceOp::BranchIf {
+                    condition_register: cond,
+                    expect_truthy: false,
+                    label: target,
+                });
+                self.ops.push(TraceOp::At { ip: ip + 3 });
+                self.ops.push(TraceOp::Move {
+                    dest: binding,
+                    src: dest,
+                });
+                self.write(binding, value_type);
+            }
+            Instruction::NewArray(dest, first_element, count) => {
+                self.ops.push(TraceOp::NewArray {
+                    dest,
+                    first_element,
+                    count,
+                });
+                self.write(dest, None);
+                if let Some(kind) = self.function.register_types.get(&dest).cloned() {
+                    self.note_type(dest, &kind);
+                }
+            }
+            Instruction::Concat(dest, lhs, rhs) => {
+                self.ops.push(TraceOp::Concat { dest, lhs, rhs });
+                self.write(dest, None);
+            }
+            Instruction::NewStruct(dest, name_idx, first_field_name_idx, first_field, field_count) => {
+                let struct_name = self.constant_string(name_idx)?;
+                let mut field_names = Vec::with_capacity(field_count as usize);
+                let mut field_registers = Vec::with_capacity(field_count as usize);
+                for i in 0..field_count {
+                    field_names.push(self.constant_string(first_field_name_idx + u16::from(i))?);
+                    field_registers.push(first_field + i);
+                }
+                self.ops.push(TraceOp::NewStruct {
+                    dest,
+                    struct_name: struct_name.clone(),
+                    field_names,
+                    field_registers,
+                });
+                self.write(dest, None);
+                if let Some(layout) = (self.ctx.layout_of)(&struct_name) {
+                    self.env.layouts.insert(dest, (layout, false));
+                }
+            }
+            Instruction::NewEnumUnit(dest, enum_idx, variant_idx) => {
+                self.ops.push(TraceOp::NewEnumUnit {
+                    dest,
+                    enum_name: self.constant_string(enum_idx)?,
+                    variant_name: self.constant_string(variant_idx)?,
+                });
+                self.write(dest, None);
+            }
+            Instruction::NewEnumVariant(dest, enum_idx, variant_idx, first_value, value_count) => {
+                let value_registers = (0..value_count).map(|i| first_value + i).collect();
+                self.ops.push(TraceOp::NewEnumVariant {
+                    dest,
+                    enum_name: self.constant_string(enum_idx)?,
+                    variant_name: self.constant_string(variant_idx)?,
+                    value_registers,
+                });
+                self.write(dest, None);
+            }
+            Instruction::IsEnumVariant(dest, value, enum_idx, variant_idx) => {
+                self.ops.push(TraceOp::IsEnumVariant {
+                    dest,
+                    value,
+                    enum_name: self.constant_string(enum_idx)?,
+                    variant_name: self.constant_string(variant_idx)?,
+                });
+                self.write(dest, Some(ValueType::Bool));
+            }
+            Instruction::GetEnumValue(dest, enum_reg, index) => {
+                self.ops.push(TraceOp::GetEnumValue {
+                    dest,
+                    enum_reg,
+                    index,
+                });
+                self.write(dest, None);
+            }
+            Instruction::TypeIs(dest, value, type_idx) => {
+                self.ops.push(TraceOp::TypeIs {
+                    dest,
+                    value,
+                    type_name: self.constant_string(type_idx)?,
+                });
+                self.write(dest, Some(ValueType::Bool));
+            }
+            Instruction::TryCast(dest, value, type_idx) => {
+                self.ops.push(TraceOp::TryCast {
+                    dest,
+                    value,
+                    type_name: self.constant_string(type_idx)?,
+                });
+                self.write(dest, None);
             }
             other => {
                 if let Some((generic, ty, lhs, rhs)) = other.numeric_specialization() {
@@ -425,6 +1001,14 @@ impl<'a> Translator<'a> {
                 // Untyped arithmetic and comparisons: only when the
                 // environment already proves both operand types.
                 match other {
+                    Instruction::Neg(dest, src) => {
+                        let ty = self.env.scalars.get(&src).copied()?;
+                        if !matches!(ty, ValueType::Int | ValueType::Float) {
+                            return None;
+                        }
+                        self.ops.push(TraceOp::Neg { dest, src });
+                        self.write(dest, Some(ty));
+                    }
                     Instruction::Add(dest, lhs, rhs)
                     | Instruction::Sub(dest, lhs, rhs)
                     | Instruction::Mul(dest, lhs, rhs)
@@ -452,21 +1036,9 @@ impl<'a> Translator<'a> {
     }
 }
 
-/// Translate `function` into function IR, or `None` when it uses
-/// something the function compiler does not handle.
-pub fn translate(
-    function: &Function,
-    function_idx: usize,
-    sig: &FunctionSig,
-    callee_sig: &dyn Fn(usize) -> Option<FunctionSig>,
-) -> Option<Trace> {
-    let instructions = &function.chunk.instructions;
-    if instructions.is_empty() || instructions.len() > MAX_FUNCTION_LENGTH || sig.lua_function {
-        return None;
-    }
-    if !function.upvalues.is_empty() {
-        return None;
-    }
+/// The environment a function starts with: its parameters' declared
+/// types, and the frame's other registers Nil.
+fn entry_env(sig: &FunctionSig, ctx: &Context) -> (Env, bool) {
     let mut env = Env::default();
     let mut frame_may_own = false;
     for (index, kind) in sig.params.iter().enumerate() {
@@ -476,36 +1048,90 @@ pub fn translate(
             }
             _ => frame_may_own = true,
         }
+        match sig.param_types.get(index) {
+            Some(Some(TypeKind::Named(name))) => {
+                if let Some(layout) = (ctx.layout_of)(name) {
+                    env.layouts.insert(index as u8, (layout, false));
+                }
+            }
+            Some(Some(TypeKind::Array(element))) => {
+                if let Some(ty) = scalar_kind(&element.kind) {
+                    env.elements.insert(index as u8, ty);
+                }
+            }
+            _ => {}
+        }
     }
-    if sig.params.len() != function.param_count as usize {
-        return None;
-    }
+    (env, frame_may_own)
+}
+
+struct Pass {
+    ops: Vec<TraceOp>,
+    /// The environment each label was compiled with.
+    label_envs: HashMap<usize, Env>,
+    /// The environment each back edge arrived with.
+    back_edges: HashMap<usize, Env>,
+    frame_may_own: bool,
+}
+
+/// One translation pass with the given loop-header environments, or
+/// `None` when the function uses something the function compiler does
+/// not handle.
+fn translate_pass(
+    function: &Function,
+    sig: &FunctionSig,
+    ctx: &Context,
+    targets: &HashSet<usize>,
+    loop_envs: &HashMap<usize, Env>,
+) -> Option<Pass> {
+    let instructions = &function.chunk.instructions;
+    let (env, frame_may_own) = entry_env(sig, ctx);
     let mut t = Translator {
         function,
         sig,
-        callee_sig,
+        ctx,
         ops: Vec::new(),
         env,
         incoming: HashMap::new(),
+        loop_envs,
+        back_edges: HashMap::new(),
+        targets,
         reachable: true,
         frame_may_own,
     };
-    for (ip, instruction) in instructions.iter().enumerate() {
-        if let Some(incoming) = t.incoming.remove(&ip) {
-            t.env = if t.reachable {
-                incoming.merge(&t.env)
-            } else {
-                incoming
+    let mut label_envs: HashMap<usize, Env> = HashMap::new();
+    let mut ip = 0;
+    while ip < instructions.len() {
+        if targets.contains(&ip) {
+            let forward = t.incoming.remove(&ip);
+            let mut env = match (forward, t.reachable) {
+                (Some(incoming), true) => incoming.merge(&t.env),
+                (Some(incoming), false) => incoming,
+                (None, true) => t.env.clone(),
+                // Only reachable through a back edge: not structured code.
+                (None, false) => return None,
             };
+            if let Some(loop_env) = t.loop_envs.get(&ip) {
+                env = env.merge(loop_env);
+            }
+            t.env = env;
             t.reachable = true;
+            label_envs.insert(ip, t.env.clone());
             let scalars = t.env.label_scalars();
             t.ops.push(TraceOp::Label { id: ip, scalars });
         }
         if !t.reachable {
+            ip += 1;
             continue;
         }
         t.ops.push(TraceOp::At { ip });
-        t.instruction(ip, *instruction)?;
+        let instruction = instructions[ip];
+        t.instruction(ip, instruction)?;
+        // The matched checked read consumed three more instructions.
+        if matches!(instruction, Instruction::TryGetIndex(..)) {
+            ip += 3;
+        }
+        ip += 1;
     }
     if t.reachable {
         // Fell off the end without a return.
@@ -515,23 +1141,81 @@ pub fn translate(
         // A jump past the last instruction.
         return None;
     }
-    Some(Trace {
-        function_idx,
-        start_ip: 0,
-        is_function: true,
-        frame_may_own: t.frame_may_own,
-        preamble: Vec::new(),
+    Some(Pass {
         ops: t.ops,
-        postamble: Vec::new(),
-        inputs: Vec::new(),
-        outputs: Vec::new(),
+        label_envs,
+        back_edges: t.back_edges,
+        frame_may_own: t.frame_may_own,
     })
+}
+
+/// Translate `function` into function IR, or `None` when it uses
+/// something the function compiler does not handle.
+pub fn translate(
+    function: &Function,
+    function_idx: usize,
+    sig: &FunctionSig,
+    ctx: &Context,
+) -> Option<Trace> {
+    let instructions = &function.chunk.instructions;
+    if instructions.is_empty() || instructions.len() > MAX_FUNCTION_LENGTH || sig.lua_function {
+        return None;
+    }
+    if !function.upvalues.is_empty() {
+        return None;
+    }
+    if sig.params.len() != function.param_count as usize {
+        return None;
+    }
+    let targets = jump_targets(instructions)?;
+    // Loop headers start with everything the entry path knows; each pass
+    // narrows them to what the back edges also guarantee, until a pass
+    // finds every back edge covered.
+    let mut loop_envs: HashMap<usize, Env> = HashMap::new();
+    for _ in 0..MAX_FIXPOINT_PASSES {
+        let pass = translate_pass(function, sig, ctx, &targets, &loop_envs)?;
+        let mut stable = true;
+        for (target, env) in &pass.back_edges {
+            let label_env = pass.label_envs.get(target)?;
+            if !env.covers(label_env) {
+                stable = false;
+                loop_envs.insert(*target, label_env.merge(env));
+            }
+        }
+        if stable {
+            return Some(Trace {
+                function_idx,
+                start_ip: 0,
+                is_function: true,
+                frame_may_own: pass.frame_may_own,
+                preamble: Vec::new(),
+                ops: pass.ops,
+                postamble: Vec::new(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+            });
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bytecode::{Function, Instruction};
+
+    fn context<'a>(sig_for: &'a dyn Fn(usize) -> Option<FunctionSig>) -> Context<'a> {
+        static NO_INTRINSICS: std::sync::OnceLock<HashMap<usize, super::super::Intrinsic>> =
+            std::sync::OnceLock::new();
+        Context {
+            callee_sig: sig_for,
+            layout_of: &|_| None,
+            function_named: &|_| None,
+            global: &|_| None,
+            globals_version: 0,
+            intrinsics: NO_INTRINSICS.get_or_init(HashMap::new),
+        }
+    }
 
     fn fib_function() -> Function {
         // The bytecode `fib` compiles to (see benchmarks/suite/fib.lust).
@@ -564,17 +1248,22 @@ mod tests {
         f
     }
 
+    fn int_sig(params: usize, register_count: u8) -> FunctionSig {
+        FunctionSig {
+            params: vec![Some(ValueType::Int); params],
+            ret: Some(ValueType::Int),
+            lua_function: false,
+            register_count,
+            param_types: vec![Some(TypeKind::Int); params],
+        }
+    }
+
     #[test]
     fn fib_translates_with_typed_params_and_no_operand_guards() {
         let f = fib_function();
-        let sig = FunctionSig {
-            params: vec![Some(ValueType::Int)],
-            ret: Some(ValueType::Int),
-            lua_function: false,
-            register_count: 8,
-        };
+        let sig = int_sig(1, 8);
         let sig_for = |idx: usize| (idx == 0).then(|| sig.clone());
-        let trace = translate(&f, 0, &sig, &sig_for).expect("fib is compilable");
+        let trace = translate(&f, 0, &sig, &context(&sig_for)).expect("fib is compilable");
         assert!(trace.is_function);
         assert!(!trace.frame_may_own);
         let guards = trace
@@ -606,24 +1295,106 @@ mod tests {
     }
 
     #[test]
-    fn backward_jumps_and_unknown_instructions_are_rejected() {
-        let mut f = Function::new("loop", 0, false);
-        f.set_register_count(2);
-        f.chunk.emit(Instruction::LoadNil(0), 1);
-        f.chunk.emit(Instruction::Jump(-2), 1);
-        let sig = FunctionSig::default();
-        assert!(translate(&f, 0, &sig, &|_| None).is_none());
+    fn loops_reach_a_fixpoint_and_keep_typed_counters() {
+        // i = 0; x = n; while i < n do i = i + 1; x = x * 2 end; return x
+        let mut f = Function::new("pow2", 1, false);
+        f.set_register_count(5);
+        let k0 = f.chunk.add_constant(Value::Int(0));
+        let k1 = f.chunk.add_constant(Value::Int(1));
+        let k2 = f.chunk.add_constant(Value::Int(2));
+        for ins in [
+            Instruction::LoadConst(1, k0), // 0: i = 0
+            Instruction::Move(2, 0),       // 1: x = n
+            Instruction::LtInt(3, 1, 0),   // 2: header: i < n
+            Instruction::JumpIfNot(3, 5),  // 3: exit → 9
+            Instruction::LoadConst(4, k1), // 4
+            Instruction::AddInt(1, 1, 4),  // 5: i = i + 1
+            Instruction::LoadConst(4, k2), // 6
+            Instruction::MulInt(2, 2, 4),  // 7: x = x * 2
+            Instruction::Jump(-7),         // 8: → 2
+            Instruction::Return(2),        // 9
+        ] {
+            f.chunk.emit(ins, 1);
+        }
+        let sig = int_sig(1, 5);
+        let trace = translate(&f, 0, &sig, &context(&|_| None)).expect("loop is compilable");
+        let guards = trace
+            .ops
+            .iter()
+            .filter(|op| matches!(op, TraceOp::Guard { .. }))
+            .count();
+        assert_eq!(guards, 0, "{:?}", trace.ops);
+        let header = trace
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                TraceOp::Label { id: 2, scalars } => Some(scalars.clone()),
+                _ => None,
+            })
+            .expect("loop header label");
+        assert_eq!(
+            header,
+            vec![(0, ValueType::Int), (1, ValueType::Int), (2, ValueType::Int)]
+        );
+        assert!(
+            trace
+                .ops
+                .iter()
+                .any(|op| matches!(op, TraceOp::Jump { label: 2 }))
+        );
+    }
 
-        let mut g = Function::new("concat", 2, false);
+    #[test]
+    fn a_loop_that_changes_a_register_type_narrows_its_header() {
+        // x starts as an Int and becomes a Float in the body: the header
+        // must not claim x is an Int, and the typed op on it needs a guard.
+        let mut f = Function::new("mix", 1, false);
+        f.set_register_count(4);
+        let k0 = f.chunk.add_constant(Value::Int(0));
+        let kf = f.chunk.add_constant(Value::Float(1.5));
+        for ins in [
+            Instruction::LoadConst(1, k0), // 0: x = 0
+            Instruction::LtInt(2, 1, 0),   // 1: header: needs a guard on x
+            Instruction::JumpIfNot(2, 2),  // 2: → 5
+            Instruction::LoadConst(1, kf), // 3: x = 1.5
+            Instruction::Jump(-4),         // 4: → 1
+            Instruction::Return(0),        // 5
+        ] {
+            f.chunk.emit(ins, 1);
+        }
+        let sig = int_sig(1, 4);
+        let trace = translate(&f, 0, &sig, &context(&|_| None)).expect("compilable");
+        let header = trace
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                TraceOp::Label { id: 1, scalars } => Some(scalars.clone()),
+                _ => None,
+            })
+            .expect("loop header label");
+        assert_eq!(header, vec![(0, ValueType::Int)]);
+        assert!(trace.ops.iter().any(|op| matches!(
+            op,
+            TraceOp::Guard {
+                register: 1,
+                expected_type: ValueType::Int
+            }
+        )));
+    }
+
+    #[test]
+    fn unknown_instructions_are_rejected() {
+        let mut g = Function::new("upvalue", 2, false);
         g.set_register_count(3);
-        g.chunk.emit(Instruction::Concat(2, 0, 1), 1);
+        g.chunk.emit(Instruction::LoadUpvalue(2, 0), 1);
         g.chunk.emit(Instruction::Return(2), 1);
         let sig = FunctionSig {
             params: vec![None, None],
             ret: None,
             lua_function: false,
             register_count: 3,
+            param_types: vec![None, None],
         };
-        assert!(translate(&g, 0, &sig, &|_| None).is_none());
+        assert!(translate(&g, 0, &sig, &context(&|_| None)).is_none());
     }
 }

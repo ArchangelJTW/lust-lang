@@ -1442,6 +1442,12 @@ impl VM {
                             // Fall through to the trace recorder below: it
                             // inlines user-defined struct methods like calls.
                             self.call_stack.push(frame);
+                            if self.jit.enabled
+                                && self.trace_recorder.is_none()
+                                && let Some(finished) = self.run_compiled_function(target)?
+                            {
+                                return Ok(finished);
+                            }
                             break 'method;
                         }
                     }
@@ -2124,12 +2130,22 @@ impl VM {
     /// Translate and compile `func_idx` (see `jit::function`), or mark it
     /// as not compilable.
     fn compile_function(&mut self, func_idx: usize) {
-        use crate::jit::function::{FunctionSig, translate};
+        use crate::jit::function::{Context, FunctionSig, translate};
         let sig_of = |meta: &CallMeta, function: &Function| FunctionSig {
             params: meta.params.iter().map(|kind| kind.value_type()).collect(),
             ret: meta.return_kind.value_type(),
             lua_function: meta.lua_function,
             register_count: function.register_count,
+            param_types: match &function.signature {
+                Some(signature) if signature.params.len() == function.param_count as usize => {
+                    signature
+                        .params
+                        .iter()
+                        .map(|ty| Some(ty.kind.clone()))
+                        .collect()
+                }
+                _ => alloc::vec![None; function.param_count as usize],
+            },
         };
         let Some((function, meta)) = self.functions.get(func_idx).zip(self.call_meta.get(func_idx))
         else {
@@ -2144,7 +2160,21 @@ impl VM {
                 .zip(call_meta.get(idx))
                 .map(|(function, meta)| sig_of(meta, function))
         };
-        let Some(trace) = translate(function, func_idx, &sig, &callee_sig) else {
+        let struct_metadata = &self.struct_metadata;
+        let layout_of = |name: &str| struct_metadata.get(name).map(|info| info.layout.clone());
+        let function_named = |name: &str| functions.iter().position(|f| f.name == name);
+        let globals = &self.globals;
+        let natives = &self.natives;
+        let global = |name: &str| globals.get(name).or_else(|| natives.get(name)).cloned();
+        let ctx = Context {
+            callee_sig: &callee_sig,
+            layout_of: &layout_of,
+            function_named: &function_named,
+            global: &global,
+            globals_version: self.globals_version,
+            intrinsics: &self.jit.intrinsics,
+        };
+        let Some(trace) = translate(function, func_idx, &sig, &ctx) else {
             crate::jit::log(|| format!("🚫 JIT: function {} is not compilable", func_idx));
             self.jit.function_not_compilable(func_idx);
             return;

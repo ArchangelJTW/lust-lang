@@ -1168,6 +1168,7 @@ impl JitCompiler {
                 TraceOp::CallDirect {
                     dest,
                     callee,
+                    receiver,
                     function_idx,
                     first_arg,
                     arg_count,
@@ -1178,6 +1179,7 @@ impl JitCompiler {
                     self.compile_call_direct(
                         *dest,
                         *callee,
+                        *receiver,
                         *function_idx,
                         *first_arg,
                         *arg_count,
@@ -1527,10 +1529,15 @@ impl JitCompiler {
             } => *condition_register == register,
             TraceOp::CallDirect {
                 callee,
+                receiver,
                 first_arg,
                 arg_count,
                 ..
-            } => *callee == register || in_args(*first_arg, *arg_count),
+            } => {
+                *callee == register
+                    || *receiver == Some(register)
+                    || in_args(*first_arg, *arg_count)
+            }
         }
     }
 

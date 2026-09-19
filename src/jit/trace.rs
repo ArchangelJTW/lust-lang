@@ -369,6 +369,9 @@ pub enum TraceOp {
     CallDirect {
         dest: Register,
         callee: Register,
+        /// A method call's receiver, passed as the callee's first
+        /// argument ahead of `first_arg..`.
+        receiver: Option<Register>,
         function_idx: usize,
         first_arg: Register,
         arg_count: u8,

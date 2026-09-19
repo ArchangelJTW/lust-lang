@@ -415,6 +415,7 @@ impl JitCompiler {
         &mut self,
         dest: u8,
         callee: u8,
+        receiver: Option<u8>,
         function_idx: usize,
         first_arg: u8,
         arg_count: u8,
@@ -431,6 +432,11 @@ impl JitCompiler {
         let frame_value_count = callee_registers as i32;
         let frame_size = (frame_value_count * value_size + 15) & !15;
         let metadata_size = INLINE_METADATA_SIZE;
+        // The receiver, then the arguments, into callee registers 0...
+        let sources: Vec<u8> = receiver
+            .into_iter()
+            .chain((0..arg_count).map(|index| first_arg.wrapping_add(index)))
+            .collect();
         let to_interpreter = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
         let epilogue = self
@@ -473,10 +479,9 @@ impl JitCompiler {
             let offset = reg as i32 * value_size;
             dynasm!(self.ops ; .arch x64 ; mov BYTE [rsp + offset], 0);
         }
-        for index in 0..arg_count {
-            let src_reg = first_arg.wrapping_add(index);
+        for (index, src_reg) in sources.into_iter().enumerate() {
             let src_offset = (src_reg as i32) * value_size;
-            let dest_offset = i32::from(index) * value_size;
+            let dest_offset = index as i32 * value_size;
             match self.scalar_registers.get(&src_reg).copied() {
                 Some(ty @ (ValueType::Int | ValueType::Bool | ValueType::Float)) => {
                     let tag = match ty {

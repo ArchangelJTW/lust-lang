@@ -759,7 +759,9 @@ impl JitCompiler {
     }
 
     fn emit_call_result_out(&mut self, x: u8, dest: u8) {
-        if self.inline_depth > 0 {
+        // Function code's frame is wherever x19 points (the machine stack
+        // when called natively), never looked up through the VM.
+        if self.inline_depth > 0 || self.function_mode {
             self.emit_reg_addr(x, dest);
         } else {
             dynasm!(self.ops ; .arch aarch64 ; mov X(x), xzr);
@@ -773,7 +775,7 @@ impl JitCompiler {
         unsafe extern "C" {
             fn jit_current_registers(vm_ptr: *mut crate::VM) -> *mut Value;
         }
-        if self.inline_depth == 0 {
+        if self.inline_depth == 0 && !self.function_mode {
             dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
             self.emit_call(jit_current_registers as *const ());
             dynasm!(self.ops

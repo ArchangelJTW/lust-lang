@@ -406,12 +406,22 @@ impl CycleCollector {
             }
         }
 
-        let mut scanned = HashSet::new();
-        while let Some(key) = nodes.keys().find(|key| !scanned.contains(*key)).copied() {
-            scanned.insert(key);
-            if !self.scan_node(key, &mut nodes) {
-                return None;
+        // Scanning a node can add nodes (containers reached only through
+        // values that are not registered, such as an enum's payload); each
+        // round scans what the previous one found. Searching the map for
+        // an unscanned key per node made this quadratic in the heap.
+        let mut scanned = HashSet::with_capacity(nodes.len());
+        let mut pending: Vec<NodeKey> = nodes.keys().copied().collect();
+        while !pending.is_empty() {
+            for key in pending.drain(..) {
+                if !scanned.insert(key) {
+                    continue;
+                }
+                if !self.scan_node(key, &mut nodes) {
+                    return None;
+                }
             }
+            pending.extend(nodes.keys().filter(|key| !scanned.contains(*key)).copied());
         }
 
         Some(nodes)

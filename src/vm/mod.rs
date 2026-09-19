@@ -167,6 +167,9 @@ pub struct VM {
     pub(super) jit: JitState,
     pub(super) budgets: BudgetState,
     pub(super) functions: Vec<Function>,
+    /// Per-function facts the call path needs, indexed like `functions`
+    /// (see `CallMeta`).
+    pub(super) call_meta: Vec<CallMeta>,
     pub(super) natives: HashMap<String, Value>,
     pub(super) globals: HashMap<String, Value>,
     pub(super) map_hasher: DefaultHashBuilder,
@@ -225,6 +228,106 @@ pub(super) struct CallFrame {
     pub(super) upvalues: Vec<Value>,
 }
 
+/// What a bytecode-to-bytecode call checks about its callee, computed
+/// once per function instead of re-derived from the signature on every
+/// call.
+#[derive(Debug, Clone, Default)]
+pub(super) struct CallMeta {
+    /// Lua-compat function (`LuaValue` params or multi-return): arguments
+    /// are padded/truncated rather than counted. Takes the general path.
+    pub(super) lua_function: bool,
+    /// Shallow kind check per parameter, when the signature is known and
+    /// matches the parameter count.
+    pub(super) params: Vec<ShallowKind>,
+    /// Shallow kind check for the return value.
+    pub(super) return_kind: ShallowKind,
+    /// A Lua multi-return function may return Nil for "nothing".
+    pub(super) lua_multi_return: bool,
+}
+
+/// The O(1) argument/return check for calls the typechecker validated:
+/// scalar and container kinds are verified, contents are not. Anything the
+/// checker treats dynamically (`unknown`, generics, unions, function types,
+/// Lua values) is `Any`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ShallowKind {
+    #[default]
+    Any,
+    Int,
+    Float,
+    String,
+    Bool,
+    Unit,
+    Array,
+    Map,
+    Tuple,
+}
+
+impl ShallowKind {
+    pub(super) fn of(ty: &crate::ast::Type) -> Self {
+        use crate::ast::TypeKind;
+        match &ty.kind {
+            TypeKind::Int => Self::Int,
+            TypeKind::Float => Self::Float,
+            TypeKind::String => Self::String,
+            TypeKind::Bool => Self::Bool,
+            TypeKind::Unit => Self::Unit,
+            TypeKind::Array(_) => Self::Array,
+            TypeKind::Map(..) => Self::Map,
+            TypeKind::Tuple(_) => Self::Tuple,
+            _ => Self::Any,
+        }
+    }
+
+    #[inline]
+    pub(super) fn matches(self, value: &Value) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Int => matches!(value, Value::Int(_)),
+            Self::Float => matches!(value, Value::Float(_)),
+            Self::String => matches!(value, Value::String(_)),
+            Self::Bool => matches!(value, Value::Bool(_)),
+            Self::Unit => matches!(value, Value::Nil),
+            Self::Array => matches!(value, Value::Array(_)),
+            Self::Map => matches!(value, Value::Map(_)),
+            Self::Tuple => matches!(value, Value::Tuple(_)),
+        }
+    }
+}
+
+impl CallMeta {
+    pub(super) fn of(function: &Function) -> Self {
+        use crate::ast::TypeKind;
+        let Some(signature) = &function.signature else {
+            return Self {
+                params: alloc::vec![ShallowKind::Any; function.param_count as usize],
+                ..Self::default()
+            };
+        };
+        let lua_params = signature
+            .params
+            .iter()
+            .all(|ty| matches!(&ty.kind, TypeKind::Named(name) if name == "LuaValue"));
+        let lua_multi_return = matches!(
+            &signature.return_type.kind,
+            TypeKind::Array(inner)
+                if matches!(&inner.kind, TypeKind::Named(name) if name == "LuaValue")
+        );
+        let lua_function = lua_params && (!signature.params.is_empty() || lua_multi_return);
+        let params = if signature.params.len() == function.param_count as usize {
+            signature.params.iter().map(ShallowKind::of).collect()
+        } else {
+            alloc::vec![ShallowKind::Any; function.param_count as usize]
+        };
+        Self {
+            lua_function,
+            params,
+            return_kind: ShallowKind::of(&signature.return_type),
+            lua_multi_return,
+        }
+    }
+}
+
 /// Upper bound on recycled frames kept around (each holds 16 KB).
 pub(super) const FRAME_POOL_LIMIT: usize = 64;
 
@@ -252,7 +355,12 @@ impl CallFrame {
     /// `register_count` registers) so it can be handed out again.
     pub(super) fn reset(&mut self, function_idx: usize, return_dest: Option<Register>, register_count: u8) {
         for value in &mut self.registers[..register_count as usize] {
-            *value = Value::Nil;
+            if value.is_plain() {
+                // SAFETY: nothing to drop.
+                unsafe { core::ptr::write(value, Value::Nil) };
+            } else {
+                *value = Value::Nil;
+            }
         }
         self.function_idx = function_idx;
         self.ip = 0;

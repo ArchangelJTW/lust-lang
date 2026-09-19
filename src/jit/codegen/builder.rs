@@ -154,6 +154,7 @@ impl JitCompiler {
         });
         self.current_fail_ip = None;
         self.compile_ops(&trace.postamble, &mut guard_index, &mut guards)?;
+        self.publish_remaining_specialized(trace)?;
 
         // Now pop the label stacks after everything is compiled
         self.exit_stack.pop();
@@ -250,6 +251,45 @@ impl JitCompiler {
             ; xor r15, r15
             ; => done
         );
+    }
+
+    /// After the postamble: publish and release every specialized slot the
+    /// postamble did not rebox. A slot whose register the trace overwrote
+    /// is dropped from the recorder's tracking (no `Rebox` is generated for
+    /// it), but its unbox still runs on every entry, so left alone it
+    /// leaked its copy and kept the array alive. Reboxing an empty slot is
+    /// a no-op, so this is safe for the slots the postamble did handle.
+    fn publish_remaining_specialized(&mut self, trace: &Trace) -> Result<()> {
+        let reboxed: Vec<usize> = trace
+            .postamble
+            .iter()
+            .filter_map(|op| match op {
+                TraceOp::Rebox { specialized_id, .. } => Some(*specialized_id),
+                _ => None,
+            })
+            .collect();
+        let layouts: Vec<(usize, SpecializedLayout)> = trace
+            .preamble
+            .iter()
+            .chain(trace.ops.iter())
+            .filter_map(|op| match op {
+                TraceOp::Unbox {
+                    specialized_id,
+                    layout,
+                    ..
+                } if !reboxed.contains(specialized_id) => Some((*specialized_id, layout.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut done = Vec::new();
+        for (id, layout) in layouts {
+            if done.contains(&id) || !self.specialized_values.contains_key(&id) {
+                continue;
+            }
+            done.push(id);
+            self.compile_rebox(0, id, &layout)?;
+        }
+        Ok(())
     }
 
     fn compile_ops(
@@ -566,9 +606,27 @@ impl JitCompiler {
                     callee,
                     trace,
                 } => {
+                    // Arguments of known scalar type are copied natively and
+                    // seed the callee's environment; the result's type comes
+                    // back the same way.
+                    let arg_types: Vec<Option<ValueType>> = trace
+                        .arg_registers
+                        .iter()
+                        .map(|reg| self.scalar_registers.get(reg).copied())
+                        .collect();
                     let outer_scalar_registers = mem::take(&mut self.scalar_registers);
-                    self.compile_inline_call(*dest, *callee, trace, guard_index, guards)?;
+                    let result =
+                        self.compile_inline_call(*dest, *callee, trace, &arg_types, guard_index, guards);
                     self.scalar_registers = outer_scalar_registers;
+                    let result_type = result?;
+                    self.update_scalar_registers(op);
+                    if let Some(ty) = result_type {
+                        self.scalar_registers.insert(*dest, ty);
+                    }
+                    if Self::op_may_fail(op) {
+                        self.emit_fail_stub();
+                    }
+                    continue;
                 }
 
                 TraceOp::CallMethod {
@@ -708,10 +766,15 @@ impl JitCompiler {
                     register,
                     expected_type,
                 } => {
-                    let guard =
-                        self.compile_guard(*register, *expected_type, *guard_index as usize)?;
-                    guards.push(guard);
-                    *guard_index += 1;
+                    // A guard on a register the static environment already
+                    // knows to hold that scalar is redundant: only typed
+                    // writes reach the environment.
+                    if self.scalar_registers.get(register) != Some(expected_type) {
+                        let guard =
+                            self.compile_guard(*register, *expected_type, *guard_index as usize)?;
+                        guards.push(guard);
+                        *guard_index += 1;
+                    }
                 }
 
                 TraceOp::GuardLoopContinue {
@@ -1368,26 +1431,37 @@ impl JitCompiler {
         size
     }
 
+    /// Distinct specialized ids: each gets one slot, however many times an
+    /// unrolled body unboxes it.
     fn count_specialized_slots(trace: &Trace) -> usize {
-        trace
+        let mut ids: Vec<usize> = trace
             .preamble
             .iter()
             .chain(trace.ops.iter())
             .chain(trace.postamble.iter())
-            .filter(|op| matches!(op, TraceOp::Unbox { .. }))
-            .count()
+            .filter_map(|op| match op {
+                TraceOp::Unbox { specialized_id, .. } => Some(*specialized_id),
+                _ => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
     }
 
+    /// Returns the scalar type of the value delivered to `dest`, when the
+    /// callee's environment proves one.
     fn compile_inline_call(
         &mut self,
         dest: u8,
         callee: u8,
         trace: &InlineTrace,
+        arg_types: &[Option<ValueType>],
         guard_index: &mut i32,
         guards: &mut Vec<Guard>,
-    ) -> Result<()> {
+    ) -> Result<Option<ValueType>> {
         self.inline_depth += 1;
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<Option<ValueType>> {
             if trace.register_count == 0 {
                 crate::jit::log(|| {
                     format!(
@@ -1395,7 +1469,7 @@ impl JitCompiler {
                         trace.function_idx
                     )
                 });
-                return self.compile_call_function(
+                self.compile_call_function(
                     dest,
                     callee,
                     trace.function_idx,
@@ -1403,7 +1477,8 @@ impl JitCompiler {
                     trace.arg_count,
                     trace.is_closure,
                     trace.upvalues_ptr,
-                );
+                )?;
+                return Ok(None);
             }
 
             crate::jit::log(|| {
@@ -1428,13 +1503,37 @@ impl JitCompiler {
             // into the unwind chain only once the frame below it is fully
             // built, so a failure while building it exits cleanly.
             let caller_resume_ip = self.current_fail_ip.map_or(0, |ip| ip + 1);
+            // An argument of unknown type whose callee register the body
+            // never writes is aliased: its bits are copied without touching
+            // the reference count, and the register is neither dropped at
+            // teardown nor moved out on exit (the record's mask tells
+            // `jit_materialize_inline_frames` to clone it instead). The
+            // caller's register keeps the value alive throughout, since the
+            // body only ever writes its own frame.
+            let alias_mask: u64 = trace
+                .arg_registers
+                .iter()
+                .enumerate()
+                .filter(|(arg_index, _)| {
+                    !matches!(
+                        arg_types.get(*arg_index).copied().flatten(),
+                        Some(ValueType::Int | ValueType::Bool | ValueType::Float)
+                    ) && *arg_index < 64
+                        && !trace
+                            .body
+                            .iter()
+                            .any(|op| Self::op_writes_register(op, *arg_index as u8))
+                })
+                .map(|(arg_index, _)| 1u64 << arg_index)
+                .fold(0, |mask, bit| mask | bit);
             dynasm!(self.ops
                 ; .arch x64
                 ; sub rsp, metadata_size
                 ; mov QWORD [rsp], frame_value_count
                 ; mov [rsp + 8], r12
                 ; mov [rsp + 16], r15
-                ; mov QWORD [rsp + 24], 0
+                ; mov rax, QWORD alias_mask as _
+                ; mov [rsp + 24], rax
                 ; mov rax, QWORD trace.function_idx as _
                 ; mov [rsp + 32], rax
                 ; mov QWORD [rsp + 40], dest as i32
@@ -1454,22 +1553,59 @@ impl JitCompiler {
                 );
             }
 
-            // Copy positional arguments into the callee frame.
+            // Copy positional arguments into the callee frame. A scalar of
+            // known type is a tag + payload store into the fresh Nil slot,
+            // an aliased argument a bit copy; anything else goes through the
+            // helper, which clones it.
+            let mut helper_copied: Vec<u8> = Vec::new();
             for (arg_index, src_reg) in trace.arg_registers.iter().enumerate() {
                 let src_offset = (*src_reg as i32) * value_size;
                 let dest_offset = (arg_index as i32) * value_size;
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; lea rdi, [r12 + src_offset]
-                    ; lea rsi, [rsp + dest_offset]
-                    ; mov rax, QWORD jit_move_safe as *const () as _
-                    ; call rax
-                    ; test al, al
-                    ; jz >fail
-                );
+                match arg_types.get(arg_index).copied().flatten() {
+                    Some(ty @ (ValueType::Int | ValueType::Bool | ValueType::Float)) => {
+                        let tag = match ty {
+                            ValueType::Int => ValueTag::Int,
+                            ValueType::Bool => ValueTag::Bool,
+                            _ => ValueTag::Float,
+                        }
+                        .as_u8() as i8;
+                        dynasm!(self.ops
+                            ; .arch x64
+                            ; mov rax, [r12 + src_offset + 8]
+                            ; mov BYTE [rsp + dest_offset], tag
+                            ; mov [rsp + dest_offset + 8], rax
+                        );
+                    }
+                    _ if alias_mask & (1u64 << arg_index) != 0 => {
+                        for word in (0..value_size).step_by(8) {
+                            dynasm!(self.ops
+                                ; .arch x64
+                                ; mov rax, [r12 + src_offset + word]
+                                ; mov [rsp + dest_offset + word], rax
+                            );
+                        }
+                    }
+                    _ => {
+                        helper_copied.push(arg_index as u8);
+                        dynasm!(self.ops
+                            ; .arch x64
+                            ; lea rdi, [r12 + src_offset]
+                            ; lea rsi, [rsp + dest_offset]
+                            ; mov rax, QWORD jit_move_safe as *const () as _
+                            ; call rax
+                            ; test al, al
+                            ; jz >fail
+                        );
+                    }
+                }
             }
             // A failed argument move resumes at the call, in the caller.
             self.emit_fail_stub();
+            for (arg_index, ty) in arg_types.iter().enumerate() {
+                if let Some(ty @ (ValueType::Int | ValueType::Bool | ValueType::Float)) = ty {
+                    self.scalar_registers.insert(arg_index as u8, *ty);
+                }
+            }
 
             // Point r12 at the callee frame and link the record.
             dynasm!(self.ops
@@ -1487,36 +1623,88 @@ impl JitCompiler {
             let callee_last_ip = self.current_fail_ip;
             self.current_fail_ip = call_ip;
 
+            // The result: a scalar of known type rides in r14 (callee-saved,
+            // unused until the exit path) across the frame teardown and is
+            // stored into the caller's register afterwards; anything else is
+            // moved by the helper while the callee frame is still live.
+            let result_type = trace.return_register.and_then(|ret_reg| {
+                self.scalar_registers
+                    .get(&ret_reg)
+                    .copied()
+                    .filter(|ty| matches!(ty, ValueType::Int | ValueType::Bool | ValueType::Float))
+            });
             if let Some(ret_reg) = trace.return_register {
-                self.current_fail_ip = callee_last_ip;
                 let ret_offset = (ret_reg as i32) * value_size;
-                let dest_offset = (dest as i32) * value_size;
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov r14, [r15 + 8]
-                    ; lea rdi, [r12 + ret_offset]
-                    ; lea rsi, [r14 + dest_offset]
-                    ; mov rax, QWORD jit_move_safe as *const () as _
-                    ; call rax
-                    ; test al, al
-                    ; jz >fail
-                );
-                self.emit_fail_stub();
-                self.current_fail_ip = call_ip;
+                if result_type.is_some() {
+                    dynasm!(self.ops ; .arch x64 ; mov r14, [r12 + ret_offset + 8]);
+                } else {
+                    self.current_fail_ip = callee_last_ip;
+                    let dest_offset = (dest as i32) * value_size;
+                    dynasm!(self.ops
+                        ; .arch x64
+                        ; mov r14, [r15 + 8]
+                        ; lea rdi, [r12 + ret_offset]
+                        ; lea rsi, [r14 + dest_offset]
+                        ; mov rax, QWORD jit_move_safe as *const () as _
+                        ; call rax
+                        ; test al, al
+                        ; jz >fail
+                    );
+                    self.emit_fail_stub();
+                    self.current_fail_ip = call_ip;
+                }
             }
 
-            // Drop callee registers and pop the frame + record.
+            // Drop callee registers — unless every one of them is a scalar,
+            // an alias, or was never written (still Nil) — and pop the frame
+            // + record. Aliased registers are blanked first so the drop
+            // leaves the caller's value alone.
+            let may_own = (0..trace.register_count).any(|reg| {
+                !self.scalar_registers.contains_key(&reg)
+                    && (helper_copied.contains(&reg)
+                        || trace.body.iter().any(|op| Self::op_writes_register(op, reg)))
+            });
+            if may_own {
+                for reg in 0..trace.register_count.min(64) {
+                    if alias_mask & (1u64 << reg) != 0 {
+                        let offset = reg as i32 * value_size;
+                        dynasm!(self.ops ; .arch x64 ; mov BYTE [r12 + offset], 0);
+                    }
+                }
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; mov rdi, r12
+                    ; mov esi, DWORD frame_value_count
+                    ; mov rax, QWORD jit_drop_values as *const () as _
+                    ; call rax
+                );
+            }
             dynasm!(self.ops
                 ; .arch x64
-                ; mov rdi, r12
-                ; mov esi, DWORD frame_value_count
-                ; mov rax, QWORD jit_drop_values as *const () as _
-                ; call rax
                 ; lea rsp, [r15 + metadata_size]
                 ; mov r12, [r15 + 8]
                 ; mov r15, [r15 + 16]
             );
 
+            // Back in the caller's frame: the caller's environment is
+            // restored by our caller, so store through the generic path
+            // (which drops whatever `dest` held).
+            self.scalar_registers.clear();
+            match result_type {
+                Some(ValueType::Float) => {
+                    dynasm!(self.ops ; .arch x64 ; movq xmm0, r14);
+                    self.store_xmm0_as_float(dest);
+                }
+                Some(ValueType::Int) => {
+                    dynasm!(self.ops ; .arch x64 ; mov rax, r14);
+                    self.store_from_rax(dest, ValueTag::Int.as_u8());
+                }
+                Some(ValueType::Bool) => {
+                    dynasm!(self.ops ; .arch x64 ; mov rax, r14);
+                    self.store_from_rax(dest, ValueTag::Bool.as_u8());
+                }
+                _ => {}
+            }
             if trace.return_register.is_none() {
                 self.compile_load_const(dest, &Value::Nil)?;
             }
@@ -1525,7 +1713,7 @@ impl JitCompiler {
                 ; => inline_end
             );
 
-            Ok(())
+            Ok(result_type)
         })();
         self.inline_depth -= 1;
         result

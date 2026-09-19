@@ -27,7 +27,7 @@ pub(super) const SPECIALIZED_SLOT_SIZE: i32 = 32;
 pub(super) const SPECIALIZED_STACK_BASE: i32 = 72;
 /// Size of the record pushed for each inlined call frame: a
 /// `crate::vm::JitInlineRecord` (value_count, caller r12, previous r15,
-/// reserved, function_idx, return_dest, callee_reg, caller_resume_ip).
+/// alias_mask, function_idx, return_dest, callee_reg, caller_resume_ip).
 pub(super) const INLINE_METADATA_SIZE: i32 = 64;
 mod arithmetic;
 mod builder;

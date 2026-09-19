@@ -59,6 +59,26 @@ impl JitCompiler {
     pub(super) fn compile_move(&mut self, dest: u8, src: u8) -> Result<()> {
         let src_offset = (src as i32) * (mem::size_of::<Value>() as i32);
         let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
+        // A source of known scalar type is a payload copy plus a typed
+        // store (which drops whatever the destination held).
+        match self.scalar_registers.get(&src).copied() {
+            Some(ValueType::Float) => {
+                dynasm!(self.ops ; .arch x64 ; movq xmm0, QWORD [r12 + src_offset + 8]);
+                self.store_xmm0_as_float(dest);
+                return Ok(());
+            }
+            Some(ValueType::Int) => {
+                self.load_to_rax(src);
+                self.store_from_rax(dest, ValueTag::Int.as_u8());
+                return Ok(());
+            }
+            Some(ValueType::Bool) => {
+                self.load_to_rax(src);
+                self.store_from_rax(dest, ValueTag::Bool.as_u8());
+                return Ok(());
+            }
+            _ => {}
+        }
         unsafe extern "C" {
             fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
         }

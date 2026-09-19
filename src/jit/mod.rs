@@ -286,11 +286,10 @@ impl JitState {
         self.stats
     }
 
-    pub(crate) fn record_function_call(&mut self, func_idx: usize, recursive: bool) {
+    pub(crate) fn record_function_call(&mut self, recursive: bool) {
         if !self.enabled {
             return;
         }
-        self.profiler.record_function_call(func_idx);
         self.stats.function_calls = self.stats.function_calls.saturating_add(1);
         if recursive {
             self.stats.recursive_calls = self.stats.recursive_calls.saturating_add(1);

@@ -156,20 +156,24 @@ milliseconds, single run each:
 
 | program   | lust-vm | lust-jit | luajit | lua 5.5 |
 |-----------|--------:|---------:|-------:|--------:|
-| fields    |    1211 |      178 |     54 |     114 |
-| array     |    1896 |      380 |     57 |      75 |
-| calls     |    1314 |      360 |     27 |     131 |
-| methods   |    2208 |      536 |     27 |     210 |
-| strings   |   14844 |    13982 |  26942 |    7287 |
-| fib       |     271 |      270 |     20 |      37 |
-| nested    |     522 |       22 |     29 |      75 |
-| floatmath |     810 |       54 |     34 |      92 |
+| fields    |    1114 |      185 |     63 |     119 |
+| array     |    1811 |      358 |     59 |      79 |
+| calls     |     855 |      159 |     30 |     122 |
+| methods   |    1876 |      387 |     27 |     215 |
+| strings   |   13864 |    14241 |  26467 |    7286 |
+| fib       |     182 |      184 |     21 |      37 |
+| nested    |     407 |       22 |     28 |      76 |
+| floatmath |     590 |       53 |     37 |      90 |
 
 The interpreter numbers were 3-90x worse before the fixes to cycle
 collection cost, call-frame copying and argument checking on this branch
 (fib: 3724 ms; `array` at 1,000,000 elements did not finish in thirty
 minutes). `nested` was 626 ms with the JIT before nested loops ran natively from the
 outer trace (each outer iteration used to exit to the interpreter, and the
-inner loop's trace was recompiled every time). Remaining gaps against Lua:
-recursion and calls (frame setup), and `strings`, where every engine is
-quadratic in `s = s .. x`.
+inner loop's trace was recompiled every time). `calls` was 367 ms and
+`methods` 562 ms with the JIT before inlined calls copied scalar arguments
+and results natively and aliased struct arguments instead of cloning them;
+`fib` 271 ms before the interpreter's call path stopped re-deriving the
+callee's signature on every call. Remaining gaps against Lua: recursion
+(the JIT does not compile recursive functions), and `strings`, where every
+engine is quadratic in `s = s .. x`.

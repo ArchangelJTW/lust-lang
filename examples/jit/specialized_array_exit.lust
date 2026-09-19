@@ -1,0 +1,18 @@
+-- An array built every iteration is specialized by the trace; a
+-- loop-condition guard exit must not let its rebox overwrite the Bool the
+-- guard just materialized (that ran one extra iteration: 100.5 instead
+-- of 7).
+function run(): float
+    local x: float = 7.0
+    local i: int = 0
+    while i < 36 and (0 - 16) <= (0 - 16) do
+        i = i + 1
+        local o: Option<int> = Option.Some(i)
+        local arr: Array<int> = [i, 0 - 20]
+        local y: float = 100.5
+        x = -((x - 7.0) + (-y))
+    end
+    return x
+end
+println(run())
+println(run())

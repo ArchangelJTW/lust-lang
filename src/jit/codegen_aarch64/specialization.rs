@@ -118,10 +118,18 @@ impl JitCompiler {
             )
         });
 
-        // Allocate a slot for the Vec raw parts and the array reference.
-        let stack_offset = self.allocate_specialized_stack(32, 8);
-        self.specialized_values
-            .insert(specialized_id, SpecializedValue { stack_offset });
+        // One slot per specialized id: an unrolled body unboxes the same id
+        // once per copy, and every copy must fill the slot the rebox reads
+        // (a fresh slot per copy left all but the last one unreleased).
+        let stack_offset = match self.specialized_values.get(&specialized_id) {
+            Some(existing) => existing.stack_offset,
+            None => {
+                let stack_offset = self.allocate_specialized_stack(32, 8);
+                self.specialized_values
+                    .insert(specialized_id, SpecializedValue { stack_offset });
+                stack_offset
+            }
+        };
 
         // jit_unbox_array_int(array_ptr, slot): the helper releases whatever
         // the slot held (an earlier unbox in an unrolled iteration) and leaves

@@ -155,9 +155,17 @@ impl JitCompiler {
             fn jit_unbox_array_int(array_value_ptr: *const Value, slot: *mut JitVecSlot) -> u8;
         }
 
-        let stack_offset = self.allocate_specialized_stack();
-        self.specialized_values
-            .insert(specialized_id, SpecializedValue { stack_offset });
+        // One slot per specialized id: an unrolled body unboxes the same id
+        // once per copy, and every copy must fill the slot the rebox reads.
+        let stack_offset = match self.specialized_values.get(&specialized_id) {
+            Some(existing) => existing.stack_offset,
+            None => {
+                let stack_offset = self.allocate_specialized_stack();
+                self.specialized_values
+                    .insert(specialized_id, SpecializedValue { stack_offset });
+                stack_offset
+            }
+        };
 
         // a0 = &array_value (source_reg in register array), a1 = slot
         self.emit_addr_in_t2(source_reg, 0);

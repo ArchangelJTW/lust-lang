@@ -77,7 +77,7 @@ pub(super) const FAIL_ISLAND_INTERVAL: usize = 900 * 1024;
 
 /// Size of the record pushed for each inlined call frame: a
 /// `crate::vm::JitInlineRecord` (value_count, caller x19, previous x21,
-/// reserved, function_idx, return_dest, callee_reg, caller_resume_ip).
+/// alias_mask, function_idx, return_dest, callee_reg, caller_resume_ip).
 pub(super) const INLINE_METADATA_SIZE: i32 = 64;
 
 mod arithmetic;

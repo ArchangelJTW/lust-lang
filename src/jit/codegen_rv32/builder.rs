@@ -178,6 +178,7 @@ impl JitCompiler {
         // Postamble (rebox / cleanup, executed at every exit)
         jit::log(|| format!("🔧 RV32 JIT: postamble ({} ops)", trace.postamble.len()));
         self.compile_ops(&trace.postamble, &mut guard_index, &mut guards)?;
+        self.publish_remaining_specialized(trace)?;
 
         self.exit_stack.pop();
         self.fail_stack.pop();
@@ -238,6 +239,45 @@ impl JitCompiler {
             fail_sites: Vec::new(),
             hoisted_constants,
         })
+    }
+
+    /// After the postamble: publish and release every specialized slot the
+    /// postamble did not rebox. A slot whose register the trace overwrote
+    /// is dropped from the recorder's tracking (no `Rebox` is generated for
+    /// it), but its unbox still runs on every entry, so left alone it
+    /// leaked its copy and kept the array alive. Reboxing an empty slot is
+    /// a no-op, so this is safe for the slots the postamble did handle.
+    fn publish_remaining_specialized(&mut self, trace: &Trace) -> Result<()> {
+        let reboxed: Vec<usize> = trace
+            .postamble
+            .iter()
+            .filter_map(|op| match op {
+                TraceOp::Rebox { specialized_id, .. } => Some(*specialized_id),
+                _ => None,
+            })
+            .collect();
+        let layouts: Vec<(usize, SpecializedLayout)> = trace
+            .preamble
+            .iter()
+            .chain(trace.ops.iter())
+            .filter_map(|op| match op {
+                TraceOp::Unbox {
+                    specialized_id,
+                    layout,
+                    ..
+                } if !reboxed.contains(specialized_id) => Some((*specialized_id, layout.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut done = Vec::new();
+        for (id, layout) in layouts {
+            if done.contains(&id) || !self.specialized_values.contains_key(&id) {
+                continue;
+            }
+            done.push(id);
+            self.compile_rebox(0, id, &layout)?;
+        }
+        Ok(())
     }
 
     fn compile_ops(

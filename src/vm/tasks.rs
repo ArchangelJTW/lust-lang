@@ -302,6 +302,7 @@ impl VM {
                 wrapper.chunk.patch_jump(jump_idx, loop_start);
 
                 let new_idx = self.functions.len();
+                self.call_meta.push(super::CallMeta::of(&wrapper));
                 self.functions.push(wrapper);
                 new_idx
             }

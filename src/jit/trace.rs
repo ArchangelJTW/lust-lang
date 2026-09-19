@@ -638,6 +638,25 @@ impl TraceRecorder {
         Ok(false)
     }
 
+    /// The recording is being completed at the loop's own back-edge (which
+    /// the VM handles before the instruction reaches the recorder). If a
+    /// nested loop was being skipped, its `NestedLoopCall` resumes there:
+    /// the inner loop ended on the last instruction before the back-edge.
+    pub fn complete_nested_skip_at(&mut self, backedge_ip: usize) {
+        if let Some(skip) = self.nested_skip.take() {
+            let ops = if skip.inline_depth == 0 {
+                &mut self.trace.ops
+            } else {
+                &mut self.inline_stack[skip.inline_depth - 1].ops
+            };
+            if let Some(TraceOp::NestedLoopCall { resume_ip, .. }) = ops.get_mut(skip.op_index) {
+                *resume_ip = backedge_ip;
+            } else {
+                self.stop_recording();
+            }
+        }
+    }
+
     fn current_function_idx(&self) -> usize {
         self.inline_stack
             .last()
@@ -1215,7 +1234,12 @@ impl TraceRecorder {
                 // Rebox specialized value if dest contains one
                 self.remove_specialization_tracking(dest);
 
-                if let Some(_ty) = Self::get_value_type(&registers[dest as usize]) {
+                // A constant establishes what the register holds until the
+                // next write: its scalar type, or for a function constant its
+                // identity, so a call through it needs no `GuardFunction`.
+                if Self::get_value_type(&registers[dest as usize]).is_some()
+                    || matches!(registers[dest as usize], Value::Function(_))
+                {
                     self.mark_guarded(dest);
                 }
 

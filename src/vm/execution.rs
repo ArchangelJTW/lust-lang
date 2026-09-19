@@ -109,7 +109,8 @@ impl VM {
                 return Ok(return_value);
             }
 
-            if let Some(return_value) = self.pending_return_value.take()
+            if self.pending_return_value.is_some()
+                && let Some(return_value) = self.pending_return_value.take()
                 && let Some(dest_reg) = self.pending_return_dest.take()
             {
                 self.set_register(dest_reg, return_value)?;
@@ -120,12 +121,6 @@ impl VM {
             {
                 self.last_task_signal = Some(signal);
                 return Ok(Value::Nil);
-            }
-
-            if self.call_stack.len() > self.max_stack_depth {
-                return Err(LustError::RuntimeError {
-                    message: "Stack overflow".to_string(),
-                });
             }
 
             let executing_frame_index =
@@ -373,7 +368,12 @@ impl VM {
                                     recorder.trace.ops.len()
                                 )
                             });
-                            let recorder = self.trace_recorder.take().unwrap();
+                            let mut recorder = self.trace_recorder.take().unwrap();
+                            recorder.complete_nested_skip_at(backedge_ip);
+                            if !recorder.is_recording() {
+                                self.jit.recording_aborted(func_idx, loop_start_ip);
+                                continue;
+                            }
                             let mut trace = recorder.finish();
                             let mut optimizer = TraceOptimizer::new();
                             let hoisted_constants = optimizer.optimize(&mut trace);
@@ -459,7 +459,7 @@ impl VM {
                 Instruction::LoadConst(dest, const_idx) => {
                     let constant = {
                         let func = &self.functions[func_idx];
-                        func.chunk.constants[const_idx as usize].clone()
+                        func.chunk.constants[const_idx as usize].fast_clone()
                     };
                     self.set_register(dest, constant)?;
                 }
@@ -794,7 +794,11 @@ impl VM {
 
                 Instruction::JumpIf(cond, offset) => {
                     let condition = self.get_register(cond)?;
-                    if condition.is_truthy() {
+                    let truthy = match condition {
+                        Value::Bool(b) => *b,
+                        other => other.is_truthy(),
+                    };
+                    if truthy {
                         let frame = self.call_stack.last_mut().unwrap();
                         frame.ip = (frame.ip as isize + offset as isize) as usize;
                     }
@@ -802,10 +806,21 @@ impl VM {
 
                 Instruction::JumpIfNot(cond, offset) => {
                     let condition = self.get_register(cond)?;
-                    if !condition.is_truthy() {
+                    let truthy = match condition {
+                        Value::Bool(b) => *b,
+                        other => other.is_truthy(),
+                    };
+                    if !truthy {
                         let frame = self.call_stack.last_mut().unwrap();
                         frame.ip = (frame.ip as isize + offset as isize) as usize;
                     }
+                }
+
+                Instruction::Call(func_reg, first_arg, arg_count, dest_reg)
+                    if self.plain_function_callee(func_reg) =>
+                {
+                    let frame = self.bytecode_call_frame(func_reg, first_arg, arg_count, dest_reg)?;
+                    self.call_stack.push(frame);
                 }
 
                 Instruction::Call(func_reg, first_arg, arg_count, dest_reg) => {
@@ -962,7 +977,7 @@ impl VM {
                     let return_value = if value_reg == 255 {
                         Value::Nil
                     } else {
-                        self.get_register(value_reg)?.clone()
+                        self.get_register(value_reg)?.fast_clone()
                     };
                     let frame = self.call_stack.last().unwrap();
                     let return_dest = frame.return_dest;
@@ -974,8 +989,15 @@ impl VM {
                         return Ok(return_value);
                     }
 
-                    self.pending_return_value = Some(return_value);
-                    self.pending_return_dest = return_dest;
+                    // Deliver straight into the caller unless this return
+                    // ends a host call into the VM, which `run` hands back
+                    // from the top of the loop.
+                    if self.call_until_depth == Some(self.call_stack.len()) {
+                        self.pending_return_value = Some(return_value);
+                        self.pending_return_dest = return_dest;
+                    } else if let Some(dest) = return_dest {
+                        self.set_register(dest, return_value)?;
+                    }
                 }
 
                 Instruction::NewArray(dest, first_elem, count) => {
@@ -1973,8 +1995,82 @@ impl VM {
         }
     }
 
-    /// Build a frame for a call whose arguments the typechecker has already
-    /// proven: only the argument kinds are checked (O(1) per argument).
+    /// Is the callee register a plain bytecode function (not a closure,
+    /// native, Lua value or callable table) whose call can take the fast
+    /// path?
+    #[inline]
+    fn plain_function_callee(&self, func_reg: Register) -> bool {
+        let Some(frame) = self.call_stack.last() else {
+            return false;
+        };
+        match frame.registers[func_reg as usize] {
+            Value::Function(idx) => self
+                .call_meta
+                .get(idx)
+                .is_some_and(|meta| !meta.lua_function),
+            _ => false,
+        }
+    }
+
+    /// The fast path of `Instruction::Call` for a plain bytecode callee:
+    /// same checks as `make_call_frame_with` with `ArgCheck::Shallow`, but
+    /// the arguments are copied straight from the caller's registers into
+    /// the new frame, with no intermediate buffer and no per-call signature
+    /// walk. `plain_function_callee` must have said yes.
+    fn bytecode_call_frame(
+        &mut self,
+        func_reg: Register,
+        first_arg: Register,
+        arg_count: u8,
+        dest_reg: Register,
+    ) -> Result<Box<CallFrame>> {
+        let caller = self.call_stack.len() - 1;
+        let Value::Function(function_idx) = self.call_stack[caller].registers[func_reg as usize]
+        else {
+            unreachable!("plain_function_callee checked the callee");
+        };
+        let function = &self.functions[function_idx];
+        if arg_count != function.param_count {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Function {} expects {} arguments, got {}",
+                    function.name, function.param_count, arg_count
+                ),
+            });
+        }
+        let register_count = function.register_count;
+        let mut frame = self.take_frame(function_idx, Some(dest_reg), register_count)?;
+        for index in 0..arg_count as usize {
+            let value = &self.call_stack[caller].registers[first_arg.wrapping_add(index as u8) as usize];
+            let expected = self.call_meta[function_idx].params[index];
+            if !expected.matches(value) {
+                let function = &self.functions[function_idx];
+                let ty = function
+                    .signature
+                    .as_ref()
+                    .map(|signature| signature.params[index].to_string())
+                    .unwrap_or_default();
+                let message = format!(
+                    "Function {} argument {} expects {}, got {:?}",
+                    function.name,
+                    index + 1,
+                    ty,
+                    value.type_of()
+                );
+                self.recycle_frame(frame);
+                return Err(LustError::RuntimeError { message });
+            }
+            self.cycle_collector.register_graph(value);
+            frame.registers[index] = value.fast_clone();
+        }
+        let recursive = self
+            .call_stack
+            .iter()
+            .any(|existing| existing.function_idx == function_idx);
+        self.jit.record_function_call(recursive);
+        Ok(frame)
+    }
+
     pub(super) fn make_checked_call_frame(
         &mut self,
         function_idx: usize,
@@ -2061,12 +2157,12 @@ impl VM {
         }
 
         let register_count = function.register_count;
-        let mut frame = self.take_frame(function_idx, return_dest, register_count);
+        let mut frame = self.take_frame(function_idx, return_dest, register_count)?;
         let recursive = self
             .call_stack
             .iter()
             .any(|existing| existing.function_idx == function_idx);
-        self.jit.record_function_call(function_idx, recursive);
+        self.jit.record_function_call(recursive);
         frame.upvalues = upvalues;
         for (index, arg) in args.drain(..).enumerate() {
             self.observe_value_graph(&arg);
@@ -2081,13 +2177,20 @@ impl VM {
     }
 
     /// A frame for `function_idx`, from the pool when one is available.
+    /// Fails when pushing it would exceed the stack depth limit (checked
+    /// here, where the stack grows, rather than on every instruction).
     pub(super) fn take_frame(
         &mut self,
         function_idx: usize,
         return_dest: Option<Register>,
         register_count: u8,
-    ) -> Box<CallFrame> {
-        match self.frame_pool.pop() {
+    ) -> Result<Box<CallFrame>> {
+        if self.call_stack.len() >= self.max_stack_depth {
+            return Err(LustError::RuntimeError {
+                message: "Stack overflow".to_string(),
+            });
+        }
+        Ok(match self.frame_pool.pop() {
             Some(mut frame) => {
                 // Pooled frames come back with every register they used
                 // reset to Nil (see `recycle_frame`); only the bookkeeping
@@ -2099,7 +2202,7 @@ impl VM {
                 frame
             }
             None => CallFrame::new(function_idx, return_dest, register_count),
-        }
+        })
     }
 
     /// An O(1) argument check for calls the typechecker already validated:
@@ -2137,32 +2240,28 @@ impl VM {
     }
 
     fn validate_function_return(&self, function_idx: usize, value: &Value) -> Result<()> {
-        let function = &self.functions[function_idx];
-        if let Some(signature) = &function.signature {
-            let is_empty_lua_return = matches!(value, Value::Nil)
-                && matches!(
-                    &signature.return_type.kind,
-                    TypeKind::Array(inner)
-                        if matches!(&inner.kind, TypeKind::Named(name) if name == "LuaValue")
-                );
-            if is_empty_lua_return {
-                return Ok(());
-            }
-            // A return executes bytecode the typechecker validated; check
-            // the kind only. Container contents are checked where they are
-            // read, by typed instructions.
-            if !Self::value_matches_type_shallow(value, &signature.return_type) {
-                return Err(LustError::RuntimeError {
-                    message: format!(
-                        "Function {} must return {}, got {:?}",
-                        function.name,
-                        signature.return_type,
-                        value.type_of()
-                    ),
-                });
-            }
+        // A return executes bytecode the typechecker validated; check the
+        // kind only (precomputed in `CallMeta`). Container contents are
+        // checked where they are read, by typed instructions.
+        let meta = &self.call_meta[function_idx];
+        if meta.return_kind.matches(value)
+            || (meta.lua_multi_return && matches!(value, Value::Nil))
+        {
+            return Ok(());
         }
-        Ok(())
+        let function = &self.functions[function_idx];
+        Err(LustError::RuntimeError {
+            message: format!(
+                "Function {} must return {}, got {:?}",
+                function.name,
+                function
+                    .signature
+                    .as_ref()
+                    .map(|signature| signature.return_type.to_string())
+                    .unwrap_or_default(),
+                value.type_of()
+            ),
+        })
     }
 
     fn value_trait_name(&self, value: &Value) -> String {
@@ -2280,15 +2379,22 @@ impl VM {
         Ok(&frame.registers[reg as usize])
     }
 
+    #[inline]
     pub(super) fn set_register(&mut self, reg: Register, value: Value) -> Result<()> {
-        self.observe_value(&value);
+        self.cycle_collector.register_value(&value);
         let frame = self
             .call_stack
             .last_mut()
             .ok_or_else(|| LustError::RuntimeError {
                 message: "Empty call stack".to_string(),
             })?;
-        frame.registers[reg as usize] = value;
+        let slot = &mut frame.registers[reg as usize];
+        if slot.is_plain() {
+            // SAFETY: the old value owns nothing, so it needs no drop.
+            unsafe { core::ptr::write(slot, value) };
+        } else {
+            *slot = value;
+        }
         self.maybe_collect_cycles();
         Ok(())
     }

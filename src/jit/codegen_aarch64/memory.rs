@@ -59,6 +59,26 @@ impl JitCompiler {
             }
             return Ok(());
         }
+        // A source of known scalar type is a payload copy plus a typed
+        // store (which drops whatever the destination held).
+        match self.scalar_registers.get(&src).copied() {
+            Some(ValueType::Float) => {
+                self.load_payload_f(0, src);
+                self.store_d0_as_float(dest);
+                return Ok(());
+            }
+            Some(ValueType::Int) => {
+                self.load_payload(0, src);
+                self.store_from_x0(dest, ValueTag::Int.as_u8());
+                return Ok(());
+            }
+            Some(ValueType::Bool) => {
+                self.load_payload(0, src);
+                self.store_from_x0(dest, ValueTag::Bool.as_u8());
+                return Ok(());
+            }
+            _ => {}
+        }
         unsafe extern "C" {
             fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
         }

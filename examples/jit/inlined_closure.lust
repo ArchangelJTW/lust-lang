@@ -1,0 +1,31 @@
+-- A closure inlined into a trace, swapped for another after 150 iterations.
+function make(k: int): function(int): int
+    return function(x: int): int
+        return x + k
+    end
+end
+struct Log
+    n: int
+end
+function apply(log: Log, f: function(int): int, x: int): int
+    log.n = log.n + 1
+    return f(x)
+end
+function run(log: Log): int
+    local total: int = 0
+    local f: function(int): int = make(1)
+    local g: function(int): int = make(2)
+    local i: int = 0
+    while i < 200 do
+        local h: function(int): int = f
+        if i > 150 then
+            h = g
+        end
+        total = total + apply(log, h, i)
+        i = i + 1
+    end
+    return total
+end
+local log: Log = Log { n = 0 }
+println(run(log))
+println(log.n)

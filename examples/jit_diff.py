@@ -17,7 +17,13 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DIRS = ["examples/basic", "examples/advanced", "examples/traits", "examples/programs"]
+DEFAULT_DIRS = [
+    "examples/basic",
+    "examples/advanced",
+    "examples/traits",
+    "examples/programs",
+    "examples/jit",
+]
 
 
 def run(binary, path, jit, timeout):

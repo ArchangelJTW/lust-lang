@@ -281,8 +281,10 @@ pub struct JitInlineRecord {
     pub caller_regs: *mut Value,
     /// The enclosing inline record, null for the outermost.
     pub prev: *const JitInlineRecord,
-    /// Backend-private (x86_64 keeps its alignment padding here).
-    pub reserved: usize,
+    /// Bit i set: callee register i aliases a caller register (its bits
+    /// were copied without a reference-count increment), so it must be
+    /// cloned, not moved, when the frame is materialized.
+    pub alias_mask: usize,
     pub function_idx: usize,
     /// Caller register the callee's result goes to.
     pub return_dest: usize,
@@ -338,9 +340,19 @@ pub unsafe extern "C" fn jit_materialize_inline_frames(
             .get(r.function_idx)
             .map(|f| f.register_count)
             .unwrap_or(r.value_count as u8);
-        let mut frame = vm.take_frame(r.function_idx, Some(r.return_dest as Register), register_count);
+        // The frames were live inside the trace already; the depth limit
+        // was checked when they were called.
+        let mut frame = match vm.take_frame(r.function_idx, Some(r.return_dest as Register), register_count) {
+            Ok(frame) => frame,
+            Err(_) => CallFrame::new(r.function_idx, Some(r.return_dest as Register), register_count),
+        };
         for i in 0..r.value_count {
-            frame.registers[i] = unsafe { core::ptr::read(regs.add(i)) };
+            let slot = unsafe { regs.add(i) };
+            frame.registers[i] = if i < 64 && r.alias_mask & (1 << i) != 0 {
+                unsafe { (*slot).clone() }
+            } else {
+                unsafe { core::ptr::read(slot) }
+            };
         }
         if let Value::Closure { upvalues, .. } = unsafe { &*r.caller_regs.add(r.callee_reg) } {
             frame.upvalues = upvalues.iter().map(|uv| uv.get()).collect();

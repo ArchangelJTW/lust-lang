@@ -758,6 +758,34 @@ impl Value {
         }
     }
 
+    /// A value with no owned payload: copying its bits is a valid clone and
+    /// overwriting it needs no drop. The interpreter's hot paths use this to
+    /// skip the general `Clone`/`Drop` for scalars.
+    #[inline]
+    pub fn is_plain(&self) -> bool {
+        matches!(
+            self,
+            Value::Nil
+                | Value::Bool(_)
+                | Value::Int(_)
+                | Value::Float(_)
+                | Value::Function(_)
+                | Value::NativeFunction(_)
+        )
+    }
+
+    /// `clone` with the scalar case inlined.
+    #[inline]
+    pub fn fast_clone(&self) -> Value {
+        if self.is_plain() {
+            // SAFETY: plain variants own nothing, so a bit copy is an
+            // independent value.
+            unsafe { core::ptr::read(self) }
+        } else {
+            self.clone()
+        }
+    }
+
     pub fn is_truthy(&self) -> bool {
         match self {
             Value::Nil => false,

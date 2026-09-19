@@ -103,6 +103,7 @@ impl VM {
             jit: JitState::new(),
             budgets: BudgetState::default(),
             functions: Vec::new(),
+            call_meta: Vec::new(),
             natives: HashMap::new(),
             globals: HashMap::new(),
             map_hasher: DefaultHashBuilder::default(),
@@ -193,6 +194,7 @@ impl VM {
         self.cycle_collector.register_graph(value);
     }
 
+    #[inline]
     pub(super) fn maybe_collect_cycles(&mut self) {
         // The trigger check is on every register write; only an actual
         // collection needs the collector taken out to borrow the VM.
@@ -227,6 +229,7 @@ impl VM {
             }
         }
         self.jit.invalidate_compiled_code();
+        self.call_meta = functions.iter().map(CallMeta::of).collect();
         self.functions = functions;
     }
 

@@ -78,16 +78,25 @@ impl CycleCollector {
         Self::default()
     }
 
+    /// Called on every register write: the leaf test is inlined so a
+    /// scalar costs a tag compare and no call.
+    #[inline]
     pub fn register_value(&mut self, value: &Value) {
-        self.discover_value(value, false);
+        if !Self::is_leaf(value) {
+            self.discover_value(value, false);
+        }
     }
 
+    #[inline]
     pub(crate) fn register_graph(&mut self, value: &Value) {
-        self.discover_value(value, false);
+        if !Self::is_leaf(value) {
+            self.discover_value(value, false);
+        }
     }
 
     /// Count a step and say whether a collection is due. Cheap: called on
     /// every register write.
+    #[inline]
     pub fn should_collect(&mut self) -> bool {
         self.steps_since_collect = self.steps_since_collect.saturating_add(1);
         if self.containers.is_empty() {
@@ -117,6 +126,7 @@ impl CycleCollector {
 
     /// Values that cannot own a cycle need no traversal (and no clone onto
     /// the traversal stack).
+    #[inline]
     fn is_leaf(value: &Value) -> bool {
         matches!(
             value,

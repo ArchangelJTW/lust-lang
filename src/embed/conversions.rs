@@ -616,7 +616,7 @@ impl IntoLustValue for FunctionHandle {
 impl FromLustValue for StructInstance {
     fn from_value(value: Value) -> Result<Self> {
         match &value {
-            Value::Struct { name, .. } => Ok(StructInstance::new(name.clone(), value)),
+            Value::Struct { name, .. } => Ok(StructInstance::new(name.to_string(), value)),
             other => Err(LustError::RuntimeError {
                 message: format!("Expected Lust value 'struct' but received '{:?}'", other),
             }),
@@ -693,7 +693,7 @@ impl FromLustValue for EnumInstance {
         match &value {
             Value::Enum {
                 enum_name, variant, ..
-            } => Ok(EnumInstance::new(enum_name.clone(), variant.clone(), value)),
+            } => Ok(EnumInstance::new(enum_name.to_string(), variant.to_string(), value)),
             other => Err(LustError::RuntimeError {
                 message: format!("Expected Lust value 'enum' but received '{:?}'", other),
             }),

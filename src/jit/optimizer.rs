@@ -34,13 +34,69 @@ impl TraceOptimizer {
         self.hoisted_constants.clone()
     }
 
+    /// Separate `At` markers from the ops they precede, so a pass can match
+    /// consecutive ops. `join_markers` puts each marker back in front of
+    /// whatever its op became.
+    fn split_markers(ops: &[TraceOp]) -> (Vec<TraceOp>, Vec<Option<usize>>) {
+        let mut bare = Vec::with_capacity(ops.len());
+        let mut markers = Vec::with_capacity(ops.len());
+        let mut pending = None;
+        for op in ops {
+            if let TraceOp::At { ip } = op {
+                pending = Some(*ip);
+            } else {
+                bare.push(op.clone());
+                markers.push(pending.take());
+            }
+        }
+        (bare, markers)
+    }
+
+    /// The scalar type the first guard on `binding` or `result` in `ops`
+    /// expects, looking past guards on other registers and moves that do
+    /// not write either; `None` if anything else comes first.
+    fn element_guard_type(
+        ops: &[TraceOp],
+        binding: Register,
+        result: Register,
+    ) -> Option<crate::jit::trace::ValueType> {
+        use crate::jit::trace::ValueType;
+        for op in ops {
+            match op {
+                TraceOp::Guard {
+                    register,
+                    expected_type,
+                } if *register == binding || *register == result => {
+                    return matches!(
+                        expected_type,
+                        ValueType::Int | ValueType::Float | ValueType::Bool
+                    )
+                    .then_some(*expected_type);
+                }
+                TraceOp::Guard { .. } => {}
+                TraceOp::Move { dest, .. } if *dest != binding && *dest != result => {}
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn push_marker(ops: &mut Vec<TraceOp>, marker: Option<usize>) {
+        if let Some(ip) = marker {
+            ops.push(TraceOp::At { ip });
+        }
+    }
+
     /// A checked index immediately matched as `Ok(value)` can keep its
     /// discriminant and payload in registers instead of allocating a Result.
     fn fuse_try_get_index_patterns(&mut self, trace: &mut Trace) {
+        let (bare, markers) = Self::split_markers(&trace.ops);
         let mut ops = Vec::with_capacity(trace.ops.len());
         let mut i = 0;
-        while i < trace.ops.len() {
-            if i + 3 < trace.ops.len()
+        while i < bare.len() {
+            // Whatever op i becomes, it belongs to op i's instruction.
+            Self::push_marker(&mut ops, markers[i]);
+            if i + 3 < bare.len()
                 && let (
                     TraceOp::TryGetIndex {
                         dest: result_reg,
@@ -63,25 +119,24 @@ impl TraceOptimizer {
                         enum_reg,
                         index: 0,
                     },
-                ) = (
-                    &trace.ops[i],
-                    &trace.ops[i + 1],
-                    &trace.ops[i + 2],
-                    &trace.ops[i + 3],
-                )
+                ) = (&bare[i], &bare[i + 1], &bare[i + 2], &bare[i + 3])
                 && tested_reg == result_reg
                 && enum_reg == result_reg
                 && condition_register == condition_reg
                 && enum_name == "Result"
                 && variant_name == "Ok"
             {
+                // The guard the recorder put on the binding (or the result)
+                // right after the match says what element type to expect.
+                let value_type = Self::element_guard_type(&bare[i + 4..], *binding_reg, *result_reg);
                 ops.push(TraceOp::ArrayIndexOk {
                     value_dest: *result_reg,
                     condition_dest: *condition_reg,
                     array: *array,
                     index: *index,
+                    value_type,
                 });
-                ops.push(trace.ops[i + 2].clone());
+                ops.push(bare[i + 2].clone());
                 ops.push(TraceOp::Move {
                     dest: *binding_reg,
                     src: *result_reg,
@@ -90,7 +145,7 @@ impl TraceOptimizer {
                 continue;
             }
 
-            ops.push(trace.ops[i].clone());
+            ops.push(bare[i].clone());
             i += 1;
         }
         trace.ops = ops;
@@ -101,10 +156,12 @@ impl TraceOptimizer {
     /// Option only to test and unpack it is redundant: the type test is the
     /// discriminant, and the successful payload is the original value.
     fn fuse_try_cast_patterns(&mut self, trace: &mut Trace) {
+        let (bare, markers) = Self::split_markers(&trace.ops);
         let mut ops = Vec::with_capacity(trace.ops.len());
         let mut i = 0;
-        while i < trace.ops.len() {
-            if i + 3 < trace.ops.len()
+        while i < bare.len() {
+            Self::push_marker(&mut ops, markers[i]);
+            if i + 3 < bare.len()
                 && let (
                     TraceOp::TryCast {
                         dest: option_reg,
@@ -127,12 +184,7 @@ impl TraceOptimizer {
                         enum_reg,
                         index: 0,
                     },
-                ) = (
-                    &trace.ops[i],
-                    &trace.ops[i + 1],
-                    &trace.ops[i + 2],
-                    &trace.ops[i + 3],
-                )
+                ) = (&bare[i], &bare[i + 1], &bare[i + 2], &bare[i + 3])
                 && tested_reg == option_reg
                 && enum_reg == option_reg
                 && condition_register == condition_reg
@@ -144,7 +196,7 @@ impl TraceOptimizer {
                     value: *value,
                     type_name: type_name.clone(),
                 });
-                ops.push(trace.ops[i + 2].clone());
+                ops.push(bare[i + 2].clone());
                 ops.push(TraceOp::Move {
                     dest: *binding_reg,
                     src: *value,
@@ -153,7 +205,7 @@ impl TraceOptimizer {
                 continue;
             }
 
-            ops.push(trace.ops[i].clone());
+            ops.push(bare[i].clone());
             i += 1;
         }
         trace.ops = ops;
@@ -174,6 +226,16 @@ impl TraceOptimizer {
         // the loop silently starts testing `i < 1`.
         let mut clobbered: HashSet<Register> = HashSet::new();
         let mut const_value: HashMap<Register, Value> = HashMap::new();
+
+        // A nested loop runs through its own trace and may write any
+        // register of this frame, so nothing in such a body is invariant.
+        if trace
+            .ops
+            .iter()
+            .any(|op| matches!(op, TraceOp::NestedLoopCall { .. }))
+        {
+            return;
+        }
 
         for op in &trace.ops {
             match op {
@@ -319,6 +381,9 @@ impl TraceOptimizer {
                 }
             } else if let TraceOp::Rebox { dest_reg, .. } = &op {
                 known_types.remove(dest_reg);
+            } else if let TraceOp::NestedLoopCall { .. } = &op {
+                // The inner loop may have written any register.
+                known_types.clear();
             }
 
             ops.push(op);
@@ -403,7 +468,7 @@ impl TraceOptimizer {
         if trace
             .ops
             .iter()
-            .any(|op| matches!(op, TraceOp::InlineCall { .. }))
+            .any(|op| matches!(op, TraceOp::InlineCall { .. } | TraceOp::NestedLoopCall { .. }))
         {
             return;
         }
@@ -455,6 +520,8 @@ mod tests {
         let mut trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::TryCast {
@@ -509,6 +576,8 @@ mod tests {
         let mut trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::TryGetIndex {
@@ -548,6 +617,7 @@ mod tests {
                     condition_dest: 3,
                     array: 0,
                     index: 1,
+                    ..
                 },
                 TraceOp::GuardLoopContinue {
                     condition_register: 3,
@@ -566,6 +636,8 @@ mod tests {
         let mut trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {

@@ -314,9 +314,11 @@ readme = "README.md"
         assert_eq!(manifest.package().version, "0.1.0");
         assert_eq!(manifest.package().keywords, vec!["foo", "bar"]);
         assert_eq!(manifest.package().categories, vec!["cat1"]);
+        // `discover` canonicalizes the manifest path; on macOS a tempdir
+        // under /var resolves to /private/var.
         assert_eq!(
             manifest.readme_path().unwrap(),
-            dir.path().join("README.md")
+            dir.path().canonicalize().unwrap().join("README.md")
         );
     }
 
@@ -343,9 +345,11 @@ readme = true
         assert_eq!(manifest.package().name, "crate");
         assert_eq!(manifest.package().version, "1.2.3");
         assert_eq!(manifest.package().keywords, vec!["k1", "k2"]);
+        // `discover` canonicalizes the manifest path; on macOS a tempdir
+        // under /var resolves to /private/var.
         assert_eq!(
             manifest.readme_path().unwrap(),
-            dir.path().join("README.md")
+            dir.path().canonicalize().unwrap().join("README.md")
         );
     }
 

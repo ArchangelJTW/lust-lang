@@ -1,0 +1,32 @@
+-- An inner loop as the last statement of the outer body: the outer
+-- trace's recording completes at the outer back-edge while the inner loop
+-- is still being skipped, so the nested call's resume point is that
+-- back-edge itself. (Left unpatched, the outer trace never continued past
+-- the inner loop and the program spun forever.)
+function run(): int
+    local total: int = 0
+    local i: int = 0
+    while i < 19 do
+        i = i + 1
+        local j: int = 0
+        while j < 2 do
+            j = j + 1
+            total = total + i * j
+        end
+    end
+    local k: int = 0
+    while k < 40 do
+        k = k + 1
+        local m: int = 0
+        while m < 3 do
+            m = m + 1
+            local n: int = 0
+            while n < 2 do
+                n = n + 1
+                total = total + k + m + n
+            end
+        end
+    end
+    return total
+end
+println(run())

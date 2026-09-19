@@ -25,12 +25,21 @@ struct TempDir {
 
 impl TempDir {
     fn new() -> Self {
+        // Tests run in parallel and the clock is coarse enough for two of
+        // them to start in the same tick, so the name also carries a
+        // per-process counter; a shared name meant one test's `Drop`
+        // deleted another test's files.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let mut dir = std::env::temp_dir();
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        dir.push(format!("lust_lang_test_{unique}"));
+        let serial = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        dir.push(format!(
+            "lust_lang_test_{}_{unique}_{serial}",
+            std::process::id()
+        ));
         fs::create_dir_all(&dir).expect("create temp dir");
         Self { path: dir }
     }

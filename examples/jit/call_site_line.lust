@@ -1,0 +1,23 @@
+-- A function called from a trace fails; the stack trace must name the
+-- line of the call, not wherever the trace last exited to the interpreter.
+function divide(n: int, d: int): int
+    -- A loop keeps this out of the trace: it is called through the runtime.
+    local k: int = 0
+    while k < 2 do
+        k = k + 1
+    end
+    return n % d
+end
+
+function run(): int
+    local total: int = 0
+    local i: int = 0
+    while i < 40 do
+        i = i + 1
+        total = total + divide(i, 40 - i)
+        total = total + math.abs(0 - i)
+    end
+    return total
+end
+
+println(run())

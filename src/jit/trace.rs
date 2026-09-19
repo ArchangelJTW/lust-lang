@@ -26,6 +26,15 @@ impl TracedNativeFn {
     pub fn pointer(&self) -> *const () {
         Rc::as_ptr(&self.function) as *const ()
     }
+
+    /// The allocation pointer a `Value::NativeFunction` holding this
+    /// function carries (the `Rc`'s own pointer word, not the data
+    /// pointer `pointer` returns).
+    pub fn inner_ptr(&self) -> usize {
+        // SAFETY: an `Rc<dyn Fn>` starts with its `NonNull<RcInner>`, a
+        // fat pointer whose first word is the allocation's address.
+        unsafe { *(&self.function as *const NativeFn as *const usize) }
+    }
 }
 
 impl fmt::Debug for TracedNativeFn {
@@ -38,6 +47,12 @@ impl fmt::Debug for TracedNativeFn {
 pub struct Trace {
     pub function_idx: usize,
     pub start_ip: usize,
+    /// Compiled function code (not a loop trace): the body runs once from
+    /// the function's entry, and `Return` ops return.
+    pub is_function: bool,
+    /// Function code only: may some register hold an owned value when the
+    /// function returns? If not, the frame needs no drop pass.
+    pub frame_may_own: bool,
     /// Operations executed once at trace entry (unboxing, guards, etc.)
     pub preamble: Vec<TraceOp>,
     /// Operations in the trace loop body
@@ -59,10 +74,22 @@ pub struct InlineTrace {
     pub return_register: Option<Register>,
     pub is_closure: bool,
     pub upvalues_ptr: Option<*const ()>,
+    /// Instructions after the call at which the interpreter resumes when
+    /// the callee's frames were materialized: 1, or 2 when the move of
+    /// the result into a local was folded into the call.
+    pub resume_offset: usize,
 }
 
 #[derive(Debug, Clone)]
 pub enum TraceOp {
+    /// Marks the bytecode instruction the following ops came from. Emits no
+    /// code; a backend uses it as the resume point when one of those ops
+    /// fails, so the interpreter re-executes exactly the failing instruction
+    /// (and raises its error) instead of restarting the loop iteration with
+    /// half of its side effects already applied.
+    At {
+        ip: usize,
+    },
     LoadConst {
         dest: Register,
         value: Value,
@@ -186,6 +213,10 @@ pub enum TraceOp {
         condition_dest: Register,
         array: Register,
         index: Register,
+        /// The scalar type a guard right after the read expects the element
+        /// to have; the read then fails to the interpreter on any other
+        /// element and leaves `value_dest` a known scalar.
+        value_type: Option<ValueType>,
     },
     ArrayLen {
         dest: Register,
@@ -194,6 +225,18 @@ pub enum TraceOp {
     GuardNativeFunction {
         register: Register,
         function: TracedNativeFn,
+    },
+    /// The VM's globals are unchanged since recording (`VM::globals_version`
+    /// still equals `version`), so the snapshots the trace loaded from them
+    /// (recorded as `LoadConst`) are still what `LoadGlobal` would produce.
+    GuardGlobals {
+        version: u64,
+    },
+    /// The register holds a struct of exactly this layout (identity of its
+    /// `StructLayout`), so a method resolved for it stays valid.
+    GuardStructLayout {
+        register: Register,
+        layout: *const (),
     },
     GuardFunction {
         register: Register,
@@ -300,13 +343,67 @@ pub enum TraceOp {
         expect_truthy: bool,
         bailout_ip: usize,
     },
+    /// Run the inner loop `[loop_start_ip, bailout_ip]` of `function_idx` to
+    /// completion through its own root trace, then continue at `resume_ip`,
+    /// the instruction the recording resumed at after the inner loop ended.
+    /// Exits to the interpreter at `bailout_ip` (the inner back-edge) when
+    /// the inner loop has no trace, and wherever the inner trace bails out
+    /// otherwise.
     NestedLoopCall {
         function_idx: usize,
         loop_start_ip: usize,
         bailout_ip: usize,
+        resume_ip: usize,
     },
     Return {
         value: Option<Register>,
+    },
+    /// A branch target in compiled function code (see `jit::function`).
+    /// `scalars` is the static type environment every path into the label
+    /// agrees on.
+    Label {
+        id: usize,
+        scalars: Vec<(Register, ValueType)>,
+    },
+    Jump {
+        label: usize,
+    },
+    /// Branch to `label` when the register's truthiness equals
+    /// `expect_truthy`.
+    BranchIf {
+        condition_register: Register,
+        expect_truthy: bool,
+        label: usize,
+    },
+    /// A call from compiled function code to a bytecode function whose
+    /// identity is known at compile time. Runs the callee's compiled code
+    /// natively when it has some, otherwise exits to the interpreter at
+    /// `call_ip` (the interpreter performs the call and carries on).
+    CallDirect {
+        dest: Register,
+        callee: Register,
+        /// A method call's receiver, passed as the callee's first
+        /// argument ahead of `first_arg..`.
+        receiver: Option<Register>,
+        function_idx: usize,
+        first_arg: Register,
+        arg_count: u8,
+        /// Registers the callee's frame needs.
+        callee_registers: u8,
+        call_ip: usize,
+        /// Where the interpreter resumes in the caller when the callee's
+        /// frames were materialized: the instruction after the call, or
+        /// one further when the move of the result into a local was
+        /// folded into the call.
+        resume_ip: usize,
+        /// Callee registers (bit i = register i) that receive a bitwise
+        /// copy of the argument instead of a clone: the callee never
+        /// writes them, so nothing owns them and they are not dropped
+        /// with its frame (materialization clones them).
+        alias_mask: u64,
+        /// The callee's declared return kind when scalar (its compiled code
+        /// guards its return value against it).
+        result_type: Option<ValueType>,
     },
     /// Unbox a Value into specialized representation
     Unbox {
@@ -387,6 +484,112 @@ pub enum ValueType {
     Struct,
 }
 
+impl TraceOp {
+    /// The one register this op writes, for ops whose result can be sent
+    /// to another register instead (see `register_dead_after`).
+    pub fn single_dest(&self) -> Option<Register> {
+        match self {
+            TraceOp::LoadConst { dest, .. }
+            | TraceOp::Move { dest, .. }
+            | TraceOp::Concat { dest, .. }
+            | TraceOp::GetIndex { dest, .. }
+            | TraceOp::TryGetIndex { dest, .. }
+            | TraceOp::ArrayLen { dest, .. }
+            | TraceOp::CallNative { dest, .. }
+            | TraceOp::CallFunction { dest, .. }
+            | TraceOp::InlineCall { dest, .. }
+            | TraceOp::CallMethod { dest, .. }
+            | TraceOp::CallDirect { dest, .. }
+            | TraceOp::GetField { dest, .. }
+            | TraceOp::NewArray { dest, .. }
+            | TraceOp::NewStruct { dest, .. }
+            | TraceOp::NewEnumUnit { dest, .. }
+            | TraceOp::NewEnumVariant { dest, .. }
+            | TraceOp::IsEnumVariant { dest, .. }
+            | TraceOp::TypeIs { dest, .. }
+            | TraceOp::TryCast { dest, .. }
+            | TraceOp::GetEnumValue { dest, .. } => Some(*dest),
+            _ => None,
+        }
+    }
+
+    /// Send a `single_dest` op's result to `register` instead.
+    pub fn set_dest(&mut self, register: Register) {
+        match self {
+            TraceOp::LoadConst { dest, .. }
+            | TraceOp::Move { dest, .. }
+            | TraceOp::Concat { dest, .. }
+            | TraceOp::GetIndex { dest, .. }
+            | TraceOp::TryGetIndex { dest, .. }
+            | TraceOp::ArrayLen { dest, .. }
+            | TraceOp::CallNative { dest, .. }
+            | TraceOp::CallFunction { dest, .. }
+            | TraceOp::InlineCall { dest, .. }
+            | TraceOp::CallMethod { dest, .. }
+            | TraceOp::CallDirect { dest, .. }
+            | TraceOp::GetField { dest, .. }
+            | TraceOp::NewArray { dest, .. }
+            | TraceOp::NewStruct { dest, .. }
+            | TraceOp::NewEnumUnit { dest, .. }
+            | TraceOp::NewEnumVariant { dest, .. }
+            | TraceOp::IsEnumVariant { dest, .. }
+            | TraceOp::TypeIs { dest, .. }
+            | TraceOp::TryCast { dest, .. }
+            | TraceOp::GetEnumValue { dest, .. } => *dest = register,
+            _ => {}
+        }
+    }
+}
+
+/// Is `register` written before it is read on every bytecode path from
+/// `ip` (so its value there is unobservable)? A temporary the compiler
+/// moves into a local right after producing it is; the producer can then
+/// write the local directly and the copy — a clone and a drop for an owned
+/// value — is skipped. Conservative: an instruction that both reads and
+/// writes it counts as a read, and a call's arguments and callee count as
+/// reads.
+pub fn register_dead_after(
+    function: &crate::bytecode::Function,
+    ip: usize,
+    register: Register,
+) -> bool {
+    let instructions = &function.chunk.instructions;
+    let mut visited = HashSet::new();
+    let mut pending = alloc::vec![ip];
+    while let Some(ip) = pending.pop() {
+        if !visited.insert(ip) {
+            continue;
+        }
+        let Some(instruction) = instructions.get(ip) else {
+            return false;
+        };
+        if instruction.reads_register(register) {
+            return false;
+        }
+        if instruction.defined_register() == Some(register) {
+            continue;
+        }
+        match *instruction {
+            Instruction::Return(_) => continue,
+            Instruction::Jump(offset) => {
+                let Some(target) = (ip as i64 + 1 + i64::from(offset)).try_into().ok() else {
+                    return false;
+                };
+                pending.push(target);
+            }
+            Instruction::JumpIf(_, offset) | Instruction::JumpIfNot(_, offset) => {
+                let Some(target) = (ip as i64 + 1 + i64::from(offset)).try_into().ok() else {
+                    return false;
+                };
+                pending.push(target);
+                pending.push(ip + 1);
+            }
+            _ => pending.push(ip + 1),
+        }
+    }
+    true
+}
+
 pub struct TraceRecorder {
     pub trace: Trace,
     max_length: usize,
@@ -396,6 +599,22 @@ pub struct TraceRecorder {
     root_frame_index: usize,
     guarded_registers: HashSet<Register>,
     inline_stack: Vec<InlineContext>,
+    /// `VM::globals_version` at the instruction being recorded; the VM keeps
+    /// it current.
+    pub globals_version: u64,
+    /// A `GuardGlobals` for `globals_version` is in force: nothing recorded
+    /// since it could have changed the globals.
+    globals_guarded: bool,
+    /// Natives the recorder may turn into specialized ops (`JitState::intrinsics`).
+    intrinsics: HashMap<usize, crate::jit::Intrinsic>,
+    /// Set when the recording was abandoned because a mutated specialized
+    /// array escaped; the site is then recorded again without specializing.
+    pub specialization_escaped: bool,
+    /// Bytecode ip of the instruction being recorded, not yet written as an
+    /// `At` marker (see `flush_marker`).
+    pending_marker: Option<usize>,
+    /// Bytecode ip of the instruction being recorded.
+    current_ip: usize,
     op_count: usize,
     /// Track which registers contain specialized values (register -> (specialized_id, layout))
     specialized_registers:
@@ -408,6 +627,21 @@ pub struct TraceRecorder {
     loop_iterations: HashMap<(usize, usize), usize>,
     /// Track specialized values that were unboxed but later invalidated (need cleanup/drop)
     leaked_specialized_values: Vec<(usize, crate::jit::specialization::SpecializedLayout)>,
+    /// While execution is inside a nested loop that a `NestedLoopCall` will
+    /// run through its own trace, nothing is recorded (see `skip_nested`).
+    nested_skip: Option<NestedSkip>,
+}
+
+/// The nested loop currently being skipped: its bytecode range in
+/// `function_idx`, and where its `NestedLoopCall` op sits so the ip the
+/// recording resumes at can be patched in once the loop is left.
+#[derive(Debug, Clone, Copy)]
+struct NestedSkip {
+    function_idx: usize,
+    loop_start_ip: usize,
+    backedge_ip: usize,
+    inline_depth: usize,
+    op_index: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -424,6 +658,9 @@ struct InlineContext {
     return_register: Option<Register>,
     is_closure: bool,
     upvalues_ptr: Option<*const ()>,
+    /// Ip of the call instruction in the caller: the `InlineCall` op's
+    /// marker, and where the caller resumes if the call must be redone.
+    call_ip: usize,
 }
 
 impl TraceRecorder {
@@ -432,6 +669,8 @@ impl TraceRecorder {
             trace: Trace {
                 function_idx,
                 start_ip,
+                is_function: false,
+                frame_may_own: true,
                 preamble: Vec::new(),
                 ops: Vec::new(),
                 postamble: Vec::new(),
@@ -445,12 +684,19 @@ impl TraceRecorder {
             root_frame_index: 0,
             guarded_registers: HashSet::new(),
             inline_stack: Vec::new(),
+            globals_version: 0,
+            globals_guarded: false,
+            intrinsics: HashMap::new(),
+            specialization_escaped: false,
+            pending_marker: None,
+            current_ip: 0,
             op_count: 0,
             specialized_registers: HashMap::new(),
             next_specialized_id: 0,
             specialization_registry: crate::jit::specialization::SpecializationRegistry::new(),
             loop_iterations: HashMap::new(),
             leaked_specialized_values: Vec::new(),
+            nested_skip: None,
         }
     }
 
@@ -546,6 +792,70 @@ impl TraceRecorder {
         }
     }
 
+    /// A nested loop is not recorded into the trace that contains it: the
+    /// `NestedLoopCall` op runs it through the inner loop's own root trace.
+    /// Returns `true` while the instruction is inside the skipped loop. The
+    /// first instruction outside it is where the outer trace resumes; that
+    /// ip is patched into the op, and every type fact is forgotten, since
+    /// the inner loop may have written any register.
+    fn skip_nested(
+        &mut self,
+        instruction: Instruction,
+        current_ip: usize,
+        function_idx: usize,
+    ) -> Result<bool, LustError> {
+        let Some(skip) = self.nested_skip else {
+            return Ok(false);
+        };
+        let ip = current_ip.saturating_sub(1);
+        if function_idx == skip.function_idx
+            && (skip.loop_start_ip..=skip.backedge_ip).contains(&ip)
+        {
+            if matches!(instruction, Instruction::Return(_)) {
+                // Leaves the frame from inside the loop; the trace cannot
+                // continue past the loop.
+                self.stop_recording();
+            }
+            return Ok(true);
+        }
+        self.nested_skip = None;
+        let ops = if skip.inline_depth == 0 {
+            &mut self.trace.ops
+        } else {
+            &mut self.inline_stack[skip.inline_depth - 1].ops
+        };
+        match ops.get_mut(skip.op_index) {
+            Some(TraceOp::NestedLoopCall { resume_ip, .. }) => *resume_ip = ip,
+            _ => {
+                self.stop_recording();
+                return Err(LustError::RuntimeError {
+                    message: "Trace aborted: lost the NestedLoopCall being skipped".to_string(),
+                });
+            }
+        }
+        self.current_guard_set_mut().clear();
+        Ok(false)
+    }
+
+    /// The recording is being completed at the loop's own back-edge (which
+    /// the VM handles before the instruction reaches the recorder). If a
+    /// nested loop was being skipped, its `NestedLoopCall` resumes there:
+    /// the inner loop ended on the last instruction before the back-edge.
+    pub fn complete_nested_skip_at(&mut self, backedge_ip: usize) {
+        if let Some(skip) = self.nested_skip.take() {
+            let ops = if skip.inline_depth == 0 {
+                &mut self.trace.ops
+            } else {
+                &mut self.inline_stack[skip.inline_depth - 1].ops
+            };
+            if let Some(TraceOp::NestedLoopCall { resume_ip, .. }) = ops.get_mut(skip.op_index) {
+                *resume_ip = backedge_ip;
+            } else {
+                self.stop_recording();
+            }
+        }
+    }
+
     fn current_function_idx(&self) -> usize {
         self.inline_stack
             .last()
@@ -559,6 +869,48 @@ impl TraceRecorder {
 
     pub fn set_root_frame_index(&mut self, frame_index: usize) {
         self.root_frame_index = frame_index;
+    }
+
+    pub fn set_intrinsics(&mut self, intrinsics: &HashMap<usize, crate::jit::Intrinsic>) {
+        self.intrinsics = intrinsics.clone();
+    }
+
+    /// The tracked register whose specialized array `register` holds (the
+    /// register itself or an alias sharing its `Rc`).
+    fn specialized_owner(&self, register: Register, registers: &[Value]) -> Option<Register> {
+        if self.specialized_registers.contains_key(&register) {
+            return Some(register);
+        }
+        let Some(Value::Array(array)) = registers.get(register as usize) else {
+            return None;
+        };
+        self.specialized_registers.keys().copied().find(|candidate| {
+            matches!(
+                registers.get(*candidate as usize),
+                Some(Value::Array(candidate_array)) if Rc::ptr_eq(array, candidate_array)
+            )
+        })
+    }
+
+    /// Code the recorder cannot see (a native, a call it does not inline)
+    /// is about to run: it may read or write any array through the boxed
+    /// value, which an unboxed copy would not reflect. Unused
+    /// specializations are dropped; one already used aborts the recording,
+    /// and the site is recorded again without specializing.
+    fn specializations_escape(&mut self, what: &str) -> Result<(), LustError> {
+        let tracked: Vec<Register> = self.specialized_registers.keys().copied().collect();
+        for register in tracked {
+            if !self.disable_unused_specialization(register) {
+                self.specialization_escaped = true;
+                self.stop_recording();
+                return Err(LustError::RuntimeError {
+                    message: format!(
+                        "Trace aborted: specialized array escapes to {what} after a specialized op"
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn current_guard_set(&self) -> &HashSet<Register> {
@@ -596,6 +948,11 @@ impl TraceRecorder {
     /// rebox path removes its own tracking entry before pushing the op.
     fn written_register(op: &TraceOp) -> Option<Register> {
         match op {
+            TraceOp::At { .. }
+            | TraceOp::Label { .. }
+            | TraceOp::Jump { .. }
+            | TraceOp::BranchIf { .. } => None,
+            TraceOp::CallDirect { dest, .. } => Some(*dest),
             TraceOp::LoadConst { dest, .. }
             | TraceOp::Move { dest, .. }
             | TraceOp::Add { dest, .. }
@@ -634,6 +991,8 @@ impl TraceRecorder {
             | TraceOp::ArrayIndexOk { .. }
             | TraceOp::Guard { .. }
             | TraceOp::GuardNativeFunction { .. }
+            | TraceOp::GuardGlobals { .. }
+            | TraceOp::GuardStructLayout { .. }
             | TraceOp::GuardFunction { .. }
             | TraceOp::GuardClosure { .. }
             | TraceOp::GuardLoopContinue { .. }
@@ -646,7 +1005,75 @@ impl TraceRecorder {
         }
     }
 
+    /// Write the pending `At` marker, if any, without counting it as a trace
+    /// op or touching specialization tracking.
+    fn flush_marker(&mut self) {
+        let Some(ip) = self.pending_marker.take() else {
+            return;
+        };
+        let op = TraceOp::At { ip };
+        if let Some(ctx) = self.inline_stack.last_mut() {
+            ctx.ops.push(op);
+        } else {
+            self.trace.ops.push(op);
+        }
+    }
+
+    /// The single destination of the last op recorded in the current
+    /// context, if the op is one whose result can be redirected.
+    fn last_op_dest(&self) -> Option<Register> {
+        let ops = self
+            .inline_stack
+            .last()
+            .map(|ctx| &ctx.ops)
+            .unwrap_or(&self.trace.ops);
+        ops.iter()
+            .rev()
+            .find(|op| !matches!(op, TraceOp::At { .. }))
+            .and_then(|op| op.single_dest())
+    }
+
+    /// Redirect the last recorded op's result to `dest` (see
+    /// `register_dead_after`); a guard fact the op established moves along.
+    fn retarget_last_op(&mut self, dest: Register) {
+        let ops = self
+            .inline_stack
+            .last_mut()
+            .map(|ctx| &mut ctx.ops)
+            .unwrap_or(&mut self.trace.ops);
+        let Some(op) = ops
+            .iter_mut()
+            .rev()
+            .find(|op| !matches!(op, TraceOp::At { .. }))
+        else {
+            return;
+        };
+        let Some(old) = op.single_dest() else {
+            return;
+        };
+        op.set_dest(dest);
+        // The elided move must not run again after an exit inside the
+        // callee: its frames resume the caller one instruction further.
+        match op {
+            TraceOp::InlineCall { trace, .. } => trace.resume_offset = 2,
+            TraceOp::CallDirect { resume_ip, .. } => *resume_ip += 1,
+            _ => {}
+        }
+        if self.current_guard_set().contains(&old) {
+            self.forget_guard(old);
+            self.mark_guarded(dest);
+        }
+    }
+
+    fn current_ops_len(&self) -> usize {
+        self.inline_stack
+            .last()
+            .map(|ctx| ctx.ops.len())
+            .unwrap_or(self.trace.ops.len())
+    }
+
     fn push_op(&mut self, op: TraceOp) {
+        self.flush_marker();
         // A specialization describes the array a register held at trace entry.
         // The instant the trace writes something else into that register the
         // specialization is stale, and the postamble rebox would otherwise dump
@@ -669,6 +1096,19 @@ impl TraceRecorder {
             self.remove_specialization_tracking(*condition_dest);
         } else if let Some(dest) = Self::written_register(&op) {
             self.remove_specialization_tracking(dest);
+        }
+
+        // Anything that runs code the recorder does not see may change the
+        // globals; the next `LoadGlobal` then needs a fresh version guard.
+        if matches!(
+            op,
+            TraceOp::CallNative { .. }
+                | TraceOp::CallFunction { .. }
+                | TraceOp::CallMethod { .. }
+                | TraceOp::CallDirect { .. }
+                | TraceOp::NestedLoopCall { .. }
+        ) {
+            self.globals_guarded = false;
         }
 
         self.op_count += 1;
@@ -845,7 +1285,8 @@ impl TraceRecorder {
             return false;
         }
 
-        self.specialized_registers.remove(&register);
+        self.specialized_registers
+            .retain(|_, (id, _)| *id != specialized_id);
         self.trace.preamble.retain(
             |op| !matches!(op, TraceOp::Unbox { specialized_id: id, .. } if *id == specialized_id),
         );
@@ -865,21 +1306,76 @@ impl TraceRecorder {
         register: Register,
         registers: &[Value],
     ) -> bool {
-        let owner =
-            if self.specialized_registers.contains_key(&register) {
-                Some(register)
-            } else if let Some(Value::Array(array)) = registers.get(register as usize) {
-                self.specialized_registers.keys().copied().find(|candidate| {
-                matches!(
-                    registers.get(*candidate as usize),
-                    Some(Value::Array(candidate_array)) if Rc::ptr_eq(array, candidate_array)
-                )
-            })
-            } else {
-                None
-            };
+        self.specialized_owner(register, registers)
+            .is_none_or(|owner| self.disable_unused_specialization(owner))
+    }
 
-        owner.is_none_or(|owner| self.disable_unused_specialization(owner))
+    /// `array.push(a, v)` / `array.len(a)` on a specialized array, as the
+    /// specialized ops (the same ones `a:push(v)` records). `None` when the
+    /// call is not one of these; `Some` is the recording's result.
+    fn record_intrinsic_call(
+        &mut self,
+        native_ptr: usize,
+        first_arg: Register,
+        arg_count: u8,
+        dest_reg: Register,
+        registers: &[Value],
+    ) -> Option<Result<(), LustError>> {
+        use crate::jit::Intrinsic;
+        let intrinsic = *self.intrinsics.get(&native_ptr)?;
+        let owner = self.specialized_owner(first_arg, registers)?;
+        let specialized_id = self.specialized_registers.get(&owner)?.0;
+        match intrinsic {
+            Intrinsic::ArrayPush if arg_count == 2 => {
+                let value_reg = first_arg + 1;
+                if !matches!(registers[value_reg as usize], Value::Int(_)) {
+                    return None;
+                }
+                crate::jit::log(|| {
+                    format!(
+                        "⚡ JIT: array.push on reg {} (specialized #{})",
+                        first_arg, specialized_id
+                    )
+                });
+                if !self.is_guarded(value_reg) {
+                    self.push_op(TraceOp::Guard {
+                        register: value_reg,
+                        expected_type: ValueType::Int,
+                    });
+                    self.mark_guarded(value_reg);
+                }
+                self.push_op(TraceOp::SpecializedOp {
+                    op: SpecializedOpKind::VecPush,
+                    operands: vec![
+                        Operand::Specialized(specialized_id),
+                        Operand::Register(value_reg),
+                    ],
+                });
+                // `array.push` returns Nil.
+                self.push_op(TraceOp::LoadConst {
+                    dest: dest_reg,
+                    value: Value::Nil,
+                });
+                Some(Ok(()))
+            }
+            Intrinsic::ArrayLen if arg_count == 1 => {
+                crate::jit::log(|| {
+                    format!(
+                        "⚡ JIT: array.len on reg {} (specialized #{})",
+                        first_arg, specialized_id
+                    )
+                });
+                self.push_op(TraceOp::SpecializedOp {
+                    op: SpecializedOpKind::VecLen,
+                    operands: vec![
+                        Operand::Specialized(specialized_id),
+                        Operand::Register(dest_reg),
+                    ],
+                });
+                Some(Ok(()))
+            }
+            _ => None,
+        }
     }
 
     fn should_inline(&self, function_idx: usize, callee_fn: &crate::bytecode::Function) -> bool {
@@ -938,11 +1434,15 @@ impl TraceRecorder {
             return_register: None,
             is_closure,
             upvalues_ptr,
+            call_ip: self.current_ip,
         });
     }
 
     fn finalize_inline_context(&mut self) -> Option<TraceOp> {
         let context = self.inline_stack.pop()?;
+        // The callee's `Return` left its own ip pending; the `InlineCall` op
+        // belongs to the call instruction.
+        self.pending_marker = Some(context.call_ip);
         let trace = InlineTrace {
             function_idx: context.function_idx,
             register_count: context.register_count,
@@ -953,6 +1453,7 @@ impl TraceRecorder {
             return_register: context.return_register,
             is_closure: context.is_closure,
             upvalues_ptr: context.upvalues_ptr,
+            resume_offset: 1,
         };
         Some(TraceOp::InlineCall {
             dest: context.dest,
@@ -978,9 +1479,14 @@ impl TraceRecorder {
             function,
             function_idx,
             functions,
+            false,
         )
     }
 
+    /// `frame_pushed`: the instruction was a call that pushed a new frame,
+    /// so the executing frame's registers are still exactly as they were
+    /// before it (the destination is written only when the callee returns).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_instruction_at_frame(
         &mut self,
         frame_index: usize,
@@ -990,6 +1496,7 @@ impl TraceRecorder {
         function: &crate::bytecode::Function,
         function_idx: usize,
         functions: &[crate::bytecode::Function],
+        frame_pushed: bool,
     ) -> Result<(), LustError> {
         if !self.recording {
             return Ok(());
@@ -1025,6 +1532,10 @@ impl TraceRecorder {
             });
         }
 
+        if self.skip_nested(instruction, current_ip, function_idx)? {
+            return Ok(());
+        }
+
         if let Some(dest) = instruction.defined_register() {
             let preserves_numeric_inputs =
                 instruction
@@ -1040,7 +1551,7 @@ impl TraceRecorder {
                                 | Instruction::Neg(..)
                         )
                     });
-            if instruction.reads_register(dest) && !preserves_numeric_inputs {
+            if instruction.reads_register(dest) && !preserves_numeric_inputs && !frame_pushed {
                 self.stop_recording();
                 return Err(LustError::RuntimeError {
                     message: format!(
@@ -1051,6 +1562,12 @@ impl TraceRecorder {
             }
             self.forget_guard(dest);
         }
+
+        // `current_ip` is the ip after the fetch; the instruction itself is one
+        // before it (the same convention as guard bailout ips). The marker is
+        // written lazily, in front of the first op this instruction records.
+        self.current_ip = current_ip.saturating_sub(1);
+        self.pending_marker = Some(self.current_ip);
 
         // Reuse the numeric trace IR, but retain the bytecode's input contract.
         // Host mutation and trace entry still require guards before payload loads.
@@ -1079,7 +1596,12 @@ impl TraceRecorder {
                 // Rebox specialized value if dest contains one
                 self.remove_specialization_tracking(dest);
 
-                if let Some(_ty) = Self::get_value_type(&registers[dest as usize]) {
+                // A constant establishes what the register holds until the
+                // next write: its scalar type, or for a function constant its
+                // identity, so a call through it needs no `GuardFunction`.
+                if Self::get_value_type(&registers[dest as usize]).is_some()
+                    || matches!(registers[dest as usize], Value::Function(_))
+                {
                     self.mark_guarded(dest);
                 }
 
@@ -1090,17 +1612,46 @@ impl TraceRecorder {
                 Ok(())
             }
 
-            Instruction::LoadGlobal(_, _) | Instruction::StoreGlobal(_, _) => {
-                // Globals can be replaced by Lust or embedding code. Until
-                // traces carry global slots and versions, snapshotting or
-                // omitting these operations would miscompile the loop.
+            Instruction::LoadGlobal(dest, _) => {
+                // The value is a snapshot: valid while `VM::globals_version`
+                // is what it was now, which every mutation of the globals
+                // bumps. One guard covers every load until something
+                // recorded (a call) could have changed them.
+                if !self.globals_guarded {
+                    self.push_op(TraceOp::GuardGlobals {
+                        version: self.globals_version,
+                    });
+                    self.globals_guarded = true;
+                }
+                self.push_op(TraceOp::LoadConst {
+                    dest,
+                    value: registers[dest as usize].clone(),
+                });
+                Ok(())
+            }
+
+            Instruction::StoreGlobal(_, _) => {
+                // A store bumps the version, so a trace containing one would
+                // fail its own guard on the next iteration.
                 self.stop_recording();
                 Err(LustError::RuntimeError {
-                    message: "Trace aborted: global access requires versioning".to_string(),
+                    message: "Trace aborted: global store".to_string(),
                 })
             }
 
             Instruction::Move(dest, src) => {
+                // A temporary moved into a local right after being produced:
+                // let the producer write the local, and skip the copy.
+                if dest != src
+                    && !self.specialized_registers.contains_key(&src)
+                    && !self.specialized_registers.contains_key(&dest)
+                    && self.last_op_dest() == Some(src)
+                    && register_dead_after(function, current_ip, src)
+                {
+                    self.remove_specialization_tracking(dest);
+                    self.retarget_last_op(dest);
+                    return Ok(());
+                }
                 // If dest contains a specialized value, rebox it first before overwriting
                 self.remove_specialization_tracking(dest);
 
@@ -1121,9 +1672,10 @@ impl TraceRecorder {
 
                 self.push_op(TraceOp::Move { dest, src });
                 if let Some((specialized_id, layout)) = moved_specialization {
-                    // `push_op` invalidates the destination first; transfer the
-                    // specialization only after that generic invalidation.
-                    self.specialized_registers.remove(&src);
+                    // `push_op` invalidates the destination first; alias it
+                    // only after that generic invalidation. Both registers
+                    // hold the same `Rc`, so both stay tracked: the next
+                    // iteration's `Move` finds the source still specialized.
                     self.specialized_registers
                         .insert(dest, (specialized_id, layout));
                 }
@@ -1353,6 +1905,7 @@ impl TraceRecorder {
 
             Instruction::GetIndex(dest, array, index) => {
                 if !self.disable_unused_array_specialization(array, registers) {
+                    self.specialization_escaped = true;
                     self.stop_recording();
                     return Err(LustError::RuntimeError {
                         message: "Trace aborted: array read follows a specialized mutation"
@@ -1393,6 +1946,7 @@ impl TraceRecorder {
                 }
 
                 if !self.disable_unused_array_specialization(array, registers) {
+                    self.specialization_escaped = true;
                     self.stop_recording();
                     return Err(LustError::RuntimeError {
                         message: "Trace aborted: checked read follows a specialized array mutation"
@@ -1505,14 +2059,61 @@ impl TraceRecorder {
                             return Ok(());
                         }
                         _ => {
-                            // Other methods on specialized values - need to rebox first
-                            // For now, fall through to normal handling (will be wrong!)
-                            crate::jit::log(|| {
-                                format!(
-                                    "⚠️  JIT: Method '{}' on specialized value not supported, will be incorrect!",
-                                    method_name
-                                )
+                            // Any other method reads the boxed array: the
+                            // specialization must go first.
+                            self.specializations_escape("a method call")?;
+                        }
+                    }
+                }
+
+                // A user-defined struct method: resolve it the way the
+                // interpreter does and inline it like a call, with the
+                // receiver as the first argument. The receiver's layout is
+                // guarded because trait dispatch can bring different structs
+                // to one call site.
+                if let Value::Struct { name, layout, .. } = &registers[obj_reg as usize] {
+                    let mangled = format!("{}:{}", name, method_name);
+                    if let Some(function_idx) = functions.iter().position(|f| f.name == mangled) {
+                        let callee_fn = &functions[function_idx];
+                        let total_args = arg_count as usize + 1;
+                        if self.should_inline(function_idx, callee_fn)
+                            && callee_fn.register_count > 0
+                            && total_args <= callee_fn.register_count as usize
+                        {
+                            self.push_op(TraceOp::GuardStructLayout {
+                                register: obj_reg,
+                                layout: Rc::as_ptr(layout) as *const (),
                             });
+                            self.mark_guarded(obj_reg);
+                            for i in 0..arg_count {
+                                let arg_reg = first_arg + i;
+                                if let Some(ty) = Self::get_value_type(&registers[arg_reg as usize])
+                                    && !self.is_guarded(arg_reg)
+                                {
+                                    self.push_op(TraceOp::Guard {
+                                        register: arg_reg,
+                                        expected_type: ty,
+                                    });
+                                    self.mark_guarded(arg_reg);
+                                }
+                            }
+                            let mut arg_registers = Vec::with_capacity(total_args);
+                            arg_registers.push(obj_reg);
+                            for i in 0..arg_count {
+                                arg_registers.push(first_arg + i);
+                            }
+                            self.push_inline_context(
+                                function_idx,
+                                callee_fn.register_count,
+                                dest_reg,
+                                obj_reg,
+                                first_arg,
+                                arg_count,
+                                arg_registers,
+                                false,
+                                None,
+                            );
+                            return Ok(());
                         }
                     }
                 }
@@ -1575,6 +2176,7 @@ impl TraceRecorder {
                     });
                 }
 
+                self.specializations_escape("a method call")?;
                 self.push_op(TraceOp::CallMethod {
                     dest: dest_reg,
                     object: obj_reg,
@@ -1806,6 +2408,7 @@ impl TraceRecorder {
                 // Rebox into the cyclic body; discard an unused eager
                 // specialization, or abort if specialized mutations came first.
                 if !self.disable_unused_array_specialization(value_reg, registers) {
+                    self.specialization_escaped = true;
                     self.stop_recording();
                     return Err(LustError::RuntimeError {
                         message: "Trace aborted: cast follows a specialized array mutation"
@@ -1847,6 +2450,17 @@ impl TraceRecorder {
                             });
                             self.mark_guarded(func_reg);
                         }
+
+                        if let Some(op) = self.record_intrinsic_call(
+                            Rc::as_ptr(native_fn) as *const () as usize,
+                            first_arg,
+                            arg_count,
+                            dest_reg,
+                            registers,
+                        ) {
+                            return op;
+                        }
+                        self.specializations_escape("a native call")?;
 
                         self.push_op(TraceOp::CallNative {
                             dest: dest_reg,
@@ -1891,6 +2505,7 @@ impl TraceRecorder {
                         }
 
                         if !did_inline {
+                            self.specializations_escape("a call")?;
                             self.push_op(TraceOp::CallFunction {
                                 dest: dest_reg,
                                 callee: func_reg,
@@ -1943,6 +2558,7 @@ impl TraceRecorder {
                         }
 
                         if !did_inline {
+                            self.specializations_escape("a closure call")?;
                             self.push_op(TraceOp::CallFunction {
                                 dest: dest_reg,
                                 callee: func_reg,
@@ -2176,14 +2792,30 @@ impl TraceRecorder {
                                 )
                             });
 
-                            // Rebox all specialized values before calling nested trace
-                            self.rebox_all_specialized_values();
+                            // The inner loop runs through its own trace on
+                            // the boxed arrays, so this trace's unboxed
+                            // copies would go stale; and a `Rebox` in the
+                            // body would empty its slot for the next
+                            // iteration's specialized ops. Give them up.
+                            self.specializations_escape("a nested loop")?;
 
-                            // Emit NestedLoopCall which will eventually call the compiled inner trace
+                            // The inner loop runs through its own root trace; its
+                            // remaining iterations are not recorded here. The
+                            // resume ip is patched in when execution leaves it.
                             self.push_op(TraceOp::NestedLoopCall {
                                 function_idx,
                                 loop_start_ip: jump_target,
                                 bailout_ip,
+                                resume_ip: 0,
+                            });
+                            let inline_depth = self.inline_stack.len();
+                            let op_index = self.current_ops_len() - 1;
+                            self.nested_skip = Some(NestedSkip {
+                                function_idx,
+                                loop_start_ip: jump_target,
+                                backedge_ip: bailout_ip,
+                                inline_depth,
+                                op_index,
                             });
                             Ok(())
                         }
@@ -2402,22 +3034,49 @@ mod tests {
     use crate::ast::TypeKind;
 
     #[test]
-    fn global_access_aborts_recording_instead_of_becoming_a_constant() {
+    fn global_load_is_a_version_guarded_snapshot() {
         let functions = vec![crate::bytecode::Function::new("global_loop", 0, false)];
+        let mut registers = vec![Value::Nil; 4];
+        registers[0] = Value::Int(7);
         let mut recorder = TraceRecorder::new(0, 0, 32);
+        recorder.globals_version = 5;
 
+        for ip in 1..=2 {
+            recorder
+                .record_instruction(
+                    Instruction::LoadGlobal(0, 0),
+                    ip,
+                    &registers,
+                    &functions[0],
+                    0,
+                    &functions,
+                )
+                .unwrap();
+        }
+
+        // One guard covers both loads; each load is the value seen.
+        let ops: Vec<&TraceOp> = recorder
+            .trace
+            .ops
+            .iter()
+            .filter(|op| !matches!(op, TraceOp::At { .. }))
+            .collect();
+        assert!(matches!(ops[0], TraceOp::GuardGlobals { version: 5 }));
+        assert!(matches!(ops[1], TraceOp::LoadConst { dest: 0, value: Value::Int(7) }));
+        assert!(matches!(ops[2], TraceOp::LoadConst { dest: 0, value: Value::Int(7) }));
+        assert_eq!(ops.len(), 3);
+
+        // A store still aborts: it would fail the trace's own guard.
         let result = recorder.record_instruction(
-            Instruction::LoadGlobal(0, 0),
-            1,
-            &[],
+            Instruction::StoreGlobal(0, 0),
+            3,
+            &registers,
             &functions[0],
             0,
             &functions,
         );
-
         assert!(result.is_err());
         assert!(!recorder.is_recording());
-        assert!(recorder.trace.ops.is_empty());
     }
 
     #[test]
@@ -2434,7 +3093,7 @@ mod tests {
         assert!(
             recorder
                 .record_instruction(
-                    Instruction::LoadGlobal(1, 0),
+                    Instruction::StoreGlobal(0, 1),
                     1,
                     &registers,
                     &functions[0],
@@ -2573,7 +3232,7 @@ mod tests {
         assert!(!recorder.is_recording());
     }
 
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn compiled_typed_arithmetic_bails_before_reading_wrong_payloads() {
         let functions = vec![crate::bytecode::Function::new("typed_guard", 0, false)];
@@ -2595,7 +3254,7 @@ mod tests {
             bailout_ip: 9,
         });
         let compiled = crate::jit::JitCompiler::new()
-            .compile_trace(&trace, crate::jit::TraceId(0), None, Vec::new())
+            .compile_trace(&trace, crate::jit::TraceId(0), Vec::new())
             .unwrap();
         let mut registers = vec![Value::Int(2), Value::Int(3), Value::Bool(false)];
         compiled.execute(
@@ -2658,7 +3317,7 @@ mod tests {
 
         assert!(matches!(
             recorder.trace.ops.as_slice(),
-            [TraceOp::NewArray { count: 0, .. }]
+            [TraceOp::At { .. }, TraceOp::NewArray { count: 0, .. }]
         ));
         assert!(recorder.specialized_registers.is_empty());
     }

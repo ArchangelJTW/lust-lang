@@ -469,35 +469,120 @@ impl JitCompiler {
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
             self.load_to_rax(lhs);
             self.load_to_rbx(rhs);
-            dynasm!(self.ops
-                ; .arch x64
-                ; test rbx, rbx
-                ; jz >fail
-                ; cqo
-                ; idiv rbx
-                ; mov rax, rdx
-            );
+            self.emit_int_mod();
             self.store_from_rax(dest, 2);
+            return Ok(());
+        }
+
+        let numeric = |ty: ValueType| matches!(ty, ValueType::Int | ValueType::Float);
+        if numeric(lhs_type) && numeric(rhs_type) {
+            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
+            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
+            if lhs_type == ValueType::Int {
+                dynasm!(self.ops ; .arch x64 ; mov rax, [r12 + lhs_offset + 8] ; cvtsi2sd xmm0, rax);
+            } else {
+                dynasm!(self.ops ; .arch x64 ; movsd xmm0, [r12 + lhs_offset + 8]);
+            }
+            if rhs_type == ValueType::Int {
+                dynasm!(self.ops ; .arch x64 ; mov rax, [r12 + rhs_offset + 8] ; cvtsi2sd xmm1, rax);
+            } else {
+                dynasm!(self.ops ; .arch x64 ; movsd xmm1, [r12 + rhs_offset + 8]);
+            }
+            self.emit_float_mod();
+            self.store_xmm0_as_float(dest);
             return Ok(());
         }
 
         self.compile_mod(dest, lhs, rhs)
     }
 
-    pub(super) fn compile_mod(&mut self, dest: u8, lhs: u8, rhs: u8) -> Result<()> {
-        let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-        let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
+    /// rax = rax % rbx with the interpreter's semantics: sign of the
+    /// dividend, modulo by zero fails the trace so the interpreter raises
+    /// the error.
+    fn emit_int_mod(&mut self) {
         dynasm!(self.ops
             ; .arch x64
-            ; mov rax, [r12 + lhs_offset + 8]
-            ; mov rbx, [r12 + rhs_offset + 8]
             ; test rbx, rbx
             ; jz >fail
             ; cqo
             ; idiv rbx
             ; mov rax, rdx
         );
+    }
+
+    /// xmm0 = xmm0 % xmm1 as Rust's `f64 % f64` (libm `fmod`). A zero
+    /// divisor fails the trace like the interpreter's "Modulo by zero"; NaN
+    /// compares unordered, not equal to zero, and falls through to fmod like
+    /// the interpreter.
+    fn emit_float_mod(&mut self) {
+        unsafe extern "C" {
+            fn fmod(a: f64, b: f64) -> f64;
+        }
+        dynasm!(self.ops
+            ; .arch x64
+            ; xorpd xmm2, xmm2
+            ; ucomisd xmm1, xmm2
+            ; jp >divisor_ok
+            ; je >fail
+            ; divisor_ok:
+            ; mov rax, QWORD fmod as *const () as _
+            ; call rax
+        );
+    }
+
+    /// Runtime-dispatched modulo for operands of unknown static type: a
+    /// Float on either side selects the float path (ints converted),
+    /// otherwise both payloads are integers.
+    pub(super) fn compile_mod(&mut self, dest: u8, lhs: u8, rhs: u8) -> Result<()> {
+        let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
+        let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov al, [r12 + lhs_offset]
+            ; cmp al, 3
+            ; je >float_path
+            ; mov al, [r12 + rhs_offset]
+            ; cmp al, 3
+            ; je >float_path
+            ; mov rax, [r12 + lhs_offset + 8]
+            ; mov rbx, [r12 + rhs_offset + 8]
+        );
+        self.emit_int_mod();
+        dynasm!(self.ops
+            ; .arch x64
+            ; jmp >store_int
+            ; float_path:
+            ; mov al, [r12 + lhs_offset]
+            ; cmp al, 2
+            ; jne >lhs_is_float
+            ; mov rax, [r12 + lhs_offset + 8]
+            ; cvtsi2sd xmm0, rax
+            ; jmp >rhs_check
+            ; lhs_is_float:
+            ; movsd xmm0, [r12 + lhs_offset + 8]
+            ; rhs_check:
+            ; mov al, [r12 + rhs_offset]
+            ; cmp al, 2
+            ; jne >rhs_is_float
+            ; mov rax, [r12 + rhs_offset + 8]
+            ; cvtsi2sd xmm1, rax
+            ; jmp >do_float_mod
+            ; rhs_is_float:
+            ; movsd xmm1, [r12 + rhs_offset + 8]
+            ; do_float_mod:
+        );
+        self.emit_float_mod();
+        self.store_xmm0_as_float(dest);
+        dynasm!(self.ops
+            ; .arch x64
+            ; jmp >mod_done
+            ; store_int:
+        );
         self.store_from_rax(dest, 2);
+        dynasm!(self.ops
+            ; .arch x64
+            ; mod_done:
+        );
         Ok(())
     }
 }

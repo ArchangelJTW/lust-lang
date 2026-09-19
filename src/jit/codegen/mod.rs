@@ -15,13 +15,20 @@ use hashbrown::HashMap;
 /// Must stay (8 mod 16) to preserve SysV stack alignment guarantees.
 pub(super) const MIN_JIT_STACK_SIZE: i32 = 504;
 
-/// Base offset for specialized value allocations (must avoid saved registers at rbp-40)
-pub(super) const SPECIALIZED_BASE_OFFSET: i32 = -64;
-/// Size (in bytes) reserved per specialized value (ptr + len + cap + padding)
+/// Base offset of the first specialized slot. Slot k occupies
+/// [rbp + base - 32k, rbp + base - 32k + 32), all of it below the saved
+/// callee-saved registers at rbp-8 through rbp-40.
+pub(super) const SPECIALIZED_BASE_OFFSET: i32 = -72;
+/// Size (in bytes) reserved per specialized value: a `JitVecSlot`
+/// (vec ptr + len + cap + array reference).
 pub(super) const SPECIALIZED_SLOT_SIZE: i32 = 32;
-/// Extra stack space required before the first specialized slot to avoid the
-/// saved callee-saved registers (rbp-8 through rbp-40).
-pub(super) const SPECIALIZED_STACK_BASE: i32 = 64;
+/// Stack space below the saved registers that the slots need before the
+/// first one starts.
+pub(super) const SPECIALIZED_STACK_BASE: i32 = 72;
+/// Size of the record pushed for each inlined call frame: a
+/// `crate::vm::JitInlineRecord` (value_count, caller r12, previous r15,
+/// alias_mask, function_idx, return_dest, callee_reg, caller_resume_ip).
+pub(super) const INLINE_METADATA_SIZE: i32 = 64;
 mod arithmetic;
 mod builder;
 mod comparisons;
@@ -30,6 +37,7 @@ mod logic;
 mod memory;
 mod registers;
 mod specialization;
+mod values;
 /// Tracks a specialized value in the JIT trace
 #[derive(Debug, Clone)]
 pub(super) struct SpecializedValue {
@@ -39,7 +47,6 @@ pub(super) struct SpecializedValue {
 pub struct JitCompiler {
     pub(super) ops: Assembler,
     pub(super) data: Vec<JitData>,
-    fail_stack: Vec<dynasmrt::DynamicLabel>,
     exit_stack: Vec<dynasmrt::DynamicLabel>,
     inline_depth: usize,
     /// Registry for type specializations
@@ -49,6 +56,34 @@ pub struct JitCompiler {
     pub(super) specialized_values: HashMap<usize, SpecializedValue>,
     /// Registers proven to contain non-owning scalar values at this point.
     pub(super) scalar_registers: HashMap<u8, ValueType>,
+    /// A scalar type an op's inline fast path established for its
+    /// destination (checked at runtime, so it holds on every path that
+    /// continues), applied after the generic environment update.
+    pub(super) pending_scalar: Option<(u8, ValueType)>,
+    /// Loop-header ip of the trace being compiled: where a guard that fails
+    /// before any instruction of the body has run resumes.
+    pub(super) trace_start_ip: usize,
+    /// Compiling whole-function code (see `jit::function`): no loop,
+    /// `Return` returns, `CallDirect` calls other compiled functions.
+    function_mode: bool,
+    /// Function mode: (frame register count, may any register own a value
+    /// at return) of the function being compiled.
+    function_frame: (u8, bool),
+    /// Function mode: address of the compiled-function entry table.
+    function_entry_table: usize,
+    /// Function mode: the epilogue, for propagating an exit that happened
+    /// inside a native callee.
+    function_epilogue: Option<dynasmrt::DynamicLabel>,
+    /// Branch targets of the function being compiled, by bytecode ip.
+    function_labels: HashMap<usize, dynasmrt::DynamicLabel>,
+    /// Function mode: the exit being emitted hands a call to the
+    /// interpreter rather than reporting a failed guard.
+    exit_is_handoff: bool,
+    /// Bytecode ip of the instruction the ops being compiled came from
+    /// (from the last `At` marker), if known.
+    current_fail_ip: Option<usize>,
+    /// Resume ips for failure exits, indexed by fail-stub number.
+    fail_sites: Vec<usize>,
     /// Next ID for specialized values
     #[allow(dead_code)]
     pub(super) next_specialized_id: usize,
@@ -97,6 +132,8 @@ mod tests {
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::LoadConst {
@@ -107,6 +144,7 @@ mod tests {
                     function_idx: 0,
                     loop_start_ip: 0,
                     bailout_ip: 0,
+                    resume_ip: 0,
                 },
             ],
             postamble: Vec::new(),
@@ -114,7 +152,7 @@ mod tests {
             outputs: vec![0],
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
         let string = Rc::new("old register value".to_string());
         let mut registers = vec![Value::String(string.clone())];
@@ -134,6 +172,8 @@ mod tests {
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![TraceOp::Guard {
                 register: 0,
@@ -144,7 +184,7 @@ mod tests {
             outputs: Vec::new(),
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
         let mut registers = vec![Value::Bool(false)];
 
@@ -162,6 +202,8 @@ mod tests {
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -190,7 +232,7 @@ mod tests {
             outputs: vec![2],
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
         let mut registers = vec![
             Value::Int(3),
@@ -295,6 +337,8 @@ mod tests {
                         let mut trace = Trace {
                             function_idx: 0,
                             start_ip: 0,
+                            is_function: false,
+                            frame_may_own: true,
                             preamble: vec![TraceOp::Guard {
                                 register: 2,
                                 expected_type: ValueType::Bool,
@@ -314,6 +358,7 @@ mod tests {
                                     function_idx: 0,
                                     loop_start_ip: 0,
                                     bailout_ip: 10,
+                                    resume_ip: 0,
                                 },
                             ],
                             postamble: Vec::new(),
@@ -325,7 +370,7 @@ mod tests {
                             trace.ops.insert(2, TraceOp::Move { dest: 3, src: 2 });
                         }
                         let compiled = JitCompiler::new()
-                            .compile_trace(&trace, TraceId(0), None, Vec::new())
+                            .compile_trace(&trace, TraceId(0), Vec::new())
                             .unwrap();
                         let mut registers = vec![
                             left.clone(),
@@ -360,6 +405,8 @@ mod tests {
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Lt {
@@ -391,6 +438,7 @@ mod tests {
                     function_idx: 0,
                     loop_start_ip: 0,
                     bailout_ip: 0,
+                    resume_ip: 0,
                 },
             ],
             postamble: Vec::new(),
@@ -398,7 +446,7 @@ mod tests {
             outputs: vec![3, 5, 6],
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
         let old_condition = Rc::new("condition".to_string());
         let old_constant = Rc::new("constant".to_string());
@@ -430,6 +478,8 @@ mod tests {
         let comparison_trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -462,7 +512,7 @@ mod tests {
             outputs: vec![2],
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&comparison_trace, TraceId(0), None, Vec::new())
+            .compile_trace(&comparison_trace, TraceId(0), Vec::new())
             .unwrap();
         let mut registers = vec![
             Value::Int(1),
@@ -484,6 +534,8 @@ mod tests {
         let constant_trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -515,7 +567,7 @@ mod tests {
             outputs: vec![4, 5],
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&constant_trace, TraceId(1), None, Vec::new())
+            .compile_trace(&constant_trace, TraceId(1), Vec::new())
             .unwrap();
         let mut registers = vec![
             Value::Int(1),
@@ -543,6 +595,8 @@ mod tests {
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![TraceOp::Div {
                 dest: 0,
@@ -556,7 +610,7 @@ mod tests {
             outputs: vec![0],
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
         let mut registers = vec![Value::Nil, Value::Int(7), Value::Int(0)];
 
@@ -574,6 +628,8 @@ mod tests {
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Div {
@@ -594,6 +650,7 @@ mod tests {
                     function_idx: 0,
                     loop_start_ip: 0,
                     bailout_ip: 0,
+                    resume_ip: 0,
                 },
             ],
             postamble: Vec::new(),
@@ -601,7 +658,7 @@ mod tests {
             outputs: vec![0, 1],
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
         let mut registers = vec![Value::Nil, Value::Nil, Value::Int(-7), Value::Int(2)];
 
@@ -621,6 +678,8 @@ mod tests {
         let trace = Trace {
             function_idx: 0,
             start_ip: 0,
+            is_function: false,
+            frame_may_own: true,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Lt {
@@ -669,6 +728,7 @@ mod tests {
                     function_idx: 0,
                     loop_start_ip: 0,
                     bailout_ip: 0,
+                    resume_ip: 0,
                 },
             ],
             postamble: Vec::new(),
@@ -676,7 +736,7 @@ mod tests {
             outputs: (0..=5).collect(),
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
         let mut registers = vec![
             Value::Nil,

@@ -571,6 +571,150 @@ impl StructLayout {
     }
 }
 
+/// A struct or enum type name carried by a value: shared, so cloning the
+/// value (every register move does) is a reference-count bump instead of
+/// a string allocation. Compares and formats like the `str` it holds.
+///
+/// Names are interned per thread (values never cross threads): two names
+/// with the same text are the same allocation, so equality is a pointer
+/// comparison, and generated code compares a value's variant against a
+/// constant the same way.
+#[derive(Clone, Eq, Hash, PartialOrd, Ord)]
+pub struct Name(Rc<str>);
+
+#[cfg(feature = "std")]
+thread_local! {
+    static NAMES: RefCell<hashbrown::HashSet<Rc<str>>> = RefCell::new(hashbrown::HashSet::new());
+}
+
+impl Name {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[cfg(feature = "std")]
+    fn intern(text: &str) -> Self {
+        NAMES.with(|names| {
+            let mut names = names.borrow_mut();
+            if let Some(existing) = names.get(text) {
+                return Name(Rc::clone(existing));
+            }
+            let fresh: Rc<str> = Rc::from(text);
+            names.insert(Rc::clone(&fresh));
+            Name(fresh)
+        })
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn intern(text: &str) -> Self {
+        Name(Rc::from(text))
+    }
+
+    /// The address generated code sees in a value holding this name: the
+    /// shared allocation's start (the `Rc` stores that, not the text).
+    pub fn inner_ptr(&self) -> *const u8 {
+        // SAFETY: an `Rc<str>` allocation is `RcInner { strong, weak, text }`
+        // (two counts, then the data); the pointer is only compared, never
+        // dereferenced.
+        (Rc::as_ptr(&self.0) as *const u8).wrapping_sub(2 * core::mem::size_of::<usize>())
+    }
+}
+
+impl PartialEq for Name {
+    fn eq(&self, other: &Name) -> bool {
+        Rc::ptr_eq(&self.0, &other.0) || (cfg!(not(feature = "std")) && self.0 == other.0)
+    }
+}
+
+impl core::ops::Deref for Name {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for Name {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::borrow::Borrow<str> for Name {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for Name {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for Name {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl PartialEq<String> for Name {
+    fn eq(&self, other: &String) -> bool {
+        &*self.0 == other.as_str()
+    }
+}
+
+impl PartialEq<Name> for str {
+    fn eq(&self, other: &Name) -> bool {
+        self == &*other.0
+    }
+}
+
+impl PartialEq<Name> for String {
+    fn eq(&self, other: &Name) -> bool {
+        self.as_str() == &*other.0
+    }
+}
+
+impl fmt::Display for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
+impl From<String> for Name {
+    fn from(s: String) -> Self {
+        Name::intern(&s)
+    }
+}
+
+impl From<&String> for Name {
+    fn from(s: &String) -> Self {
+        Name::intern(s)
+    }
+}
+
+impl From<&str> for Name {
+    fn from(s: &str) -> Self {
+        Name::intern(s)
+    }
+}
+
+impl From<Name> for String {
+    fn from(name: Name) -> Self {
+        name.0.to_string()
+    }
+}
+
+// The JIT copies values 16 bytes at a time and lays registers out at
+// `size_of::<Value>()` strides; both need the size to stay a multiple of 16.
+const _: () = assert!(core::mem::size_of::<Value>() % 16 == 0);
+
 #[repr(C, u8)]
 #[derive(Clone)]
 pub enum Value {
@@ -583,14 +727,14 @@ pub enum Value {
     Tuple(Rc<Vec<Value>>),
     Map(Rc<RefCell<LustMap>>),
     Struct {
-        name: String,
+        name: Name,
         layout: Rc<StructLayout>,
         fields: Rc<RefCell<Vec<Value>>>,
     },
     WeakStruct(WeakStructRef),
     Enum {
-        enum_name: String,
-        variant: String,
+        enum_name: Name,
+        variant: Name,
         values: Option<Rc<Vec<Value>>>,
     },
     Function(usize),
@@ -605,15 +749,19 @@ pub enum Value {
 
 #[derive(Debug, Clone)]
 pub struct WeakStructRef {
-    name: String,
+    name: Name,
     layout: Rc<StructLayout>,
     fields: Weak<RefCell<Vec<Value>>>,
 }
 
 impl WeakStructRef {
-    pub fn new(name: String, layout: Rc<StructLayout>, fields: &Rc<RefCell<Vec<Value>>>) -> Self {
+    pub fn new(
+        name: impl Into<Name>,
+        layout: Rc<StructLayout>,
+        fields: &Rc<RefCell<Vec<Value>>>,
+    ) -> Self {
         Self {
-            name,
+            name: name.into(),
             layout,
             fields: Rc::downgrade(fields),
         }
@@ -755,6 +903,34 @@ impl Value {
             Value::Closure { .. } => ValueType::Closure,
             Value::Iterator(_) => ValueType::Iterator,
             Value::Task(_) => ValueType::Task,
+        }
+    }
+
+    /// A value with no owned payload: copying its bits is a valid clone and
+    /// overwriting it needs no drop. The interpreter's hot paths use this to
+    /// skip the general `Clone`/`Drop` for scalars.
+    #[inline]
+    pub fn is_plain(&self) -> bool {
+        matches!(
+            self,
+            Value::Nil
+                | Value::Bool(_)
+                | Value::Int(_)
+                | Value::Float(_)
+                | Value::Function(_)
+                | Value::NativeFunction(_)
+        )
+    }
+
+    /// `clone` with the scalar case inlined.
+    #[inline]
+    pub fn fast_clone(&self) -> Value {
+        if self.is_plain() {
+            // SAFETY: plain variants own nothing, so a bit copy is an
+            // independent value.
+            unsafe { core::ptr::read(self) }
+        } else {
+            self.clone()
         }
     }
 
@@ -1040,7 +1216,7 @@ impl Value {
         }
     }
 
-    pub fn enum_unit(enum_name: impl Into<String>, variant: impl Into<String>) -> Self {
+    pub fn enum_unit(enum_name: impl Into<Name>, variant: impl Into<Name>) -> Self {
         Value::Enum {
             enum_name: enum_name.into(),
             variant: variant.into(),
@@ -1049,8 +1225,8 @@ impl Value {
     }
 
     pub fn enum_variant(
-        enum_name: impl Into<String>,
-        variant: impl Into<String>,
+        enum_name: impl Into<Name>,
+        variant: impl Into<Name>,
         values: Vec<Value>,
     ) -> Self {
         Value::Enum {
@@ -1465,6 +1641,48 @@ pub unsafe extern "C" fn jit_init_nil(dest: *mut Value) -> u8 {
     }
 }
 
+/// A compiled function's `Return`: move `src` (null = Nil) into `dest`,
+/// dropping what `dest` held and leaving `src` Nil so the frame's drop
+/// pass does not see the value twice.
+///
+/// # Safety
+/// `dest` points at a live `Value`; `src` is null or points at one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_return_value(src: *mut Value, dest: *mut Value) {
+    unsafe {
+        let value = if src.is_null() {
+            Value::Nil
+        } else {
+            let value = ptr::read(src);
+            ptr::write(src, Value::Nil);
+            value
+        };
+        replace_value(dest, value);
+    }
+}
+
+/// Drop a native frame's registers except the aliased ones (`mask`, bit
+/// i = register i), which are bitwise copies of the caller's values and
+/// own nothing.
+///
+/// # Safety
+/// `values` points at `len` initialized values; the masked ones are never
+/// read again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_drop_values_masked(values: *mut Value, len: usize, mask: u64) {
+    unsafe {
+        if values.is_null() {
+            return;
+        }
+        for i in 0..len {
+            if i < 64 && mask & (1 << i) != 0 {
+                continue;
+            }
+            ptr::drop_in_place(values.add(i));
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_drop_values(values: *mut Value, len: usize) {
     unsafe {
@@ -1710,130 +1928,123 @@ pub unsafe extern "C" fn jit_array_push_safe(
     }
 }
 
-/// Unbox Array<int> from Value to Vec<LustInt> for specialized JIT operations
-/// IMPORTANT: This takes ownership of the array's data. The original Vec<Value> is emptied.
-/// Returns 1 on success, 0 on failure
-/// Outputs: vec_ptr (pointer to data), vec_len, vec_cap
+/// A specialized `Array<int>` slot on the JIT stack: the raw parts of a
+/// `Vec<LustInt>` copy of the elements, plus a strong reference to the
+/// array it was copied from. Traces read and push through the copy; the
+/// rebox publishes it back into that same array object, wherever the
+/// register that held the array has moved on to by then. Zeroed = empty.
+#[cfg(feature = "std")]
+type ArrayRef = Rc<RefCell<Vec<Value>>>;
+
+#[cfg(feature = "std")]
+#[repr(C)]
+pub struct JitVecSlot {
+    ptr: *mut LustInt,
+    len: usize,
+    cap: usize,
+    array: *const RefCell<Vec<Value>>,
+}
+
+#[cfg(feature = "std")]
+impl JitVecSlot {
+    /// Take the slot's contents, leaving it zeroed.
+    ///
+    /// # Safety
+    /// The slot holds either zeros or what `jit_unbox_array_int` stored.
+    unsafe fn take(&mut self) -> (Option<Vec<LustInt>>, Option<ArrayRef>) {
+        let vec = if self.ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { Vec::from_raw_parts(self.ptr, self.len, self.cap) })
+        };
+        let array = if self.array.is_null() {
+            None
+        } else {
+            Some(unsafe { Rc::from_raw(self.array) })
+        };
+        self.ptr = ptr::null_mut();
+        self.len = 0;
+        self.cap = 0;
+        self.array = ptr::null();
+        (vec, array)
+    }
+}
+
+/// Unbox `Array<int>` into `slot`: copy the elements into a `Vec<LustInt>`
+/// and keep a reference to the array. Whatever the slot held before (an
+/// earlier unbox in an unrolled iteration) is released first; on failure
+/// the slot is left empty. Returns 1 on success, 0 on failure.
+///
+/// # Safety
+/// `array_value_ptr` points at a live `Value` and `slot` at a slot that
+/// holds zeros or what an earlier call stored.
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_unbox_array_int(
     array_value_ptr: *const Value,
-    out_vec_ptr: *mut *mut LustInt,
-    out_len: *mut usize,
-    out_cap: *mut usize,
+    slot: *mut JitVecSlot,
 ) -> u8 {
     unsafe {
-        if array_value_ptr.is_null()
-            || out_vec_ptr.is_null()
-            || out_len.is_null()
-            || out_cap.is_null()
-        {
+        if array_value_ptr.is_null() || slot.is_null() {
             return 0;
         }
+        let slot = &mut *slot;
+        drop(slot.take());
 
-        let array_value = &*array_value_ptr;
-        match array_value {
-            Value::Array(arr_rc) => {
-                // Get exclusive access to the inner vector
-                let cell_ptr = arr_rc.as_ptr();
-                let vec_ref = &mut *cell_ptr;
+        let Value::Array(arr_rc) = &*array_value_ptr else {
+            return 0;
+        };
+        // Copy the elements out; do NOT move them. Moving left the source
+        // array empty for the span of the trace, and anything that re-entered
+        // the runtime mid-trace (a nested `for elem in arr`) saw a hollowed-out
+        // array. A runtime re-entry mid-trace can still see values that
+        // predate pushes made by the trace; closing that hole needs escape
+        // analysis so such arrays are never specialized at all.
+        let vec_ref = &*arr_rc.as_ptr();
+        if vec_ref.iter().any(|value| !matches!(value, Value::Int(_))) {
+            return 0;
+        }
+        let mut specialized_vec: Vec<LustInt> = vec_ref
+            .iter()
+            .map(|value| match value {
+                Value::Int(value) => *value,
+                _ => unreachable!("array element types were validated above"),
+            })
+            .collect();
+        slot.len = specialized_vec.len();
+        slot.cap = specialized_vec.capacity();
+        slot.ptr = specialized_vec.as_mut_ptr();
+        core::mem::forget(specialized_vec);
+        slot.array = Rc::into_raw(Rc::clone(arr_rc));
+        1
+    }
+}
 
-                // Copy the elements out; do NOT move them.  This used to be a
-                // `mem::replace(vec_ref, Vec::new())`, which left the source array
-                // empty for the entire span of the trace and relied on the postamble
-                // rebox to put the elements back.  Anything that re-entered the
-                // runtime mid-trace then observed a zero-length array: a nested
-                // `for elem in arr` built its iterator from the hollowed-out array
-                // and failed with "Array index 2 out of bounds (length: 0)".
-                //
-                // Copying is affordable because unboxing happens once per trace
-                // entry, not per iteration, and it is sound because no trace op
-                // overwrites the boxed array in place — `VecPush` only appends to the
-                // specialized buffer, and the rebox publishes the result.  A runtime
-                // re-entry mid-trace can still see values that predate pushes made
-                // by the trace; closing that hole needs escape analysis so such
-                // arrays are never specialized at all.
-                if vec_ref.iter().any(|value| !matches!(value, Value::Int(_))) {
-                    return 0;
-                }
-                let mut specialized_vec: Vec<LustInt> = vec_ref
-                    .iter()
-                    .map(|value| match value {
-                        Value::Int(value) => *value,
-                        _ => unreachable!("array element types were validated above"),
-                    })
-                    .collect();
-
-                // Extract Vec metadata
-                let len = specialized_vec.len();
-                let cap = specialized_vec.capacity();
-                let ptr = specialized_vec.as_mut_ptr();
-
-                // Prevent Vec from being dropped
-                core::mem::forget(specialized_vec);
-
-                // Write outputs
-                ptr::write(out_vec_ptr, ptr);
-                ptr::write(out_len, len);
-                ptr::write(out_cap, cap);
-
-                // The original Rc<RefCell<Vec<Value>>> keeps its contents; the rebox
-                // overwrites them with whatever the trace produced.
-
+/// Rebox: write the slot's elements back into the array they were unboxed
+/// from and empty the slot. An empty slot (nothing unboxed on this path) is
+/// a no-op. Returns 1 on success, 0 on a malformed slot.
+///
+/// # Safety
+/// `slot` points at a slot that holds zeros or what `jit_unbox_array_int`
+/// stored.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8 {
+    unsafe {
+        if slot.is_null() {
+            return 0;
+        }
+        let (vec, array) = (*slot).take();
+        match (vec, array) {
+            (Some(vec), Some(array)) => {
+                *array.as_ptr() = vec.into_iter().map(Value::Int).collect();
                 1
             }
+            (None, None) => 1,
             _ => 0,
         }
     }
 }
-
-/// Rebox Vec<LustInt> back to Array Value
-/// IMPORTANT: Writes the specialized vec data back into the EXISTING Rc<RefCell<Vec<Value>>>
-/// This ensures the original array is updated, not replaced
-#[cfg(feature = "std")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jit_rebox_array_int(
-    vec_ptr: *mut LustInt,
-    vec_len: usize,
-    vec_cap: usize,
-    array_value_ptr: *mut Value,
-) -> u8 {
-    unsafe {
-        if array_value_ptr.is_null() {
-            return 0;
-        }
-        if vec_ptr.is_null() {
-            return u8::from(vec_len == 0 && vec_cap == 0);
-        }
-
-        // Reconstruct Vec<LustInt> from raw parts
-        let specialized_vec = Vec::from_raw_parts(vec_ptr, vec_len, vec_cap);
-
-        // Get the existing Array value
-        let array_value = &mut *array_value_ptr;
-        match array_value {
-            Value::Array(arr_rc) => {
-                // Get exclusive access to the inner vector (should be empty from unbox)
-                let cell_ptr = arr_rc.as_ptr();
-                let vec_ref = &mut *cell_ptr;
-
-                // Convert Vec<LustInt> back to Vec<Value> and write into the existing RefCell
-                *vec_ref = specialized_vec.into_iter().map(Value::Int).collect();
-
-                1
-            }
-            _ => {
-                // This shouldn't happen - the register should still contain the Array
-                // But if it doesn't, create a new array
-                let value_vec: Vec<Value> = specialized_vec.into_iter().map(Value::Int).collect();
-                let array_value_new = Value::array(value_vec);
-                replace_value(array_value_ptr, array_value_new);
-                1
-            }
-        }
-    }
-}
-
 /// Specialized push operation for Vec<LustInt>
 /// Directly pushes LustInt to the specialized vector
 #[cfg(feature = "std")]
@@ -1880,17 +2091,19 @@ pub unsafe extern "C" fn jit_vec_int_push(
 /// WARNING: This should NOT be called! Specialized values that get invalidated
 /// during loop recording don't actually exist on the stack during execution.
 #[cfg(feature = "std")]
+/// Drop a specialized slot without publishing it (its value was
+/// invalidated during recording).
+///
+/// # Safety
+/// `slot` points at a slot that holds zeros or what `jit_unbox_array_int`
+/// stored.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jit_drop_vec_int(vec_ptr: *mut LustInt, vec_len: usize, vec_cap: usize) {
-    eprintln!(
-        "🗑️  jit_drop_vec_int: ptr={:p}, len={}, cap={}",
-        vec_ptr, vec_len, vec_cap
-    );
-    eprintln!("🗑️  jit_drop_vec_int: THIS SHOULD NOT BE CALLED - THE VEC DATA IS STALE!");
-
-    // DO NOT drop - the Vec data on the stack is stale from trace recording
-    // The actual arrays are managed by their Rc<RefCell<>> wrappers
-    eprintln!("🗑️  jit_drop_vec_int: skipping drop (would cause corruption)");
+pub unsafe extern "C" fn jit_drop_vec_int(slot: *mut JitVecSlot) {
+    unsafe {
+        if !slot.is_null() {
+            drop((*slot).take());
+        }
+    }
 }
 
 #[cfg(feature = "std")]
@@ -2088,6 +2301,20 @@ pub unsafe extern "C" fn jit_guard_native_function(
     }
 }
 
+/// Does the value hold a struct whose layout is `expected`?
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_guard_struct_layout(value_ptr: *const Value, expected: *const ()) -> u8 {
+    unsafe {
+        if value_ptr.is_null() {
+            return 0;
+        }
+        match &*value_ptr {
+            Value::Struct { layout, .. } => u8::from(Rc::as_ptr(layout) as *const () == expected),
+            _ => 0,
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_guard_function_identity(
     value_ptr: *const Value,
@@ -2238,6 +2465,12 @@ pub unsafe extern "C" fn jit_call_native_safe(
             }
         }
 
+        // The caller's frame shows the call's line if the native fails.
+        if let Some(ip) = jit::take_call_ip()
+            && let Some(frame) = (&mut *vm_ptr).call_stack.last_mut()
+        {
+            frame.ip = ip + 1;
+        }
         push_vm_ptr(vm_ptr);
         let outcome = native_fn(&args);
         pop_vm_ptr();
@@ -2320,12 +2553,18 @@ pub unsafe extern "C" fn jit_call_native_safe(
 }
 
 #[unsafe(no_mangle)]
+/// Call a Lust function from generated code. The result goes to `out` when
+/// it is non-null (a register of an inlined frame on the JIT stack, whose
+/// address is stable), otherwise to register `dest_reg` of the VM's current
+/// frame, looked up after the call because the call may reallocate the
+/// register file.
 pub unsafe extern "C" fn jit_call_function_safe(
     vm_ptr: *mut VM,
     callee_ptr: *const Value,
     args_ptr: *const Value,
     arg_count: u8,
     dest_reg: u8,
+    out: *mut Value,
 ) -> u8 {
     unsafe {
         if vm_ptr.is_null() || callee_ptr.is_null() {
@@ -2349,21 +2588,29 @@ pub unsafe extern "C" fn jit_call_function_safe(
         }
 
         let vm = &mut *vm_ptr;
+        // The caller's frame shows the call's line in a stack trace.
+        if let Some(ip) = jit::take_call_ip()
+            && let Some(frame) = vm.call_stack.last_mut()
+        {
+            frame.ip = ip + 1;
+        }
         push_vm_ptr(vm_ptr);
 
-        // Temporarily disable JIT to prevent recursive JIT execution
-        let jit_was_enabled = vm.jit.enabled;
-        vm.jit.enabled = false;
-
+        // The callee runs with the JIT on: its loops get their own traces
+        // and its body its own compiled code. Nothing in the trace that
+        // made this call depends on the JIT being idle meanwhile — it holds
+        // its own code alive and has written every register back.
         let call_result = vm.call_value(&callee, args);
 
-        // Restore JIT state
-        vm.jit.enabled = jit_was_enabled;
         pop_vm_ptr();
 
         match call_result {
             Ok(value) => {
                 vm.observe_value_graph(&value);
+                if !out.is_null() {
+                    *out = value;
+                    return 1;
+                }
                 // Get current registers pointer AFTER the call (it may have reallocated)
                 let vm = &mut *vm_ptr;
                 if let Some(frame) = vm.call_stack.last_mut() {
@@ -2633,6 +2880,9 @@ pub unsafe extern "C" fn jit_get_enum_value_safe(
 }
 
 #[unsafe(no_mangle)]
+/// Call a builtin method from generated code. Result delivery follows
+/// `jit_call_function_safe`: `out` when non-null, else `dest_reg` of the
+/// VM's current frame.
 pub unsafe extern "C" fn jit_call_method_safe(
     vm_ptr: *mut VM,
     object_ptr: *const Value,
@@ -2641,6 +2891,7 @@ pub unsafe extern "C" fn jit_call_method_safe(
     args_ptr: *const Value,
     arg_count: u8,
     dest_reg: u8,
+    out: *mut Value,
 ) -> u8 {
     unsafe {
         if vm_ptr.is_null() || object_ptr.is_null() || method_name_ptr.is_null() {
@@ -2674,6 +2925,10 @@ pub unsafe extern "C" fn jit_call_method_safe(
         crate::vm::pop_vm_ptr();
         match outcome {
             Ok(val) => {
+                if !out.is_null() {
+                    *out = val;
+                    return 1;
+                }
                 let vm = &mut *vm_ptr;
                 if let Some(frame) = vm.call_stack.last_mut() {
                     if (dest_reg as usize) < frame.registers.len() {
@@ -2839,6 +3094,34 @@ pub unsafe extern "C" fn jit_get_field_safe(
         };
         replace_value(out, field_value);
         1
+    }
+}
+
+/// `jit_get_field_safe` that also reads a `Map` (a module table, say),
+/// keyed by `key`: the field name as a `ValueKey` the code retains, so
+/// nothing is built per call. A missing entry reads as Nil, as in the
+/// interpreter.
+///
+/// # Safety
+/// `object_ptr` and `key` point to live values, `out` to a live value slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_get_field_keyed(
+    object_ptr: *const Value,
+    field_name_ptr: *const u8,
+    field_name_len: usize,
+    key: *const ValueKey,
+    out: *mut Value,
+) -> u8 {
+    unsafe {
+        if let Value::Map(map) = &*object_ptr {
+            let value = match map.try_borrow() {
+                Ok(map) => map.get(&*key).cloned().unwrap_or(Value::Nil),
+                Err(_) => return 0,
+            };
+            replace_value(out, value);
+            return 1;
+        }
+        jit_get_field_safe(object_ptr, field_name_ptr, field_name_len, out)
     }
 }
 
@@ -3056,6 +3339,30 @@ pub unsafe extern "C" fn jit_new_struct_safe(
     }
 }
 
+/// Take another reference to whatever the value owns (the counterpart of
+/// a bitwise copy generated code made of it).
+///
+/// # Safety
+/// `value` points at a live `Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_retain_value(value: *const Value) {
+    unsafe {
+        core::mem::forget((*value).clone());
+    }
+}
+
+/// Drop the value in place, leaving Nil.
+///
+/// # Safety
+/// `value` points at a live `Value` that generated code will overwrite or
+/// no longer read.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_release_value(value: *mut Value) {
+    unsafe {
+        replace_value(value, Value::Nil);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8 {
     unsafe {
@@ -3119,22 +3426,63 @@ mod jit_replacement_tests {
     }
 
     #[cfg(feature = "std")]
+    fn empty_slot() -> JitVecSlot {
+        JitVecSlot {
+            ptr: core::ptr::null_mut(),
+            len: 0,
+            cap: 0,
+            array: core::ptr::null(),
+        }
+    }
+
+    #[cfg(feature = "std")]
     #[test]
     fn failed_array_specialization_restores_original_values() {
-        let mut value = Value::array(vec![Value::Int(1), Value::string("not an int")]);
-        let mut data = core::ptr::null_mut();
-        let mut len = 0;
-        let mut cap = 0;
+        let value = Value::array(vec![Value::Int(1), Value::string("not an int")]);
+        let mut slot = empty_slot();
 
-        let result = unsafe { jit_unbox_array_int(&value, &mut data, &mut len, &mut cap) };
+        let result = unsafe { jit_unbox_array_int(&value, &mut slot) };
 
         assert_eq!(result, 0);
-        assert_eq!(
-            unsafe { jit_rebox_array_int(data, len, cap, &mut value) },
-            1
-        );
+        assert!(slot.ptr.is_null() && slot.array.is_null());
+        assert_eq!(unsafe { jit_rebox_array_int(&mut slot) }, 1);
         assert_eq!(value.array_len(), Some(2));
         assert!(matches!(value.array_get(0), Some(Value::Int(1))));
         assert!(matches!(value.array_get(1), Some(Value::String(_))));
+    }
+
+    /// The rebox publishes into the array that was unboxed, not into
+    /// whatever register the trace last held it in: a guard exit taken while
+    /// that register holds something else must leave the register alone.
+    #[cfg(feature = "std")]
+    #[test]
+    fn rebox_publishes_into_the_unboxed_array() {
+        let value = Value::array(vec![Value::Int(1), Value::Int(2)]);
+        let Value::Array(rc) = &value else { unreachable!() };
+        let mut slot = empty_slot();
+        assert_eq!(unsafe { jit_unbox_array_int(&value, &mut slot) }, 1);
+        assert_eq!(Rc::strong_count(rc), 2);
+
+        // A push through the specialized copy, then a rebox.
+        let mut vec = unsafe { Vec::from_raw_parts(slot.ptr, slot.len, slot.cap) };
+        vec.push(3);
+        slot.len = vec.len();
+        slot.cap = vec.capacity();
+        slot.ptr = vec.as_mut_ptr();
+        core::mem::forget(vec);
+        assert_eq!(unsafe { jit_rebox_array_int(&mut slot) }, 1);
+
+        assert_eq!(value.array_len(), Some(3));
+        assert!(matches!(value.array_get(2), Some(Value::Int(3))));
+        assert_eq!(Rc::strong_count(rc), 1);
+        assert!(slot.ptr.is_null() && slot.array.is_null());
+
+        // Unboxing again over a slot that was never reboxed releases the old
+        // copy and reference instead of leaking them.
+        assert_eq!(unsafe { jit_unbox_array_int(&value, &mut slot) }, 1);
+        assert_eq!(unsafe { jit_unbox_array_int(&value, &mut slot) }, 1);
+        assert_eq!(Rc::strong_count(rc), 2);
+        unsafe { jit_drop_vec_int(&mut slot) };
+        assert_eq!(Rc::strong_count(rc), 1);
     }
 }

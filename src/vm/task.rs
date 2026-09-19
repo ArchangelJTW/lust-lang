@@ -41,7 +41,7 @@ impl TaskState {
 pub struct TaskInstance {
     pub id: TaskId,
     pub state: TaskState,
-    pub(super) call_stack: Vec<CallFrame>,
+    pub(super) call_stack: Vec<Box<CallFrame>>,
     pub pending_return_value: Option<Value>,
     pub pending_return_dest: Option<Register>,
     pub yield_dest: Option<Register>,
@@ -49,7 +49,7 @@ pub struct TaskInstance {
     pub last_result: Option<Value>,
     pub error: Option<LustError>,
     kind: TaskKind,
-    initial_frame: Option<CallFrame>,
+    initial_frame: Option<Box<CallFrame>>,
 }
 
 #[derive(Clone, Debug)]
@@ -59,7 +59,7 @@ pub enum TaskKind {
 }
 
 impl TaskInstance {
-    pub(super) fn new(id: TaskId, initial_frame: CallFrame) -> Self {
+    pub(super) fn new(id: TaskId, initial_frame: Box<CallFrame>) -> Self {
         Self {
             id,
             state: TaskState::Ready,
@@ -123,7 +123,7 @@ impl TaskInstance {
     }
 
     pub(super) fn initial_frame(&self) -> Option<&CallFrame> {
-        self.initial_frame.as_ref()
+        self.initial_frame.as_deref()
     }
 
     pub fn kind(&self) -> &TaskKind {

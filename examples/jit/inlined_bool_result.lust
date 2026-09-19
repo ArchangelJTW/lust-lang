@@ -1,0 +1,26 @@
+-- An inlined callee whose Bool result lands in a register that last held
+-- an owned value (the native function fetched from `math`). The Bool is
+-- stored through a helper that takes a byte; the payload's upper bytes
+-- are whatever was there, and must not be read as part of the value.
+function f1(): bool
+    local n3: int = 18
+    local o6: Option<int> = Option.Some(math.max(n3, 32))
+    return (27 < (0 - 3))
+end
+
+function run(): string
+    local out: string = ""
+    local b44: bool = f1()
+    local i45: int = 0
+    while i45 < 12 do
+        i45 = i45 + 1
+        if b44 then
+            local q: int = 1
+        elseif f1() then
+            out = out .. "x"
+        end
+        out = out .. tostring(i45) .. " "
+    end
+    return out
+end
+println(run())

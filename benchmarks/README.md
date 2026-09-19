@@ -142,3 +142,60 @@ static lowering described above. RISC-V codegen has not been modified.
   reports before and after: 1,148 `MATCH_OK`, 107 existing `FRONTEND` failures.
   Those frontend failures are not counted as passing tests; dedicated native
   code tests and the typed benchmark cover floating-point behavior here.
+
+## Cross-language suite (`benchmarks/suite`)
+
+`benchmarks/suite/run.sh` runs nine small programs — struct fields, array
+indexing, function calls, struct method calls, string building, recursive
+fib, nested loops, float math, tree recursion over structs plus an
+array-scanning function — through the Lust interpreter (`LUST_JIT=0`),
+the Lust JIT, LuaJIT and Lua, checking that all outputs agree. Each program
+has a `.lust` and an equivalent `.lua`.
+
+Measured on an Apple M5 (native aarch64 backend, branch `aarch64-jit`),
+milliseconds, single run each:
+
+| program   | lust-vm | lust-jit | luajit | lua 5.5 |
+|-----------|--------:|---------:|-------:|--------:|
+| fields    |     737 |       44 |     55 |     111 |
+| array     |    1327 |      205 |     55 |      77 |
+| calls     |     770 |      104 |     27 |     125 |
+| methods   |    1384 |       73 |     27 |     214 |
+| strings   |   13987 |    13783 |  25994 |    7311 |
+| fib       |     175 |       37 |     20 |      36 |
+| nested    |     365 |       23 |     27 |      76 |
+| floatmath |     552 |       53 |     34 |      95 |
+| tree      |     746 |      134 |     36 |      53 |
+
+The interpreter numbers were 3-90x worse before the fixes to cycle
+collection cost, call-frame copying and argument checking on this branch
+(fib: 3724 ms; `array` at 1,000,000 elements did not finish in thirty
+minutes). `nested` was 626 ms with the JIT before nested loops ran natively from the
+outer trace (each outer iteration used to exit to the interpreter, and the
+inner loop's trace was recompiled every time). `calls` was 367 ms and
+`methods` 562 ms with the JIT before inlined calls copied scalar arguments
+and results natively and aliased struct arguments instead of cloning them;
+`fib` 271 ms before the interpreter's call path stopped re-deriving the
+callee's signature on every call, and 178 ms before loop-free functions were
+compiled whole with native calls between them (`fib(34)`: 1.08 s interpreted,
+0.12 s compiled, Lua 5.5 0.13 s, LuaJIT 0.02 s). `fields` was 182 ms and
+`methods` 377 ms before scalar struct fields were read and written inline
+instead of through runtime helpers; `array` was 357 ms before its push loop
+could be traced at all (a loop calling `array.push` — a global read — used
+to abort recording every time) and its element reads were typed inline
+loads. `tree` (added with whole-function compilation of loops, fields and
+enums) was 620 ms with loop-free-only function compilation and 8 s or
+worse before the cycle collector's graph scan stopped being quadratic;
+sharing struct and enum names (so a value clone no longer allocates) took
+the interpreter from 1560 to 1133 ms and shrank `Value` to 48 bytes, which
+is where the interpreter's `fields` and `methods` gains come from.
+`tree` then went 191 → 134 ms and `calls` 152 → 104 once enum tests,
+struct-layout and native-function guards, field and payload reads and
+value moves stopped calling the runtime (interned names, measured
+layouts, inline reference counting), arguments were aliased into callee
+frames instead of cloned, and the cycle collector stopped collecting on
+allocation. Remaining gaps against Lua: `strings`, where every engine is
+quadratic in `s = s .. x`; `array`, whose element loop still writes every
+value through to the frame; and `tree`, where a node visit is three
+native calls with frames and records each, against LuaJIT's register
+passing.

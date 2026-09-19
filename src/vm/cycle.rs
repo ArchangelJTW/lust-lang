@@ -7,8 +7,21 @@ use alloc::{vec, vec::Vec};
 use core::cell::RefCell;
 use hashbrown::{HashMap, HashSet, hash_map::Entry};
 
-const COLLECT_INTERVAL: usize = 512;
+/// Base triggers: a collection every this many register writes (raised in
+/// proportion to the size of the heap the previous collection had to
+/// walk, see `should_collect`), and a sweep of dead registrations every
+/// this many new containers (raised to the number registered, so it is
+/// amortized constant per allocation). A cycle can only be closed by a
+/// store into an existing container, never by constructing a new one, so
+/// allocation alone never needs the graph walked: the registration
+/// trigger only keeps the registry from filling with entries whose values
+/// are already gone.
+const COLLECT_INTERVAL: usize = 1 << 16;
 const REGISTRATION_THRESHOLD: usize = 256;
+/// Steps granted per value the previous collection visited: a collection
+/// walks the whole live heap, so this bounds its share of the run (each
+/// visit costs about as much as thirty register writes).
+const STEPS_PER_WORK_UNIT: usize = 32;
 
 type NodeKey = (u8, usize);
 const NODE_ARRAY: u8 = 1;
@@ -25,6 +38,11 @@ pub struct CycleCollector {
     containers: HashMap<NodeKey, ContainerKind>,
     steps_since_collect: usize,
     pending_registrations: usize,
+    /// Values visited by the previous collection: the cost of walking the
+    /// heap, which the next collection is deferred in proportion to.
+    last_collect_work: usize,
+    /// Values visited so far by the collection in progress.
+    work: usize,
 }
 
 enum ContainerKind {
@@ -63,34 +81,81 @@ impl CycleCollector {
         Self::default()
     }
 
+    /// Called on every register write: the leaf test is inlined so a
+    /// scalar costs a tag compare and no call.
+    #[inline]
     pub fn register_value(&mut self, value: &Value) {
-        self.discover_value(value, false);
+        if !Self::is_leaf(value) {
+            self.discover_value(value, false);
+        }
     }
 
+    #[inline]
     pub(crate) fn register_graph(&mut self, value: &Value) {
-        self.discover_value(value, false);
+        if !Self::is_leaf(value) {
+            self.discover_value(value, false);
+        }
     }
 
-    pub fn maybe_collect(&mut self, vm: &VM) {
+    /// Count a step and say whether a collection is due. Cheap: called on
+    /// every register write. Registrations piling up trigger a sweep of the
+    /// registry here instead of a collection.
+    #[inline]
+    pub fn should_collect(&mut self) -> bool {
         self.steps_since_collect = self.steps_since_collect.saturating_add(1);
         if self.containers.is_empty() {
             self.steps_since_collect = 0;
             self.pending_registrations = 0;
-            return;
+            return false;
         }
 
-        if self.steps_since_collect >= COLLECT_INTERVAL
-            || self.pending_registrations >= REGISTRATION_THRESHOLD
-        {
-            self.collect(vm);
-            self.steps_since_collect = 0;
+        if self.pending_registrations >= REGISTRATION_THRESHOLD.max(self.containers.len()) {
+            self.sweep_dead();
             self.pending_registrations = 0;
         }
+
+        // A collection walks every reachable value, so its cost is the heap
+        // size. Spacing collections by that cost keeps the amortized charge
+        // per step bounded; small heaps still collect at the base rate.
+        let step_interval = COLLECT_INTERVAL.max(self.last_collect_work * STEPS_PER_WORK_UNIT);
+        self.steps_since_collect >= step_interval
+    }
+
+    /// Forget registrations whose container has already been freed.
+    fn sweep_dead(&mut self) {
+        self.containers.retain(|_, container| match container {
+            ContainerKind::Array(weak) | ContainerKind::Struct(weak) => weak.strong_count() > 0,
+            ContainerKind::Map(weak) => weak.strong_count() > 0,
+            ContainerKind::Iterator(weak) => weak.strong_count() > 0,
+        });
     }
 
     pub fn collect(&mut self, vm: &VM) {
+        self.work = 0;
         self.discover_vm_roots(vm);
         self.collect_registered();
+        self.last_collect_work = self.work;
+        self.steps_since_collect = 0;
+        self.pending_registrations = 0;
+    }
+
+    /// Values that cannot own a cycle need no traversal (and no clone onto
+    /// the traversal stack).
+    #[inline]
+    fn is_leaf(value: &Value) -> bool {
+        matches!(
+            value,
+            Value::Nil
+                | Value::Bool(_)
+                | Value::Int(_)
+                | Value::Float(_)
+                | Value::String(_)
+                | Value::Function(_)
+                | Value::NativeFunction(_)
+                | Value::WeakStruct(_)
+                | Value::Task(_)
+                | Value::Enum { values: None, .. }
+        )
     }
 
     fn discover_vm_roots(&mut self, vm: &VM) {
@@ -98,7 +163,7 @@ impl CycleCollector {
             self.discover_value(value, true);
         }
         for frame in &vm.call_stack {
-            self.discover_frame(frame);
+            self.discover_frame(vm, frame);
         }
         if let Some(value) = &vm.pending_return_value {
             self.discover_value(value, true);
@@ -110,12 +175,21 @@ impl CycleCollector {
             self.discover_task_signal(signal);
         }
         for task in vm.task_manager.iter() {
-            self.discover_task(task);
+            self.discover_task(vm, task);
         }
     }
 
-    fn discover_frame(&mut self, frame: &CallFrame) {
-        for value in frame.registers.iter() {
+    fn discover_frame(&mut self, vm: &VM, frame: &CallFrame) {
+        // Only the registers the function uses can hold anything; the rest
+        // of the fixed-size frame is Nil.
+        let used = vm
+            .functions
+            .get(frame.function_idx)
+            .map(|f| f.register_count as usize)
+            .unwrap_or(frame.registers.len())
+            .min(frame.registers.len());
+        self.work += used + frame.upvalues.len();
+        for value in &frame.registers[..used] {
             self.discover_value(value, true);
         }
         for value in &frame.upvalues {
@@ -131,12 +205,12 @@ impl CycleCollector {
         }
     }
 
-    fn discover_task(&mut self, task: &TaskInstance) {
+    fn discover_task(&mut self, vm: &VM, task: &TaskInstance) {
         for frame in &task.call_stack {
-            self.discover_frame(frame);
+            self.discover_frame(vm, frame);
         }
         if let Some(frame) = task.initial_frame() {
-            self.discover_frame(frame);
+            self.discover_frame(vm, frame);
         }
         if let Some(value) = &task.pending_return_value {
             self.discover_value(value, true);
@@ -152,30 +226,13 @@ impl CycleCollector {
     fn discover_value(&mut self, value: &Value, scan_existing: bool) {
         // Leaf values cannot own a cycle. Avoid allocating a traversal stack for
         // every scalar register write (and every scalar visited in VM roots).
-        match value {
-            Value::Nil
-            | Value::Bool(_)
-            | Value::Int(_)
-            | Value::Float(_)
-            | Value::String(_)
-            | Value::Function(_)
-            | Value::NativeFunction(_)
-            | Value::WeakStruct(_)
-            | Value::Task(_)
-            | Value::Enum { values: None, .. } => return,
-            Value::Array(_)
-            | Value::Tuple(_)
-            | Value::Map(_)
-            | Value::Struct { .. }
-            | Value::Enum {
-                values: Some(_), ..
-            }
-            | Value::Closure { .. }
-            | Value::Iterator(_) => {}
+        if Self::is_leaf(value) {
+            return;
         }
         let mut stack = vec![value.clone()];
         let mut visited = HashSet::new();
         while let Some(value) = stack.pop() {
+            self.work += 1;
             match value {
                 Value::Array(rc) => {
                     let key = (NODE_ARRAY, Rc::as_ptr(&rc) as usize);
@@ -187,7 +244,8 @@ impl CycleCollector {
                         && visited.insert(key)
                         && let Ok(values) = rc.try_borrow()
                     {
-                        stack.extend(values.iter().cloned());
+                        self.work += values.len();
+                        stack.extend(values.iter().filter(|v| !Self::is_leaf(v)).cloned());
                     }
                 }
                 Value::Map(rc) => {
@@ -200,11 +258,14 @@ impl CycleCollector {
                         && visited.insert(key)
                         && let Ok(map) = rc.try_borrow()
                     {
+                        self.work += map.len();
                         for (map_key, value) in map.iter() {
                             let (original, hashed) = map_key.owned_values();
-                            stack.push(original.clone());
-                            stack.push(hashed.clone());
-                            stack.push(value.clone());
+                            for v in [original, hashed, value] {
+                                if !Self::is_leaf(v) {
+                                    stack.push(v.clone());
+                                }
+                            }
                         }
                     }
                 }
@@ -218,7 +279,8 @@ impl CycleCollector {
                         && visited.insert(key)
                         && let Ok(values) = fields.try_borrow()
                     {
-                        stack.extend(values.iter().cloned());
+                        self.work += values.len();
+                        stack.extend(values.iter().filter(|v| !Self::is_leaf(v)).cloned());
                     }
                 }
                 Value::Iterator(rc) => {
@@ -233,14 +295,18 @@ impl CycleCollector {
                     {
                         match &*iterator {
                             IteratorState::Array { items, .. } => {
-                                stack.extend(items.iter().cloned());
+                                self.work += items.len();
+                                stack.extend(items.iter().filter(|v| !Self::is_leaf(v)).cloned());
                             }
                             IteratorState::MapPairs { items, .. } => {
+                                self.work += items.len();
                                 for (map_key, value) in items {
                                     let (original, hashed) = map_key.owned_values();
-                                    stack.push(original.clone());
-                                    stack.push(hashed.clone());
-                                    stack.push(value.clone());
+                                    for v in [original, hashed, value] {
+                                        if !Self::is_leaf(v) {
+                                            stack.push(v.clone());
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -249,7 +315,8 @@ impl CycleCollector {
                 Value::Tuple(values) => {
                     let key = (NODE_TUPLE_VALUES, Rc::as_ptr(&values) as usize);
                     if visited.insert(key) {
-                        stack.extend(values.iter().cloned());
+                        self.work += values.len();
+                        stack.extend(values.iter().filter(|v| !Self::is_leaf(v)).cloned());
                     }
                 }
                 Value::Enum {
@@ -258,13 +325,15 @@ impl CycleCollector {
                 } => {
                     let key = (NODE_ENUM_VALUES, Rc::as_ptr(&values) as usize);
                     if visited.insert(key) {
-                        stack.extend(values.iter().cloned());
+                        self.work += values.len();
+                        stack.extend(values.iter().filter(|v| !Self::is_leaf(v)).cloned());
                     }
                 }
                 Value::Closure { upvalues, .. } => {
                     let key = (NODE_CLOSURE_UPVALUES, Rc::as_ptr(&upvalues) as usize);
                     if visited.insert(key) {
-                        stack.extend(upvalues.iter().map(Upvalue::get));
+                        self.work += upvalues.len();
+                        stack.extend(upvalues.iter().map(Upvalue::get).filter(|v| !Self::is_leaf(v)));
                     }
                 }
                 Value::WeakStruct(_) => {}
@@ -352,12 +421,22 @@ impl CycleCollector {
             }
         }
 
-        let mut scanned = HashSet::new();
-        while let Some(key) = nodes.keys().find(|key| !scanned.contains(*key)).copied() {
-            scanned.insert(key);
-            if !self.scan_node(key, &mut nodes) {
-                return None;
+        // Scanning a node can add nodes (containers reached only through
+        // values that are not registered, such as an enum's payload); each
+        // round scans what the previous one found. Searching the map for
+        // an unscanned key per node made this quadratic in the heap.
+        let mut scanned = HashSet::with_capacity(nodes.len());
+        let mut pending: Vec<NodeKey> = nodes.keys().copied().collect();
+        while !pending.is_empty() {
+            for key in pending.drain(..) {
+                if !scanned.insert(key) {
+                    continue;
+                }
+                if !self.scan_node(key, &mut nodes) {
+                    return None;
+                }
             }
+            pending.extend(nodes.keys().filter(|key| !scanned.contains(*key)).copied());
         }
 
         Some(nodes)
@@ -372,6 +451,7 @@ impl CycleCollector {
                 let Ok(values) = rc.try_borrow() else {
                     return false;
                 };
+                self.work += values.len();
                 for value in values.iter() {
                     self.scan_value(key, value, nodes);
                 }
@@ -833,7 +913,7 @@ mod tests {
         ));
         let fields = Rc::new(RefCell::new(vec![Value::Nil]));
         let value = Value::Struct {
-            name: "Node".to_string(),
+            name: "Node".into(),
             layout: layout.clone(),
             fields: fields.clone(),
         };

@@ -811,6 +811,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lust-fuzz"
+version = "0.1.0"
+dependencies = [
+ "lust-rs",
+]
+
+[[package]]
 name = "lust-macros"
 version = "0.1.4"
 dependencies = [

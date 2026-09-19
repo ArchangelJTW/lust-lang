@@ -1,0 +1,31 @@
+-- A loop whose body builds an int array in one branch and an Option in the
+-- same register later: the trace specializes the array at entry, and on a
+-- re-entry where that register holds the Option the unbox fails before the
+-- body runs. That failure must restart the iteration, not resume at the
+-- body's first fallible instruction (x86_64 once bound it there).
+function f(p: float): int
+    local total: int = 0
+    local k: int = -2
+    while k <= 36 do
+        local x: float = p
+        if -9 <= (-k) / 2 then
+            local arr: Array<int> = [k % (0 - 2), k / (0 - 6), 19]
+            total = total + array.len(arr)
+        elseif k % 5 > 37 then
+            local o: Option<int> = Option.Some((0 - 6) / 5)
+            p = 0.001
+        end
+        local o2: Option<int> = Option.None
+        o2 = Option.Some(k)
+        total = total + o2:unwrap_or(0)
+        k = k + 1
+    end
+    return total
+end
+local i: int = 0
+local acc: int = 0
+while i < 40 do
+    acc = acc + f(1.5)
+    i = i + 1
+end
+println(acc)

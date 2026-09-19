@@ -1,0 +1,10 @@
+function step(a: int, b: int): int
+    return a + b * 2
+end
+local acc: int = 0
+local i: int = 0
+while i < 10000000 do
+    acc = step(acc, i)
+    i = i + 1
+end
+println(acc)

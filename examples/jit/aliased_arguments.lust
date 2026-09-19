@@ -1,0 +1,54 @@
+-- Struct arguments of inlined calls are aliased, not cloned: a method that
+-- returns self, `c = c:same()`, and exits from inside inlined bodies that
+-- hold an aliased argument all have to keep the reference counts straight.
+struct Counter
+    value: int
+end
+impl Counter
+    function same(self): Counter
+        return self
+    end
+    function bump(self, d: int): int
+        self.value = self.value + d
+        return self.value
+    end
+    function pick(self, other: Counter, f: function(int): int): Counter
+        if f(self.value) > 150 then
+            return other
+        end
+        return self
+    end
+end
+function inc(x: int): int
+    return x + 1
+end
+function dbl(x: int): int
+    return x * 2
+end
+function choose(i: int): function(int): int
+    if i > 150 then
+        return dbl
+    end
+    return inc
+end
+function apply(c: Counter, f: function(int): int, x: int): int
+    c.value = c.value + 1
+    return f(x)
+end
+function run(): int
+    local c: Counter = Counter { value = 0 }
+    local d: Counter = Counter { value = 1000 }
+    local total: int = 0
+    local i: int = 0
+    while i < 300 do
+        c = c:same()
+        total = total + c:bump(i)
+        total = total + apply(c, choose(i), i)
+        local e: Counter = c:pick(d, choose(i))
+        total = total + e.value
+        i = i + 1
+    end
+    return total + c.value + d.value
+end
+println(run())
+println(run())

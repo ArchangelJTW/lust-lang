@@ -47,6 +47,15 @@ impl JitCompiler {
             .expect("JIT exit label stack is empty")
     }
 
+    /// Keep an interned name alive with the code; returns the address a
+    /// value holding that name carries (see `Name::inner_ptr`).
+    pub(super) fn retain_name(&mut self, text: &str) -> usize {
+        let name = crate::bytecode::value::Name::from(text);
+        let ptr = name.inner_ptr() as usize;
+        self.data.push(JitData::Name(name));
+        ptr
+    }
+
     pub(super) fn retain_value(&mut self, value: Value) -> *const Value {
         let value = Box::new(value);
         let ptr = value.as_ref() as *const Value;
@@ -1174,6 +1183,8 @@ impl JitCompiler {
                     arg_count,
                     callee_registers,
                     call_ip,
+                    resume_ip,
+                    alias_mask,
                     result_type,
                 } => {
                     self.compile_call_direct(
@@ -1185,6 +1196,8 @@ impl JitCompiler {
                         *arg_count,
                         *callee_registers,
                         *call_ip,
+                        *resume_ip,
+                        *alias_mask,
                         *result_type,
                         guard_index,
                         guards,
@@ -1837,7 +1850,7 @@ impl JitCompiler {
             // Push the inline record (see `JitInlineRecord`). It is linked
             // into the unwind chain only once the frame below it is fully
             // built, so a failure while building it exits cleanly.
-            let caller_resume_ip = self.current_fail_ip.map_or(0, |ip| ip + 1);
+            let caller_resume_ip = self.current_fail_ip.map_or(0, |ip| ip + trace.resume_offset);
             // An argument of unknown type whose callee register the body
             // never writes is aliased: its bits are copied without touching
             // the reference count, and the register is neither dropped at

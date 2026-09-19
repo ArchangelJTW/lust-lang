@@ -208,6 +208,39 @@ impl JitCompiler {
         unsafe extern "C" {
             fn jit_guard_struct_layout(value_ptr: *const Value, expected: *const ()) -> u8;
         }
+        if let Some(measured) = jit::layout::rc_vec_layout() {
+            // Inline: the struct tag, then the layout's allocation pointer
+            // (`expected` is the `Rc`'s data pointer, 16 bytes in).
+            let struct_tag = ValueTag::Struct.as_u8() as u32;
+            let layout_offset = measured.struct_layout_offset as u32;
+            let inner = (layout as usize).wrapping_sub(16) as u64;
+            self.load_tag(0, register);
+            self.emit_reg_addr(11, register);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #struct_tag
+                ; b.ne >guard_fail
+                ; ldr x9, [x11, #layout_offset]
+            );
+            self.emit_mov_imm64(10, inner);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp x9, x10
+                ; b.eq >guard_ok
+                ; guard_fail:
+            );
+            self.emit_guard_exit(guard_return_value);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; guard_ok:
+            );
+            return Ok(Guard {
+                index: guard_index,
+                bailout_ip: self.guard_bailout_ip(),
+                kind: GuardKind::StructLayout { register, layout },
+                fail_count: 0,
+            });
+        }
         self.emit_reg_addr(0, register);
         self.emit_mov_imm64(1, layout as usize as u64);
         self.emit_call(jit_guard_struct_layout as *const ());
@@ -396,6 +429,8 @@ impl JitCompiler {
         arg_count: u8,
         callee_registers: u8,
         call_ip: usize,
+        resume_ip: usize,
+        alias_mask: u64,
         result_type: Option<ValueType>,
         guard_index: &mut i32,
         guards: &mut Vec<Guard>,
@@ -448,12 +483,13 @@ impl JitCompiler {
             ; sub sp, sp, #metadata_size
         );
         self.emit_mov_imm_i32(0, frame_value_count);
+        self.emit_mov_imm64(12, alias_mask);
         dynasm!(self.ops
             ; .arch aarch64
             ; str x0, [sp]
             ; str x19, [sp, 8]
             ; str x21, [sp, 16]
-            ; str xzr, [sp, 24]
+            ; str x12, [sp, 24]
         );
         self.emit_mov_imm64(0, function_idx as u64);
         dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 32]);
@@ -461,7 +497,7 @@ impl JitCompiler {
         dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 40]);
         self.emit_mov_imm64(0, callee as u64);
         dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 48]);
-        self.emit_mov_imm64(0, (call_ip + 1) as u64);
+        self.emit_mov_imm64(0, resume_ip as u64);
         dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 56]);
 
         // The callee frame: every register Nil (tag 0), then the arguments.
@@ -473,6 +509,21 @@ impl JitCompiler {
         }
         for (index, src_reg) in sources.into_iter().enumerate() {
             let dest_offset = index as i32 * value_size;
+            if index < 64 && alias_mask & (1 << index) != 0 {
+                // Aliased: a bitwise copy the callee only reads and does
+                // not drop (its record says so).
+                self.emit_reg_addr(11, src_reg);
+                dynasm!(self.ops ; .arch aarch64 ; mov x9, sp);
+                self.emit_add_imm(9, 9, dest_offset);
+                for chunk in (0..value_size).step_by(16) {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; ldp x0, x1, [x11, #chunk]
+                        ; stp x0, x1, [x9, #chunk]
+                    );
+                }
+                continue;
+            }
             match self.scalar_registers.get(&src_reg).copied() {
                 Some(ty @ (ValueType::Int | ValueType::Bool | ValueType::Float)) => {
                     let tag = match ty {
@@ -579,7 +630,7 @@ impl JitCompiler {
         let value_size = mem::size_of::<Value>() as u32;
         unsafe extern "C" {
             fn jit_return_value(src: *mut Value, dest: *mut Value);
-            fn jit_drop_values(values: *mut Value, len: usize);
+            fn jit_drop_values_masked(values: *mut Value, len: usize, mask: u64);
         }
         let (register_count, may_own) = self.function_frame;
         let epilogue = self
@@ -638,9 +689,18 @@ impl JitCompiler {
         self.emit_call(jit_return_value as *const ());
         dynasm!(self.ops ; .arch aarch64 ; => stored);
         if may_own {
-            dynasm!(self.ops ; .arch aarch64 ; mov x0, x19);
+            // Aliased arguments (the record's mask; no record when entered
+            // from the interpreter) are the caller's and are not dropped.
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; mov x0, x19
+                ; mov x2, xzr
+                ; cbz x21, >no_record
+                ; ldr x2, [x21, 24]
+                ; no_record:
+            );
             self.emit_mov_imm_i32(1, i32::from(register_count));
-            self.emit_call(jit_drop_values as *const ());
+            self.emit_call(jit_drop_values_masked as *const ());
         }
         let returned_hi = (jit::NATIVE_RETURNED as u32) >> 16;
         dynasm!(self.ops

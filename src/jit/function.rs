@@ -40,6 +40,30 @@ pub struct FunctionSig {
     pub register_count: u8,
     /// The declared parameter types, when the function has a signature.
     pub param_types: Vec<Option<TypeKind>>,
+    /// Registers (bit i = register i) the function's bytecode writes; an
+    /// argument to a register it never writes can be passed by aliasing.
+    pub written_registers: u64,
+}
+
+/// The registers a function's bytecode writes, as a mask (see
+/// `FunctionSig::written_registers`). A closure captured from the frame
+/// may write through its cells, so a function creating closures counts as
+/// writing everything.
+pub fn written_registers(function: &Function) -> u64 {
+    let mut mask = 0u64;
+    for instruction in &function.chunk.instructions {
+        if matches!(instruction, Instruction::Closure(..)) {
+            return u64::MAX;
+        }
+        if let Some(reg) = instruction.defined_register() {
+            if reg < 64 {
+                mask |= 1 << reg;
+            } else {
+                return u64::MAX;
+            }
+        }
+    }
+    mask
 }
 
 /// What the translator can ask the VM about.
@@ -187,6 +211,49 @@ impl Env {
             && self.globals_guarded == other.globals_guarded
     }
 
+    /// Give `to` the facts `from` has, then restore `from`'s facts from
+    /// `previous` (the environment before the op that established them).
+    fn move_facts(&mut self, from: Register, to: Register, previous: &Env) {
+        let scalar = self.scalars.get(&from).copied();
+        let function = self.functions.get(&from).copied();
+        let layout = self.layouts.get(&from).cloned();
+        let elements = self.elements.get(&from).copied();
+        let constant = self.constants.get(&from).cloned();
+        let native_guarded = self.natives_guarded.contains(&from);
+        self.write(to, scalar);
+        if let Some(idx) = function {
+            self.functions.insert(to, idx);
+        }
+        if let Some(layout) = layout {
+            self.layouts.insert(to, layout);
+        }
+        if let Some(elements) = elements {
+            self.elements.insert(to, elements);
+        }
+        if let Some(constant) = constant {
+            self.constants.insert(to, constant);
+        }
+        if native_guarded {
+            self.natives_guarded.insert(to);
+        }
+        self.write(from, previous.scalars.get(&from).copied());
+        if let Some(idx) = previous.functions.get(&from) {
+            self.functions.insert(from, *idx);
+        }
+        if let Some(layout) = previous.layouts.get(&from) {
+            self.layouts.insert(from, layout.clone());
+        }
+        if let Some(elements) = previous.elements.get(&from) {
+            self.elements.insert(from, *elements);
+        }
+        if let Some(constant) = previous.constants.get(&from) {
+            self.constants.insert(from, constant.clone());
+        }
+        if previous.natives_guarded.contains(&from) {
+            self.natives_guarded.insert(from);
+        }
+    }
+
     fn label_scalars(&self) -> Vec<(Register, ValueType)> {
         let mut scalars: Vec<(Register, ValueType)> =
             self.scalars.iter().map(|(r, t)| (*r, *t)).collect();
@@ -264,6 +331,11 @@ struct Translator<'a> {
     targets: &'a HashSet<usize>,
     reachable: bool,
     frame_may_own: bool,
+    /// The environment before the last instruction translated, and
+    /// whether that instruction is the last op's only producer (nothing
+    /// else — a label, a marker — came between).
+    previous_env: Env,
+    previous_is_last_op: bool,
 }
 
 impl<'a> Translator<'a> {
@@ -513,11 +585,19 @@ impl<'a> Translator<'a> {
         for index in 0..arg_count {
             sources.push(first_arg.wrapping_add(index));
         }
-        for (reg, kind) in sources.iter().zip(sig.params.iter()) {
+        let mut alias_mask = 0u64;
+        for (index, (reg, kind)) in sources.iter().zip(sig.params.iter()).enumerate() {
             if let Some(kind) = kind
                 && is_scalar(*kind)
             {
                 self.guard(*reg, *kind);
+            } else if index < 64
+                && sig.written_registers & (1 << index) == 0
+                && !self.env.scalars.contains_key(reg)
+            {
+                // The callee only reads this parameter: pass the caller's
+                // value by aliasing rather than cloning and dropping it.
+                alias_mask |= 1 << index;
             }
         }
         let result_type = sig.ret.filter(|ty| is_scalar(*ty));
@@ -530,6 +610,8 @@ impl<'a> Translator<'a> {
             arg_count,
             callee_registers: sig.register_count,
             call_ip: ip,
+            resume_ip: ip + 1,
+            alias_mask,
             result_type,
         });
         self.opaque_call();
@@ -596,6 +678,40 @@ impl<'a> Translator<'a> {
                 }
             }
             Instruction::Move(dest, src) => {
+                // A temporary moved into a local right after being
+                // produced: let the producer write the local and skip the
+                // copy (a clone and a drop for an owned value).
+                if dest != src
+                    && self.previous_is_last_op
+                    && self
+                        .ops
+                        .iter()
+                        .rev()
+                        .find(|op| !matches!(op, TraceOp::At { .. }))
+                        .and_then(|op| op.single_dest())
+                        == Some(src)
+                    && super::trace::register_dead_after(self.function, ip + 1, src)
+                {
+                    let previous = self.previous_env.clone();
+                    if let Some(op) = self
+                        .ops
+                        .iter_mut()
+                        .rev()
+                        .find(|op| !matches!(op, TraceOp::At { .. }))
+                    {
+                        op.set_dest(dest);
+                        // The elided move must not run again after an exit
+                        // inside the callee.
+                        if let TraceOp::CallDirect { resume_ip, .. } = op {
+                            *resume_ip = ip + 1;
+                        }
+                    }
+                    if self.env.scalars.get(&src).is_none() {
+                        self.frame_may_own = true;
+                    }
+                    self.env.move_facts(src, dest, &previous);
+                    return Some(());
+                }
                 let ty = self.env.scalars.get(&src).copied();
                 let function = self.env.functions.get(&src).copied();
                 let layout = self.env.layouts.get(&src).cloned();
@@ -1046,6 +1162,11 @@ fn entry_env(sig: &FunctionSig, ctx: &Context) -> (Env, bool) {
             Some(kind) if is_scalar(*kind) => {
                 env.scalars.insert(index as u8, *kind);
             }
+            // A parameter the function never writes owns nothing in a
+            // native frame: a compiled caller aliases a non-scalar argument
+            // to it and copies a scalar one (the interpreter drops its own
+            // frames). Any other register may come to own something.
+            _ if index < 64 && sig.written_registers & (1 << index) == 0 => {}
             _ => frame_may_own = true,
         }
         match sig.param_types.get(index) {
@@ -1098,6 +1219,8 @@ fn translate_pass(
         targets,
         reachable: true,
         frame_may_own,
+        previous_env: Env::default(),
+        previous_is_last_op: false,
     };
     let mut label_envs: HashMap<usize, Env> = HashMap::new();
     let mut ip = 0;
@@ -1125,8 +1248,15 @@ fn translate_pass(
             continue;
         }
         t.ops.push(TraceOp::At { ip });
+        let ops_before = t.ops.len();
         let instruction = instructions[ip];
+        let before = t.env.clone();
         t.instruction(ip, instruction)?;
+        t.previous_env = before;
+        // Only a straight-line predecessor's result may be redirected: the
+        // last op must be this instruction's, and no label may come
+        // between (another path would arrive there).
+        t.previous_is_last_op = t.ops.len() > ops_before && !targets.contains(&(ip + 1));
         // The matched checked read consumed three more instructions.
         if matches!(instruction, Instruction::TryGetIndex(..)) {
             ip += 3;
@@ -1255,6 +1385,7 @@ mod tests {
             lua_function: false,
             register_count,
             param_types: vec![Some(TypeKind::Int); params],
+            written_registers: u64::MAX,
         }
     }
 
@@ -1394,6 +1525,7 @@ mod tests {
             lua_function: false,
             register_count: 3,
             param_types: vec![None, None],
+            written_registers: u64::MAX,
         };
         assert!(translate(&g, 0, &sig, &context(&|_| None)).is_none());
     }

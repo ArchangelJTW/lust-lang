@@ -407,10 +407,11 @@ impl Default for VM {
 impl Drop for VM {
     fn drop(&mut self) {
         let mut collector = core::mem::take(&mut self.cycle_collector);
-        collector.collect(self);
 
         // Drop every VM-owned root before the collector itself disappears so
-        // closed Rc cycles are broken during runtime teardown.
+        // closed Rc cycles are broken during runtime teardown. (Collecting
+        // with the roots still in place would walk the whole live heap for
+        // nothing: everything reachable from a root is kept anyway.)
         self.jit.traces.clear();
         self.functions.clear();
         self.natives.clear();

@@ -574,12 +574,55 @@ impl StructLayout {
 /// A struct or enum type name carried by a value: shared, so cloning the
 /// value (every register move does) is a reference-count bump instead of
 /// a string allocation. Compares and formats like the `str` it holds.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// Names are interned per thread (values never cross threads): two names
+/// with the same text are the same allocation, so equality is a pointer
+/// comparison, and generated code compares a value's variant against a
+/// constant the same way.
+#[derive(Clone, Eq, Hash, PartialOrd, Ord)]
 pub struct Name(Rc<str>);
+
+#[cfg(feature = "std")]
+thread_local! {
+    static NAMES: RefCell<hashbrown::HashSet<Rc<str>>> = RefCell::new(hashbrown::HashSet::new());
+}
 
 impl Name {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    #[cfg(feature = "std")]
+    fn intern(text: &str) -> Self {
+        NAMES.with(|names| {
+            let mut names = names.borrow_mut();
+            if let Some(existing) = names.get(text) {
+                return Name(Rc::clone(existing));
+            }
+            let fresh: Rc<str> = Rc::from(text);
+            names.insert(Rc::clone(&fresh));
+            Name(fresh)
+        })
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn intern(text: &str) -> Self {
+        Name(Rc::from(text))
+    }
+
+    /// The address generated code sees in a value holding this name: the
+    /// shared allocation's start (the `Rc` stores that, not the text).
+    pub fn inner_ptr(&self) -> *const u8 {
+        // SAFETY: an `Rc<str>` allocation is `RcInner { strong, weak, text }`
+        // (two counts, then the data); the pointer is only compared, never
+        // dereferenced.
+        (Rc::as_ptr(&self.0) as *const u8).wrapping_sub(2 * core::mem::size_of::<usize>())
+    }
+}
+
+impl PartialEq for Name {
+    fn eq(&self, other: &Name) -> bool {
+        Rc::ptr_eq(&self.0, &other.0) || (cfg!(not(feature = "std")) && self.0 == other.0)
     }
 }
 
@@ -646,19 +689,19 @@ impl fmt::Debug for Name {
 
 impl From<String> for Name {
     fn from(s: String) -> Self {
-        Name(Rc::from(s))
+        Name::intern(&s)
     }
 }
 
 impl From<&String> for Name {
     fn from(s: &String) -> Self {
-        Name(Rc::from(s.as_str()))
+        Name::intern(s)
     }
 }
 
 impl From<&str> for Name {
     fn from(s: &str) -> Self {
-        Name(Rc::from(s))
+        Name::intern(s)
     }
 }
 
@@ -1615,6 +1658,28 @@ pub unsafe extern "C" fn jit_return_value(src: *mut Value, dest: *mut Value) {
             value
         };
         replace_value(dest, value);
+    }
+}
+
+/// Drop a native frame's registers except the aliased ones (`mask`, bit
+/// i = register i), which are bitwise copies of the caller's values and
+/// own nothing.
+///
+/// # Safety
+/// `values` points at `len` initialized values; the masked ones are never
+/// read again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_drop_values_masked(values: *mut Value, len: usize, mask: u64) {
+    unsafe {
+        if values.is_null() {
+            return;
+        }
+        for i in 0..len {
+            if i < 64 && mask & (1 << i) != 0 {
+                continue;
+            }
+            ptr::drop_in_place(values.add(i));
+        }
     }
 }
 
@@ -3272,6 +3337,30 @@ pub unsafe extern "C" fn jit_new_struct_safe(
         vm.observe_value(&struct_value);
         replace_value(out, struct_value);
         1
+    }
+}
+
+/// Take another reference to whatever the value owns (the counterpart of
+/// a bitwise copy generated code made of it).
+///
+/// # Safety
+/// `value` points at a live `Value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_retain_value(value: *const Value) {
+    unsafe {
+        core::mem::forget((*value).clone());
+    }
+}
+
+/// Drop the value in place, leaving Nil.
+///
+/// # Safety
+/// `value` points at a live `Value` that generated code will overwrite or
+/// no longer read.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_release_value(value: *mut Value) {
+    unsafe {
+        replace_value(value, Value::Nil);
     }
 }
 

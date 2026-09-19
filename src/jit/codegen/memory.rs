@@ -85,7 +85,6 @@ impl JitCompiler {
 
     pub(super) fn compile_move(&mut self, dest: u8, src: u8) -> Result<()> {
         let src_offset = (src as i32) * (mem::size_of::<Value>() as i32);
-        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
         // A source of known scalar type is a payload copy plus a typed
         // store (which drops whatever the destination held).
         match self.scalar_registers.get(&src).copied() {
@@ -106,16 +105,8 @@ impl JitCompiler {
             }
             _ => {}
         }
-        unsafe extern "C" {
-            fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
-        }
-        dynasm!(self.ops
-            ; .arch x64
-            ; lea rdi, [r12 + src_offset]
-            ; lea rsi, [r12 + dest_offset]
-            ; mov rax, QWORD jit_move_safe as *const () as _
-            ; call rax
-        );
+        dynasm!(self.ops ; .arch x64 ; lea rsi, [r12 + src_offset]);
+        self.emit_clone_rsi_into(dest);
         Ok(())
     }
 
@@ -421,6 +412,29 @@ impl JitCompiler {
                 }
             }
             self.pending_scalar = Some((dest, ty));
+            return Ok(());
+        }
+
+        if let (Some(index), Some(layout), false) = (field_index, jit::layout::rc_vec_layout(), _is_weak) {
+            // Any strong field read inline: struct tag and field count are
+            // checked (anything else fails to the interpreter), then the
+            // element is cloned into the register without the runtime.
+            let struct_tag = ValueTag::Struct.as_u8() as i8;
+            let fields_offset = layout.struct_fields_offset as i32;
+            let len_offset = layout.len_offset as i32;
+            let ptr_offset = layout.ptr_offset as i32;
+            let element = (index * mem::size_of::<Value>()) as i32;
+            dynasm!(self.ops
+                ; .arch x64
+                ; cmp BYTE [r12 + object_offset], struct_tag
+                ; jne >fail
+                ; mov r9, [r12 + object_offset + fields_offset]
+                ; cmp QWORD [r9 + len_offset], index as i32
+                ; jbe >fail
+                ; mov rsi, [r9 + ptr_offset]
+                ; add rsi, element
+            );
+            self.emit_clone_rsi_into(dest);
             return Ok(());
         }
 
@@ -1115,6 +1129,40 @@ impl JitCompiler {
                 variant_name_len: usize,
             ) -> u8;
         }
+        if let Some(layout) = jit::layout::enum_layout() {
+            // Names are interned, so the variant test is a tag check and
+            // pointer compares against the interned constants (the enum
+            // name too, unless the test leaves it open).
+            let variant_ptr = self.retain_name(variant_name);
+            let enum_ptr = (!enum_name.is_empty()).then(|| self.retain_name(enum_name));
+            let tag = layout.tag as i8;
+            let variant_offset = layout.variant_offset as i32;
+            let enum_name_offset = layout.enum_name_offset as i32;
+            dynasm!(self.ops
+                ; .arch x64
+                ; xor eax, eax
+                ; cmp BYTE [r12 + value_offset], tag
+                ; jne >done
+                ; mov rcx, QWORD variant_ptr as i64
+                ; cmp rcx, [r12 + value_offset + variant_offset]
+                ; jne >done
+            );
+            if let Some(enum_ptr) = enum_ptr {
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; mov rcx, QWORD enum_ptr as i64
+                    ; cmp rcx, [r12 + value_offset + enum_name_offset]
+                    ; jne >done
+                );
+            }
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov eax, 1
+                ; done:
+            );
+            self.store_from_rax(dest, 1);
+            return Ok(());
+        }
         let (enum_name_ptr, enum_name_len) = self.retain_string(enum_name);
         let (variant_name_ptr, variant_name_len) = self.retain_string(variant_name);
         dynasm!(self.ops
@@ -1226,6 +1274,30 @@ impl JitCompiler {
             -> u8;
         }
         let index_usize = index as usize;
+        if let Some(layout) = jit::layout::enum_layout() {
+            // Inline: an enum with a payload of at least `index + 1` values
+            // (anything else fails to the interpreter), the value cloned
+            // into the register without the runtime.
+            let tag = layout.tag as i8;
+            let values_offset = layout.values_offset as i32;
+            let len_offset = layout.values_len_offset as i32;
+            let ptr_offset = layout.values_ptr_offset as i32;
+            let element = (index_usize * mem::size_of::<Value>()) as i32;
+            dynasm!(self.ops
+                ; .arch x64
+                ; cmp BYTE [r12 + enum_offset], tag
+                ; jne >fail
+                ; mov r9, [r12 + enum_offset + values_offset]
+                ; test r9, r9
+                ; jz >fail
+                ; cmp QWORD [r9 + len_offset], index as i32
+                ; jbe >fail
+                ; mov rsi, [r9 + ptr_offset]
+                ; add rsi, element
+            );
+            self.emit_clone_rsi_into(dest);
+            return Ok(());
+        }
         dynasm!(self.ops
             ; .arch x64
             ; lea rdi, [r12 + enum_offset]

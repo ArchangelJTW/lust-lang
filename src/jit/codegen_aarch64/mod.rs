@@ -89,6 +89,7 @@ mod memory;
 mod pins;
 mod registers;
 mod specialization;
+mod values;
 
 /// Tracks a specialized value in the JIT trace
 #[derive(Debug, Clone)]

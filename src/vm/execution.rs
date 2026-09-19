@@ -2146,6 +2146,7 @@ impl VM {
                 }
                 _ => alloc::vec![None; function.param_count as usize],
             },
+            written_registers: crate::jit::function::written_registers(function),
         };
         let Some((function, meta)) = self.functions.get(func_idx).zip(self.call_meta.get(func_idx))
         else {

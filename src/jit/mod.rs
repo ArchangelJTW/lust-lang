@@ -197,6 +197,7 @@ impl CompiledTrace {
 #[allow(dead_code)]
 pub(super) enum JitData {
     Value(Box<Value>),
+    Name(crate::bytecode::value::Name),
     String(Box<str>),
     StringPointers(Box<[*const u8]>),
     StringLengths(Box<[usize]>),

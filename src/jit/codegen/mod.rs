@@ -37,6 +37,7 @@ mod logic;
 mod memory;
 mod registers;
 mod specialization;
+mod values;
 /// Tracks a specialized value in the JIT trace
 #[derive(Debug, Clone)]
 pub(super) struct SpecializedValue {

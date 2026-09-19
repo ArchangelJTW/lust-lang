@@ -7,18 +7,21 @@ use alloc::{vec, vec::Vec};
 use core::cell::RefCell;
 use hashbrown::{HashMap, HashSet, hash_map::Entry};
 
-/// Base triggers for a collection: this many register writes, or this many
-/// newly registered containers. Both are raised in proportion to the size of
-/// the heap the previous collection had to walk (see `should_collect`), so a
-/// program holding a large array is not charged a full heap traversal every
-/// few hundred instructions. Allocation is the trigger that matters; the
-/// step trigger only catches cycles closed by mutation of existing values,
-/// so it runs rarely — a collection has a fixed cost (graph snapshot,
-/// hash maps) even when there is almost nothing to walk.
+/// Base triggers: a collection every this many register writes (raised in
+/// proportion to the size of the heap the previous collection had to
+/// walk, see `should_collect`), and a sweep of dead registrations every
+/// this many new containers (raised to the number registered, so it is
+/// amortized constant per allocation). A cycle can only be closed by a
+/// store into an existing container, never by constructing a new one, so
+/// allocation alone never needs the graph walked: the registration
+/// trigger only keeps the registry from filling with entries whose values
+/// are already gone.
 const COLLECT_INTERVAL: usize = 1 << 16;
 const REGISTRATION_THRESHOLD: usize = 256;
-/// Steps granted per value the previous collection visited.
-const STEPS_PER_WORK_UNIT: usize = 4;
+/// Steps granted per value the previous collection visited: a collection
+/// walks the whole live heap, so this bounds its share of the run (each
+/// visit costs about as much as thirty register writes).
+const STEPS_PER_WORK_UNIT: usize = 32;
 
 type NodeKey = (u8, usize);
 const NODE_ARRAY: u8 = 1;
@@ -95,7 +98,8 @@ impl CycleCollector {
     }
 
     /// Count a step and say whether a collection is due. Cheap: called on
-    /// every register write.
+    /// every register write. Registrations piling up trigger a sweep of the
+    /// registry here instead of a collection.
     #[inline]
     pub fn should_collect(&mut self) -> bool {
         self.steps_since_collect = self.steps_since_collect.saturating_add(1);
@@ -105,14 +109,25 @@ impl CycleCollector {
             return false;
         }
 
+        if self.pending_registrations >= REGISTRATION_THRESHOLD.max(self.containers.len()) {
+            self.sweep_dead();
+            self.pending_registrations = 0;
+        }
+
         // A collection walks every reachable value, so its cost is the heap
         // size. Spacing collections by that cost keeps the amortized charge
-        // per step and per allocation bounded; small heaps still collect at
-        // the base rate.
+        // per step bounded; small heaps still collect at the base rate.
         let step_interval = COLLECT_INTERVAL.max(self.last_collect_work * STEPS_PER_WORK_UNIT);
-        let registration_threshold = REGISTRATION_THRESHOLD.max(self.containers.len());
         self.steps_since_collect >= step_interval
-            || self.pending_registrations >= registration_threshold
+    }
+
+    /// Forget registrations whose container has already been freed.
+    fn sweep_dead(&mut self) {
+        self.containers.retain(|_, container| match container {
+            ContainerKind::Array(weak) | ContainerKind::Struct(weak) => weak.strong_count() > 0,
+            ContainerKind::Map(weak) => weak.strong_count() > 0,
+            ContainerKind::Iterator(weak) => weak.strong_count() > 0,
+        });
     }
 
     pub fn collect(&mut self, vm: &VM) {

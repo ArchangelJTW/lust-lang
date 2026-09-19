@@ -65,6 +65,10 @@ pub struct InlineTrace {
     pub return_register: Option<Register>,
     pub is_closure: bool,
     pub upvalues_ptr: Option<*const ()>,
+    /// Instructions after the call at which the interpreter resumes when
+    /// the callee's frames were materialized: 1, or 2 when the move of
+    /// the result into a local was folded into the call.
+    pub resume_offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -378,6 +382,16 @@ pub enum TraceOp {
         /// Registers the callee's frame needs.
         callee_registers: u8,
         call_ip: usize,
+        /// Where the interpreter resumes in the caller when the callee's
+        /// frames were materialized: the instruction after the call, or
+        /// one further when the move of the result into a local was
+        /// folded into the call.
+        resume_ip: usize,
+        /// Callee registers (bit i = register i) that receive a bitwise
+        /// copy of the argument instead of a clone: the callee never
+        /// writes them, so nothing owns them and they are not dropped
+        /// with its frame (materialization clones them).
+        alias_mask: u64,
         /// The callee's declared return kind when scalar (its compiled code
         /// guards its return value against it).
         result_type: Option<ValueType>,
@@ -459,6 +473,112 @@ pub enum ValueType {
     Array,
     Tuple,
     Struct,
+}
+
+impl TraceOp {
+    /// The one register this op writes, for ops whose result can be sent
+    /// to another register instead (see `register_dead_after`).
+    pub fn single_dest(&self) -> Option<Register> {
+        match self {
+            TraceOp::LoadConst { dest, .. }
+            | TraceOp::Move { dest, .. }
+            | TraceOp::Concat { dest, .. }
+            | TraceOp::GetIndex { dest, .. }
+            | TraceOp::TryGetIndex { dest, .. }
+            | TraceOp::ArrayLen { dest, .. }
+            | TraceOp::CallNative { dest, .. }
+            | TraceOp::CallFunction { dest, .. }
+            | TraceOp::InlineCall { dest, .. }
+            | TraceOp::CallMethod { dest, .. }
+            | TraceOp::CallDirect { dest, .. }
+            | TraceOp::GetField { dest, .. }
+            | TraceOp::NewArray { dest, .. }
+            | TraceOp::NewStruct { dest, .. }
+            | TraceOp::NewEnumUnit { dest, .. }
+            | TraceOp::NewEnumVariant { dest, .. }
+            | TraceOp::IsEnumVariant { dest, .. }
+            | TraceOp::TypeIs { dest, .. }
+            | TraceOp::TryCast { dest, .. }
+            | TraceOp::GetEnumValue { dest, .. } => Some(*dest),
+            _ => None,
+        }
+    }
+
+    /// Send a `single_dest` op's result to `register` instead.
+    pub fn set_dest(&mut self, register: Register) {
+        match self {
+            TraceOp::LoadConst { dest, .. }
+            | TraceOp::Move { dest, .. }
+            | TraceOp::Concat { dest, .. }
+            | TraceOp::GetIndex { dest, .. }
+            | TraceOp::TryGetIndex { dest, .. }
+            | TraceOp::ArrayLen { dest, .. }
+            | TraceOp::CallNative { dest, .. }
+            | TraceOp::CallFunction { dest, .. }
+            | TraceOp::InlineCall { dest, .. }
+            | TraceOp::CallMethod { dest, .. }
+            | TraceOp::CallDirect { dest, .. }
+            | TraceOp::GetField { dest, .. }
+            | TraceOp::NewArray { dest, .. }
+            | TraceOp::NewStruct { dest, .. }
+            | TraceOp::NewEnumUnit { dest, .. }
+            | TraceOp::NewEnumVariant { dest, .. }
+            | TraceOp::IsEnumVariant { dest, .. }
+            | TraceOp::TypeIs { dest, .. }
+            | TraceOp::TryCast { dest, .. }
+            | TraceOp::GetEnumValue { dest, .. } => *dest = register,
+            _ => {}
+        }
+    }
+}
+
+/// Is `register` written before it is read on every bytecode path from
+/// `ip` (so its value there is unobservable)? A temporary the compiler
+/// moves into a local right after producing it is; the producer can then
+/// write the local directly and the copy — a clone and a drop for an owned
+/// value — is skipped. Conservative: an instruction that both reads and
+/// writes it counts as a read, and a call's arguments and callee count as
+/// reads.
+pub fn register_dead_after(
+    function: &crate::bytecode::Function,
+    ip: usize,
+    register: Register,
+) -> bool {
+    let instructions = &function.chunk.instructions;
+    let mut visited = HashSet::new();
+    let mut pending = alloc::vec![ip];
+    while let Some(ip) = pending.pop() {
+        if !visited.insert(ip) {
+            continue;
+        }
+        let Some(instruction) = instructions.get(ip) else {
+            return false;
+        };
+        if instruction.reads_register(register) {
+            return false;
+        }
+        if instruction.defined_register() == Some(register) {
+            continue;
+        }
+        match *instruction {
+            Instruction::Return(_) => continue,
+            Instruction::Jump(offset) => {
+                let Some(target) = (ip as i64 + 1 + i64::from(offset)).try_into().ok() else {
+                    return false;
+                };
+                pending.push(target);
+            }
+            Instruction::JumpIf(_, offset) | Instruction::JumpIfNot(_, offset) => {
+                let Some(target) = (ip as i64 + 1 + i64::from(offset)).try_into().ok() else {
+                    return false;
+                };
+                pending.push(target);
+                pending.push(ip + 1);
+            }
+            _ => pending.push(ip + 1),
+        }
+    }
+    true
 }
 
 pub struct TraceRecorder {
@@ -890,6 +1010,52 @@ impl TraceRecorder {
         }
     }
 
+    /// The single destination of the last op recorded in the current
+    /// context, if the op is one whose result can be redirected.
+    fn last_op_dest(&self) -> Option<Register> {
+        let ops = self
+            .inline_stack
+            .last()
+            .map(|ctx| &ctx.ops)
+            .unwrap_or(&self.trace.ops);
+        ops.iter()
+            .rev()
+            .find(|op| !matches!(op, TraceOp::At { .. }))
+            .and_then(|op| op.single_dest())
+    }
+
+    /// Redirect the last recorded op's result to `dest` (see
+    /// `register_dead_after`); a guard fact the op established moves along.
+    fn retarget_last_op(&mut self, dest: Register) {
+        let ops = self
+            .inline_stack
+            .last_mut()
+            .map(|ctx| &mut ctx.ops)
+            .unwrap_or(&mut self.trace.ops);
+        let Some(op) = ops
+            .iter_mut()
+            .rev()
+            .find(|op| !matches!(op, TraceOp::At { .. }))
+        else {
+            return;
+        };
+        let Some(old) = op.single_dest() else {
+            return;
+        };
+        op.set_dest(dest);
+        // The elided move must not run again after an exit inside the
+        // callee: its frames resume the caller one instruction further.
+        match op {
+            TraceOp::InlineCall { trace, .. } => trace.resume_offset = 2,
+            TraceOp::CallDirect { resume_ip, .. } => *resume_ip += 1,
+            _ => {}
+        }
+        if self.current_guard_set().contains(&old) {
+            self.forget_guard(old);
+            self.mark_guarded(dest);
+        }
+    }
+
     fn current_ops_len(&self) -> usize {
         self.inline_stack
             .last()
@@ -1278,6 +1444,7 @@ impl TraceRecorder {
             return_register: context.return_register,
             is_closure: context.is_closure,
             upvalues_ptr: context.upvalues_ptr,
+            resume_offset: 1,
         };
         Some(TraceOp::InlineCall {
             dest: context.dest,
@@ -1464,6 +1631,18 @@ impl TraceRecorder {
             }
 
             Instruction::Move(dest, src) => {
+                // A temporary moved into a local right after being produced:
+                // let the producer write the local, and skip the copy.
+                if dest != src
+                    && !self.specialized_registers.contains_key(&src)
+                    && !self.specialized_registers.contains_key(&dest)
+                    && self.last_op_dest() == Some(src)
+                    && register_dead_after(function, current_ip, src)
+                {
+                    self.remove_specialization_tracking(dest);
+                    self.retarget_last_op(dest);
+                    return Ok(());
+                }
                 // If dest contains a specialized value, rebox it first before overwriting
                 self.remove_specialization_tracking(dest);
 

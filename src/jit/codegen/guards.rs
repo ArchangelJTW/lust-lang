@@ -218,6 +218,33 @@ impl JitCompiler {
         unsafe extern "C" {
             fn jit_guard_struct_layout(value_ptr: *const Value, expected: *const ()) -> u8;
         }
+        if let Some(measured) = jit::layout::rc_vec_layout() {
+            // Inline: the struct tag, then the layout's allocation pointer
+            // (`expected` is the `Rc`'s data pointer, 16 bytes in).
+            let struct_tag = ValueTag::Struct.as_u8() as i8;
+            let layout_offset = measured.struct_layout_offset as i32;
+            let inner = (layout as usize).wrapping_sub(16) as i64;
+            dynasm!(self.ops
+                ; .arch x64
+                ; cmp BYTE [r12 + offset], struct_tag
+                ; jne >guard_fail
+                ; mov rax, QWORD inner
+                ; cmp rax, [r12 + offset + layout_offset]
+                ; je >guard_ok
+                ; guard_fail:
+            );
+            self.emit_guard_exit(guard_return_value);
+            dynasm!(self.ops
+                ; .arch x64
+                ; guard_ok:
+            );
+            return Ok(Guard {
+                index: guard_index,
+                bailout_ip: self.guard_bailout_ip(),
+                kind: GuardKind::StructLayout { register, layout },
+                fail_count: 0,
+            });
+        }
         dynasm!(self.ops
             ; .arch x64
             ; lea rdi, [r12 + offset]
@@ -421,6 +448,8 @@ impl JitCompiler {
         arg_count: u8,
         callee_registers: u8,
         call_ip: usize,
+        resume_ip: usize,
+        alias_mask: u64,
         result_type: Option<ValueType>,
         guard_index: &mut i32,
         guards: &mut Vec<Guard>,
@@ -465,12 +494,13 @@ impl JitCompiler {
             ; mov QWORD [rsp], frame_value_count
             ; mov [rsp + 8], r12
             ; mov [rsp + 16], r15
-            ; mov QWORD [rsp + 24], 0
+            ; mov rax, QWORD alias_mask as i64
+            ; mov [rsp + 24], rax
             ; mov rax, QWORD function_idx as _
             ; mov [rsp + 32], rax
             ; mov QWORD [rsp + 40], dest as i32
             ; mov QWORD [rsp + 48], callee as i32
-            ; mov rax, QWORD (call_ip + 1) as _
+            ; mov rax, QWORD resume_ip as _
             ; mov [rsp + 56], rax
             // The callee frame: every register Nil, then the arguments.
             ; sub rsp, frame_size
@@ -482,6 +512,18 @@ impl JitCompiler {
         for (index, src_reg) in sources.into_iter().enumerate() {
             let src_offset = (src_reg as i32) * value_size;
             let dest_offset = index as i32 * value_size;
+            if index < 64 && alias_mask & (1 << index) != 0 {
+                // Aliased: a bitwise copy the callee only reads and does
+                // not drop (its record says so).
+                for word in (0..value_size).step_by(8) {
+                    dynasm!(self.ops
+                        ; .arch x64
+                        ; mov rax, [r12 + src_offset + word]
+                        ; mov [rsp + dest_offset + word], rax
+                    );
+                }
+                continue;
+            }
             match self.scalar_registers.get(&src_reg).copied() {
                 Some(ty @ (ValueType::Int | ValueType::Bool | ValueType::Float)) => {
                     let tag = match ty {
@@ -558,7 +600,7 @@ impl JitCompiler {
     pub(super) fn compile_function_return(&mut self, value: Option<u8>) -> Result<()> {
         unsafe extern "C" {
             fn jit_return_value(src: *mut Value, dest: *mut Value);
-            fn jit_drop_values(values: *mut Value, len: usize);
+            fn jit_drop_values_masked(values: *mut Value, len: usize, mask: u64);
         }
         let (register_count, may_own) = self.function_frame;
         let epilogue = self
@@ -627,11 +669,18 @@ impl JitCompiler {
             ; => stored
         );
         if may_own {
+            // Aliased arguments (the record's mask; no record when entered
+            // from the interpreter) are the caller's and are not dropped.
             dynasm!(self.ops
                 ; .arch x64
                 ; mov rdi, r12
                 ; mov esi, DWORD i32::from(register_count)
-                ; mov rax, QWORD jit_drop_values as *const () as _
+                ; xor edx, edx
+                ; test r15, r15
+                ; jz >no_record
+                ; mov rdx, [r15 + 24]
+                ; no_record:
+                ; mov rax, QWORD jit_drop_values_masked as *const () as _
                 ; call rax
             );
         }

@@ -86,6 +86,18 @@ std::thread_local! {
     /// bits, its kind in the high bits (`EXIT_KIND_*`). Set by the exit
     /// stubs of function code just before they leave.
     pub static JIT_EXIT_INFO: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    /// Native calls still allowed before the interpreter's stack depth
+    /// limit would be reached: `max_stack_depth - call_stack.len()` at the
+    /// interpreter's entry into function code, decremented by each native
+    /// call and restored on return. A call with no budget left is handed
+    /// to the interpreter, which raises the overflow.
+    pub static JIT_DEPTH_BUDGET: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Address of this thread's `JIT_DEPTH_BUDGET` cell, for compiled code.
+#[cfg(feature = "std")]
+pub fn depth_budget_cell() -> usize {
+    JIT_DEPTH_BUDGET.with(|cell| cell as *const _ as usize)
 }
 
 /// Address of this thread's `JIT_STACK_LIMIT` cell, for compiled code.

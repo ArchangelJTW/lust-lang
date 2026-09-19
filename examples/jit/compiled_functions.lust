@@ -52,8 +52,32 @@ function scale(x: float, k: float): float
     end
     return x * k
 end
+-- A bool parameter arrives from interpreted code with undefined bytes
+-- beyond its first; compiled branches must read only that byte.
+function keep(n: int, acc: bool): bool
+    if n <= 0 then
+        return acc
+    end
+    if acc then
+        return true
+    end
+    return keep(n - 1, acc)
+end
 println(fib(22))
 println(down(900))
+local kept: int = 0
+local t: int = 0
+while t < 120 do
+    local w: int = t * 7 + 3
+    if keep(w % 4, w > 1000) then
+        kept = kept + 1
+    end
+    if keep(t % 3, t == 500) then
+        kept = kept + 10
+    end
+    t = t + 1
+end
+println(kept)
 local total: int = 0
 local i: int = 0
 while i < 200 do

@@ -2,12 +2,17 @@
 //! one seed, so `seed -> program` is a pure function and any finding replays
 //! from its number alone.
 //!
-//! The subset is chosen to drive the trace JIT: counted loops (bounded by
-//! literals, counters never assigned), int/float/bool arithmetic and
-//! comparisons, loop-carried locals, if/elseif/else, break/continue, calls to
-//! straight-line helpers (inlinable) and to helpers with their own loops,
-//! `Array<int>` push/len/index, a struct with int/float/bool fields, and
-//! `Option<int>`. Every observation is appended to a string the entry
+//! The subset is chosen to drive the trace JIT and the function compiler:
+//! counted loops (bounded by literals, counters never assigned), int/float/
+//! bool arithmetic and comparisons, loop-carried locals, if/elseif/else,
+//! break/continue, calls to straight-line helpers (inlinable) and to helpers
+//! with their own loops, recursive helpers (linear with an accumulator,
+//! binary, mutual) whose depth is bounded by their first argument,
+//! function-typed values (named `function(int): int` helpers and closures
+//! capturing locals) called directly and through the `apply`/`twice`
+//! prelude, `Array<int>` push/len/index, `Map<int, int>`, a struct with
+//! int/float/bool fields, `Option<int>`, and pair-returning helpers with
+//! destructuring. Every observation is appended to a string the entry
 //! function returns, so the two engines' outputs can be compared directly.
 
 use crate::rng::Rng;
@@ -24,6 +29,10 @@ pub enum Ty {
     Str,
     /// `unknown`: a dynamically typed value; only `is` and `as` read it.
     Unknown,
+    /// `function(int): int`: a named helper or a closure.
+    FnIntInt,
+    /// `Map<int, int>`
+    MapIntInt,
 }
 
 impl Ty {
@@ -37,6 +46,8 @@ impl Ty {
             Ty::OptInt => "Option<int>",
             Ty::Str => "string",
             Ty::Unknown => "unknown",
+            Ty::FnIntInt => "function(int): int",
+            Ty::MapIntInt => "Map<int, int>",
         }
     }
 }
@@ -120,6 +131,22 @@ pub enum Expr {
     TypeIs(String, &'static str),
     /// `(u as int)` → Option<int>
     Cast(String, &'static str),
+    /// A named `function(int): int` helper used as a value.
+    FnName(String),
+    /// `function(x: int): int return e end`, `e` over `x` and captured locals.
+    Closure(String, Box<Expr>),
+    /// `f(e)` through a `function(int): int` variable.
+    CallVar(String, Box<Expr>),
+    /// `{}`
+    MapLit,
+    /// `map.get(m, k)` → Option<int>
+    MapGet(String, Box<Expr>),
+    /// `map.delete(m, k)` → Option<int>
+    MapDelete(String, Box<Expr>),
+    /// `map.len(m)`
+    MapLen(String),
+    /// `map.has(m, k)`
+    MapHas(String, Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +220,20 @@ pub enum Stmt {
         cond: Expr,
         body: Vec<Stmt>,
     },
+    /// `return e` (recursive helpers' base cases).
+    Return(Expr),
+    /// `map.set(m, k, v)`
+    MapSet {
+        map: String,
+        key: Expr,
+        value: Expr,
+    },
+    /// `local a: ta, b: tb = f(args)` from a pair-returning helper.
+    LocalPair {
+        names: [String; 2],
+        tys: [Ty; 2],
+        call: Expr,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +243,9 @@ pub struct Func {
     pub ret: Ty,
     pub body: Vec<Stmt>,
     pub ret_expr: Expr,
+    /// A pair-returning helper: `(ret, second.0)` returning `ret_expr,
+    /// second.1`.
+    pub second: Option<(Ty, Expr)>,
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +374,34 @@ fn render_expr(e: &Expr, out: &mut String) {
         }
         Expr::TypeIs(u, ty) => out.push_str(&format!("({u} is {ty})")),
         Expr::Cast(u, ty) => out.push_str(&format!("({u} as {ty})")),
+        Expr::FnName(f) => out.push_str(f),
+        Expr::Closure(x, body) => {
+            out.push_str(&format!("function({x}: int): int return "));
+            render_expr(body, out);
+            out.push_str(" end");
+        }
+        Expr::CallVar(f, arg) => {
+            out.push_str(&format!("{f}("));
+            render_expr(arg, out);
+            out.push(')');
+        }
+        Expr::MapLit => out.push_str("{}"),
+        Expr::MapGet(m, k) => {
+            out.push_str(&format!("map.get({m}, "));
+            render_expr(k, out);
+            out.push(')');
+        }
+        Expr::MapDelete(m, k) => {
+            out.push_str(&format!("map.delete({m}, "));
+            render_expr(k, out);
+            out.push(')');
+        }
+        Expr::MapLen(m) => out.push_str(&format!("map.len({m})")),
+        Expr::MapHas(m, k) => {
+            out.push_str(&format!("map.has({m}, "));
+            render_expr(k, out);
+            out.push(')');
+        }
     }
 }
 
@@ -453,6 +525,20 @@ fn render_stmt(s: &Stmt, out: &mut Out) {
             out.indent -= 1;
             out.line("end");
         }
+        Stmt::Return(e) => out.line(&format!("return {}", expr_text(e))),
+        Stmt::MapSet { map, key, value } => out.line(&format!(
+            "map.set({map}, {}, {})",
+            expr_text(key),
+            expr_text(value)
+        )),
+        Stmt::LocalPair { names, tys, call } => out.line(&format!(
+            "local {}: {}, {}: {} = {}",
+            names[0],
+            tys[0].name(),
+            names[1],
+            tys[1].name(),
+            expr_text(call)
+        )),
     }
 }
 
@@ -490,6 +576,19 @@ pub fn render(p: &Program) -> String {
     out.indent -= 1;
     out.line("end");
     out.line("");
+    // Higher-order prelude: straight-line, so the recorder inlines them
+    // with a function-typed argument.
+    out.line("function apply(f: function(int): int, x: int): int");
+    out.indent += 1;
+    out.line("return f(x)");
+    out.indent -= 1;
+    out.line("end");
+    out.line("function twice(f: function(int): int, x: int): int");
+    out.indent += 1;
+    out.line("return f(f(x))");
+    out.indent -= 1;
+    out.line("end");
+    out.line("");
     for f in &p.funcs {
         let params = f
             .params
@@ -497,10 +596,21 @@ pub fn render(p: &Program) -> String {
             .map(|(n, t)| format!("{n}: {}", t.name()))
             .collect::<Vec<_>>()
             .join(", ");
-        out.line(&format!("function {}({params}): {}", f.name, f.ret.name()));
+        let ret = match &f.second {
+            Some((ty, _)) => format!("({}, {})", f.ret.name(), ty.name()),
+            None => f.ret.name().to_string(),
+        };
+        out.line(&format!("function {}({params}): {ret}", f.name));
         out.indent += 1;
         render_block(&f.body, &mut out);
-        out.line(&format!("return {}", expr_text(&f.ret_expr)));
+        match &f.second {
+            Some((_, second)) => out.line(&format!(
+                "return {}, {}",
+                expr_text(&f.ret_expr),
+                expr_text(second)
+            )),
+            None => out.line(&format!("return {}", expr_text(&f.ret_expr))),
+        }
         out.indent -= 1;
         out.line("end");
         out.line("");
@@ -532,6 +642,11 @@ struct FuncSig {
     ret: Ty,
     /// Estimated iterations one call performs (its own loops and calls).
     work: i64,
+    /// Recursive helper: its first parameter bounds the recursion, and call
+    /// sites keep it at most this large.
+    bound: Option<i64>,
+    /// Pair-returning helper (`(ret, second)`): only `LocalPair` calls it.
+    second: Option<Ty>,
 }
 
 struct Gen {
@@ -559,6 +674,9 @@ struct Gen {
     /// Upper bound on each array variable's length: its literal size plus
     /// every push site times the loop scale that site runs under.
     array_bounds: HashMap<String, i64>,
+    /// Generating a closure body: it may not use function-typed variables
+    /// (`f = function(x) return twice(f, x) end` never returns).
+    in_closure: bool,
 }
 
 /// Rough cap on loop iterations (plus called work) a program may execute.
@@ -584,11 +702,17 @@ pub fn program(seed: u64, size: u32) -> Program {
         iter_scale: 1,
         cur_work: 0,
         array_bounds: HashMap::new(),
+        in_closure: false,
     };
     let mut funcs = Vec::new();
     let func_count = g.rng.below(size as u64 + 1) as usize;
     for _ in 0..func_count {
-        funcs.push(g.func());
+        match g.rng.below(10) {
+            0..=1 => funcs.push(g.unary_func()),
+            2 => funcs.push(g.pair_func()),
+            3..=4 => funcs.extend(g.recursive_funcs()),
+            _ => funcs.push(g.func()),
+        }
     }
     g.in_func = false;
     g.scopes.clear();
@@ -648,7 +772,13 @@ impl Gen {
         self.scopes.clear();
         self.scopes.push(Vec::new());
         for _ in 0..param_count {
-            let ty = *self.rng.pick(&scalar);
+            // A function-typed parameter now and then: calls through it
+            // inside the helper guard on the callee's identity.
+            let ty = if self.rng.chance(0.12) {
+                Ty::FnIntInt
+            } else {
+                *self.rng.pick(&scalar)
+            };
             let pname = self.fresh("p");
             self.declare(&pname, ty, false);
             params.push((pname, ty));
@@ -693,6 +823,8 @@ impl Gen {
             params: params.iter().map(|(_, t)| *t).collect(),
             ret,
             work,
+            bound: None,
+            second: None,
         });
         Func {
             name,
@@ -700,7 +832,289 @@ impl Gen {
             ret,
             body,
             ret_expr,
+            second: None,
         }
+    }
+
+    /// Names of helpers usable as `function(int): int` values: one int
+    /// parameter, int result, safe for any argument (not recursive).
+    fn unary_names(&self) -> Vec<String> {
+        self.funcs
+            .iter()
+            .filter(|f| {
+                f.params == [Ty::Int] && f.ret == Ty::Int && f.bound.is_none() && f.second.is_none()
+            })
+            .map(|f| f.name.clone())
+            .collect()
+    }
+
+    /// A `function(int): int` helper over its parameter only — the shape
+    /// that gets passed around as a value. Straight-line or one branch.
+    fn unary_func(&mut self) -> Func {
+        let name = self.fresh("g");
+        let x = self.fresh("x");
+        self.scopes.clear();
+        self.scopes.push(Vec::new());
+        self.declare(&x, Ty::Int, false);
+        self.in_func = true;
+        self.iter_scale = 1;
+        self.cur_work = 0;
+        let saved_funcs = std::mem::take(&mut self.funcs);
+        let body = if self.rng.chance(0.5) {
+            Vec::new()
+        } else {
+            let cond = self.bool_expr(2);
+            let early = self.int_expr(2);
+            vec![Stmt::If {
+                branches: vec![(cond, vec![Stmt::Return(early)])],
+                otherwise: None,
+            }]
+        };
+        let ret_expr = self.int_expr(2);
+        self.funcs = saved_funcs;
+        self.in_func = false;
+        self.cur_work = 0;
+        self.funcs.push(FuncSig {
+            name: name.clone(),
+            params: vec![Ty::Int],
+            ret: Ty::Int,
+            work: 1,
+            bound: None,
+            second: None,
+        });
+        Func {
+            name,
+            params: vec![(x, Ty::Int)],
+            ret: Ty::Int,
+            body,
+            ret_expr,
+            second: None,
+        }
+    }
+
+    /// A pair-returning helper, `(int, float)` or `(int, bool)`.
+    fn pair_func(&mut self) -> Func {
+        let name = self.fresh("h");
+        let scalar = [Ty::Int, Ty::Float, Ty::Bool];
+        let mut params = Vec::new();
+        self.scopes.clear();
+        self.scopes.push(Vec::new());
+        for _ in 0..self.rng.below(3) {
+            let ty = *self.rng.pick(&scalar);
+            let pname = self.fresh("p");
+            self.declare(&pname, ty, false);
+            params.push((pname, ty));
+        }
+        self.in_func = true;
+        self.iter_scale = 1;
+        self.cur_work = 0;
+        let second_ty = *self.rng.pick(&[Ty::Float, Ty::Bool]);
+        let ret_expr = self.int_expr(2);
+        let second = self.expr(second_ty, 2);
+        self.in_func = false;
+        let work = self.cur_work.max(1);
+        self.cur_work = 0;
+        self.funcs.push(FuncSig {
+            name: name.clone(),
+            params: params.iter().map(|(_, t)| *t).collect(),
+            ret: Ty::Int,
+            work,
+            bound: None,
+            second: Some(second_ty),
+        });
+        Func {
+            name,
+            params,
+            ret: Ty::Int,
+            body: Vec::new(),
+            ret_expr,
+            second: Some((second_ty, second)),
+        }
+    }
+
+    /// Recursive helpers, bounded by their first parameter `n` (every base
+    /// case is `n <= 0`, so any argument terminates): a linear one with an
+    /// accumulator, a binary one, or a mutually recursive pair. They are
+    /// loop-free, so the function compiler takes them whole and their
+    /// calls to each other run natively.
+    fn recursive_funcs(&mut self) -> Vec<Func> {
+        match self.rng.below(3) {
+            0 => vec![self.linear_recursive()],
+            1 => vec![self.binary_recursive()],
+            _ => self.mutual_recursive(),
+        }
+    }
+
+    fn linear_recursive(&mut self) -> Func {
+        let name = self.fresh("r");
+        let acc_ty = *self.rng.pick(&[Ty::Int, Ty::Int, Ty::Float, Ty::Bool]);
+        let n = self.fresh("n");
+        let acc = self.fresh("acc");
+        self.scopes.clear();
+        self.scopes.push(Vec::new());
+        self.declare(&n, Ty::Int, true);
+        self.declare(&acc, acc_ty, false);
+        self.in_func = true;
+        self.iter_scale = 1;
+        self.cur_work = 0;
+        // Deep enough, sometimes, to cross the native stack reserve.
+        let bound = match self.rng.below(6) {
+            0 => 1500,
+            1 => 300,
+            _ => self.rng.range(1, 40),
+        };
+        // The body may call other helpers (scaled by the depth) but not
+        // recurse elsewhere: the sig is registered only afterwards.
+        self.iter_scale = bound;
+        let mut body = vec![Stmt::If {
+            branches: vec![(
+                Expr::Bin(Box::new(Expr::Var(n.clone())), BinOp::Le, Box::new(Expr::Int(0))),
+                vec![Stmt::Return(Expr::Var(acc.clone()))],
+            )],
+            otherwise: None,
+        }];
+        for _ in 0..self.rng.below(3) {
+            let ty = *self.rng.pick(&[Ty::Int, Ty::Float, Ty::Bool]);
+            let vname = self.fresh("t");
+            let init = self.expr(ty, 2);
+            body.push(Stmt::Local {
+                name: vname.clone(),
+                ty,
+                init,
+            });
+            self.declare(&vname, ty, false);
+        }
+        if self.rng.chance(0.4) {
+            // An early exit on some depths.
+            let cond = self.bool_expr(2);
+            let early = self.expr(acc_ty, 2);
+            body.push(Stmt::If {
+                branches: vec![(cond, vec![Stmt::Return(early)])],
+                otherwise: None,
+            });
+        }
+        let next_acc = self.expr(acc_ty, 2);
+        let step = self.rng.range(1, 3);
+        let ret_expr = Expr::Call(
+            name.clone(),
+            vec![
+                Expr::Bin(Box::new(Expr::Var(n.clone())), BinOp::Sub, Box::new(Expr::Int(step))),
+                next_acc,
+            ],
+        );
+        self.in_func = false;
+        self.iter_scale = 1;
+        let work = self.cur_work.max(1) + bound;
+        self.cur_work = 0;
+        self.funcs.push(FuncSig {
+            name: name.clone(),
+            params: vec![Ty::Int, acc_ty],
+            ret: acc_ty,
+            work,
+            bound: Some(bound),
+            second: None,
+        });
+        Func {
+            name,
+            params: vec![(n, Ty::Int), (acc, acc_ty)],
+            ret: acc_ty,
+            body,
+            ret_expr,
+            second: None,
+        }
+    }
+
+    fn binary_recursive(&mut self) -> Func {
+        let name = self.fresh("b");
+        let n = self.fresh("n");
+        self.scopes.clear();
+        self.scopes.push(Vec::new());
+        self.declare(&n, Ty::Int, true);
+        let bound = self.rng.range(2, 13);
+        let base = Expr::Bin(Box::new(Expr::Var(n.clone())), BinOp::Le, Box::new(Expr::Int(1)));
+        let body = vec![Stmt::If {
+            branches: vec![(base, vec![Stmt::Return(Expr::Var(n.clone()))])],
+            otherwise: None,
+        }];
+        let call = |k: i64| {
+            Expr::Call(
+                name.clone(),
+                vec![Expr::Bin(
+                    Box::new(Expr::Var(n.clone())),
+                    BinOp::Sub,
+                    Box::new(Expr::Int(k)),
+                )],
+            )
+        };
+        let ret_expr = match self.rng.below(3) {
+            0 => Expr::Bin(Box::new(call(1)), BinOp::Add, Box::new(call(2))),
+            1 => Expr::Bin(
+                Box::new(Expr::Bin(Box::new(call(1)), BinOp::Mul, Box::new(Expr::Int(2)))),
+                BinOp::Sub,
+                Box::new(call(2)),
+            ),
+            _ => Expr::Bin(
+                Box::new(call(1)),
+                BinOp::Add,
+                Box::new(Expr::Bin(Box::new(call(3)), BinOp::Mod, Box::new(Expr::Int(7)))),
+            ),
+        };
+        self.funcs.push(FuncSig {
+            name: name.clone(),
+            params: vec![Ty::Int],
+            ret: Ty::Int,
+            work: 1i64 << bound,
+            bound: Some(bound),
+            second: None,
+        });
+        Func {
+            name,
+            params: vec![(n, Ty::Int)],
+            ret: Ty::Int,
+            body,
+            ret_expr,
+            second: None,
+        }
+    }
+
+    fn mutual_recursive(&mut self) -> Vec<Func> {
+        let even = self.fresh("even");
+        let odd = self.fresh("odd");
+        let bound = self.rng.range(1, 60);
+        let make = |name: String, other: &str, base: bool| {
+            let n = format!("n_{name}");
+            let cond = Expr::Bin(Box::new(Expr::Var(n.clone())), BinOp::Le, Box::new(Expr::Int(0)));
+            Func {
+                name,
+                params: vec![(n.clone(), Ty::Int)],
+                ret: Ty::Bool,
+                body: vec![Stmt::If {
+                    branches: vec![(cond, vec![Stmt::Return(Expr::Bool(base))])],
+                    otherwise: None,
+                }],
+                ret_expr: Expr::Call(
+                    other.to_string(),
+                    vec![Expr::Bin(
+                        Box::new(Expr::Var(n)),
+                        BinOp::Sub,
+                        Box::new(Expr::Int(1)),
+                    )],
+                ),
+                second: None,
+            }
+        };
+        let funcs = vec![make(even.clone(), &odd, true), make(odd.clone(), &even, false)];
+        for name in [even, odd] {
+            self.funcs.push(FuncSig {
+                name,
+                params: vec![Ty::Int],
+                ret: Ty::Bool,
+                work: bound,
+                bound: Some(bound),
+                second: None,
+            });
+        }
+        funcs
     }
 
     // ── Statements ───────────────────────────────────────────────────────
@@ -769,13 +1183,52 @@ impl Gen {
             86..=89 if !deep => self.if_index(),
             90..=92 if !deep => self.if_some(),
             93..=95 if !deep => self.if_is_some(),
-            96..=99 => self.set_field(),
-            _ => Some(self.local()),
+            96..=97 => self.set_field(),
+            98 => self.map_set(),
+            _ => self.local_pair(),
         }
     }
 
+    fn map_set(&mut self) -> Option<Stmt> {
+        let maps = self.vars_of(Ty::MapIntInt);
+        if maps.is_empty() {
+            return Some(self.local());
+        }
+        let map = self.rng.pick(&maps).name.clone();
+        let key = self.int_expr(2);
+        let value = self.int_expr(2);
+        Some(Stmt::MapSet { map, key, value })
+    }
+
+    /// `local a: int, b: T = h(...)` from a pair-returning helper.
+    fn local_pair(&mut self) -> Option<Stmt> {
+        let scale = self.iter_scale.max(1);
+        let candidates: Vec<FuncSig> = self
+            .funcs
+            .iter()
+            .filter(|f| f.second.is_some() && scale.saturating_mul(f.work) <= MAX_WORK)
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            return Some(self.local());
+        }
+        let f = self.rng.pick(&candidates).clone();
+        self.cur_work += scale * f.work;
+        let args = self.call_args(&f, 2);
+        let second_ty = f.second.unwrap();
+        let a = self.fresh("q");
+        let b = self.fresh(if second_ty == Ty::Float { "x" } else { "b" });
+        self.declare(&a, Ty::Int, false);
+        self.declare(&b, second_ty, false);
+        Some(Stmt::LocalPair {
+            names: [a, b],
+            tys: [Ty::Int, second_ty],
+            call: Expr::Call(f.name, args),
+        })
+    }
+
     fn local(&mut self) -> Stmt {
-        let ty = match self.rng.below(14) {
+        let ty = match self.rng.below(18) {
             0..=3 => Ty::Int,
             4..=5 => Ty::Float,
             6 => Ty::Bool,
@@ -783,7 +1236,9 @@ impl Gen {
             8 => Ty::Struct,
             9..=10 => Ty::OptInt,
             11..=12 => Ty::Str,
-            _ => Ty::Unknown,
+            13 => Ty::Unknown,
+            14..=15 => Ty::FnIntInt,
+            _ => Ty::MapIntInt,
         };
         let name = self.fresh(match ty {
             Ty::Int => "n",
@@ -794,6 +1249,8 @@ impl Gen {
             Ty::OptInt => "o",
             Ty::Str => "s",
             Ty::Unknown => "u",
+            Ty::FnIntInt => "fn",
+            Ty::MapIntInt => "m",
         });
         let init = self.expr(ty, 2);
         if let Expr::ArrLit(items) = &init {
@@ -804,7 +1261,15 @@ impl Gen {
     }
 
     fn assign(&mut self) -> Option<Stmt> {
-        let ty = *self.rng.pick(&[Ty::Int, Ty::Int, Ty::Float, Ty::Bool, Ty::OptInt, Ty::Str]);
+        let ty = *self.rng.pick(&[
+            Ty::Int,
+            Ty::Int,
+            Ty::Float,
+            Ty::Bool,
+            Ty::OptInt,
+            Ty::Str,
+            Ty::FnIntInt,
+        ]);
         let vars = self.mutable_vars_of(ty);
         if vars.is_empty() {
             return Some(self.local());
@@ -1048,9 +1513,24 @@ impl Gen {
                 Box::new(self.float_expr(1)),
                 Box::new(self.bool_expr(1)),
             ),
-            Ty::OptInt => match self.rng.below(10) {
+            Ty::OptInt => match self.rng.below(12) {
                 0..=4 => Expr::Some(Box::new(self.int_expr(1))),
                 5..=6 => Expr::None,
+                10..=11 => {
+                    let maps = self.vars_of(Ty::MapIntInt);
+                    match maps.is_empty() {
+                        true => Expr::None,
+                        false => {
+                            let m = self.rng.pick(&maps).name.clone();
+                            let k = Box::new(self.int_expr(1));
+                            if self.rng.chance(0.7) {
+                                Expr::MapGet(m, k)
+                            } else {
+                                Expr::MapDelete(m, k)
+                            }
+                        }
+                    }
+                }
                 7 => {
                     let arrays = self.vars_of(Ty::ArrInt);
                     match arrays.is_empty() {
@@ -1080,6 +1560,44 @@ impl Gen {
             Ty::Unknown => {
                 let ty = *self.rng.pick(&[Ty::Int, Ty::Float, Ty::Bool, Ty::Str]);
                 self.expr(ty, 1)
+            }
+            Ty::FnIntInt => self.fn_value(depth),
+            Ty::MapIntInt => Expr::MapLit,
+        }
+    }
+
+    /// A `function(int): int` value: a variable already holding one, a
+    /// named helper, or a closure over the locals in scope.
+    fn fn_value(&mut self, depth: u32) -> Expr {
+        let vars = if self.in_closure {
+            Vec::new()
+        } else {
+            self.vars_of(Ty::FnIntInt)
+        };
+        let names = self.unary_names();
+        match self.rng.below(10) {
+            0..=3 if !vars.is_empty() => Expr::Var(self.rng.pick(&vars).name.clone()),
+            4..=6 if !names.is_empty() => Expr::FnName(self.rng.pick(&names).clone()),
+            _ if depth > 0 && !self.in_closure => {
+                let x = self.fresh("x");
+                self.scopes.push(vec![Var {
+                    name: x.clone(),
+                    ty: Ty::Int,
+                    fixed: true,
+                }]);
+                let saved_in_func = self.in_func;
+                self.in_func = true;
+                self.in_closure = true;
+                let body = self.int_expr(depth.min(2));
+                self.in_closure = false;
+                self.in_func = saved_in_func;
+                self.scopes.pop();
+                Expr::Closure(x, Box::new(body))
+            }
+            _ if !names.is_empty() => Expr::FnName(self.rng.pick(&names).clone()),
+            _ => {
+                let x = self.fresh("x");
+                Expr::Closure(x.clone(), Box::new(Expr::Var(x)))
             }
         }
     }
@@ -1139,10 +1657,18 @@ impl Gen {
     fn call_returning(&mut self, ty: Ty, depth: u32) -> Option<Expr> {
         // A call here runs `iter_scale` times; keep the total within budget.
         let scale = self.iter_scale.max(1);
+        // A closure body may not call a helper that takes a function value:
+        // handing it a closure that calls the helper back never returns.
+        let in_closure = self.in_closure;
         let candidates: Vec<FuncSig> = self
             .funcs
             .iter()
-            .filter(|f| f.ret == ty && scale.saturating_mul(f.work) <= MAX_WORK)
+            .filter(|f| {
+                f.ret == ty
+                    && f.second.is_none()
+                    && scale.saturating_mul(f.work) <= MAX_WORK
+                    && !(in_closure && f.params.contains(&Ty::FnIntInt))
+            })
             .cloned()
             .collect();
         if candidates.is_empty() {
@@ -1150,8 +1676,27 @@ impl Gen {
         }
         let f = self.rng.pick(&candidates).clone();
         self.cur_work += scale * f.work;
-        let args = f.params.iter().map(|t| self.expr(*t, depth.saturating_sub(1))).collect();
+        let args = self.call_args(&f, depth);
         Some(Expr::Call(f.name, args))
+    }
+
+    /// Arguments for a call to `f`. A recursive helper's bounding argument
+    /// is `e % (bound + 1)`: never above the bound, and a negative value
+    /// hits the base case at once.
+    fn call_args(&mut self, f: &FuncSig, depth: u32) -> Vec<Expr> {
+        f.params
+            .iter()
+            .enumerate()
+            .map(|(index, t)| {
+                let e = self.expr(*t, depth.saturating_sub(1));
+                match f.bound {
+                    Some(bound) if index == 0 => {
+                        Expr::Bin(Box::new(e), BinOp::Mod, Box::new(Expr::Int(bound + 1)))
+                    }
+                    _ => e,
+                }
+            })
+            .collect()
     }
 
     fn int_expr(&mut self, depth: u32) -> Expr {
@@ -1253,13 +1798,42 @@ impl Gen {
                     }
                 }
             }
-            90..=93 => {
+            90..=92 => {
                 let vars = self.vars_of(Ty::OptInt);
                 if vars.is_empty() {
                     self.int_lit()
                 } else {
                     let d = self.int_expr(depth - 1);
                     Expr::UnwrapOr(self.rng.pick(&vars).name.clone(), Box::new(d))
+                }
+            }
+            93..=95 => {
+                // A call through a function value, or `apply`/`twice` with
+                // one: the callee register's identity is guarded.
+                let vars = if self.in_closure {
+                    Vec::new()
+                } else {
+                    self.vars_of(Ty::FnIntInt)
+                };
+                if vars.is_empty() {
+                    return self
+                        .call_returning(Ty::Int, depth)
+                        .unwrap_or_else(|| self.var_or(Ty::Int, |g| g.int_lit()));
+                }
+                let f = self.rng.pick(&vars).name.clone();
+                let arg = self.int_expr(depth - 1);
+                match self.rng.below(3) {
+                    0 => Expr::Call("apply".to_string(), vec![Expr::Var(f), arg]),
+                    1 => Expr::Call("twice".to_string(), vec![Expr::Var(f), arg]),
+                    _ => Expr::CallVar(f, Box::new(arg)),
+                }
+            }
+            96 => {
+                let vars = self.vars_of(Ty::MapIntInt);
+                if vars.is_empty() {
+                    self.int_lit()
+                } else {
+                    Expr::MapLen(self.rng.pick(&vars).name.clone())
                 }
             }
             _ => self
@@ -1395,12 +1969,21 @@ impl Gen {
                     Expr::TypeIs(self.rng.pick(&vars).name.clone(), ty)
                 }
             }
-            91..=94 => {
+            91..=93 => {
                 let vars = self.vars_of(Ty::OptInt);
                 if vars.is_empty() {
                     Expr::Bool(self.rng.chance(0.5))
                 } else {
                     Expr::IsSome(self.rng.pick(&vars).name.clone())
+                }
+            }
+            94 => {
+                let vars = self.vars_of(Ty::MapIntInt);
+                if vars.is_empty() {
+                    Expr::Bool(self.rng.chance(0.5))
+                } else {
+                    let k = self.int_expr(depth - 1);
+                    Expr::MapHas(self.rng.pick(&vars).name.clone(), Box::new(k))
                 }
             }
             _ => self

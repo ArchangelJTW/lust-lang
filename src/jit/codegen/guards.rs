@@ -358,7 +358,8 @@ impl JitCompiler {
         let label = self.function_label(label);
         let offset = (register as i32) * (mem::size_of::<Value>() as i32);
         if self.scalar_registers.get(&register) == Some(&ValueType::Bool) {
-            dynasm!(self.ops ; .arch x64 ; mov rax, [r12 + offset + 8]);
+            // Only the low byte of a Bool's payload is defined.
+            dynasm!(self.ops ; .arch x64 ; movzx eax, BYTE [r12 + offset + 8]);
         } else {
             unsafe extern "C" {
                 fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
@@ -420,6 +421,10 @@ impl JitCompiler {
             ; mov rax, [rax]
             ; cmp rsp, rax
             ; jb => to_interpreter
+            // The interpreter's frame depth limit (`JIT_DEPTH_BUDGET`).
+            ; mov rax, QWORD jit::depth_budget_cell() as _
+            ; cmp QWORD [rax], 0
+            ; je => to_interpreter
             // The callee's entry point, if it has compiled code.
             ; mov rax, QWORD slot as _
             ; mov rbx, [rax]
@@ -456,9 +461,13 @@ impl JitCompiler {
                         _ => ValueTag::Float,
                     }
                     .as_u8() as i8;
+                    if ty == ValueType::Bool {
+                        dynasm!(self.ops ; .arch x64 ; movzx eax, BYTE [r12 + src_offset + 8]);
+                    } else {
+                        dynasm!(self.ops ; .arch x64 ; mov rax, [r12 + src_offset + 8]);
+                    }
                     dynasm!(self.ops
                         ; .arch x64
-                        ; mov rax, [r12 + src_offset + 8]
                         ; mov BYTE [rsp + dest_offset], tag
                         ; mov [rsp + dest_offset + 8], rax
                     );
@@ -483,6 +492,8 @@ impl JitCompiler {
         dynasm!(self.ops
             ; .arch x64
             // Enter the callee: rdi = its registers, rsi = VM, rdx = record.
+            ; mov rax, QWORD jit::depth_budget_cell() as _
+            ; dec QWORD [rax]
             ; mov rdi, rsp
             ; mov rsi, r13
             ; lea rdx, [rsp + frame_size]
@@ -490,6 +501,8 @@ impl JitCompiler {
             // Pop the frame and record; the callee's epilogue restored
             // rbx, r12..r15.
             ; add rsp, frame_size + metadata_size
+            ; mov rcx, QWORD jit::depth_budget_cell() as _
+            ; inc QWORD [rcx]
             ; cmp eax, DWORD returned
             ; je => done
             // Anything else is an exit that already materialized every
@@ -557,7 +570,14 @@ impl JitCompiler {
                 ; .arch x64
                 ; cmp BYTE [rsi], scalar_max_tag
                 ; ja >owned
-                ; mov rax, [r12 + offset + 8]
+            );
+            if ty == ValueType::Bool {
+                dynasm!(self.ops ; .arch x64 ; movzx eax, BYTE [r12 + offset + 8]);
+            } else {
+                dynasm!(self.ops ; .arch x64 ; mov rax, [r12 + offset + 8]);
+            }
+            dynasm!(self.ops
+                ; .arch x64
                 ; mov BYTE [rsi], tag
                 ; mov [rsi + 8], rax
                 ; jmp => stored

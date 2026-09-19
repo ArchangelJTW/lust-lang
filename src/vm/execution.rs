@@ -2053,6 +2053,8 @@ impl VM {
         self.jit.record_native_entry();
         self.pending_jit_error = None;
         crate::jit::JIT_EXIT_INFO.with(|cell| cell.set(usize::MAX));
+        let budget = self.max_stack_depth.saturating_sub(self.call_stack.len());
+        crate::jit::JIT_DEPTH_BUDGET.with(|cell| cell.set(budget));
         let registers_ptr = self.call_stack.last_mut().unwrap().registers.as_mut_ptr();
         let vm_ptr = self as *mut VM;
         let result = code.execute(registers_ptr, vm_ptr, ptr::null());

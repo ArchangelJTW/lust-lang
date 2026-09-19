@@ -335,7 +335,8 @@ impl JitCompiler {
     pub(super) fn compile_branch_if(&mut self, register: u8, expect_truthy: bool, label: usize) {
         let label = self.function_label(label);
         if self.scalar_registers.get(&register) == Some(&ValueType::Bool) {
-            self.load_payload(0, register);
+            // Only the low byte of a Bool's payload is defined.
+            self.load_bool_payload(0, register);
         } else {
             unsafe extern "C" {
                 fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
@@ -394,6 +395,9 @@ impl JitCompiler {
             ; mov x9, sp
             ; cmp x9, x23
             ; b.lo => to_interpreter
+            // The interpreter's frame depth limit (x26, see
+            // `JIT_DEPTH_BUDGET`).
+            ; cbz x26, => to_interpreter
         );
         if slot_offset <= 32760 {
             dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x24, #slot_offset]);
@@ -448,7 +452,11 @@ impl JitCompiler {
                     .as_u8() as u32;
                     let payload_offset = (dest_offset + 8) as u32;
                     let tag_offset = dest_offset as u32;
-                    self.load_payload(0, src_reg);
+                    if ty == ValueType::Bool {
+                        self.load_bool_payload(0, src_reg);
+                    } else {
+                        self.load_payload(0, src_reg);
+                    }
                     dynasm!(self.ops
                         ; .arch aarch64
                         ; mov x11, sp
@@ -480,12 +488,17 @@ impl JitCompiler {
         }
         dynasm!(self.ops
             ; .arch aarch64
+            ; sub x26, x26, 1
             ; mov x0, sp
             ; mov x1, x20
             ; mov x11, sp
         );
         self.emit_add_imm(2, 11, frame_size);
-        dynasm!(self.ops ; .arch aarch64 ; blr x16);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; blr x16
+            ; add x26, x26, 1
+        );
         // Pop the frame and record; the callee's epilogue restored x19..x24.
         let pop = (frame_size + INLINE_METADATA_SIZE) as u32;
         if pop <= 4095 {
@@ -568,7 +581,11 @@ impl JitCompiler {
             }
             .as_u8() as u32;
             let scalar_max_tag = ValueTag::Float.as_u8() as u32;
-            self.load_payload(0, reg);
+            if ty == ValueType::Bool {
+                self.load_bool_payload(0, reg);
+            } else {
+                self.load_payload(0, reg);
+            }
             dynasm!(self.ops
                 ; .arch aarch64
                 ; ldrb w9, [x1]

@@ -164,7 +164,11 @@ impl JitCompiler {
         // and need no saving; x23 and x24 hold the native stack limit and
         // the entry table for the function's calls.
         if self.function_mode {
-            dynasm!(self.ops ; .arch aarch64 ; stp x23, x24, [sp, -16]!);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; stp x23, x24, [sp, -16]!
+                ; stp x25, x26, [sp, -16]!
+            );
         } else {
             dynasm!(self.ops
                 ; .arch aarch64
@@ -191,6 +195,16 @@ impl JitCompiler {
             self.emit_mov_imm64(23, jit::stack_limit_cell() as u64);
             self.emit_mov_imm64(24, self.function_entry_table as u64);
             dynasm!(self.ops ; .arch aarch64 ; ldr x23, [x23]);
+            // x26 = the remaining frame-depth budget: loaded from the cell
+            // when the interpreter enters, inherited from the caller (who
+            // already decremented it) on a native call.
+            self.emit_mov_imm64(25, jit::depth_budget_cell() as u64);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cbnz x21, >budget_ready
+                ; ldr x26, [x25]
+                ; budget_ready:
+            );
         } else {
             dynasm!(self.ops ; .arch aarch64 ; mov x21, xzr);
         }
@@ -328,7 +342,7 @@ impl JitCompiler {
         // Epilogue: sp is recovered from the frame pointer, so the exit path
         // is valid regardless of how deep an inline frame we came from.
         let saved_below_fp = if self.function_mode {
-            48u32
+            64u32
         } else {
             SAVED_BELOW_FP as u32
         };
@@ -339,7 +353,11 @@ impl JitCompiler {
             ; sub sp, x29, #saved_below_fp
         );
         if self.function_mode {
-            dynasm!(self.ops ; .arch aarch64 ; ldp x23, x24, [sp], 16);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldp x25, x26, [sp], 16
+                ; ldp x23, x24, [sp], 16
+            );
         } else {
             dynasm!(self.ops
                 ; .arch aarch64

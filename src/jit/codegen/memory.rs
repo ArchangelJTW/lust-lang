@@ -100,7 +100,7 @@ impl JitCompiler {
                 return Ok(());
             }
             Some(ValueType::Bool) => {
-                self.load_to_rax(src);
+                dynasm!(self.ops ; .arch x64 ; movzx eax, BYTE [r12 + src_offset + 8]);
                 self.store_from_rax(dest, ValueTag::Bool.as_u8());
                 return Ok(());
             }

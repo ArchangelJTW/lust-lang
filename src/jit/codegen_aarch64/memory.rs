@@ -105,7 +105,7 @@ impl JitCompiler {
                 return Ok(());
             }
             Some(ValueType::Bool) => {
-                self.load_payload(0, src);
+                self.load_bool_payload(0, src);
                 self.store_from_x0(dest, ValueTag::Bool.as_u8());
                 return Ok(());
             }

@@ -234,8 +234,10 @@ backend change:
 - `cargo build --release -p lust-fuzz` builds a seeded random-program
   differential fuzzer (a workspace member, so it is not built by a plain
   `cargo build`). `lust-fuzz run --cases 20000 --size 4 --jobs 6 --keep-going`
-  generates programs, runs each both ways in-process and reports every
-  disagreement with a shrunk reproducer; `lust-fuzz one --seed S` prints a
+  generates programs (loops, branches, calls, recursion, function values and
+  closures, arrays, maps, structs, options, strings, pair returns), runs each
+  both ways in-process and reports every disagreement with a shrunk
+  reproducer; `lust-fuzz one --seed S` prints a
   program and `lust-fuzz replay --seed S` reruns it with timings. `--size`
   scales program length, `--fg` runs the workers at normal priority (they
   default to background QoS), and a watchdog kills cases over 120 s or 2 GB.

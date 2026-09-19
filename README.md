@@ -218,9 +218,11 @@ the recording is abandoned and the site is recorded again without unboxing.
 
 Functions are also compiled whole after thirty calls: their bytecode is
 translated statically, every branch and loop included (types flow to a
-fixpoint around loops), and the code calls other compiled functions and
-struct methods natively — frames on the machine stack, arguments and results
-copied directly — so direct and mutual recursion run native end to end.
+fixpoint around loops, and a function with a loop keeps its type-stable
+scalars in machine registers), and the code calls other compiled functions
+and struct methods natively — frames on the machine stack, scalar
+arguments and results copied directly, other arguments aliased — so direct
+and mutual recursion run native end to end.
 Struct fields (through the layout the parameter's declared type names,
 guarded once), arrays, strings, enums, globals, natives and function-valued
 arguments are handled; a function using something the function compiler

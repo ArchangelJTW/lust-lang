@@ -157,15 +157,15 @@ milliseconds, single run each:
 
 | program   | lust-vm | lust-jit | luajit | lua 5.5 |
 |-----------|--------:|---------:|-------:|--------:|
-| fields    |     755 |       46 |     62 |     120 |
-| array     |    1556 |      231 |     61 |      76 |
-| calls     |     787 |      152 |     31 |     127 |
-| methods   |    1377 |       77 |     31 |     216 |
-| strings   |   17629 |    17193 |  29455 |    7348 |
-| fib       |     175 |       36 |     20 |      37 |
-| nested    |     368 |       24 |     29 |      79 |
-| floatmath |     539 |       57 |     38 |      90 |
-| tree      |    1133 |      191 |     39 |      54 |
+| fields    |     737 |       44 |     55 |     111 |
+| array     |    1327 |      205 |     55 |      77 |
+| calls     |     770 |      104 |     27 |     125 |
+| methods   |    1384 |       73 |     27 |     214 |
+| strings   |   13987 |    13783 |  25994 |    7311 |
+| fib       |     175 |       37 |     20 |      36 |
+| nested    |     365 |       23 |     27 |      76 |
+| floatmath |     552 |       53 |     34 |      95 |
+| tree      |     746 |      134 |     36 |      53 |
 
 The interpreter numbers were 3-90x worse before the fixes to cycle
 collection cost, call-frame copying and argument checking on this branch
@@ -189,8 +189,13 @@ worse before the cycle collector's graph scan stopped being quadratic;
 sharing struct and enum names (so a value clone no longer allocates) took
 the interpreter from 1560 to 1133 ms and shrank `Value` to 48 bytes, which
 is where the interpreter's `fields` and `methods` gains come from.
-Remaining gaps against Lua: `strings`, where every engine is quadratic in
-`s = s .. x`; `array`, where each iteration still moves its values through
-the VM's register memory; and `tree`, where reading an `Option<Node>` field
-and matching it still clones and drops the enum and the struct through
-runtime helpers.
+`tree` then went 191 → 134 ms and `calls` 152 → 104 once enum tests,
+struct-layout and native-function guards, field and payload reads and
+value moves stopped calling the runtime (interned names, measured
+layouts, inline reference counting), arguments were aliased into callee
+frames instead of cloned, and the cycle collector stopped collecting on
+allocation. Remaining gaps against Lua: `strings`, where every engine is
+quadratic in `s = s .. x`; `array`, whose element loop still writes every
+value through to the frame; and `tree`, where a node visit is three
+native calls with frames and records each, against LuaJIT's register
+passing.

@@ -115,7 +115,6 @@ impl VM {
             pending_return_dest: None,
             pending_jit_error: None,
             trace_recorder: None,
-            side_trace_context: None,
             nested_loop_exit_ip: None,
             skip_next_trace_record: false,
             trait_impls: HashMap::new(),
@@ -640,7 +639,6 @@ impl VM {
         let saved_pending_task_signal = self.pending_task_signal.clone();
         let saved_last_task_signal = self.last_task_signal.clone();
         let saved_trace_recorder = self.trace_recorder.take();
-        let saved_side_trace_context = self.side_trace_context.take();
         let saved_skip_next_trace_record = self.skip_next_trace_record;
         let saved_call_until_depth = self.call_until_depth;
         self.skip_next_trace_record = false;
@@ -651,7 +649,6 @@ impl VM {
             self.abandon_trace_recording();
         }
         self.trace_recorder = saved_trace_recorder;
-        self.side_trace_context = saved_side_trace_context;
         self.skip_next_trace_record = saved_skip_next_trace_record;
         self.call_until_depth = saved_call_until_depth;
         match result {
@@ -1470,13 +1467,11 @@ end
         let mut vm = VM::new();
         vm.load_functions(vec![failing, succeeding]);
         vm.trace_recorder = Some(TraceRecorder::new(99, 7, 32));
-        vm.side_trace_context = Some((crate::jit::TraceId(4), 2));
         vm.skip_next_trace_record = true;
 
         assert!(vm.call("failing", Vec::new()).is_err());
         assert!(vm.call_stack.is_empty());
         assert!(vm.trace_recorder.is_some());
-        assert_eq!(vm.side_trace_context, Some((crate::jit::TraceId(4), 2)));
         assert!(vm.skip_next_trace_record);
         assert!(matches!(
             vm.call("succeeding", Vec::new()),
@@ -1521,7 +1516,7 @@ end
             outputs: Vec::new(),
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
 
         let mut vm = VM::new();

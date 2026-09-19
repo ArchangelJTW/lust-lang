@@ -176,11 +176,10 @@ impl VM {
                 let backedge_ip = ip_before_execution.saturating_sub(1);
                 let loop_in_hierarchy =
                     self.is_loop_in_hierarchy(func_idx, loop_start_ip, backedge_ip);
-                if self.side_trace_context.is_none()
-                    && self
-                        .trace_recorder
-                        .as_ref()
-                        .is_some_and(|recorder| !recorder.is_recording())
+                if self
+                    .trace_recorder
+                    .as_ref()
+                    .is_some_and(|recorder| !recorder.is_recording())
                 {
                     self.abandon_trace_recording();
                 }
@@ -263,108 +262,58 @@ impl VM {
                         } else if result > 0 {
                             self.jit.record_guard_exit();
                             let guard_index = (result - 1) as usize;
-                            let side_trace_id = self
+                            let bailout_ip = self
                                 .jit
                                 .get_trace(trace_id)
-                                .and_then(|t| t.guards.get(guard_index))
-                                .and_then(|g| g.side_trace);
-                            if let Some(side_trace_id) = side_trace_id {
-                                crate::jit::log(|| {
-                                    format!(
-                                        "🌳 JIT: Executing side trace #{} for guard #{}",
-                                        side_trace_id.0, guard_index
-                                    )
-                                });
-                                let frame = self.call_stack.last_mut().unwrap();
-                                let registers_ptr = frame.registers.as_mut_ptr();
-                                if let Some(side_trace) = self.jit.trace_handle(side_trace_id) {
-                                    let side_trace_gas_cost = {
-                                        let cost = side_trace.trace.ops.len()
-                                            + side_trace.trace.preamble.len()
-                                            + side_trace.trace.postamble.len();
-                                        core::cmp::max(1, cost) as u64
-                                    };
-                                    self.budgets.charge_gas(side_trace_gas_cost)?;
-                                    let vm_ptr = self as *mut VM;
-                                    self.pending_jit_error = None;
-                                    let side_result =
-                                        side_trace.execute(registers_ptr, vm_ptr, ptr::null());
-                                    drop(side_trace);
-                                    if side_result < 0
-                                        && let Some(error) = self.pending_jit_error.take()
-                                    {
-                                        return Err(error);
-                                    }
-                                    if side_result == 0 {
-                                        crate::jit::log(|| {
-                                            format!(
-                                                "✅ JIT: Side trace #{} executed successfully",
-                                                side_trace_id.0
-                                            )
-                                        });
-                                    } else {
-                                        crate::jit::log(|| {
-                                            format!(
-                                                "⚠️  JIT: Side trace #{} failed, falling back to interpreter",
-                                                side_trace_id.0
-                                            )
-                                        });
-                                    }
-                                }
-                            } else {
-                                let bailout_ip = self
+                                .and_then(|trace| trace.guards.get(guard_index))
+                                .map(|guard| guard.bailout_ip);
+
+                            crate::jit::log(|| {
+                                let kind = self
                                     .jit
                                     .get_trace(trace_id)
                                     .and_then(|trace| trace.guards.get(guard_index))
-                                    .map(|guard| guard.bailout_ip);
-
-                                crate::jit::log(|| {
-                                    let kind = self
-                                        .jit
-                                        .get_trace(trace_id)
-                                        .and_then(|trace| trace.guards.get(guard_index))
-                                        .map(|guard| format!("{:?}", guard.kind));
-                                    format!(
-                                        "↩️  JIT: guard #{guard_index} exit {kind:?} → ip {bailout_ip:?}"
-                                    )
-                                });
-                                // A nested loop's trace may have bailed out
-                                // somewhere other than the guard's own ip.
-                                let bailout_ip = self.nested_loop_exit_ip.take().or(bailout_ip);
-                                if let Some(bailout_ip) = bailout_ip
-                                    && let Some(frame) = self.call_stack.last_mut()
-                                {
-                                    frame.ip = bailout_ip;
-                                }
-                                if let Some(error) = self.pending_jit_error.take() {
-                                    return Err(error);
-                                }
-
-                                self.handle_guard_failure(trace_id, guard_index, func_idx)?;
-                                // A loop-condition exit is how a trace normally
-                                // ends, and a nested-loop exit is where an outer
-                                // trace hands the inner loop to its own trace;
-                                // both resume at a known ip with the registers
-                                // written back, so the trace stays valid for the
-                                // next entry. Any other guard failure means the
-                                // trace assumed something that no longer holds.
-                                let reusable_exit = self
-                                    .jit
-                                    .get_trace(trace_id)
-                                    .and_then(|trace| trace.guards.get(guard_index))
-                                    .is_some_and(|guard| {
-                                        matches!(
-                                            guard.kind,
-                                            crate::jit::GuardKind::Truthy { .. }
-                                                | crate::jit::GuardKind::Falsy { .. }
-                                                | crate::jit::GuardKind::NestedLoop { .. }
-                                        )
-                                    });
-                                if !reusable_exit {
-                                    self.jit.evict_root_trace(func_idx, loop_start_ip);
-                                }
-                                continue;
+                                    .map(|guard| format!("{:?}", guard.kind));
+                                format!(
+                                    "↩️  JIT: guard #{guard_index} exit {kind:?} → ip {bailout_ip:?}"
+                                )
+                            });
+                            // A nested loop's trace may have bailed out
+                            // somewhere other than the guard's own ip.
+                            let bailout_ip = self.nested_loop_exit_ip.take().or(bailout_ip);
+                            if let Some(bailout_ip) = bailout_ip
+                                && let Some(frame) = self.call_stack.last_mut()
+                            {
+                                frame.ip = bailout_ip;
                             }
+                            if let Some(error) = self.pending_jit_error.take() {
+                                return Err(error);
+                            }
+
+                            self.handle_guard_failure(trace_id, guard_index, func_idx)?;
+                            // A loop-condition exit is how a trace normally
+                            // ends, and a nested-loop exit is where an outer
+                            // trace hands the inner loop to its own trace;
+                            // both resume at a known ip with the registers
+                            // written back, so the trace stays valid for the
+                            // next entry. Any other guard failure means the
+                            // trace assumed something that no longer holds.
+                            let reusable_exit = self
+                                .jit
+                                .get_trace(trace_id)
+                                .and_then(|trace| trace.guards.get(guard_index))
+                                .is_some_and(|guard| {
+                                    matches!(
+                                        guard.kind,
+                                        crate::jit::GuardKind::Truthy { .. }
+                                            | crate::jit::GuardKind::Falsy { .. }
+                                            | crate::jit::GuardKind::NestedLoop { .. }
+                                    )
+                                });
+                            if !reusable_exit {
+                                self.jit.evict_root_trace(func_idx, loop_start_ip);
+                            }
+                            continue;
                         } else {
                             self.jit.record_execution_failure();
                             if let Some(error) = self.pending_jit_error.take() {
@@ -406,15 +355,18 @@ impl VM {
                         }
                     }
                 } else {
-                    let is_side_trace = self.side_trace_context.is_some();
-                    if is_side_trace {
-                        if let Some(recorder) = &self.trace_recorder
-                            && !recorder.is_recording()
-                        {
-                            if !recorder.is_complete() {
-                                self.abandon_trace_recording();
-                                continue;
-                            }
+                    if let Some(recorder) = &mut self.trace_recorder {
+                        // Only finalise the recording when *this* loop is the
+                        // one being recorded.  With a nested loop the inner
+                        // back-edge reaches this handler while the recorder is
+                        // still part-way through the outer loop's body; taking
+                        // that partial body and installing it under the inner
+                        // loop's key produced a trace that re-initialised the
+                        // inner induction variable, never advanced the outer
+                        // one, and therefore never terminated.
+                        let recording_this_loop = recorder.trace.function_idx == func_idx
+                            && recorder.trace.start_ip == loop_start_ip;
+                        if recorder.is_recording() && recording_this_loop {
                             crate::jit::log(|| {
                                 format!(
                                     "📝 JIT: Trace recording complete - {} ops recorded",
@@ -423,142 +375,73 @@ impl VM {
                             });
                             let recorder = self.trace_recorder.take().unwrap();
                             let mut trace = recorder.finish();
-                            let side_trace_ctx = self.side_trace_context.take().unwrap();
                             let mut optimizer = TraceOptimizer::new();
                             let hoisted_constants = optimizer.optimize(&mut trace);
-                            let (parent_trace_id, guard_index) = side_trace_ctx;
-                            crate::jit::log(|| {
-                                format!(
-                                    "⚙️  JIT: Compiling side trace (parent: #{}, guard: {})...",
-                                    parent_trace_id.0, guard_index
-                                )
-                            });
+                            crate::jit::log(|| "⚙️  JIT: Compiling root trace...".to_string());
                             let trace_id = self.jit.alloc_trace_id();
                             match JitCompiler::new().compile_trace(
                                 &trace,
                                 trace_id,
-                                Some(parent_trace_id),
                                 hoisted_constants.clone(),
                             ) {
                                 Ok(compiled_trace) => {
                                     crate::jit::log(|| {
                                         format!(
-                                            "✅ JIT: Side trace #{} compiled successfully!",
+                                            "✅ JIT: Trace #{} compiled successfully!",
                                             trace_id.0
                                         )
                                     });
-                                    if let Some(parent) = self.jit.get_trace_mut(parent_trace_id)
-                                        && guard_index < parent.guards.len()
-                                    {
-                                        parent.guards[guard_index].side_trace = Some(trace_id);
-                                        crate::jit::log(|| {
-                                            format!(
-                                                "🔗 JIT: Linked side trace #{} to parent trace #{} guard #{}",
-                                                trace_id.0, parent_trace_id.0, guard_index
-                                            )
-                                        });
-                                    }
-
-                                    self.jit.store_side_trace(compiled_trace);
+                                    crate::jit::log(|| {
+                                        "🚀 JIT: Future iterations will use native code!"
+                                            .to_string()
+                                    });
+                                    self.jit.store_root_trace(
+                                        func_idx,
+                                        loop_start_ip,
+                                        compiled_trace,
+                                    );
                                 }
 
                                 Err(e) => {
                                     crate::jit::log(|| {
-                                        format!("❌ JIT: Side trace compilation failed: {}", e)
+                                        format!("❌ JIT: Trace compilation failed: {}", e)
                                     });
+                                    self.jit.recording_aborted(func_idx, loop_start_ip);
                                 }
                             }
                         }
-                    } else {
-                        if let Some(recorder) = &mut self.trace_recorder {
-                            // Only finalise the recording when *this* loop is the
-                            // one being recorded.  With a nested loop the inner
-                            // back-edge reaches this handler while the recorder is
-                            // still part-way through the outer loop's body; taking
-                            // that partial body and installing it under the inner
-                            // loop's key produced a trace that re-initialised the
-                            // inner induction variable, never advanced the outer
-                            // one, and therefore never terminated.
-                            let recording_this_loop = recorder.trace.function_idx == func_idx
-                                && recorder.trace.start_ip == loop_start_ip;
-                            if recorder.is_recording() && recording_this_loop {
-                                crate::jit::log(|| {
-                                    format!(
-                                        "📝 JIT: Trace recording complete - {} ops recorded",
-                                        recorder.trace.ops.len()
-                                    )
-                                });
-                                let recorder = self.trace_recorder.take().unwrap();
-                                let mut trace = recorder.finish();
-                                let mut optimizer = TraceOptimizer::new();
-                                let hoisted_constants = optimizer.optimize(&mut trace);
-                                crate::jit::log(|| "⚙️  JIT: Compiling root trace...".to_string());
-                                let trace_id = self.jit.alloc_trace_id();
-                                match JitCompiler::new().compile_trace(
-                                    &trace,
-                                    trace_id,
-                                    None,
-                                    hoisted_constants.clone(),
-                                ) {
-                                    Ok(compiled_trace) => {
-                                        crate::jit::log(|| {
-                                            format!(
-                                                "✅ JIT: Trace #{} compiled successfully!",
-                                                trace_id.0
-                                            )
-                                        });
-                                        crate::jit::log(|| {
-                                            "🚀 JIT: Future iterations will use native code!"
-                                                .to_string()
-                                        });
-                                        self.jit.store_root_trace(
-                                            func_idx,
-                                            loop_start_ip,
-                                            compiled_trace,
-                                        );
-                                    }
+                    }
 
-                                    Err(e) => {
-                                        crate::jit::log(|| {
-                                            format!("❌ JIT: Trace compilation failed: {}", e)
-                                        });
-                                        self.jit.recording_aborted(func_idx, loop_start_ip);
-                                    }
-                                }
-                            }
-                        }
-
-                        if self.trace_recorder.is_none()
-                            && !self
-                                .jit
-                                .root_traces
-                                .contains_key(&(func_idx, loop_start_ip))
-                            && self.jit.should_record_root(
-                                func_idx,
-                                loop_start_ip,
-                                count,
-                                crate::jit::HOT_THRESHOLD + u32::from(loop_in_hierarchy),
+                    if self.trace_recorder.is_none()
+                        && !self
+                            .jit
+                            .root_traces
+                            .contains_key(&(func_idx, loop_start_ip))
+                        && self.jit.should_record_root(
+                            func_idx,
+                            loop_start_ip,
+                            count,
+                            crate::jit::HOT_THRESHOLD + u32::from(loop_in_hierarchy),
+                        )
+                    {
+                        crate::jit::log(|| {
+                            format!(
+                                "🔥 JIT: Hot loop detected at func {} ip {} - starting trace recording!",
+                                func_idx, loop_start_ip
                             )
+                        });
+                        let mut recorder =
+                            TraceRecorder::new(func_idx, loop_start_ip, MAX_TRACE_LENGTH);
+                        recorder.set_root_frame_index(self.call_stack.len().saturating_sub(1));
+                        // Specialize loop-invariant values at trace entry
                         {
-                            crate::jit::log(|| {
-                                format!(
-                                    "🔥 JIT: Hot loop detected at func {} ip {} - starting trace recording!",
-                                    func_idx, loop_start_ip
-                                )
-                            });
-                            let mut recorder =
-                                TraceRecorder::new(func_idx, loop_start_ip, MAX_TRACE_LENGTH);
-                            recorder.set_root_frame_index(self.call_stack.len().saturating_sub(1));
-                            // Specialize loop-invariant values at trace entry
-                            {
-                                let frame = self.call_stack.last().unwrap();
-                                let func = &self.functions[func_idx];
-                                recorder.specialize_trace_inputs(&frame.registers, func);
-                            }
-                            self.trace_recorder = Some(recorder);
-                            self.jit.recording_started();
-                            self.skip_next_trace_record = true;
+                            let frame = self.call_stack.last().unwrap();
+                            let func = &self.functions[func_idx];
+                            recorder.specialize_trace_inputs(&frame.registers, func);
                         }
+                        self.trace_recorder = Some(recorder);
+                        self.jit.recording_started();
+                        self.skip_next_trace_record = true;
                     }
                 }
             }

@@ -2795,7 +2795,7 @@ mod tests {
             bailout_ip: 9,
         });
         let compiled = crate::jit::JitCompiler::new()
-            .compile_trace(&trace, crate::jit::TraceId(0), None, Vec::new())
+            .compile_trace(&trace, crate::jit::TraceId(0), Vec::new())
             .unwrap();
         let mut registers = vec![Value::Int(2), Value::Int(3), Value::Bool(false)];
         compiled.execute(

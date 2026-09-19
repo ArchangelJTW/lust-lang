@@ -39,7 +39,6 @@ impl JitCompiler {
         &mut self,
         _trace: &Trace,
         _trace_id: TraceId,
-        _parent: Option<TraceId>,
         _hoisted_constants: Vec<(u8, Value)>,
     ) -> crate::Result<CompiledTrace> {
         Err(crate::LustError::RuntimeError {
@@ -66,7 +65,6 @@ where
 
 pub const HOT_THRESHOLD: u32 = 5;
 pub const MAX_TRACE_LENGTH: usize = 2000; // Increased to allow more loop unrolling
-pub const SIDE_EXIT_THRESHOLD: u32 = 10;
 pub const UNROLL_FACTOR: usize = 32;
 /// How many times to unroll a loop during trace recording
 pub const LOOP_UNROLL_COUNT: usize = 32;
@@ -92,8 +90,6 @@ pub struct CompiledTrace {
     /// op recorded from bytecode ip `fail_sites[k]` failed; the interpreter
     /// re-executes that instruction. `-1` is a failure without a known site.
     pub fail_sites: Vec<usize>,
-    pub parent: Option<TraceId>,
-    pub side_traces: Vec<TraceId>,
     pub hoisted_constants: Vec<(u8, Value)>,
 }
 
@@ -124,7 +120,6 @@ pub struct Guard {
     pub bailout_ip: usize,
     pub kind: GuardKind,
     pub fail_count: u32,
-    pub side_trace: Option<TraceId>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,7 +171,6 @@ pub struct JitStats {
     pub recordings_started: u64,
     pub recordings_aborted: u64,
     pub root_traces_compiled: u64,
-    pub side_traces_compiled: u64,
     pub native_trace_entries: u64,
     pub guard_exits: u64,
     pub execution_failures: u64,
@@ -261,7 +255,7 @@ impl JitState {
     pub fn store_root_trace(&mut self, func_idx: usize, ip: usize, trace: CompiledTrace) {
         let id = trace.id;
         if let Some(previous) = self.root_traces.insert((func_idx, ip), id) {
-            self.drop_trace_tree(previous);
+            self.traces.remove(&previous);
         }
         self.traces.insert(id, Rc::new(trace));
         self.next_root_recording.remove(&(func_idx, ip));
@@ -270,11 +264,11 @@ impl JitState {
     }
 
     /// Forget the root trace at a site because its guards keep failing.
-    /// The compiled code and every side trace hanging off it are freed;
-    /// the site is retried with a delay that doubles on each eviction.
+    /// The compiled code is freed; the site is retried with a delay that
+    /// doubles on each eviction.
     pub(crate) fn evict_root_trace(&mut self, func_idx: usize, ip: usize) {
         if let Some(id) = self.root_traces.remove(&(func_idx, ip)) {
-            self.drop_trace_tree(id);
+            self.traces.remove(&id);
         }
         let count = self.profiler.get_count(func_idx, ip);
         let evictions = self
@@ -286,31 +280,6 @@ impl JitState {
         let next = count.saturating_add(retry_delay);
         let entry = self.next_root_recording.entry((func_idx, ip)).or_insert(0);
         *entry = (*entry).max(next);
-    }
-
-    /// Drop a compiled trace and, recursively, the side traces its guards
-    /// link to. Traces are only ever entered through `root_traces` or a
-    /// parent's guard, so nothing else can reach them afterwards.
-    fn drop_trace_tree(&mut self, id: TraceId) {
-        let Some(trace) = self.traces.remove(&id) else {
-            return;
-        };
-        let children: Vec<TraceId> = trace
-            .guards
-            .iter()
-            .filter_map(|guard| guard.side_trace)
-            .chain(trace.side_traces.iter().copied())
-            .collect();
-        drop(trace);
-        for child in children {
-            self.drop_trace_tree(child);
-        }
-    }
-
-    pub fn store_side_trace(&mut self, trace: CompiledTrace) {
-        let id = trace.id;
-        self.traces.insert(id, Rc::new(trace));
-        self.stats.side_traces_compiled = self.stats.side_traces_compiled.saturating_add(1);
     }
 
     pub fn stats(&self) -> JitStats {
@@ -350,10 +319,6 @@ impl JitState {
     pub(crate) fn recording_aborted(&mut self, func_idx: usize, ip: usize) {
         self.stats.recordings_aborted = self.stats.recordings_aborted.saturating_add(1);
         self.schedule_root_retry(func_idx, ip);
-    }
-
-    pub(crate) fn side_recording_aborted(&mut self) {
-        self.stats.recordings_aborted = self.stats.recordings_aborted.saturating_add(1);
     }
 
     pub(crate) fn schedule_root_retry(&mut self, func_idx: usize, ip: usize) {

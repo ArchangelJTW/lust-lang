@@ -44,7 +44,6 @@ impl JitCompiler {
                 ValueType::Struct => GuardKind::IntType { register },
             },
             fail_count: 0,
-            side_trace: None,
         })
     }
 
@@ -135,7 +134,6 @@ impl JitCompiler {
             bailout_ip: self.guard_bailout_ip(),
             kind,
             fail_count: 0,
-            side_trace: None,
         })
     }
 
@@ -179,7 +177,6 @@ impl JitCompiler {
                 expected: expected_ptr,
             },
             fail_count: 0,
-            side_trace: None,
         })
     }
 
@@ -212,7 +209,6 @@ impl JitCompiler {
             bailout_ip: self.guard_bailout_ip(),
             kind: GuardKind::StructLayout { register, layout },
             fail_count: 0,
-            side_trace: None,
         })
     }
 
@@ -268,7 +264,6 @@ impl JitCompiler {
                 loop_start_ip,
             },
             fail_count: 0,
-            side_trace: None,
         }
     }
 
@@ -343,7 +338,6 @@ impl JitCompiler {
             bailout_ip,
             kind,
             fail_count: 0,
-            side_trace: None,
         })
     }
 }

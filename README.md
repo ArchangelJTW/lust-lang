@@ -192,19 +192,42 @@ language work, not implied current behavior.
 
 ## JIT activation
 
-The tracing JIT profiles backward bytecode jumps and starts recording an
-ordinary hot loop after five observed backedges. Successful non-nested traces
-remain cached across normal loop exits, and a recording that ends too early or
-aborts is retried with bounded exponential backoff. Loop hierarchies use an
-extra warmup iteration and conservative one-shot roots until linked side traces
-can safely resume through every nested exit.
+The tracing JIT (x86_64 and aarch64 backends; an rv32 backend exists for
+riscv32 targets) profiles backward bytecode jumps and starts recording an
+ordinary hot loop after five observed backedges. A compiled trace stays cached
+across its normal exits (the loop condition failing, a nested loop being
+entered); only a guard that fails on something the trace assumed evicts it,
+after which the site is retried with bounded exponential backoff. A nested
+loop gets its own root trace, which the outer loop's trace calls directly, so
+loop nests run natively end to end.
 
-Non-inlined Lust calls are opaque operations inside a loop trace. This allows a
-hot loop to remain native while a branch-heavy or recursive callee executes
-through the safe interpreter call helper. Pure direct or mutual recursion has
-no backward jump, so calls are profiled but the recursive function itself is
-not yet compiled; general recursion requires a separate finite-function JIT
-mode rather than the cyclic loop-trace compiler.
+Straight-line Lust functions and struct methods are inlined into the trace;
+other calls are opaque operations inside it, so a hot loop stays native while a
+branch-heavy or recursive callee executes through the interpreter. Pure direct
+or mutual recursion has no backward jump, so the recursive function itself is
+not compiled; general recursion requires a separate finite-function JIT mode
+rather than the cyclic loop-trace compiler.
+
+Environment switches, read once at VM creation:
+
+- `LUST_JIT=0` disables the JIT entirely (the interpreter is the reference
+  semantics; use this to check a result against it).
+- `LUST_JIT_NOPIN=1` keeps the JIT but disables register pinning on aarch64,
+  for bisecting and benchmarking.
+
+Two tools check the JIT against the interpreter, and should be run on every
+backend change:
+
+- `examples/jit_diff.py` runs every program under `examples/` with `LUST_JIT=0`
+  and with the JIT and diffs the outputs.
+- `cargo build --release -p lust-fuzz` builds a seeded random-program
+  differential fuzzer (a workspace member, so it is not built by a plain
+  `cargo build`). `lust-fuzz run --cases 20000 --size 4 --jobs 6 --keep-going`
+  generates programs, runs each both ways in-process and reports every
+  disagreement with a shrunk reproducer; `lust-fuzz one --seed S` prints a
+  program and `lust-fuzz replay --seed S` reruns it with timings. `--size`
+  scales program length, `--fg` runs the workers at normal priority (they
+  default to background QoS), and a watchdog kills cases over 120 s or 2 GB.
 
 Embedders can inspect cumulative activation counters after calling Lust code:
 

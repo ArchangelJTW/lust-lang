@@ -2,14 +2,8 @@ use super::*;
 impl VM {
     pub(super) fn abandon_trace_recording(&mut self) {
         if let Some(recorder) = self.trace_recorder.take() {
-            if self.side_trace_context.take().is_none() {
-                self.jit
-                    .recording_aborted(recorder.trace.function_idx, recorder.trace.start_ip);
-            } else {
-                self.jit.side_recording_aborted();
-            }
-        } else {
-            self.side_trace_context = None;
+            self.jit
+                .recording_aborted(recorder.trace.function_idx, recorder.trace.start_ip);
         }
         self.skip_next_trace_record = false;
     }
@@ -143,12 +137,10 @@ impl VM {
         }
     }
 
-    /// Count a guard exit. Nested loops run through their own root trace
-    /// from inside the outer trace (`jit_run_nested_loop`), so no guard kind
-    /// grows a side trace any more; the side-trace recording that used to
-    /// start here after `SIDE_EXIT_THRESHOLD` failures produced a loop trace
-    /// whose completion left the frame's ip at the outer back-edge rather
-    /// than at the inner loop's exit.
+    /// Count a guard exit. (Side traces used to be recorded from here once a
+    /// `NestedLoop` guard had failed often enough; nested loops now run
+    /// through their own root trace from inside the outer trace instead,
+    /// see `jit_run_nested_loop`.)
     pub(super) fn handle_guard_failure(
         &mut self,
         trace_id: crate::jit::TraceId,

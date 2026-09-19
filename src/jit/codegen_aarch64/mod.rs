@@ -192,7 +192,7 @@ mod tests {
             outputs: vec![0],
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
         let string = Rc::new("old register value".to_string());
         let mut registers = vec![Value::String(string.clone())];
@@ -222,7 +222,7 @@ mod tests {
             outputs: Vec::new(),
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
         let mut registers = vec![Value::Bool(false)];
 
@@ -268,7 +268,7 @@ mod tests {
             outputs: vec![2],
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
         let mut registers = vec![
             Value::Int(3),
@@ -404,7 +404,7 @@ mod tests {
                             trace.ops.insert(2, TraceOp::Move { dest: 3, src: 2 });
                         }
                         let compiled = JitCompiler::new()
-                            .compile_trace(&trace, TraceId(0), None, Vec::new())
+                            .compile_trace(&trace, TraceId(0), Vec::new())
                             .unwrap();
                         let mut registers = vec![
                             left.clone(),
@@ -478,7 +478,7 @@ mod tests {
             outputs: vec![3, 5, 6],
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
         let old_condition = Rc::new("condition".to_string());
         let old_constant = Rc::new("constant".to_string());
@@ -542,7 +542,7 @@ mod tests {
             outputs: vec![2],
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&comparison_trace, TraceId(0), None, Vec::new())
+            .compile_trace(&comparison_trace, TraceId(0), Vec::new())
             .unwrap();
         let mut registers = vec![
             Value::Int(1),
@@ -595,7 +595,7 @@ mod tests {
             outputs: vec![4, 5],
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&constant_trace, TraceId(1), None, Vec::new())
+            .compile_trace(&constant_trace, TraceId(1), Vec::new())
             .unwrap();
         let mut registers = vec![
             Value::Int(1),
@@ -636,7 +636,7 @@ mod tests {
             outputs: vec![0],
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
         let mut registers = vec![Value::Nil, Value::Int(7), Value::Int(0)];
 
@@ -682,7 +682,7 @@ mod tests {
             outputs: vec![0, 1],
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
         let mut registers = vec![Value::Nil, Value::Nil, Value::Int(-7), Value::Int(2)];
 
@@ -738,7 +738,7 @@ mod tests {
                 outputs: vec![0],
             };
             let compiled = JitCompiler::new()
-                .compile_trace(&trace, TraceId(0), None, Vec::new())
+                .compile_trace(&trace, TraceId(0), Vec::new())
                 .unwrap();
             let mut registers = vec![Value::Nil, lhs.clone(), rhs.clone()];
             let result = compiled.execute(
@@ -777,7 +777,7 @@ mod tests {
                 outputs: vec![0],
             };
             let compiled = JitCompiler::new()
-                .compile_trace(&trace, TraceId(0), None, Vec::new())
+                .compile_trace(&trace, TraceId(0), Vec::new())
                 .unwrap();
             let mut registers = vec![Value::Nil, lhs, rhs];
             let result = compiled.execute(
@@ -855,7 +855,7 @@ mod tests {
             outputs: (0..=5).collect(),
         };
         let compiled = JitCompiler::new()
-            .compile_trace(&trace, TraceId(0), None, Vec::new())
+            .compile_trace(&trace, TraceId(0), Vec::new())
             .unwrap();
         let mut registers = vec![
             Value::Nil,

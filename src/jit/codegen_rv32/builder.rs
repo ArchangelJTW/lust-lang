@@ -77,7 +77,6 @@ impl JitCompiler {
         &mut self,
         trace: &Trace,
         trace_id: TraceId,
-        parent: Option<TraceId>,
         hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
         let frame_size = Self::compute_frame_size(trace);
@@ -237,8 +236,6 @@ impl JitCompiler {
             trace: trace.clone(),
             guards,
             fail_sites: Vec::new(),
-            parent,
-            side_traces: Vec::new(),
             hoisted_constants,
         })
     }
@@ -594,7 +591,6 @@ impl JitCompiler {
                             loop_start_ip: *loop_start_ip,
                         },
                         fail_count: 0,
-                        side_trace: None,
                     });
                     dynasm!(self.ops
                         ; .arch riscv32i

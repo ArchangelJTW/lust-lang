@@ -56,7 +56,6 @@ struct Stats {
     /// Cases where the JIT actually ran native code.
     native: u64,
     root_traces: u64,
-    side_traces: u64,
     native_entries: u64,
     guard_exits: u64,
     runtime_errors: u64,
@@ -68,7 +67,6 @@ impl Stats {
         self.agreed += o.agreed;
         self.native += o.native;
         self.root_traces += o.root_traces;
-        self.side_traces += o.side_traces;
         self.native_entries += o.native_entries;
         self.guard_exits += o.guard_exits;
         self.runtime_errors += o.runtime_errors;
@@ -326,8 +324,8 @@ fn run(s: &Settings) {
         t.runtime_errors
     );
     println!(
-        "jit: {} root traces, {} side traces, {} native entries, {} guard exits",
-        t.root_traces, t.side_traces, t.native_entries, t.guard_exits
+        "jit: {} root traces, {} native entries, {} guard exits",
+        t.root_traces, t.native_entries, t.guard_exits
     );
     let fs = findings.lock().unwrap();
     for f in fs.iter() {
@@ -372,7 +370,6 @@ fn run_case(program: &Program, seed: u64, stats: &mut Stats) -> Option<Finding> 
         Err(message) => return finding(Kind::Broke { message }),
     };
     stats.root_traces += jit.root_traces;
-    stats.side_traces += jit.side_traces;
     stats.native_entries += jit.native_entries;
     stats.guard_exits += jit.guard_exits;
     if jit.native_entries > 0 {

@@ -67,7 +67,6 @@ impl JitCompiler {
         &mut self,
         trace: &Trace,
         trace_id: TraceId,
-        parent: Option<TraceId>,
         hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
         self.scalar_registers.clear();
@@ -199,7 +198,7 @@ impl JitCompiler {
                 path.push(format!(
                     "jit_trace_{}_{}.bin",
                     trace_id.0,
-                    parent.map(|p| p.0).unwrap_or(trace.function_idx)
+                    trace.function_idx
                 ));
                 if let Err(err) = fs::write(&path, bytes) {
                     crate::jit::log(|| {
@@ -219,8 +218,6 @@ impl JitCompiler {
             trace: trace.clone(),
             guards,
             fail_sites: mem::take(&mut self.fail_sites),
-            parent,
-            side_traces: Vec::new(),
             hoisted_constants,
         })
     }
@@ -1005,7 +1002,6 @@ impl JitCompiler {
                 }
             },
             fail_count: 0,
-            side_trace: None,
         }))
     }
 

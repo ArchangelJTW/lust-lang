@@ -1,0 +1,21 @@
+-- A hot loop reads a module-level variable, which is a global to the VM.
+-- The trace snapshots it under a version guard; the assignment between
+-- calls bumps the version, so the stale trace exits and is replaced.
+local step: int = 1
+
+function total(n: int): int
+    local t: int = 0
+    local i: int = 0
+    while i < n do
+        t = t + step
+        i = i + 1
+    end
+    return t
+end
+
+println(total(200))
+println(total(200))
+step = 5
+println(total(200))
+step = -2
+println(total(200))

@@ -178,6 +178,7 @@ impl JitCompiler {
         condition_dest: u8,
         array: u8,
         index: u8,
+        value_type: Option<ValueType>,
     ) -> Result<()> {
         unsafe extern "C" {
             fn jit_array_index_ok_safe(
@@ -186,6 +187,114 @@ impl JitCompiler {
                 value_out: *mut Value,
                 condition_out: *mut Value,
             ) -> u8;
+        }
+
+        if let (Some(layout), true) = (
+            jit::layout::rc_vec_layout(),
+            self.scalar_registers.get(&index) == Some(&ValueType::Int),
+        ) {
+            // Inline: bounds from the Vec's length, a scalar element copied
+            // as tag + payload. An element that owns something, or a
+            // destination that does, goes through the helper.
+            let array_tag = ValueTag::Array.as_u8() as u32;
+            let scalar_max_tag = ValueTag::Float.as_u8() as u32;
+            let rc_offset = layout.array_rc_offset as u32;
+            let len_offset = layout.len_offset as u32;
+            let ptr_offset = layout.ptr_offset as u32;
+            let done = self.ops.new_dynamic_label();
+            let out_of_range = self.ops.new_dynamic_label();
+            let slow = self.ops.new_dynamic_label();
+            self.load_tag(0, array);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #array_tag
+                ; b.ne => slow
+            );
+            self.load_payload(12, index);
+            self.emit_reg_addr(11, array);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x9, [x11, #rc_offset]
+                ; ldr x10, [x9, #len_offset]
+                ; cmp x12, x10
+                ; b.hs => out_of_range
+                ; ldr x10, [x9, #ptr_offset]
+                ; add x10, x10, x12, lsl #6
+                ; ldrb w9, [x10]
+            );
+            if let Some(ty) = value_type {
+                // An element of the expected scalar type: a typed store,
+                // after which the destination is known to hold that type.
+                // Any other element fails to the interpreter.
+                let expected_tag = match ty {
+                    ValueType::Int => ValueTag::Int,
+                    ValueType::Float => ValueTag::Float,
+                    _ => ValueTag::Bool,
+                }
+                .as_u8() as u32;
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w9, #expected_tag
+                    ; b.ne >fail
+                );
+                match ty {
+                    ValueType::Float => {
+                        dynasm!(self.ops ; .arch aarch64 ; ldr d0, [x10, 8]);
+                        self.store_d0_as_float(value_dest);
+                    }
+                    ValueType::Int => {
+                        dynasm!(self.ops ; .arch aarch64 ; ldr x0, [x10, 8]);
+                        self.store_from_x0(value_dest, ValueTag::Int.as_u8());
+                    }
+                    _ => {
+                        dynasm!(self.ops ; .arch aarch64 ; ldrb w0, [x10, 8]);
+                        self.store_from_x0(value_dest, ValueTag::Bool.as_u8());
+                    }
+                }
+                self.pending_scalar = Some((value_dest, ty));
+            } else {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w9, #scalar_max_tag
+                    ; b.hi => slow
+                );
+                // The destination must hold nothing owned for a plain copy.
+                self.load_tag_from_memory(13, value_dest);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w13, #scalar_max_tag
+                    ; b.hi => slow
+                    ; ldp x0, x1, [x10]
+                );
+                self.emit_reg_addr(11, value_dest);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; stp x0, x1, [x11]
+                );
+            }
+            dynasm!(self.ops ; .arch aarch64 ; movz x0, 1);
+            self.store_from_x0(condition_dest, ValueTag::Bool.as_u8());
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; b => done
+                ; => out_of_range
+            );
+            self.compile_load_const(value_dest, &Value::Nil)?;
+            dynasm!(self.ops ; .arch aarch64 ; mov x0, xzr);
+            self.store_from_x0(condition_dest, ValueTag::Bool.as_u8());
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; b => done
+                ; => slow
+            );
+            self.emit_reg_addr(0, array);
+            self.emit_reg_addr(1, index);
+            self.emit_reg_addr(2, value_dest);
+            self.emit_reg_addr(3, condition_dest);
+            self.emit_call(jit_array_index_ok_safe as *const ());
+            self.emit_fail_if_w0_zero();
+            dynasm!(self.ops ; .arch aarch64 ; => done);
+            return Ok(());
         }
 
         self.emit_reg_addr(0, array);
@@ -209,6 +318,18 @@ impl JitCompiler {
             ; cmp w0, #array_tag
             ; b.ne >fail
         );
+        if let Some(layout) = jit::layout::rc_vec_layout() {
+            let rc_offset = layout.array_rc_offset as u32;
+            let len_offset = layout.len_offset as u32;
+            self.emit_reg_addr(11, array);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x9, [x11, #rc_offset]
+                ; ldr x0, [x9, #len_offset]
+            );
+            self.store_from_x0(dest, ValueTag::Int.as_u8());
+            return Ok(());
+        }
         self.emit_reg_addr(0, array);
         self.emit_call(jit_array_len_safe as *const ());
         // `tbnz` only reaches ±32 KB; traces can be larger, so branch on
@@ -232,10 +353,11 @@ impl JitCompiler {
         _is_weak: bool,
     ) -> Result<()> {
         unsafe extern "C" {
-            fn jit_get_field_safe(
+            fn jit_get_field_keyed(
                 object_ptr: *const Value,
                 field_name_ptr: *const u8,
                 field_name_len: usize,
+                key: *const Value,
                 out: *mut Value,
             ) -> u8;
             fn jit_get_field_indexed_safe(
@@ -245,6 +367,67 @@ impl JitCompiler {
             ) -> u8;
         }
 
+        if let (Some(index), Some(ty), Some(layout), false) = (
+            field_index,
+            _value_type.filter(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool)),
+            jit::layout::rc_vec_layout(),
+            _is_weak,
+        ) {
+            // A scalar field read inline: struct tag, field count, element
+            // tag are each checked, and anything unexpected fails to the
+            // interpreter, which re-executes the read. The field is a
+            // scalar of the recorded type afterwards.
+            let expected_tag = match ty {
+                ValueType::Int => ValueTag::Int,
+                ValueType::Float => ValueTag::Float,
+                _ => ValueTag::Bool,
+            }
+            .as_u8() as u32;
+            let struct_tag = ValueTag::Struct.as_u8() as u32;
+            let fields_offset = layout.struct_fields_offset as u32;
+            let len_offset = layout.len_offset as u32;
+            let ptr_offset = layout.ptr_offset as u32;
+            let element = (index * mem::size_of::<Value>()) as i32;
+            self.load_tag(0, object);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #struct_tag
+                ; b.ne >fail
+            );
+            self.emit_reg_addr(11, object);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x9, [x11, #fields_offset]
+                ; ldr x10, [x9, #len_offset]
+                ; cmp x10, #index as u32
+                ; b.ls >fail
+                ; ldr x10, [x9, #ptr_offset]
+            );
+            self.emit_add_imm(10, 10, element);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldrb w9, [x10]
+                ; cmp w9, #expected_tag
+                ; b.ne >fail
+            );
+            match ty {
+                ValueType::Float => {
+                    dynasm!(self.ops ; .arch aarch64 ; ldr d0, [x10, 8]);
+                    self.store_d0_as_float(dest);
+                }
+                ValueType::Int => {
+                    dynasm!(self.ops ; .arch aarch64 ; ldr x0, [x10, 8]);
+                    self.store_from_x0(dest, ValueTag::Int.as_u8());
+                }
+                _ => {
+                    dynasm!(self.ops ; .arch aarch64 ; ldrb w0, [x10, 8]);
+                    self.store_from_x0(dest, ValueTag::Bool.as_u8());
+                }
+            }
+            self.pending_scalar = Some((dest, ty));
+            return Ok(());
+        }
+
         if let Some(index) = field_index {
             self.emit_reg_addr(0, object);
             self.emit_mov_imm64(1, index as u64);
@@ -252,11 +435,13 @@ impl JitCompiler {
             self.emit_call(jit_get_field_indexed_safe as *const ());
         } else {
             let (field_name_ptr, field_name_len) = self.retain_string(field_name);
+            let key = self.retain_value(Value::String(alloc::rc::Rc::new(field_name.to_string())));
             self.emit_reg_addr(0, object);
             self.emit_mov_imm64(1, field_name_ptr as usize as u64);
             self.emit_mov_imm64(2, field_name_len as u64);
-            self.emit_reg_addr(3, dest);
-            self.emit_call(jit_get_field_safe as *const ());
+            self.emit_mov_imm64(3, key as usize as u64);
+            self.emit_reg_addr(4, dest);
+            self.emit_call(jit_get_field_keyed as *const ());
         }
         self.emit_fail_if_w0_zero();
 
@@ -289,6 +474,83 @@ impl JitCompiler {
                 field_index: usize,
                 value_ptr: *const Value,
             ) -> u8;
+        }
+
+        let value_ty = self
+            .scalar_registers
+            .get(&value)
+            .copied()
+            .filter(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool));
+        if let (Some(index), Some(ty), Some(layout), false) =
+            (field_index, value_ty, jit::layout::rc_vec_layout(), _is_weak)
+        {
+            // A scalar store inline when the field currently holds the same
+            // scalar kind and the struct is not borrowed; any other
+            // situation goes through the helper, which does the full
+            // canonicalization and borrow handling.
+            let expected_tag = match ty {
+                ValueType::Int => ValueTag::Int,
+                ValueType::Float => ValueTag::Float,
+                _ => ValueTag::Bool,
+            }
+            .as_u8() as u32;
+            let struct_tag = ValueTag::Struct.as_u8() as u32;
+            let fields_offset = layout.struct_fields_offset as u32;
+            let len_offset = layout.len_offset as u32;
+            let ptr_offset = layout.ptr_offset as u32;
+            let borrow_offset = layout.borrow_offset as u32;
+            let element = (index * mem::size_of::<Value>()) as i32;
+            let done = self.ops.new_dynamic_label();
+            self.load_tag(0, object);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #struct_tag
+                ; b.ne >slow
+            );
+            self.emit_reg_addr(11, object);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x9, [x11, #fields_offset]
+                ; ldr x10, [x9, #borrow_offset]
+                ; cbnz x10, >slow
+                ; ldr x10, [x9, #len_offset]
+                ; cmp x10, #index as u32
+                ; b.ls >slow
+                ; ldr x10, [x9, #ptr_offset]
+            );
+            self.emit_add_imm(10, 10, element);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldrb w9, [x10]
+                ; cmp w9, #expected_tag
+                ; b.ne >slow
+            );
+            match ty {
+                ValueType::Float => {
+                    self.load_payload_f(0, value);
+                    dynasm!(self.ops ; .arch aarch64 ; str d0, [x10, 8]);
+                }
+                ValueType::Int => {
+                    self.load_payload(0, value);
+                    dynasm!(self.ops ; .arch aarch64 ; str x0, [x10, 8]);
+                }
+                _ => {
+                    self.load_bool_payload(0, value);
+                    dynasm!(self.ops ; .arch aarch64 ; strb w0, [x10, 8]);
+                }
+            }
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; b => done
+                ; slow:
+            );
+            self.emit_reg_addr(0, object);
+            self.emit_mov_imm64(1, index as u64);
+            self.emit_reg_addr(2, value);
+            self.emit_call(jit_set_field_indexed_safe as *const ());
+            self.emit_fail_if_w0_zero();
+            dynasm!(self.ops ; .arch aarch64 ; => done);
+            return Ok(());
         }
 
         if let Some(index) = field_index {
@@ -416,6 +678,7 @@ impl JitCompiler {
             ) -> u8;
         }
 
+        self.emit_call_ip();
         dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
         self.emit_reg_addr(1, callee);
         self.emit_mov_imm64(2, expected_ptr as usize as u64);
@@ -469,6 +732,7 @@ impl JitCompiler {
         self.emit_mov_imm32(3, arg_count as u32);
         self.emit_mov_imm32(4, dest as u32);
         self.emit_call_result_out(5, dest);
+        self.emit_call_ip();
         self.emit_call(jit_call_function_safe as *const ());
         self.emit_fail_if_w0_zero();
         self.emit_reload_registers_base();
@@ -480,6 +744,20 @@ impl JitCompiler {
     /// is stable and is passed directly. At depth zero the VM may reallocate
     /// its register file during the call, so the helper writes the result by
     /// index into the current frame instead (and x19 is reloaded after).
+    /// `JIT_CALL_IP = ip of the call being compiled`, for the helper about
+    /// to run it (unknown inside an inlined body, whose frame the
+    /// interpreter does not have). Clobbers x11/x12 only.
+    fn emit_call_ip(&mut self) {
+        let ip = if self.inline_depth == 0 {
+            self.current_fail_ip.unwrap_or(usize::MAX)
+        } else {
+            usize::MAX
+        };
+        self.emit_mov_imm64(11, jit::call_ip_cell() as u64);
+        self.emit_mov_imm64(12, ip as u64);
+        dynasm!(self.ops ; .arch aarch64 ; str x12, [x11]);
+    }
+
     fn emit_call_result_out(&mut self, x: u8, dest: u8) {
         if self.inline_depth > 0 {
             self.emit_reg_addr(x, dest);

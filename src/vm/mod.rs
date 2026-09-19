@@ -172,6 +172,10 @@ pub struct VM {
     pub(super) call_meta: Vec<CallMeta>,
     pub(super) natives: HashMap<String, Value>,
     pub(super) globals: HashMap<String, Value>,
+    /// Bumped on every change to `globals` or `natives`. Traces snapshot
+    /// the globals they read and guard on this counter (see
+    /// `TraceOp::GuardGlobals`).
+    pub(crate) globals_version: u64,
     pub(super) map_hasher: DefaultHashBuilder,
     /// Frames are boxed: a `CallFrame` carries 16 KB of inline registers,
     /// and moving that into and out of the stack on every call dominated
@@ -411,6 +415,7 @@ impl Drop for VM {
         self.functions.clear();
         self.natives.clear();
         self.globals.clear();
+        self.globals_version = self.globals_version.wrapping_add(1);
         self.call_stack.clear();
         self.pending_return_value = None;
         self.pending_task_signal = None;

@@ -23,6 +23,7 @@ impl JitCompiler {
             function_epilogue: None,
             function_labels: HashMap::new(),
             exit_is_handoff: false,
+            pending_scalar: None,
             current_fail_ip: None,
             fail_sites: Vec::new(),
             next_specialized_id: 0,
@@ -790,8 +791,15 @@ impl JitCompiler {
                     condition_dest,
                     array,
                     index,
+                    value_type,
                 } => {
-                    self.compile_array_index_ok(*value_dest, *condition_dest, *array, *index)?;
+                    self.compile_array_index_ok(
+                        *value_dest,
+                        *condition_dest,
+                        *array,
+                        *index,
+                        *value_type,
+                    )?;
                 }
 
                 TraceOp::ArrayLen { dest, array } => {
@@ -816,6 +824,13 @@ impl JitCompiler {
                         expected_ptr,
                         *guard_index as usize,
                     )?;
+                    guards.push(guard);
+                    *guard_index += 1;
+                }
+
+                TraceOp::GuardGlobals { version } => {
+                    crate::jit::log(|| format!("🔒 JIT: guard globals version {}", version));
+                    let guard = self.compile_guard_globals(*version, *guard_index as usize);
                     guards.push(guard);
                     *guard_index += 1;
                 }
@@ -1175,6 +1190,9 @@ impl JitCompiler {
                 }
             }
             self.update_scalar_registers(op);
+            if let Some((reg, ty)) = self.pending_scalar.take() {
+                self.scalar_registers.insert(reg, ty);
+            }
             if Self::op_may_fail(op) {
                 self.emit_fail_stub();
             }
@@ -1384,6 +1402,7 @@ impl JitCompiler {
                 | TraceOp::ArrayIndexOk { .. }
                 | TraceOp::ArrayLen { .. }
                 | TraceOp::GuardNativeFunction { .. }
+                | TraceOp::GuardGlobals { .. }
                 | TraceOp::GuardStructLayout { .. }
                 | TraceOp::GuardFunction { .. }
                 | TraceOp::GuardClosure { .. }
@@ -1420,7 +1439,7 @@ impl JitCompiler {
         let in_args =
             |first: u8, count: u8| register >= first && register < first.saturating_add(count);
         match op {
-            TraceOp::At { .. } | TraceOp::LoadConst { .. } => false,
+            TraceOp::At { .. } | TraceOp::LoadConst { .. } | TraceOp::GuardGlobals { .. } => false,
             TraceOp::Move { src, .. } | TraceOp::Neg { src, .. } => *src == register,
             TraceOp::Add { lhs, rhs, .. }
             | TraceOp::Sub { lhs, rhs, .. }
@@ -1706,6 +1725,7 @@ impl JitCompiler {
             }
             TraceOp::SetField { .. }
             | TraceOp::GuardNativeFunction { .. }
+            | TraceOp::GuardGlobals { .. }
             | TraceOp::GuardStructLayout { .. }
             | TraceOp::GuardFunction { .. }
             | TraceOp::GuardClosure { .. }
@@ -1954,8 +1974,12 @@ impl JitCompiler {
                     .filter(|ty| matches!(ty, ValueType::Int | ValueType::Bool | ValueType::Float))
             });
             if let Some(ret_reg) = trace.return_register {
-                if result_type.is_some() {
-                    self.load_payload(22, ret_reg);
+                if let Some(ty) = result_type {
+                    if ty == ValueType::Bool {
+                        self.load_bool_payload(22, ret_reg);
+                    } else {
+                        self.load_payload(22, ret_reg);
+                    }
                 } else {
                     self.current_fail_ip = callee_last_ip;
                     let dest_offset = (dest as i32) * value_size;

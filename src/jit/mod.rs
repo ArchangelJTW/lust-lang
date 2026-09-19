@@ -1,6 +1,7 @@
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 pub mod codegen;
 pub mod function;
+pub mod layout;
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 pub mod codegen_aarch64;
 #[cfg(all(feature = "rv32", target_arch = "riscv32"))]
@@ -23,7 +24,7 @@ pub use codegen_rv32::JitCompiler;
 )))]
 pub struct JitCompiler;
 use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 pub use optimizer::TraceOptimizer;
 pub use profiler::{HotSpot, Profiler};
 pub use trace::{Trace, TraceOp, TraceRecorder};
@@ -92,6 +93,32 @@ std::thread_local! {
     /// call and restored on return. A call with no budget left is handed
     /// to the interpreter, which raises the overflow.
     pub static JIT_DEPTH_BUDGET: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    /// Bytecode ip of the call a trace is making through a runtime helper
+    /// (`jit_call_function_safe` / `jit_call_native_safe`), stored just
+    /// before the call so the caller's frame can show the right line in a
+    /// stack trace; `usize::MAX` when unknown (a call from an inlined body,
+    /// whose frame is not on the interpreter's stack). The helper resets it.
+    pub static JIT_CALL_IP: core::cell::Cell<usize> = const { core::cell::Cell::new(usize::MAX) };
+}
+
+/// Address of this thread's `JIT_CALL_IP` cell, for compiled code.
+#[cfg(feature = "std")]
+pub fn call_ip_cell() -> usize {
+    JIT_CALL_IP.with(|cell| cell as *const _ as usize)
+}
+
+/// Take the call ip a trace stored for the helper call in progress.
+#[cfg(feature = "std")]
+pub fn take_call_ip() -> Option<usize> {
+    JIT_CALL_IP.with(|cell| {
+        let ip = cell.replace(usize::MAX);
+        (ip != usize::MAX).then_some(ip)
+    })
+}
+
+#[cfg(not(feature = "std"))]
+pub fn take_call_ip() -> Option<usize> {
+    None
 }
 
 /// Address of this thread's `JIT_DEPTH_BUDGET` cell, for compiled code.
@@ -125,7 +152,11 @@ pub const MAX_TRACE_LENGTH: usize = 2000; // Increased to allow more loop unroll
 pub const UNROLL_FACTOR: usize = 32;
 /// How many times to unroll a loop during trace recording
 pub const LOOP_UNROLL_COUNT: usize = 32;
-const MAX_ROOT_RETRY_SHIFT: u32 = 5;
+/// Cap on the recording-abort backoff, same shape as the eviction one
+/// below. A loop the recorder can never trace (a global store, say) used to
+/// be re-recorded every 32 back-edges for the life of the program, which
+/// made recording overhead the main cost of running it.
+const MAX_ROOT_RETRY_SHIFT: u32 = 16;
 /// Cap on the eviction backoff: a root trace that keeps exiting is retried
 /// after 1, 2, 4, ... 2^16 backedges, so a site that never stabilises costs
 /// O(log n) compiles rather than one every few iterations.
@@ -208,6 +239,10 @@ pub enum GuardKind {
         register: u8,
         expected: *const (),
     },
+    /// `VM::globals_version` no longer matches the snapshots the trace took.
+    Globals {
+        version: u64,
+    },
     StructLayout {
         register: u8,
         layout: *const (),
@@ -241,12 +276,27 @@ pub struct JitStats {
     pub recursive_calls: u64,
 }
 
+/// A stdlib native the recorder knows the meaning of, so a call to it on a
+/// specialized array becomes the matching `SpecializedOpKind` instead of
+/// a native call the array would have to escape to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intrinsic {
+    ArrayPush,
+    ArrayLen,
+}
+
 pub struct JitState {
     pub profiler: Profiler,
     pub traces: HashMap<TraceId, Rc<CompiledTrace>>,
     pub root_traces: HashMap<(usize, usize), TraceId>,
     next_root_recording: HashMap<(usize, usize), u32>,
     root_recording_failures: HashMap<(usize, usize), u32>,
+    /// Loop sites whose trace input arrays must not be specialized: a
+    /// recording there mutated a specialized array and then let it escape
+    /// (to a native, a call, a store), which the unboxed copy cannot follow.
+    pub no_specialize_sites: HashSet<(usize, usize)>,
+    /// Native functions the recorder may specialize, by `Rc` pointer.
+    pub intrinsics: HashMap<usize, Intrinsic>,
     /// Times a compiled root trace at this site was evicted after a guard
     /// exit. Unlike recording failures this is never reset by a successful
     /// compile, so the retry delay keeps growing for a site that thrashes.
@@ -289,6 +339,8 @@ impl JitState {
             root_traces: HashMap::new(),
             next_root_recording: HashMap::new(),
             root_recording_failures: HashMap::new(),
+            no_specialize_sites: HashSet::new(),
+            intrinsics: HashMap::new(),
             root_evictions: HashMap::new(),
             next_trace_id: 0,
             enabled,

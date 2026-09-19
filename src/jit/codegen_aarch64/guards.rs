@@ -172,6 +172,32 @@ impl JitCompiler {
         })
     }
 
+    /// `VM::globals_version == version`, else exit (the trace's global
+    /// snapshots are stale, so the exit evicts it).
+    pub(super) fn compile_guard_globals(&mut self, version: u64, guard_index: usize) -> Guard {
+        let guard_return_value = (guard_index + 1) as i32;
+        let offset = core::mem::offset_of!(crate::vm::VM, globals_version) as u64;
+        self.emit_mov_imm64(10, offset);
+        self.emit_mov_imm64(11, version);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x9, [x20, x10]
+            ; cmp x9, x11
+            ; b.eq >guard_ok
+        );
+        self.emit_guard_exit(guard_return_value);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; guard_ok:
+        );
+        Guard {
+            index: guard_index,
+            bailout_ip: self.guard_bailout_ip(),
+            kind: GuardKind::Globals { version },
+            fail_count: 0,
+        }
+    }
+
     pub(super) fn compile_guard_struct_layout(
         &mut self,
         register: u8,

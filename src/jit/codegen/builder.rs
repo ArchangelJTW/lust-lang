@@ -11,6 +11,7 @@ impl JitCompiler {
             specialization_registry: SpecializationRegistry::new(),
             specialized_values: HashMap::new(),
             scalar_registers: HashMap::new(),
+            pending_scalar: None,
             trace_start_ip: 0,
             function_mode: false,
             function_frame: (0, true),
@@ -598,8 +599,15 @@ impl JitCompiler {
                     condition_dest,
                     array,
                     index,
+                    value_type,
                 } => {
-                    self.compile_array_index_ok(*value_dest, *condition_dest, *array, *index)?;
+                    self.compile_array_index_ok(
+                        *value_dest,
+                        *condition_dest,
+                        *array,
+                        *index,
+                        *value_type,
+                    )?;
                 }
 
                 TraceOp::ArrayLen { dest, array } => {
@@ -624,6 +632,13 @@ impl JitCompiler {
                         expected_ptr,
                         *guard_index as usize,
                     )?;
+                    guards.push(guard);
+                    *guard_index += 1;
+                }
+
+                TraceOp::GuardGlobals { version } => {
+                    crate::jit::log(|| format!("🔒 JIT: guard globals version {}", version));
+                    let guard = self.compile_guard_globals(*version, *guard_index as usize);
                     guards.push(guard);
                     *guard_index += 1;
                 }
@@ -718,6 +733,7 @@ impl JitCompiler {
                     self.scalar_registers = outer_scalar_registers;
                     let result_type = result?;
                     self.update_scalar_registers(op);
+                    self.pending_scalar = None;
                     if let Some(ty) = result_type {
                         self.scalar_registers.insert(*dest, ty);
                     }
@@ -984,6 +1000,9 @@ impl JitCompiler {
                 }
             }
             self.update_scalar_registers(op);
+            if let Some((reg, ty)) = self.pending_scalar.take() {
+                self.scalar_registers.insert(reg, ty);
+            }
             if Self::op_may_fail(op) {
                 self.emit_fail_stub();
             }
@@ -1247,6 +1266,7 @@ impl JitCompiler {
                 | TraceOp::ArrayIndexOk { .. }
                 | TraceOp::ArrayLen { .. }
                 | TraceOp::GuardNativeFunction { .. }
+                | TraceOp::GuardGlobals { .. }
                 | TraceOp::GuardStructLayout { .. }
                 | TraceOp::GuardFunction { .. }
                 | TraceOp::GuardClosure { .. }
@@ -1283,7 +1303,7 @@ impl JitCompiler {
         let in_args =
             |first: u8, count: u8| register >= first && register < first.saturating_add(count);
         match op {
-            TraceOp::At { .. } | TraceOp::LoadConst { .. } => false,
+            TraceOp::At { .. } | TraceOp::LoadConst { .. } | TraceOp::GuardGlobals { .. } => false,
             TraceOp::Move { src, .. } | TraceOp::Neg { src, .. } => *src == register,
             TraceOp::Add { lhs, rhs, .. }
             | TraceOp::Sub { lhs, rhs, .. }
@@ -1569,6 +1589,7 @@ impl JitCompiler {
             }
             TraceOp::SetField { .. }
             | TraceOp::GuardNativeFunction { .. }
+            | TraceOp::GuardGlobals { .. }
             | TraceOp::GuardStructLayout { .. }
             | TraceOp::GuardFunction { .. }
             | TraceOp::GuardClosure { .. }
@@ -1808,8 +1829,12 @@ impl JitCompiler {
             });
             if let Some(ret_reg) = trace.return_register {
                 let ret_offset = (ret_reg as i32) * value_size;
-                if result_type.is_some() {
-                    dynasm!(self.ops ; .arch x64 ; mov r14, [r12 + ret_offset + 8]);
+                if let Some(ty) = result_type {
+                    if ty == ValueType::Bool {
+                        dynasm!(self.ops ; .arch x64 ; movzx r14d, BYTE [r12 + ret_offset + 8]);
+                    } else {
+                        dynasm!(self.ops ; .arch x64 ; mov r14, [r12 + ret_offset + 8]);
+                    }
                 } else {
                     self.current_fail_ip = callee_last_ip;
                     let dest_offset = (dest as i32) * value_size;

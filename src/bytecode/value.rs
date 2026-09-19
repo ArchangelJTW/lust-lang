@@ -2295,6 +2295,12 @@ pub unsafe extern "C" fn jit_call_native_safe(
             }
         }
 
+        // The caller's frame shows the call's line if the native fails.
+        if let Some(ip) = jit::take_call_ip()
+            && let Some(frame) = (&mut *vm_ptr).call_stack.last_mut()
+        {
+            frame.ip = ip + 1;
+        }
         push_vm_ptr(vm_ptr);
         let outcome = native_fn(&args);
         pop_vm_ptr();
@@ -2412,6 +2418,12 @@ pub unsafe extern "C" fn jit_call_function_safe(
         }
 
         let vm = &mut *vm_ptr;
+        // The caller's frame shows the call's line in a stack trace.
+        if let Some(ip) = jit::take_call_ip()
+            && let Some(frame) = vm.call_stack.last_mut()
+        {
+            frame.ip = ip + 1;
+        }
         push_vm_ptr(vm_ptr);
 
         // The callee runs with the JIT on: its loops get their own traces
@@ -2912,6 +2924,35 @@ pub unsafe extern "C" fn jit_get_field_safe(
         };
         replace_value(out, field_value);
         1
+    }
+}
+
+/// `jit_get_field_safe` that also reads a `Map` (a module table, say),
+/// keyed by `key`: the field name as a `Value::String` the trace retains,
+/// so no key is built per call. A missing entry reads as Nil, as in the
+/// interpreter.
+///
+/// # Safety
+/// `object_ptr` and `key` point to live values, `out` to a live value slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_get_field_keyed(
+    object_ptr: *const Value,
+    field_name_ptr: *const u8,
+    field_name_len: usize,
+    key: *const Value,
+    out: *mut Value,
+) -> u8 {
+    unsafe {
+        if let Value::Map(map) = &*object_ptr {
+            let key = ValueKey::from_value(&*key);
+            let value = match map.try_borrow() {
+                Ok(map) => map.get(&key).cloned().unwrap_or(Value::Nil),
+                Err(_) => return 0,
+            };
+            replace_value(out, value);
+            return 1;
+        }
+        jit_get_field_safe(object_ptr, field_name_ptr, field_name_len, out)
     }
 }
 

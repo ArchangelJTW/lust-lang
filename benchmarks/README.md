@@ -156,14 +156,14 @@ milliseconds, single run each:
 
 | program   | lust-vm | lust-jit | luajit | lua 5.5 |
 |-----------|--------:|---------:|-------:|--------:|
-| fields    |    1101 |      182 |     58 |     114 |
-| array     |    1746 |      357 |     55 |      72 |
-| calls     |     856 |      158 |     29 |     125 |
-| methods   |    1893 |      377 |     29 |     218 |
-| strings   |   14367 |    14116 |  26420 |    7197 |
-| fib       |     178 |       35 |     21 |      35 |
-| nested    |     374 |       22 |     29 |      74 |
-| floatmath |     567 |       53 |     36 |      91 |
+| fields    |    1109 |       46 |     57 |     123 |
+| array     |    1735 |      246 |     60 |      76 |
+| calls     |     843 |      165 |     28 |     131 |
+| methods   |    1869 |       76 |     29 |     218 |
+| strings   |   13012 |    14936 |  29290 |    7314 |
+| fib       |     176 |       37 |     21 |      37 |
+| nested    |     365 |       23 |     27 |      78 |
+| floatmath |     551 |       55 |     36 |      89 |
 
 The interpreter numbers were 3-90x worse before the fixes to cycle
 collection cost, call-frame copying and argument checking on this branch
@@ -176,5 +176,11 @@ and results natively and aliased struct arguments instead of cloning them;
 `fib` 271 ms before the interpreter's call path stopped re-deriving the
 callee's signature on every call, and 178 ms before loop-free functions were
 compiled whole with native calls between them (`fib(34)`: 1.08 s interpreted,
-0.12 s compiled, Lua 5.5 0.13 s, LuaJIT 0.02 s). Remaining gap against Lua:
-`strings`, where every engine is quadratic in `s = s .. x`.
+0.12 s compiled, Lua 5.5 0.13 s, LuaJIT 0.02 s). `fields` was 182 ms and
+`methods` 377 ms before scalar struct fields were read and written inline
+instead of through runtime helpers; `array` was 357 ms before its push loop
+could be traced at all (a loop calling `array.push` — a global read — used
+to abort recording every time) and its element reads were typed inline
+loads. Remaining gaps against Lua: `strings`, where every engine is
+quadratic in `s = s .. x`, and `array`, where each iteration still moves
+its values through the VM's register memory.

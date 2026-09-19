@@ -55,6 +55,10 @@ pub struct JitCompiler {
     pub(super) specialized_values: HashMap<usize, SpecializedValue>,
     /// Registers proven to contain non-owning scalar values at this point.
     pub(super) scalar_registers: HashMap<u8, ValueType>,
+    /// A scalar type an op's inline fast path established for its
+    /// destination (checked at runtime, so it holds on every path that
+    /// continues), applied after the generic environment update.
+    pub(super) pending_scalar: Option<(u8, ValueType)>,
     /// Loop-header ip of the trace being compiled: where a guard that fails
     /// before any instruction of the body has run resumes.
     pub(super) trace_start_ip: usize,

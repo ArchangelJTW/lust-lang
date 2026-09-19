@@ -183,6 +183,7 @@ fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
         }
         TraceOp::SetField { .. }
         | TraceOp::GuardNativeFunction { .. }
+        | TraceOp::GuardGlobals { .. }
         | TraceOp::GuardStructLayout { .. }
         | TraceOp::GuardFunction { .. }
         | TraceOp::GuardClosure { .. }
@@ -389,6 +390,7 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
             condition_dest,
             array,
             index,
+            ..
         } => {
             e.reads.push((*array, None));
             e.reads.push((*index, None));
@@ -489,7 +491,9 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
         TraceOp::GuardLoopContinue {
             condition_register, ..
         } => e.reads.push((*condition_register, None)),
-        TraceOp::NestedLoopCall { .. } | TraceOp::DropSpecialized { .. } => {}
+        TraceOp::NestedLoopCall { .. }
+        | TraceOp::DropSpecialized { .. }
+        | TraceOp::GuardGlobals { .. } => {}
         TraceOp::Return { value } => {
             if let Some(r) = value {
                 e.reads.push((*r, None));
@@ -535,6 +539,7 @@ pub(super) fn op_touches_register_memory(op: &TraceOp) -> bool {
             | TraceOp::Or { .. }
             | TraceOp::Not { .. }
             | TraceOp::Guard { .. }
+            | TraceOp::GuardGlobals { .. }
             | TraceOp::GuardLoopContinue { .. }
             | TraceOp::Return { .. }
     )

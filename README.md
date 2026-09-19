@@ -205,6 +205,17 @@ Straight-line Lust functions and struct methods are inlined into the trace;
 other calls are opaque operations inside it, so a hot loop stays native while a
 branch-heavy callee executes through the interpreter.
 
+A global read in a loop (`array.push`, `math.sqrt`, a module-level variable)
+is recorded as the value seen, guarded by the VM's globals version, which
+every assignment to a global bumps; the guard failing evicts the trace. Struct
+fields of scalar type and `Array` elements are read and written inline through
+the measured layout of the runtime's `Rc<RefCell<Vec<_>>>` (see
+`src/jit/layout.rs`), falling back to the runtime helpers for anything else.
+An `Array<int>` a loop reads and writes is unboxed into a native vector for
+the trace's duration (`array.push` / `array.len` on it become native
+operations); when the array also escapes to a native or a non-inlined call,
+the recording is abandoned and the site is recorded again without unboxing.
+
 Loop-free functions are also compiled whole after thirty calls: their bytecode
 is translated statically, every branch included, and the code calls other
 compiled functions natively — frames on the machine stack, arguments and

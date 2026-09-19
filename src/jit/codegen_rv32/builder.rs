@@ -383,6 +383,7 @@ impl JitCompiler {
                     condition_dest,
                     array,
                     index,
+                    ..
                 } => {
                     self.compile_array_index_ok(*value_dest, *condition_dest, *array, *index)?;
                 }
@@ -639,8 +640,47 @@ impl JitCompiler {
                     );
                     *guard_index += 1;
                 }
+                TraceOp::GuardGlobals { version } => {
+                    // `VM::globals_version` is a u64; compare both halves.
+                    let offset = core::mem::offset_of!(crate::vm::VM, globals_version) as i32;
+                    let lo = *version as u32 as i32;
+                    let hi = (*version >> 32) as u32 as i32;
+                    let exit_label = self.current_exit_label();
+                    let current_guard_index = *guard_index;
+                    guards.push(Guard {
+                        index: current_guard_index as usize,
+                        bailout_ip: 0,
+                        kind: GuardKind::Globals { version: *version },
+                        fail_count: 0,
+                    });
+                    dynasm!(self.ops
+                        ; .arch riscv32i
+                        ; li t1, offset
+                        ; add t1, t1, s3
+                        ; lw t2, [t1, 0]
+                        ; li t3, lo
+                        ; bne t2, t3, >guard_fail
+                        ; lw t2, [t1, 4]
+                        ; li t3, hi
+                        ; beq t2, t3, >guard_ok
+                        ; guard_fail:
+                        ; li a0, current_guard_index + 1
+                        ; j => exit_label
+                        ; guard_ok:
+                    );
+                    *guard_index += 1;
+                }
                 TraceOp::Return { .. } => {
                     // Return ops are handled by the epilogue; no codegen needed here.
+                }
+                TraceOp::Label { .. }
+                | TraceOp::Jump { .. }
+                | TraceOp::BranchIf { .. }
+                | TraceOp::CallDirect { .. } => {
+                    return Err(crate::LustError::RuntimeError {
+                        message: "whole-function compilation is not supported on riscv32"
+                            .to_string(),
+                    });
                 }
             }
         }

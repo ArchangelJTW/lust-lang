@@ -52,6 +52,35 @@ impl TraceOptimizer {
         (bare, markers)
     }
 
+    /// The scalar type the first guard on `binding` or `result` in `ops`
+    /// expects, looking past guards on other registers and moves that do
+    /// not write either; `None` if anything else comes first.
+    fn element_guard_type(
+        ops: &[TraceOp],
+        binding: Register,
+        result: Register,
+    ) -> Option<crate::jit::trace::ValueType> {
+        use crate::jit::trace::ValueType;
+        for op in ops {
+            match op {
+                TraceOp::Guard {
+                    register,
+                    expected_type,
+                } if *register == binding || *register == result => {
+                    return matches!(
+                        expected_type,
+                        ValueType::Int | ValueType::Float | ValueType::Bool
+                    )
+                    .then_some(*expected_type);
+                }
+                TraceOp::Guard { .. } => {}
+                TraceOp::Move { dest, .. } if *dest != binding && *dest != result => {}
+                _ => return None,
+            }
+        }
+        None
+    }
+
     fn push_marker(ops: &mut Vec<TraceOp>, marker: Option<usize>) {
         if let Some(ip) = marker {
             ops.push(TraceOp::At { ip });
@@ -97,11 +126,15 @@ impl TraceOptimizer {
                 && enum_name == "Result"
                 && variant_name == "Ok"
             {
+                // The guard the recorder put on the binding (or the result)
+                // right after the match says what element type to expect.
+                let value_type = Self::element_guard_type(&bare[i + 4..], *binding_reg, *result_reg);
                 ops.push(TraceOp::ArrayIndexOk {
                     value_dest: *result_reg,
                     condition_dest: *condition_reg,
                     array: *array,
                     index: *index,
+                    value_type,
                 });
                 ops.push(bare[i + 2].clone());
                 ops.push(TraceOp::Move {
@@ -584,6 +617,7 @@ mod tests {
                     condition_dest: 3,
                     array: 0,
                     index: 1,
+                    ..
                 },
                 TraceOp::GuardLoopContinue {
                     condition_register: 3,

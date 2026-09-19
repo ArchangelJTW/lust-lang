@@ -138,6 +138,10 @@ pub struct JitCompiler {
     /// Function mode: the exit being emitted hands a call to the
     /// interpreter rather than reporting a failed guard.
     exit_is_handoff: bool,
+    /// A scalar type an op's inline fast path established for its
+    /// destination (checked at runtime, so it holds on every path that
+    /// continues), applied after the generic environment update.
+    pub(super) pending_scalar: Option<(u8, ValueType)>,
     /// Bytecode ip of the instruction the ops being compiled came from
     /// (from the last `At` marker), if known.
     current_fail_ip: Option<usize>,

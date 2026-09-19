@@ -106,6 +106,7 @@ impl VM {
             call_meta: Vec::new(),
             natives: HashMap::new(),
             globals: HashMap::new(),
+            globals_version: 0,
             map_hasher: DefaultHashBuilder::default(),
             call_stack: Vec::new(),
             frame_pool: Vec::new(),
@@ -147,6 +148,7 @@ impl VM {
         for (name, func) in super::stdlib::create_stdlib(config, &vm) {
             vm.register_native(name, func);
         }
+        vm.register_jit_intrinsics();
 
         vm
     }
@@ -421,6 +423,7 @@ impl VM {
                 self.globals.insert(name, other);
             }
         }
+        self.globals_version = self.globals_version.wrapping_add(1);
     }
 
     #[allow(dead_code)]
@@ -575,6 +578,7 @@ impl VM {
 
     pub fn clear_native_functions(&mut self) {
         self.natives.clear();
+        self.globals_version = self.globals_version.wrapping_add(1);
         #[cfg(feature = "std")]
         self.exported_type_stubs.clear();
     }
@@ -624,6 +628,7 @@ impl VM {
         self.observe_value(&value);
         self.globals.insert(name.clone(), value);
         self.natives.remove(&name);
+        self.globals_version = self.globals_version.wrapping_add(1);
         self.maybe_collect_cycles();
     }
 

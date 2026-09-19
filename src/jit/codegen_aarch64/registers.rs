@@ -404,6 +404,13 @@ impl JitCompiler {
             2 => ValueType::Int,
             _ => unreachable!("unsupported scalar Value discriminant"),
         };
+        // A Bool arrives as a byte in w0; whatever the upper bits hold (an
+        // 8-byte payload load of a Bool, say) must not reach the payload
+        // or the `u8` helper argument, which the ABI lets the callee read
+        // as a full register.
+        if stored_type == ValueType::Bool {
+            dynasm!(self.ops ; .arch aarch64 ; and x0, x0, #0xff);
+        }
         if let Some(pin) = self.active_pin(vm_reg) {
             assert_eq!(pin.ty, stored_type, "pinned register written with another type");
             dynasm!(self.ops ; .arch aarch64 ; mov X(pin.reg), x0);

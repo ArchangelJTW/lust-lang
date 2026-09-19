@@ -433,7 +433,12 @@ impl VM {
                         let mut recorder =
                             TraceRecorder::new(func_idx, loop_start_ip, MAX_TRACE_LENGTH);
                         recorder.set_root_frame_index(self.call_stack.len().saturating_sub(1));
+                        recorder.set_intrinsics(&self.jit.intrinsics);
                         // Specialize loop-invariant values at trace entry
+                        if !self
+                            .jit
+                            .no_specialize_sites
+                            .contains(&(func_idx, loop_start_ip))
                         {
                             let frame = self.call_stack.last().unwrap();
                             let func = &self.functions[func_idx];
@@ -501,6 +506,7 @@ impl VM {
                         })?;
                     let value = self.get_register(src)?.clone();
                     self.globals.insert(name.to_string(), value);
+                    self.globals_version = self.globals_version.wrapping_add(1);
                 }
 
                 Instruction::Move(dest, src) => {
@@ -1695,6 +1701,7 @@ impl VM {
                             None
                         };
                     let frame_pushed = self.call_stack.len() > executing_frame_index + 1;
+                    recorder.globals_version = self.globals_version;
                     if let Some(registers) = registers_opt
                         && let Err(e) = recorder.record_instruction_at_frame(
                             executing_frame_index,

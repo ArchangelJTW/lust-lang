@@ -2,10 +2,32 @@ use super::*;
 impl VM {
     pub(super) fn abandon_trace_recording(&mut self) {
         if let Some(recorder) = self.trace_recorder.take() {
-            self.jit
-                .recording_aborted(recorder.trace.function_idx, recorder.trace.start_ip);
+            let site = (recorder.trace.function_idx, recorder.trace.start_ip);
+            if recorder.specialization_escaped {
+                self.jit.no_specialize_sites.insert(site);
+            }
+            self.jit.recording_aborted(site.0, site.1);
         }
         self.skip_next_trace_record = false;
+    }
+
+    /// Remember the stdlib natives the recorder can specialize (see
+    /// `jit::Intrinsic`), by the `Rc` pointer a trace guards on.
+    pub(super) fn register_jit_intrinsics(&mut self) {
+        let Some(Value::Map(array_module)) = self.globals.get("array") else {
+            return;
+        };
+        let array_module = array_module.borrow();
+        for (name, intrinsic) in [
+            ("push", crate::jit::Intrinsic::ArrayPush),
+            ("len", crate::jit::Intrinsic::ArrayLen),
+        ] {
+            if let Some(Value::NativeFunction(func)) = array_module.get(&crate::bytecode::ValueKey::from(name)) {
+                self.jit
+                    .intrinsics
+                    .insert(Rc::as_ptr(func) as *const () as usize, intrinsic);
+            }
+        }
     }
 
     pub(super) fn build_stack_trace(&self) -> Vec<StackFrame> {

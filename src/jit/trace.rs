@@ -26,6 +26,15 @@ impl TracedNativeFn {
     pub fn pointer(&self) -> *const () {
         Rc::as_ptr(&self.function) as *const ()
     }
+
+    /// The allocation pointer a `Value::NativeFunction` holding this
+    /// function carries (the `Rc`'s own pointer word, not the data
+    /// pointer `pointer` returns).
+    pub fn inner_ptr(&self) -> usize {
+        // SAFETY: an `Rc<dyn Fn>` starts with its `NonNull<RcInner>`, a
+        // fat pointer whose first word is the allocation's address.
+        unsafe { *(&self.function as *const NativeFn as *const usize) }
+    }
 }
 
 impl fmt::Debug for TracedNativeFn {

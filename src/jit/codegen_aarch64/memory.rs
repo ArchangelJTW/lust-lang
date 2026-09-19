@@ -74,7 +74,7 @@ impl JitCompiler {
         // A pinned destination is only ever written with a scalar of its
         // own type (see pins::plan), so the move is a register copy; the
         // helper below would update memory and leave the pin stale.
-        if let Some(pin) = self.active_pin(dest) {
+        if let Some(pin) = self.pin_for_write(dest) {
             match pin.ty {
                 ValueType::Float => {
                     self.load_payload_f(0, src);
@@ -355,7 +355,7 @@ impl JitCompiler {
                 object_ptr: *const Value,
                 field_name_ptr: *const u8,
                 field_name_len: usize,
-                key: *const Value,
+                key: *const crate::bytecode::ValueKey,
                 out: *mut Value,
             ) -> u8;
             fn jit_get_field_indexed_safe(
@@ -462,7 +462,7 @@ impl JitCompiler {
             self.emit_call(jit_get_field_indexed_safe as *const ());
         } else {
             let (field_name_ptr, field_name_len) = self.retain_string(field_name);
-            let key = self.retain_value(Value::String(alloc::rc::Rc::new(field_name.to_string())));
+            let key = self.retain_key(field_name);
             self.emit_reg_addr(0, object);
             self.emit_mov_imm64(1, field_name_ptr as usize as u64);
             self.emit_mov_imm64(2, field_name_len as u64);

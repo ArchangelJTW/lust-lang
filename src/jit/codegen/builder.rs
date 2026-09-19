@@ -51,6 +51,15 @@ impl JitCompiler {
         ptr
     }
 
+    /// Keep a map key alive with the code (a field name looked up in a
+    /// map, built once here rather than per lookup).
+    pub(super) fn retain_key(&mut self, name: &str) -> *const crate::bytecode::ValueKey {
+        let key = Box::new(crate::bytecode::ValueKey::from(name));
+        let ptr = key.as_ref() as *const crate::bytecode::ValueKey;
+        self.data.push(JitData::Key(key));
+        ptr
+    }
+
     pub(super) fn retain_value(&mut self, value: Value) -> *const Value {
         let value = Box::new(value);
         let ptr = value.as_ref() as *const Value;
@@ -639,6 +648,7 @@ impl JitCompiler {
                     let guard = self.compile_guard_native_function(
                         *register,
                         expected_ptr,
+                        function.inner_ptr(),
                         *guard_index as usize,
                     )?;
                     guards.push(guard);

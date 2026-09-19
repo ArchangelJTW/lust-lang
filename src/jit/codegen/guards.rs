@@ -143,6 +143,7 @@ impl JitCompiler {
         &mut self,
         register: u8,
         expected_ptr: *const (),
+        expected_inner: usize,
         guard_index: usize,
     ) -> Result<Guard> {
         let offset = (register as i32) * (mem::size_of::<Value>() as i32);
@@ -153,6 +154,34 @@ impl JitCompiler {
                 expected: *const (),
                 register_index: u8,
             ) -> u8;
+        }
+        if let Some(layout) = jit::layout::ownership_layout() {
+            // Inline: the native-function tag, then the allocation pointer.
+            let tag = layout.single_rc_tags[4] as i8;
+            let rc_offset = layout.single_rc_offset as i32;
+            dynasm!(self.ops
+                ; .arch x64
+                ; cmp BYTE [r12 + offset], tag
+                ; jne >guard_fail
+                ; mov rax, QWORD expected_inner as i64
+                ; cmp rax, [r12 + offset + rc_offset]
+                ; je >guard_ok
+                ; guard_fail:
+            );
+            self.emit_guard_exit(guard_return_value);
+            dynasm!(self.ops
+                ; .arch x64
+                ; guard_ok:
+            );
+            return Ok(Guard {
+                index: guard_index,
+                bailout_ip: self.guard_bailout_ip(),
+                kind: GuardKind::NativeFunction {
+                    register,
+                    expected: expected_ptr,
+                },
+                fail_count: 0,
+            });
         }
         let reg_index = register as i32;
         dynasm!(self.ops

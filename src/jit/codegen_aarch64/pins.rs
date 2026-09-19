@@ -549,6 +549,95 @@ pub(super) fn op_touches_register_memory(op: &TraceOp) -> bool {
 
 /// Plan the pins for a trace body. `preamble` establishes the scalar types
 /// known at loop entry.
+/// Plan the pins for function code. Control flow makes the trace rules
+/// (loop-carried state, entry proofs) meaningless, so every pin here is a
+/// write-through `Local` one: a register every write of which is a typed
+/// native op of one scalar type, never a helper. Memory stays current, so
+/// reads may use the machine register only where the static environment
+/// proves the type (see `JitCompiler::active_pin`), and the machine
+/// registers are loaded from the frame at entry. The environment restarts
+/// from each label's known scalars, as the translator computed them.
+pub(super) fn plan_function(body: &[TraceOp]) -> HashMap<u8, Pin> {
+    #[cfg(feature = "std")]
+    if std::env::var_os("LUST_JIT_NOPIN").is_some() {
+        return HashMap::new();
+    }
+    // Pins cost a few saves and loads per call; only a loop repays them.
+    let mut labels_seen = hashbrown::HashSet::new();
+    let has_loop = body.iter().any(|op| match op {
+        TraceOp::Label { id, .. } => {
+            labels_seen.insert(*id);
+            false
+        }
+        TraceOp::Jump { label } | TraceOp::BranchIf { label, .. } => labels_seen.contains(label),
+        _ => false,
+    });
+    if !has_loop {
+        return HashMap::new();
+    }
+    let mut env: HashMap<u8, ValueType> = HashMap::new();
+    let mut candidates: HashMap<u8, Candidate> = HashMap::new();
+    for op in body {
+        if let TraceOp::Label { scalars, .. } = op {
+            env = scalars.iter().copied().collect();
+            continue;
+        }
+        let e = effects(op, &env);
+        for (r, _) in e.reads {
+            candidates.entry(r).or_default().accesses += 1;
+        }
+        for (r, ty) in e.native_writes {
+            let cand = candidates.entry(r).or_default();
+            cand.accesses += 1;
+            cand.write_types.push(ty);
+        }
+        for r in e.helper_writes {
+            candidates.entry(r).or_default().helper_write = true;
+        }
+        env_update(&mut env, op);
+    }
+    let mut eligible: Vec<(u8, ValueType, usize)> = Vec::new();
+    for (r, cand) in candidates {
+        if cand.helper_write || cand.write_types.is_empty() {
+            continue;
+        }
+        let mut ty: Option<ValueType> = None;
+        let mut consistent = true;
+        for t in &cand.write_types {
+            match (ty, t) {
+                (_, None) => consistent = false,
+                (None, Some(t)) => ty = scalar(*t),
+                (Some(prev), Some(t)) if Some(prev) == scalar(*t) => {}
+                _ => consistent = false,
+            }
+        }
+        if let (true, Some(ty)) = (consistent, ty) {
+            eligible.push((r, ty, cand.accesses));
+        }
+    }
+    eligible.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    let mut ints = INT_PIN_REGS.iter();
+    let mut floats = FLOAT_PIN_REGS.iter();
+    let mut pins = HashMap::new();
+    for (r, ty, _) in eligible {
+        let reg = match ty {
+            ValueType::Float => floats.next(),
+            _ => ints.next(),
+        };
+        let Some(reg) = reg else { continue };
+        pins.insert(
+            r,
+            Pin {
+                ty,
+                reg: *reg,
+                class: PinClass::Local,
+                proven_at_entry: false,
+            },
+        );
+    }
+    pins
+}
+
 pub(super) fn plan(
     hoisted_constants: &[(u8, Value)],
     preamble: &[TraceOp],

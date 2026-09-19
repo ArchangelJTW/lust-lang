@@ -137,6 +137,7 @@ impl JitCompiler {
         &mut self,
         register: u8,
         expected_ptr: *const (),
+        expected_inner: usize,
         guard_index: usize,
     ) -> Result<Guard> {
         let guard_return_value = (guard_index + 1) as i32;
@@ -146,6 +147,40 @@ impl JitCompiler {
                 expected: *const (),
                 register_index: u8,
             ) -> u8;
+        }
+        if let Some(layout) = jit::layout::ownership_layout() {
+            // Inline: the native-function tag, then the allocation pointer.
+            let tag = layout.single_rc_tags[4] as u32;
+            let offset = layout.single_rc_offset as u32;
+            self.load_tag(0, register);
+            self.emit_reg_addr(11, register);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #tag
+                ; b.ne >guard_fail
+                ; ldr x9, [x11, #offset]
+            );
+            self.emit_mov_imm64(10, expected_inner as u64);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp x9, x10
+                ; b.eq >guard_ok
+                ; guard_fail:
+            );
+            self.emit_guard_exit(guard_return_value);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; guard_ok:
+            );
+            return Ok(Guard {
+                index: guard_index,
+                bailout_ip: self.guard_bailout_ip(),
+                kind: GuardKind::NativeFunction {
+                    register,
+                    expected: expected_ptr,
+                },
+                fail_count: 0,
+            });
         }
         self.emit_reg_addr(0, register);
         self.emit_mov_imm64(1, expected_ptr as usize as u64);
@@ -454,25 +489,31 @@ impl JitCompiler {
             .expect("function code is compiled inside compile_trace");
         let _ = result_type;
 
-        // Native stack limit (x23, see `JIT_STACK_LIMIT`) and the callee's
-        // entry point (x24 = the entry table), if it has compiled code.
-        let slot_offset = (function_idx * mem::size_of::<usize>()) as u32;
+        // Native stack limit (see `JIT_STACK_LIMIT`), the interpreter's
+        // frame depth limit (`JIT_DEPTH_BUDGET`) and the callee's entry
+        // point (from the entry table), all from their cells: the
+        // callee-saved registers are for pinned values.
+        let slot = self.function_entry_table + function_idx * mem::size_of::<usize>();
+        self.emit_mov_imm64(9, jit::stack_limit_cell() as u64);
         dynasm!(self.ops
             ; .arch aarch64
-            ; mov x9, sp
-            ; cmp x9, x23
+            ; ldr x9, [x9]
+            ; mov x10, sp
+            ; cmp x10, x9
             ; b.lo => to_interpreter
-            // The interpreter's frame depth limit (x26, see
-            // `JIT_DEPTH_BUDGET`).
-            ; cbz x26, => to_interpreter
         );
-        if slot_offset <= 32760 {
-            dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x24, #slot_offset]);
-        } else {
-            self.emit_mov_imm64(11, slot_offset as u64);
-            dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x24, x11]);
-        }
-        dynasm!(self.ops ; .arch aarch64 ; cbz x16, => to_interpreter);
+        self.emit_mov_imm64(9, jit::depth_budget_cell() as u64);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x10, [x9]
+            ; cbz x10, => to_interpreter
+        );
+        self.emit_mov_imm64(11, slot as u64);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x16, [x11]
+            ; cbz x16, => to_interpreter
+        );
 
         // Push the record (see `JitInlineRecord`): value_count, caller
         // regs, previous chain, alias mask, function, result register,
@@ -561,16 +602,16 @@ impl JitCompiler {
 
         // Enter the callee: x0 = its registers, x1 = VM, x2 = its record.
         // The entry is reloaded: the argument moves above may have called
-        // helpers through x16.
-        if slot_offset <= 32760 {
-            dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x24, #slot_offset]);
-        } else {
-            self.emit_mov_imm64(11, slot_offset as u64);
-            dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x24, x11]);
-        }
+        // helpers through x16. The depth budget is spent for the call's
+        // duration.
+        self.emit_mov_imm64(11, slot as u64);
+        dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x11]);
+        self.emit_mov_imm64(11, jit::depth_budget_cell() as u64);
         dynasm!(self.ops
             ; .arch aarch64
-            ; sub x26, x26, 1
+            ; ldr x9, [x11]
+            ; sub x9, x9, 1
+            ; str x9, [x11]
             ; mov x0, sp
             ; mov x1, x20
             ; mov x11, sp
@@ -579,7 +620,13 @@ impl JitCompiler {
         dynasm!(self.ops
             ; .arch aarch64
             ; blr x16
-            ; add x26, x26, 1
+        );
+        self.emit_mov_imm64(11, jit::depth_budget_cell() as u64);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x9, [x11]
+            ; add x9, x9, 1
+            ; str x9, [x11]
         );
         // Pop the frame and record; the callee's epilogue restored x19..x24.
         let pop = (frame_size + INLINE_METADATA_SIZE) as u32;

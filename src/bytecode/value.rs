@@ -3098,8 +3098,8 @@ pub unsafe extern "C" fn jit_get_field_safe(
 }
 
 /// `jit_get_field_safe` that also reads a `Map` (a module table, say),
-/// keyed by `key`: the field name as a `Value::String` the trace retains,
-/// so no key is built per call. A missing entry reads as Nil, as in the
+/// keyed by `key`: the field name as a `ValueKey` the code retains, so
+/// nothing is built per call. A missing entry reads as Nil, as in the
 /// interpreter.
 ///
 /// # Safety
@@ -3109,14 +3109,13 @@ pub unsafe extern "C" fn jit_get_field_keyed(
     object_ptr: *const Value,
     field_name_ptr: *const u8,
     field_name_len: usize,
-    key: *const Value,
+    key: *const ValueKey,
     out: *mut Value,
 ) -> u8 {
     unsafe {
         if let Value::Map(map) = &*object_ptr {
-            let key = ValueKey::from_value(&*key);
             let value = match map.try_borrow() {
-                Ok(map) => map.get(&key).cloned().unwrap_or(Value::Nil),
+                Ok(map) => map.get(&*key).cloned().unwrap_or(Value::Nil),
                 Err(_) => return 0,
             };
             replace_value(out, value);

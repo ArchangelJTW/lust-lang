@@ -12,8 +12,25 @@ pub(super) fn reg_offset(vm_reg: u8) -> i32 {
 }
 
 impl JitCompiler {
-    /// The pin for a VM register, if pins are in effect at this point.
+    /// The pin for a VM register, if pins are in effect at this point. In
+    /// function code the machine register is only known to be current
+    /// where the static environment proves the register's type (every
+    /// typed write updates it; anything else is in memory, which the
+    /// write-through pins keep current).
     pub(super) fn active_pin(&self, vm_reg: u8) -> Option<pins::Pin> {
+        if !self.pin_active {
+            return None;
+        }
+        let pin = self.pins.get(&vm_reg).copied()?;
+        if self.function_mode && self.scalar_registers.get(&vm_reg) != Some(&pin.ty) {
+            return None;
+        }
+        Some(pin)
+    }
+
+    /// The pin a write to a VM register must update, whatever the static
+    /// environment knows (see `active_pin`).
+    pub(super) fn pin_for_write(&self, vm_reg: u8) -> Option<pins::Pin> {
         if self.pin_active {
             self.pins.get(&vm_reg).copied()
         } else {
@@ -411,7 +428,7 @@ impl JitCompiler {
         if stored_type == ValueType::Bool {
             dynasm!(self.ops ; .arch aarch64 ; and x0, x0, #0xff);
         }
-        if let Some(pin) = self.active_pin(vm_reg) {
+        if let Some(pin) = self.pin_for_write(vm_reg) {
             assert_eq!(pin.ty, stored_type, "pinned register written with another type");
             dynasm!(self.ops ; .arch aarch64 ; mov X(pin.reg), x0);
             if pin.class == pins::PinClass::Carried {
@@ -471,7 +488,7 @@ impl JitCompiler {
     /// that previously lived there.
     pub(super) fn store_d0_as_float(&mut self, vm_reg: u8) {
         let float_tag = ValueTag::Float.as_u8();
-        if let Some(pin) = self.active_pin(vm_reg) {
+        if let Some(pin) = self.pin_for_write(vm_reg) {
             assert_eq!(pin.ty, ValueType::Float, "pinned register written with another type");
             dynasm!(self.ops ; .arch aarch64 ; fmov D(pin.reg), d0);
             if pin.class == pins::PinClass::Carried {

@@ -198,6 +198,7 @@ impl CompiledTrace {
 pub(super) enum JitData {
     Value(Box<Value>),
     Name(crate::bytecode::value::Name),
+    Key(Box<crate::bytecode::ValueKey>),
     String(Box<str>),
     StringPointers(Box<[*const u8]>),
     StringLengths(Box<[usize]>),

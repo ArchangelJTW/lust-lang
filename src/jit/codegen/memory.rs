@@ -355,7 +355,7 @@ impl JitCompiler {
                 object_ptr: *const Value,
                 field_name_ptr: *const u8,
                 field_name_len: usize,
-                key: *const Value,
+                key: *const crate::bytecode::ValueKey,
                 out: *mut Value,
             ) -> u8;
             fn jit_get_field_indexed_safe(
@@ -451,7 +451,7 @@ impl JitCompiler {
             );
         } else {
             let (field_name_ptr, field_name_len) = self.retain_string(field_name);
-            let key = self.retain_value(Value::String(alloc::rc::Rc::new(field_name.to_string())));
+            let key = self.retain_key(field_name);
             dynasm!(self.ops
                 ; .arch x64
                 ; lea rdi, [r12 + object_offset]

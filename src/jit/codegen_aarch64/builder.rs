@@ -56,6 +56,15 @@ impl JitCompiler {
         ptr
     }
 
+    /// Keep a map key alive with the code (a field name looked up in a
+    /// map, built once here rather than per lookup).
+    pub(super) fn retain_key(&mut self, name: &str) -> *const crate::bytecode::ValueKey {
+        let key = Box::new(crate::bytecode::ValueKey::from(name));
+        let ptr = key.as_ref() as *const crate::bytecode::ValueKey;
+        self.data.push(JitData::Key(key));
+        ptr
+    }
+
     pub(super) fn retain_value(&mut self, value: Value) -> *const Value {
         let value = Box::new(value);
         let ptr = value.as_ref() as *const Value;
@@ -122,7 +131,7 @@ impl JitCompiler {
         self.trace_start_ip = trace.start_ip;
         self.last_fail_island = self.ops.offset().0;
         self.pins = if self.function_mode {
-            HashMap::new()
+            pins::plan_function(&trace.ops)
         } else {
             pins::plan(&hoisted_constants, &trace.preamble, &trace.ops)
         };
@@ -170,15 +179,9 @@ impl JitCompiler {
             ; stp x19, x20, [sp, -16]!
             ; stp x21, x22, [sp, -16]!
         );
-        // Function code never pins, so x25..x28 and d8..d15 stay untouched
-        // and need no saving; x23 and x24 hold the native stack limit and
-        // the entry table for the function's calls.
-        if self.function_mode {
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; stp x23, x24, [sp, -16]!
-                ; stp x25, x26, [sp, -16]!
-            );
+        // Function code without pins leaves x23..x28 and d8..d15 untouched
+        // and need not save them.
+        if self.function_mode && self.pins.is_empty() {
         } else {
             dynasm!(self.ops
                 ; .arch aarch64
@@ -202,19 +205,6 @@ impl JitCompiler {
         );
         if self.function_mode {
             dynasm!(self.ops ; .arch aarch64 ; mov x21, x2);
-            self.emit_mov_imm64(23, jit::stack_limit_cell() as u64);
-            self.emit_mov_imm64(24, self.function_entry_table as u64);
-            dynasm!(self.ops ; .arch aarch64 ; ldr x23, [x23]);
-            // x26 = the remaining frame-depth budget: loaded from the cell
-            // when the interpreter enters, inherited from the caller (who
-            // already decremented it) on a native call.
-            self.emit_mov_imm64(25, jit::depth_budget_cell() as u64);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; cbnz x21, >budget_ready
-                ; ldr x26, [x25]
-                ; budget_ready:
-            );
         } else {
             dynasm!(self.ops ; .arch aarch64 ; mov x21, xzr);
         }
@@ -247,11 +237,14 @@ impl JitCompiler {
             ; preamble_fail_skip:
         );
 
-        // Loop prologue: load carried pins.
+        // Loop prologue: load carried pins. Function code loads every pin:
+        // a parameter's value is in the frame already, and a register that
+        // is not is only read through its pin once a typed write has
+        // proven it (see `active_pin`).
         let mut pinned: Vec<(u8, pins::Pin)> = self.pins.iter().map(|(r, p)| (*r, *p)).collect();
         pinned.sort_by_key(|(r, _)| *r);
         for (vm_reg, pin) in &pinned {
-            if pin.class == pins::PinClass::Carried {
+            if pin.class == pins::PinClass::Carried || self.function_mode {
                 self.emit_pin_load(*vm_reg, *pin);
             }
         }
@@ -351,8 +344,8 @@ impl JitCompiler {
 
         // Epilogue: sp is recovered from the frame pointer, so the exit path
         // is valid regardless of how deep an inline frame we came from.
-        let saved_below_fp = if self.function_mode {
-            64u32
+        let saved_below_fp = if self.function_mode && self.pins.is_empty() {
+            32u32
         } else {
             SAVED_BELOW_FP as u32
         };
@@ -362,12 +355,7 @@ impl JitCompiler {
             ; => epilogue_label
             ; sub sp, x29, #saved_below_fp
         );
-        if self.function_mode {
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; ldp x25, x26, [sp], 16
-                ; ldp x23, x24, [sp], 16
-            );
+        if self.function_mode && self.pins.is_empty() {
         } else {
             dynasm!(self.ops
                 ; .arch aarch64
@@ -831,6 +819,7 @@ impl JitCompiler {
                     let guard = self.compile_guard_native_function(
                         *register,
                         expected_ptr,
+                        function.inner_ptr(),
                         *guard_index as usize,
                     )?;
                     guards.push(guard);

@@ -20,6 +20,7 @@ pub(super) use crate::jit::{
 pub(super) use crate::number::{LustFloat, LustInt, float_from_int, int_from_usize};
 pub(super) use crate::{LustError, Result};
 pub(super) use alloc::{
+    boxed::Box,
     format,
     rc::Rc,
     string::{String, ToString},

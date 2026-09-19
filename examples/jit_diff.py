@@ -12,8 +12,10 @@ Use a release build: debug builds print JIT trace logs to stdout.
 """
 import argparse
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -24,18 +26,39 @@ DEFAULT_DIRS = [
     "examples/programs",
     "examples/jit",
 ]
+# Repository directories the examples read relative to the working
+# directory. Each run gets a pristine copy, so a program that rewrites its
+# input (examples/programs/profile_cli.lust) cannot change what the next
+# engine, or the next run, sees.
+SEED_DIRS = ["profiles"]
 
 
 def run(binary, path, jit, timeout):
+    """Run one program under one engine, in a private working directory.
+
+    Programs that write files (examples/programs/profile_cli.lust,
+    examples/basic/18_io.lust, 19_os.lust) behave differently on a second
+    run, so sharing a directory between the two engines makes the first one
+    to run change what the second one sees — and, when the directory is the
+    repository, leaves a modified tracked file behind. Module resolution is
+    relative to the script's own directory, not the working directory, so a
+    scratch one is safe.
+    """
     env = dict(os.environ, LUST_JIT="1" if jit else "0")
+    script = Path(path).resolve()
     try:
-        proc = subprocess.run(
-            [binary, str(path)],
-            cwd=ROOT,
-            env=env,
-            capture_output=True,
-            timeout=timeout,
-        )
+        with tempfile.TemporaryDirectory(prefix="lust-jit-diff-") as workdir:
+            for name in SEED_DIRS:
+                source = ROOT / name
+                if source.is_dir():
+                    shutil.copytree(source, Path(workdir) / name)
+            proc = subprocess.run(
+                [binary, str(script)],
+                cwd=workdir,
+                env=env,
+                capture_output=True,
+                timeout=timeout,
+            )
         return proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired:
         return "timeout", b"", b""

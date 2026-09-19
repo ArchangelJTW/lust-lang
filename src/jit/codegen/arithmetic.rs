@@ -350,13 +350,7 @@ impl JitCompiler {
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
             self.load_to_rax(lhs);
             self.load_to_rbx(rhs);
-            dynasm!(self.ops
-                ; .arch x64
-                ; test rbx, rbx
-                ; jz >fail
-                ; cqo
-                ; idiv rbx
-            );
+            self.emit_int_div();
             self.store_from_rax(dest, 2);
             return Ok(());
         }
@@ -418,10 +412,10 @@ impl JitCompiler {
             ; je >float_path
             ; mov rax, [r12 + lhs_offset + 8]
             ; mov rbx, [r12 + rhs_offset + 8]
-            ; test rbx, rbx
-            ; jz >fail
-            ; cqo
-            ; idiv rbx
+        );
+        self.emit_int_div();
+        dynasm!(self.ops
+            ; .arch x64
             ; jmp >store_int
             ; float_path:
             ; mov al, [r12 + lhs_offset]
@@ -496,17 +490,52 @@ impl JitCompiler {
         self.compile_mod(dest, lhs, rhs)
     }
 
-    /// rax = rax % rbx with the interpreter's semantics: sign of the
-    /// dividend, modulo by zero fails the trace so the interpreter raises
-    /// the error.
+    /// rax = rax / rbx with the interpreter's semantics (`wrapping_div`):
+    /// division by zero fails the trace so the interpreter raises the
+    /// error, and `MIN / -1` wraps to `MIN`.
+    ///
+    /// The divisor is tested against -1 because x86 `idiv` raises #DE (a
+    /// `SIGFPE`) for `MIN / -1`, whose quotient does not fit the
+    /// destination. aarch64 `sdiv` and riscv `div` wrap in hardware, so
+    /// only this backend needs the check. `neg rax` gives the wrapped
+    /// quotient for any dividend (`0 - x`), `MIN` included.
+    fn emit_int_div(&mut self) {
+        dynasm!(self.ops
+            ; .arch x64
+            ; test rbx, rbx
+            ; jz >fail
+            ; cmp rbx, -1
+            ; jne >div_safe
+            ; neg rax
+            ; jmp >div_done
+            ; div_safe:
+            ; cqo
+            ; idiv rbx
+            ; div_done:
+        );
+    }
+
+    /// rax = rax % rbx with the interpreter's semantics (`wrapping_rem`):
+    /// sign of the dividend, modulo by zero fails the trace so the
+    /// interpreter raises the error.
+    ///
+    /// `x % -1` is 0 for every dividend, and taking that path also avoids
+    /// the #DE that `idiv` would raise for `MIN % -1` (see
+    /// `emit_int_div`).
     fn emit_int_mod(&mut self) {
         dynasm!(self.ops
             ; .arch x64
             ; test rbx, rbx
             ; jz >fail
+            ; cmp rbx, -1
+            ; jne >mod_safe
+            ; xor eax, eax
+            ; jmp >mod_done
+            ; mod_safe:
             ; cqo
             ; idiv rbx
             ; mov rax, rdx
+            ; mod_done:
         );
     }
 

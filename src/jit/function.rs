@@ -43,6 +43,28 @@ pub struct FunctionSig {
     /// Registers (bit i = register i) the function's bytecode writes; an
     /// argument to a register it never writes can be passed by aliasing.
     pub written_registers: u64,
+    /// Registers (bit i = register i) the function returns directly. A
+    /// `Return` *moves* its register into the caller's destination
+    /// (`jit_return_value`), so such a register must own what it holds and
+    /// cannot be an uncounted alias.
+    pub returned_registers: u64,
+}
+
+impl FunctionSig {
+    /// May callee register `index` receive a bitwise copy of the caller's
+    /// argument, with no reference-count bump?
+    ///
+    /// Only when the callee neither writes it nor returns it: an aliased
+    /// register is a pure borrow for the whole life of the frame, kept
+    /// alive by the caller's register, dropped by nobody, and cloned
+    /// rather than moved if the frame is materialized. Both the caller
+    /// (which builds `alias_mask`) and the callee (which decides whether
+    /// its frame may own anything) must agree, so both ask this.
+    pub fn can_alias_param(&self, index: usize) -> bool {
+        index < 64
+            && self.written_registers & (1 << index) == 0
+            && self.returned_registers & (1 << index) == 0
+    }
 }
 
 /// The registers a function's bytecode writes, as a mask (see
@@ -58,6 +80,26 @@ pub fn written_registers(function: &Function) -> u64 {
         if let Some(reg) = instruction.defined_register() {
             if reg < 64 {
                 mask |= 1 << reg;
+            } else {
+                return u64::MAX;
+            }
+        }
+    }
+    mask
+}
+
+/// The registers a function returns directly, as a mask (see
+/// `FunctionSig::returned_registers`). `Return(255)` returns Nil and owns
+/// nothing; a register outside the mask's range is treated as returned.
+pub fn returned_registers(function: &Function) -> u64 {
+    let mut mask = 0u64;
+    for instruction in &function.chunk.instructions {
+        if let Instruction::Return(reg) = instruction {
+            if *reg == 255 {
+                continue;
+            }
+            if *reg < 64 {
+                mask |= 1 << *reg;
             } else {
                 return u64::MAX;
             }
@@ -591,12 +633,10 @@ impl<'a> Translator<'a> {
                 && is_scalar(*kind)
             {
                 self.guard(*reg, *kind);
-            } else if index < 64
-                && sig.written_registers & (1 << index) == 0
-                && !self.env.scalars.contains_key(reg)
-            {
-                // The callee only reads this parameter: pass the caller's
-                // value by aliasing rather than cloning and dropping it.
+            } else if sig.can_alias_param(index) && !self.env.scalars.contains_key(reg) {
+                // The callee only reads this parameter, and never returns
+                // it: pass the caller's value by aliasing rather than
+                // cloning and dropping it.
                 alias_mask |= 1 << index;
             }
         }
@@ -1162,11 +1202,13 @@ fn entry_env(sig: &FunctionSig, ctx: &Context) -> (Env, bool) {
             Some(kind) if is_scalar(*kind) => {
                 env.scalars.insert(index as u8, *kind);
             }
-            // A parameter the function never writes owns nothing in a
-            // native frame: a compiled caller aliases a non-scalar argument
-            // to it and copies a scalar one (the interpreter drops its own
-            // frames). Any other register may come to own something.
-            _ if index < 64 && sig.written_registers & (1 << index) == 0 => {}
+            // A parameter the function never writes and never returns owns
+            // nothing in a native frame: a compiled caller aliases a
+            // non-scalar argument to it and copies a scalar one (the
+            // interpreter drops its own frames). Any other register may
+            // come to own something — including a parameter that is
+            // returned, which is cloned in and moved out.
+            _ if sig.can_alias_param(index) => {}
             _ => frame_may_own = true,
         }
         match sig.param_types.get(index) {
@@ -1386,6 +1428,7 @@ mod tests {
             register_count,
             param_types: vec![Some(TypeKind::Int); params],
             written_registers: u64::MAX,
+            returned_registers: u64::MAX,
         }
     }
 
@@ -1526,7 +1569,115 @@ mod tests {
             register_count: 3,
             param_types: vec![None, None],
             written_registers: u64::MAX,
+            returned_registers: u64::MAX,
         };
         assert!(translate(&g, 0, &sig, &context(&|_| None)).is_none());
+    }
+}
+
+/// End-to-end regressions for whole-function compilation: a program is run
+/// until its functions are compiled (see `FUNCTION_HOT_THRESHOLD`) and the
+/// results are compared against the interpreter's semantics.
+#[cfg(all(test, feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod compiled_semantics_tests {
+    use crate::bytecode::Value;
+    use crate::embed::EmbeddedProgram;
+    use alloc::rc::Rc;
+
+    fn program(source: &str) -> EmbeddedProgram {
+        let mut program = EmbeddedProgram::builder()
+            .module("main", source)
+            .entry_module("main")
+            .compile()
+            .expect("compile");
+        program.run_entry_script().expect("run entry script");
+        program
+    }
+
+    /// A function that returns one of its parameters cannot take it as an
+    /// uncounted alias: `Return` moves the register into the caller's
+    /// destination, so the value would be owned twice (the caller's
+    /// original register and the destination) and freed twice.
+    #[test]
+    fn returning_a_parameter_keeps_its_reference_count() {
+        let mut program = program(
+            r#"
+            function identity(a: Array<int>): Array<int>
+                return a
+            end
+            function wrapper(a: Array<int>): Array<int>
+                return identity(a)
+            end
+            function drive(a: Array<int>): int
+                local b: Array<int> = wrapper(a)
+                return array.len(b)
+            end
+        "#,
+        );
+        let value = Value::array(alloc::vec![Value::Int(42)]);
+        let Value::Array(rc) = &value else {
+            unreachable!("built an array")
+        };
+        let before = Rc::strong_count(rc);
+
+        // Enough calls for all three functions to be compiled whole and to
+        // call each other natively.
+        for _ in 0..80 {
+            let result = program
+                .call_raw("main.drive", alloc::vec![value.clone()])
+                .expect("drive");
+            assert_eq!(result.as_int(), Some(1));
+            assert_eq!(Rc::strong_count(rc), before);
+        }
+        assert!(program.jit_stats().functions_compiled >= 1);
+        assert_eq!(value.array_len(), Some(1));
+    }
+
+    /// `MIN / -1` and `MIN % -1` wrap, as the interpreter does. x86 `idiv`
+    /// raises #DE (a `SIGFPE`) for that quotient, so the backend has to
+    /// take the divisor apart first; aarch64 and riscv wrap in hardware.
+    #[test]
+    fn integer_division_overflow_wraps_in_compiled_code() {
+        let mut program = program(
+            r#"
+            function divide(a: int, b: int): int
+                return a / b
+            end
+            function modulo(a: int, b: int): int
+                return a % b
+            end
+            function drive(a: int, b: int, n: int): (int, int)
+                local q: int = 0
+                local r: int = 0
+                local i: int = 0
+                while i < n do
+                    q = divide(a, b)
+                    r = modulo(a, b)
+                    i = i + 1
+                end
+                return q, r
+            end
+        "#,
+        );
+        let min = crate::LustInt::MIN;
+        for _ in 0..80 {
+            let quotient: crate::LustInt = program.call_typed("main.divide", (min, -1)).expect("divide");
+            let remainder: crate::LustInt = program.call_typed("main.modulo", (min, -1)).expect("modulo");
+            assert_eq!(quotient, min.wrapping_div(-1));
+            assert_eq!(remainder, min.wrapping_rem(-1));
+        }
+        // Again through a traced loop calling both.
+        let pair = program
+            .call_raw("main.drive", alloc::vec![Value::Int(min), Value::Int(-1), Value::Int(200)])
+            .expect("drive");
+        let Value::Tuple(values) = &pair else {
+            panic!("expected a tuple, got {pair:?}")
+        };
+        assert_eq!(values[0].as_int(), Some(min.wrapping_div(-1)));
+        assert_eq!(values[1].as_int(), Some(min.wrapping_rem(-1)));
+
+        // Division by zero is still an error, not a wrap.
+        assert!(program.call_typed::<_, crate::LustInt>("main.divide", (1, 0)).is_err());
+        assert!(program.call_typed::<_, crate::LustInt>("main.modulo", (1, 0)).is_err());
     }
 }

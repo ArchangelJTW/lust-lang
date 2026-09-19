@@ -2033,6 +2033,11 @@ impl VM {
     /// popped (it returned; `Some` when that emptied the stack), or one or
     /// more frames — native callees materialized on exit included —
     /// positioned at the instruction the interpreter continues from.
+    ///
+    /// Only the backends that implement `JitCompiler::compile_function`
+    /// (x86_64 and aarch64, with `std`) have function code; elsewhere the
+    /// interpreter runs every call itself and loops are still traced.
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn run_compiled_function(&mut self, func_idx: usize) -> Result<Option<Value>> {
         let code = match self.jit.function_code(func_idx) {
             Some(code) => code,
@@ -2129,6 +2134,7 @@ impl VM {
 
     /// Translate and compile `func_idx` (see `jit::function`), or mark it
     /// as not compilable.
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn compile_function(&mut self, func_idx: usize) {
         use crate::jit::function::{Context, FunctionSig, translate};
         let sig_of = |meta: &CallMeta, function: &Function| FunctionSig {
@@ -2147,6 +2153,7 @@ impl VM {
                 _ => alloc::vec![None; function.param_count as usize],
             },
             written_registers: crate::jit::function::written_registers(function),
+            returned_registers: crate::jit::function::returned_registers(function),
         };
         let Some((function, meta)) = self.functions.get(func_idx).zip(self.call_meta.get(func_idx))
         else {
@@ -2193,6 +2200,13 @@ impl VM {
                 self.jit.function_not_compilable(func_idx);
             }
         }
+    }
+
+    /// Targets without a whole-function backend: the call stays
+    /// interpreted (see the compiled version above).
+    #[cfg(not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    fn run_compiled_function(&mut self, _func_idx: usize) -> Result<Option<Value>> {
+        Ok(None)
     }
 
     /// Is the callee register a plain bytecode function (not a closure,

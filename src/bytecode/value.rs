@@ -909,16 +909,16 @@ impl Value {
     /// A value with no owned payload: copying its bits is a valid clone and
     /// overwriting it needs no drop. The interpreter's hot paths use this to
     /// skip the general `Clone`/`Drop` for scalars.
+    ///
+    /// `Function` is a plain index into the function table. `NativeFunction`
+    /// is deliberately *not* here: it holds an `Rc`, so a bit copy would not
+    /// bump the count and an overwrite would not release it (the JIT's own
+    /// ownership probe lists it in `single_rc_tags` for the same reason).
     #[inline]
     pub fn is_plain(&self) -> bool {
         matches!(
             self,
-            Value::Nil
-                | Value::Bool(_)
-                | Value::Int(_)
-                | Value::Float(_)
-                | Value::Function(_)
-                | Value::NativeFunction(_)
+            Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Function(_)
         )
     }
 
@@ -1687,7 +1687,7 @@ pub unsafe extern "C" fn jit_drop_values_masked(values: *mut Value, len: usize, 
 pub unsafe extern "C" fn jit_drop_values(values: *mut Value, len: usize) {
     unsafe {
         if !values.is_null() && len != 0 {
-            ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(values, len));
+            ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(values, len));
         }
     }
 }
@@ -3373,6 +3373,44 @@ pub unsafe extern "C" fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Val
         let cloned_value = (&*src_ptr).clone();
         replace_value(dest_ptr, cloned_value);
         1
+    }
+}
+
+#[cfg(test)]
+mod value_ownership_tests {
+    use super::*;
+
+    /// `is_plain` decides whether the interpreter may copy a value's bits
+    /// instead of cloning it (`fast_clone`) and overwrite a register
+    /// instead of dropping it (`set_register`, `CallFrame::reset`). A
+    /// variant holding an `Rc` must never qualify: the copy would not bump
+    /// the count and the overwrite would not release it.
+    #[test]
+    fn native_functions_are_not_plain_values() {
+        let native: NativeFn = Rc::new(|_args: &[Value]| Ok(NativeCallResult::Return(Value::Nil)));
+        let value = Value::NativeFunction(Rc::clone(&native));
+        assert!(!value.is_plain());
+        assert_eq!(Rc::strong_count(&native), 2);
+
+        let copy = value.fast_clone();
+        assert_eq!(Rc::strong_count(&native), 3);
+        drop(copy);
+        assert_eq!(Rc::strong_count(&native), 2);
+    }
+
+    /// The variants that may be bit-copied, spelled out: everything else
+    /// owns a payload and goes through `Clone`/`Drop`.
+    #[test]
+    fn only_payload_free_variants_are_plain() {
+        assert!(Value::Nil.is_plain());
+        assert!(Value::Bool(true).is_plain());
+        assert!(Value::Int(1).is_plain());
+        assert!(Value::Float(1.0).is_plain());
+        assert!(Value::Function(0).is_plain());
+
+        assert!(!Value::string("owned").is_plain());
+        assert!(!Value::array(alloc::vec![Value::Int(1)]).is_plain());
+        assert!(!Value::some(Value::Int(1)).is_plain());
     }
 }
 

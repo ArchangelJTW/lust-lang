@@ -1,7 +1,7 @@
 use super::CallFrame;
 use crate::bytecode::{Register, TaskHandle, Value};
 use crate::error::LustError;
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 use hashbrown::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TaskId(pub u64);

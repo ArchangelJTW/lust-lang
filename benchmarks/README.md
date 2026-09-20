@@ -152,8 +152,9 @@ array-scanning function — through the Lust interpreter (`LUST_JIT=0`),
 the Lust JIT, LuaJIT and Lua, checking that all outputs agree. Each program
 has a `.lust` and an equivalent `.lua`.
 
-Measured on an Apple M5 (native aarch64 backend, branch `aarch64-jit`),
-milliseconds, single run each:
+Measured on an Apple M5 (native aarch64 backend; the x86_64 backend has the
+same optimizations but was only checked for agreement under Rosetta, not
+timed), milliseconds, single run each:
 
 | program   | lust-vm | lust-jit | luajit | lua 5.5 |
 |-----------|--------:|---------:|-------:|--------:|

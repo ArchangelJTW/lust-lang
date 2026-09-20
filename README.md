@@ -262,6 +262,13 @@ backend change:
   program and `lust-fuzz replay --seed S` reruns it with timings. `--size`
   scales program length, `--fg` runs the workers at normal priority (they
   default to background QoS), and a watchdog kills cases over 120 s or 2 GB.
+  To fuzz the x86_64 backend on an Apple Silicon Mac, build with
+  `--target x86_64-apple-darwin` and run the fuzzer under `arch -x86_64` as
+  several `--jobs 1` processes: a multi-threaded fuzzer process under
+  Rosetta produces about one spurious disagreement or segfault per 6,000
+  cases on any commit, none of which replays, apparently Rosetta's
+  translation cache and JIT buffers being mapped and unmapped from several
+  threads; single-worker processes are clean.
 
 Embedders can inspect cumulative activation counters after calling Lust code:
 

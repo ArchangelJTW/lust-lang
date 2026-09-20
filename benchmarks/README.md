@@ -158,15 +158,15 @@ timed), milliseconds, single run each:
 
 | program   | lust-vm | lust-jit | luajit | lua 5.5 |
 |-----------|--------:|---------:|-------:|--------:|
-| fields    |     747 |       48 |     58 |     120 |
-| array     |    1388 |       58 |     64 |      80 |
-| calls     |     757 |       64 |     30 |     126 |
-| methods   |    1330 |       70 |     31 |     222 |
-| strings   |     118 |      116 |    125 |     159 |
-| fib       |     170 |       32 |     21 |      40 |
-| nested    |     363 |       24 |     29 |      79 |
-| floatmath |     537 |       55 |     37 |      93 |
-| tree      |     748 |      126 |     39 |      53 |
+| fields    |     696 |       46 |     57 |     119 |
+| array     |    1248 |       49 |     58 |      76 |
+| calls     |     726 |       62 |     30 |     130 |
+| methods   |    1166 |       61 |     30 |     216 |
+| strings   |     116 |      116 |    122 |     156 |
+| fib       |     165 |       32 |     22 |      37 |
+| nested    |     352 |       25 |     28 |      78 |
+| floatmath |     522 |       55 |     37 |      93 |
+| tree      |     671 |      112 |     39 |      53 |
 
 (`strings` builds a 100,000-character string; it was 1,000,000 characters,
 14 s for every engine but Lua, until the suite got a per-program timeout.)
@@ -220,10 +220,20 @@ register skips the release, the inline retain and release test struct
 and enum tags before the five single-count ones, and a function's
 return releases only the registers that may own something instead of
 calling a helper that dropped the frame. `calls` went 107 → 64 ms.
-`tree` (138 → 126) is now all generated code: each node visit clones
+`tree` (138 → 126) was then all generated code: each node visit clones
 the `Option` field and its payload and releases both, and every clone
-or release of a struct or enum is three reference-count updates, two of
-them on the interned name and layout every node shares. `array` was
+or release of a struct or enum was three reference-count updates, two of
+them on the interned name and layout every node shares. That was the
+shape of `Value`: a struct was a name, a layout pointer and a fields
+pointer, an enum two names and a payload pointer, and the widest variant
+made every value 48 bytes. Every heap variant is now one thin `Rc` to an
+object holding the parts, so a `Value` is 16 bytes (a tag and a payload
+word), a register move copies two words, frames and arrays are a third
+of the size, and a struct or enum clone is one count on the value's own
+allocation. `tree` went 126 → 112 (its `sum` alone 0.18 → 0.14 s for
+200 passes), `methods` 70 → 61, `array` 58 → 49, and the interpreter
+gained 5–12% across the suite (`methods` 1330 → 1166, `tree` 748 →
+671). `array` was
 204 ms for a reason that had nothing to do with its element loop: when
 the outer `pass` loop got hot and was recorded, the recorder skipped the
 inner loop's iterations (a `NestedLoopCall` runs them through the inner

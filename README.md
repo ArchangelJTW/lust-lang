@@ -253,7 +253,12 @@ backend change:
   generates programs (loops, branches, calls, recursion, function values and
   closures, arrays, maps, structs, options, strings, pair returns), runs each
   both ways in-process and reports every disagreement with a shrunk
-  reproducer; `lust-fuzz one --seed S` prints a
+  reproducer. Helpers take and return structs (often the parameter
+  itself) and `Option<P>`, and natives are passed around as function
+  values. A debug build of the fuzzer (`cargo build -p lust-fuzz`, run
+  with `LUST_JIT_QUIET=1`, and `MallocScribble=1` on macOS) adds overflow
+  checks and debug assertions and makes freed memory visible, at about a
+  sixth of the speed; `lust-fuzz one --seed S` prints a
   program and `lust-fuzz replay --seed S` reruns it with timings. `--size`
   scales program length, `--fg` runs the workers at normal priority (they
   default to background QoS), and a watchdog kills cases over 120 s or 2 GB.

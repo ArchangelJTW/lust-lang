@@ -54,6 +54,12 @@ pub(crate) fn log<F>(message: F)
 where
     F: FnOnce() -> String,
 {
+    // Debug builds narrate the JIT; `LUST_JIT_QUIET=1` silences it (the
+    // fuzzer's debug runs would otherwise drown in it).
+    static QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *QUIET.get_or_init(|| std::env::var_os("LUST_JIT_QUIET").is_some()) {
+        return;
+    }
     println!("{}", message());
 }
 

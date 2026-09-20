@@ -33,6 +33,8 @@ pub enum Ty {
     FnIntInt,
     /// `Map<int, int>`
     MapIntInt,
+    /// `Option<P>`: a struct handed around through an enum payload.
+    OptStruct,
 }
 
 impl Ty {
@@ -48,6 +50,7 @@ impl Ty {
             Ty::Unknown => "unknown",
             Ty::FnIntInt => "function(int): int",
             Ty::MapIntInt => "Map<int, int>",
+            Ty::OptStruct => "Option<P>",
         }
     }
 }
@@ -133,6 +136,10 @@ pub enum Expr {
     Cast(String, &'static str),
     /// A named `function(int): int` helper used as a value.
     FnName(String),
+    /// A stdlib native (`math.abs`) used as a `function(int): int` value.
+    Native(&'static str),
+    /// `Option.Some(e)` over a struct.
+    SomeStruct(Box<Expr>),
     /// `function(x: int): int return e end`, `e` over `x` and captured locals.
     Closure(String, Box<Expr>),
     /// `f(e)` through a `function(int): int` variable.
@@ -203,6 +210,12 @@ pub enum Stmt {
     },
     /// `if opt is Some(v) then body end`
     IfIsSome {
+        opt: String,
+        var: String,
+        body: Vec<Stmt>,
+    },
+    /// `if opt is Some(q) then body end` over an `Option<P>`.
+    IfIsSomeStruct {
         opt: String,
         var: String,
         body: Vec<Stmt>,
@@ -375,6 +388,12 @@ fn render_expr(e: &Expr, out: &mut String) {
         Expr::TypeIs(u, ty) => out.push_str(&format!("({u} is {ty})")),
         Expr::Cast(u, ty) => out.push_str(&format!("({u} as {ty})")),
         Expr::FnName(f) => out.push_str(f),
+        Expr::Native(f) => out.push_str(f),
+        Expr::SomeStruct(e) => {
+            out.push_str("Option.Some(");
+            render_expr(e, out);
+            out.push(')');
+        }
         Expr::Closure(x, body) => {
             out.push_str(&format!("function({x}: int): int return "));
             render_expr(body, out);
@@ -497,7 +516,7 @@ fn render_stmt(s: &Stmt, out: &mut Out) {
             out.indent -= 1;
             out.line("end");
         }
-        Stmt::IfIsSome { opt, var, body } => {
+        Stmt::IfIsSome { opt, var, body } | Stmt::IfIsSomeStruct { opt, var, body } => {
             out.line(&format!("if {opt} is Some({var}) then"));
             out.indent += 1;
             render_block(body, out);
@@ -707,10 +726,12 @@ pub fn program(seed: u64, size: u32) -> Program {
     let mut funcs = Vec::new();
     let func_count = g.rng.below(size as u64 + 1) as usize;
     for _ in 0..func_count {
-        match g.rng.below(10) {
+        match g.rng.below(12) {
             0..=1 => funcs.push(g.unary_func()),
             2 => funcs.push(g.pair_func()),
             3..=4 => funcs.extend(g.recursive_funcs()),
+            5 => funcs.push(g.struct_func()),
+            6 => funcs.push(g.opt_struct_func()),
             _ => funcs.push(g.func()),
         }
     }
@@ -893,6 +914,128 @@ impl Gen {
     }
 
     /// A pair-returning helper, `(int, float)` or `(int, bool)`.
+    /// A helper taking a struct (and an int) and returning a struct: the
+    /// parameter itself most of the time — a compiled caller passes it by
+    /// aliasing, and returning it must add a reference — else a fresh
+    /// struct built from it. The body may read and mutate the parameter.
+    fn struct_func(&mut self) -> Func {
+        let name = self.fresh("s");
+        self.scopes.clear();
+        self.scopes.push(Vec::new());
+        let p = self.fresh("p");
+        let k = self.fresh("k");
+        self.declare(&p, Ty::Struct, false);
+        self.declare(&k, Ty::Int, false);
+        self.in_func = true;
+        self.iter_scale = 1;
+        self.cur_work = 0;
+        let straight = self.rng.chance(0.5);
+        let saved_size = self.size;
+        if straight {
+            self.size = 1;
+        }
+        let mut body = if straight { Vec::new() } else { self.block(false) };
+        if self.rng.chance(0.4) {
+            body.push(Stmt::SetField {
+                obj: p.clone(),
+                field: "a",
+                expr: Expr::Bin(
+                    Box::new(Expr::Field(p.clone(), "a")),
+                    BinOp::Add,
+                    Box::new(Expr::Var(k.clone())),
+                ),
+            });
+        }
+        let ret_expr = match self.rng.below(10) {
+            0..=5 => Expr::Var(p.clone()),
+            6..=7 => Expr::StructLit(
+                Box::new(Expr::Bin(
+                    Box::new(Expr::Field(p.clone(), "a")),
+                    BinOp::Sub,
+                    Box::new(Expr::Var(k.clone())),
+                )),
+                Box::new(Expr::Field(p.clone(), "b")),
+                Box::new(Expr::Not(Box::new(Expr::Field(p.clone(), "c")))),
+            ),
+            _ => self.expr(Ty::Struct, 1),
+        };
+        self.size = saved_size;
+        self.in_func = false;
+        self.iter_scale = 1;
+        let work = self.cur_work.max(1);
+        self.cur_work = 0;
+        self.funcs.push(FuncSig {
+            name: name.clone(),
+            params: vec![Ty::Struct, Ty::Int],
+            ret: Ty::Struct,
+            work,
+            bound: None,
+            second: None,
+        });
+        Func {
+            name,
+            params: vec![(p, Ty::Struct), (k, Ty::Int)],
+            ret: Ty::Struct,
+            body,
+            ret_expr,
+            second: None,
+        }
+    }
+
+    /// A helper returning `Option<P>`: the struct parameter wrapped in
+    /// `Some` (an enum payload the callee's frame gives up and the caller
+    /// unwraps again), or `None` depending on the flag.
+    fn opt_struct_func(&mut self) -> Func {
+        let name = self.fresh("o");
+        self.scopes.clear();
+        self.scopes.push(Vec::new());
+        let p = self.fresh("p");
+        let flag = self.fresh("b");
+        self.declare(&p, Ty::Struct, false);
+        self.declare(&flag, Ty::Bool, false);
+        self.in_func = true;
+        self.iter_scale = 1;
+        self.cur_work = 0;
+        let saved_size = self.size;
+        self.size = 1;
+        let body = if self.rng.chance(0.5) { Vec::new() } else { self.block(false) };
+        // `if not flag then return None end`, then `Some(p)`.
+        let mut body = body;
+        body.push(Stmt::If {
+            branches: vec![(
+                Expr::Not(Box::new(Expr::Var(flag.clone()))),
+                vec![Stmt::Return(Expr::None)],
+            )],
+            otherwise: None,
+        });
+        let ret_expr = if self.rng.chance(0.8) {
+            Expr::SomeStruct(Box::new(Expr::Var(p.clone())))
+        } else {
+            Expr::SomeStruct(Box::new(self.expr(Ty::Struct, 1)))
+        };
+        self.size = saved_size;
+        self.in_func = false;
+        self.iter_scale = 1;
+        let work = self.cur_work.max(1);
+        self.cur_work = 0;
+        self.funcs.push(FuncSig {
+            name: name.clone(),
+            params: vec![Ty::Struct, Ty::Bool],
+            ret: Ty::OptStruct,
+            work,
+            bound: None,
+            second: None,
+        });
+        Func {
+            name,
+            params: vec![(p, Ty::Struct), (flag, Ty::Bool)],
+            ret: Ty::OptStruct,
+            body,
+            ret_expr,
+            second: None,
+        }
+    }
+
     fn pair_func(&mut self) -> Func {
         let name = self.fresh("h");
         let scalar = [Ty::Int, Ty::Float, Ty::Bool];
@@ -1228,7 +1371,7 @@ impl Gen {
     }
 
     fn local(&mut self) -> Stmt {
-        let ty = match self.rng.below(18) {
+        let ty = match self.rng.below(19) {
             0..=3 => Ty::Int,
             4..=5 => Ty::Float,
             6 => Ty::Bool,
@@ -1238,6 +1381,7 @@ impl Gen {
             11..=12 => Ty::Str,
             13 => Ty::Unknown,
             14..=15 => Ty::FnIntInt,
+            16 => Ty::OptStruct,
             _ => Ty::MapIntInt,
         };
         let name = self.fresh(match ty {
@@ -1251,6 +1395,7 @@ impl Gen {
             Ty::Unknown => "u",
             Ty::FnIntInt => "fn",
             Ty::MapIntInt => "m",
+            Ty::OptStruct => "op",
         });
         let init = self.expr(ty, 2);
         if let Expr::ArrLit(items) = &init {
@@ -1269,6 +1414,8 @@ impl Gen {
             Ty::OptInt,
             Ty::Str,
             Ty::FnIntInt,
+            Ty::Struct,
+            Ty::OptStruct,
         ]);
         let vars = self.mutable_vars_of(ty);
         if vars.is_empty() {
@@ -1374,6 +1521,18 @@ impl Gen {
     }
 
     fn if_is_some(&mut self) -> Option<Stmt> {
+        if self.rng.chance(0.4) {
+            let opts = self.vars_of(Ty::OptStruct);
+            if !opts.is_empty() {
+                let opt = self.rng.pick(&opts).name.clone();
+                let var = self.fresh("q");
+                self.scopes.push(Vec::new());
+                self.declare(&var, Ty::Struct, true);
+                let body = self.block(false);
+                self.scopes.pop();
+                return Some(Stmt::IfIsSomeStruct { opt, var, body });
+            }
+        }
         let vars = self.vars_of(Ty::OptInt);
         if vars.is_empty() {
             return Some(self.local());
@@ -1508,11 +1667,37 @@ impl Gen {
                 let items = (0..n).map(|_| self.int_expr(1)).collect();
                 Expr::ArrLit(items)
             }
-            Ty::Struct => Expr::StructLit(
-                Box::new(self.int_expr(1)),
-                Box::new(self.float_expr(1)),
-                Box::new(self.bool_expr(1)),
-            ),
+            Ty::Struct => {
+                // A struct-returning helper call (its argument a variable
+                // when one exists, so the callee's frame aliases it), an
+                // existing variable, or a literal.
+                if depth > 0 && self.rng.chance(0.4)
+                    && let Some(call) = self.call_returning(Ty::Struct, depth)
+                {
+                    return call;
+                }
+                let vars = self.vars_of(Ty::Struct);
+                if !vars.is_empty() && self.rng.chance(0.3) {
+                    return Expr::Var(self.rng.pick(&vars).name.clone());
+                }
+                Expr::StructLit(
+                    Box::new(self.int_expr(1)),
+                    Box::new(self.float_expr(1)),
+                    Box::new(self.bool_expr(1)),
+                )
+            }
+            Ty::OptStruct => {
+                if depth > 0 && self.rng.chance(0.6)
+                    && let Some(call) = self.call_returning(Ty::OptStruct, depth)
+                {
+                    return call;
+                }
+                if self.rng.chance(0.7) {
+                    Expr::SomeStruct(Box::new(self.expr(Ty::Struct, 1)))
+                } else {
+                    Expr::None
+                }
+            }
             Ty::OptInt => match self.rng.below(12) {
                 0..=4 => Expr::Some(Box::new(self.int_expr(1))),
                 5..=6 => Expr::None,
@@ -1558,6 +1743,9 @@ impl Gen {
             },
             Ty::Str => self.str_expr(depth),
             Ty::Unknown => {
+                if self.rng.chance(0.1) {
+                    return Expr::Native(*self.rng.pick(&["math.abs", "tostring"]));
+                }
                 let ty = *self.rng.pick(&[Ty::Int, Ty::Float, Ty::Bool, Ty::Str]);
                 self.expr(ty, 1)
             }
@@ -1575,9 +1763,12 @@ impl Gen {
             self.vars_of(Ty::FnIntInt)
         };
         let names = self.unary_names();
-        match self.rng.below(10) {
+        match self.rng.below(12) {
             0..=3 if !vars.is_empty() => Expr::Var(self.rng.pick(&vars).name.clone()),
             4..=6 if !names.is_empty() => Expr::FnName(self.rng.pick(&names).clone()),
+            // A native as a function value: an owning `NativeFunction` in
+            // a register, moved and called like any other.
+            10..=11 => Expr::Native("math.abs"),
             _ if depth > 0 && !self.in_closure => {
                 let x = self.fresh("x");
                 self.scopes.push(vec![Var {
@@ -2057,7 +2248,8 @@ fn children(s: &Stmt) -> Vec<&Vec<Stmt>> {
         | Stmt::ForIn { body, .. }
         | Stmt::IfIndex { body, .. }
         | Stmt::IfSome { body, .. }
-        | Stmt::IfIsSome { body, .. } => vec![body],
+        | Stmt::IfIsSome { body, .. }
+        | Stmt::IfIsSomeStruct { body, .. } => vec![body],
         Stmt::If {
             branches,
             otherwise,
@@ -2080,7 +2272,8 @@ fn children_mut(s: &mut Stmt) -> Vec<&mut Vec<Stmt>> {
         | Stmt::ForIn { body, .. }
         | Stmt::IfIndex { body, .. }
         | Stmt::IfSome { body, .. }
-        | Stmt::IfIsSome { body, .. } => vec![body],
+        | Stmt::IfIsSome { body, .. }
+        | Stmt::IfIsSomeStruct { body, .. } => vec![body],
         Stmt::If {
             branches,
             otherwise,

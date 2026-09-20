@@ -515,13 +515,13 @@ impl VM {
                 }
 
                 Instruction::AddInt(dest, lhs, rhs) => {
-                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Int(a + b)))?;
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Int(a.wrapping_add(b))))?;
                 }
                 Instruction::SubInt(dest, lhs, rhs) => {
-                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Int(a - b)))?;
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Int(a.wrapping_sub(b))))?;
                 }
                 Instruction::MulInt(dest, lhs, rhs) => {
-                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Int(a * b)))?;
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Int(a.wrapping_mul(b))))?;
                 }
                 Instruction::DivInt(dest, lhs, rhs) => {
                     self.int_binary_op(dest, lhs, rhs, |a, b| {
@@ -546,7 +546,7 @@ impl VM {
                     })?;
                 }
                 Instruction::NegInt(dest, src) => {
-                    self.int_binary_op(dest, src, src, |a, _| Ok(Value::Int(-a)))?;
+                    self.int_binary_op(dest, src, src, |a, _| Ok(Value::Int(a.wrapping_neg())))?;
                 }
                 Instruction::EqInt(dest, lhs, rhs) => {
                     self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Bool(a == b)))?;
@@ -613,7 +613,7 @@ impl VM {
 
                 Instruction::Add(dest, lhs, rhs) => {
                     self.binary_op(dest, lhs, rhs, |l, r| match (l, r) {
-                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_add(*b))),
                         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
                         (Value::Int(a), Value::Float(b)) => {
                             Ok(Value::Float(float_from_int(*a) + *b))
@@ -629,7 +629,7 @@ impl VM {
 
                 Instruction::Sub(dest, lhs, rhs) => {
                     self.binary_op(dest, lhs, rhs, |l, r| match (l, r) {
-                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_sub(*b))),
                         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
                         (Value::Int(a), Value::Float(b)) => {
                             Ok(Value::Float(float_from_int(*a) - *b))
@@ -645,7 +645,7 @@ impl VM {
 
                 Instruction::Mul(dest, lhs, rhs) => {
                     self.binary_op(dest, lhs, rhs, |l, r| match (l, r) {
-                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
+                        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a.wrapping_mul(*b))),
                         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
                         (Value::Int(a), Value::Float(b)) => {
                             Ok(Value::Float(float_from_int(*a) * *b))
@@ -735,7 +735,7 @@ impl VM {
                 Instruction::Neg(dest, src) => {
                     let value = self.get_register(src)?;
                     let result = match value {
-                        Value::Int(i) => Value::Int(-i),
+                        Value::Int(i) => Value::Int(i.wrapping_neg()),
                         Value::Float(f) => Value::Float(-f),
                         _ => {
                             return Err(LustError::RuntimeError {

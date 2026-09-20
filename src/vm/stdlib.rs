@@ -1777,7 +1777,7 @@ fn create_math_abs_fn() -> Value {
     Value::NativeFunction(Rc::new(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         match val {
-            Value::Int(i) => Ok(NativeCallResult::Return(Value::Int(i.abs()))),
+            Value::Int(i) => Ok(NativeCallResult::Return(Value::Int(i.wrapping_abs()))),
             Value::Float(f) => Ok(NativeCallResult::Return(Value::Float(f.abs()))),
             other => Err(format!(
                 "math.abs expects a number, got {:?}",

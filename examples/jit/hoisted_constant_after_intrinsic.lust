@@ -1,0 +1,19 @@
+-- `array.len(arr)` on an unboxed array becomes a specialized length op
+-- writing the call's result register; the module-table constant loaded
+-- into that same register later in the iteration must not be hoisted out
+-- of the loop as if nothing else wrote the register.
+local arr: Array<int> = [13, 0, 0, 3]
+for k = (0 - 5), 9 do
+    array.push(arr, (0 - 18) + array.len(arr))
+    array.push(arr, array.len(arr) + (0 - k))
+end
+println(array.len(arr))
+local total: int = 0
+local i: int = 0
+while i < array.len(arr) do
+    if arr[i] is Ok(v) then
+        total = total + v
+    end
+    i = i + 1
+end
+println(total)

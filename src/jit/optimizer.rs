@@ -268,6 +268,15 @@ impl TraceOptimizer {
                     {
                         clobbered.insert(*value_dest);
                         clobbered.insert(*condition_dest);
+                    } else if let TraceOp::SpecializedOp { operands, .. } = other {
+                        // A specialized op writes its register operands
+                        // (`VecLen`'s length, say); treat every one as
+                        // written rather than tell them apart.
+                        for operand in operands {
+                            if let crate::jit::trace::Operand::Register(register) = operand {
+                                clobbered.insert(*register);
+                            }
+                        }
                     } else if let Some(dest) = Self::dest_of(other) {
                         clobbered.insert(dest);
                     }

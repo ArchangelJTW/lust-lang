@@ -78,7 +78,7 @@ pub(super) const FAIL_ISLAND_INTERVAL: usize = 900 * 1024;
 /// Size of the record pushed for each inlined call frame: a
 /// `crate::vm::JitInlineRecord` (value_count, caller x19, previous x21,
 /// alias_mask, function_idx, return_dest, callee_reg, caller_resume_ip).
-pub(super) const INLINE_METADATA_SIZE: i32 = 64;
+pub(super) const INLINE_METADATA_SIZE: i32 = 32;
 
 mod arithmetic;
 mod builder;
@@ -128,6 +128,10 @@ pub struct JitCompiler {
     /// Function mode: (frame register count, may any register own a value
     /// at return) of the function being compiled.
     function_frame: (u8, bool),
+    /// Function mode: the declared scalar return kind, if any. A native
+    /// caller then takes the result from a register (see
+    /// `compile_function_return`) instead of having it stored.
+    function_result: Option<ValueType>,
     /// Function mode: address of the table of compiled-function entry
     /// points, indexed by function index (see `JitState::function_entries`).
     function_entry_table: usize,

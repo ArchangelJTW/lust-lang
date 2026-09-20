@@ -500,37 +500,34 @@ impl JitCompiler {
         let epilogue = self
             .function_epilogue
             .expect("function code is compiled inside compile_trace");
-        let _ = result_type;
-        let slot = self.function_entry_table + function_idx * mem::size_of::<usize>();
+        let slot_offset = (function_idx * mem::size_of::<usize>()) as i32;
+        let site = self.retain_call_site(crate::vm::JitCallSite {
+            value_count: frame_value_count as usize,
+            alias_mask: alias_mask as usize,
+            function_idx,
+            return_dest: dest as usize,
+            callee_reg: callee as usize,
+            caller_resume_ip: resume_ip,
+        });
         dynasm!(self.ops
             ; .arch x64
-            // Native stack limit (see `JIT_STACK_LIMIT`).
-            ; mov rax, QWORD jit::stack_limit_cell() as _
-            ; mov rax, [rax]
-            ; cmp rsp, rax
+            // Native stack limit and the interpreter's frame depth limit
+            // (see `JitCells`).
+            ; cmp rsp, [r13 + jit::STACK_LIMIT_OFFSET as i32]
             ; jb => to_interpreter
-            // The interpreter's frame depth limit (`JIT_DEPTH_BUDGET`).
-            ; mov rax, QWORD jit::depth_budget_cell() as _
-            ; cmp QWORD [rax], 0
+            ; cmp QWORD [r13 + jit::DEPTH_BUDGET_OFFSET as i32], 0
             ; je => to_interpreter
             // The callee's entry point, if it has compiled code.
-            ; mov rax, QWORD slot as _
-            ; mov rbx, [rax]
+            ; mov rax, [r13 + jit::ENTRY_TABLE_OFFSET as i32]
+            ; mov rbx, [rax + slot_offset]
             ; test rbx, rbx
             ; jz => to_interpreter
             // The record (see `JitInlineRecord`).
             ; sub rsp, metadata_size
-            ; mov QWORD [rsp], frame_value_count
-            ; mov [rsp + 8], r12
-            ; mov [rsp + 16], r15
-            ; mov rax, QWORD alias_mask as i64
-            ; mov [rsp + 24], rax
-            ; mov rax, QWORD function_idx as _
-            ; mov [rsp + 32], rax
-            ; mov QWORD [rsp + 40], dest as i32
-            ; mov QWORD [rsp + 48], callee as i32
-            ; mov rax, QWORD resume_ip as _
-            ; mov [rsp + 56], rax
+            ; mov [rsp], r12
+            ; mov [rsp + 8], r15
+            ; mov rax, QWORD site as i64
+            ; mov [rsp + 16], rax
             // The callee frame: every register Nil, then the arguments.
             ; sub rsp, frame_size
         );
@@ -592,17 +589,16 @@ impl JitCompiler {
         dynasm!(self.ops
             ; .arch x64
             // Enter the callee: rdi = its registers, rsi = VM, rdx = record.
-            ; mov rax, QWORD jit::depth_budget_cell() as _
-            ; dec QWORD [rax]
+            ; dec QWORD [r13 + jit::DEPTH_BUDGET_OFFSET as i32]
             ; mov rdi, rsp
             ; mov rsi, r13
             ; lea rdx, [rsp + frame_size]
+            ; lea rcx, [r12 + (dest as i32) * value_size]
             ; call rbx
             // Pop the frame and record; the callee's epilogue restored
             // rbx, r12..r15.
             ; add rsp, frame_size + metadata_size
-            ; mov rcx, QWORD jit::depth_budget_cell() as _
-            ; inc QWORD [rcx]
+            ; inc QWORD [r13 + jit::DEPTH_BUDGET_OFFSET as i32]
             ; cmp eax, DWORD returned
             ; je => done
             // Anything else is an exit that already materialized every
@@ -622,14 +618,52 @@ impl JitCompiler {
         });
         *guard_index += 1;
         dynasm!(self.ops ; .arch x64 ; => done);
+        if let Some(ty) = result_type {
+            // The callee returned its declared scalar result in rdx.
+            match ty {
+                ValueType::Float => {
+                    dynasm!(self.ops ; .arch x64 ; movq xmm0, rdx);
+                    self.store_xmm0_as_float(dest);
+                }
+                ValueType::Int => {
+                    dynasm!(self.ops ; .arch x64 ; mov rax, rdx);
+                    self.store_from_rax(dest, ValueTag::Int.as_u8());
+                }
+                _ => {
+                    dynasm!(self.ops ; .arch x64 ; mov rax, rdx);
+                    self.store_from_rax(dest, ValueTag::Bool.as_u8());
+                }
+            }
+        }
         Ok(())
     }
 
     /// `Return` of function code (see the aarch64 backend).
+    /// Drop this frame's registers at a native return, except the aliased
+    /// arguments (the record's mask; no record when entered from the
+    /// interpreter), which are the caller's.
+    fn emit_drop_frame(&mut self, register_count: u8) {
+        unsafe extern "C" {
+            fn jit_drop_values_masked(values: *mut Value, len: usize, mask: u64);
+        }
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov rdi, r12
+            ; mov esi, DWORD i32::from(register_count)
+            ; xor edx, edx
+            ; test r15, r15
+            ; jz >no_record
+            ; mov rdx, [r15 + 16]
+            ; mov rdx, [rdx + 8]
+            ; no_record:
+            ; mov rax, QWORD jit_drop_values_masked as *const () as _
+            ; call rax
+        );
+    }
+
     pub(super) fn compile_function_return(&mut self, value: Option<u8>) -> Result<()> {
         unsafe extern "C" {
             fn jit_return_value(src: *mut Value, dest: *mut Value);
-            fn jit_drop_values_masked(values: *mut Value, len: usize, mask: u64);
         }
         let (register_count, may_own) = self.function_frame;
         let epilogue = self
@@ -639,13 +673,35 @@ impl JitCompiler {
         let interp_return = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch x64
-            ; test r15, r15
+            ; test r14, r14
             ; jz => interp_return
-            ; mov rsi, [r15 + 8]
-            ; mov rax, [r15 + 40]
-            ; imul rax, rax, mem::size_of::<Value>() as i32
-            ; add rsi, rax
         );
+        if let (Some(ty), Some(reg)) = (self.function_result, value) {
+            // A declared scalar result goes back in rdx (its payload bits;
+            // the translator's guard before the `Return` proved the type)
+            // and the caller stores it: no store here, no tag to check.
+            if may_own {
+                self.emit_drop_frame(register_count);
+            }
+            let payload = (reg as i32) * (mem::size_of::<Value>() as i32) + 8;
+            if ty == ValueType::Bool {
+                dynasm!(self.ops ; .arch x64 ; movzx edx, BYTE [r12 + payload]);
+            } else {
+                dynasm!(self.ops ; .arch x64 ; mov rdx, [r12 + payload]);
+            }
+            let returned = jit::NATIVE_RETURNED;
+            let code = jit::FUNCTION_RETURN_BASE + i32::from(reg);
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov eax, DWORD returned
+                ; jmp => epilogue
+                ; => interp_return
+                ; mov eax, DWORD code
+                ; jmp => exit_label
+            );
+            return Ok(());
+        }
+        dynasm!(self.ops ; .arch x64 ; mov rsi, r14);
         // A scalar result of known type is stored directly when the
         // caller's register holds nothing owned; the helper handles the
         // rest.
@@ -698,20 +754,7 @@ impl JitCompiler {
             ; => stored
         );
         if may_own {
-            // Aliased arguments (the record's mask; no record when entered
-            // from the interpreter) are the caller's and are not dropped.
-            dynasm!(self.ops
-                ; .arch x64
-                ; mov rdi, r12
-                ; mov esi, DWORD i32::from(register_count)
-                ; xor edx, edx
-                ; test r15, r15
-                ; jz >no_record
-                ; mov rdx, [r15 + 24]
-                ; no_record:
-                ; mov rax, QWORD jit_drop_values_masked as *const () as _
-                ; call rax
-            );
+            self.emit_drop_frame(register_count);
         }
         let returned = jit::NATIVE_RETURNED;
         let code = jit::FUNCTION_RETURN_BASE + i32::from(value.unwrap_or(255));

@@ -107,6 +107,7 @@ impl VM {
             natives: HashMap::new(),
             globals: HashMap::new(),
             globals_version: 0,
+            jit_cells: crate::jit::JitCells::default(),
             map_hasher: DefaultHashBuilder::default(),
             call_stack: Vec::new(),
             frame_pool: Vec::new(),
@@ -232,6 +233,7 @@ impl VM {
         }
         self.jit.invalidate_compiled_code();
         self.jit.reset_function_tables(functions.len());
+        self.jit_cells.entry_table = self.jit.function_entry_table();
         self.call_meta = functions.iter().map(CallMeta::of).collect();
         self.functions = functions;
     }

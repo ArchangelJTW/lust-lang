@@ -780,9 +780,9 @@ impl JitCompiler {
         } else {
             usize::MAX
         };
-        self.emit_mov_imm64(11, jit::call_ip_cell() as u64);
+        let offset = jit::CALL_IP_OFFSET as u32;
         self.emit_mov_imm64(12, ip as u64);
-        dynasm!(self.ops ; .arch aarch64 ; str x12, [x11]);
+        dynasm!(self.ops ; .arch aarch64 ; str x12, [x20, #offset]);
     }
 
     fn emit_call_result_out(&mut self, x: u8, dest: u8) {

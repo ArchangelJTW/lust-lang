@@ -2466,7 +2466,7 @@ pub unsafe extern "C" fn jit_call_native_safe(
         }
 
         // The caller's frame shows the call's line if the native fails.
-        if let Some(ip) = jit::take_call_ip()
+        if let Some(ip) = (&mut *vm_ptr).take_call_ip()
             && let Some(frame) = (&mut *vm_ptr).call_stack.last_mut()
         {
             frame.ip = ip + 1;
@@ -2589,7 +2589,7 @@ pub unsafe extern "C" fn jit_call_function_safe(
 
         let vm = &mut *vm_ptr;
         // The caller's frame shows the call's line in a stack trace.
-        if let Some(ip) = jit::take_call_ip()
+        if let Some(ip) = vm.take_call_ip()
             && let Some(frame) = vm.call_stack.last_mut()
         {
             frame.ip = ip + 1;

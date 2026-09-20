@@ -15,6 +15,7 @@ impl JitCompiler {
             trace_start_ip: 0,
             function_mode: false,
             function_frame: (0, true),
+            function_result: None,
             function_entry_table: 0,
             function_epilogue: None,
             function_labels: HashMap::new(),
@@ -60,6 +61,14 @@ impl JitCompiler {
         ptr
     }
 
+    /// Keep a call site's fixed facts with the code (see `JitInlineRecord`).
+    pub(super) fn retain_call_site(&mut self, site: crate::vm::JitCallSite) -> usize {
+        let site = Box::new(site);
+        let ptr = site.as_ref() as *const crate::vm::JitCallSite as usize;
+        self.data.push(JitData::CallSite(site));
+        ptr
+    }
+
     pub(super) fn retain_value(&mut self, value: Value) -> *const Value {
         let value = Box::new(value);
         let ptr = value.as_ref() as *const Value;
@@ -97,9 +106,11 @@ impl JitCompiler {
         trace_id: TraceId,
         register_count: u8,
         entry_table: usize,
+        result_type: Option<ValueType>,
     ) -> Result<CompiledTrace> {
         self.function_mode = true;
         self.function_frame = (register_count, trace.frame_may_own);
+        self.function_result = result_type;
         self.function_entry_table = entry_table;
         self.function_labels.clear();
         let result = self.compile_trace(trace, trace_id, Vec::new());
@@ -142,9 +153,8 @@ impl JitCompiler {
         let info = (ip & ((1usize << jit::EXIT_KIND_SHIFT) - 1)) | (kind << jit::EXIT_KIND_SHIFT);
         dynasm!(self.ops
             ; .arch x64
-            ; mov rax, QWORD jit::exit_info_cell() as _
             ; mov rcx, QWORD info as _
-            ; mov [rax], rcx
+            ; mov [r13 + jit::EXIT_INFO_OFFSET as i32], rcx
         );
     }
 
@@ -184,7 +194,9 @@ impl JitCompiler {
             ; mov r13, rsi
         );
         if self.function_mode {
-            dynasm!(self.ops ; .arch x64 ; mov r15, rdx);
+            // rcx = where a native caller wants the result (null from the
+            // interpreter, which takes it from the return code).
+            dynasm!(self.ops ; .arch x64 ; mov r15, rdx ; mov r14, rcx);
         } else {
             dynasm!(self.ops ; .arch x64 ; xor r15, r15);
         }
@@ -303,7 +315,7 @@ impl JitCompiler {
         let ops = mem::replace(&mut self.ops, Assembler::new().unwrap());
         let exec_buffer = ops.finalize().unwrap();
         let entry_point = exec_buffer.ptr(dynasmrt::AssemblyOffset(0));
-        let entry: extern "C" fn(*mut Value, *mut VM, *const Function) -> i32 =
+        let entry: extern "C" fn(*mut Value, *mut VM, *const Function, *mut Value) -> i32 =
             unsafe { mem::transmute(entry_point) };
         #[cfg(feature = "std")]
         {
@@ -1750,20 +1762,21 @@ impl JitCompiler {
                 })
                 .map(|(arg_index, _)| 1u64 << arg_index)
                 .fold(0, |mask, bit| mask | bit);
+            let site = self.retain_call_site(crate::vm::JitCallSite {
+                value_count: frame_value_count as usize,
+                alias_mask: alias_mask as usize,
+                function_idx: trace.function_idx,
+                return_dest: dest as usize,
+                callee_reg: callee as usize,
+                caller_resume_ip,
+            });
             dynasm!(self.ops
                 ; .arch x64
                 ; sub rsp, metadata_size
-                ; mov QWORD [rsp], frame_value_count
-                ; mov [rsp + 8], r12
-                ; mov [rsp + 16], r15
-                ; mov rax, QWORD alias_mask as _
-                ; mov [rsp + 24], rax
-                ; mov rax, QWORD trace.function_idx as _
-                ; mov [rsp + 32], rax
-                ; mov QWORD [rsp + 40], dest as i32
-                ; mov QWORD [rsp + 48], callee as i32
-                ; mov rax, QWORD caller_resume_ip as _
-                ; mov [rsp + 56], rax
+                ; mov [rsp], r12
+                ; mov [rsp + 8], r15
+                ; mov rax, QWORD site as i64
+                ; mov [rsp + 16], rax
                 // Allocate the callee frame and initialise every register to
                 // Nil (discriminant 0), so the argument moves below find
                 // nothing to drop. r12 still addresses the caller's registers.
@@ -1870,7 +1883,7 @@ impl JitCompiler {
                     let dest_offset = (dest as i32) * value_size;
                     dynasm!(self.ops
                         ; .arch x64
-                        ; mov r14, [r15 + 8]
+                        ; mov r14, [r15]
                         ; lea rdi, [r12 + ret_offset]
                         ; lea rsi, [r14 + dest_offset]
                         ; mov rax, QWORD jit_move_safe as *const () as _
@@ -1910,8 +1923,8 @@ impl JitCompiler {
             dynasm!(self.ops
                 ; .arch x64
                 ; lea rsp, [r15 + metadata_size]
-                ; mov r12, [r15 + 8]
-                ; mov r15, [r15 + 16]
+                ; mov r12, [r15]
+                ; mov r15, [r15 + 8]
             );
 
             // Back in the caller's frame: the caller's environment is

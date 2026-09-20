@@ -686,6 +686,14 @@ impl<'a> Translator<'a> {
                 if ty.is_none() && function.is_none() {
                     self.frame_may_own = true;
                 }
+                // A function constant the register is already proven to
+                // hold (reloaded by the bytecode on every iteration of a
+                // loop making the same call) need not be stored again.
+                if let Some(idx) = function
+                    && self.env.functions.get(&dest) == Some(&idx)
+                {
+                    return Some(());
+                }
                 self.ops.push(TraceOp::LoadConst { dest, value });
                 self.env.write(dest, ty);
                 if let Some(idx) = function {

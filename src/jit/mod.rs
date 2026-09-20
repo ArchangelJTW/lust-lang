@@ -80,70 +80,72 @@ pub const FUNCTION_RETURN_BASE: i32 = 1 << 20;
 /// Result of compiled function code called natively by other compiled code
 /// when it returned normally (anything else is an exit to propagate).
 pub const NATIVE_RETURNED: i32 = 1 << 30;
-#[cfg(feature = "std")]
-std::thread_local! {
-    /// Lowest machine stack address native-to-native calls may grow to. Set
-    /// by the VM before entering function code; a call that would go below
-    /// it is handed to the interpreter instead. Per thread: compiled code
-    /// embeds the address of its own thread's cell (a VM never changes
-    /// threads).
-    pub static JIT_STACK_LIMIT: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
-    /// Where the interpreter resumes after function code exits (any depth
-    /// of native calls in): the exiting site's bytecode ip in the low 48
-    /// bits, its kind in the high bits (`EXIT_KIND_*`). Set by the exit
-    /// stubs of function code just before they leave.
-    pub static JIT_EXIT_INFO: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+/// Runtime state compiled code reads and writes directly, addressed
+/// through the VM pointer it holds (`VM::jit_cells`): a native call checks
+/// the stack limit and depth budget, an exit records where it left, and a
+/// helper call publishes its ip. One block per VM, so VMs on other
+/// threads (the fuzzer's workers) never share it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct JitCells {
+    /// Lowest machine stack address native-to-native calls may grow to.
+    /// Set by the VM before entering function code; a call that would go
+    /// below it is handed to the interpreter instead.
+    pub stack_limit: usize,
     /// Native calls still allowed before the interpreter's stack depth
     /// limit would be reached: `max_stack_depth - call_stack.len()` at the
     /// interpreter's entry into function code, decremented by each native
     /// call and restored on return. A call with no budget left is handed
     /// to the interpreter, which raises the overflow.
-    pub static JIT_DEPTH_BUDGET: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    pub depth_budget: usize,
+    /// Where the interpreter resumes after function code exits (any depth
+    /// of native calls in): the exiting site's bytecode ip in the low 48
+    /// bits, its kind in the high bits (`EXIT_KIND_*`). Set by the exit
+    /// stubs of function code just before they leave.
+    pub exit_info: usize,
     /// Bytecode ip of the call a trace is making through a runtime helper
     /// (`jit_call_function_safe` / `jit_call_native_safe`), stored just
     /// before the call so the caller's frame can show the right line in a
-    /// stack trace; `usize::MAX` when unknown (a call from an inlined body,
-    /// whose frame is not on the interpreter's stack). The helper resets it.
-    pub static JIT_CALL_IP: core::cell::Cell<usize> = const { core::cell::Cell::new(usize::MAX) };
+    /// stack trace; `usize::MAX` when unknown (a call from an inlined
+    /// body, whose frame is not on the interpreter's stack). The helper
+    /// resets it.
+    pub call_ip: usize,
+    /// The function entry table (`JitState::function_entries`): compiled
+    /// code loads a callee's entry through it rather than embedding the
+    /// table's address.
+    pub entry_table: usize,
 }
 
-/// Address of this thread's `JIT_CALL_IP` cell, for compiled code.
-#[cfg(feature = "std")]
-pub fn call_ip_cell() -> usize {
-    JIT_CALL_IP.with(|cell| cell as *const _ as usize)
+impl Default for JitCells {
+    fn default() -> Self {
+        Self {
+            stack_limit: 0,
+            depth_budget: 0,
+            exit_info: usize::MAX,
+            call_ip: usize::MAX,
+            entry_table: 0,
+        }
+    }
 }
 
-/// Take the call ip a trace stored for the helper call in progress.
-#[cfg(feature = "std")]
-pub fn take_call_ip() -> Option<usize> {
-    JIT_CALL_IP.with(|cell| {
-        let ip = cell.replace(usize::MAX);
+/// Byte offsets of the cells from the VM pointer, for compiled code.
+pub const CELLS_OFFSET: usize = core::mem::offset_of!(VM, jit_cells);
+pub const STACK_LIMIT_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCells, stack_limit);
+pub const DEPTH_BUDGET_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCells, depth_budget);
+pub const EXIT_INFO_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCells, exit_info);
+pub const CALL_IP_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCells, call_ip);
+pub const ENTRY_TABLE_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCells, entry_table);
+// Compiled code addresses the cells with 12-bit scaled immediates.
+const _: () = assert!(ENTRY_TABLE_OFFSET < 32760);
+
+impl VM {
+    /// Take the call ip a trace stored for the helper call in progress.
+    pub(crate) fn take_call_ip(&mut self) -> Option<usize> {
+        let ip = core::mem::replace(&mut self.jit_cells.call_ip, usize::MAX);
         (ip != usize::MAX).then_some(ip)
-    })
+    }
 }
 
-#[cfg(not(feature = "std"))]
-pub fn take_call_ip() -> Option<usize> {
-    None
-}
-
-/// Address of this thread's `JIT_DEPTH_BUDGET` cell, for compiled code.
-#[cfg(feature = "std")]
-pub fn depth_budget_cell() -> usize {
-    JIT_DEPTH_BUDGET.with(|cell| cell as *const _ as usize)
-}
-
-/// Address of this thread's `JIT_STACK_LIMIT` cell, for compiled code.
-#[cfg(feature = "std")]
-pub fn stack_limit_cell() -> usize {
-    JIT_STACK_LIMIT.with(|cell| cell as *const _ as usize)
-}
-
-/// Address of this thread's `JIT_EXIT_INFO` cell, for compiled code.
-#[cfg(feature = "std")]
-pub fn exit_info_cell() -> usize {
-    JIT_EXIT_INFO.with(|cell| cell as *const _ as usize)
-}
 /// Machine stack kept free below the interpreter's entry into function
 /// code before native calls hand over to the interpreter.
 pub const NATIVE_STACK_RESERVE: usize = 1 << 20;
@@ -171,7 +173,10 @@ const MAX_ROOT_EVICTION_SHIFT: u32 = 16;
 pub struct TraceId(pub usize);
 pub struct CompiledTrace {
     pub id: TraceId,
-    entry: extern "C" fn(*mut Value, *mut VM, *const crate::bytecode::Function) -> i32,
+    /// `(registers, vm, record, result)`: the record and the result slot
+    /// are what a native caller passes (see `compile_call_direct`); the
+    /// interpreter passes null for both.
+    entry: extern "C" fn(*mut Value, *mut VM, *const crate::bytecode::Function, *mut Value) -> i32,
     #[cfg(any(
         all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
         all(feature = "rv32", target_arch = "riscv32")
@@ -194,7 +199,7 @@ impl CompiledTrace {
         vm: *mut VM,
         function: *const crate::bytecode::Function,
     ) -> i32 {
-        (self.entry)(registers, vm, function)
+        (self.entry)(registers, vm, function, core::ptr::null_mut())
     }
 }
 
@@ -205,6 +210,7 @@ pub(super) enum JitData {
     Value(Box<Value>),
     Name(crate::bytecode::value::Name),
     Key(Box<crate::bytecode::ValueKey>),
+    CallSite(Box<crate::vm::JitCallSite>),
     String(Box<str>),
     StringPointers(Box<[*const u8]>),
     StringLengths(Box<[usize]>),

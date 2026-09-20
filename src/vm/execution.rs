@@ -2059,20 +2059,16 @@ impl VM {
         let marker = 0u8;
         let sp = &marker as *const u8 as usize;
         let limit = sp.saturating_sub(crate::jit::NATIVE_STACK_RESERVE);
-        crate::jit::JIT_STACK_LIMIT.with(|cell| {
-            let current = cell.get();
-            if current == 0 || limit < current {
-                cell.set(limit);
-            }
-        });
+        if self.jit_cells.stack_limit == 0 || limit < self.jit_cells.stack_limit {
+            self.jit_cells.stack_limit = limit;
+        }
 
         let cost = code.trace.ops.len();
         self.budgets.charge_gas(core::cmp::max(1, cost) as u64)?;
         self.jit.record_native_entry();
         self.pending_jit_error = None;
-        crate::jit::JIT_EXIT_INFO.with(|cell| cell.set(usize::MAX));
-        let budget = self.max_stack_depth.saturating_sub(self.call_stack.len());
-        crate::jit::JIT_DEPTH_BUDGET.with(|cell| cell.set(budget));
+        self.jit_cells.exit_info = usize::MAX;
+        self.jit_cells.depth_budget = self.max_stack_depth.saturating_sub(self.call_stack.len());
         let registers_ptr = self.call_stack.last_mut().unwrap().registers.as_mut_ptr();
         let vm_ptr = self as *mut VM;
         let result = code.execute(registers_ptr, vm_ptr, ptr::null());
@@ -2092,7 +2088,7 @@ impl VM {
         // An exit, from this function or a native callee whose frames are
         // now on the call stack: resume the innermost frame where the
         // exiting site said.
-        let info = crate::jit::JIT_EXIT_INFO.with(|cell| cell.get());
+        let info = self.jit_cells.exit_info;
         if info == usize::MAX {
             // Every exit stub of function code records its site; an exit
             // without one is a compiler bug. Evict the code and resume at
@@ -2190,7 +2186,21 @@ impl VM {
         let trace_id = self.jit.alloc_trace_id();
         let register_count = function.register_count;
         let entry_table = self.jit.function_entry_table();
-        match JitCompiler::new().compile_function(&trace, trace_id, register_count, entry_table) {
+        let result_type = sig.ret.filter(|ty| {
+            matches!(
+                ty,
+                crate::jit::trace::ValueType::Int
+                    | crate::jit::trace::ValueType::Float
+                    | crate::jit::trace::ValueType::Bool
+            )
+        });
+        match JitCompiler::new().compile_function(
+            &trace,
+            trace_id,
+            register_count,
+            entry_table,
+            result_type,
+        ) {
             Ok(code) => {
                 crate::jit::log(|| format!("✅ JIT: function {} compiled", func_idx));
                 self.jit.store_function_code(func_idx, code);

@@ -305,6 +305,7 @@ impl VM {
                 self.call_meta.push(super::CallMeta::of(&wrapper));
                 self.functions.push(wrapper);
                 self.jit.push_function_slot();
+                self.jit_cells.entry_table = self.jit.function_entry_table();
                 new_idx
             }
         };

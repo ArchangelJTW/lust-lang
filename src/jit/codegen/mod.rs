@@ -28,7 +28,7 @@ pub(super) const SPECIALIZED_STACK_BASE: i32 = 72;
 /// Size of the record pushed for each inlined call frame: a
 /// `crate::vm::JitInlineRecord` (value_count, caller r12, previous r15,
 /// alias_mask, function_idx, return_dest, callee_reg, caller_resume_ip).
-pub(super) const INLINE_METADATA_SIZE: i32 = 64;
+pub(super) const INLINE_METADATA_SIZE: i32 = 32;
 mod arithmetic;
 mod builder;
 mod comparisons;
@@ -69,6 +69,10 @@ pub struct JitCompiler {
     /// Function mode: (frame register count, may any register own a value
     /// at return) of the function being compiled.
     function_frame: (u8, bool),
+    /// Function mode: the declared scalar return kind, if any. A native
+    /// caller then takes the result from a register (see
+    /// `compile_function_return`) instead of having it stored.
+    function_result: Option<ValueType>,
     /// Function mode: address of the compiled-function entry table.
     function_entry_table: usize,
     /// Function mode: the epilogue, for propagating an exit that happened

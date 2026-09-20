@@ -748,9 +748,8 @@ impl JitCompiler {
         };
         dynasm!(self.ops
             ; .arch x64
-            ; mov rax, QWORD jit::call_ip_cell() as _
             ; mov r10, QWORD ip as i64
-            ; mov [rax], r10
+            ; mov [r13 + jit::CALL_IP_OFFSET as i32], r10
         );
     }
 

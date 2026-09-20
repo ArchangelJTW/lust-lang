@@ -406,9 +406,9 @@ impl JitCompiler {
     /// `JIT_EXIT_INFO = ip | kind << EXIT_KIND_SHIFT`.
     pub(super) fn emit_exit_info(&mut self, ip: usize, kind: usize) {
         let info = (ip & ((1usize << jit::EXIT_KIND_SHIFT) - 1)) | (kind << jit::EXIT_KIND_SHIFT);
-        self.emit_mov_imm64(11, jit::exit_info_cell() as u64);
+        let offset = jit::EXIT_INFO_OFFSET as u32;
         self.emit_mov_imm64(12, info as u64);
-        dynasm!(self.ops ; .arch aarch64 ; str x12, [x11]);
+        dynasm!(self.ops ; .arch aarch64 ; str x12, [x20, #offset]);
     }
 
     // ── Scalar stores (port of store_from_rax / store_xmm0_as_float) ──────

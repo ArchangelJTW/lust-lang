@@ -157,15 +157,18 @@ milliseconds, single run each:
 
 | program   | lust-vm | lust-jit | luajit | lua 5.5 |
 |-----------|--------:|---------:|-------:|--------:|
-| fields    |     737 |       44 |     55 |     111 |
-| array     |    1327 |      205 |     55 |      77 |
-| calls     |     770 |      104 |     27 |     125 |
-| methods   |    1384 |       73 |     27 |     214 |
-| strings   |   13987 |    13783 |  25994 |    7311 |
-| fib       |     175 |       37 |     20 |      36 |
-| nested    |     365 |       23 |     27 |      76 |
-| floatmath |     552 |       53 |     34 |      95 |
-| tree      |     746 |      134 |     36 |      53 |
+| fields    |     766 |       50 |     59 |     124 |
+| array     |    1360 |      213 |     61 |      78 |
+| calls     |     793 |      107 |     31 |     121 |
+| methods   |    1353 |       70 |     30 |     228 |
+| strings   |     117 |      121 |    123 |     160 |
+| fib       |     182 |       34 |     24 |      40 |
+| nested    |     396 |       25 |     30 |      81 |
+| floatmath |     583 |       57 |     38 |      89 |
+| tree      |     764 |      138 |     41 |      57 |
+
+(`strings` builds a 100,000-character string; it was 1,000,000 characters,
+14 s for every engine but Lua, until the suite got a per-program timeout.)
 
 The interpreter numbers were 3-90x worse before the fixes to cycle
 collection cost, call-frame copying and argument checking on this branch
@@ -198,4 +201,15 @@ allocation. Remaining gaps against Lua: `strings`, where every engine is
 quadratic in `s = s .. x`; `array`, whose element loop still writes every
 value through to the frame; and `tree`, where a node visit is three
 native calls with frames and records each, against LuaJIT's register
-passing.
+passing. A native call has since lost its per-call site materialization
+(the callee's argument mask, function index and resume point are one
+record the trace's data owns, pushed by pointer), its function-constant
+reload, its entry-table address load (the table, the stack limit, the
+depth budget and the exit word live in the VM at fixed offsets from the
+pinned VM pointer) and, for a declared `int`, `float` or `bool` result,
+its result store: the callee hands the payload back in a register and
+the caller stores it. `fib(34)` went from 0.12 to 0.08 s; a loop of
+200,000,000 calls to a one-line function from 1.63 to 1.55 s. The suite
+does not move: its `calls` and `methods` loops are traced with the
+callee inlined, and `tree`'s calls are dominated by the frame setup and
+teardown that remain.

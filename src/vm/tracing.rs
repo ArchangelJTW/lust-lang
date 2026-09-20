@@ -296,16 +296,26 @@ pub unsafe extern "C" fn jit_run_nested_loop(
 /// `compile_inline_call`.
 #[repr(C)]
 pub struct JitInlineRecord {
-    /// Registers the callee frame holds.
-    pub value_count: usize,
     /// The caller's register array (the trace's own for the outermost
     /// record, the enclosing inline frame's otherwise).
     pub caller_regs: *mut Value,
     /// The enclosing inline record, null for the outermost.
     pub prev: *const JitInlineRecord,
+    /// What is fixed about the call site, kept with the code that made
+    /// the call (three stores per call instead of eight).
+    pub site: *const JitCallSite,
+}
+
+/// The compile-time facts about a native call site (see `JitInlineRecord`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct JitCallSite {
+    /// Registers the callee frame holds.
+    pub value_count: usize,
     /// Bit i set: callee register i aliases a caller register (its bits
     /// were copied without a reference-count increment), so it must be
-    /// cloned, not moved, when the frame is materialized.
+    /// cloned, not moved, when the frame is materialized, and is not
+    /// dropped with the frame.
     pub alias_mask: usize,
     pub function_idx: usize,
     /// Caller register the callee's result goes to.
@@ -341,46 +351,49 @@ pub unsafe extern "C" fn jit_materialize_inline_frames(
     let mut record = record;
     let mut regs = regs;
     while !record.is_null() {
-        let r = unsafe { &*record };
-        chain.push((r, regs));
+        let (r, site) = unsafe { (&*record, &*(*record).site) };
+        chain.push((r, site, regs));
         regs = r.caller_regs;
         record = r.prev;
     }
     let root_regs = regs;
     if vm.is_null() {
-        for (r, regs) in chain {
-            for i in 0..r.value_count {
+        for (_, site, regs) in chain {
+            for i in 0..site.value_count {
+                if i < 64 && site.alias_mask & (1 << i) != 0 {
+                    continue;
+                }
                 unsafe { core::ptr::drop_in_place(regs.add(i)) };
             }
         }
         return root_regs;
     }
     let vm = unsafe { &mut *vm };
-    for (r, regs) in chain.into_iter().rev() {
+    for (r, site, regs) in chain.into_iter().rev() {
         let register_count = vm
             .functions
-            .get(r.function_idx)
+            .get(site.function_idx)
             .map(|f| f.register_count)
-            .unwrap_or(r.value_count as u8);
+            .unwrap_or(site.value_count as u8);
         // The frames were live inside the trace already; the depth limit
         // was checked when they were called.
-        let mut frame = match vm.take_frame(r.function_idx, Some(r.return_dest as Register), register_count) {
+        let mut frame = match vm.take_frame(site.function_idx, Some(site.return_dest as Register), register_count) {
             Ok(frame) => frame,
-            Err(_) => CallFrame::new(r.function_idx, Some(r.return_dest as Register), register_count),
+            Err(_) => CallFrame::new(site.function_idx, Some(site.return_dest as Register), register_count),
         };
-        for i in 0..r.value_count {
+        for i in 0..site.value_count {
             let slot = unsafe { regs.add(i) };
-            frame.registers[i] = if i < 64 && r.alias_mask & (1 << i) != 0 {
+            frame.registers[i] = if i < 64 && site.alias_mask & (1 << i) != 0 {
                 unsafe { (*slot).clone() }
             } else {
                 unsafe { core::ptr::read(slot) }
             };
         }
-        if let Value::Closure { upvalues, .. } = unsafe { &*r.caller_regs.add(r.callee_reg) } {
+        if let Value::Closure { upvalues, .. } = unsafe { &*r.caller_regs.add(site.callee_reg) } {
             frame.upvalues = upvalues.iter().map(|uv| uv.get()).collect();
         }
         if let Some(caller) = vm.call_stack.last_mut() {
-            caller.ip = r.caller_resume_ip;
+            caller.ip = site.caller_resume_ip;
         }
         vm.call_stack.push(frame);
     }

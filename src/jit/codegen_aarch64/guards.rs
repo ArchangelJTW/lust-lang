@@ -487,33 +487,32 @@ impl JitCompiler {
         let epilogue = self
             .function_epilogue
             .expect("function code is compiled inside compile_trace");
-        let _ = result_type;
 
         // Native stack limit (see `JIT_STACK_LIMIT`), the interpreter's
         // frame depth limit (`JIT_DEPTH_BUDGET`) and the callee's entry
         // point (from the entry table), all from their cells: the
         // callee-saved registers are for pinned values.
-        let slot = self.function_entry_table + function_idx * mem::size_of::<usize>();
-        self.emit_mov_imm64(9, jit::stack_limit_cell() as u64);
+        let slot_offset = function_idx * mem::size_of::<usize>();
+        let stack_limit = jit::STACK_LIMIT_OFFSET as u32;
+        let depth_budget = jit::DEPTH_BUDGET_OFFSET as u32;
+        let entry_table = jit::ENTRY_TABLE_OFFSET as u32;
         dynasm!(self.ops
             ; .arch aarch64
-            ; ldr x9, [x9]
+            ; ldr x9, [x20, #stack_limit]
             ; mov x10, sp
             ; cmp x10, x9
             ; b.lo => to_interpreter
-        );
-        self.emit_mov_imm64(9, jit::depth_budget_cell() as u64);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; ldr x10, [x9]
+            ; ldr x10, [x20, #depth_budget]
             ; cbz x10, => to_interpreter
+            ; ldr x11, [x20, #entry_table]
         );
-        self.emit_mov_imm64(11, slot as u64);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; ldr x16, [x11]
-            ; cbz x16, => to_interpreter
-        );
+        if slot_offset <= 32760 {
+            dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x11, #slot_offset as u32]);
+        } else {
+            self.emit_mov_imm64(9, slot_offset as u64);
+            dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x11, x9]);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; cbz x16, => to_interpreter);
 
         // Push the record (see `JitInlineRecord`): value_count, caller
         // regs, previous chain, alias mask, function, result register,
@@ -523,23 +522,21 @@ impl JitCompiler {
             ; .arch aarch64
             ; sub sp, sp, #metadata_size
         );
-        self.emit_mov_imm_i32(0, frame_value_count);
-        self.emit_mov_imm64(12, alias_mask);
+        let site = self.retain_call_site(crate::vm::JitCallSite {
+            value_count: frame_value_count as usize,
+            alias_mask: alias_mask as usize,
+            function_idx,
+            return_dest: dest as usize,
+            callee_reg: callee as usize,
+            caller_resume_ip: resume_ip,
+        });
+        self.emit_mov_imm64(0, site as u64);
         dynasm!(self.ops
             ; .arch aarch64
-            ; str x0, [sp]
-            ; str x19, [sp, 8]
-            ; str x21, [sp, 16]
-            ; str x12, [sp, 24]
+            ; str x19, [sp]
+            ; str x21, [sp, 8]
+            ; str x0, [sp, 16]
         );
-        self.emit_mov_imm64(0, function_idx as u64);
-        dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 32]);
-        self.emit_mov_imm64(0, dest as u64);
-        dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 40]);
-        self.emit_mov_imm64(0, callee as u64);
-        dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 48]);
-        self.emit_mov_imm64(0, resume_ip as u64);
-        dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 56]);
 
         // The callee frame: every register Nil (tag 0), then the arguments.
         self.emit_sub_sp(frame_size);
@@ -548,6 +545,9 @@ impl JitCompiler {
             let offset = super::registers::reg_offset(reg) as u32;
             dynasm!(self.ops ; .arch aarch64 ; strb wzr, [x11, #offset]);
         }
+        // x16 (the entry) survives the argument moves unless one calls a
+        // helper; then it is reloaded.
+        let mut helper_called = false;
         for (index, src_reg) in sources.into_iter().enumerate() {
             let dest_offset = index as i32 * value_size;
             if index < 64 && alias_mask & (1 << index) != 0 {
@@ -589,6 +589,7 @@ impl JitCompiler {
                     );
                 }
                 _ => {
+                    helper_called = true;
                     self.emit_reg_addr(0, src_reg);
                     dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
                     self.emit_add_imm(1, 11, dest_offset);
@@ -604,29 +605,32 @@ impl JitCompiler {
         // The entry is reloaded: the argument moves above may have called
         // helpers through x16. The depth budget is spent for the call's
         // duration.
-        self.emit_mov_imm64(11, slot as u64);
-        dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x11]);
-        self.emit_mov_imm64(11, jit::depth_budget_cell() as u64);
+        if helper_called {
+            dynasm!(self.ops ; .arch aarch64 ; ldr x11, [x20, #entry_table]);
+            if slot_offset <= 32760 {
+                dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x11, #slot_offset as u32]);
+            } else {
+                self.emit_mov_imm64(9, slot_offset as u64);
+                dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x11, x9]);
+            }
+        }
         dynasm!(self.ops
             ; .arch aarch64
-            ; ldr x9, [x11]
+            ; ldr x9, [x20, #depth_budget]
             ; sub x9, x9, 1
-            ; str x9, [x11]
+            ; str x9, [x20, #depth_budget]
             ; mov x0, sp
             ; mov x1, x20
             ; mov x11, sp
         );
         self.emit_add_imm(2, 11, frame_size);
+        self.emit_reg_addr(3, dest);
         dynasm!(self.ops
             ; .arch aarch64
             ; blr x16
-        );
-        self.emit_mov_imm64(11, jit::depth_budget_cell() as u64);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; ldr x9, [x11]
+            ; ldr x9, [x20, #depth_budget]
             ; add x9, x9, 1
-            ; str x9, [x11]
+            ; str x9, [x20, #depth_budget]
         );
         // Pop the frame and record; the callee's epilogue restored x19..x24.
         let pop = (frame_size + INLINE_METADATA_SIZE) as u32;
@@ -660,7 +664,44 @@ impl JitCompiler {
         });
         *guard_index += 1;
         dynasm!(self.ops ; .arch aarch64 ; => done);
+        if let Some(ty) = result_type {
+            // The callee returned its declared scalar result in x1.
+            match ty {
+                ValueType::Float => {
+                    dynasm!(self.ops ; .arch aarch64 ; fmov d0, x1);
+                    self.store_d0_as_float(dest);
+                }
+                ValueType::Int => {
+                    dynasm!(self.ops ; .arch aarch64 ; mov x0, x1);
+                    self.store_from_x0(dest, ValueTag::Int.as_u8());
+                }
+                _ => {
+                    dynasm!(self.ops ; .arch aarch64 ; mov x0, x1);
+                    self.store_from_x0(dest, ValueTag::Bool.as_u8());
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Drop this frame's registers at a native return, except the aliased
+    /// arguments (the record's mask; no record when entered from the
+    /// interpreter), which are the caller's.
+    fn emit_drop_frame(&mut self, register_count: u8) {
+        unsafe extern "C" {
+            fn jit_drop_values_masked(values: *mut Value, len: usize, mask: u64);
+        }
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; mov x0, x19
+            ; mov x2, xzr
+            ; cbz x21, >no_record
+            ; ldr x2, [x21, 16]
+            ; ldr x2, [x2, 8]
+            ; no_record:
+        );
+        self.emit_mov_imm_i32(1, i32::from(register_count));
+        self.emit_call(jit_drop_values_masked as *const ());
     }
 
     /// `Return` of function code. Called natively (x21 = our record): move
@@ -674,10 +715,8 @@ impl JitCompiler {
         _guard_index: &mut i32,
         _guards: &mut Vec<Guard>,
     ) -> Result<()> {
-        let value_size = mem::size_of::<Value>() as u32;
         unsafe extern "C" {
             fn jit_return_value(src: *mut Value, dest: *mut Value);
-            fn jit_drop_values_masked(values: *mut Value, len: usize, mask: u64);
         }
         let (register_count, may_own) = self.function_frame;
         let epilogue = self
@@ -687,12 +726,33 @@ impl JitCompiler {
         let interp_return = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
-            ; cbz x21, => interp_return
-            ; ldr x11, [x21, 8]
-            ; ldr x9, [x21, 40]
-            ; movz w10, #value_size
-            ; madd x1, x9, x10, x11
+            ; cbz x22, => interp_return
         );
+        if let (Some(ty), Some(reg)) = (self.function_result, value) {
+            // A declared scalar result goes back in x1 (its payload bits;
+            // the translator's guard before the `Return` proved the type)
+            // and the caller stores it: no store here, no tag to check.
+            if may_own {
+                self.emit_drop_frame(register_count);
+            }
+            if ty == ValueType::Bool {
+                self.load_bool_payload(1, reg);
+            } else {
+                self.load_payload(1, reg);
+            }
+            let returned_hi = (jit::NATIVE_RETURNED as u32) >> 16;
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; movz w0, #returned_hi, lsl #16
+                ; b => epilogue
+                ; => interp_return
+            );
+            let code = jit::FUNCTION_RETURN_BASE + i32::from(reg);
+            self.emit_mov_imm_i32(0, code);
+            dynasm!(self.ops ; .arch aarch64 ; b => exit_label);
+            return Ok(());
+        }
+        dynasm!(self.ops ; .arch aarch64 ; mov x1, x22);
         // A scalar result of known type is stored directly when the
         // caller's register holds nothing owned (it usually holds Nil or
         // the previous scalar); the helper handles everything else.
@@ -736,18 +796,7 @@ impl JitCompiler {
         self.emit_call(jit_return_value as *const ());
         dynasm!(self.ops ; .arch aarch64 ; => stored);
         if may_own {
-            // Aliased arguments (the record's mask; no record when entered
-            // from the interpreter) are the caller's and are not dropped.
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; mov x0, x19
-                ; mov x2, xzr
-                ; cbz x21, >no_record
-                ; ldr x2, [x21, 24]
-                ; no_record:
-            );
-            self.emit_mov_imm_i32(1, i32::from(register_count));
-            self.emit_call(jit_drop_values_masked as *const ());
+            self.emit_drop_frame(register_count);
         }
         let returned_hi = (jit::NATIVE_RETURNED as u32) >> 16;
         dynasm!(self.ops

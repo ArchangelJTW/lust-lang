@@ -19,6 +19,7 @@ impl JitCompiler {
             trace_start_ip: 0,
             function_mode: false,
             function_frame: (0, true),
+            function_result: None,
             function_entry_table: 0,
             function_epilogue: None,
             function_labels: HashMap::new(),
@@ -65,6 +66,14 @@ impl JitCompiler {
         ptr
     }
 
+    /// Keep a call site's fixed facts with the code (see `JitInlineRecord`).
+    pub(super) fn retain_call_site(&mut self, site: crate::vm::JitCallSite) -> usize {
+        let site = Box::new(site);
+        let ptr = site.as_ref() as *const crate::vm::JitCallSite as usize;
+        self.data.push(JitData::CallSite(site));
+        ptr
+    }
+
     pub(super) fn retain_value(&mut self, value: Value) -> *const Value {
         let value = Box::new(value);
         let ptr = value.as_ref() as *const Value;
@@ -102,9 +111,11 @@ impl JitCompiler {
         trace_id: TraceId,
         register_count: u8,
         entry_table: usize,
+        result_type: Option<ValueType>,
     ) -> Result<CompiledTrace> {
         self.function_mode = true;
         self.function_frame = (register_count, trace.frame_may_own);
+        self.function_result = result_type;
         self.function_entry_table = entry_table;
         self.function_labels.clear();
         let result = self.compile_trace(trace, trace_id, Vec::new());
@@ -204,7 +215,9 @@ impl JitCompiler {
             ; mov x20, x1
         );
         if self.function_mode {
-            dynasm!(self.ops ; .arch aarch64 ; mov x21, x2);
+            // x3 = where a native caller wants the result (null from the
+            // interpreter, which takes it from the return code).
+            dynasm!(self.ops ; .arch aarch64 ; mov x21, x2 ; mov x22, x3);
         } else {
             dynasm!(self.ops ; .arch aarch64 ; mov x21, xzr);
         }
@@ -391,7 +404,7 @@ impl JitCompiler {
         let ops = mem::replace(&mut self.ops, Assembler::new().unwrap());
         let exec_buffer = ops.finalize().unwrap();
         let entry_point = exec_buffer.ptr(dynasmrt::AssemblyOffset(0));
-        let entry: extern "C" fn(*mut Value, *mut VM, *const Function) -> i32 =
+        let entry: extern "C" fn(*mut Value, *mut VM, *const Function, *mut Value) -> i32 =
             unsafe { mem::transmute(entry_point) };
         #[cfg(feature = "std")]
         {
@@ -1867,23 +1880,21 @@ impl JitCompiler {
                 ; .arch aarch64
                 ; sub sp, sp, #metadata_size
             );
-            self.emit_mov_imm_i32(0, frame_value_count);
+            let site = self.retain_call_site(crate::vm::JitCallSite {
+                value_count: frame_value_count as usize,
+                alias_mask: alias_mask as usize,
+                function_idx: trace.function_idx,
+                return_dest: dest as usize,
+                callee_reg: callee as usize,
+                caller_resume_ip,
+            });
+            self.emit_mov_imm64(0, site as u64);
             dynasm!(self.ops
                 ; .arch aarch64
-                ; str x0, [sp]
-                ; str x19, [sp, 8]
-                ; str x21, [sp, 16]
+                ; str x19, [sp]
+                ; str x21, [sp, 8]
+                ; str x0, [sp, 16]
             );
-            self.emit_mov_imm64(0, alias_mask);
-            dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 24]);
-            self.emit_mov_imm64(0, trace.function_idx as u64);
-            dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 32]);
-            self.emit_mov_imm64(0, dest as u64);
-            dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 40]);
-            self.emit_mov_imm64(0, callee as u64);
-            dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 48]);
-            self.emit_mov_imm64(0, caller_resume_ip as u64);
-            dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 56]);
             // Allocate space for callee registers and initialise every one
             // to Nil (discriminant 0) — what `jit_init_nil` does, without a
             // call per register — so the argument moves below find nothing to
@@ -1993,7 +2004,7 @@ impl JitCompiler {
                     let dest_offset = (dest as i32) * value_size;
                     dynasm!(self.ops
                         ; .arch aarch64
-                        ; ldr x11, [x21, 8]
+                        ; ldr x11, [x21]
                     );
                     self.emit_reg_addr(0, ret_reg);
                     self.emit_add_imm(1, 11, dest_offset);
@@ -2029,8 +2040,8 @@ impl JitCompiler {
             dynasm!(self.ops
                 ; .arch aarch64
                 ; add sp, x21, #metadata_size
-                ; ldr x19, [x21, 8]
-                ; ldr x21, [x21, 16]
+                ; ldr x19, [x21]
+                ; ldr x21, [x21, 8]
             );
 
             // Back in the caller's frame: the caller's environment is

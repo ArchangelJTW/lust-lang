@@ -3047,6 +3047,13 @@ impl TraceRecorder {
         self.recording
     }
 
+    /// The nested loop whose iterations are not being recorded, as
+    /// `(function_idx, loop_start_ip)`: its own root trace may run them.
+    pub fn skipped_loop(&self) -> Option<(usize, usize)> {
+        self.nested_skip
+            .map(|skip| (skip.function_idx, skip.loop_start_ip))
+    }
+
     pub fn is_complete(&self) -> bool {
         self.completed
     }

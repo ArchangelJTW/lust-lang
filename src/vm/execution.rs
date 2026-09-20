@@ -178,7 +178,18 @@ impl VM {
                 {
                     self.abandon_trace_recording();
                 }
-                let root_trace_id = if self.trace_recorder.is_none() {
+                // No trace runs while one is being recorded, except the
+                // root trace of a nested loop the recording is skipping:
+                // that loop's iterations are not part of the trace, and
+                // interpreting them (a million, for a big array) would be
+                // what the recording costs.
+                let skipped_nested = self
+                    .trace_recorder
+                    .as_ref()
+                    .is_some_and(|recorder| {
+                        recorder.skipped_loop() == Some((func_idx, loop_start_ip))
+                    });
+                let root_trace_id = if self.trace_recorder.is_none() || skipped_nested {
                     self.jit
                         .root_traces
                         .get(&(func_idx, loop_start_ip))

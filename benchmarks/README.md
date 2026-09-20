@@ -159,7 +159,7 @@ timed), milliseconds, single run each:
 | program   | lust-vm | lust-jit | luajit | lua 5.5 |
 |-----------|--------:|---------:|-------:|--------:|
 | fields    |     747 |       48 |     58 |     120 |
-| array     |    1342 |      204 |     60 |      77 |
+| array     |    1388 |       58 |     64 |      80 |
 | calls     |     757 |       64 |     30 |     126 |
 | methods   |    1330 |       70 |     31 |     222 |
 | strings   |     118 |      116 |    125 |     159 |
@@ -199,8 +199,7 @@ value moves stopped calling the runtime (interned names, measured
 layouts, inline reference counting), arguments were aliased into callee
 frames instead of cloned, and the cycle collector stopped collecting on
 allocation. Remaining gaps against Lua: `strings`, where every engine is
-quadratic in `s = s .. x`; `array`, whose element loop still writes every
-value through to the frame; and `tree`, where a node visit is three
+quadratic in `s = s .. x`, and `tree`, where a node visit is three
 native calls with frames and records each, against LuaJIT's register
 passing. A native call has since lost its per-call site materialization
 (the callee's argument mask, function index and resume point are one
@@ -224,4 +223,10 @@ calling a helper that dropped the frame. `calls` went 107 → 64 ms.
 `tree` (138 → 126) is now all generated code: each node visit clones
 the `Option` field and its payload and releases both, and every clone
 or release of a struct or enum is three reference-count updates, two of
-them on the interned name and layout every node shares.
+them on the interned name and layout every node shares. `array` was
+204 ms for a reason that had nothing to do with its element loop: when
+the outer `pass` loop got hot and was recorded, the recorder skipped the
+inner loop's iterations (a `NestedLoopCall` runs them through the inner
+loop's own trace) but the interpreter still executed them, all million,
+at interpreter speed — 160 of the 204 ms. The skipped loop's root trace
+now runs during the recording.

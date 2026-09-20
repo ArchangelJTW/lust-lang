@@ -1,5 +1,6 @@
 use super::*;
 use crate::bytecode::ValueKey;
+use crate::bytecode::value::{ClosureObject, EnumObject, StructObject};
 use core::ptr;
 
 /// How thoroughly a call's arguments are checked against the signature.
@@ -45,21 +46,17 @@ impl VM {
     }
 
     fn lua_table_map(value: &Value) -> Option<Value> {
-        if let Value::Enum {
-            enum_name,
-            variant,
-            values,
-        } = value
-            && enum_name == "LuaValue"
-            && variant == "Table"
-            && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
+        if let Value::Enum(object) = value
+            && object.enum_name == "LuaValue"
+            && object.variant == "Table"
+            && let Some(inner) = object.values.as_ref().and_then(|vals| vals.first())
             && let Some(map) = inner.struct_get_field("table")
         {
             return Some(map);
         }
 
-        if let Value::Struct { name, .. } = value
-            && name == "LuaTable"
+        if let Value::Struct(object) = value
+            && object.name == "LuaTable"
             && let Some(map) = value.struct_get_field("table")
         {
             return Some(map);
@@ -69,13 +66,12 @@ impl VM {
     }
 
     fn lua_table_key_value(value: &Value) -> Value {
-        if let Value::Enum {
-            enum_name,
-            variant,
-            values,
-        } = value
-            && enum_name == "LuaValue"
+        if let Value::Enum(object) = value
+            && object.enum_name == "LuaValue"
         {
+            let EnumObject {
+                variant, values, ..
+            } = object.as_ref();
             return match variant.as_str() {
                 "Nil" => Value::Nil,
                 "Bool" | "Int" | "Float" | "String" | "Table" | "Function" | "LightUserdata"
@@ -851,30 +847,20 @@ impl VM {
                     let func_value = self.get_register(func_reg)?.clone();
                     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
                     let mut func_value = func_value;
-                    // if let Value::Enum { enum_name, variant, .. } = &func_value {
-                    //     if enum_name == "LuaValue" && variant == "Table" {
-                    //         eprintln!("DEBUG: Instruction::Call with LuaValue.Table");
-                    //     }
-                    // }
-
                     // Check if this is a table/userdata with __call metamethod (Lua compat)
                     let needs_call_value = {
                         let mut check_value = &func_value;
                         // Unwrap LuaValue enum if needed
-                        if let Value::Enum {
-                            enum_name,
-                            variant,
-                            values,
-                        } = &func_value
-                            && enum_name == "LuaValue"
-                            && (variant == "Table" || variant == "Userdata")
-                            && let Some(inner) = values.as_ref().and_then(|v| v.first())
+                        if let Value::Enum(object) = &func_value
+                            && object.enum_name == "LuaValue"
+                            && (object.variant == "Table" || object.variant == "Userdata")
+                            && let Some(inner) = object.values.as_ref().and_then(|v| v.first())
                         {
                             check_value = inner;
                         }
                         // Check if it's a LuaTable/LuaUserdata struct with metamethods
-                        if let Value::Struct { name, .. } = check_value {
-                            (name == "LuaTable" || name == "LuaUserdata")
+                        if let Value::Struct(object) = check_value {
+                            (object.name == "LuaTable" || object.name == "LuaUserdata")
                                 && check_value.struct_get_field("metamethods").is_some()
                         } else {
                             false
@@ -893,12 +879,11 @@ impl VM {
                         continue;
                     } else {
                         // Check what type we're actually dealing with
-                        if let Value::Enum {
-                            enum_name, variant, ..
-                        } = &func_value
-                            && enum_name == "LuaValue"
-                            && (variant == "Table" || variant == "Userdata")
+                        if let Value::Enum(object) = &func_value
+                            && object.enum_name == "LuaValue"
+                            && (object.variant == "Table" || object.variant == "Userdata")
                         {
+                            let EnumObject { variant, .. } = object.as_ref();
                             #[cfg(feature = "std")]
                             eprintln!(
                                 "DEBUG Instruction::Call: Have LuaValue.{} but needs_call_value=false",
@@ -910,16 +895,18 @@ impl VM {
                     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
                     loop {
                         let handle = match &func_value {
-                            Value::Enum {
-                                enum_name,
-                                variant,
-                                values,
-                            } if enum_name == "LuaValue" && variant == "Function" => values
-                                .as_ref()
-                                .and_then(|vals| vals.first())
-                                .and_then(|v| v.struct_get_field("handle"))
-                                .and_then(|v| v.as_int())
-                                .map(|i| i as usize),
+                            Value::Enum(object)
+                                if object.enum_name == "LuaValue"
+                                    && object.variant == "Function" =>
+                            {
+                                object
+                                    .values
+                                    .as_ref()
+                                    .and_then(|vals| vals.first())
+                                    .and_then(|v| v.struct_get_field("handle"))
+                                    .and_then(|v| v.as_int())
+                                    .map(|i| i as usize)
+                            }
                             _ => None,
                         };
                         let Some(handle) = handle else { break };
@@ -951,10 +938,9 @@ impl VM {
                             self.call_stack.push(frame);
                         }
 
-                        Value::Closure {
-                            function_idx: func_idx,
-                            upvalues,
-                        } => {
+                        Value::Closure(closure) => {
+                            let func_idx = closure.function_idx;
+                            let upvalues = &closure.upvalues;
                             let mut args = core::mem::take(&mut self.arg_scratch);
                             args.clear();
                             for i in 0..arg_count {
@@ -1105,18 +1091,17 @@ impl VM {
                 Instruction::NewEnumUnit(dest, enum_name_idx, variant_idx) => {
                     let func = &self.functions[self.call_stack.last().unwrap().function_idx];
                     let enum_name = func.chunk.constants[enum_name_idx as usize]
-                        .as_string()
+                        .as_string_rc()
                         .ok_or_else(|| LustError::RuntimeError {
                             message: "Enum name must be a string".to_string(),
-                        })?
-                        .to_string();
+                        })?;
                     let variant_name = func.chunk.constants[variant_idx as usize]
-                        .as_string()
+                        .as_string_rc()
                         .ok_or_else(|| LustError::RuntimeError {
                             message: "Variant name must be a string".to_string(),
-                        })?
-                        .to_string();
-                    self.set_register(dest, Value::enum_unit(enum_name, variant_name))?;
+                        })?;
+                    let value = self.unit_enum(&enum_name, &variant_name);
+                    self.set_register(dest, value)?;
                 }
 
                 Instruction::NewEnumVariant(
@@ -1207,7 +1192,7 @@ impl VM {
                         }
                     } else {
                         match object {
-                            Value::Struct { .. } => object
+                            Value::Struct(_) => object
                                 .struct_get_field_rc(&field_name)
                                 .unwrap_or(Value::Nil),
                             Value::Map(map) => {
@@ -1260,7 +1245,7 @@ impl VM {
                         }
                     } else {
                         match &object {
-                            Value::Struct { .. } => {
+                            Value::Struct(_) => {
                                 invalidate_key = Self::struct_cache_key(&object);
                                 object
                                     .struct_set_field_rc(&field_name, value)
@@ -1431,9 +1416,9 @@ impl VM {
                     let object = self.get_register(obj_reg)?.clone();
                     // Fast path: a user-defined struct method already resolved
                     // at this call site.
-                    if let Value::Struct { layout, .. } = &object {
+                    if let Value::Struct(receiver) = &object {
                         let key = (
-                            Rc::as_ptr(layout) as usize,
+                            Rc::as_ptr(&receiver.layout) as usize,
                             func_idx,
                             method_name_idx as u16,
                         );
@@ -1472,8 +1457,8 @@ impl VM {
                             .to_string()
                     };
                     let object_type_name = match &object {
-                        Value::Struct { name, .. } => Some(name.as_str()),
-                        Value::Enum { enum_name, .. } => Some(enum_name.as_str()),
+                        Value::Struct(object) => Some(object.name.as_str()),
+                        Value::Enum(object) => Some(object.enum_name.as_str()),
                         _ => None,
                     };
                     if let Some(struct_name) = object_type_name {
@@ -1481,7 +1466,8 @@ impl VM {
                         if let Some(func_idx) =
                             self.functions.iter().position(|f| f.name == mangled_name)
                         {
-                            if let Value::Struct { layout, .. } = &object {
+                            if let Value::Struct(object) = &object {
+                                let StructObject { layout, .. } = object.as_ref();
                                 let caller = self.call_stack.last().unwrap().function_idx;
                                 self.method_cache.insert(
                                     (Rc::as_ptr(layout) as usize, caller, method_name_idx as u16),
@@ -1561,10 +1547,10 @@ impl VM {
                         upvalues.push(Upvalue::new(value));
                     }
 
-                    let closure = Value::Closure {
+                    let closure = Value::Closure(Rc::new(ClosureObject {
                         function_idx: func_idx as usize,
-                        upvalues: Rc::new(upvalues),
-                    };
+                        upvalues,
+                    }));
                     self.set_register(dest, closure)?;
                 }
 
@@ -1859,10 +1845,14 @@ impl VM {
             Value::Array(_) => "Array",
             Value::Tuple(_) => "Tuple",
             Value::Map(_) => "Map",
-            Value::Struct { name, .. } => name.as_str(),
-            Value::WeakStruct(weak) => weak.struct_name(),
-            Value::Enum { enum_name, .. } => enum_name.as_str(),
-            Value::Function(_) | Value::NativeFunction(_) | Value::Closure { .. } => "function",
+            Value::Struct(object) => object.name.as_str(),
+            Value::WeakStruct(weak) => {
+                return weak
+                    .struct_name()
+                    .is_some_and(|name| name.as_str() == type_name);
+            }
+            Value::Enum(object) => object.enum_name.as_str(),
+            Value::Function(_) | Value::NativeFunction(_) | Value::Closure(_) => "function",
             Value::Iterator(_) => "Iterator",
             Value::Task(_) => "Task",
         };
@@ -1883,13 +1873,13 @@ impl VM {
         }
 
         if (type_name == "Option" || type_name.starts_with("Option<"))
-            && matches!(value, Value::Enum { enum_name, .. } if enum_name == "Option")
+            && matches!(value, Value::Enum(object) if object.enum_name == "Option")
         {
             return true;
         }
 
         if (type_name == "Result" || type_name.starts_with("Result<"))
-            && matches!(value, Value::Enum { enum_name, .. } if enum_name == "Result")
+            && matches!(value, Value::Enum(object) if object.enum_name == "Result")
         {
             return true;
         }
@@ -1944,31 +1934,28 @@ impl VM {
                 _ => false,
             },
             TypeKind::Option(inner) => match value {
-                Value::Enum {
-                    enum_name,
-                    variant,
-                    values,
-                } if enum_name == "Option" => match variant.as_str() {
-                    "None" => values.as_ref().is_none_or(|values| values.is_empty()),
-                    "Some" => values.as_ref().is_some_and(|values| {
-                        values.len() == 1 && self.value_matches_type(&values[0], inner)
-                    }),
-                    _ => false,
-                },
+                Value::Enum(object) if object.enum_name == "Option" => {
+                    match object.variant.as_str() {
+                        "None" => object
+                            .values
+                            .as_ref()
+                            .is_none_or(|values| values.is_empty()),
+                        "Some" => object.values.as_ref().is_some_and(|values| {
+                            values.len() == 1 && self.value_matches_type(&values[0], inner)
+                        }),
+                        _ => false,
+                    }
+                }
                 _ => false,
             },
             TypeKind::Result(ok_type, err_type) => match value {
-                Value::Enum {
-                    enum_name,
-                    variant,
-                    values,
-                } if enum_name == "Result" => {
-                    let payload_type = match variant.as_str() {
+                Value::Enum(object) if object.enum_name == "Result" => {
+                    let payload_type = match object.variant.as_str() {
                         "Ok" => ok_type,
                         "Err" => err_type,
                         _ => return false,
                     };
-                    values.as_ref().is_some_and(|values| {
+                    object.values.as_ref().is_some_and(|values| {
                         values.len() == 1 && self.value_matches_type(&values[0], payload_type)
                     })
                 }
@@ -1978,13 +1965,13 @@ impl VM {
                 params,
                 return_type,
             } => match value {
-                Value::Function(index)
-                | Value::Closure {
-                    function_idx: index,
-                    ..
-                } => self
+                Value::Function(_) | Value::Closure(_) => self
                     .functions
-                    .get(*index)
+                    .get(match value {
+                        Value::Function(index) => *index,
+                        Value::Closure(closure) => closure.function_idx,
+                        _ => unreachable!(),
+                    })
                     .and_then(|function| function.signature.as_ref())
                     .is_some_and(|signature| {
                         signature.params == *params && signature.return_type == **return_type
@@ -2509,10 +2496,13 @@ impl VM {
             Value::Array(_) => "Array".to_string(),
             Value::Tuple(_) => "Tuple".to_string(),
             Value::Map(_) => "Map".to_string(),
-            Value::Struct { name, .. } => name.to_string(),
-            Value::WeakStruct(weak) => weak.struct_name().to_string(),
-            Value::Enum { enum_name, .. } => enum_name.to_string(),
-            Value::Function(_) | Value::NativeFunction(_) | Value::Closure { .. } => {
+            Value::Struct(object) => object.name.to_string(),
+            Value::WeakStruct(weak) => weak
+                .struct_name()
+                .map(|name| name.to_string())
+                .unwrap_or_else(|| "struct".to_string()),
+            Value::Enum(object) => object.enum_name.to_string(),
+            Value::Function(_) | Value::NativeFunction(_) | Value::Closure(_) => {
                 "function".to_string()
             }
             Value::Iterator(_) => "Iterator".to_string(),
@@ -2561,7 +2551,8 @@ impl VM {
 
         let matches = match value {
             Value::Function(idx) => self.function_signature_matches(*idx, type_name),
-            Value::Closure { function_idx, .. } => {
+            Value::Closure(closure) => {
+                let ClosureObject { function_idx, .. } = closure.as_ref();
                 self.function_signature_matches(*function_idx, type_name)
             }
             Value::NativeFunction(_) => wants_generic,
@@ -2648,8 +2639,8 @@ impl VM {
             let interesting = borrowed.len() > 1
                 && matches!(
                     borrowed.first(),
-                    Some(Value::Enum { enum_name, variant, .. })
-                        if enum_name == "LuaValue" && variant == "Nil"
+                    Some(Value::Enum(object))
+                        if object.enum_name == "LuaValue" && object.variant == "Nil"
                 );
             if interesting {
                 let func_name = self
@@ -2698,8 +2689,14 @@ impl VM {
     pub fn value_to_string_for_concat(&mut self, value: &Value) -> Result<Rc<String>> {
         match value {
             Value::String(s) => Ok(s.clone()),
-            Value::Struct { name, .. } => self.invoke_tostring(value, name),
-            Value::Enum { enum_name, .. } => self.invoke_tostring(value, enum_name),
+            Value::Struct(object) => {
+                let name = object.name.clone();
+                self.invoke_tostring(value, &name)
+            }
+            Value::Enum(object) => {
+                let name = object.enum_name.clone();
+                self.invoke_tostring(value, &name)
+            }
             _ => Ok(Rc::new(value.to_string())),
         }
     }
@@ -2714,7 +2711,8 @@ impl VM {
             let mut current = func;
             let mut receiver_wrapped = func.clone();
 
-            if let Value::Struct { name, .. } = func {
+            if let Value::Struct(object) = func {
+                let name = &object.name;
                 if name == "LuaTable" {
                     receiver_wrapped = Value::enum_variant("LuaValue", "Table", vec![func.clone()]);
                 } else if name == "LuaUserdata" {
@@ -2723,19 +2721,16 @@ impl VM {
                 }
             }
 
-            if let Value::Enum {
-                enum_name,
-                variant,
-                values,
-            } = func
-                && enum_name == "LuaValue"
-                && (variant == "Table" || variant == "Userdata")
-                && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
+            if let Value::Enum(object) = func
+                && object.enum_name == "LuaValue"
+                && (object.variant == "Table" || object.variant == "Userdata")
+                && let Some(inner) = object.values.as_ref().and_then(|vals| vals.first())
             {
                 current = inner;
             }
 
-            if let Value::Struct { name, .. } = current {
+            if let Value::Struct(object) = current {
+                let name = &object.name;
                 if name == "LuaTable" || name == "LuaUserdata" {
                     if let Some(Value::Map(meta_rc)) = current.struct_get_field("metamethods") {
                         meta_rc
@@ -2760,22 +2755,15 @@ impl VM {
             call_args.push(receiver);
             call_args.append(&mut args);
             return self.call_value(&callable, call_args);
-        } else {
-            // if let Value::Struct { name, .. } = func {
-            //     if name == "LuaTable" || name == "LuaUserdata" {
-            //         eprintln!("DEBUG: Calling LuaTable/Userdata but no __call found in metamethods");
-            //     }
-            // }
         }
 
         match func {
             #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-            Value::Enum {
-                enum_name,
-                variant,
-                values,
-            } if enum_name == "LuaValue" && variant == "Function" => {
-                let handle = values
+            Value::Enum(object)
+                if object.enum_name == "LuaValue" && object.variant == "Function" =>
+            {
+                let handle = object
+                    .values
                     .as_ref()
                     .and_then(|vals| vals.first())
                     .and_then(|v| v.struct_get_field("handle"))
@@ -2834,10 +2822,11 @@ impl VM {
                 }
             }
 
-            Value::Closure {
-                function_idx: func_idx,
-                upvalues,
-            } => {
+            Value::Closure(closure) => {
+                let ClosureObject {
+                    function_idx: func_idx,
+                    upvalues,
+                } = closure.as_ref();
                 let saved_pending_return_value = self.pending_return_value.clone();
                 let saved_pending_return_dest = self.pending_return_dest;
                 let saved_pending_task_signal = self.pending_task_signal.clone();

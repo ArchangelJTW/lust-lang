@@ -2,7 +2,8 @@ use super::VM;
 use super::task::{TaskInstance, TaskKind, TaskState};
 use crate::LustError;
 use crate::bytecode::value::IteratorState;
-use crate::bytecode::{NativeCallResult, Value, ValueKey};
+use crate::bytecode::value::{EnumObject, StructObject};
+use crate::bytecode::{NativeCallResult, Value, ValueKey, native_fn};
 use crate::number::{LustFloat, LustInt};
 use alloc::format;
 use alloc::rc::Rc;
@@ -44,13 +45,12 @@ fn lua_truthy(value: &Value) -> bool {
 }
 
 pub(super) fn unwrap_lua_value(value: Value) -> Value {
-    if let Value::Enum {
-        enum_name,
-        variant,
-        values,
-    } = &value
-        && enum_name == "LuaValue"
+    if let Value::Enum(object) = &value
+        && object.enum_name == "LuaValue"
     {
+        let EnumObject {
+            variant, values, ..
+        } = object.as_ref();
         return match variant.as_str() {
             "Nil" => Value::Nil,
             "Bool" => values
@@ -90,7 +90,7 @@ pub(super) fn unwrap_lua_value(value: Value) -> Value {
 }
 
 fn create_error_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let message = args
             .first()
             .cloned()
@@ -102,7 +102,7 @@ fn create_error_fn() -> Value {
 }
 
 fn create_assert_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let cond = args
             .first()
             .cloned()
@@ -130,7 +130,7 @@ fn parse_base_arg(arg: Option<Value>) -> Option<u32> {
 }
 
 fn create_tonumber_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let value = args
             .first()
             .cloned()
@@ -222,7 +222,7 @@ fn setmetatable_value(table: Value, meta: Value) -> Result<Value, String> {
 }
 
 fn create_setmetatable_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() != 2 {
             return Err("setmetatable(table, meta) requires 2 args".to_string());
         }
@@ -253,7 +253,7 @@ fn collect_map_pairs(value: &Value) -> Vec<(ValueKey, Value)> {
 }
 
 fn create_pairs_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let target = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let items = collect_map_pairs(&target);
         let iter = IteratorState::MapPairs { items, index: 0 };
@@ -264,7 +264,7 @@ fn create_pairs_fn() -> Value {
 }
 
 fn create_ipairs_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let target = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let items = if let Some(arr) = target.as_array() {
             arr.into_iter()
@@ -287,7 +287,7 @@ fn create_ipairs_fn() -> Value {
 }
 
 pub(super) fn create_tostring_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.is_empty() {
             return Err("tostring() requires at least one argument".to_string());
         }
@@ -324,7 +324,7 @@ fn create_lua_module(vm: &VM) -> Value {
         (string_key("nil"), Value::enum_unit("LuaValue", "Nil")),
         (
             string_key("require"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 if args.len() != 1 {
                     return Err("lua.require(name) requires 1 argument".to_string());
                 }
@@ -345,7 +345,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("table"),
-            Value::NativeFunction(Rc::new(|_| {
+            Value::NativeFunction(native_fn(|_| {
                 VM::with_current(|vm| {
                     let table = vm.new_map_value();
                     let metamethods = vm.new_map_value();
@@ -363,11 +363,11 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("to_value"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let value = args.first().cloned().unwrap_or(Value::Nil);
                 VM::with_current(|vm| {
                     let converted = match value.clone() {
-                        Value::Enum { enum_name, .. } if enum_name == "LuaValue" => value,
+                        Value::Enum(object) if object.enum_name == "LuaValue" => value,
                         Value::Nil => Value::enum_unit("LuaValue", "Nil"),
                         Value::Bool(b) => {
                             Value::enum_variant("LuaValue", "Bool", vec![Value::Bool(b)])
@@ -381,16 +381,16 @@ fn create_lua_module(vm: &VM) -> Value {
                         Value::String(s) => {
                             Value::enum_variant("LuaValue", "String", vec![Value::String(s)])
                         }
-                        Value::Struct { name, .. } if name == "LuaTable" => {
+                        Value::Struct(object) if object.name == "LuaTable" => {
                             Value::enum_variant("LuaValue", "Table", vec![value])
                         }
-                        Value::Struct { name, .. } if name == "LuaFunction" => {
+                        Value::Struct(object) if object.name == "LuaFunction" => {
                             Value::enum_variant("LuaValue", "Function", vec![value])
                         }
-                        Value::Struct { name, .. } if name == "LuaUserdata" => {
+                        Value::Struct(object) if object.name == "LuaUserdata" => {
                             Value::enum_variant("LuaValue", "Userdata", vec![value])
                         }
-                        Value::Struct { name, .. } if name == "LuaThread" => {
+                        Value::Struct(object) if object.name == "LuaThread" => {
                             Value::enum_variant("LuaValue", "Thread", vec![value])
                         }
                         Value::Map(map) => {
@@ -435,14 +435,14 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("unwrap"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let value = args.first().cloned().unwrap_or(Value::Nil);
                 Ok(NativeCallResult::Return(unwrap_lua_value(value)))
             })),
         ),
         (
             string_key("is_truthy"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let value = args.first().cloned().unwrap_or(Value::Nil);
                 let unwrapped = unwrap_lua_value(value);
                 let is_truthy = lua_truthy(&unwrapped);
@@ -451,7 +451,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("setmetatable"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 if args.len() != 2 {
                     return Err("lua.setmetatable(table, meta) requires 2 args".to_string());
                 }
@@ -464,7 +464,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("getmetatable"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 if args.len() != 1 {
                     return Err("lua.getmetatable(table) requires 1 arg".to_string());
                 }
@@ -478,14 +478,11 @@ fn create_lua_module(vm: &VM) -> Value {
                             map.get(&ValueKey::string(META_KEY.to_string())).cloned()
                     {
                         // Lua: if metatable has __metatable, return that instead.
-                        if let Value::Enum {
-                            enum_name,
-                            variant,
-                            values,
-                        } = &meta
-                            && enum_name == "LuaValue"
-                            && variant == "Table"
-                            && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
+                        if let Value::Enum(object) = &meta
+                            && object.enum_name == "LuaValue"
+                            && object.variant == "Table"
+                            && let Some(inner) =
+                                object.values.as_ref().and_then(|vals| vals.first())
                             && let Some(Value::Map(meta_map)) = inner.struct_get_field("table")
                             && let Some(protect) = meta_map
                                 .borrow()
@@ -509,14 +506,14 @@ fn create_lua_module(vm: &VM) -> Value {
         // Operator helpers for LuaValue
         (
             string_key("op_neg"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let a = args.first().cloned().unwrap_or(Value::Nil);
                 Ok(NativeCallResult::Return(lua_op_neg(a)))
             })),
         ),
         (
             string_key("op_add"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let a = args.first().cloned().unwrap_or(Value::Nil);
                 let b = args.get(1).cloned().unwrap_or(Value::Nil);
                 Ok(NativeCallResult::Return(lua_op_binary(a, b, |x, y| x + y)))
@@ -524,7 +521,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("op_sub"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let a = args.first().cloned().unwrap_or(Value::Nil);
                 let b = args.get(1).cloned().unwrap_or(Value::Nil);
                 Ok(NativeCallResult::Return(lua_op_binary(a, b, |x, y| x - y)))
@@ -532,7 +529,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("op_mul"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let a = args.first().cloned().unwrap_or(Value::Nil);
                 let b = args.get(1).cloned().unwrap_or(Value::Nil);
                 Ok(NativeCallResult::Return(lua_op_binary(a, b, |x, y| x * y)))
@@ -540,7 +537,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("op_div"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let a = args.first().cloned().unwrap_or(Value::Nil);
                 let b = args.get(1).cloned().unwrap_or(Value::Nil);
                 Ok(NativeCallResult::Return(lua_op_binary(a, b, |x, y| x / y)))
@@ -548,7 +545,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("op_mod"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let a = args.first().cloned().unwrap_or(Value::Nil);
                 let b = args.get(1).cloned().unwrap_or(Value::Nil);
                 Ok(NativeCallResult::Return(lua_op_binary(a, b, |x, y| x % y)))
@@ -556,7 +553,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("op_concat"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let a = args.first().cloned().unwrap_or(Value::Nil);
                 let b = args.get(1).cloned().unwrap_or(Value::Nil);
                 Ok(NativeCallResult::Return(lua_op_concat(a, b)))
@@ -564,7 +561,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("op_eq"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let a = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
                 let b = unwrap_lua_value(args.get(1).cloned().unwrap_or(Value::Nil));
                 Ok(NativeCallResult::Return(Value::Bool(a == b)))
@@ -572,7 +569,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("op_ne"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let a = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
                 let b = unwrap_lua_value(args.get(1).cloned().unwrap_or(Value::Nil));
                 Ok(NativeCallResult::Return(Value::Bool(a != b)))
@@ -580,7 +577,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("op_lt"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let a = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
                 let b = unwrap_lua_value(args.get(1).cloned().unwrap_or(Value::Nil));
                 let result = match (a, b) {
@@ -596,7 +593,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("op_le"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let a = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
                 let b = unwrap_lua_value(args.get(1).cloned().unwrap_or(Value::Nil));
                 let result = match (a, b) {
@@ -612,7 +609,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("op_gt"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let a = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
                 let b = unwrap_lua_value(args.get(1).cloned().unwrap_or(Value::Nil));
                 let result = match (a, b) {
@@ -628,7 +625,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("op_ge"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let a = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
                 let b = unwrap_lua_value(args.get(1).cloned().unwrap_or(Value::Nil));
                 let result = match (a, b) {
@@ -644,7 +641,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("call_method"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let obj = args.first().cloned().unwrap_or(Value::Nil);
                 let method_name_val = args.get(1).cloned().unwrap_or(Value::Nil);
                 let method_args: Vec<Value> = args.iter().skip(2).cloned().collect();
@@ -664,7 +661,8 @@ fn create_lua_module(vm: &VM) -> Value {
                     //     obj.type_of(), unwrapped_obj.type_of(), method_name);
 
                     // Try to find method on object
-                    let method = if let Value::Struct { name, .. } = &unwrapped_obj {
+                    let method = if let Value::Struct(object) = &unwrapped_obj {
+                        let StructObject { name, .. } = object.as_ref();
                         // #[cfg(feature = "std")]
                         // eprintln!("[call_method] Struct name: {}", name);
 
@@ -721,7 +719,7 @@ fn create_lua_module(vm: &VM) -> Value {
                                                                 let _cfunc_name = func.name.clone();
                                                                 let cfunc_upvalues = func.upvalues.clone();
 
-                                                                let native = Value::NativeFunction(alloc::rc::Rc::new(move |args: &[Value]| {
+                                                                let native = Value::NativeFunction(native_fn(move |args: &[Value]| {
                                                                     use crate::vm::VM;
                                                                     VM::with_current(|vm| {
                                                                         // unsafe {
@@ -865,10 +863,8 @@ fn create_lua_module(vm: &VM) -> Value {
                                                     // eprintln!("[call_method] Map lookup result: {:?}", result.is_some());
                                                     result
                                                 }
-                                                Value::Enum { variant, values, .. } if variant == "Table" => {
-                                                    // #[cfg(feature = "std")]
-                                                    // eprintln!("[call_method] table[__index] is a LuaValue.Table enum");
-                                                    values.as_ref()
+                                                Value::Enum(object) if object.variant == "Table" => {
+                                                    object.values.as_ref()
                                                         .and_then(|vals| vals.first().cloned())
                                                         .and_then(|table_struct| {
                                                             table_struct.struct_get_field("table")
@@ -911,12 +907,12 @@ fn create_lua_module(vm: &VM) -> Value {
 
                                                     // __index could be a table or an enum wrapping a table
                                                     match &index_table {
-                                                        Value::Struct { name, .. } if name == "LuaTable" => {
+                                                        Value::Struct(object) if object.name == "LuaTable" => {
                                                             index_table.struct_get_field(&method_name)
                                                         }
-                                                        Value::Enum { variant, values, .. } if variant == "Table" => {
+                                                        Value::Enum(object) if object.variant == "Table" => {
                                                             // Unwrap LuaValue.Table enum
-                                                            values.as_ref()
+                                                            object.values.as_ref()
                                                                 .and_then(|vals| vals.first().cloned())
                                                                 .and_then(|table_struct| {
                                                                     table_struct.struct_get_field("table")
@@ -960,7 +956,7 @@ fn create_lua_module(vm: &VM) -> Value {
         ),
         (
             string_key("table_from_entries"),
-            Value::NativeFunction(Rc::new(|args: &[Value]| {
+            Value::NativeFunction(native_fn(|args: &[Value]| {
                 let entries_array = args.first().cloned().unwrap_or(Value::Nil);
 
                 VM::with_current(|vm| {
@@ -1023,22 +1019,22 @@ fn pack_lua_values(vm: &mut VM, values: Vec<Value>) -> Result<Value, String> {
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn to_lua_value(vm: &mut VM, value: Value) -> Result<Value, String> {
     Ok(match value.clone() {
-        Value::Enum { enum_name, .. } if enum_name == "LuaValue" => value,
+        Value::Enum(object) if object.enum_name == "LuaValue" => value,
         Value::Nil => Value::enum_unit("LuaValue", "Nil"),
         Value::Bool(b) => Value::enum_variant("LuaValue", "Bool", vec![Value::Bool(b)]),
         Value::Int(i) => Value::enum_variant("LuaValue", "Int", vec![Value::Int(i)]),
         Value::Float(f) => Value::enum_variant("LuaValue", "Float", vec![Value::Float(f)]),
         Value::String(s) => Value::enum_variant("LuaValue", "String", vec![Value::String(s)]),
-        Value::Struct { name, .. } if name == "LuaTable" => {
+        Value::Struct(object) if object.name == "LuaTable" => {
             Value::enum_variant("LuaValue", "Table", vec![value])
         }
-        Value::Struct { name, .. } if name == "LuaFunction" => {
+        Value::Struct(object) if object.name == "LuaFunction" => {
             Value::enum_variant("LuaValue", "Function", vec![value])
         }
-        Value::Struct { name, .. } if name == "LuaUserdata" => {
+        Value::Struct(object) if object.name == "LuaUserdata" => {
             Value::enum_variant("LuaValue", "Userdata", vec![value])
         }
-        Value::Struct { name, .. } if name == "LuaThread" => {
+        Value::Struct(object) if object.name == "LuaThread" => {
             Value::enum_variant("LuaValue", "Thread", vec![value])
         }
         Value::Map(map) => {
@@ -1083,8 +1079,8 @@ fn lua_value_error_message(err: LustError) -> String {
 
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn resolve_callable_for_pcall(value: Value) -> Result<Value, String> {
-    if let Value::Struct { name, .. } = &value
-        && name == "LuaFunction"
+    if let Value::Struct(object) = &value
+        && object.name == "LuaFunction"
     {
         let handle = value
             .struct_get_field("handle")
@@ -1099,7 +1095,7 @@ fn resolve_callable_for_pcall(value: Value) -> Result<Value, String> {
 
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn create_lua_socket_protect_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let func = args.first().cloned().unwrap_or(Value::Nil);
         #[cfg(feature = "std")]
         if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() {
@@ -1107,7 +1103,7 @@ fn create_lua_socket_protect_fn() -> Value {
         }
         VM::with_current(move |_vm| {
             let func = resolve_callable_for_pcall(func)?;
-            let wrapper = Value::NativeFunction(Rc::new(move |call_args: &[Value]| {
+            let wrapper = Value::NativeFunction(native_fn(move |call_args: &[Value]| {
                 let func = func.clone();
                 VM::with_current(move |vm| match vm.call_value(&func, call_args.to_vec()) {
                     Ok(value) => {
@@ -1143,7 +1139,7 @@ fn create_lua_socket_protect_fn() -> Value {
 
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn create_lua_socket_skip_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let count = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let skip = count
             .as_int()
@@ -1175,11 +1171,11 @@ fn create_lua_socket_skip_fn() -> Value {
 
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn create_lua_socket_newtry_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let finalizer = args.first().cloned();
 
         // Create a "try" function that captures the finalizer
-        let try_fn = Value::NativeFunction(Rc::new(move |try_args: &[Value]| {
+        let try_fn = Value::NativeFunction(native_fn(move |try_args: &[Value]| {
             let first = unwrap_lua_value(try_args.first().cloned().unwrap_or(Value::Nil));
 
             // If first argument is nil or false, call finalizer and throw error
@@ -1220,7 +1216,7 @@ fn create_lua_socket_newtry_fn() -> Value {
 
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn create_lua_socket_try_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let first = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
 
         // If first argument is nil or false, throw error
@@ -1248,7 +1244,7 @@ fn create_lua_socket_try_fn() -> Value {
 }
 
 fn create_task_run_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.is_empty() {
             return Err("task.run() requires a function".to_string());
         }
@@ -1264,7 +1260,7 @@ fn create_task_run_fn() -> Value {
 }
 
 fn create_task_create_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.is_empty() {
             return Err("task.create() requires a function".to_string());
         }
@@ -1280,7 +1276,7 @@ fn create_task_create_fn() -> Value {
 }
 
 fn create_task_status_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() != 1 {
             return Err("task.status() requires a task handle".to_string());
         }
@@ -1298,7 +1294,7 @@ fn create_task_status_fn() -> Value {
 }
 
 fn create_task_info_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() != 1 {
             return Err("task.info() requires a task handle".to_string());
         }
@@ -1315,7 +1311,7 @@ fn create_task_info_fn() -> Value {
 }
 
 fn create_task_resume_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.is_empty() {
             return Err("task.resume() requires a task handle".to_string());
         }
@@ -1353,14 +1349,14 @@ fn create_task_resume_fn() -> Value {
 }
 
 fn create_task_yield_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let value = args.first().cloned().unwrap_or(Value::Nil);
         Ok(NativeCallResult::Yield(value))
     }))
 }
 
 fn create_task_stop_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() != 1 {
             return Err("task.stop() requires a task handle".to_string());
         }
@@ -1385,7 +1381,7 @@ fn create_task_stop_fn() -> Value {
 }
 
 fn create_task_restart_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() != 1 {
             return Err("task.restart() requires a task handle".to_string());
         }
@@ -1403,7 +1399,7 @@ fn create_task_restart_fn() -> Value {
 }
 
 fn create_task_current_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if !args.is_empty() {
             return Err("task.current() takes no arguments".to_string());
         }

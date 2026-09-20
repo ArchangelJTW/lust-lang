@@ -1,6 +1,7 @@
 use crate::LustError;
 use crate::bytecode::Instruction;
 use crate::bytecode::value::NativeFn;
+use crate::bytecode::value::StructObject;
 use crate::bytecode::{Register, Value};
 use alloc::{
     boxed::Box,
@@ -15,11 +16,11 @@ use hashbrown::{HashMap, HashSet};
 
 #[derive(Clone)]
 pub struct TracedNativeFn {
-    function: NativeFn,
+    function: Rc<NativeFn>,
 }
 
 impl TracedNativeFn {
-    pub fn new(function: NativeFn) -> Self {
+    pub fn new(function: Rc<NativeFn>) -> Self {
         Self { function }
     }
 
@@ -31,9 +32,9 @@ impl TracedNativeFn {
     /// function carries (the `Rc`'s own pointer word, not the data
     /// pointer `pointer` returns).
     pub fn inner_ptr(&self) -> usize {
-        // SAFETY: an `Rc<dyn Fn>` starts with its `NonNull<RcInner>`, a
-        // fat pointer whose first word is the allocation's address.
-        unsafe { *(&self.function as *const NativeFn as *const usize) }
+        // The `Rc` stores the allocation's address (`RcInner { strong,
+        // weak, value }`); `as_ptr` gives the value, two words in.
+        (Rc::as_ptr(&self.function) as usize) - 2 * core::mem::size_of::<usize>()
     }
 }
 
@@ -2099,7 +2100,8 @@ impl TraceRecorder {
                 // receiver as the first argument. The receiver's layout is
                 // guarded because trait dispatch can bring different structs
                 // to one call site.
-                if let Value::Struct { name, layout, .. } = &registers[obj_reg as usize] {
+                if let Value::Struct(object) = &registers[obj_reg as usize] {
+                    let StructObject { name, layout, .. } = object.as_ref();
                     let mangled = format!("{}:{}", name, method_name);
                     if let Some(function_idx) = functions.iter().position(|f| f.name == mangled) {
                         let callee_fn = &functions[function_idx];
@@ -2187,7 +2189,9 @@ impl TraceRecorder {
                 // Int/Float arms, not relaxing the check.
                 let receiver_supported = match &registers[obj_reg as usize] {
                     Value::Iterator(_) => true,
-                    Value::Enum { enum_name, .. } => enum_name == "Option" || enum_name == "Result",
+                    Value::Enum(object) => {
+                        object.enum_name == "Option" || object.enum_name == "Result"
+                    }
                     _ => false,
                 };
                 if !receiver_supported {
@@ -2221,7 +2225,8 @@ impl TraceRecorder {
                     .unwrap_or("unknown")
                     .to_string();
                 let (field_index, is_weak_field) = match &registers[obj_reg as usize] {
-                    Value::Struct { layout, .. } => {
+                    Value::Struct(object) => {
+                        let StructObject { layout, .. } = object.as_ref();
                         let idx = layout.index_of_str(&field_name);
                         let is_weak = idx.map(|i| layout.is_weak(i)).unwrap_or(false);
                         (idx, is_weak)
@@ -2257,7 +2262,8 @@ impl TraceRecorder {
                     .unwrap_or("unknown")
                     .to_string();
                 let (field_index, is_weak_field) = match &registers[obj_reg as usize] {
-                    Value::Struct { layout, .. } => {
+                    Value::Struct(object) => {
+                        let StructObject { layout, .. } = object.as_ref();
                         let idx = layout.index_of_str(&field_name);
                         let is_weak = idx.map(|i| layout.is_weak(i)).unwrap_or(false);
                         (idx, is_weak)
@@ -2548,11 +2554,10 @@ impl TraceRecorder {
                         Ok(())
                     }
 
-                    Value::Closure {
-                        function_idx,
-                        upvalues,
-                    } => {
-                        let upvalues_ptr = Rc::as_ptr(upvalues) as *const ();
+                    Value::Closure(closure) => {
+                        let function_idx = &closure.function_idx;
+                        // The closure's identity: the object every clone shares.
+                        let upvalues_ptr = Rc::as_ptr(closure) as *const ();
                         if !self.is_guarded(func_reg) {
                             self.push_op(TraceOp::GuardClosure {
                                 register: func_reg,
@@ -3008,7 +3013,7 @@ impl TraceRecorder {
             Value::String(_) => Some(ValueType::String),
             Value::Array(_) => Some(ValueType::Array),
             Value::Tuple(_) => Some(ValueType::Tuple),
-            Value::Struct { .. } => Some(ValueType::Struct),
+            Value::Struct(_) => Some(ValueType::Struct),
             _ => None,
         }
     }

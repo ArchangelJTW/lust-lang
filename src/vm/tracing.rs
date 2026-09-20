@@ -1,5 +1,19 @@
 use super::*;
 impl VM {
+    /// A unit enum value (`Option.None`): the one shared object for these
+    /// names, so the value is a count bump and compares by pointer.
+    pub(crate) fn unit_enum(&mut self, enum_name: &str, variant: &str) -> Value {
+        use crate::bytecode::value::Name;
+        let enum_name = Name::from(enum_name);
+        let variant = Name::from(variant);
+        let key = (enum_name.inner_ptr() as usize, variant.inner_ptr() as usize);
+        let object = self
+            .unit_enums
+            .entry(key)
+            .or_insert_with(|| crate::bytecode::EnumObject::new(enum_name, variant, None));
+        Value::Enum(Rc::clone(object))
+    }
+
     pub(super) fn abandon_trace_recording(&mut self) {
         if let Some(recorder) = self.trace_recorder.take() {
             let site = (recorder.trace.function_idx, recorder.trace.start_ip);
@@ -152,8 +166,8 @@ impl VM {
     }
 
     pub(super) fn struct_cache_key(value: &Value) -> Option<usize> {
-        if let Value::Struct { fields, .. } = value {
-            Some(Rc::as_ptr(fields) as usize)
+        if let Value::Struct(object) = value {
+            Some(Rc::as_ptr(object) as usize)
         } else {
             None
         }
@@ -389,8 +403,8 @@ pub unsafe extern "C" fn jit_materialize_inline_frames(
                 unsafe { core::ptr::read(slot) }
             };
         }
-        if let Value::Closure { upvalues, .. } = unsafe { &*r.caller_regs.add(site.callee_reg) } {
-            frame.upvalues = upvalues.iter().map(|uv| uv.get()).collect();
+        if let Value::Closure(closure) = unsafe { &*r.caller_regs.add(site.callee_reg) } {
+            frame.upvalues = closure.upvalues.iter().map(|uv| uv.get()).collect();
         }
         if let Some(caller) = vm.call_stack.last_mut() {
             caller.ip = site.caller_resume_ip;

@@ -1,5 +1,6 @@
 use super::*;
 use crate::LustInt;
+use crate::bytecode::value::EnumObject;
 use crate::bytecode::{LustMap, ValueKey};
 use crate::vm::task::TaskKind;
 use alloc::{format, string::ToString};
@@ -149,12 +150,9 @@ impl VM {
         match func {
             Value::Function(func_idx) => self.make_call_frame(func_idx, None, args, Vec::new()),
 
-            Value::Closure {
-                function_idx,
-                upvalues,
-            } => {
-                let captured: Vec<Value> = upvalues.iter().map(|uv| uv.get()).collect();
-                self.make_call_frame(function_idx, None, args, captured)
+            Value::Closure(closure) => {
+                let captured: Vec<Value> = closure.upvalues.iter().map(|uv| uv.get()).collect();
+                self.make_call_frame(closure.function_idx, None, args, captured)
             }
 
             other => Err(LustError::RuntimeError {
@@ -472,9 +470,10 @@ impl VM {
         #[cfg(feature = "std")]
         if std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some() && method_name == "settimeout" {
             match object {
-                Value::Enum {
-                    enum_name, variant, ..
-                } => {
+                Value::Enum(object) => {
+                    let EnumObject {
+                        enum_name, variant, ..
+                    } = object.as_ref();
                     eprintln!(
                         "[lua-socket] CallMethod enum={} variant={} method={}",
                         enum_name, variant, method_name
@@ -490,11 +489,9 @@ impl VM {
             }
         }
 
-        if let Value::Enum {
-            enum_name, variant, ..
-        } = object
-            && enum_name == "LuaValue"
-            && variant == "Userdata"
+        if let Value::Enum(enum_object) = object
+            && enum_object.enum_name == "LuaValue"
+            && enum_object.variant == "Userdata"
         {
             if let Some(result) = self.try_call_lua_dynamic_method(object, method_name, &args)? {
                 return Ok(result);
@@ -511,28 +508,24 @@ impl VM {
             }
         }
 
-        if let Value::Struct { name, .. } = object
-            && name == "LuaTable"
+        if let Value::Struct(struct_object) = object
+            && struct_object.name == "LuaTable"
             && let Some(result) = self.try_call_lua_dynamic_method(object, method_name, &args)?
         {
             return Ok(result);
         }
 
-        if let Value::Enum {
-            enum_name,
-            variant,
-            values,
-        } = object
-            && enum_name == "LuaValue"
-            && variant == "Table"
-            && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
+        if let Value::Enum(object) = object
+            && object.enum_name == "LuaValue"
+            && object.variant == "Table"
+            && let Some(inner) = object.values.as_ref().and_then(|vals| vals.first())
         {
             return self.call_builtin_method(inner, method_name, args);
         }
 
         let object_type_name = match object {
-            Value::Struct { name, .. } => Some(name.as_str()),
-            Value::Enum { enum_name, .. } => Some(enum_name.as_str()),
+            Value::Struct(object) => Some(object.name.as_str()),
+            Value::Enum(object) => Some(object.enum_name.as_str()),
             _ => None,
         };
         if let Some(struct_name) = object_type_name {
@@ -566,7 +559,7 @@ impl VM {
         }
 
         match object {
-            Value::Struct { name, .. } if name == "LuaTable" => {
+            Value::Struct(struct_object) if struct_object.name == "LuaTable" => {
                 let Some(map_rc) = lua_table_map_rc(object) else {
                     return Err(LustError::RuntimeError {
                         message: "LuaTable is missing 'table' map field".to_string(),
@@ -725,16 +718,12 @@ impl VM {
                     }),
                 }
             }
-            Value::Enum {
-                enum_name,
-                variant,
-                values,
-            } if enum_name == "Option" => match method_name {
-                "is_some" => Ok(Value::Bool(variant == "Some")),
-                "is_none" => Ok(Value::Bool(variant == "None")),
+            Value::Enum(object) if object.enum_name == "Option" => match method_name {
+                "is_some" => Ok(Value::Bool(object.variant == "Some")),
+                "is_none" => Ok(Value::Bool(object.variant == "None")),
                 "unwrap" => {
-                    if variant == "Some" {
-                        if let Some(vals) = values {
+                    if object.variant == "Some" {
+                        if let Some(vals) = &object.values {
                             if !vals.is_empty() {
                                 Ok(vals[0].clone())
                             } else {
@@ -761,8 +750,8 @@ impl VM {
                         });
                     }
 
-                    if variant == "Some" {
-                        if let Some(vals) = values {
+                    if object.variant == "Some" {
+                        if let Some(vals) = &object.values {
                             if !vals.is_empty() {
                                 Ok(vals[0].clone())
                             } else {
@@ -780,16 +769,12 @@ impl VM {
                     message: format!("Option has no method '{}'", method_name),
                 }),
             },
-            Value::Enum {
-                enum_name,
-                variant,
-                values,
-            } if enum_name == "Result" => match method_name {
-                "is_ok" => Ok(Value::Bool(variant == "Ok")),
-                "is_err" => Ok(Value::Bool(variant == "Err")),
+            Value::Enum(object) if object.enum_name == "Result" => match method_name {
+                "is_ok" => Ok(Value::Bool(object.variant == "Ok")),
+                "is_err" => Ok(Value::Bool(object.variant == "Err")),
                 "unwrap" => {
-                    if variant == "Ok" {
-                        if let Some(vals) = values {
+                    if object.variant == "Ok" {
+                        if let Some(vals) = &object.values {
                             if !vals.is_empty() {
                                 Ok(vals[0].clone())
                             } else {
@@ -816,8 +801,8 @@ impl VM {
                         });
                     }
 
-                    if variant == "Ok" {
-                        if let Some(vals) = values {
+                    if object.variant == "Ok" {
+                        if let Some(vals) = &object.values {
                             if !vals.is_empty() {
                                 Ok(vals[0].clone())
                             } else {
@@ -949,11 +934,7 @@ impl VM {
             Value::Function(_) | Value::Closure { .. } | Value::NativeFunction(_)
         ) || matches!(
             &indexer,
-            Value::Enum {
-                enum_name,
-                variant,
-                ..
-            } if enum_name == "LuaValue" && variant == "Function"
+            Value::Enum(object) if object.enum_name == "LuaValue" && object.variant == "Function"
         );
 
         if is_callable {
@@ -964,20 +945,16 @@ impl VM {
     }
 
     fn lua_direct_index(&self, receiver: &Value, key: &Value) -> Option<Value> {
-        if let Value::Enum {
-            enum_name,
-            variant,
-            values,
-        } = receiver
-            && enum_name == "LuaValue"
-            && variant == "Table"
-            && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
+        if let Value::Enum(object) = receiver
+            && object.enum_name == "LuaValue"
+            && object.variant == "Table"
+            && let Some(inner) = object.values.as_ref().and_then(|vals| vals.first())
         {
             return self.lua_direct_index(inner, key);
         }
 
         match receiver {
-            Value::Struct { name, .. } if name == "LuaTable" => {
+            Value::Struct(object) if object.name == "LuaTable" => {
                 let Some(Value::Map(map_rc)) = receiver.struct_get_field("table") else {
                     return None;
                 };
@@ -997,12 +974,12 @@ impl VM {
     }
 
     fn lua_index_metamethod(&self, receiver: &Value) -> Option<Value> {
-        if let Value::Enum {
-            enum_name,
-            variant,
-            values,
-        } = receiver
-        {
+        if let Value::Enum(object) = receiver {
+            let EnumObject {
+                enum_name,
+                variant,
+                values,
+            } = object.as_ref();
             if enum_name == "LuaValue"
                 && variant == "Table"
                 && let Some(inner) = values.as_ref().and_then(|vals| vals.first())
@@ -1017,9 +994,10 @@ impl VM {
             }
         }
 
-        let Value::Struct { name, .. } = receiver else {
+        let Value::Struct(object) = receiver else {
             return None;
         };
+        let name = &object.name;
         let Some(Value::Map(meta_rc)) = receiver.struct_get_field("metamethods") else {
             return None;
         };

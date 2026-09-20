@@ -169,6 +169,9 @@ pub struct VM {
     pub(super) jit: JitState,
     /// Cells compiled code reads and writes through the VM pointer.
     pub(crate) jit_cells: crate::jit::JitCells,
+    /// One shared object per unit enum value (`Option.None`), keyed by
+    /// the interned names: constructing one is a count bump.
+    pub(crate) unit_enums: HashMap<(usize, usize), Rc<crate::bytecode::EnumObject>>,
     pub(super) budgets: BudgetState,
     pub(super) functions: Vec<Function>,
     /// Per-function facts the call path needs, indexed like `functions`

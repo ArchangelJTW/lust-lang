@@ -163,7 +163,7 @@ impl JitCompiler {
         }
         if let Some(layout) = jit::layout::ownership_layout() {
             // Inline: the native-function tag, then the allocation pointer.
-            let tag = layout.single_rc_tags[4] as i8;
+            let tag = layout.native_tag as i8;
             let rc_offset = layout.single_rc_offset as i32;
             dynasm!(self.ops
                 ; .arch x64
@@ -257,14 +257,16 @@ impl JitCompiler {
             // Inline: the struct tag, then the layout's allocation pointer
             // (`expected` is the `Rc`'s data pointer, 16 bytes in).
             let struct_tag = ValueTag::Struct.as_u8() as i8;
+            let object_offset = measured.struct_fields_offset as i32;
             let layout_offset = measured.struct_layout_offset as i32;
             let inner = (layout as usize).wrapping_sub(16) as i64;
             dynasm!(self.ops
                 ; .arch x64
                 ; cmp BYTE [r12 + offset], struct_tag
                 ; jne >guard_fail
+                ; mov rcx, [r12 + offset + object_offset]
                 ; mov rax, QWORD inner
-                ; cmp rax, [r12 + offset + layout_offset]
+                ; cmp rax, [rcx + layout_offset]
                 ; je >guard_ok
                 ; guard_fail:
             );

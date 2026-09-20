@@ -1,105 +1,84 @@
 //! Copying values without the runtime (the x86_64 twin of
-//! `codegen_aarch64/values.rs`): a `Value` is 48 bytes plus the reference
-//! counts it owns, and for the common variants (one `Rc`, a struct's
-//! three, an enum's two names and payload) those counts live at offsets
-//! the layout probe measured. Retaining is an increment; releasing
-//! decrements unless a count would reach zero, when the runtime drops the
-//! value. Variants the probe does not cover (weak references, closures,
-//! tasks) always go to the runtime.
+//! `codegen_aarch64/values.rs`): a `Value` is a tag and an 8-byte payload,
+//! and every owning variant's payload is one `Rc` allocation pointer,
+//! whose strong count is the allocation's first word. Retaining is an
+//! increment; releasing decrements unless the count would reach zero,
+//! when the runtime drops the value. A weak reference (whose count is the
+//! second word, and which may be dangling) always goes to the runtime.
 
 use super::*;
 
 impl JitCompiler {
-    /// rsi = address of a `Value`: bump the counts it owns. Clobbers the
+    /// Jump to `owned` for a value at rsi that owns an allocation, to
+    /// `weak` for a weak reference; fall through for one that owns
+    /// nothing. ecx = its tag afterwards.
+    fn emit_ownership_dispatch(
+        &mut self,
+        own: &jit::layout::OwnershipLayout,
+        owned: dynasmrt::DynamicLabel,
+        weak: dynasmrt::DynamicLabel,
+    ) {
+        // Scalars (tags up to Float) are the common case: one compare.
+        let scalar_max_tag = ValueTag::Float.as_u8() as i32;
+        dynasm!(self.ops
+            ; .arch x64
+            ; movzx ecx, BYTE [rsi]
+            ; cmp ecx, scalar_max_tag
+            ; jbe >plain
+        );
+        for tag in own.plain_tags {
+            if i32::from(tag) > scalar_max_tag {
+                dynasm!(self.ops ; .arch x64 ; cmp ecx, tag as i32 ; je >plain);
+            }
+        }
+        dynasm!(self.ops
+            ; .arch x64
+            ; cmp ecx, own.weak_tag as i32
+            ; je => weak
+            ; jmp => owned
+            ; plain:
+        );
+    }
+
+    fn emit_call_on_rsi(&mut self, helper: *const ()) {
+        dynasm!(self.ops
+            ; .arch x64
+            ; push rsi
+            ; sub rsp, 8
+            ; mov rdi, rsi
+            ; mov rax, QWORD helper as _
+            ; call rax
+            ; add rsp, 8
+            ; pop rsi
+        );
+    }
+
+    /// rsi = address of a `Value`: bump the count it owns. Clobbers the
     /// caller-saved registers (the slow path is a call); rsi is preserved.
     pub(super) fn emit_retain_at_rsi(&mut self) {
         unsafe extern "C" {
             fn jit_retain_value(value: *const Value);
         }
-        let Some((own, rc, en)) = Self::ownership() else {
-            dynasm!(self.ops
-                ; .arch x64
-                ; push rsi
-                ; sub rsp, 8
-                ; mov rdi, rsi
-                ; mov rax, QWORD jit_retain_value as *const () as _
-                ; call rax
-                ; add rsp, 8
-                ; pop rsi
-            );
+        let Some(own) = jit::layout::ownership_layout() else {
+            self.emit_call_on_rsi(jit_retain_value as *const ());
             return;
         };
         let done = self.ops.new_dynamic_label();
-        let single = self.ops.new_dynamic_label();
+        let owned = self.ops.new_dynamic_label();
         let slow = self.ops.new_dynamic_label();
-        // Scalars (tags up to Float) go first with one compare; structs and
-        // enums, what the typed paths leave to this code, come next.
-        let scalar_max_tag = ValueTag::Float.as_u8() as i32;
-        let not_enum = self.ops.new_dynamic_label();
+        let offset = own.single_rc_offset as i32;
+        self.emit_ownership_dispatch(&own, owned, slow);
         dynasm!(self.ops
             ; .arch x64
-            ; movzx ecx, BYTE [rsi]
-            ; cmp ecx, scalar_max_tag
-            ; jbe => done
-        );
-        let struct_tag = own.struct_tag as i32;
-        let enum_tag = own.enum_tag as i32;
-        let name_offset = rc.struct_name_offset as i32;
-        let layout_offset = rc.struct_layout_offset as i32;
-        let fields_offset = rc.struct_fields_offset as i32;
-        let enum_name_offset = en.enum_name_offset as i32;
-        let variant_offset = en.variant_offset as i32;
-        let values_offset = en.values_offset as i32;
-        dynasm!(self.ops
-            ; .arch x64
-            ; cmp ecx, struct_tag
-            ; jne >not_struct
-            ; mov rax, [rsi + name_offset]
-            ; add QWORD [rax], 1
-            ; mov rax, [rsi + layout_offset]
-            ; add QWORD [rax], 1
-            ; mov rax, [rsi + fields_offset]
-            ; add QWORD [rax], 1
             ; jmp => done
-            ; not_struct:
-            ; cmp ecx, enum_tag
-            ; jne => not_enum
-            ; mov rax, [rsi + enum_name_offset]
-            ; add QWORD [rax], 1
-            ; mov rax, [rsi + variant_offset]
-            ; add QWORD [rax], 1
-            ; mov rax, [rsi + values_offset]
-            ; test rax, rax
-            ; jz => done
-            ; add QWORD [rax], 1
-            ; jmp => done
-            ; => not_enum
-        );
-        for tag in own.single_rc_tags {
-            dynasm!(self.ops ; .arch x64 ; cmp ecx, tag as i32 ; je => single);
-        }
-        for tag in own.plain_tags {
-            if i32::from(tag) > scalar_max_tag {
-                dynasm!(self.ops ; .arch x64 ; cmp ecx, tag as i32 ; je => done);
-            }
-        }
-        dynasm!(self.ops ; .arch x64 ; jmp => slow ; => single);
-        let single_offset = own.single_rc_offset as i32;
-        dynasm!(self.ops
-            ; .arch x64
-            ; mov rax, [rsi + single_offset]
+            ; => owned
+            ; mov rax, [rsi + offset]
             ; add QWORD [rax], 1
             ; jmp => done
             ; => slow
-            ; push rsi
-            ; sub rsp, 8
-            ; mov rdi, rsi
-            ; mov rax, QWORD jit_retain_value as *const () as _
-            ; call rax
-            ; add rsp, 8
-            ; pop rsi
-            ; => done
         );
+        self.emit_call_on_rsi(jit_retain_value as *const ());
+        dynasm!(self.ops ; .arch x64 ; => done);
     }
 
     /// rsi = address of a `Value` about to be overwritten: give up what it
@@ -110,107 +89,28 @@ impl JitCompiler {
         unsafe extern "C" {
             fn jit_release_value(value: *mut Value);
         }
-        let Some((own, rc, en)) = Self::ownership() else {
-            dynasm!(self.ops
-                ; .arch x64
-                ; push rsi
-                ; sub rsp, 8
-                ; mov rdi, rsi
-                ; mov rax, QWORD jit_release_value as *const () as _
-                ; call rax
-                ; add rsp, 8
-                ; pop rsi
-            );
+        let Some(own) = jit::layout::ownership_layout() else {
+            self.emit_call_on_rsi(jit_release_value as *const ());
             return;
         };
         let done = self.ops.new_dynamic_label();
-        let single = self.ops.new_dynamic_label();
+        let owned = self.ops.new_dynamic_label();
         let slow = self.ops.new_dynamic_label();
-        // Scalars (tags up to Float) go first with one compare; structs and
-        // enums, what the typed paths leave to this code, come next.
-        let scalar_max_tag = ValueTag::Float.as_u8() as i32;
-        let not_enum = self.ops.new_dynamic_label();
+        let offset = own.single_rc_offset as i32;
+        self.emit_ownership_dispatch(&own, owned, slow);
         dynasm!(self.ops
             ; .arch x64
-            ; movzx ecx, BYTE [rsi]
-            ; cmp ecx, scalar_max_tag
-            ; jbe => done
-        );
-        let struct_tag = own.struct_tag as i32;
-        let enum_tag = own.enum_tag as i32;
-        let name_offset = rc.struct_name_offset as i32;
-        let layout_offset = rc.struct_layout_offset as i32;
-        let fields_offset = rc.struct_fields_offset as i32;
-        let enum_name_offset = en.enum_name_offset as i32;
-        let variant_offset = en.variant_offset as i32;
-        let values_offset = en.values_offset as i32;
-        // Every count is checked before any is decremented, so the slow
-        // path always sees the value intact.
-        dynasm!(self.ops
-            ; .arch x64
-            ; cmp ecx, struct_tag
-            ; jne >not_struct
-            ; mov rax, [rsi + name_offset]
-            ; mov rdx, [rsi + layout_offset]
-            ; mov r8, [rsi + fields_offset]
-            ; cmp QWORD [rax], 1
-            ; jbe => slow
-            ; cmp QWORD [rdx], 1
-            ; jbe => slow
-            ; cmp QWORD [r8], 1
-            ; jbe => slow
-            ; sub QWORD [rax], 1
-            ; sub QWORD [rdx], 1
-            ; sub QWORD [r8], 1
             ; jmp => done
-            ; not_struct:
-            ; cmp ecx, enum_tag
-            ; jne => not_enum
-            ; mov rax, [rsi + enum_name_offset]
-            ; mov rdx, [rsi + variant_offset]
-            ; mov r8, [rsi + values_offset]
-            ; cmp QWORD [rax], 1
-            ; jbe => slow
-            ; cmp QWORD [rdx], 1
-            ; jbe => slow
-            ; test r8, r8
-            ; jz >names_only
-            ; cmp QWORD [r8], 1
-            ; jbe => slow
-            ; sub QWORD [r8], 1
-            ; names_only:
-            ; sub QWORD [rax], 1
-            ; sub QWORD [rdx], 1
-            ; jmp => done
-            ; => not_enum
-        );
-        for tag in own.single_rc_tags {
-            dynasm!(self.ops ; .arch x64 ; cmp ecx, tag as i32 ; je => single);
-        }
-        for tag in own.plain_tags {
-            if i32::from(tag) > scalar_max_tag {
-                dynasm!(self.ops ; .arch x64 ; cmp ecx, tag as i32 ; je => done);
-            }
-        }
-        dynasm!(self.ops ; .arch x64 ; jmp => slow ; => single);
-        let single_offset = own.single_rc_offset as i32;
-        dynasm!(self.ops
-            ; .arch x64
-            ; mov rax, [rsi + single_offset]
+            ; => owned
+            ; mov rax, [rsi + offset]
             ; cmp QWORD [rax], 1
             ; jbe => slow
             ; sub QWORD [rax], 1
             ; jmp => done
             ; => slow
-            ; push rsi
-            ; sub rsp, 8
-            ; mov rdi, rsi
-            ; mov rax, QWORD jit_release_value as *const () as _
-            ; call rax
-            ; add rsp, 8
-            ; pop rsi
-            ; => done
         );
+        self.emit_call_on_rsi(jit_release_value as *const ());
+        dynasm!(self.ops ; .arch x64 ; => done);
     }
 
     /// `registers[dest] = clone of the Value at rsi`: the source is copied
@@ -257,17 +157,5 @@ impl JitCompiler {
         }
         dynasm!(self.ops ; .arch x64 ; add rsp, value_size);
         self.scalar_registers.remove(&dest);
-    }
-
-    fn ownership() -> Option<(
-        jit::layout::OwnershipLayout,
-        jit::layout::RcVecLayout,
-        jit::layout::EnumLayout,
-    )> {
-        Some((
-            jit::layout::ownership_layout()?,
-            jit::layout::rc_vec_layout()?,
-            jit::layout::enum_layout()?,
-        ))
     }
 }

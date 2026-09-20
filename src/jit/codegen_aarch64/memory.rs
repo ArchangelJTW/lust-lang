@@ -397,8 +397,8 @@ impl JitCompiler {
             .as_u8() as u32;
             let struct_tag = ValueTag::Struct.as_u8() as u32;
             let fields_offset = layout.struct_fields_offset as u32;
-            let len_offset = layout.len_offset as u32;
-            let ptr_offset = layout.ptr_offset as u32;
+            let len_offset = layout.struct_len_offset as u32;
+            let ptr_offset = layout.struct_ptr_offset as u32;
             let element = (index * mem::size_of::<Value>()) as i32;
             self.load_tag(0, object);
             dynasm!(self.ops
@@ -446,8 +446,8 @@ impl JitCompiler {
             // element is cloned into the register without the runtime.
             let struct_tag = ValueTag::Struct.as_u8() as u32;
             let fields_offset = layout.struct_fields_offset as u32;
-            let len_offset = layout.len_offset as u32;
-            let ptr_offset = layout.ptr_offset as u32;
+            let len_offset = layout.struct_len_offset as u32;
+            let ptr_offset = layout.struct_ptr_offset as u32;
             let element = (index * mem::size_of::<Value>()) as i32;
             self.load_tag(0, object);
             dynasm!(self.ops
@@ -537,9 +537,9 @@ impl JitCompiler {
             .as_u8() as u32;
             let struct_tag = ValueTag::Struct.as_u8() as u32;
             let fields_offset = layout.struct_fields_offset as u32;
-            let len_offset = layout.len_offset as u32;
-            let ptr_offset = layout.ptr_offset as u32;
-            let borrow_offset = layout.borrow_offset as u32;
+            let len_offset = layout.struct_len_offset as u32;
+            let ptr_offset = layout.struct_ptr_offset as u32;
+            let borrow_offset = layout.struct_borrow_offset as u32;
             let element = (index * mem::size_of::<Value>()) as i32;
             let done = self.ops.new_dynamic_label();
             self.load_tag(0, object);
@@ -919,26 +919,11 @@ impl JitCompiler {
         enum_name: &str,
         variant_name: &str,
     ) -> Result<()> {
-        unsafe extern "C" {
-            fn jit_new_enum_unit_safe(
-                vm_ptr: *mut crate::VM,
-                enum_name_ptr: *const u8,
-                enum_name_len: usize,
-                variant_name_ptr: *const u8,
-                variant_name_len: usize,
-                out: *mut Value,
-            ) -> u8;
-        }
-        let (enum_name_ptr, enum_name_len) = self.retain_string(enum_name);
-        let (variant_name_ptr, variant_name_len) = self.retain_string(variant_name);
-        dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
-        self.emit_mov_imm64(1, enum_name_ptr as usize as u64);
-        self.emit_mov_imm64(2, enum_name_len as u64);
-        self.emit_mov_imm64(3, variant_name_ptr as usize as u64);
-        self.emit_mov_imm64(4, variant_name_len as u64);
-        self.emit_reg_addr(5, dest);
-        self.emit_call(jit_new_enum_unit_safe as *const ());
-        self.emit_fail_if_w0_zero();
+        // One shared unit value per site: the store is a copy and a count
+        // bump.
+        let unit = self.retain_value(Value::enum_unit(enum_name, variant_name));
+        self.emit_mov_imm64(11, unit as usize as u64);
+        self.emit_clone_x11_into(dest);
         Ok(())
     }
 
@@ -1003,6 +988,7 @@ impl JitCompiler {
             let variant_ptr = self.retain_name(variant_name);
             let enum_ptr = (!enum_name.is_empty()).then(|| self.retain_name(enum_name));
             let tag = layout.tag as u32;
+            let object_offset = layout.object_offset as u32;
             let variant_offset = layout.variant_offset as u32;
             let enum_name_offset = layout.enum_name_offset as u32;
             self.load_tag(0, value);
@@ -1011,6 +997,7 @@ impl JitCompiler {
                 ; .arch aarch64
                 ; cmp w0, #tag
                 ; b.ne >no
+                ; ldr x11, [x11, #object_offset]
                 ; ldr x9, [x11, #variant_offset]
             );
             self.emit_mov_imm64(10, variant_ptr as u64);
@@ -1136,9 +1123,10 @@ impl JitCompiler {
             // (anything else fails to the interpreter), the value cloned
             // into the register without the runtime.
             let tag = layout.tag as u32;
-            let values_offset = layout.values_offset as u32;
+            let object_offset = layout.object_offset as u32;
             let len_offset = layout.values_len_offset as u32;
             let ptr_offset = layout.values_ptr_offset as u32;
+            let unit_offset = layout.unit_word_offset as u32;
             let element = (index as usize * mem::size_of::<Value>()) as i32;
             self.load_tag(0, enum_reg);
             dynasm!(self.ops
@@ -1147,10 +1135,17 @@ impl JitCompiler {
                 ; b.ne >fail
             );
             self.emit_reg_addr(11, enum_reg);
+            // A unit variant (no payload) fails: its niche word says so.
             dynasm!(self.ops
                 ; .arch aarch64
-                ; ldr x9, [x11, #values_offset]
-                ; cbz x9, >fail
+                ; ldr x9, [x11, #object_offset]
+                ; ldr x10, [x9, #unit_offset]
+            );
+            self.emit_mov_imm64(12, layout.unit_word_value as u64);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp x10, x12
+                ; b.eq >fail
                 ; ldr x10, [x9, #len_offset]
                 ; cmp x10, #index as u32
                 ; b.ls >fail

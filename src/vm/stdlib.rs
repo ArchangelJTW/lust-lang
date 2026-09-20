@@ -1,8 +1,9 @@
 use super::VM;
 use super::corelib::{string_key, unwrap_lua_value};
 use crate::LustInt;
+use crate::bytecode::value::EnumObject;
 use crate::bytecode::value::ValueKey;
-use crate::bytecode::{NativeCallResult, Value};
+use crate::bytecode::{NativeCallResult, Value, native_fn};
 use crate::config::LustConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::lua_compat::register_lust_function;
@@ -42,7 +43,7 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
 }
 
 fn create_print_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         for (i, arg) in args.iter().enumerate() {
             if i > 0 {
                 print!("\t");
@@ -56,7 +57,7 @@ fn create_print_fn() -> Value {
 }
 
 fn create_println_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         for (i, arg) in args.iter().enumerate() {
             if i > 0 {
                 print!("\t");
@@ -71,7 +72,7 @@ fn create_println_fn() -> Value {
 }
 
 fn create_type_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.is_empty() {
             return Err("type() requires at least one argument".to_string());
         }
@@ -79,11 +80,10 @@ fn create_type_fn() -> Value {
         let value = &args[0];
 
         // Special handling for LuaValue enum - return Lua type names
-        if let Value::Enum {
-            enum_name, variant, ..
-        } = value
-            && enum_name == "LuaValue"
+        if let Value::Enum(object) = value
+            && object.enum_name == "LuaValue"
         {
+            let EnumObject { variant, .. } = object.as_ref();
             let lua_type = match variant.as_str() {
                 "Nil" => "nil",
                 "Bool" => "boolean",
@@ -113,10 +113,10 @@ fn create_type_fn() -> Value {
             Value::Tuple(_) => "tuple",
             Value::Map(_) => "map",
             Value::Struct { .. } | Value::WeakStruct(_) => "struct",
-            Value::Enum { .. } => "enum",
+            Value::Enum(_) => "enum",
             Value::Function(_) => "function",
             Value::NativeFunction(_) => "function",
-            Value::Closure { .. } => "function",
+            Value::Closure(_) => "function",
             Value::Iterator(_) => "iterator",
             Value::Task(_) => "task",
         };
@@ -129,7 +129,7 @@ fn create_type_fn() -> Value {
 }
 
 pub(crate) fn create_select_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.is_empty() {
             return Err("select expects at least one argument".to_string());
         }
@@ -192,7 +192,7 @@ fn create_io_module(vm: &VM) -> Value {
 }
 
 fn create_io_read_file_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() != 1 {
             return Ok(NativeCallResult::Return(Value::err(Value::string(
                 "io.read_file(path) requires a single string path",
@@ -217,7 +217,7 @@ fn create_io_read_file_fn() -> Value {
 }
 
 fn create_io_read_file_bytes_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() != 1 {
             return Ok(NativeCallResult::Return(Value::err(Value::string(
                 "io.read_file_bytes(path) requires a single string path",
@@ -250,7 +250,7 @@ fn create_io_read_file_bytes_fn() -> Value {
 }
 
 fn create_io_write_file_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 2 {
             return Ok(NativeCallResult::Return(Value::err(Value::string(
                 "io.write_file(path, contents) requires a path and value",
@@ -280,7 +280,7 @@ fn create_io_write_file_fn() -> Value {
 }
 
 fn create_io_read_stdin_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if !args.is_empty() {
             return Ok(NativeCallResult::Return(Value::err(Value::string(
                 "io.read_stdin() takes no arguments",
@@ -298,7 +298,7 @@ fn create_io_read_stdin_fn() -> Value {
 }
 
 fn create_io_read_line_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if !args.is_empty() {
             return Ok(NativeCallResult::Return(Value::err(Value::string(
                 "io.read_line() takes no arguments",
@@ -316,7 +316,7 @@ fn create_io_read_line_fn() -> Value {
 }
 
 fn create_io_write_stdout_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let mut stdout = io::stdout();
         for arg in args {
             if let Err(err) = write!(stdout, "{}", arg) {
@@ -350,7 +350,7 @@ fn create_os_module(vm: &VM) -> Value {
 }
 
 fn create_os_time_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if !args.is_empty() {
             return Ok(NativeCallResult::Return(Value::err(Value::string(
                 "os.time() takes no arguments",
@@ -368,7 +368,7 @@ fn create_os_time_fn() -> Value {
 }
 
 fn create_os_sleep_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() != 1 {
             return Ok(NativeCallResult::Return(Value::err(Value::string(
                 "os.sleep(seconds) requires a single float duration",
@@ -403,7 +403,7 @@ fn create_os_sleep_fn() -> Value {
 }
 
 fn create_os_create_file_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() != 1 {
             return Ok(NativeCallResult::Return(Value::err(Value::string(
                 "os.create_file(path) requires a single string path",
@@ -428,7 +428,7 @@ fn create_os_create_file_fn() -> Value {
 }
 
 fn create_os_create_dir_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() != 1 {
             return Ok(NativeCallResult::Return(Value::err(Value::string(
                 "os.create_dir(path) requires a single string path",
@@ -453,7 +453,7 @@ fn create_os_create_dir_fn() -> Value {
 }
 
 fn create_os_remove_file_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() != 1 {
             return Ok(NativeCallResult::Return(Value::err(Value::string(
                 "os.remove_file(path) requires a single string path",
@@ -478,7 +478,7 @@ fn create_os_remove_file_fn() -> Value {
 }
 
 fn create_os_remove_dir_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() != 1 {
             return Ok(NativeCallResult::Return(Value::err(Value::string(
                 "os.remove_dir(path) requires a single string path",
@@ -503,7 +503,7 @@ fn create_os_remove_dir_fn() -> Value {
 }
 
 fn create_os_rename_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() != 2 {
             return Ok(NativeCallResult::Return(Value::err(Value::string(
                 "os.rename(from, to) requires two string paths",
@@ -565,7 +565,7 @@ fn create_string_module(vm: &VM) -> Value {
 }
 
 fn create_string_len_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let input = args.first().cloned().unwrap_or(Value::Nil);
         let value = unwrap_lua_value(input);
         match value {
@@ -577,7 +577,7 @@ fn create_string_len_fn() -> Value {
 }
 
 fn create_string_lower_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let value = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let s = value
             .as_string()
@@ -587,7 +587,7 @@ fn create_string_lower_fn() -> Value {
 }
 
 fn create_string_upper_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let value = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let s = value
             .as_string()
@@ -597,7 +597,7 @@ fn create_string_upper_fn() -> Value {
 }
 
 fn create_string_sub_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let value = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let source = value
             .as_string()
@@ -623,7 +623,7 @@ fn create_string_sub_fn() -> Value {
 }
 
 fn create_string_byte_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let value = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let source = value
             .as_string()
@@ -649,7 +649,7 @@ fn create_string_byte_fn() -> Value {
 }
 
 fn create_string_char_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let mut output = String::new();
         for arg in args {
             let raw = unwrap_lua_value(arg.clone());
@@ -669,7 +669,7 @@ fn create_string_char_fn() -> Value {
 }
 
 fn create_string_find_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let subject = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let pattern_val = unwrap_lua_value(args.get(1).cloned().unwrap_or(Value::Nil));
         let haystack = subject
@@ -726,7 +726,7 @@ fn create_string_find_fn() -> Value {
 }
 
 fn create_string_match_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let subject = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let pattern_val = unwrap_lua_value(args.get(1).cloned().unwrap_or(Value::Nil));
         let haystack = subject
@@ -776,7 +776,7 @@ fn create_string_match_fn() -> Value {
 }
 
 fn create_string_gsub_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let subject = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let pattern_val = unwrap_lua_value(args.get(1).cloned().unwrap_or(Value::Nil));
         let repl = args.get(2).cloned().unwrap_or(Value::Nil);
@@ -798,10 +798,12 @@ fn create_string_gsub_fn() -> Value {
             Other(Value),
         }
         let replacer = match &repl {
-            Value::Enum {
-                enum_name, variant, ..
-            } if enum_name == "LuaValue" && variant == "Function" => Replacer::Func(repl.clone()),
-            Value::Function(_) | Value::NativeFunction(_) | Value::Closure { .. } => {
+            Value::Enum(object)
+                if object.enum_name == "LuaValue" && object.variant == "Function" =>
+            {
+                Replacer::Func(repl.clone())
+            }
+            Value::Function(_) | Value::NativeFunction(_) | Value::Closure(_) => {
                 Replacer::Func(repl.clone())
             }
             _ => {
@@ -854,7 +856,7 @@ fn create_string_gsub_fn() -> Value {
 }
 
 fn create_string_format_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.is_empty() {
             return Err("string.format requires a format string".to_string());
         }
@@ -868,7 +870,7 @@ fn create_string_format_fn() -> Value {
 }
 
 fn create_string_rep_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.is_empty() {
             return Err("string.rep requires at least a string and count".to_string());
         }
@@ -900,7 +902,7 @@ fn create_string_rep_fn() -> Value {
 }
 
 fn create_string_reverse_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let s = val
             .as_string()
@@ -911,7 +913,7 @@ fn create_string_reverse_fn() -> Value {
 }
 
 fn create_string_split_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let s = val
             .as_string()
@@ -931,7 +933,7 @@ fn create_string_split_fn() -> Value {
 }
 
 fn create_string_trim_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let s = val
             .as_string()
@@ -941,7 +943,7 @@ fn create_string_trim_fn() -> Value {
 }
 
 fn create_string_trim_start_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let s = val
             .as_string()
@@ -951,7 +953,7 @@ fn create_string_trim_start_fn() -> Value {
 }
 
 fn create_string_trim_end_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let s = val
             .as_string()
@@ -961,7 +963,7 @@ fn create_string_trim_end_fn() -> Value {
 }
 
 fn create_string_replace_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let s = val
             .as_string()
@@ -981,7 +983,7 @@ fn create_string_replace_fn() -> Value {
 }
 
 fn create_string_starts_with_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let s = val
             .as_string()
@@ -996,7 +998,7 @@ fn create_string_starts_with_fn() -> Value {
 }
 
 fn create_string_ends_with_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let s = val
             .as_string()
@@ -1011,7 +1013,7 @@ fn create_string_ends_with_fn() -> Value {
 }
 
 fn create_string_contains_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let s = val
             .as_string()
@@ -1026,7 +1028,7 @@ fn create_string_contains_fn() -> Value {
 }
 
 fn create_string_is_empty_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let s = val
             .as_string()
@@ -1036,7 +1038,7 @@ fn create_string_is_empty_fn() -> Value {
 }
 
 fn create_string_chars_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let s = val
             .as_string()
@@ -1047,7 +1049,7 @@ fn create_string_chars_fn() -> Value {
 }
 
 fn create_string_lines_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let s = val
             .as_string()
@@ -1083,7 +1085,7 @@ fn create_array_module(vm: &VM) -> Value {
 }
 
 fn create_array_len_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Array(arr) => Ok(NativeCallResult::Return(Value::Int(
@@ -1098,7 +1100,7 @@ fn create_array_len_fn() -> Value {
 }
 
 fn create_array_is_empty_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Array(arr) => Ok(NativeCallResult::Return(Value::Bool(
@@ -1113,7 +1115,7 @@ fn create_array_is_empty_fn() -> Value {
 }
 
 fn create_array_get_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         let index = args
             .get(1)
@@ -1139,7 +1141,7 @@ fn create_array_get_fn() -> Value {
 }
 
 fn create_array_first_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Array(arr) => {
@@ -1161,7 +1163,7 @@ fn create_array_first_fn() -> Value {
 }
 
 fn create_array_last_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Array(arr) => {
@@ -1183,7 +1185,7 @@ fn create_array_last_fn() -> Value {
 }
 
 fn create_array_push_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 2 {
             return Err("array.push requires an array and a value".to_string());
         }
@@ -1211,7 +1213,7 @@ fn create_array_push_fn() -> Value {
 }
 
 fn create_array_pop_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Array(arr) => {
@@ -1229,7 +1231,7 @@ fn create_array_pop_fn() -> Value {
 }
 
 fn create_array_insert_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 3 {
             return Err("array.insert requires array, index, and value".to_string());
         }
@@ -1261,7 +1263,7 @@ fn create_array_insert_fn() -> Value {
 }
 
 fn create_array_remove_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 2 {
             return Err("array.remove requires array and index".to_string());
         }
@@ -1287,7 +1289,7 @@ fn create_array_remove_fn() -> Value {
 }
 
 fn create_array_clear_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Array(arr) => {
@@ -1303,7 +1305,7 @@ fn create_array_clear_fn() -> Value {
 }
 
 fn create_array_slice_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 3 {
             return Err("array.slice requires array, start, and end indices".to_string());
         }
@@ -1333,7 +1335,7 @@ fn create_array_slice_fn() -> Value {
 }
 
 fn create_array_concat_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         let sep_val = args.get(1).map(|v| unwrap_lua_value(v.clone()));
         let sep = sep_val
@@ -1355,7 +1357,7 @@ fn create_array_concat_fn() -> Value {
 }
 
 fn create_array_sort_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         let comp = args.get(1).cloned();
         match val {
@@ -1416,7 +1418,7 @@ fn create_array_sort_fn() -> Value {
 }
 
 fn create_array_reverse_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Array(arr) => {
@@ -1432,7 +1434,7 @@ fn create_array_reverse_fn() -> Value {
 }
 
 fn create_array_contains_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 2 {
             return Err("array.contains requires an array and a value".to_string());
         }
@@ -1451,7 +1453,7 @@ fn create_array_contains_fn() -> Value {
 }
 
 fn create_array_map_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 2 {
             return Err("array.map requires an array and a function".to_string());
         }
@@ -1477,7 +1479,7 @@ fn create_array_map_fn() -> Value {
 }
 
 fn create_array_filter_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 2 {
             return Err("array.filter requires an array and a predicate function".to_string());
         }
@@ -1507,7 +1509,7 @@ fn create_array_filter_fn() -> Value {
 }
 
 fn create_array_reduce_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 3 {
             return Err(
                 "array.reduce requires array, initial value, and a reducer function".to_string(),
@@ -1536,7 +1538,7 @@ fn create_array_reduce_fn() -> Value {
 }
 
 fn create_array_iter_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Array(arr) => {
@@ -1571,7 +1573,7 @@ fn create_map_module(vm: &VM) -> Value {
 }
 
 fn create_map_len_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Map(m) => Ok(NativeCallResult::Return(Value::Int(
@@ -1583,7 +1585,7 @@ fn create_map_len_fn() -> Value {
 }
 
 fn create_map_is_empty_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Map(m) => Ok(NativeCallResult::Return(Value::Bool(m.borrow().is_empty()))),
@@ -1596,7 +1598,7 @@ fn create_map_is_empty_fn() -> Value {
 }
 
 fn create_map_get_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 2 {
             return Err("map.get requires map and key".to_string());
         }
@@ -1615,7 +1617,7 @@ fn create_map_get_fn() -> Value {
 }
 
 fn create_map_set_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 3 {
             return Err("map.set requires map, key, and value".to_string());
         }
@@ -1639,7 +1641,7 @@ fn create_map_set_fn() -> Value {
 }
 
 fn create_map_has_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 2 {
             return Err("map.has requires map and key".to_string());
         }
@@ -1655,7 +1657,7 @@ fn create_map_has_fn() -> Value {
 }
 
 fn create_map_delete_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 2 {
             return Err("map.delete requires map and key".to_string());
         }
@@ -1676,7 +1678,7 @@ fn create_map_delete_fn() -> Value {
 }
 
 fn create_map_clear_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Map(m) => {
@@ -1692,7 +1694,7 @@ fn create_map_clear_fn() -> Value {
 }
 
 fn create_map_keys_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Map(m) => {
@@ -1705,7 +1707,7 @@ fn create_map_keys_fn() -> Value {
 }
 
 fn create_map_values_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Map(m) => {
@@ -1721,7 +1723,7 @@ fn create_map_values_fn() -> Value {
 }
 
 fn create_map_iter_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Map(m) => {
@@ -1774,7 +1776,7 @@ fn create_math_module(vm: &VM) -> Value {
 }
 
 fn create_math_abs_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         match val {
             Value::Int(i) => Ok(NativeCallResult::Return(Value::Int(i.wrapping_abs()))),
@@ -1788,7 +1790,7 @@ fn create_math_abs_fn() -> Value {
 }
 
 fn create_math_floor_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         match val {
             Value::Int(i) => Ok(NativeCallResult::Return(Value::Int(i))),
@@ -1802,7 +1804,7 @@ fn create_math_floor_fn() -> Value {
 }
 
 fn create_math_ceil_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         match val {
             Value::Int(i) => Ok(NativeCallResult::Return(Value::Int(i))),
@@ -1816,7 +1818,7 @@ fn create_math_ceil_fn() -> Value {
 }
 
 fn create_math_round_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         match val {
             Value::Int(i) => Ok(NativeCallResult::Return(Value::Int(i))),
@@ -1830,7 +1832,7 @@ fn create_math_round_fn() -> Value {
 }
 
 fn create_math_sqrt_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let num = val
             .as_float()
@@ -1841,7 +1843,7 @@ fn create_math_sqrt_fn() -> Value {
 }
 
 fn create_math_sin_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let num = val
             .as_float()
@@ -1852,7 +1854,7 @@ fn create_math_sin_fn() -> Value {
 }
 
 fn create_math_cos_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let num = val
             .as_float()
@@ -1863,7 +1865,7 @@ fn create_math_cos_fn() -> Value {
 }
 
 fn create_math_tan_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let num = val
             .as_float()
@@ -1874,7 +1876,7 @@ fn create_math_tan_fn() -> Value {
 }
 
 fn create_math_asin_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let num = val
             .as_float()
@@ -1885,7 +1887,7 @@ fn create_math_asin_fn() -> Value {
 }
 
 fn create_math_acos_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let num = val
             .as_float()
@@ -1896,7 +1898,7 @@ fn create_math_acos_fn() -> Value {
 }
 
 fn create_math_atan_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let num = val
             .as_float()
@@ -1907,7 +1909,7 @@ fn create_math_atan_fn() -> Value {
 }
 
 fn create_math_atan2_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 2 {
             return Err("math.atan2 requires y and x arguments".to_string());
         }
@@ -1926,7 +1928,7 @@ fn create_math_atan2_fn() -> Value {
 }
 
 fn create_math_min_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.is_empty() {
             return Err("math.min requires at least one argument".to_string());
         }
@@ -1962,7 +1964,7 @@ fn create_math_min_fn() -> Value {
 }
 
 fn create_math_max_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.is_empty() {
             return Err("math.max requires at least one argument".to_string());
         }
@@ -1998,7 +2000,7 @@ fn create_math_max_fn() -> Value {
 }
 
 fn create_math_clamp_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.len() < 3 {
             return Err("math.clamp requires x, min, and max arguments".to_string());
         }
@@ -2031,7 +2033,7 @@ fn create_math_clamp_fn() -> Value {
 }
 
 fn create_math_deg_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let num = val
             .as_float()
@@ -2042,7 +2044,7 @@ fn create_math_deg_fn() -> Value {
 }
 
 fn create_math_rad_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let num = val
             .as_float()
@@ -2053,7 +2055,7 @@ fn create_math_rad_fn() -> Value {
 }
 
 fn create_math_exp_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let num = val
             .as_float()
@@ -2064,7 +2066,7 @@ fn create_math_exp_fn() -> Value {
 }
 
 fn create_math_log_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         let num = val
             .as_float()
@@ -2083,7 +2085,7 @@ fn create_math_log_fn() -> Value {
 }
 
 fn create_math_tointeger_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         match val {
             Value::Int(i) => Ok(NativeCallResult::Return(Value::some(Value::Int(i)))),
@@ -2109,7 +2111,7 @@ fn create_math_tointeger_fn() -> Value {
 }
 
 fn create_math_tofloat_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
         match val {
             Value::Float(f) => Ok(NativeCallResult::Return(Value::some(Value::Float(f)))),
@@ -2174,7 +2176,7 @@ fn read_sequence(data: &TableData) -> Vec<Value> {
 }
 
 pub(crate) fn create_table_unpack_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.is_empty() {
             return Err("table.unpack expects a table/array".to_string());
         }
@@ -2205,7 +2207,7 @@ pub(crate) fn create_table_unpack_fn() -> Value {
 }
 
 fn create_math_random_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let lower = args
             .first()
             .map(|v| unwrap_lua_value(v.clone()))
@@ -2233,7 +2235,7 @@ fn create_math_random_fn() -> Value {
 }
 
 fn create_math_randomseed_fn() -> Value {
-    Value::NativeFunction(Rc::new(|args: &[Value]| {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
         let seed_val = args
             .first()
             .map(|v| unwrap_lua_value(v.clone()))
@@ -2518,8 +2520,8 @@ fn build_template_replacement(template: &str, caps: &regex::Captures) -> String 
 }
 
 fn to_lua_value(vm: &VM, value: Value) -> Result<Value, String> {
-    if let Value::Enum { enum_name, .. } = &value
-        && enum_name == "LuaValue"
+    if let Value::Enum(object) = &value
+        && object.enum_name == "LuaValue"
     {
         return Ok(value);
     }

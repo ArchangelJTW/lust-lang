@@ -37,13 +37,28 @@ impl JitCompiler {
         // coarser classification and numbers `Function` differently).
         // SAFETY: reading the first byte of a live `Value`.
         let tag = unsafe { *(value as *const Value as *const u8) } as u32;
+        // A destination known to hold nothing owned is simply overwritten.
+        if self.scalar_registers.contains_key(&dest) {
+            self.emit_mov_imm64(0, payload);
+            self.store_tag_imm(dest, tag as u8);
+            self.store_payload(dest, 0);
+            return Ok(());
+        }
         let done = self.ops.new_dynamic_label();
         self.load_tag_from_memory(9, dest);
         dynasm!(self.ops
             ; .arch aarch64
             ; cmp w9, #scalar_max_tag
-            ; b.hi >owned
+            ; b.ls >plain
         );
+        // A function index held from the previous iteration of a loop that
+        // reloads it is as plain as a scalar.
+        if matches!(value, Value::Function(_)) {
+            dynasm!(self.ops ; .arch aarch64 ; cmp w9, #tag ; b.ne >owned);
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; b >owned);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; plain:);
         self.emit_mov_imm64(0, payload);
         self.store_tag_imm(dest, tag as u8);
         self.store_payload(dest, 0);
@@ -54,7 +69,6 @@ impl JitCompiler {
         );
         self.copy_owned_constant(dest, value)?;
         dynasm!(self.ops ; .arch aarch64 ; => done);
-        self.scalar_registers.remove(&dest);
         Ok(())
     }
 

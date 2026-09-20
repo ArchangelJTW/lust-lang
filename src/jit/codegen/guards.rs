@@ -16,6 +16,11 @@ impl JitCompiler {
             ValueType::Array => ValueTag::Array,
             ValueType::Tuple => ValueTag::Tuple,
             ValueType::Struct => ValueTag::Struct,
+            ValueType::Plain => {
+                return Err(crate::LustError::RuntimeError {
+                    message: "a guard cannot expect Plain".into(),
+                });
+            }
         };
         let expected_discriminant = expected_tag.as_u8() as i8;
         let guard_return_value = (guard_index + 1) as i32;
@@ -43,6 +48,7 @@ impl JitCompiler {
                 ValueType::Array => GuardKind::IntType { register },
                 ValueType::Tuple => GuardKind::IntType { register },
                 ValueType::Struct => GuardKind::IntType { register },
+                ValueType::Plain => unreachable!("rejected above"),
             },
             fail_count: 0,
         })
@@ -645,6 +651,24 @@ impl JitCompiler {
     fn emit_drop_frame(&mut self, register_count: u8) {
         unsafe extern "C" {
             fn jit_drop_values_masked(values: *mut Value, len: usize, mask: u64);
+        }
+        // Only the registers that may own something here are released,
+        // inline: not the scalars, not the parameters a native caller
+        // aliased (the record's mask says which, but they own nothing
+        // either way — an unaliased one was copied as a scalar).
+        if register_count <= 64 {
+            let value_size = mem::size_of::<Value>() as i32;
+            for reg in 0..register_count {
+                if self.function_alias_params & (1u64 << reg) != 0
+                    || self.scalar_registers.contains_key(&reg)
+                {
+                    continue;
+                }
+                let offset = i32::from(reg) * value_size;
+                dynasm!(self.ops ; .arch x64 ; lea rsi, [r12 + offset]);
+                self.emit_release_at_rsi();
+            }
+            return;
         }
         dynasm!(self.ops
             ; .arch x64

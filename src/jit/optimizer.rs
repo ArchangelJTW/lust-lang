@@ -531,6 +531,8 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::TryCast {
@@ -587,6 +589,8 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::TryGetIndex {
@@ -647,6 +651,8 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {

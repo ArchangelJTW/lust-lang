@@ -18,6 +18,7 @@ impl JitCompiler {
             dirty_pins: Vec::new(),
             trace_start_ip: 0,
             function_mode: false,
+            function_alias_params: 0,
             function_frame: (0, true),
             function_result: None,
             function_entry_table: 0,
@@ -115,6 +116,7 @@ impl JitCompiler {
     ) -> Result<CompiledTrace> {
         self.function_mode = true;
         self.function_frame = (register_count, trace.frame_may_own);
+        self.function_alias_params = trace.alias_params;
         self.function_result = result_type;
         self.function_entry_table = entry_table;
         self.function_labels.clear();
@@ -138,7 +140,7 @@ impl JitCompiler {
         trace_id: TraceId,
         hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
-        self.scalar_registers.clear();
+        self.scalar_registers = trace.entry_scalars.iter().copied().collect();
         self.trace_start_ip = trace.start_ip;
         self.last_fail_island = self.ops.offset().0;
         self.pins = if self.function_mode {
@@ -162,7 +164,7 @@ impl JitCompiler {
         self.dirty_pins.clear();
         self.current_fail_ip = None;
         self.fail_sites.clear();
-        let stack_size = Self::compute_stack_size(trace);
+        let stack_size = self.compute_stack_size(trace);
         let mut guards = Vec::new();
         let mut guard_index = 0i32;
         // Exits from the preamble and the loop prologue: nothing pinned yet.
@@ -1625,6 +1627,9 @@ impl JitCompiler {
                     Value::Bool(_) => Some(ValueType::Bool),
                     Value::Int(_) => Some(ValueType::Int),
                     Value::Float(_) => Some(ValueType::Float),
+                    // A function index or Nil: nothing to drop, no particular
+                    // type.
+                    Value::Function(_) | Value::Nil => Some(ValueType::Plain),
                     _ => None,
                 };
                 set(&mut self.scalar_registers, *dest, ty);
@@ -1765,11 +1770,17 @@ impl JitCompiler {
         }
     }
 
-    fn compute_stack_size(trace: &Trace) -> i32 {
+    fn compute_stack_size(&self, trace: &Trace) -> i32 {
         let specialized_slots = Self::count_specialized_slots(trace) as i32;
         let specialized_bytes =
             SPECIALIZED_STACK_BASE + (specialized_slots * SPECIALIZED_SLOT_SIZE);
-        let size = MIN_JIT_STACK_SIZE.max(specialized_bytes);
+        // Function code pays for its local area on every call, so it takes
+        // only what its specialized values need.
+        let size = if self.function_mode {
+            specialized_bytes
+        } else {
+            MIN_JIT_STACK_SIZE.max(specialized_bytes)
+        };
         let size = (size + 15) & !15;
         crate::jit::log(|| {
             format!(
@@ -1876,10 +1887,6 @@ impl JitCompiler {
                 })
                 .map(|(arg_index, _)| 1u64 << arg_index)
                 .fold(0, |mask, bit| mask | bit);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; sub sp, sp, #metadata_size
-            );
             let site = self.retain_call_site(crate::vm::JitCallSite {
                 value_count: frame_value_count as usize,
                 alias_mask: alias_mask as usize,
@@ -1891,8 +1898,7 @@ impl JitCompiler {
             self.emit_mov_imm64(0, site as u64);
             dynasm!(self.ops
                 ; .arch aarch64
-                ; str x19, [sp]
-                ; str x21, [sp, 8]
+                ; stp x19, x21, [sp, #-(INLINE_METADATA_SIZE)]!
                 ; str x0, [sp, 16]
             );
             // Allocate space for callee registers and initialise every one
@@ -1900,12 +1906,16 @@ impl JitCompiler {
             // call per register — so the argument moves below find nothing to
             // drop. x19 still addresses the caller's registers here.
             self.emit_sub_sp(frame_size);
-            let nil_tag = ValueTag::Nil.as_u8() as u32;
-            dynasm!(self.ops ; .arch aarch64 ; movz w13, #nil_tag);
+            dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
             for reg in 0..trace.register_count {
-                dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
-                self.emit_add_imm(11, 11, super::registers::reg_offset(reg));
-                dynasm!(self.ops ; .arch aarch64 ; strb w13, [x11]);
+                let offset = super::registers::reg_offset(reg);
+                if offset < 4096 {
+                    dynasm!(self.ops ; .arch aarch64 ; strb wzr, [x11, #offset as u32]);
+                } else {
+                    dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
+                    self.emit_add_imm(11, 11, offset);
+                    dynasm!(self.ops ; .arch aarch64 ; strb wzr, [x11] ; mov x11, sp);
+                }
             }
 
             // Copy positional arguments into the callee frame. A scalar of
@@ -1922,14 +1932,15 @@ impl JitCompiler {
                             _ => ValueTag::Float,
                         }
                         .as_u8() as u32;
+                        let payload_offset = (dest_offset + 8) as u32;
+                        let tag_offset = dest_offset as u32;
                         self.load_payload(0, *src_reg);
-                        dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
-                        self.emit_add_imm(11, 11, dest_offset);
                         dynasm!(self.ops
                             ; .arch aarch64
+                            ; mov x11, sp
                             ; movz w13, #tag
-                            ; strb w13, [x11]
-                            ; str x0, [x11, 8]
+                            ; strb w13, [x11, #tag_offset]
+                            ; str x0, [x11, #payload_offset]
                         );
                     }
                     _ if alias_mask & (1u64 << arg_index) != 0 => {
@@ -1964,14 +1975,15 @@ impl JitCompiler {
                     self.scalar_registers.insert(arg_index as u8, *ty);
                 }
             }
+            // The rest of the frame is still Nil: the first store into
+            // any of those registers has nothing to drop.
+            for reg in trace.arg_registers.len() as u8..trace.register_count {
+                self.scalar_registers.insert(reg, ValueType::Plain);
+            }
 
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; mov x19, sp
-            );
+            dynasm!(self.ops ; .arch aarch64 ; mov x19, sp);
             // Link the record into the unwind chain.
-            dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
-            self.emit_add_imm(21, 11, frame_size);
+            self.emit_add_imm(21, 19, frame_size);
 
             let call_ip = self.current_fail_ip;
             let inline_result = self.compile_ops(&trace.body, guard_index, guards);

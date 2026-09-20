@@ -23,13 +23,16 @@ impl JitCompiler {
         let done = self.ops.new_dynamic_label();
         let single = self.ops.new_dynamic_label();
         let slow = self.ops.new_dynamic_label();
-        dynasm!(self.ops ; .arch aarch64 ; ldrb w9, [x11]);
-        for tag in own.plain_tags {
-            dynasm!(self.ops ; .arch aarch64 ; cmp w9, #tag as u32 ; b.eq => done);
-        }
-        for tag in own.single_rc_tags {
-            dynasm!(self.ops ; .arch aarch64 ; cmp w9, #tag as u32 ; b.eq => single);
-        }
+        // Scalars (tags up to Float) go first with one compare; structs and
+        // enums, what the typed paths leave to this code, come next.
+        let scalar_max_tag = ValueTag::Float.as_u8() as u32;
+        let not_enum = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldrb w9, [x11]
+            ; cmp w9, #scalar_max_tag
+            ; b.ls => done
+        );
         let struct_tag = own.struct_tag as u32;
         let enum_tag = own.enum_tag as u32;
         let name_offset = rc.struct_name_offset as u32;
@@ -57,7 +60,7 @@ impl JitCompiler {
             ; b => done
             ; not_struct:
             ; cmp w9, #enum_tag
-            ; b.ne => slow
+            ; b.ne => not_enum
             ; ldr x10, [x11, #enum_name_offset]
             ; ldr x12, [x10]
             ; add x12, x12, 1
@@ -72,8 +75,17 @@ impl JitCompiler {
             ; add x12, x12, 1
             ; str x12, [x10]
             ; b => done
-            ; => single
+            ; => not_enum
         );
+        for tag in own.single_rc_tags {
+            dynasm!(self.ops ; .arch aarch64 ; cmp w9, #tag as u32 ; b.eq => single);
+        }
+        for tag in own.plain_tags {
+            if u32::from(tag) > scalar_max_tag {
+                dynasm!(self.ops ; .arch aarch64 ; cmp w9, #tag as u32 ; b.eq => done);
+            }
+        }
+        dynasm!(self.ops ; .arch aarch64 ; b => slow ; => single);
         let single_offset = own.single_rc_offset as u32;
         dynasm!(self.ops
             ; .arch aarch64
@@ -104,13 +116,16 @@ impl JitCompiler {
         let done = self.ops.new_dynamic_label();
         let single = self.ops.new_dynamic_label();
         let slow = self.ops.new_dynamic_label();
-        dynasm!(self.ops ; .arch aarch64 ; ldrb w9, [x11]);
-        for tag in own.plain_tags {
-            dynasm!(self.ops ; .arch aarch64 ; cmp w9, #tag as u32 ; b.eq => done);
-        }
-        for tag in own.single_rc_tags {
-            dynasm!(self.ops ; .arch aarch64 ; cmp w9, #tag as u32 ; b.eq => single);
-        }
+        // Scalars (tags up to Float) go first with one compare; structs and
+        // enums, what the typed paths leave to this code, come next.
+        let scalar_max_tag = ValueTag::Float.as_u8() as u32;
+        let not_enum = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldrb w9, [x11]
+            ; cmp w9, #scalar_max_tag
+            ; b.ls => done
+        );
         let struct_tag = own.struct_tag as u32;
         let enum_tag = own.enum_tag as u32;
         let name_offset = rc.struct_name_offset as u32;
@@ -146,7 +161,7 @@ impl JitCompiler {
             ; b => done
             ; not_struct:
             ; cmp w9, #enum_tag
-            ; b.ne => slow
+            ; b.ne => not_enum
             ; ldr x10, [x11, #enum_name_offset]
             ; ldr x12, [x10]
             ; ldr x13, [x11, #variant_offset]
@@ -170,8 +185,17 @@ impl JitCompiler {
             ; sub x9, x9, 1
             ; str x9, [x15]
             ; b => done
-            ; => single
+            ; => not_enum
         );
+        for tag in own.single_rc_tags {
+            dynasm!(self.ops ; .arch aarch64 ; cmp w9, #tag as u32 ; b.eq => single);
+        }
+        for tag in own.plain_tags {
+            if u32::from(tag) > scalar_max_tag {
+                dynasm!(self.ops ; .arch aarch64 ; cmp w9, #tag as u32 ; b.eq => done);
+            }
+        }
+        dynasm!(self.ops ; .arch aarch64 ; b => slow ; => single);
         let single_offset = own.single_rc_offset as u32;
         dynasm!(self.ops
             ; .arch aarch64
@@ -205,6 +229,16 @@ impl JitCompiler {
     /// `registers[dest] = clone of the Value at x11`: retain the source,
     /// release the destination's old value, copy. Clobbers x0–x15.
     pub(super) fn emit_clone_x11_into(&mut self, dest: u8) {
+        // A destination holding nothing owned needs no release: copy, then
+        // retain the copy (the same counts as the source's).
+        if self.scalar_registers.contains_key(&dest) {
+            self.emit_reg_addr(9, dest);
+            self.emit_copy_x11_to_x9();
+            self.emit_reg_addr(11, dest);
+            self.emit_retain_at_x11();
+            self.scalar_registers.remove(&dest);
+            return;
+        }
         // The source is copied to the stack first: releasing the
         // destination may free the container the source lives in (`t =
         // t.next` with `t` the last reference), and the slow paths are

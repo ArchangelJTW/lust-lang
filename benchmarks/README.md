@@ -157,15 +157,15 @@ milliseconds, single run each:
 
 | program   | lust-vm | lust-jit | luajit | lua 5.5 |
 |-----------|--------:|---------:|-------:|--------:|
-| fields    |     766 |       50 |     59 |     124 |
-| array     |    1360 |      213 |     61 |      78 |
-| calls     |     793 |      107 |     31 |     121 |
-| methods   |    1353 |       70 |     30 |     228 |
-| strings   |     117 |      121 |    123 |     160 |
-| fib       |     182 |       34 |     24 |      40 |
-| nested    |     396 |       25 |     30 |      81 |
-| floatmath |     583 |       57 |     38 |      89 |
-| tree      |     764 |      138 |     41 |      57 |
+| fields    |     747 |       48 |     58 |     120 |
+| array     |    1342 |      204 |     60 |      77 |
+| calls     |     757 |       64 |     30 |     126 |
+| methods   |    1330 |       70 |     31 |     222 |
+| strings   |     118 |      116 |    125 |     159 |
+| fib       |     170 |       32 |     21 |      40 |
+| nested    |     363 |       24 |     29 |      79 |
+| floatmath |     537 |       55 |     37 |      93 |
+| tree      |     748 |      126 |     39 |      53 |
 
 (`strings` builds a 100,000-character string; it was 1,000,000 characters,
 14 s for every engine but Lua, until the suite got a per-program timeout.)
@@ -208,8 +208,19 @@ reload, its entry-table address load (the table, the stack limit, the
 depth budget and the exit word live in the VM at fixed offsets from the
 pinned VM pointer) and, for a declared `int`, `float` or `bool` result,
 its result store: the callee hands the payload back in a register and
-the caller stores it. `fib(34)` went from 0.12 to 0.08 s; a loop of
-200,000,000 calls to a one-line function from 1.63 to 1.55 s. The suite
-does not move: its `calls` and `methods` loops are traced with the
-callee inlined, and `tree`'s calls are dominated by the frame setup and
-teardown that remain.
+the caller stores it. `fib(34)` went from 0.12 to 0.08 s. Registers
+known to hold nothing owned — a fresh frame's unwritten registers, a
+function index, a scalar of either of two types on two paths (the
+`Plain` fact) — are then overwritten without a tag check, a scalar
+source is guarded once so its moves are typed copies, a loop reloading
+the same function constant into the same register stores it without
+calling the runtime (that call ran on every iteration: 1.55 → 0.97 s
+for 200,000,000 calls to a one-line function), a clone into a plain
+register skips the release, the inline retain and release test struct
+and enum tags before the five single-count ones, and a function's
+return releases only the registers that may own something instead of
+calling a helper that dropped the frame. `calls` went 107 → 64 ms.
+`tree` (138 → 126) is now all generated code: each node visit clones
+the `Option` field and its payload and releases both, and every clone
+or release of a struct or enum is three reference-count updates, two of
+them on the interned name and layout every node shares.

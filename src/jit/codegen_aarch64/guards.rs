@@ -15,6 +15,11 @@ impl JitCompiler {
             ValueType::Array => ValueTag::Array,
             ValueType::Tuple => ValueTag::Tuple,
             ValueType::Struct => ValueTag::Struct,
+            ValueType::Plain => {
+                return Err(crate::LustError::RuntimeError {
+                    message: "a guard cannot expect Plain".into(),
+                });
+            }
         };
         let expected_discriminant = expected_tag.as_u8() as u32;
         let guard_return_value = (guard_index + 1) as i32;
@@ -42,6 +47,7 @@ impl JitCompiler {
                 ValueType::Array => GuardKind::IntType { register },
                 ValueType::Tuple => GuardKind::IntType { register },
                 ValueType::Struct => GuardKind::IntType { register },
+                ValueType::Plain => unreachable!("rejected above"),
             },
             fail_count: 0,
         })
@@ -476,7 +482,6 @@ impl JitCompiler {
         let value_size = mem::size_of::<Value>() as i32;
         let frame_value_count = callee_registers as i32;
         let frame_size = (frame_value_count * value_size + 15) & !15;
-        let metadata_size = INLINE_METADATA_SIZE as u32;
         // The receiver, then the arguments, into callee registers 0...
         let sources: Vec<u8> = receiver
             .into_iter()
@@ -518,10 +523,6 @@ impl JitCompiler {
         // regs, previous chain, alias mask, function, result register,
         // callee register, where the caller resumes if the frame is
         // materialized.
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; sub sp, sp, #metadata_size
-        );
         let site = self.retain_call_site(crate::vm::JitCallSite {
             value_count: frame_value_count as usize,
             alias_mask: alias_mask as usize,
@@ -533,8 +534,7 @@ impl JitCompiler {
         self.emit_mov_imm64(0, site as u64);
         dynasm!(self.ops
             ; .arch aarch64
-            ; str x19, [sp]
-            ; str x21, [sp, 8]
+            ; stp x19, x21, [sp, #-(INLINE_METADATA_SIZE)]!
             ; str x0, [sp, 16]
         );
 
@@ -690,6 +690,22 @@ impl JitCompiler {
     fn emit_drop_frame(&mut self, register_count: u8) {
         unsafe extern "C" {
             fn jit_drop_values_masked(values: *mut Value, len: usize, mask: u64);
+        }
+        // Only the registers that may own something here are released,
+        // inline: not the scalars, not the parameters a native caller
+        // aliased (the record's mask says which, but they own nothing
+        // either way — an unaliased one was copied as a scalar).
+        if register_count <= 64 {
+            for reg in 0..register_count {
+                if self.function_alias_params & (1u64 << reg) != 0
+                    || self.scalar_registers.contains_key(&reg)
+                {
+                    continue;
+                }
+                self.emit_reg_addr(11, reg);
+                self.emit_release_at_x11();
+            }
+            return;
         }
         dynasm!(self.ops
             ; .arch aarch64

@@ -14,6 +14,7 @@ impl JitCompiler {
             pending_scalar: None,
             trace_start_ip: 0,
             function_mode: false,
+            function_alias_params: 0,
             function_frame: (0, true),
             function_result: None,
             function_entry_table: 0,
@@ -110,6 +111,7 @@ impl JitCompiler {
     ) -> Result<CompiledTrace> {
         self.function_mode = true;
         self.function_frame = (register_count, trace.frame_may_own);
+        self.function_alias_params = trace.alias_params;
         self.function_result = result_type;
         self.function_entry_table = entry_table;
         self.function_labels.clear();
@@ -164,11 +166,11 @@ impl JitCompiler {
         trace_id: TraceId,
         hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
-        self.scalar_registers.clear();
+        self.scalar_registers = trace.entry_scalars.iter().copied().collect();
         self.trace_start_ip = trace.start_ip;
         self.current_fail_ip = None;
         self.fail_sites.clear();
-        let stack_size = Self::compute_stack_size(trace);
+        let stack_size = self.compute_stack_size(trace);
         let mut guards = Vec::new();
         let mut guard_index = 0i32;
         let exit_label = self.ops.new_dynamic_label();
@@ -1509,6 +1511,9 @@ impl JitCompiler {
                     Value::Bool(_) => Some(ValueType::Bool),
                     Value::Int(_) => Some(ValueType::Int),
                     Value::Float(_) => Some(ValueType::Float),
+                    // A function index or Nil: nothing to drop, no particular
+                    // type.
+                    Value::Function(_) | Value::Nil => Some(ValueType::Plain),
                     _ => None,
                 };
                 set(&mut self.scalar_registers, *dest, ty);
@@ -1649,11 +1654,17 @@ impl JitCompiler {
         }
     }
 
-    fn compute_stack_size(trace: &Trace) -> i32 {
+    fn compute_stack_size(&self, trace: &Trace) -> i32 {
         let specialized_slots = Self::count_specialized_slots(trace) as i32;
         let specialized_bytes =
             SPECIALIZED_STACK_BASE + (specialized_slots * SPECIALIZED_SLOT_SIZE);
-        let mut size = MIN_JIT_STACK_SIZE.max(specialized_bytes);
+        // Function code pays for its local area on every call, so it takes
+        // only what its specialized values need.
+        let mut size = if self.function_mode {
+            specialized_bytes
+        } else {
+            MIN_JIT_STACK_SIZE.max(specialized_bytes)
+        };
         let remainder = size % 16;
         if remainder != 8 {
             size += (8 - remainder + 16) % 16;
@@ -1842,6 +1853,11 @@ impl JitCompiler {
                 if let Some(ty @ (ValueType::Int | ValueType::Bool | ValueType::Float)) = ty {
                     self.scalar_registers.insert(arg_index as u8, *ty);
                 }
+            }
+            // The rest of the frame is still Nil: the first store into
+            // any of those registers has nothing to drop.
+            for reg in trace.arg_registers.len() as u8..trace.register_count {
+                self.scalar_registers.insert(reg, ValueType::Plain);
             }
 
             // Point r12 at the callee frame and link the record.

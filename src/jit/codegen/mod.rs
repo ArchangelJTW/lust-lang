@@ -69,6 +69,8 @@ pub struct JitCompiler {
     /// Function mode: (frame register count, may any register own a value
     /// at return) of the function being compiled.
     function_frame: (u8, bool),
+    /// Function code: parameters a native caller may alias (never dropped).
+    function_alias_params: u64,
     /// Function mode: the declared scalar return kind, if any. A native
     /// caller then takes the result from a register (see
     /// `compile_function_return`) instead of having it stored.
@@ -138,6 +140,8 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::LoadConst {
@@ -178,6 +182,8 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
             preamble: Vec::new(),
             ops: vec![TraceOp::Guard {
                 register: 0,
@@ -208,6 +214,8 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -343,6 +351,8 @@ mod tests {
                             start_ip: 0,
                             is_function: false,
                             frame_may_own: true,
+                            entry_scalars: Vec::new(),
+                            alias_params: 0,
                             preamble: vec![TraceOp::Guard {
                                 register: 2,
                                 expected_type: ValueType::Bool,
@@ -411,6 +421,8 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Lt {
@@ -484,6 +496,8 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -540,6 +554,8 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -601,6 +617,8 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
             preamble: Vec::new(),
             ops: vec![TraceOp::Div {
                 dest: 0,
@@ -634,6 +652,8 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Div {
@@ -684,6 +704,8 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Lt {

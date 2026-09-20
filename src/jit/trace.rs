@@ -53,6 +53,14 @@ pub struct Trace {
     /// Function code only: may some register hold an owned value when the
     /// function returns? If not, the frame needs no drop pass.
     pub frame_may_own: bool,
+    /// Function code only: what the registers hold on entry — the scalar
+    /// parameters by their declared types, everything else `Nil`.
+    pub entry_scalars: Vec<(Register, ValueType)>,
+    /// Function code only: the parameters a native caller may alias into
+    /// the frame (bit `i` for parameter `i`; see
+    /// `FunctionSig::can_alias_param`). They never own anything in a
+    /// native frame, so a return does not drop them.
+    pub alias_params: u64,
     /// Operations executed once at trace entry (unboxing, guards, etc.)
     pub preamble: Vec<TraceOp>,
     /// Operations in the trace loop body
@@ -482,6 +490,12 @@ pub enum ValueType {
     Array,
     Tuple,
     Struct,
+    /// A register that holds nothing owned — `Nil`, a `Bool`, an `Int` or
+    /// a `Float` — without saying which: a fresh frame's unwritten
+    /// registers, or one that holds different scalars on different paths.
+    /// Never recorded or guarded; the fact only tells the backend that a
+    /// store into the register has nothing to drop.
+    Plain,
 }
 
 impl TraceOp {
@@ -671,6 +685,8 @@ impl TraceRecorder {
                 start_ip,
                 is_function: false,
                 frame_may_own: true,
+                entry_scalars: Vec::new(),
+                alias_params: 0,
                 preamble: Vec::new(),
                 ops: Vec::new(),
                 postamble: Vec::new(),
@@ -1670,6 +1686,18 @@ impl TraceRecorder {
                     });
                 }
 
+                // A scalar source, once guarded, moves as a payload copy
+                // and a typed store instead of a runtime clone and drop.
+                if let Some(ty @ (ValueType::Int | ValueType::Float | ValueType::Bool)) =
+                    Self::get_value_type(&registers[src as usize])
+                    && !self.is_guarded(src)
+                {
+                    self.push_op(TraceOp::Guard {
+                        register: src,
+                        expected_type: ty,
+                    });
+                    self.mark_guarded(src);
+                }
                 self.push_op(TraceOp::Move { dest, src });
                 if let Some((specialized_id, layout)) = moved_specialization {
                     // `push_op` invalidates the destination first; alias it

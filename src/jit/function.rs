@@ -178,11 +178,14 @@ impl Env {
     /// Facts both environments agree on.
     fn merge(&self, other: &Env) -> Env {
         Env {
+            // Two scalars of different types still hold nothing owned.
             scalars: self
                 .scalars
                 .iter()
-                .filter(|(reg, ty)| other.scalars.get(*reg) == Some(*ty))
-                .map(|(reg, ty)| (*reg, *ty))
+                .filter_map(|(reg, ty)| {
+                    let other = other.scalars.get(reg)?;
+                    Some((*reg, if other == ty { *ty } else { ValueType::Plain }))
+                })
                 .collect(),
             functions: self
                 .functions
@@ -633,7 +636,9 @@ impl<'a> Translator<'a> {
                 && is_scalar(*kind)
             {
                 self.guard(*reg, *kind);
-            } else if sig.can_alias_param(index) && !self.env.scalars.contains_key(reg) {
+            } else if sig.can_alias_param(index)
+                && !self.env.scalars.get(reg).is_some_and(|ty| is_scalar(*ty))
+            {
                 // The callee only reads this parameter, and never returns
                 // it: pass the caller's value by aliasing rather than
                 // cloning and dropping it.
@@ -683,7 +688,8 @@ impl<'a> Translator<'a> {
                     Value::Function(idx) => Some(*idx),
                     _ => None,
                 };
-                if ty.is_none() && function.is_none() {
+                let plain = matches!(value, Value::Function(_) | Value::Nil);
+                if ty.is_none() && !plain {
                     self.frame_may_own = true;
                 }
                 // A function constant the register is already proven to
@@ -695,7 +701,10 @@ impl<'a> Translator<'a> {
                     return Some(());
                 }
                 self.ops.push(TraceOp::LoadConst { dest, value });
-                self.env.write(dest, ty);
+                // A function index or Nil is plain: nothing to drop when
+                // the register is written again.
+                self.env
+                    .write(dest, ty.or(plain.then_some(ValueType::Plain)));
                 if let Some(idx) = function {
                     self.env.functions.insert(dest, idx);
                 }
@@ -1233,6 +1242,13 @@ fn entry_env(sig: &FunctionSig, ctx: &Context) -> (Env, bool) {
             _ => {}
         }
     }
+    // Every other register is `Nil` on entry: the interpreter resets a
+    // frame before it copies the arguments in, and a native caller blanks
+    // the callee's frame the same way. The first store into such a register
+    // has nothing to drop.
+    for reg in sig.params.len()..usize::from(sig.register_count) {
+        env.scalars.insert(reg as u8, ValueType::Plain);
+    }
     (env, frame_may_own)
 }
 
@@ -1243,6 +1259,7 @@ struct Pass {
     /// The environment each back edge arrived with.
     back_edges: HashMap<usize, Env>,
     frame_may_own: bool,
+    entry_scalars: Vec<(Register, ValueType)>,
 }
 
 /// One translation pass with the given loop-header environments, or
@@ -1257,6 +1274,7 @@ fn translate_pass(
 ) -> Option<Pass> {
     let instructions = &function.chunk.instructions;
     let (env, frame_may_own) = entry_env(sig, ctx);
+    let entry_scalars = env.label_scalars();
     let mut t = Translator {
         function,
         sig,
@@ -1326,6 +1344,7 @@ fn translate_pass(
         label_envs,
         back_edges: t.back_edges,
         frame_may_own: t.frame_may_own,
+        entry_scalars,
     })
 }
 
@@ -1368,6 +1387,10 @@ pub fn translate(
                 start_ip: 0,
                 is_function: true,
                 frame_may_own: pass.frame_may_own,
+                entry_scalars: pass.entry_scalars,
+                alias_params: (0..sig.params.len().min(64))
+                    .filter(|index| sig.can_alias_param(*index))
+                    .fold(0, |mask, index| mask | (1u64 << index)),
                 preamble: Vec::new(),
                 ops: pass.ops,
                 postamble: Vec::new(),
@@ -1514,9 +1537,17 @@ mod tests {
                 _ => None,
             })
             .expect("loop header label");
+        // The counters stay Int; the two temporaries hold a Bool (the
+        // comparison) or nothing yet, so nothing owned either way.
         assert_eq!(
             header,
-            vec![(0, ValueType::Int), (1, ValueType::Int), (2, ValueType::Int)]
+            vec![
+                (0, ValueType::Int),
+                (1, ValueType::Int),
+                (2, ValueType::Int),
+                (3, ValueType::Plain),
+                (4, ValueType::Plain)
+            ]
         );
         assert!(
             trace
@@ -1554,7 +1585,17 @@ mod tests {
                 _ => None,
             })
             .expect("loop header label");
-        assert_eq!(header, vec![(0, ValueType::Int)]);
+        // x is an Int or a Float — nothing owned, no particular type; the
+        // comparison result and the unused register 3 likewise.
+        assert_eq!(
+            header,
+            vec![
+                (0, ValueType::Int),
+                (1, ValueType::Plain),
+                (2, ValueType::Plain),
+                (3, ValueType::Plain)
+            ]
+        );
         assert!(trace.ops.iter().any(|op| matches!(
             op,
             TraceOp::Guard {

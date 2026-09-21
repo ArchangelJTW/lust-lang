@@ -1003,6 +1003,55 @@ impl Gen {
         self.in_func = true;
         self.iter_scale = 1;
         self.cur_work = 0;
+        let mut inner = vec![Stmt::Assign {
+            name: s.clone(),
+            expr: Expr::Bin(
+                Box::new(Expr::Var(s.clone())),
+                BinOp::Add,
+                Box::new(Expr::Call(
+                    name.clone(),
+                    vec![
+                        Expr::Var(q.clone()),
+                        Expr::Bin(
+                            Box::new(Expr::Var(d.clone())),
+                            BinOp::Sub,
+                            Box::new(Expr::Int(1)),
+                        ),
+                    ],
+                )),
+            ),
+        }];
+        // Sometimes the borrowed link is copied into a local — a clone
+        // the local owns — twice, so the second copy has to release the
+        // first, and read through.
+        if self.rng.chance(0.5) {
+            let h = self.fresh("h");
+            inner.push(Stmt::Local {
+                name: h.clone(),
+                ty: Ty::Struct,
+                init: Expr::Var(q.clone()),
+            });
+            inner.push(Stmt::Assign {
+                name: s.clone(),
+                expr: Expr::Bin(
+                    Box::new(Expr::Var(s.clone())),
+                    BinOp::Add,
+                    Box::new(Expr::Field(h.clone(), "a")),
+                ),
+            });
+            inner.push(Stmt::Assign {
+                name: h.clone(),
+                expr: Expr::Var(q.clone()),
+            });
+            inner.push(Stmt::Assign {
+                name: s.clone(),
+                expr: Expr::Bin(
+                    Box::new(Expr::Var(s.clone())),
+                    BinOp::Add,
+                    Box::new(Expr::Field(h, "a")),
+                ),
+            });
+        }
         let body = vec![
             Stmt::Local {
                 name: s.clone(),
@@ -1016,24 +1065,7 @@ impl Gen {
             Stmt::IfIsSomeStruct {
                 opt: format!("{p}.next"),
                 var: q.clone(),
-                body: vec![Stmt::Assign {
-                    name: s.clone(),
-                    expr: Expr::Bin(
-                        Box::new(Expr::Var(s.clone())),
-                        BinOp::Add,
-                        Box::new(Expr::Call(
-                            name.clone(),
-                            vec![
-                                Expr::Var(q.clone()),
-                                Expr::Bin(
-                                    Box::new(Expr::Var(d.clone())),
-                                    BinOp::Sub,
-                                    Box::new(Expr::Int(1)),
-                                ),
-                            ],
-                        )),
-                    ),
-                }],
+                body: inner,
             },
         ];
         self.in_func = false;

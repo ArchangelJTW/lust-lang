@@ -268,8 +268,13 @@ backend change:
   closures, arrays, maps, structs, options, strings, pair returns), runs each
   both ways in-process and reports every disagreement with a shrunk
   reproducer. Helpers take and return structs (often the parameter
-  itself) and `Option<P>`, and natives are passed around as function
-  values. A debug build of the fuzzer (`cargo build -p lust-fuzz`, run
+  itself) and `Option<P>`, walk a `next` chain of structs (which a
+  compiled helper borrows link by link), and natives are passed around
+  as function values. The fuzzer's allocator counts each thread's live
+  allocations, so a program that leaves any behind after its VM is
+  dropped — a reference count never given back, which the outputs would
+  never show — is a finding too (shrunk like a disagreement; a first
+  run's lazy initialization is ruled out by running the program again). A debug build of the fuzzer (`cargo build -p lust-fuzz`, run
   with `LUST_JIT_QUIET=1`, and `MallocScribble=1` on macOS) adds overflow
   checks and debug assertions and makes freed memory visible, at about a
   sixth of the speed; `lust-fuzz one --seed S` prints a

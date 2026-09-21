@@ -310,6 +310,7 @@ impl VM {
                                         crate::jit::GuardKind::Truthy { .. }
                                             | crate::jit::GuardKind::Falsy { .. }
                                             | crate::jit::GuardKind::NestedLoop { .. }
+                                            | crate::jit::GuardKind::Plain { .. }
                                     )
                                 });
                             if !reusable_exit {

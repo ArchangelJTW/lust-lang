@@ -117,6 +117,13 @@ impl JitCompiler {
         {
             return pin.reg;
         }
+        // Still in x0 from the previous op's store.
+        if self.hot_x0_in == Some(vm_reg) {
+            if scratch != 0 {
+                dynasm!(self.ops ; .arch aarch64 ; mov X(scratch), x0);
+            }
+            return scratch;
+        }
         self.load_payload(scratch, vm_reg);
         scratch
     }
@@ -128,12 +135,23 @@ impl JitCompiler {
         {
             return pin.reg;
         }
+        if self.hot_d0_in == Some(vm_reg) {
+            if scratch != 0 {
+                dynasm!(self.ops ; .arch aarch64 ; fmov D(scratch), d0);
+            }
+            return scratch;
+        }
         self.load_payload_f(scratch, vm_reg);
         scratch
     }
 
     /// D register holding registers[vm_reg]'s int payload converted to float.
     pub(super) fn operand_int_as_d(&mut self, vm_reg: u8, scratch: u8) -> u8 {
+        if self.hot_x0_in == Some(vm_reg) {
+            self.clobber_d(scratch);
+            dynasm!(self.ops ; .arch aarch64 ; scvtf D(scratch), x0);
+            return scratch;
+        }
         self.load_payload_int_as_f(scratch, vm_reg);
         scratch
     }
@@ -172,7 +190,21 @@ impl JitCompiler {
     // ── Immediates ────────────────────────────────────────────────────────
 
     /// X(reg) = value, via movz + movk (skipping zero halves after the first).
+    /// Code is about to write X(reg): what x0 held for this op is gone.
+    fn clobber_x(&mut self, reg: u8) {
+        if reg == 0 {
+            self.hot_x0_in = None;
+        }
+    }
+
+    fn clobber_d(&mut self, reg: u8) {
+        if reg == 0 {
+            self.hot_d0_in = None;
+        }
+    }
+
     pub(super) fn emit_mov_imm64(&mut self, reg: u8, value: u64) {
+        self.clobber_x(reg);
         let h0 = (value & 0xffff) as u32;
         let h1 = ((value >> 16) & 0xffff) as u32;
         let h2 = ((value >> 32) & 0xffff) as u32;
@@ -191,6 +223,7 @@ impl JitCompiler {
 
     /// W(reg) = value (zero-extended into the full X register).
     pub(super) fn emit_mov_imm32(&mut self, reg: u8, value: u32) {
+        self.clobber_x(reg);
         let lo = value & 0xffff;
         let hi = value >> 16;
         dynasm!(self.ops ; .arch aarch64 ; movz W(reg), #lo);
@@ -201,6 +234,7 @@ impl JitCompiler {
 
     /// W(reg) = value as a 32-bit two's complement immediate.
     pub(super) fn emit_mov_imm_i32(&mut self, reg: u8, value: i32) {
+        self.clobber_x(reg);
         self.emit_mov_imm32(reg, value as u32);
     }
 
@@ -208,6 +242,7 @@ impl JitCompiler {
     /// immediate does not fit the 12-bit add encoding. `dst`/`src` may be
     /// the same register but must not be x12.
     pub(super) fn emit_add_imm(&mut self, dst: u8, src: u8, imm: i32) {
+        self.clobber_x(dst);
         debug_assert!(imm >= 0);
         debug_assert!(dst != 12 && src != 12);
         if imm == 0 {
@@ -257,6 +292,7 @@ impl JitCompiler {
 
     /// X(dst) = &registers[vm_reg]
     pub(super) fn emit_reg_addr(&mut self, dst: u8, vm_reg: u8) {
+        self.clobber_x(dst);
         self.emit_add_imm(dst, 19, reg_offset(vm_reg));
     }
 
@@ -264,6 +300,7 @@ impl JitCompiler {
     /// the tag is a compile-time constant (reads only happen after the type
     /// is proven; stores use `load_tag_from_memory`).
     pub(super) fn load_tag(&mut self, w: u8, vm_reg: u8) {
+        self.clobber_x(w);
         if let Some(pin) = self.active_pin(vm_reg) {
             let tag = Self::pin_tag(&pin) as u32;
             dynasm!(self.ops ; .arch aarch64 ; movz W(w), #tag);
@@ -275,6 +312,7 @@ impl JitCompiler {
     /// W(w) = the discriminant byte actually in memory, pinned or not. The
     /// first write to a write-through pin may replace an owned value.
     pub(super) fn load_tag_from_memory(&mut self, w: u8, vm_reg: u8) {
+        self.clobber_x(w);
         let offset = reg_offset(vm_reg);
         if offset <= IMM12_MAX {
             let offset = offset as u32;
@@ -287,6 +325,7 @@ impl JitCompiler {
 
     /// W(w) = low payload byte of registers[vm_reg] (bool payload)
     pub(super) fn load_bool_payload(&mut self, w: u8, vm_reg: u8) {
+        self.clobber_x(w);
         if let Some(pin) = self.active_pin(vm_reg) {
             match pin.ty {
                 ValueType::Float => dynasm!(self.ops ; .arch aarch64 ; fmov W(w), S(pin.reg)),
@@ -320,6 +359,7 @@ impl JitCompiler {
 
     /// X(x) = 64-bit payload of registers[vm_reg]
     pub(super) fn load_payload(&mut self, x: u8, vm_reg: u8) {
+        self.clobber_x(x);
         if let Some(pin) = self.active_pin(vm_reg) {
             match pin.ty {
                 ValueType::Float => dynasm!(self.ops ; .arch aarch64 ; fmov X(x), D(pin.reg)),
@@ -339,6 +379,7 @@ impl JitCompiler {
 
     /// D(d) = float payload of registers[vm_reg]
     pub(super) fn load_payload_f(&mut self, d: u8, vm_reg: u8) {
+        self.clobber_d(d);
         if let Some(pin) = self.active_pin(vm_reg) {
             match pin.ty {
                 ValueType::Float => dynasm!(self.ops ; .arch aarch64 ; fmov D(d), D(pin.reg)),
@@ -352,6 +393,7 @@ impl JitCompiler {
 
     /// D(d) = float(int payload of registers[vm_reg]); clobbers x11
     pub(super) fn load_payload_int_as_f(&mut self, d: u8, vm_reg: u8) {
+        self.clobber_d(d);
         if let Some(pin) = self.active_pin(vm_reg)
             && pin.ty != ValueType::Float
         {
@@ -372,6 +414,8 @@ impl JitCompiler {
 
     /// Call an `extern "C"` helper with arguments already in x0..x7.
     pub(super) fn emit_call(&mut self, function: *const ()) {
+        self.hot_x0_in = None;
+        self.hot_d0_in = None;
         self.emit_mov_imm64(16, function as usize as u64);
         dynasm!(self.ops ; .arch aarch64 ; blr x16);
     }
@@ -439,13 +483,16 @@ impl JitCompiler {
         }
         if self.scalar_registers.get(&vm_reg) == Some(&stored_type) {
             self.store_payload(vm_reg, 0);
+            self.hot_x0 = Some(vm_reg);
             return;
         }
         if self.scalar_registers.contains_key(&vm_reg) {
             self.store_tag_imm(vm_reg, discriminant);
             self.store_payload(vm_reg, 0);
+            self.hot_x0 = Some(vm_reg);
             return;
         }
+        // The slow path below is a call: x0 is not the payload afterwards.
         let scalar_max_tag = ValueTag::Float.as_u8() as u32;
         let replace: *const () = match discriminant {
             1 => {
@@ -499,12 +546,14 @@ impl JitCompiler {
         if self.scalar_registers.get(&vm_reg) == Some(&ValueType::Float) {
             let offset = (reg_offset(vm_reg) + 8) as u32;
             dynasm!(self.ops ; .arch aarch64 ; str d0, [x19, #offset]);
+            self.hot_d0 = Some(vm_reg);
             return;
         }
         if self.scalar_registers.contains_key(&vm_reg) {
             self.store_tag_imm(vm_reg, float_tag);
             let offset = (reg_offset(vm_reg) + 8) as u32;
             dynasm!(self.ops ; .arch aarch64 ; str d0, [x19, #offset]);
+            self.hot_d0 = Some(vm_reg);
             return;
         }
         let scalar_max_tag = ValueTag::Float.as_u8() as u32;

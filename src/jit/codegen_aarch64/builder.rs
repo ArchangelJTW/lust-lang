@@ -15,6 +15,10 @@ impl JitCompiler {
             scalar_registers: HashMap::new(),
             pins: HashMap::new(),
             pin_active: false,
+            hot_x0: None,
+            hot_d0: None,
+            hot_x0_in: None,
+            hot_d0_in: None,
             dirty_pins: Vec::new(),
             trace_start_ip: 0,
             function_mode: false,
@@ -592,6 +596,9 @@ impl JitCompiler {
                 self.current_fail_ip = Some(*ip);
                 continue;
             }
+            // What the previous op left in x0 / d0 is this op's to use.
+            self.hot_x0_in = self.hot_x0.take();
+            self.hot_d0_in = self.hot_d0.take();
             if self.pin_active && pins::op_touches_register_memory(op) {
                 self.flush_dirty_pins();
             }
@@ -647,6 +654,29 @@ impl JitCompiler {
                 {
                     self.update_scalar_registers(next);
                     skip_through = Some(next_index);
+                    continue;
+                }
+                // A constant that stays live is still stored, but the
+                // arithmetic takes it as an immediate rather than loading
+                // it back.
+                if let TraceOp::LoadConst {
+                    dest: constant_register,
+                    value,
+                } = op
+                    && self.scalar_registers.contains_key(constant_register)
+                    && Self::folds_as_immediate(op, next)
+                {
+                    self.compile_load_const(*constant_register, value)?;
+                    self.update_scalar_registers(op);
+                    // The constant's store is what x0 / d0 now hold.
+                    self.hot_x0_in = self.hot_x0.take();
+                    self.hot_d0_in = self.hot_d0.take();
+                    if self.compile_integer_add_immediate(op, next)?
+                        || self.compile_float_op_immediate(op, next)?
+                    {
+                        self.update_scalar_registers(next);
+                        skip_through = Some(next_index);
+                    }
                     continue;
                 }
             }
@@ -1163,6 +1193,9 @@ impl JitCompiler {
                     let label = self.function_label(*id);
                     dynasm!(self.ops ; .arch aarch64 ; => label);
                     self.scalar_registers = scalars.iter().copied().collect();
+                    // Control also arrives here by jump.
+                    self.hot_x0_in = None;
+                    self.hot_d0_in = None;
                 }
 
                 TraceOp::Jump { label } => {
@@ -1237,6 +1270,40 @@ impl JitCompiler {
             ; fail_island_skip:
         );
         self.last_fail_island = self.ops.offset().0;
+    }
+
+    /// Is `arithmetic` an `Add` (or a float op) on the constant `load`
+    /// produces, written elsewhere than the constant's register? Mirrors
+    /// what `compile_integer_add_immediate` and
+    /// `compile_float_op_immediate` accept, without emitting anything.
+    fn folds_as_immediate(load: &TraceOp, arithmetic: &TraceOp) -> bool {
+        let TraceOp::LoadConst {
+            dest: constant_register,
+            value,
+        } = load
+        else {
+            return false;
+        };
+        match (value, arithmetic) {
+            (
+                Value::Int(_),
+                TraceOp::Add {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type: ValueType::Int,
+                    rhs_type: ValueType::Int,
+                },
+            ) => (lhs == constant_register) != (rhs == constant_register) && dest != constant_register,
+            (
+                Value::Float(_),
+                TraceOp::Add { dest, lhs, rhs, .. }
+                | TraceOp::Sub { dest, lhs, rhs, .. }
+                | TraceOp::Mul { dest, lhs, rhs, .. }
+                | TraceOp::Div { dest, lhs, rhs, .. },
+            ) => (lhs == constant_register) != (rhs == constant_register) && dest != constant_register,
+            _ => false,
+        }
     }
 
     fn compile_integer_add_immediate(
@@ -1610,7 +1677,11 @@ impl JitCompiler {
             return;
         }
         let scalar_type = |ty: ValueType| {
-            matches!(ty, ValueType::Bool | ValueType::Int | ValueType::Float).then_some(ty)
+            matches!(
+                ty,
+                ValueType::Bool | ValueType::Int | ValueType::Float | ValueType::Plain
+            )
+            .then_some(ty)
         };
         let set = |registers: &mut HashMap<u8, ValueType>, register, ty| {
             if let Some(ty) = ty {
@@ -1986,7 +2057,16 @@ impl JitCompiler {
             self.emit_add_imm(21, 19, frame_size);
 
             let call_ip = self.current_fail_ip;
+            // The callee's registers are numbered from its own frame:
+            // nothing left in x0 / d0 carries across the frame switch,
+            // either way.
+            self.hot_x0 = None;
+            self.hot_d0 = None;
             let inline_result = self.compile_ops(&trace.body, guard_index, guards);
+            self.hot_x0 = None;
+            self.hot_d0 = None;
+            self.hot_x0_in = None;
+            self.hot_d0_in = None;
             inline_result?;
             // A failed result move exits from the callee frame at its last
             // instruction; everything after the frame is popped is the

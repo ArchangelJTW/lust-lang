@@ -271,7 +271,10 @@ pub unsafe extern "C" fn jit_run_nested_loop(
             };
             let reusable_exit = matches!(
                 kind,
-                GuardKind::Truthy { .. } | GuardKind::Falsy { .. } | GuardKind::NestedLoop { .. }
+                GuardKind::Truthy { .. }
+                    | GuardKind::Falsy { .. }
+                    | GuardKind::NestedLoop { .. }
+                    | GuardKind::Plain { .. }
             );
             if !reusable_exit {
                 vm.jit.evict_root_trace(function_idx, loop_start_ip);

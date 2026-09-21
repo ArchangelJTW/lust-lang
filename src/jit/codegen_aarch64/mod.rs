@@ -117,6 +117,14 @@ pub struct JitCompiler {
     /// Pins apply only while compiling the loop body (not the preamble,
     /// postamble, or inline-call bodies, which address other storage).
     pin_active: bool,
+    /// The register whose int/bool payload the last store left in x0, and
+    /// the one whose float payload it left in d0: the next op may read
+    /// them there instead of from memory (`hot_x0_in` / `hot_d0_in` are
+    /// the values carried into the op being compiled).
+    hot_x0: Option<u8>,
+    hot_d0: Option<u8>,
+    hot_x0_in: Option<u8>,
+    hot_d0_in: Option<u8>,
     /// Carried pins whose machine value may be newer than memory.
     dirty_pins: Vec<u8>,
     /// Loop-header ip of the trace being compiled: where a guard that fails

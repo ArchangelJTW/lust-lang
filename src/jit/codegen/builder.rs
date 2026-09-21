@@ -477,6 +477,33 @@ impl JitCompiler {
                     skip_through = Some(next_index);
                     continue;
                 }
+                // A constant that stays live is still stored, but the add
+                // takes it as an immediate rather than loading it back.
+                if let TraceOp::LoadConst {
+                    dest: constant_register,
+                    value: value @ Value::Int(_),
+                } = op
+                    && self.scalar_registers.contains_key(constant_register)
+                    && matches!(
+                        next,
+                        TraceOp::Add {
+                            dest,
+                            lhs,
+                            rhs,
+                            lhs_type: ValueType::Int,
+                            rhs_type: ValueType::Int,
+                        } if (lhs == constant_register) != (rhs == constant_register)
+                            && dest != constant_register
+                    )
+                {
+                    self.compile_load_const(*constant_register, value)?;
+                    self.update_scalar_registers(op);
+                    if self.compile_integer_add_immediate(op, next)? {
+                        self.update_scalar_registers(next);
+                        skip_through = Some(next_index);
+                    }
+                    continue;
+                }
             }
             match op {
                 TraceOp::At { .. } => unreachable!("markers are consumed above"),
@@ -1494,7 +1521,11 @@ impl JitCompiler {
             return;
         }
         let scalar_type = |ty: ValueType| {
-            matches!(ty, ValueType::Bool | ValueType::Int | ValueType::Float).then_some(ty)
+            matches!(
+                ty,
+                ValueType::Bool | ValueType::Int | ValueType::Float | ValueType::Plain
+            )
+            .then_some(ty)
         };
         let set = |registers: &mut HashMap<u8, ValueType>, register, ty| {
             if let Some(ty) = ty {

@@ -233,7 +233,16 @@ of the size, and a struct or enum clone is one count on the value's own
 allocation. `tree` went 126 → 112 (its `sum` alone 0.18 → 0.14 s for
 200 passes), `methods` 70 → 61, `array` 58 → 49, and the interpreter
 gained 5–12% across the suite (`methods` 1330 → 1166, `tree` 748 →
-671). `array` was
+671). A round of codegen cleanups followed: a loop's type guards on
+registers it never writes with another type move to the trace entry
+(checked once, not per iteration), registers the loop overwrites with
+scalars before reading them get an entry check that they hold nothing
+owned (after which every store into them skips its tag check), a
+constant feeding an add is stored and used as an immediate rather than
+stored and reloaded, and the value a store leaves in x0 or d0 is what
+the next op reads — a comparison feeding a branch, a result feeding a
+return — instead of a reload (aarch64). `calls` 62 → 60, `methods` 61 →
+58, `tree` 112 → 107. `array` was
 204 ms for a reason that had nothing to do with its element loop: when
 the outer `pass` loop got hot and was recorded, the recorder skipped the
 inner loop's iterations (a `NestedLoopCall` runs them through the inner

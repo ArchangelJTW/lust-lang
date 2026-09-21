@@ -241,6 +241,13 @@ pub enum GuardKind {
     Falsy {
         register: u8,
     },
+    /// The register holds nothing owned at trace entry (a preamble guard
+    /// the optimizer adds for a register the loop overwrites with a
+    /// scalar). Failing it means one interpreted iteration writes the
+    /// scalar; the trace stays.
+    Plain {
+        register: u8,
+    },
     ArrayBoundsCheck {
         array_register: u8,
         index_register: u8,

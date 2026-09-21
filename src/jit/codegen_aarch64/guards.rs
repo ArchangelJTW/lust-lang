@@ -7,6 +7,37 @@ impl JitCompiler {
         expected_type: ValueType,
         guard_index: usize,
     ) -> Result<Guard> {
+        let guard_return_value = (guard_index + 1) as i32;
+        // A guard is the proof of a register's type; it must look at memory
+        // even when the register is pinned.
+        self.load_tag_from_memory(0, register);
+        if expected_type == ValueType::Plain {
+            // Nothing owned: a scalar, a function index or a task handle.
+            let scalar_max_tag = ValueTag::Float.as_u8() as u32;
+            let plain_tags = jit::layout::ownership_layout()
+                .map(|own| own.plain_tags.to_vec())
+                .ok_or_else(|| crate::LustError::RuntimeError {
+                    message: "a Plain guard needs the measured layout".into(),
+                })?;
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #scalar_max_tag
+                ; b.ls >guard_ok
+            );
+            for tag in plain_tags {
+                if u32::from(tag) > scalar_max_tag {
+                    dynasm!(self.ops ; .arch aarch64 ; cmp w0, #tag as u32 ; b.eq >guard_ok);
+                }
+            }
+            self.emit_guard_exit(guard_return_value);
+            dynasm!(self.ops ; .arch aarch64 ; guard_ok:);
+            return Ok(Guard {
+                index: guard_index,
+                bailout_ip: self.guard_bailout_ip(),
+                kind: GuardKind::Plain { register },
+                fail_count: 0,
+            });
+        }
         let expected_tag = match expected_type {
             ValueType::Bool => ValueTag::Bool,
             ValueType::Int => ValueTag::Int,
@@ -15,17 +46,9 @@ impl JitCompiler {
             ValueType::Array => ValueTag::Array,
             ValueType::Tuple => ValueTag::Tuple,
             ValueType::Struct => ValueTag::Struct,
-            ValueType::Plain => {
-                return Err(crate::LustError::RuntimeError {
-                    message: "a guard cannot expect Plain".into(),
-                });
-            }
+            ValueType::Plain => unreachable!("handled above"),
         };
         let expected_discriminant = expected_tag.as_u8() as u32;
-        let guard_return_value = (guard_index + 1) as i32;
-        // A guard is the proof of a register's type; it must look at memory
-        // even when the register is pinned.
-        self.load_tag_from_memory(0, register);
         dynasm!(self.ops
             ; .arch aarch64
             ; cmp w0, #expected_discriminant
@@ -47,7 +70,7 @@ impl JitCompiler {
                 ValueType::Array => GuardKind::IntType { register },
                 ValueType::Tuple => GuardKind::IntType { register },
                 ValueType::Struct => GuardKind::IntType { register },
-                ValueType::Plain => unreachable!("rejected above"),
+                ValueType::Plain => unreachable!("handled above"),
             },
             fail_count: 0,
         })
@@ -372,7 +395,11 @@ impl JitCompiler {
         unsafe extern "C" {
             fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
         }
-        if self.scalar_registers.get(&condition_register) == Some(&ValueType::Bool) {
+        if self.hot_x0_in == Some(condition_register)
+            && self.scalar_registers.get(&condition_register) == Some(&ValueType::Bool)
+        {
+            // Still in w0 (as 0 or 1) from the store the previous op made.
+        } else if self.scalar_registers.get(&condition_register) == Some(&ValueType::Bool) {
             self.load_bool_payload(0, condition_register);
         } else {
             self.load_tag(0, condition_register);
@@ -436,7 +463,11 @@ impl JitCompiler {
     /// `expect_truthy`.
     pub(super) fn compile_branch_if(&mut self, register: u8, expect_truthy: bool, label: usize) {
         let label = self.function_label(label);
-        if self.scalar_registers.get(&register) == Some(&ValueType::Bool) {
+        if self.hot_x0_in == Some(register)
+            && self.scalar_registers.get(&register) == Some(&ValueType::Bool)
+        {
+            // Still in w0 (as 0 or 1) from the store the previous op made.
+        } else if self.scalar_registers.get(&register) == Some(&ValueType::Bool) {
             // Only the low byte of a Bool's payload is defined.
             self.load_bool_payload(0, register);
         } else {
@@ -750,10 +781,25 @@ impl JitCompiler {
             // A declared scalar result goes back in x1 (its payload bits;
             // the translator's guard before the `Return` proved the type)
             // and the caller stores it: no store here, no tag to check.
+            // The frame drop is a call, after which the payload must be
+            // reloaded; otherwise it may still sit in x0 / d0 from the
+            // previous op's store.
+            let still_in_register = !may_own
+                && if ty == ValueType::Float {
+                    self.hot_d0_in == Some(reg)
+                } else {
+                    self.hot_x0_in == Some(reg)
+                };
             if may_own {
                 self.emit_drop_frame(register_count);
             }
-            if ty == ValueType::Bool {
+            if still_in_register {
+                if ty == ValueType::Float {
+                    dynasm!(self.ops ; .arch aarch64 ; fmov x1, d0);
+                } else {
+                    dynasm!(self.ops ; .arch aarch64 ; mov x1, x0);
+                }
+            } else if ty == ValueType::Bool {
                 self.load_bool_payload(1, reg);
             } else {
                 self.load_payload(1, reg);

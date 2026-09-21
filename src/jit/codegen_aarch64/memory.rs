@@ -10,6 +10,7 @@ impl JitCompiler {
 
             Value::Float(f) => {
                 self.emit_mov_imm64(0, f.to_bits());
+                self.hot_d0_in = None;
                 dynasm!(self.ops ; .arch aarch64 ; fmov d0, x0);
                 self.store_d0_as_float(dest);
                 Ok(())

@@ -8,6 +8,35 @@ impl JitCompiler {
         guard_index: usize,
     ) -> Result<Guard> {
         let offset = (register as i32) * (mem::size_of::<Value>() as i32);
+        let guard_return_value = (guard_index + 1) as i32;
+        if expected_type == ValueType::Plain {
+            // Nothing owned: a scalar, a function index or a task handle.
+            let scalar_max_tag = ValueTag::Float.as_u8() as i8;
+            let plain_tags = jit::layout::ownership_layout()
+                .map(|own| own.plain_tags.to_vec())
+                .ok_or_else(|| crate::LustError::RuntimeError {
+                    message: "a Plain guard needs the measured layout".into(),
+                })?;
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov al, [r12 + offset]
+                ; cmp al, BYTE scalar_max_tag
+                ; jbe >guard_ok
+            );
+            for tag in plain_tags {
+                if tag as i8 > scalar_max_tag {
+                    dynasm!(self.ops ; .arch x64 ; cmp al, BYTE tag as i8 ; je >guard_ok);
+                }
+            }
+            self.emit_guard_exit(guard_return_value);
+            dynasm!(self.ops ; .arch x64 ; guard_ok:);
+            return Ok(Guard {
+                index: guard_index,
+                bailout_ip: self.guard_bailout_ip(),
+                kind: GuardKind::Plain { register },
+                fail_count: 0,
+            });
+        }
         let expected_tag = match expected_type {
             ValueType::Bool => ValueTag::Bool,
             ValueType::Int => ValueTag::Int,
@@ -16,14 +45,9 @@ impl JitCompiler {
             ValueType::Array => ValueTag::Array,
             ValueType::Tuple => ValueTag::Tuple,
             ValueType::Struct => ValueTag::Struct,
-            ValueType::Plain => {
-                return Err(crate::LustError::RuntimeError {
-                    message: "a guard cannot expect Plain".into(),
-                });
-            }
+            ValueType::Plain => unreachable!("handled above"),
         };
         let expected_discriminant = expected_tag.as_u8() as i8;
-        let guard_return_value = (guard_index + 1) as i32;
         dynasm!(self.ops
             ; .arch x64
             ; mov al, [r12 + offset]
@@ -48,7 +72,7 @@ impl JitCompiler {
                 ValueType::Array => GuardKind::IntType { register },
                 ValueType::Tuple => GuardKind::IntType { register },
                 ValueType::Struct => GuardKind::IntType { register },
-                ValueType::Plain => unreachable!("rejected above"),
+                ValueType::Plain => unreachable!("handled above"),
             },
             fail_count: 0,
         })

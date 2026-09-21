@@ -21,6 +21,7 @@ impl TraceOptimizer {
         self.fuse_try_cast_patterns(trace);
         self.hoist_constants(trace);
         self.unroll_loop(trace, crate::jit::UNROLL_FACTOR);
+        self.hoist_entry_guards(trace);
         self.eliminate_redundant_type_guards(trace);
         self.coalesce_registers(trace);
         let optimized_ops = trace.ops.len();
@@ -350,6 +351,368 @@ impl TraceOptimizer {
             | TraceOp::InlineCall { dest, .. } => Some(*dest),
             TraceOp::ArrayIndexOk { .. } => None,
             _ => None,
+        }
+    }
+
+    /// The type of the value `op` writes to its destination, when the op
+    /// itself says so (its annotations, not the environment).
+    fn annotated_write_type(op: &TraceOp) -> Option<crate::jit::trace::ValueType> {
+        use crate::jit::trace::ValueType;
+        match op {
+            TraceOp::LoadConst { value, .. } => match value {
+                Value::Bool(_) => Some(ValueType::Bool),
+                Value::Int(_) => Some(ValueType::Int),
+                Value::Float(_) => Some(ValueType::Float),
+                // A function index or Nil: nothing owned, no particular type.
+                Value::Function(_) | Value::Nil => Some(ValueType::Plain),
+                _ => None,
+            },
+            TraceOp::Add {
+                lhs_type, rhs_type, ..
+            }
+            | TraceOp::Sub {
+                lhs_type, rhs_type, ..
+            }
+            | TraceOp::Mul {
+                lhs_type, rhs_type, ..
+            }
+            | TraceOp::Div {
+                lhs_type, rhs_type, ..
+            } => match (lhs_type, rhs_type) {
+                (ValueType::Int, ValueType::Int) => Some(ValueType::Int),
+                (ValueType::Int | ValueType::Float, ValueType::Int | ValueType::Float) => {
+                    Some(ValueType::Float)
+                }
+                _ => None,
+            },
+            TraceOp::Mod {
+                lhs_type, rhs_type, ..
+            } => match (lhs_type, rhs_type) {
+                (ValueType::Int, ValueType::Int) => Some(ValueType::Int),
+                _ => None,
+            },
+            TraceOp::Eq { .. }
+            | TraceOp::Ne { .. }
+            | TraceOp::Lt { .. }
+            | TraceOp::Le { .. }
+            | TraceOp::Gt { .. }
+            | TraceOp::Ge { .. }
+            | TraceOp::Not { .. }
+            | TraceOp::IsEnumVariant { .. }
+            | TraceOp::TypeIs { .. } => Some(ValueType::Bool),
+            TraceOp::ArrayLen { .. } => Some(ValueType::Int),
+            TraceOp::CallDirect { result_type, .. } => *result_type,
+            TraceOp::InlineCall { trace, .. } => Self::inline_result_type(trace),
+            _ => None,
+        }
+    }
+
+    /// The type an inlined call's result has when its body proves it:
+    /// what the body's guards and typed writes say about the register it
+    /// returns.
+    fn inline_result_type(
+        trace: &crate::jit::trace::InlineTrace,
+    ) -> Option<crate::jit::trace::ValueType> {
+        let return_register = trace.return_register?;
+        let mut known: HashMap<Register, crate::jit::trace::ValueType> = HashMap::new();
+        for op in &trace.body {
+            if let TraceOp::Guard {
+                register,
+                expected_type,
+            } = op
+            {
+                known.insert(*register, *expected_type);
+                continue;
+            }
+            let mut targets = Self::other_writes(op);
+            if let Some(dest) = Self::dest_of(op) {
+                targets.push(dest);
+            }
+            let ty = match op {
+                TraceOp::Move { src, .. } => known.get(src).copied(),
+                _ => Self::annotated_write_type(op),
+            };
+            for register in targets {
+                match ty {
+                    Some(ty) => {
+                        known.insert(register, ty);
+                    }
+                    None => {
+                        known.remove(&register);
+                    }
+                }
+            }
+        }
+        known.get(&return_register).copied()
+    }
+
+    /// Every register `op` may write, beyond `dest_of`.
+    fn other_writes(op: &TraceOp) -> Vec<Register> {
+        match op {
+            TraceOp::ArrayIndexOk {
+                value_dest,
+                condition_dest,
+                ..
+            } => vec![*value_dest, *condition_dest],
+            TraceOp::Rebox { dest_reg, .. } => vec![*dest_reg],
+            TraceOp::LoadConst { dest, .. } => vec![*dest],
+            TraceOp::Unbox { source_reg, .. } => vec![*source_reg],
+            TraceOp::CallDirect { dest, .. } => vec![*dest],
+            TraceOp::SpecializedOp { operands, .. } => operands
+                .iter()
+                .filter_map(|operand| match operand {
+                    crate::jit::trace::Operand::Register(register) => Some(*register),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// A type guard the loop re-checks every iteration on a register it
+    /// never writes with another type is checked once, at entry: it moves
+    /// to the preamble, and the body's copy (now redundant) goes. Only a
+    /// guard that comes before any write of its register moves, so entry
+    /// is not held to a type the loop would have established itself.
+    fn hoist_entry_guards(&mut self, trace: &mut Trace) {
+        // The inner loop may write any register.
+        if trace
+            .ops
+            .iter()
+            .any(|op| matches!(op, TraceOp::NestedLoopCall { .. }))
+        {
+            return;
+        }
+        // The type of each write, with a running environment so a `Move`
+        // of a guarded or typed register counts as a typed write.
+        let mut writes: HashMap<Register, Vec<Option<crate::jit::trace::ValueType>>> = HashMap::new();
+        let mut known: HashMap<Register, crate::jit::trace::ValueType> = HashMap::new();
+        for op in &trace.ops {
+            if let TraceOp::Guard {
+                register,
+                expected_type,
+            } = op
+            {
+                known.insert(*register, *expected_type);
+                continue;
+            }
+            let ty = match op {
+                TraceOp::Move { src, .. } => known.get(src).copied(),
+                _ => Self::annotated_write_type(op),
+            };
+            for register in Self::other_writes(op)
+                .into_iter()
+                .chain(Self::dest_of(op))
+            {
+                writes.entry(register).or_default().push(ty);
+                match ty {
+                    Some(ty) => {
+                        known.insert(register, ty);
+                    }
+                    None => {
+                        known.remove(&register);
+                    }
+                }
+            }
+        }
+        let mut written_so_far: HashSet<Register> = HashSet::new();
+        let mut hoisted: Vec<TraceOp> = Vec::new();
+        let mut ops = Vec::with_capacity(trace.ops.len());
+        for op in trace.ops.drain(..) {
+            if let TraceOp::Guard {
+                register,
+                expected_type,
+            } = &op
+                && !written_so_far.contains(register)
+                && writes
+                    .get(register)
+                    .is_none_or(|types| types.iter().all(|ty| *ty == Some(*expected_type)))
+            {
+                if !hoisted.iter().any(|h| {
+                    matches!(h, TraceOp::Guard { register: r, expected_type: t } if r == register && t == expected_type)
+                }) {
+                    hoisted.push(op.clone());
+                }
+                // The body keeps its copy: the backend elides it, and a
+                // marker before it still names the ip.
+                ops.push(op);
+                continue;
+            }
+            for register in Self::other_writes(&op)
+                .into_iter()
+                .chain(Self::dest_of(&op))
+            {
+                written_so_far.insert(register);
+            }
+            ops.push(op);
+        }
+        trace.ops = ops;
+        // A register the loop writes with scalars before it reads it, and
+        // never with anything else, holds nothing owned from the second
+        // iteration on. Checking that at entry too lets every store into it
+        // skip the tag check (and keep the value in a machine register for
+        // the next op). At entry it usually holds the previous iteration's
+        // scalar, or Nil; anything else costs one interpreted iteration.
+        let mut first_access: HashMap<Register, bool> = HashMap::new(); // true = write
+        for op in &trace.ops {
+            for register in Self::reads_of(op) {
+                first_access.entry(register).or_insert(false);
+            }
+            for register in Self::other_writes(op)
+                .into_iter()
+                .chain(Self::dest_of(op))
+            {
+                first_access.entry(register).or_insert(true);
+            }
+        }
+        let guarded: HashSet<Register> = hoisted
+            .iter()
+            .filter_map(|op| match op {
+                TraceOp::Guard { register, .. } => Some(*register),
+                _ => None,
+            })
+            .collect();
+        let mut plain: Vec<Register> = first_access
+            .iter()
+            .filter(|(register, written_first)| {
+                **written_first
+                    && !guarded.contains(*register)
+                    && writes.get(*register).is_some_and(|types| {
+                        types.iter().all(|ty| {
+                            matches!(
+                                ty,
+                                Some(
+                                    crate::jit::trace::ValueType::Int
+                                        | crate::jit::trace::ValueType::Float
+                                        | crate::jit::trace::ValueType::Bool
+                                        | crate::jit::trace::ValueType::Plain
+                                )
+                            )
+                        })
+                    })
+            })
+            .map(|(register, _)| *register)
+            .collect();
+        plain.sort_unstable();
+        for register in plain {
+            hoisted.push(TraceOp::Guard {
+                register,
+                expected_type: crate::jit::trace::ValueType::Plain,
+            });
+        }
+        if !hoisted.is_empty() {
+            jit::log(|| format!("⬆️  JIT Optimizer: hoisted {} entry guard(s)", hoisted.len()));
+            let mut preamble = hoisted;
+            preamble.append(&mut trace.preamble);
+            trace.preamble = preamble;
+        }
+    }
+
+    /// Every register `op` reads (conservatively: the inputs the op names;
+    /// an inlined call reads its arguments and callee).
+    fn reads_of(op: &TraceOp) -> Vec<Register> {
+        match op {
+            TraceOp::Move { src, .. } | TraceOp::Neg { src, .. } | TraceOp::Not { src, .. } => vec![*src],
+            TraceOp::Add { lhs, rhs, .. }
+            | TraceOp::Sub { lhs, rhs, .. }
+            | TraceOp::Mul { lhs, rhs, .. }
+            | TraceOp::Div { lhs, rhs, .. }
+            | TraceOp::Mod { lhs, rhs, .. }
+            | TraceOp::Eq { lhs, rhs, .. }
+            | TraceOp::Ne { lhs, rhs, .. }
+            | TraceOp::Lt { lhs, rhs, .. }
+            | TraceOp::Le { lhs, rhs, .. }
+            | TraceOp::Gt { lhs, rhs, .. }
+            | TraceOp::Ge { lhs, rhs, .. }
+            | TraceOp::And { lhs, rhs, .. }
+            | TraceOp::Or { lhs, rhs, .. }
+            | TraceOp::Concat { lhs, rhs, .. } => vec![*lhs, *rhs],
+            TraceOp::Guard { register, .. }
+            | TraceOp::GuardFunction { register, .. }
+            | TraceOp::GuardClosure { register, .. }
+            | TraceOp::GuardNativeFunction { register, .. }
+            | TraceOp::GuardStructLayout { register, .. }
+            | TraceOp::TypeIs { value: register, .. }
+            | TraceOp::IsEnumVariant { value: register, .. }
+            | TraceOp::GetEnumValue { enum_reg: register, .. }
+            | TraceOp::GetField { object: register, .. }
+            | TraceOp::ArrayLen { array: register, .. }
+            | TraceOp::TryCast { value: register, .. } => vec![*register],
+            TraceOp::GuardLoopContinue {
+                condition_register, ..
+            }
+            | TraceOp::BranchIf {
+                condition_register, ..
+            } => vec![*condition_register],
+            TraceOp::SetField { object, value, .. } => vec![*object, *value],
+            TraceOp::GetIndex { array, index, .. }
+            | TraceOp::TryGetIndex { array, index, .. }
+            | TraceOp::ArrayIndexOk { array, index, .. } => vec![*array, *index],
+            TraceOp::Return { value } => value.iter().copied().collect(),
+            TraceOp::InlineCall { callee, trace, .. } => {
+                let mut reads = trace.arg_registers.clone();
+                reads.push(*callee);
+                reads
+            }
+            TraceOp::CallNative {
+                callee,
+                first_arg,
+                arg_count,
+                ..
+            }
+            | TraceOp::CallFunction {
+                callee,
+                first_arg,
+                arg_count,
+                ..
+            } => {
+                let mut reads: Vec<Register> = (0..*arg_count).map(|i| first_arg + i).collect();
+                reads.push(*callee);
+                reads
+            }
+            TraceOp::CallMethod {
+                object,
+                first_arg,
+                arg_count,
+                ..
+            } => {
+                let mut reads: Vec<Register> = (0..*arg_count).map(|i| first_arg + i).collect();
+                reads.push(*object);
+                reads
+            }
+            TraceOp::CallDirect {
+                callee,
+                receiver,
+                first_arg,
+                arg_count,
+                ..
+            } => {
+                let mut reads: Vec<Register> = (0..*arg_count).map(|i| first_arg + i).collect();
+                reads.push(*callee);
+                reads.extend(receiver.iter().copied());
+                reads
+            }
+            TraceOp::NewArray {
+                first_element,
+                count,
+                ..
+            } => (0..*count).map(|i| first_element + i).collect(),
+            TraceOp::NewStruct {
+                field_registers, ..
+            } => field_registers.clone(),
+            TraceOp::NewEnumVariant {
+                value_registers, ..
+            } => value_registers.clone(),
+            TraceOp::NewEnumUnit { .. }
+            | TraceOp::LoadConst { .. }
+            | TraceOp::GuardGlobals { .. }
+            | TraceOp::At { .. }
+            | TraceOp::Label { .. }
+            | TraceOp::Jump { .. }
+            | TraceOp::DropSpecialized { .. } => Vec::new(),
+            // Specialized ops and reboxing read and write through slots;
+            // treat every register as read (no entry guard comes of it).
+            _ => (0..=u8::MAX).collect(),
         }
     }
 

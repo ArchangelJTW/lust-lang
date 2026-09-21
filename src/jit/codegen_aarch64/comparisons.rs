@@ -67,8 +67,12 @@ impl JitCompiler {
         let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
         self.emit_compare(cmp);
         match cmp {
-            Compare::Float(..) => self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), mi)),
-            Compare::Int(..) => self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), lt)),
+            Compare::Float(..) => {
+                self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), mi))
+            }
+            Compare::Int(..) => {
+                self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), lt))
+            }
         }
         Ok(())
     }
@@ -84,8 +88,12 @@ impl JitCompiler {
         let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
         self.emit_compare(cmp);
         match cmp {
-            Compare::Float(..) => self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), ls)),
-            Compare::Int(..) => self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), le)),
+            Compare::Float(..) => {
+                self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), ls))
+            }
+            Compare::Int(..) => {
+                self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), le))
+            }
         }
         Ok(())
     }
@@ -129,7 +137,10 @@ impl JitCompiler {
     ) -> Result<()> {
         if lhs_type != rhs_type {
             let value = u32::from(!equal);
-            self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; movz X(d), #value));
+            self.finish_bool(
+                dest,
+                |s, d| dynasm!(s.ops ; .arch aarch64 ; movz X(d), #value),
+            );
             return Ok(());
         }
         match lhs_type {

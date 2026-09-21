@@ -1822,6 +1822,44 @@ pub unsafe extern "C" fn jit_array_index_ok_safe(
     }
 }
 
+/// `array[index] = value` for an `Array` and an in-range int index: the
+/// element becomes a clone of the value. Returns 0 without touching
+/// anything for any other case (the interpreter then raises the error).
+///
+/// # Safety
+/// The pointers are null or point to live values.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_array_set_index_safe(
+    array_value_ptr: *const Value,
+    index_value_ptr: *const Value,
+    value_ptr: *const Value,
+) -> u8 {
+    unsafe {
+        if array_value_ptr.is_null() || index_value_ptr.is_null() || value_ptr.is_null() {
+            return 0;
+        }
+        let Value::Array(array) = &*array_value_ptr else {
+            return 0;
+        };
+        let Some(index) = (&*index_value_ptr).as_int() else {
+            return 0;
+        };
+        let Ok(mut borrowed) = array.try_borrow_mut() else {
+            return 0;
+        };
+        if index < 0 || index as usize >= borrowed.len() {
+            return 0;
+        }
+        // The value is cloned before the old element is dropped: `a[i] = a`
+        // must not drop the array's only owner first, and the element may
+        // be the value itself.
+        let value = (*value_ptr).clone();
+        borrowed[index as usize] = value;
+        1
+    }
+}
+
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_array_len_safe(array_value_ptr: *const Value) -> i64 {
@@ -1911,9 +1949,11 @@ pub unsafe extern "C" fn jit_array_push_safe(
 
         match array_value {
             Value::Array(arr) => {
-                // Use unchecked borrow for maximum performance
-                let cell_ptr = arr.as_ptr();
-                let vec_ref = &mut *cell_ptr;
+                // A borrowed array (an iteration in progress, say) is left
+                // to the interpreter, which reports it as the native would.
+                let Ok(mut vec_ref) = arr.try_borrow_mut() else {
+                    return 0;
+                };
                 if !vm_ptr.is_null() {
                     let vm = &mut *vm_ptr;
                     let len = vec_ref.len();
@@ -2308,7 +2348,10 @@ pub unsafe extern "C" fn jit_guard_native_function(
 
 /// Does the value hold a struct whose layout is `expected`?
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jit_guard_struct_layout(value_ptr: *const Value, expected: *const ()) -> u8 {
+pub unsafe extern "C" fn jit_guard_struct_layout(
+    value_ptr: *const Value,
+    expected: *const (),
+) -> u8 {
     unsafe {
         if value_ptr.is_null() {
             return 0;
@@ -3510,7 +3553,9 @@ mod jit_replacement_tests {
     #[test]
     fn rebox_publishes_into_the_unboxed_array() {
         let value = Value::array(vec![Value::Int(1), Value::Int(2)]);
-        let Value::Array(rc) = &value else { unreachable!() };
+        let Value::Array(rc) = &value else {
+            unreachable!()
+        };
         let mut slot = empty_slot();
         assert_eq!(unsafe { jit_unbox_array_int(&value, &mut slot) }, 1);
         assert_eq!(Rc::strong_count(rc), 2);

@@ -26,7 +26,7 @@ timed() {
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 printf "%-10s %10s %10s %10s %10s   %s\n" program lust-vm lust-jit luajit lua outputs
-for f in fields array calls methods strings fib nested floatmath tree; do
+for f in fields array sieve calls methods strings fib nested floatmath tree; do
   timed env LUST_JIT=0 "$LUST" "$D/$f.lust"; t1=$T; o1=$O
   timed env LUST_JIT=1 "$LUST" "$D/$f.lust"; t2=$T; o2=$O
   t3=-; t4=-; o3=$o2

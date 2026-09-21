@@ -125,11 +125,36 @@ impl BudgetState {
 
 impl VM {
     pub fn set_gas_budget(&mut self, limit: u64) {
+        // Code compiled without a budget has no gas checks in its loops.
+        if self.budgets.gas.limit.is_none() {
+            self.jit.invalidate_compiled_code();
+        }
         self.budgets.gas.limit = Some(limit);
     }
 
     pub fn clear_gas_budget(&mut self) {
         self.budgets.gas.limit = None;
+    }
+
+    /// Whether compiled code must charge gas at loop back-edges.
+    pub(crate) fn gas_checked(&self) -> bool {
+        self.budgets.gas.limit.is_some()
+    }
+
+    /// Hand the gas budget to native code (`JitCells::gas_left`) before
+    /// entering it.
+    pub(crate) fn publish_gas_to_cells(&mut self) {
+        self.jit_cells.gas_left = match self.budgets.gas.limit {
+            Some(limit) => limit.saturating_sub(self.budgets.gas.used),
+            None => u64::MAX,
+        };
+    }
+
+    /// Take back what native code charged.
+    pub(crate) fn sync_gas_from_cells(&mut self) {
+        if let Some(limit) = self.budgets.gas.limit {
+            self.budgets.gas.used = limit.saturating_sub(self.jit_cells.gas_left);
+        }
     }
 
     pub fn reset_gas_counter(&mut self) {
@@ -228,6 +253,95 @@ mod tests {
                 assert!(message.to_lowercase().contains("out of gas"));
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// A loop the JIT compiles (a counted one, whose trace runs its
+    /// iterations natively) still traps when the budget runs out, and a
+    /// loop the budget covers completes with its gas accounted for.
+    #[test]
+    fn gas_budget_traps_inside_compiled_loops() -> Result<()> {
+        let source = r#"
+            function count(n: int): int
+                local i: int = 0
+                local total: int = 0
+                while i < n do
+                    total = total + i
+                    i = i + 1
+                end
+                return total
+            end
+            function outer(n: int): int
+                local total: int = 0
+                local pass: int = 0
+                while pass < 3 do
+                    total = total + count(n)
+                    pass = pass + 1
+                end
+                return total
+            end
+            function warm(): int
+                local total: int = 0
+                local pass: int = 0
+                while pass < 500 do
+                    total = total + count(4)
+                    pass = pass + 1
+                end
+                return total
+            end
+        "#;
+        // `warm` makes `count` hot enough to be compiled as a whole
+        // function (its loop a `Jump` back to a label) before the
+        // budgeted calls; the direct call exercises the loop trace.
+        for (entry, warm) in [
+            ("main.count", false),
+            ("main.count", true),
+            ("main.outer", false),
+            ("main.outer", true),
+        ] {
+            let mut program = EmbeddedProgram::builder()
+                .module("main", source)
+                .entry_module("main")
+                .compile()?;
+            program.vm_mut().set_gas_budget(200_000);
+            if warm {
+                program.vm_mut().reset_gas_counter();
+                assert_eq!(
+                    program.call_raw("main.warm", vec![])?,
+                    crate::Value::Int(3000)
+                );
+            }
+            program.vm_mut().reset_gas_counter();
+            let err = program
+                .call_raw(entry, vec![crate::Value::Int(1_000_000_000)])
+                .unwrap_err();
+            match err {
+                LustError::RuntimeErrorWithTrace { message, .. }
+                | LustError::RuntimeError { message } => {
+                    assert!(
+                        message.to_lowercase().contains("out of gas"),
+                        "{entry}: {message}"
+                    );
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+            // Budgets are approximate under the JIT, but not by orders of
+            // magnitude: the loop was stopped near the limit.
+            let used = program.vm_mut().gas_used();
+            assert!((200_000..400_000).contains(&used), "{entry}: used {used}");
+
+            program.vm_mut().set_gas_budget(50_000_000);
+            program.vm_mut().reset_gas_counter();
+            let value = program.call_raw(entry, vec![crate::Value::Int(100_000)])?;
+            let expected = if entry == "main.count" {
+                4_999_950_000
+            } else {
+                3 * 4_999_950_000
+            };
+            assert_eq!(value, crate::Value::Int(expected));
+            let used = program.vm_mut().gas_used();
+            assert!(used > 100_000 && used < 50_000_000, "{entry}: used {used}");
         }
         Ok(())
     }

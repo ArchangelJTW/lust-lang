@@ -196,6 +196,12 @@ pub enum Stmt {
         arr: String,
         expr: Expr,
     },
+    /// `arr[idx] = e` (an index out of range is a runtime error)
+    SetIndex {
+        arr: String,
+        idx: Expr,
+        expr: Expr,
+    },
     /// `if arr[idx] is Ok(v) then body end`
     IfIndex {
         arr: String,
@@ -504,6 +510,11 @@ fn render_stmt(s: &Stmt, out: &mut Out) {
         Stmt::Break => out.line("break"),
         Stmt::Continue => out.line("continue"),
         Stmt::Push { arr, expr } => out.line(&format!("array.push({arr}, {})", expr_text(expr))),
+        Stmt::SetIndex { arr, idx, expr } => out.line(&format!(
+            "{arr}[{}] = {}",
+            expr_text(idx),
+            expr_text(expr)
+        )),
         Stmt::IfIndex { arr, idx, var, body } => {
             out.line(&format!("if {arr}[{}] is Ok({var}) then", expr_text(idx)));
             out.indent += 1;
@@ -1429,8 +1440,10 @@ impl Gen {
             66..=68 if !deep => self.for_in_loop(),
             69..=78 if !deep => Some(self.if_stmt()),
             79..=81 if self.loop_depth > 0 => Some(self.break_or_continue()),
-            82..=85 => self.push(),
-            86..=89 if !deep => self.if_index(),
+            82..=84 => self.push(),
+            85 => self.set_index(),
+            86..=88 if !deep => self.if_index(),
+            89 => self.set_index(),
             90..=92 if !deep => self.if_some(),
             93..=95 if !deep => self.if_is_some(),
             96..=97 => self.set_field(),
@@ -1726,6 +1739,24 @@ impl Gen {
         let bound = self.array_bounds.entry(arr.clone()).or_insert(0);
         *bound = (*bound + self.iter_scale).min(MAX_WORK);
         Some(Stmt::Push { arr, expr })
+    }
+
+    /// `arr[idx] = e`: the index is usually in range (a counter or a
+    /// literal below what has been pushed so far), sometimes anything.
+    fn set_index(&mut self) -> Option<Stmt> {
+        let vars = self.vars_of(Ty::ArrInt);
+        if vars.is_empty() {
+            return Some(self.local());
+        }
+        let arr = self.rng.pick(&vars).name.clone();
+        let pushed = self.array_bounds.get(&arr).copied().unwrap_or(0);
+        let idx = if pushed > 0 && self.rng.below(4) != 0 {
+            Expr::Int(self.rng.below(pushed as u64) as i64)
+        } else {
+            self.expr(Ty::Int, 2)
+        };
+        let expr = self.expr(Ty::Int, 2);
+        Some(Stmt::SetIndex { arr, idx, expr })
     }
 
     fn if_index(&mut self) -> Option<Stmt> {

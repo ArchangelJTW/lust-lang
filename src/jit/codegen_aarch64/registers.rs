@@ -1,7 +1,7 @@
 use super::*;
 
 /// Largest unsigned immediate accepted by `add`/`sub`/`ldrb`/`strb` (12 bits).
-const IMM12_MAX: i32 = 4095;
+pub(super) const IMM12_MAX: i32 = 4095;
 
 pub(super) fn value_size() -> i32 {
     mem::size_of::<Value>() as i32
@@ -531,7 +531,10 @@ impl JitCompiler {
             dynasm!(self.ops ; .arch aarch64 ; and x0, x0, #0xff);
         }
         if let Some(pin) = self.pin_for_write(vm_reg) {
-            assert_eq!(pin.ty, stored_type, "pinned register written with another type");
+            assert_eq!(
+                pin.ty, stored_type,
+                "pinned register written with another type"
+            );
             dynasm!(self.ops ; .arch aarch64 ; mov X(pin.reg), x0);
             if pin.class == pins::PinClass::Carried {
                 self.mark_dirty(vm_reg);
@@ -594,7 +597,11 @@ impl JitCompiler {
     pub(super) fn store_d0_as_float(&mut self, vm_reg: u8) {
         let float_tag = ValueTag::Float.as_u8();
         if let Some(pin) = self.pin_for_write(vm_reg) {
-            assert_eq!(pin.ty, ValueType::Float, "pinned register written with another type");
+            assert_eq!(
+                pin.ty,
+                ValueType::Float,
+                "pinned register written with another type"
+            );
             dynasm!(self.ops ; .arch aarch64 ; fmov D(pin.reg), d0);
             if pin.class == pins::PinClass::Carried {
                 self.mark_dirty(vm_reg);

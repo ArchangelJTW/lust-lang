@@ -100,6 +100,14 @@ pub struct JitCompiler {
     function_self: Option<(usize, dynasmrt::DynamicLabel)>,
     /// Branch targets of the function being compiled, by bytecode ip.
     function_labels: HashMap<usize, dynasmrt::DynamicLabel>,
+    /// Compiled under a gas budget: loop back-edges charge
+    /// `JitCells::gas_left` and leave the loop when it runs out.
+    gas_checked: bool,
+    /// Ops compiled so far (across inlined bodies), and the count at which
+    /// each function label was bound: a jump to a bound label is a loop
+    /// back-edge, charged the ops between.
+    op_counter: usize,
+    label_positions: HashMap<usize, usize>,
     /// Function mode: the exit being emitted hands a call to the
     /// interpreter rather than reporting a failed guard.
     exit_is_handoff: bool,

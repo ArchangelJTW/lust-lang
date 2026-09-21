@@ -222,6 +222,24 @@ pub enum TraceOp {
         array: Register,
         index: Register,
     },
+    /// `array[index] = value` on an `Array`: a clone of the value replaces
+    /// the element (the old one dropped), or the op fails to the
+    /// interpreter (out of bounds, not an array, not an int index) which
+    /// raises the error.
+    SetIndex {
+        array: Register,
+        index: Register,
+        value: Register,
+    },
+    /// `array.push(array, value)` on a plain (unspecialized) `Array`: a
+    /// clone of the value is appended and `dest` becomes Nil, or the op
+    /// fails to the interpreter (not an array, memory budget exceeded on
+    /// growth) which performs the call and raises the error.
+    ArrayPush {
+        dest: Register,
+        array: Register,
+        value: Register,
+    },
     ArrayIndexOk {
         value_dest: Register,
         condition_dest: Register,
@@ -655,6 +673,10 @@ pub struct TraceRecorder {
     /// Set when the recording was abandoned because a mutated specialized
     /// array escaped; the site is then recorded again without specializing.
     pub specialization_escaped: bool,
+    /// A specialized array whose copy has been written was overwritten in
+    /// its register (see `remove_specialization_tracking`): the recording
+    /// is abandoned after the op that did it.
+    overwritten_specialization: bool,
     /// Bytecode ip of the instruction being recorded, not yet written as an
     /// `At` marker (see `flush_marker`).
     pending_marker: Option<usize>,
@@ -736,6 +758,7 @@ impl TraceRecorder {
             globals_guarded: false,
             intrinsics: HashMap::new(),
             specialization_escaped: false,
+            overwritten_specialization: false,
             pending_marker: None,
             current_ip: 0,
             op_count: 0,
@@ -932,12 +955,15 @@ impl TraceRecorder {
         let Some(Value::Array(array)) = registers.get(register as usize) else {
             return None;
         };
-        self.specialized_registers.keys().copied().find(|candidate| {
-            matches!(
-                registers.get(*candidate as usize),
-                Some(Value::Array(candidate_array)) if Rc::ptr_eq(array, candidate_array)
-            )
-        })
+        self.specialized_registers
+            .keys()
+            .copied()
+            .find(|candidate| {
+                matches!(
+                    registers.get(*candidate as usize),
+                    Some(Value::Array(candidate_array)) if Rc::ptr_eq(array, candidate_array)
+                )
+            })
     }
 
     /// Code the recorder cannot see (a native, a call it does not inline)
@@ -1000,7 +1026,7 @@ impl TraceRecorder {
             | TraceOp::Label { .. }
             | TraceOp::Jump { .. }
             | TraceOp::BranchIf { .. } => None,
-            TraceOp::CallDirect { dest, .. } => Some(*dest),
+            TraceOp::CallDirect { dest, .. } | TraceOp::ArrayPush { dest, .. } => Some(*dest),
             TraceOp::LoadConst { dest, .. }
             | TraceOp::Move { dest, .. }
             | TraceOp::Add { dest, .. }
@@ -1038,6 +1064,7 @@ impl TraceRecorder {
             | TraceOp::BorrowField { dest, .. }
             | TraceOp::BorrowEnumValue { dest, .. } => Some(*dest),
             TraceOp::SetField { .. }
+            | TraceOp::SetIndex { .. }
             | TraceOp::ArrayIndexOk { .. }
             | TraceOp::Guard { .. }
             | TraceOp::GuardNativeFunction { .. }
@@ -1277,20 +1304,31 @@ impl TraceRecorder {
         }
     }
 
-    /// Remove specialization tracking if register is about to be overwritten
-    /// The Vec data becomes "leaked" on the JIT stack but that's fine - it's cleaned
-    /// up when the stack frame is destroyed. The array is still managed by Rc<RefCell<>>.
+    /// The register a specialization describes is about to be overwritten.
+    /// A specialization nothing has used yet is dropped outright, `Unbox`
+    /// and all: the trace exit publishes every remaining copy back into the
+    /// array it was taken from, and a copy taken at entry would overwrite
+    /// whatever the trace itself wrote into that array through the boxed
+    /// value (`array.push` on an alias, `a[i] = v`) with the entry-time
+    /// contents. One already written to cannot simply be dropped, and after
+    /// the overwrite the next iteration would run its ops on a copy of the
+    /// wrong array: the recording is abandoned, and the site recorded again
+    /// without specializing.
     fn remove_specialization_tracking(&mut self, register: Register) {
-        if let Some((_specialized_id, _layout)) = self.specialized_registers.remove(&register) {
+        if !self.specialized_registers.contains_key(&register) {
+            return;
+        }
+        if self.disable_unused_specialization(register) {
             crate::jit::log(|| {
                 format!(
-                    "🗑️  JIT: Removing specialization tracking for reg {} (being overwritten)",
+                    "🗑️  JIT: Dropping the unused specialization of reg {} (being overwritten)",
                     register
                 )
             });
-            // Don't emit rebox - the Vec data stays on JIT stack but that's OK
-            // It will be cleaned up when the JIT stack frame is destroyed
+            return;
         }
+        self.specialized_registers.remove(&register);
+        self.overwritten_specialization = true;
     }
 
     fn rebox_specialized_register(&mut self, register: Register, context: &str) {
@@ -1358,6 +1396,43 @@ impl TraceRecorder {
     ) -> bool {
         self.specialized_owner(register, registers)
             .is_none_or(|owner| self.disable_unused_specialization(owner))
+    }
+
+    /// `array.push(a, v)` on a plain array, as one op instead of a native
+    /// call: the array's type is guarded, the value may be anything (a
+    /// specialized value is reboxed first). Nothing else can observe the
+    /// push, so live specializations stay unboxed. False when the call is
+    /// not that.
+    fn record_array_push(
+        &mut self,
+        native_ptr: usize,
+        first_arg: Register,
+        arg_count: u8,
+        dest_reg: Register,
+        registers: &[Value],
+    ) -> bool {
+        if self.intrinsics.get(&native_ptr) != Some(&crate::jit::Intrinsic::ArrayPush)
+            || arg_count != 2
+            || !matches!(registers.get(first_arg as usize), Some(Value::Array(_)))
+            || self.specialized_owner(first_arg, registers).is_some()
+        {
+            return false;
+        }
+        let value_reg = first_arg + 1;
+        self.rebox_specialized_register(value_reg, "array.push");
+        if !self.is_guarded(first_arg) {
+            self.push_op(TraceOp::Guard {
+                register: first_arg,
+                expected_type: ValueType::Array,
+            });
+            self.mark_guarded(first_arg);
+        }
+        self.push_op(TraceOp::ArrayPush {
+            dest: dest_reg,
+            array: first_arg,
+            value: value_reg,
+        });
+        true
     }
 
     /// `array.push(a, v)` / `array.len(a)` on a specialized array, as the
@@ -1658,6 +1733,16 @@ impl TraceRecorder {
                 self.push_op(TraceOp::LoadConst {
                     dest,
                     value: registers[dest as usize].clone(),
+                });
+                Ok(())
+            }
+
+            Instruction::LoadBool(dest, value) => {
+                self.remove_specialization_tracking(dest);
+                self.mark_guarded(dest);
+                self.push_op(TraceOp::LoadConst {
+                    dest,
+                    value: Value::Bool(value),
                 });
                 Ok(())
             }
@@ -2527,6 +2612,15 @@ impl TraceRecorder {
                         ) {
                             return op;
                         }
+                        if self.record_array_push(
+                            Rc::as_ptr(native_fn) as *const () as usize,
+                            first_arg,
+                            arg_count,
+                            dest_reg,
+                            registers,
+                        ) {
+                            return Ok(());
+                        }
                         self.specializations_escape("a native call")?;
 
                         self.push_op(TraceOp::CallNative {
@@ -2735,7 +2829,43 @@ impl TraceRecorder {
                 Ok(())
             }
 
-            Instruction::NewMap(_) | Instruction::SetIndex(_, _, _) => {
+            Instruction::SetIndex(array, index, value) => {
+                if !matches!(registers.get(array as usize), Some(Value::Array(_))) {
+                    self.stop_recording();
+                    return Err(LustError::RuntimeError {
+                        message: "Trace aborted: index assignment currently supports arrays only"
+                            .to_string(),
+                    });
+                }
+                if !self.disable_unused_array_specialization(array, registers) {
+                    self.specialization_escaped = true;
+                    self.stop_recording();
+                    return Err(LustError::RuntimeError {
+                        message: "Trace aborted: array write follows a specialized mutation"
+                            .to_string(),
+                    });
+                }
+                self.rebox_specialized_register(value, "SetIndex");
+                for reg in [array, index] {
+                    if let Some(ty) = Self::get_value_type(&registers[reg as usize])
+                        && !self.is_guarded(reg)
+                    {
+                        self.push_op(TraceOp::Guard {
+                            register: reg,
+                            expected_type: ty,
+                        });
+                        self.mark_guarded(reg);
+                    }
+                }
+                self.push_op(TraceOp::SetIndex {
+                    array,
+                    index,
+                    value,
+                });
+                Ok(())
+            }
+
+            Instruction::NewMap(_) => {
                 self.stop_recording();
                 Err(LustError::RuntimeError {
                     message: "Trace aborted: unsupported index operation".to_string(),
@@ -2943,6 +3073,14 @@ impl TraceRecorder {
 
         outcome?;
 
+        if self.overwritten_specialization {
+            self.specialization_escaped = true;
+            self.stop_recording();
+            return Err(LustError::RuntimeError {
+                message: "Trace aborted: a written specialized array was overwritten".to_string(),
+            });
+        }
+
         if self.op_count >= self.max_length {
             self.stop_recording();
             return Err(LustError::RuntimeError {
@@ -3135,8 +3273,20 @@ mod tests {
             .filter(|op| !matches!(op, TraceOp::At { .. }))
             .collect();
         assert!(matches!(ops[0], TraceOp::GuardGlobals { version: 5 }));
-        assert!(matches!(ops[1], TraceOp::LoadConst { dest: 0, value: Value::Int(7) }));
-        assert!(matches!(ops[2], TraceOp::LoadConst { dest: 0, value: Value::Int(7) }));
+        assert!(matches!(
+            ops[1],
+            TraceOp::LoadConst {
+                dest: 0,
+                value: Value::Int(7)
+            }
+        ));
+        assert!(matches!(
+            ops[2],
+            TraceOp::LoadConst {
+                dest: 0,
+                value: Value::Int(7)
+            }
+        ));
         assert_eq!(ops.len(), 3);
 
         // A store still aborts: it would fail the trace's own guard.

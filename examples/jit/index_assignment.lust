@@ -1,0 +1,207 @@
+-- `a[i] = v` and `array.push(a, v)` inside hot loops and compiled
+-- functions: scalar and owning values, the old element dropped, an array
+-- stored into itself, growth, module-table lookups, and the errors the
+-- interpreter raises for an index out of range.
+
+-- A sieve: bool literals in a loop, index assignment in the inner loop.
+local N: int = 20000
+local flags: Array<bool> = []
+local i: int = 0
+while i <= N do
+    array.push(flags, true)
+    i = i + 1
+end
+local count: int = 0
+i = 2
+while i <= N do
+    if flags[i] is Ok(f) then
+        if f then
+            count = count + 1
+            local j: int = i * i
+            while j <= N do
+                flags[j] = false
+                j = j + i
+            end
+        end
+    end
+    i = i + 1
+end
+println(count)
+
+-- Ints, floats, and strings (owning values: the old element must be
+-- released, the new one retained).
+local ints: Array<int> = []
+local floats: Array<float> = []
+local names: Array<string> = []
+i = 0
+while i < 3000 do
+    array.push(ints, i)
+    array.push(floats, i * 0.5)
+    array.push(names, "n" .. tostring(i % 7))
+    i = i + 1
+end
+i = 0
+while i < 3000 do
+    if ints[i] is Ok(v) then
+        ints[i] = v * 2
+    end
+    if floats[i] is Ok(x) then
+        floats[i] = x + 0.25
+    end
+    if names[i] is Ok(s) then
+        names[i] = s .. "!"
+    end
+    i = i + 1
+end
+local isum: int = 0
+local fsum: float = 0.0
+local nlen: int = 0
+i = 0
+while i < 3000 do
+    if ints[i] is Ok(v) then
+        isum = isum + v
+    end
+    if floats[i] is Ok(x) then
+        fsum = fsum + x
+    end
+    if names[i] is Ok(s) then
+        nlen = nlen + string.len(s)
+    end
+    i = i + 1
+end
+println(isum)
+println(fsum)
+println(nlen)
+
+-- Structs replaced element by element; the replaced ones are dropped.
+struct Cell
+    value: int
+    tag: string
+end
+local cells: Array<Cell> = []
+i = 0
+while i < 2000 do
+    array.push(cells, Cell { value = i, tag = "c" })
+    i = i + 1
+end
+i = 0
+while i < 2000 do
+    if cells[i] is Ok(c) then
+        cells[i] = Cell { value = c.value + 1, tag = c.tag .. "x" }
+    end
+    i = i + 1
+end
+local csum: int = 0
+i = 0
+while i < 2000 do
+    if cells[i] is Ok(c) then
+        csum = csum + c.value + string.len(c.tag)
+    end
+    i = i + 1
+end
+println(csum)
+
+-- Nested arrays: an array stored into another, and into itself.
+local rows: Array<Array<int>> = []
+i = 0
+while i < 200 do
+    local row: Array<int> = [i, i + 1]
+    array.push(rows, row)
+    i = i + 1
+end
+i = 0
+while i < 200 do
+    if rows[i] is Ok(r) then
+        if r[0] is Ok(a) then
+            r[0] = a * 10
+        end
+        rows[i] = r
+    end
+    i = i + 1
+end
+local rsum: int = 0
+i = 0
+while i < 200 do
+    if rows[i] is Ok(r) then
+        if r[0] is Ok(a) then
+            rsum = rsum + a
+        end
+    end
+    i = i + 1
+end
+println(rsum)
+local nest: Array<Array<int>> = [[1], [2], [3]]
+i = 0
+while i < 100 do
+    if nest[0] is Ok(inner) then
+        if inner[0] is Ok(a) then
+            inner[0] = a + 1
+        end
+    end
+    i = i + 1
+end
+println(nest[0])
+
+-- Compiled functions: a helper that writes through an array parameter
+-- and one that pushes, called from a hot loop.
+function bump(a: Array<int>, at: int, by: int): ()
+    if a[at] is Ok(v) then
+        a[at] = v + by
+    end
+end
+function fill(a: Array<int>, n: int): int
+    local k: int = 0
+    while k < n do
+        array.push(a, k * 3)
+        k = k + 1
+    end
+    return array.len(a)
+end
+local target: Array<int> = [0, 0, 0, 0]
+i = 0
+while i < 5000 do
+    bump(target, i % 4, i)
+    i = i + 1
+end
+println(target)
+local filled: Array<int> = []
+i = 0
+while i < 300 do
+    fill(filled, 5)
+    i = i + 1
+end
+println(array.len(filled))
+println(filled[1499])
+
+-- A value that comes from a call rather than a literal or arithmetic.
+function pick(a: int, b: int): int
+    if a % 2 == 0 then
+        return a
+    end
+    return b
+end
+local mixed: Array<int> = []
+i = 0
+while i < 1000 do
+    array.push(mixed, pick(i, i * 3))
+    if mixed[i] is Ok(v) then
+        mixed[i] = pick(v, v - 1)
+    end
+    i = i + 1
+end
+println(array.len(mixed))
+println(mixed[999])
+
+-- Out of range on a late iteration: the interpreter raises with the
+-- writes before it intact.
+local short: Array<int> = [1, 2, 3]
+i = 0
+while i < 10 do
+    short[i % 3] = i
+    if i == 8 then
+        println(short)
+        short[3] = i
+    end
+    i = i + 1
+end
+println("unreachable")

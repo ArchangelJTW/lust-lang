@@ -210,11 +210,20 @@ is recorded as the value seen, guarded by the VM's globals version, which
 every assignment to a global bumps; the guard failing evicts the trace. Struct
 fields of scalar type and `Array` elements are read and written inline through
 the measured layout of the runtime's `Rc<RefCell<Vec<_>>>` (see
-`src/jit/layout.rs`), falling back to the runtime helpers for anything else.
+`src/jit/layout.rs`), falling back to the runtime helpers for anything else:
+`a[i] = v` stores the value's two words over an element that owns nothing,
+and `array.push(a, v)` on any array appends them while there is capacity
+(growth, which charges the memory budget, goes through the helper).
 An `Array<int>` a loop reads and writes is unboxed into a native vector for
 the trace's duration (`array.push` / `array.len` on it become native
 operations); when the array also escapes to a native or a non-inlined call,
-the recording is abandoned and the site is recorded again without unboxing.
+or its register is overwritten after the copy has been written to, the
+recording is abandoned and the site is recorded again without unboxing.
+
+Under a gas budget (`VM::set_gas_budget`), compiled loops charge each
+back-edge and hand the loop to the interpreter — which raises the error —
+when the budget runs out; code compiled before the budget was set is
+discarded when it is.
 
 Functions are also compiled whole after thirty calls: their bytecode is
 translated statically, every branch and loop included (types flow to a
@@ -265,7 +274,8 @@ backend change:
   differential fuzzer (a workspace member, so it is not built by a plain
   `cargo build`). `lust-fuzz run --cases 20000 --size 4 --jobs 6 --keep-going`
   generates programs (loops, branches, calls, recursion, function values and
-  closures, arrays, maps, structs, options, strings, pair returns), runs each
+  closures, arrays with pushes and index assignment, maps, structs, options,
+  strings, pair returns), runs each
   both ways in-process and reports every disagreement with a shrunk
   reproducer. Helpers take and return structs (often the parameter
   itself) and `Option<P>`, walk a `next` chain of structs (which a

@@ -26,6 +26,8 @@ pub struct RcVecLayout {
     pub borrow_offset: usize,
     pub ptr_offset: usize,
     pub len_offset: usize,
+    /// Offset, from an array's allocation, of the `Vec`'s capacity.
+    pub cap_offset: usize,
     /// Offset of the allocation pointer within a `Value::Array`.
     pub array_rc_offset: usize,
     /// Offset of the allocation pointer within a `Value::Struct`.
@@ -291,25 +293,24 @@ fn unique_position(words: &[usize], value: usize) -> Option<usize> {
 }
 
 /// Within a `RefCell<Vec<Value>>` holding two of five elements: the words
-/// of the borrow flag, the element pointer and the length, given the
+/// of the borrow flag, the element pointer, the length and the capacity, given the
 /// cell's words at rest and a way to take a shared borrow.
 fn cell_words(
     cell_ptr: *const u8,
     elements: usize,
     borrow: impl FnOnce() -> Vec<usize>,
-) -> Option<(usize, usize, usize)> {
+) -> Option<(usize, usize, usize, usize)> {
     let at_rest = words(cell_ptr, 4);
     let ptr_word = unique_position(&at_rest, elements)?;
     let len_word = unique_position(&at_rest, 2)?;
-    // The capacity (5) must be a word of its own too.
-    unique_position(&at_rest, 5)?;
+    let cap_word = unique_position(&at_rest, 5)?;
     let borrowed = borrow();
     let changed: Vec<usize> = (0..4).filter(|i| borrowed[*i] != at_rest[*i]).collect();
     let borrow_word = match changed.as_slice() {
         [one] if at_rest[*one] == 0 && borrowed[*one] == 1 => *one,
         _ => return None,
     };
-    Some((borrow_word, ptr_word, len_word))
+    Some((borrow_word, ptr_word, len_word, cap_word))
 }
 
 fn probe() -> Option<RcVecLayout> {
@@ -332,7 +333,7 @@ fn probe() -> Option<RcVecLayout> {
         return None;
     }
     let value_offset = 16;
-    let (borrow_word, ptr_word, len_word) = cell_words(cell_ptr, elements, || {
+    let (borrow_word, ptr_word, len_word, cap_word) = cell_words(cell_ptr, elements, || {
         let shared = rc.borrow();
         let borrowed = words(cell_ptr, 4);
         drop(shared);
@@ -371,7 +372,7 @@ fn probe() -> Option<RcVecLayout> {
     let struct_layout_offset = unique_position(&object_words, layout_inner)? * 8;
     let struct_name_offset = unique_position(&object_words, name.inner_ptr() as usize)? * 8;
     let fields_cell = &object.fields as *const RefCell<Vec<Value>> as *const u8;
-    let (fields_borrow_word, fields_ptr_word, fields_len_word) =
+    let (fields_borrow_word, fields_ptr_word, fields_len_word, _) =
         cell_words(fields_cell, field_elements, || {
             let shared = object.fields.borrow();
             let borrowed = words(fields_cell, 4);
@@ -386,6 +387,7 @@ fn probe() -> Option<RcVecLayout> {
         borrow_offset: value_offset + borrow_word * 8,
         ptr_offset: value_offset + ptr_word * 8,
         len_offset: value_offset + len_word * 8,
+        cap_offset: value_offset + cap_word * 8,
         array_rc_offset,
         struct_fields_offset,
         struct_borrow_offset: fields_cell_offset + fields_borrow_word * 8,
@@ -450,7 +452,11 @@ mod tests {
 /// Generated code adjusts reference counts itself for the values whose
 /// layout the probes cover; these run compiled functions that copy structs
 /// and enums around and check the counts they leave behind.
-#[cfg(all(test, feature = "std", any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
 mod refcount_tests {
     use crate::bytecode::Value;
     use crate::embed::EmbeddedProgram;
@@ -515,9 +521,7 @@ mod refcount_tests {
         // Enough direct calls for `walk` to be compiled whole and run
         // natively (recursively), then a traced loop calling it.
         for _ in 0..80 {
-            let total: i64 = program
-                .call_typed("main.walk", root.clone())
-                .expect("walk");
+            let total: i64 = program.call_typed("main.walk", root.clone()).expect("walk");
             assert_eq!(total, 3 + 1 + 1 + 2 + 3 + 1 + 2);
         }
         for _ in 0..3 {
@@ -535,7 +539,11 @@ mod refcount_tests {
     }
 }
 
-#[cfg(all(test, feature = "std", any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
 mod borrow_tests {
     use crate::bytecode::Value;
     use crate::embed::EmbeddedProgram;
@@ -587,27 +595,45 @@ mod borrow_tests {
         let before = strong(&tree);
         let leaf = tree
             .struct_get_field("left")
-            .and_then(|v| v.as_enum().and_then(|(_, _, vals)| vals.and_then(|v| v.first().cloned())))
+            .and_then(|v| {
+                v.as_enum()
+                    .and_then(|(_, _, vals)| vals.and_then(|v| v.first().cloned()))
+            })
             .and_then(|v| v.struct_get_field("left"))
-            .and_then(|v| v.as_enum().and_then(|(_, _, vals)| vals.and_then(|v| v.first().cloned())))
+            .and_then(|v| {
+                v.as_enum()
+                    .and_then(|(_, _, vals)| vals.and_then(|v| v.first().cloned()))
+            })
             .expect("leaf");
         let leaf_before = strong(&leaf);
         let left = tree
             .struct_get_field("left")
-            .and_then(|v| v.as_enum().and_then(|(_, _, vals)| vals.and_then(|v| v.first().cloned())))
+            .and_then(|v| {
+                v.as_enum()
+                    .and_then(|(_, _, vals)| vals.and_then(|v| v.first().cloned()))
+            })
             .expect("left");
         let left_before = strong(&left);
         let right = tree
             .struct_get_field("right")
-            .and_then(|v| v.as_enum().and_then(|(_, _, vals)| vals.and_then(|v| v.first().cloned())))
+            .and_then(|v| {
+                v.as_enum()
+                    .and_then(|(_, _, vals)| vals.and_then(|v| v.first().cloned()))
+            })
             .expect("right");
         let right_before = strong(&right);
         for round in 0..60 {
-            let total: f64 = program.call_typed("main.weigh", tree.clone()).expect("weigh");
+            let total: f64 = program
+                .call_typed("main.weigh", tree.clone())
+                .expect("weigh");
             assert_eq!(total, 1.5 + 2.0 * (1.5 + 2.0 * 0.5));
             assert_eq!(strong(&tree), before, "root count after round {round}");
             assert_eq!(strong(&left), left_before, "left count after round {round}");
-            assert_eq!(strong(&right), right_before, "right count after round {round}");
+            assert_eq!(
+                strong(&right),
+                right_before,
+                "right count after round {round}"
+            );
             assert_eq!(strong(&leaf), leaf_before, "leaf count after round {round}");
         }
         let stats = program.jit_stats();
@@ -615,7 +641,11 @@ mod borrow_tests {
     }
 }
 
-#[cfg(all(test, feature = "std", any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
 mod borrow_copy_tests {
     use crate::bytecode::Value;
     use crate::embed::EmbeddedProgram;

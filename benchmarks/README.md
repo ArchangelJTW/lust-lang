@@ -145,10 +145,11 @@ static lowering described above. RISC-V codegen has not been modified.
 
 ## Cross-language suite (`benchmarks/suite`)
 
-`benchmarks/suite/run.sh` runs nine small programs — struct fields, array
-indexing, function calls, struct method calls, string building, recursive
-fib, nested loops, float math, tree recursion over structs plus an
-array-scanning function — through the Lust interpreter (`LUST_JIT=0`),
+`benchmarks/suite/run.sh` runs ten small programs — struct fields, array
+indexing, a sieve of Eratosthenes (index assignment into a 10,000,001
+element `Array<bool>`), function calls, struct method calls, string
+building, recursive fib, nested loops, float math, tree recursion over
+structs plus an array-scanning function — through the Lust interpreter (`LUST_JIT=0`),
 the Lust JIT, LuaJIT and Lua, checking that all outputs agree. Each program
 has a `.lust` and an equivalent `.lua`.
 
@@ -160,6 +161,7 @@ timed), milliseconds, single run each:
 |-----------|--------:|---------:|-------:|--------:|
 | fields    |     710 |       45 |     57 |     118 |
 | array     |    1249 |       48 |     59 |      79 |
+| sieve     |    3335 |      306 |     92 |     286 |
 | calls     |     745 |       61 |     29 |     128 |
 | methods   |    1178 |       59 |     30 |     222 |
 | strings   |     113 |      113 |    121 |     154 |
@@ -286,3 +288,29 @@ inner loop's iterations (a `NestedLoopCall` runs them through the inner
 loop's own trace) but the interpreter still executed them, all million,
 at interpreter speed — 160 of the 204 ms. The skipped loop's root trace
 now runs during the recording.
+
+`sieve` (added when a benchmark of the owner's found it 15x slower than
+plain Lua) could not be traced at all: the loop recorder had no case for
+the `LoadBool` a `true` or `false` literal compiles to, so any loop with
+one in it ran interpreted, and `a[i] = v` was unsupported in every kind
+of compiled code. Both are ops now — the index assignment inline when the
+index is a known int and neither the old element nor the value owns
+anything, and `array.push(a, v)` on a plain array is one op too: a
+two-word store after the last element while there is capacity, the
+helper (which charges the memory budget) on growth. 2.7 s → 0.28
+(LuaJIT 0.08, Lua 0.26). What is left is the push loop's `array.push`
+lookup, a hash-table probe of the mutable `array` module table on every
+iteration (12 of the 28 ns an iteration costs); hoisting it needs a way
+to know the table has not changed. Two things came out of the work. A
+gas budget was not enforced inside compiled loops (a trace charged once
+per entry and looped natively; `while true do end` had only been caught
+because `LoadBool` kept it out of the JIT): code compiled while a budget
+is set now charges each loop back-edge against a remaining-gas cell and
+leaves the loop to the interpreter when it runs out, at no measurable
+cost, and setting a budget discards code compiled without the checks.
+And a trace whose entry-time copy of an array (the unboxed `Array<int>`
+specialization) was still published back into the array at exit after
+the register holding it had been overwritten — clobbering anything the
+trace itself had written into that array through an alias (`array.push`
+on `nest[0]`, printed 8 for 101) — now drops the copy if it was never
+written, or gives up the recording if it was.

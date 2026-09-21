@@ -36,7 +36,9 @@ impl VM {
             ("push", crate::jit::Intrinsic::ArrayPush),
             ("len", crate::jit::Intrinsic::ArrayLen),
         ] {
-            if let Some(Value::NativeFunction(func)) = array_module.get(&crate::bytecode::ValueKey::from(name)) {
+            if let Some(Value::NativeFunction(func)) =
+                array_module.get(&crate::bytecode::ValueKey::from(name))
+            {
                 self.jit
                     .intrinsics
                     .insert(Rc::as_ptr(func) as *const () as usize, intrinsic);
@@ -246,10 +248,12 @@ pub unsafe extern "C" fn jit_run_nested_loop(
             vm.pending_jit_error = Some(error);
             return 1;
         }
+        vm.publish_gas_to_cells();
         vm.jit.record_native_entry();
         vm.pending_jit_error = None;
         let result = trace.execute(registers, vm as *mut VM, core::ptr::null());
         drop(trace);
+        vm.sync_gas_from_cells();
         if result == 0 {
             if vm.current_task.is_some() && vm.pending_task_signal.is_some() {
                 // Let the interpreter's back-edge handling see the signal.
@@ -422,9 +426,17 @@ pub unsafe extern "C" fn jit_materialize_inline_frames(
             .unwrap_or(site.value_count as u8);
         // The frames were live inside the trace already; the depth limit
         // was checked when they were called.
-        let mut frame = match vm.take_frame(site.function_idx, Some(site.return_dest as Register), register_count) {
+        let mut frame = match vm.take_frame(
+            site.function_idx,
+            Some(site.return_dest as Register),
+            register_count,
+        ) {
             Ok(frame) => frame,
-            Err(_) => CallFrame::new(site.function_idx, Some(site.return_dest as Register), register_count),
+            Err(_) => CallFrame::new(
+                site.function_idx,
+                Some(site.return_dest as Register),
+                register_count,
+            ),
         };
         for i in 0..site.value_count {
             let slot = unsafe { regs.add(i) };

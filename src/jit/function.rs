@@ -134,9 +134,8 @@ pub fn field_pure(functions: &[Function], idx: usize) -> bool {
                 | Instruction::CallMethod(..)
                 | Instruction::Closure(..)
                 | Instruction::StoreUpvalue(..) => false,
-                Instruction::Call(func_reg, ..) => {
-                    callee_of(ip, *func_reg).is_some_and(|callee| check(functions, callee, visiting))
-                }
+                Instruction::Call(func_reg, ..) => callee_of(ip, *func_reg)
+                    .is_some_and(|callee| check(functions, callee, visiting)),
                 _ => true,
             });
         visiting.pop();
@@ -885,7 +884,11 @@ impl<'a> Translator<'a> {
                 let native_guarded = self.env.natives_guarded.contains(&src);
                 self.ops.push(TraceOp::Move { dest, src });
                 // A copy of a borrow is a clone: the destination owns it.
-                let ty = if self.env.borrows.contains(&src) { None } else { ty };
+                let ty = if self.env.borrows.contains(&src) {
+                    None
+                } else {
+                    ty
+                };
                 self.write(dest, ty);
                 if let Some(idx) = function {
                     self.env.functions.insert(dest, idx);
@@ -979,6 +982,17 @@ impl<'a> Translator<'a> {
                             array: first_arg,
                         });
                         self.write(dest, Some(ValueType::Int));
+                        return Some(());
+                    }
+                    if intrinsic == Some(super::Intrinsic::ArrayPush) && arg_count == 2 {
+                        // `array.push(a, v)`: the array's type is checked by
+                        // the op (anything else fails to the interpreter).
+                        self.ops.push(TraceOp::ArrayPush {
+                            dest,
+                            array: first_arg,
+                            value: first_arg + 1,
+                        });
+                        self.write(dest, Some(ValueType::Plain));
                         return Some(());
                     }
                     self.ops.push(TraceOp::CallNative {
@@ -1125,6 +1139,14 @@ impl<'a> Translator<'a> {
                 self.ops.push(TraceOp::ArrayLen { dest, array });
                 self.write(dest, Some(ValueType::Int));
             }
+            Instruction::SetIndex(array, index, value) => {
+                self.guard(index, ValueType::Int);
+                self.ops.push(TraceOp::SetIndex {
+                    array,
+                    index,
+                    value,
+                });
+            }
             Instruction::GetIndex(dest, array, index) => {
                 self.guard(index, ValueType::Int);
                 self.ops.push(TraceOp::GetIndex { dest, array, index });
@@ -1203,7 +1225,13 @@ impl<'a> Translator<'a> {
                 self.ops.push(TraceOp::Concat { dest, lhs, rhs });
                 self.write(dest, None);
             }
-            Instruction::NewStruct(dest, name_idx, first_field_name_idx, first_field, field_count) => {
+            Instruction::NewStruct(
+                dest,
+                name_idx,
+                first_field_name_idx,
+                first_field,
+                field_count,
+            ) => {
                 let struct_name = self.constant_string(name_idx)?;
                 let mut field_names = Vec::with_capacity(field_count as usize);
                 let mut field_registers = Vec::with_capacity(field_count as usize);
@@ -1496,7 +1524,9 @@ fn translate_pass(
         .ops
         .iter()
         .filter_map(|op| match op {
-            TraceOp::BorrowField { dest, .. } | TraceOp::BorrowEnumValue { dest, .. } => Some(*dest),
+            TraceOp::BorrowField { dest, .. } | TraceOp::BorrowEnumValue { dest, .. } => {
+                Some(*dest)
+            }
             _ => None,
         })
         .collect();
@@ -1673,7 +1703,10 @@ mod tests {
             2
         );
         assert!(matches!(
-            trace.ops.iter().find(|op| matches!(op, TraceOp::Label { .. })),
+            trace
+                .ops
+                .iter()
+                .find(|op| matches!(op, TraceOp::Label { .. })),
             Some(TraceOp::Label { id: 5, .. })
         ));
         assert!(trace.ops.iter().any(|op| matches!(
@@ -1814,7 +1847,11 @@ mod tests {
 /// End-to-end regressions for whole-function compilation: a program is run
 /// until its functions are compiled (see `FUNCTION_HOT_THRESHOLD`) and the
 /// results are compared against the interpreter's semantics.
-#[cfg(all(test, feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod compiled_semantics_tests {
     use crate::bytecode::Value;
     use crate::embed::EmbeddedProgram;
@@ -1897,14 +1934,21 @@ mod compiled_semantics_tests {
         );
         let min = crate::LustInt::MIN;
         for _ in 0..80 {
-            let quotient: crate::LustInt = program.call_typed("main.divide", (min, -1)).expect("divide");
-            let remainder: crate::LustInt = program.call_typed("main.modulo", (min, -1)).expect("modulo");
+            let quotient: crate::LustInt = program
+                .call_typed("main.divide", (min, -1))
+                .expect("divide");
+            let remainder: crate::LustInt = program
+                .call_typed("main.modulo", (min, -1))
+                .expect("modulo");
             assert_eq!(quotient, min.wrapping_div(-1));
             assert_eq!(remainder, min.wrapping_rem(-1));
         }
         // Again through a traced loop calling both.
         let pair = program
-            .call_raw("main.drive", alloc::vec![Value::Int(min), Value::Int(-1), Value::Int(200)])
+            .call_raw(
+                "main.drive",
+                alloc::vec![Value::Int(min), Value::Int(-1), Value::Int(200)],
+            )
             .expect("drive");
         let Value::Tuple(values) = &pair else {
             panic!("expected a tuple, got {pair:?}")
@@ -1913,7 +1957,15 @@ mod compiled_semantics_tests {
         assert_eq!(values[1].as_int(), Some(min.wrapping_rem(-1)));
 
         // Division by zero is still an error, not a wrap.
-        assert!(program.call_typed::<_, crate::LustInt>("main.divide", (1, 0)).is_err());
-        assert!(program.call_typed::<_, crate::LustInt>("main.modulo", (1, 0)).is_err());
+        assert!(
+            program
+                .call_typed::<_, crate::LustInt>("main.divide", (1, 0))
+                .is_err()
+        );
+        assert!(
+            program
+                .call_typed::<_, crate::LustInt>("main.modulo", (1, 0))
+                .is_err()
+        );
     }
 }

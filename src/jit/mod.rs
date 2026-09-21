@@ -1,11 +1,11 @@
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 pub mod codegen;
-pub mod function;
-pub mod layout;
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 pub mod codegen_aarch64;
 #[cfg(all(feature = "rv32", target_arch = "riscv32"))]
 pub mod codegen_rv32;
+pub mod function;
+pub mod layout;
 pub mod optimizer;
 pub mod profiler;
 pub mod specialization;
@@ -116,6 +116,13 @@ pub struct JitCells {
     /// code loads a callee's entry through it rather than embedding the
     /// table's address.
     pub entry_table: usize,
+    /// Gas left before the budget is exhausted, while a gas budget is set:
+    /// the VM computes it from the budget before entering native code and
+    /// reads it back after. Code compiled under a budget charges each loop
+    /// back-edge here and exits to the interpreter when it runs out, which
+    /// then raises the error (code compiled without a budget does not
+    /// check; setting a budget discards it).
+    pub gas_left: u64,
 }
 
 impl Default for JitCells {
@@ -125,6 +132,7 @@ impl Default for JitCells {
             exit_info: usize::MAX,
             call_ip: usize::MAX,
             entry_table: 0,
+            gas_left: u64::MAX,
         }
     }
 }
@@ -135,8 +143,9 @@ pub const STACK_LIMIT_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCe
 pub const EXIT_INFO_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCells, exit_info);
 pub const CALL_IP_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCells, call_ip);
 pub const ENTRY_TABLE_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCells, entry_table);
+pub const GAS_LEFT_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCells, gas_left);
 // Compiled code addresses the cells with 12-bit scaled immediates.
-const _: () = assert!(ENTRY_TABLE_OFFSET < 32760);
+const _: () = assert!(GAS_LEFT_OFFSET < 32760);
 
 impl VM {
     /// Take the call ip a trace stored for the helper call in progress.
@@ -460,7 +469,8 @@ impl JitState {
         *evictions = evictions.saturating_add(1);
         let delay = 1u32 << evictions.saturating_sub(1).min(MAX_ROOT_EVICTION_SHIFT);
         let count = self.function_calls[func_idx];
-        self.function_next_compile[func_idx] = count.saturating_add(delay.max(FUNCTION_HOT_THRESHOLD));
+        self.function_next_compile[func_idx] =
+            count.saturating_add(delay.max(FUNCTION_HOT_THRESHOLD));
     }
 
     pub fn alloc_trace_id(&mut self) -> TraceId {

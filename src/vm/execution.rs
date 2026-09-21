@@ -179,12 +179,9 @@ impl VM {
                 // that loop's iterations are not part of the trace, and
                 // interpreting them (a million, for a big array) would be
                 // what the recording costs.
-                let skipped_nested = self
-                    .trace_recorder
-                    .as_ref()
-                    .is_some_and(|recorder| {
-                        recorder.skipped_loop() == Some((func_idx, loop_start_ip))
-                    });
+                let skipped_nested = self.trace_recorder.as_ref().is_some_and(|recorder| {
+                    recorder.skipped_loop() == Some((func_idx, loop_start_ip))
+                });
                 let root_trace_id = if self.trace_recorder.is_none() || skipped_nested {
                     self.jit
                         .root_traces
@@ -212,6 +209,7 @@ impl VM {
                             core::cmp::max(1, cost) as u64
                         };
                         self.budgets.charge_gas(trace_gas_cost)?;
+                        self.publish_gas_to_cells();
                         self.pending_jit_error = None;
 
                         // Capture RSP before and after to detect stack leaks (x86_64 only)
@@ -225,6 +223,7 @@ impl VM {
                         let vm_ptr = self as *mut VM;
                         let result = trace.execute(registers_ptr, vm_ptr, ptr::null());
                         drop(trace);
+                        self.sync_gas_from_cells();
 
                         #[cfg(target_arch = "x86_64")]
                         let rsp_after: usize;
@@ -387,11 +386,10 @@ impl VM {
                             let hoisted_constants = optimizer.optimize(&mut trace);
                             crate::jit::log(|| "⚙️  JIT: Compiling root trace...".to_string());
                             let trace_id = self.jit.alloc_trace_id();
-                            match JitCompiler::new().compile_trace(
-                                &trace,
-                                trace_id,
-                                hoisted_constants.clone(),
-                            ) {
+                            match JitCompiler::new()
+                                .with_gas_checks(self.gas_checked())
+                                .compile_trace(&trace, trace_id, hoisted_constants.clone())
+                            {
                                 Ok(compiled_trace) => {
                                     crate::jit::log(|| {
                                         format!(
@@ -833,7 +831,8 @@ impl VM {
                 Instruction::Call(func_reg, first_arg, arg_count, dest_reg)
                     if self.plain_function_callee(func_reg) =>
                 {
-                    let frame = self.bytecode_call_frame(func_reg, first_arg, arg_count, dest_reg)?;
+                    let frame =
+                        self.bytecode_call_frame(func_reg, first_arg, arg_count, dest_reg)?;
                     let callee_idx = frame.function_idx;
                     self.call_stack.push(frame);
                     if self.jit.enabled
@@ -2067,6 +2066,7 @@ impl VM {
 
         let cost = code.trace.ops.len();
         self.budgets.charge_gas(core::cmp::max(1, cost) as u64)?;
+        self.publish_gas_to_cells();
         self.jit.record_native_entry();
         self.pending_jit_error = None;
         self.jit_cells.exit_info = usize::MAX;
@@ -2074,6 +2074,7 @@ impl VM {
         let vm_ptr = self as *mut VM;
         let result = code.execute(registers_ptr, vm_ptr, ptr::null());
         self.jit_cells.stack_limit = outer_limit;
+        self.sync_gas_from_cells();
         crate::jit::log(|| format!("🎯 JIT: function {} native result {}", func_idx, result));
         drop(code);
 
@@ -2096,7 +2097,10 @@ impl VM {
             // without one is a compiler bug. Evict the code and resume at
             // the function's entry, which at least keeps the interpreter
             // consistent.
-            debug_assert!(false, "function {func_idx} exited with {result} and no exit info");
+            debug_assert!(
+                false,
+                "function {func_idx} exited with {result} and no exit info"
+            );
             crate::jit::log(|| {
                 format!("❌ JIT: function {func_idx} exited with {result} and no exit info")
             });
@@ -2153,7 +2157,10 @@ impl VM {
             written_registers: crate::jit::function::written_registers(function),
             returned_registers: crate::jit::function::returned_registers(function),
         };
-        let Some((function, meta)) = self.functions.get(func_idx).zip(self.call_meta.get(func_idx))
+        let Some((function, meta)) = self
+            .functions
+            .get(func_idx)
+            .zip(self.call_meta.get(func_idx))
         else {
             return;
         };
@@ -2198,13 +2205,10 @@ impl VM {
                     | crate::jit::trace::ValueType::Bool
             )
         });
-        match JitCompiler::new().compile_function(
-            &trace,
-            trace_id,
-            register_count,
-            entry_table,
-            result_type,
-        ) {
+        match JitCompiler::new()
+            .with_gas_checks(self.gas_checked())
+            .compile_function(&trace, trace_id, register_count, entry_table, result_type)
+        {
             Ok(code) => {
                 crate::jit::log(|| format!("✅ JIT: function {} compiled", func_idx));
                 self.jit.store_function_code(func_idx, code);
@@ -2269,7 +2273,8 @@ impl VM {
         let register_count = function.register_count;
         let mut frame = self.take_frame(function_idx, Some(dest_reg), register_count)?;
         for index in 0..arg_count as usize {
-            let value = &self.call_stack[caller].registers[first_arg.wrapping_add(index as u8) as usize];
+            let value =
+                &self.call_stack[caller].registers[first_arg.wrapping_add(index as u8) as usize];
             let expected = self.call_meta[function_idx].params[index];
             if !expected.matches(value) {
                 let function = &self.functions[function_idx];
@@ -2472,8 +2477,7 @@ impl VM {
         // kind only (precomputed in `CallMeta`). Container contents are
         // checked where they are read, by typed instructions.
         let meta = &self.call_meta[function_idx];
-        if meta.return_kind.matches(value)
-            || (meta.lua_multi_return && matches!(value, Value::Nil))
+        if meta.return_kind.matches(value) || (meta.lua_multi_return && matches!(value, Value::Nil))
         {
             return Ok(());
         }

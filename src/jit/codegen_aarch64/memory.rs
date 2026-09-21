@@ -183,6 +183,87 @@ impl JitCompiler {
         Ok(())
     }
 
+    /// `array[index] = value`. Inline when the index is a known int: the
+    /// array tag, the bounds, and that neither the old element nor the
+    /// value owns anything are checked, then the value's two words replace
+    /// the element. Anything else goes through the helper, which fails to
+    /// the interpreter for an error.
+    pub(super) fn compile_set_index(&mut self, array: u8, index: u8, value: u8) -> Result<()> {
+        unsafe extern "C" {
+            fn jit_array_set_index_safe(
+                array_value: *const Value,
+                index_value: *const Value,
+                value: *const Value,
+            ) -> u8;
+        }
+
+        if let (Some(layout), true) = (
+            jit::layout::rc_vec_layout(),
+            self.scalar_registers.get(&index) == Some(&ValueType::Int),
+        ) {
+            let array_tag = ValueTag::Array.as_u8() as u32;
+            let scalar_max_tag = ValueTag::Float.as_u8() as u32;
+            let rc_offset = layout.array_rc_offset as u32;
+            let len_offset = layout.len_offset as u32;
+            let ptr_offset = layout.ptr_offset as u32;
+            let value_size = mem::size_of::<Value>() as u32;
+            let done = self.ops.new_dynamic_label();
+            let slow = self.ops.new_dynamic_label();
+            self.load_tag(0, array);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #array_tag
+                ; b.ne => slow
+            );
+            self.load_payload(12, index);
+            self.emit_reg_addr(11, array);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x9, [x11, #rc_offset]
+                ; ldr x10, [x9, #len_offset]
+                ; cmp x12, x10
+                ; b.hs >fail
+                ; ldr x10, [x9, #ptr_offset]
+                ; movz w13, #value_size
+                ; madd x10, x12, x13, x10
+                ; ldrb w9, [x10]
+                ; cmp w9, #scalar_max_tag
+                ; b.hi => slow
+            );
+            if !self.scalar_registers.contains_key(&value) {
+                // The value's own tag says whether a plain copy is enough.
+                self.load_tag_from_memory(13, value);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w13, #scalar_max_tag
+                    ; b.hi => slow
+                );
+            }
+            self.emit_reg_addr(11, value);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldp x0, x1, [x11]
+                ; stp x0, x1, [x10]
+                ; b => done
+                ; => slow
+            );
+            self.emit_reg_addr(0, array);
+            self.emit_reg_addr(1, index);
+            self.emit_reg_addr(2, value);
+            self.emit_call(jit_array_set_index_safe as *const ());
+            self.emit_fail_if_w0_zero();
+            dynasm!(self.ops ; .arch aarch64 ; => done);
+            return Ok(());
+        }
+
+        self.emit_reg_addr(0, array);
+        self.emit_reg_addr(1, index);
+        self.emit_reg_addr(2, value);
+        self.emit_call(jit_array_set_index_safe as *const ());
+        self.emit_fail_if_w0_zero();
+        Ok(())
+    }
+
     pub(super) fn compile_array_index_ok(
         &mut self,
         value_dest: u8,
@@ -382,7 +463,8 @@ impl JitCompiler {
 
         if let (Some(index), Some(ty), Some(layout), false) = (
             field_index,
-            _value_type.filter(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool)),
+            _value_type
+                .filter(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool)),
             jit::layout::rc_vec_layout(),
             _is_weak,
         ) {
@@ -441,7 +523,9 @@ impl JitCompiler {
             return Ok(());
         }
 
-        if let (Some(index), Some(layout), false) = (field_index, jit::layout::rc_vec_layout(), _is_weak) {
+        if let (Some(index), Some(layout), false) =
+            (field_index, jit::layout::rc_vec_layout(), _is_weak)
+        {
             // Any strong field read inline: struct tag and field count are
             // checked (anything else fails to the interpreter), then the
             // element is cloned into the register without the runtime.
@@ -523,9 +607,12 @@ impl JitCompiler {
             .get(&value)
             .copied()
             .filter(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool));
-        if let (Some(index), Some(ty), Some(layout), false) =
-            (field_index, value_ty, jit::layout::rc_vec_layout(), _is_weak)
-        {
+        if let (Some(index), Some(ty), Some(layout), false) = (
+            field_index,
+            value_ty,
+            jit::layout::rc_vec_layout(),
+            _is_weak,
+        ) {
             // A scalar store inline when the field currently holds the same
             // scalar kind and the struct is not borrowed; any other
             // situation goes through the helper, which does the full
@@ -650,6 +737,12 @@ impl JitCompiler {
         Ok(())
     }
 
+    /// `array.push(array, value)` / `array:push(value)`. Inline when the
+    /// array has spare capacity, is not borrowed, and the value owns
+    /// nothing: the value's two words go after the last element and the
+    /// length grows. Growth (the memory budget is charged), a borrowed
+    /// array or an owning value go through the helper, which fails to the
+    /// interpreter for an error.
     pub(super) fn compile_array_push(&mut self, array: u8, value: u8) -> Result<()> {
         unsafe extern "C" {
             fn jit_array_push_safe(
@@ -659,13 +752,68 @@ impl JitCompiler {
             ) -> u8;
         }
 
-        // Guards have already verified the type, so directly call the helper
-        dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
-        self.emit_reg_addr(1, array);
-        self.emit_reg_addr(2, value);
-        self.emit_call(jit_array_push_safe as *const ());
-        self.emit_fail_if_w0_zero();
-
+        if let Some(layout) = jit::layout::rc_vec_layout() {
+            let array_tag = ValueTag::Array.as_u8() as u32;
+            let scalar_max_tag = ValueTag::Float.as_u8() as u32;
+            let rc_offset = layout.array_rc_offset as u32;
+            let borrow_offset = layout.borrow_offset as u32;
+            let len_offset = layout.len_offset as u32;
+            let cap_offset = layout.cap_offset as u32;
+            let ptr_offset = layout.ptr_offset as u32;
+            let value_size = mem::size_of::<Value>() as u32;
+            let done = self.ops.new_dynamic_label();
+            let slow = self.ops.new_dynamic_label();
+            self.load_tag(0, array);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #array_tag
+                ; b.ne => slow
+            );
+            self.emit_reg_addr(11, array);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x9, [x11, #rc_offset]
+                ; ldr x10, [x9, #borrow_offset]
+                ; cbnz x10, => slow
+                ; ldr x12, [x9, #len_offset]
+                ; ldr x10, [x9, #cap_offset]
+                ; cmp x12, x10
+                ; b.hs => slow
+            );
+            if !self.scalar_registers.contains_key(&value) {
+                self.load_tag_from_memory(13, value);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w13, #scalar_max_tag
+                    ; b.hi => slow
+                );
+            }
+            self.emit_reg_addr(11, value);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x10, [x9, #ptr_offset]
+                ; movz w13, #value_size
+                ; madd x10, x12, x13, x10
+                ; ldp x0, x1, [x11]
+                ; stp x0, x1, [x10]
+                ; add x12, x12, #1
+                ; str x12, [x9, #len_offset]
+                ; b => done
+                ; => slow
+            );
+            dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
+            self.emit_reg_addr(1, array);
+            self.emit_reg_addr(2, value);
+            self.emit_call(jit_array_push_safe as *const ());
+            self.emit_fail_if_w0_zero();
+            dynasm!(self.ops ; .arch aarch64 ; => done);
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
+            self.emit_reg_addr(1, array);
+            self.emit_reg_addr(2, value);
+            self.emit_call(jit_array_push_safe as *const ());
+            self.emit_fail_if_w0_zero();
+        }
         Ok(())
     }
 
@@ -1116,7 +1264,12 @@ impl JitCompiler {
     /// with no count taken and nothing released (see
     /// `TraceOp::BorrowField`). The struct tag and field count are checked;
     /// anything else fails to the interpreter, which re-executes the read.
-    pub(super) fn compile_borrow_field(&mut self, dest: u8, object: u8, index: usize) -> Result<()> {
+    pub(super) fn compile_borrow_field(
+        &mut self,
+        dest: u8,
+        object: u8,
+        index: usize,
+    ) -> Result<()> {
         let Some(layout) = jit::layout::rc_vec_layout() else {
             return Err(crate::LustError::RuntimeError {
                 message: "a borrow needs the measured struct layout".into(),
@@ -1150,7 +1303,12 @@ impl JitCompiler {
 
     /// `dest` = the bits of payload value `index` of the enum in
     /// `enum_reg`, a borrow of a borrow (see `TraceOp::BorrowEnumValue`).
-    pub(super) fn compile_borrow_enum_value(&mut self, dest: u8, enum_reg: u8, index: u8) -> Result<()> {
+    pub(super) fn compile_borrow_enum_value(
+        &mut self,
+        dest: u8,
+        enum_reg: u8,
+        index: u8,
+    ) -> Result<()> {
         let Some(layout) = jit::layout::enum_layout() else {
             return Err(crate::LustError::RuntimeError {
                 message: "a borrow needs the measured enum layout".into(),

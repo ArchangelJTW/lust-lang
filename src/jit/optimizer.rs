@@ -129,7 +129,8 @@ impl TraceOptimizer {
             {
                 // The guard the recorder put on the binding (or the result)
                 // right after the match says what element type to expect.
-                let value_type = Self::element_guard_type(&bare[i + 4..], *binding_reg, *result_reg);
+                let value_type =
+                    Self::element_guard_type(&bare[i + 4..], *binding_reg, *result_reg);
                 ops.push(TraceOp::ArrayIndexOk {
                     value_dest: *result_reg,
                     condition_dest: *condition_reg,
@@ -335,6 +336,7 @@ impl TraceOptimizer {
             | TraceOp::Concat { dest, .. }
             | TraceOp::GetIndex { dest, .. }
             | TraceOp::TryGetIndex { dest, .. }
+            | TraceOp::ArrayPush { dest, .. }
             | TraceOp::ArrayLen { dest, .. }
             | TraceOp::CallMethod { dest, .. }
             | TraceOp::GetField { dest, .. }
@@ -485,7 +487,8 @@ impl TraceOptimizer {
         }
         // The type of each write, with a running environment so a `Move`
         // of a guarded or typed register counts as a typed write.
-        let mut writes: HashMap<Register, Vec<Option<crate::jit::trace::ValueType>>> = HashMap::new();
+        let mut writes: HashMap<Register, Vec<Option<crate::jit::trace::ValueType>>> =
+            HashMap::new();
         let mut known: HashMap<Register, crate::jit::trace::ValueType> = HashMap::new();
         for op in &trace.ops {
             if let TraceOp::Guard {
@@ -500,10 +503,7 @@ impl TraceOptimizer {
                 TraceOp::Move { src, .. } => known.get(src).copied(),
                 _ => Self::annotated_write_type(op),
             };
-            for register in Self::other_writes(op)
-                .into_iter()
-                .chain(Self::dest_of(op))
-            {
+            for register in Self::other_writes(op).into_iter().chain(Self::dest_of(op)) {
                 writes.entry(register).or_default().push(ty);
                 match ty {
                     Some(ty) => {
@@ -558,10 +558,7 @@ impl TraceOptimizer {
             for register in Self::reads_of(op) {
                 first_access.entry(register).or_insert(false);
             }
-            for register in Self::other_writes(op)
-                .into_iter()
-                .chain(Self::dest_of(op))
-            {
+            for register in Self::other_writes(op).into_iter().chain(Self::dest_of(op)) {
                 first_access.entry(register).or_insert(true);
             }
         }
@@ -601,7 +598,12 @@ impl TraceOptimizer {
             });
         }
         if !hoisted.is_empty() {
-            jit::log(|| format!("⬆️  JIT Optimizer: hoisted {} entry guard(s)", hoisted.len()));
+            jit::log(|| {
+                format!(
+                    "⬆️  JIT Optimizer: hoisted {} entry guard(s)",
+                    hoisted.len()
+                )
+            });
             let mut preamble = hoisted;
             preamble.append(&mut trace.preamble);
             trace.preamble = preamble;
@@ -612,7 +614,9 @@ impl TraceOptimizer {
     /// an inlined call reads its arguments and callee).
     fn reads_of(op: &TraceOp) -> Vec<Register> {
         match op {
-            TraceOp::Move { src, .. } | TraceOp::Neg { src, .. } | TraceOp::Not { src, .. } => vec![*src],
+            TraceOp::Move { src, .. } | TraceOp::Neg { src, .. } | TraceOp::Not { src, .. } => {
+                vec![*src]
+            }
             TraceOp::Add { lhs, rhs, .. }
             | TraceOp::Sub { lhs, rhs, .. }
             | TraceOp::Mul { lhs, rhs, .. }
@@ -632,12 +636,24 @@ impl TraceOptimizer {
             | TraceOp::GuardClosure { register, .. }
             | TraceOp::GuardNativeFunction { register, .. }
             | TraceOp::GuardStructLayout { register, .. }
-            | TraceOp::TypeIs { value: register, .. }
-            | TraceOp::IsEnumVariant { value: register, .. }
-            | TraceOp::GetEnumValue { enum_reg: register, .. }
-            | TraceOp::GetField { object: register, .. }
-            | TraceOp::ArrayLen { array: register, .. }
-            | TraceOp::TryCast { value: register, .. } => vec![*register],
+            | TraceOp::TypeIs {
+                value: register, ..
+            }
+            | TraceOp::IsEnumVariant {
+                value: register, ..
+            }
+            | TraceOp::GetEnumValue {
+                enum_reg: register, ..
+            }
+            | TraceOp::GetField {
+                object: register, ..
+            }
+            | TraceOp::ArrayLen {
+                array: register, ..
+            }
+            | TraceOp::TryCast {
+                value: register, ..
+            } => vec![*register],
             TraceOp::GuardLoopContinue {
                 condition_register, ..
             }
@@ -645,6 +661,12 @@ impl TraceOptimizer {
                 condition_register, ..
             } => vec![*condition_register],
             TraceOp::SetField { object, value, .. } => vec![*object, *value],
+            TraceOp::SetIndex {
+                array,
+                index,
+                value,
+            } => vec![*array, *index, *value],
+            TraceOp::ArrayPush { array, value, .. } => vec![*array, *value],
             TraceOp::GetIndex { array, index, .. }
             | TraceOp::TryGetIndex { array, index, .. }
             | TraceOp::ArrayIndexOk { array, index, .. } => vec![*array, *index],
@@ -837,11 +859,12 @@ impl TraceOptimizer {
             return;
         }
 
-        if trace
-            .ops
-            .iter()
-            .any(|op| matches!(op, TraceOp::InlineCall { .. } | TraceOp::NestedLoopCall { .. }))
-        {
+        if trace.ops.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::InlineCall { .. } | TraceOp::NestedLoopCall { .. }
+            )
+        }) {
             return;
         }
 

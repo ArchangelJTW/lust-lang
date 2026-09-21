@@ -26,6 +26,9 @@ impl JitCompiler {
             function_epilogue: None,
             function_self: None,
             function_labels: HashMap::new(),
+            gas_checked: false,
+            op_counter: 0,
+            label_positions: HashMap::new(),
             exit_is_handoff: false,
             current_fail_ip: None,
             fail_sites: Vec::new(),
@@ -107,6 +110,12 @@ impl JitCompiler {
     /// Compile whole-function code (see `jit::function`). `entry_table` is
     /// the address of the compiled-function entry table, which the code
     /// reads at each `CallDirect`.
+    /// Compile loop back-edges with a gas charge (see `JitCells::gas_left`).
+    pub fn with_gas_checks(mut self, checked: bool) -> Self {
+        self.gas_checked = checked;
+        self
+    }
+
     pub fn compile_function(
         &mut self,
         trace: &Trace,
@@ -292,6 +301,7 @@ impl JitCompiler {
             );
         } else {
             // At end of loop body, jump back to loop_start to loop
+            self.emit_gas_check(trace.ops.len());
             dynasm!(self.ops
                 ; .arch x64
                 ; jmp => loop_start_label
@@ -366,8 +376,7 @@ impl JitCompiler {
                 let _ = fs::create_dir_all(&path);
                 path.push(format!(
                     "jit_trace_{}_{}.bin",
-                    trace_id.0,
-                    trace.function_idx
+                    trace_id.0, trace.function_idx
                 ));
                 if let Err(err) = fs::write(&path, bytes) {
                     crate::jit::log(|| {
@@ -482,12 +491,13 @@ impl JitCompiler {
                 self.current_fail_ip = Some(*ip);
                 continue;
             }
+            self.op_counter += 1;
             // What the previous op left in rax / xmm0 is this op's to use.
             self.hot_rax_in = self.hot_rax.take();
             self.hot_xmm0_in = self.hot_xmm0.take();
             // Fusion looks at the next real op; `At` markers are transparent.
-            let next_index = (op_index + 1..ops.len())
-                .find(|&j| !matches!(ops[j], TraceOp::At { .. }));
+            let next_index =
+                (op_index + 1..ops.len()).find(|&j| !matches!(ops[j], TraceOp::At { .. }));
             if let Some(next_index) = next_index {
                 let next = &ops[next_index];
                 if let TraceOp::GuardLoopContinue {
@@ -703,6 +713,20 @@ impl JitCompiler {
                     self.compile_try_get_index(*dest, *array, *index)?;
                 }
 
+                TraceOp::SetIndex {
+                    array,
+                    index,
+                    value,
+                } => {
+                    self.compile_set_index(*array, *index, *value)?;
+                }
+
+                TraceOp::ArrayPush { dest, array, value } => {
+                    self.compile_array_push(*array, *value)?;
+                    // `array.push` returns Nil.
+                    self.compile_load_const(*dest, &Value::Nil)?;
+                }
+
                 TraceOp::ArrayIndexOk {
                     value_dest,
                     condition_dest,
@@ -838,8 +862,14 @@ impl JitCompiler {
                         .map(|reg| self.scalar_registers.get(reg).copied())
                         .collect();
                     let outer_scalar_registers = mem::take(&mut self.scalar_registers);
-                    let result =
-                        self.compile_inline_call(*dest, *callee, trace, &arg_types, guard_index, guards);
+                    let result = self.compile_inline_call(
+                        *dest,
+                        *callee,
+                        trace,
+                        &arg_types,
+                        guard_index,
+                        guards,
+                    );
                     self.scalar_registers = outer_scalar_registers;
                     let result_type = result?;
                     self.update_scalar_registers(op);
@@ -1085,6 +1115,7 @@ impl JitCompiler {
                 TraceOp::Label { id, scalars } => {
                     let label = self.function_label(*id);
                     dynasm!(self.ops ; .arch x64 ; => label);
+                    self.label_positions.insert(*id, self.op_counter);
                     self.scalar_registers = scalars.iter().copied().collect();
                     // Control also arrives here by jump.
                     self.hot_rax_in = None;
@@ -1092,6 +1123,7 @@ impl JitCompiler {
                 }
 
                 TraceOp::Jump { label } => {
+                    self.emit_back_edge_gas_check(*label);
                     let label = self.function_label(*label);
                     dynasm!(self.ops ; .arch x64 ; jmp => label);
                 }
@@ -1101,6 +1133,7 @@ impl JitCompiler {
                     expect_truthy,
                     label,
                 } => {
+                    self.emit_back_edge_gas_check(*label);
                     self.compile_branch_if(*condition_register, *expect_truthy, *label);
                 }
 
@@ -1209,6 +1242,49 @@ impl JitCompiler {
     /// at the instruction the op came from (inside an inlined body, in the
     /// callee frame the exit path materializes). Without a known ip the
     /// branches fall through to the trace's generic `fail:` (-1).
+    /// A jump to a label already bound is a loop back-edge: charge the ops
+    /// between (before the jump, whether or not a conditional one is
+    /// taken).
+    fn emit_back_edge_gas_check(&mut self, label: usize) {
+        if let Some(position) = self.label_positions.get(&label).copied() {
+            self.emit_gas_check(self.op_counter.saturating_sub(position));
+        }
+    }
+
+    /// Charge `cost` gas at a loop back-edge (see the aarch64 backend). The
+    /// fall-through path leaves rax / xmm0 alone.
+    fn emit_gas_check(&mut self, cost: usize) {
+        if !self.gas_checked {
+            return;
+        }
+        let gas = jit::GAS_LEFT_OFFSET as i32;
+        let cost = cost.clamp(1, i32::MAX as usize) as i32;
+        let exit_label = self.current_exit_label();
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov r9, [r13 + gas]
+            ; sub r9, cost
+            ; jb >gas_out
+            ; mov [r13 + gas], r9
+            ; jmp >gas_ok
+            ; gas_out:
+            ; mov QWORD [r13 + gas], 0
+        );
+        if self.function_mode {
+            let ip = self.current_fail_ip.unwrap_or(usize::MAX >> 16);
+            self.emit_retain_borrows();
+            self.emit_exit_info(ip, jit::EXIT_KIND_FAIL);
+            dynasm!(self.ops ; .arch x64 ; mov eax, -1);
+        } else {
+            dynasm!(self.ops ; .arch x64 ; xor eax, eax);
+        }
+        dynasm!(self.ops
+            ; .arch x64
+            ; jmp => exit_label
+            ; gas_ok:
+        );
+    }
+
     pub(super) fn emit_fail_stub(&mut self) {
         let Some(ip) = self.current_fail_ip else {
             return;
@@ -1243,6 +1319,8 @@ impl JitCompiler {
                 | TraceOp::Concat { .. }
                 | TraceOp::GetIndex { .. }
                 | TraceOp::TryGetIndex { .. }
+                | TraceOp::SetIndex { .. }
+                | TraceOp::ArrayPush { .. }
                 | TraceOp::ArrayIndexOk { .. }
                 | TraceOp::ArrayLen { .. }
                 | TraceOp::CallNative { .. }
@@ -1459,6 +1537,8 @@ impl JitCompiler {
                 | TraceOp::Concat { .. }
                 | TraceOp::GetIndex { .. }
                 | TraceOp::TryGetIndex { .. }
+                | TraceOp::SetIndex { .. }
+                | TraceOp::ArrayPush { .. }
                 | TraceOp::ArrayIndexOk { .. }
                 | TraceOp::ArrayLen { .. }
                 | TraceOp::GuardNativeFunction { .. }
@@ -1556,6 +1636,12 @@ impl JitCompiler {
             TraceOp::SetField { object, value, .. } => {
                 *object == register || *value == register
             }
+            TraceOp::SetIndex {
+                array,
+                index,
+                value,
+            } => *array == register || *index == register || *value == register,
+            TraceOp::ArrayPush { array, value, .. } => *array == register || *value == register,
             TraceOp::NewArray {
                 first_element,
                 count,
@@ -1631,6 +1717,7 @@ impl JitCompiler {
             | TraceOp::Concat { dest, .. }
             | TraceOp::GetIndex { dest, .. }
             | TraceOp::TryGetIndex { dest, .. }
+            | TraceOp::ArrayPush { dest, .. }
             | TraceOp::ArrayLen { dest, .. }
             | TraceOp::CallNative { dest, .. }
             | TraceOp::CallFunction { dest, .. }
@@ -1811,7 +1898,12 @@ impl JitCompiler {
                     }
                 }
             }
+            TraceOp::ArrayPush { dest, .. } => {
+                // `array.push` returns Nil.
+                self.scalar_registers.insert(*dest, ValueType::Plain);
+            }
             TraceOp::SetField { .. }
+            | TraceOp::SetIndex { .. }
             | TraceOp::GuardNativeFunction { .. }
             | TraceOp::GuardGlobals { .. }
             | TraceOp::GuardStructLayout { .. }
@@ -1926,7 +2018,9 @@ impl JitCompiler {
             // Push the inline record (see `JitInlineRecord`). It is linked
             // into the unwind chain only once the frame below it is fully
             // built, so a failure while building it exits cleanly.
-            let caller_resume_ip = self.current_fail_ip.map_or(0, |ip| ip + trace.resume_offset);
+            let caller_resume_ip = self
+                .current_fail_ip
+                .map_or(0, |ip| ip + trace.resume_offset);
             // An argument of unknown type whose callee register the body
             // never writes is aliased: its bits are copied without touching
             // the reference count, and the register is neither dropped at
@@ -2104,7 +2198,10 @@ impl JitCompiler {
             let may_own = (0..trace.register_count).any(|reg| {
                 !self.scalar_registers.contains_key(&reg)
                     && (helper_copied.contains(&reg)
-                        || trace.body.iter().any(|op| Self::op_writes_register(op, reg)))
+                        || trace
+                            .body
+                            .iter()
+                            .any(|op| Self::op_writes_register(op, reg)))
             });
             if may_own {
                 for reg in 0..trace.register_count.min(64) {

@@ -85,6 +85,9 @@ pub struct JitCompiler {
     /// Function mode: the epilogue, for propagating an exit that happened
     /// inside a native callee.
     function_epilogue: Option<dynasmrt::DynamicLabel>,
+    /// Function code: the function being compiled and the label at its
+    /// entry, so a call to itself is a direct call.
+    function_self: Option<(usize, dynasmrt::DynamicLabel)>,
     /// Branch targets of the function being compiled, by bytecode ip.
     function_labels: HashMap<usize, dynasmrt::DynamicLabel>,
     /// Function mode: the exit being emitted hands a call to the

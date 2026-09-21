@@ -2055,22 +2055,25 @@ impl VM {
         // Native-to-native calls grow the machine stack; give them at most
         // `NATIVE_STACK_RESERVE` below here before they hand calls to the
         // interpreter, whose frames live on the heap.
+        // And no deeper than the interpreter's frame depth limit allows:
+        // each native call level takes at least `MIN_NATIVE_FRAME` bytes.
         let marker = 0u8;
         let sp = &marker as *const u8 as usize;
-        let limit = sp.saturating_sub(crate::jit::NATIVE_STACK_RESERVE);
-        if self.jit_cells.stack_limit == 0 || limit < self.jit_cells.stack_limit {
-            self.jit_cells.stack_limit = limit;
-        }
+        let depth_budget = self.max_stack_depth.saturating_sub(self.call_stack.len());
+        let limit = sp
+            .saturating_sub(crate::jit::NATIVE_STACK_RESERVE)
+            .max(sp.saturating_sub(depth_budget.saturating_mul(crate::jit::MIN_NATIVE_FRAME)));
+        let outer_limit = core::mem::replace(&mut self.jit_cells.stack_limit, limit);
 
         let cost = code.trace.ops.len();
         self.budgets.charge_gas(core::cmp::max(1, cost) as u64)?;
         self.jit.record_native_entry();
         self.pending_jit_error = None;
         self.jit_cells.exit_info = usize::MAX;
-        self.jit_cells.depth_budget = self.max_stack_depth.saturating_sub(self.call_stack.len());
         let registers_ptr = self.call_stack.last_mut().unwrap().registers.as_mut_ptr();
         let vm_ptr = self as *mut VM;
         let result = code.execute(registers_ptr, vm_ptr, ptr::null());
+        self.jit_cells.stack_limit = outer_limit;
         crate::jit::log(|| format!("🎯 JIT: function {} native result {}", func_idx, result));
         drop(code);
 

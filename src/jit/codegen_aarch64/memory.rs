@@ -966,13 +966,16 @@ impl JitCompiler {
         Ok(())
     }
 
+    /// Returns whether the test was compiled inline (the enum's tag and
+    /// names compared), so a following branch knows what a true result
+    /// proves.
     pub(super) fn compile_is_enum_variant(
         &mut self,
         dest: u8,
         value: u8,
         enum_name: &str,
         variant_name: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         unsafe extern "C" {
             fn jit_is_enum_variant_safe(
                 value_ptr: *const Value,
@@ -1025,7 +1028,7 @@ impl JitCompiler {
                 ; done:
             );
             self.store_from_x0(dest, ValueTag::Bool.as_u8());
-            return Ok(());
+            return Ok(true);
         }
         let (enum_name_ptr, enum_name_len) = self.retain_string(enum_name);
         let (variant_name_ptr, variant_name_len) = self.retain_string(variant_name);
@@ -1037,7 +1040,7 @@ impl JitCompiler {
         self.emit_call(jit_is_enum_variant_safe as *const ());
         dynasm!(self.ops ; .arch aarch64 ; and x0, x0, 0xff);
         self.store_from_x0(dest, ValueTag::Bool.as_u8());
-        Ok(())
+        Ok(false)
     }
 
     pub(super) fn compile_type_is(&mut self, dest: u8, value: u8, type_name: &str) -> Result<()> {
@@ -1159,23 +1162,30 @@ impl JitCompiler {
         let ptr_offset = layout.values_ptr_offset as u32;
         let unit_offset = layout.unit_word_offset as u32;
         let element = (index as usize * mem::size_of::<Value>()) as i32;
-        self.load_tag(0, enum_reg);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; cmp w0, #tag
-            ; b.ne >fail
-        );
+        // The enum test this read follows already proved the tag and the
+        // variant; only the payload length is left to check.
+        let verified = self.verified_enum_in == Some(enum_reg);
+        if !verified {
+            self.load_tag(0, enum_reg);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #tag
+                ; b.ne >fail
+            );
+        }
         self.emit_reg_addr(11, enum_reg);
+        dynasm!(self.ops ; .arch aarch64 ; ldr x9, [x11, #object_offset]);
+        if !verified {
+            dynasm!(self.ops ; .arch aarch64 ; ldr x10, [x9, #unit_offset]);
+            self.emit_mov_imm64(12, layout.unit_word_value as u64);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp x10, x12
+                ; b.eq >fail
+            );
+        }
         dynasm!(self.ops
             ; .arch aarch64
-            ; ldr x9, [x11, #object_offset]
-            ; ldr x10, [x9, #unit_offset]
-        );
-        self.emit_mov_imm64(12, layout.unit_word_value as u64);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; cmp x10, x12
-            ; b.eq >fail
             ; ldr x10, [x9, #len_offset]
             ; cmp x10, #index as u32
             ; b.ls >fail

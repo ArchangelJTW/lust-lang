@@ -19,6 +19,8 @@ impl JitCompiler {
             hot_d0: None,
             hot_x0_in: None,
             hot_d0_in: None,
+            verified_enum: None,
+            verified_enum_in: None,
             dirty_pins: Vec::new(),
             trace_start_ip: 0,
             function_mode: false,
@@ -28,6 +30,7 @@ impl JitCompiler {
             function_result: None,
             function_entry_table: 0,
             function_epilogue: None,
+            function_self: None,
             function_labels: HashMap::new(),
             exit_is_handoff: false,
             pending_scalar: None,
@@ -195,6 +198,11 @@ impl JitCompiler {
         });
 
         // Entry: x0 = *mut Value (registers), x1 = *mut VM, x2 = *const Function
+        if self.function_mode {
+            let entry = self.ops.new_dynamic_label();
+            dynasm!(self.ops ; .arch aarch64 ; => entry);
+            self.function_self = Some((trace.function_idx, entry));
+        }
         dynasm!(self.ops
             ; .arch aarch64
             ; stp x29, x30, [sp, -16]!
@@ -608,6 +616,7 @@ impl JitCompiler {
             // What the previous op left in x0 / d0 is this op's to use.
             self.hot_x0_in = self.hot_x0.take();
             self.hot_d0_in = self.hot_d0.take();
+            self.verified_enum_in = self.verified_enum.take();
             if self.pin_active && pins::op_touches_register_memory(op) {
                 self.flush_dirty_pins();
             }
@@ -1096,7 +1105,20 @@ impl JitCompiler {
                     enum_name,
                     variant_name,
                 } => {
-                    self.compile_is_enum_variant(*dest, *value, enum_name, variant_name)?;
+                    let inline = self.compile_is_enum_variant(*dest, *value, enum_name, variant_name)?;
+                    // Followed by a branch away on false: the fallthrough
+                    // has the enum proven, for the payload read after it.
+                    if inline
+                        && let Some(next_index) = next_index
+                        && let TraceOp::BranchIf {
+                            condition_register,
+                            expect_truthy: false,
+                            ..
+                        } = &ops[next_index]
+                        && condition_register == dest
+                    {
+                        self.verified_enum = Some(*value);
+                    }
                 }
 
                 TraceOp::TypeIs {
@@ -1221,6 +1243,7 @@ impl JitCompiler {
                     // Control also arrives here by jump.
                     self.hot_x0_in = None;
                     self.hot_d0_in = None;
+                    self.verified_enum_in = None;
                 }
 
                 TraceOp::Jump { label } => {
@@ -1233,7 +1256,10 @@ impl JitCompiler {
                     expect_truthy,
                     label,
                 } => {
+                    let verified = self.verified_enum_in.take();
                     self.compile_branch_if(*condition_register, *expect_truthy, *label);
+                    // Carried past the branch to the payload read.
+                    self.verified_enum = verified;
                 }
 
                 TraceOp::CallDirect {
@@ -1885,9 +1911,9 @@ impl JitCompiler {
         let specialized_bytes =
             SPECIALIZED_STACK_BASE + (specialized_slots * SPECIALIZED_SLOT_SIZE);
         // Function code pays for its local area on every call, so it takes
-        // only what its specialized values need.
+        // only what its specialized values need — nothing, usually.
         let size = if self.function_mode {
-            specialized_bytes
+            if specialized_slots == 0 { 0 } else { specialized_bytes }
         } else {
             MIN_JIT_STACK_SIZE.max(specialized_bytes)
         };

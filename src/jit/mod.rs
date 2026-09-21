@@ -78,8 +78,11 @@ pub const FUNCTION_HOT_THRESHOLD: u32 = 30;
 /// `Return` reached: `FUNCTION_RETURN_BASE + register` (255 = Nil).
 pub const FUNCTION_RETURN_BASE: i32 = 1 << 20;
 /// Result of compiled function code called natively by other compiled code
-/// when it returned normally (anything else is an exit to propagate).
-pub const NATIVE_RETURNED: i32 = 1 << 30;
+/// when it returned normally (anything else is an exit to propagate). Above
+/// every `FUNCTION_RETURN_BASE + register`, and an aarch64 12-bit
+/// immediate shifted by 12, so a caller compares against it in one
+/// instruction.
+pub const NATIVE_RETURNED: i32 = 1 << 23;
 /// Runtime state compiled code reads and writes directly, addressed
 /// through the VM pointer it holds (`VM::jit_cells`): a native call checks
 /// the stack limit and depth budget, an exit records where it left, and a
@@ -90,14 +93,13 @@ pub const NATIVE_RETURNED: i32 = 1 << 30;
 pub struct JitCells {
     /// Lowest machine stack address native-to-native calls may grow to.
     /// Set by the VM before entering function code; a call that would go
-    /// below it is handed to the interpreter instead.
+    /// below it is handed to the interpreter instead. It is the lower of
+    /// the native stack reserve and the interpreter's remaining frame
+    /// depth times `MIN_NATIVE_FRAME`: a native call takes at least that
+    /// much stack, so the depth limit cannot be passed natively (the
+    /// interpreter, handed the call, counts the rest and raises the
+    /// overflow).
     pub stack_limit: usize,
-    /// Native calls still allowed before the interpreter's stack depth
-    /// limit would be reached: `max_stack_depth - call_stack.len()` at the
-    /// interpreter's entry into function code, decremented by each native
-    /// call and restored on return. A call with no budget left is handed
-    /// to the interpreter, which raises the overflow.
-    pub depth_budget: usize,
     /// Where the interpreter resumes after function code exits (any depth
     /// of native calls in): the exiting site's bytecode ip in the low 48
     /// bits, its kind in the high bits (`EXIT_KIND_*`). Set by the exit
@@ -120,7 +122,6 @@ impl Default for JitCells {
     fn default() -> Self {
         Self {
             stack_limit: 0,
-            depth_budget: 0,
             exit_info: usize::MAX,
             call_ip: usize::MAX,
             entry_table: 0,
@@ -131,7 +132,6 @@ impl Default for JitCells {
 /// Byte offsets of the cells from the VM pointer, for compiled code.
 pub const CELLS_OFFSET: usize = core::mem::offset_of!(VM, jit_cells);
 pub const STACK_LIMIT_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCells, stack_limit);
-pub const DEPTH_BUDGET_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCells, depth_budget);
 pub const EXIT_INFO_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCells, exit_info);
 pub const CALL_IP_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCells, call_ip);
 pub const ENTRY_TABLE_OFFSET: usize = CELLS_OFFSET + core::mem::offset_of!(JitCells, entry_table);
@@ -149,6 +149,11 @@ impl VM {
 /// Machine stack kept free below the interpreter's entry into function
 /// code before native calls hand over to the interpreter.
 pub const NATIVE_STACK_RESERVE: usize = 1 << 20;
+/// The least machine stack one native-to-native call level takes (its
+/// record, a frame of at least one register, the callee's saved
+/// registers), on either backend. Used to turn the interpreter's frame
+/// depth limit into a stack address.
+pub const MIN_NATIVE_FRAME: usize = 96;
 pub const EXIT_KIND_SHIFT: u32 = 48;
 /// A guard on something the code assumed: the function's code is evicted.
 pub const EXIT_KIND_GUARD: usize = 0;

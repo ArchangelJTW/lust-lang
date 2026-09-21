@@ -20,6 +20,7 @@ impl JitCompiler {
             function_result: None,
             function_entry_table: 0,
             function_epilogue: None,
+            function_self: None,
             function_labels: HashMap::new(),
             exit_is_handoff: false,
             current_fail_ip: None,
@@ -209,6 +210,11 @@ impl JitCompiler {
         // Entry: rdi = registers, rsi = VM, rdx = the inline record a native
         // caller pushed for this frame (function mode; null from the
         // interpreter). Traces are only ever entered by the interpreter.
+        if self.function_mode {
+            let entry = self.ops.new_dynamic_label();
+            dynasm!(self.ops ; .arch x64 ; => entry);
+            self.function_self = Some((trace.function_idx, entry));
+        }
         dynasm!(self.ops
             ; .arch x64
             ; push rbp

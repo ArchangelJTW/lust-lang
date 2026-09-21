@@ -542,33 +542,60 @@ impl JitCompiler {
             callee_reg: callee as usize,
             caller_resume_ip: resume_ip,
         });
+        // A call to the function being compiled is a direct call to its
+        // own entry: no table lookup, and no way for it to be absent.
+        let self_entry = self
+            .function_self
+            .filter(|(idx, _)| *idx == function_idx)
+            .map(|(_, entry)| entry);
         dynasm!(self.ops
             ; .arch x64
-            // Native stack limit and the interpreter's frame depth limit
-            // (see `JitCells`).
+            // Native stack limit, which also bounds the frame depth (see
+            // `JitCells`).
             ; cmp rsp, [r13 + jit::STACK_LIMIT_OFFSET as i32]
             ; jb => to_interpreter
-            ; cmp QWORD [r13 + jit::DEPTH_BUDGET_OFFSET as i32], 0
-            ; je => to_interpreter
-            // The callee's entry point, if it has compiled code.
-            ; mov rax, [r13 + jit::ENTRY_TABLE_OFFSET as i32]
-            ; mov rbx, [rax + slot_offset]
-            ; test rbx, rbx
-            ; jz => to_interpreter
+        );
+        if self_entry.is_none() {
+            dynasm!(self.ops
+                ; .arch x64
+                // The callee's entry point, if it has compiled code.
+                ; mov rax, [r13 + jit::ENTRY_TABLE_OFFSET as i32]
+                ; mov rbx, [rax + slot_offset]
+                ; test rbx, rbx
+                ; jz => to_interpreter
+            );
+        }
+        dynasm!(self.ops
+            ; .arch x64
             // The record (see `JitInlineRecord`).
             ; sub rsp, metadata_size
             ; mov [rsp], r12
             ; mov [rsp + 8], r15
             ; mov rax, QWORD site as i64
             ; mov [rsp + 16], rax
-            // The callee frame: every register Nil, then the arguments.
+            // The callee frame: every register Nil — except those the
+            // arguments below overwrite whole (a helper-copied argument
+            // reads the old slot, so it keeps its Nil) — then the arguments.
             ; sub rsp, frame_size
         );
+        let copied_whole = |this: &Self, index: usize, src_reg: u8| {
+            (index < 64 && alias_mask & (1 << index) != 0)
+                || matches!(
+                    this.scalar_registers.get(&src_reg),
+                    Some(ValueType::Int | ValueType::Bool | ValueType::Float)
+                )
+        };
         for reg in 0..callee_registers {
+            if sources
+                .get(usize::from(reg))
+                .is_some_and(|src| copied_whole(self, usize::from(reg), *src))
+            {
+                continue;
+            }
             let offset = reg as i32 * value_size;
             dynasm!(self.ops ; .arch x64 ; mov BYTE [rsp + offset], 0);
         }
-        for (index, src_reg) in sources.into_iter().enumerate() {
+        for (index, src_reg) in sources.iter().copied().enumerate() {
             let src_offset = (src_reg as i32) * value_size;
             let dest_offset = index as i32 * value_size;
             if index < 64 && alias_mask & (1 << index) != 0 {
@@ -622,16 +649,20 @@ impl JitCompiler {
         dynasm!(self.ops
             ; .arch x64
             // Enter the callee: rdi = its registers, rsi = VM, rdx = record.
-            ; dec QWORD [r13 + jit::DEPTH_BUDGET_OFFSET as i32]
             ; mov rdi, rsp
             ; mov rsi, r13
             ; lea rdx, [rsp + frame_size]
             ; lea rcx, [r12 + (dest as i32) * value_size]
-            ; call rbx
+        );
+        match self_entry {
+            Some(entry) => dynasm!(self.ops ; .arch x64 ; call => entry),
+            None => dynasm!(self.ops ; .arch x64 ; call rbx),
+        }
+        dynasm!(self.ops
+            ; .arch x64
             // Pop the frame and record; the callee's epilogue restored
             // rbx, r12..r15.
             ; add rsp, frame_size + metadata_size
-            ; inc QWORD [r13 + jit::DEPTH_BUDGET_OFFSET as i32]
             ; cmp eax, DWORD returned
             ; je => done
             // Anything else is an exit that already materialized every

@@ -526,31 +526,39 @@ impl JitCompiler {
             .function_epilogue
             .expect("function code is compiled inside compile_trace");
 
-        // Native stack limit (see `JIT_STACK_LIMIT`), the interpreter's
-        // frame depth limit (`JIT_DEPTH_BUDGET`) and the callee's entry
-        // point (from the entry table), all from their cells: the
-        // callee-saved registers are for pinned values.
+        // Native stack limit (which also bounds the frame depth, see
+        // `JitCells`) and the callee's entry point (from the entry table),
+        // from their cells: the callee-saved registers are for pinned
+        // values.
         let slot_offset = function_idx * mem::size_of::<usize>();
         let stack_limit = jit::STACK_LIMIT_OFFSET as u32;
-        let depth_budget = jit::DEPTH_BUDGET_OFFSET as u32;
         let entry_table = jit::ENTRY_TABLE_OFFSET as u32;
+        // A call to the function being compiled is a direct branch to
+        // its own entry: no table lookup, and no way for it to be absent.
+        let self_entry = self
+            .function_self
+            .filter(|(idx, _)| *idx == function_idx)
+            .map(|(_, entry)| entry);
         dynasm!(self.ops
             ; .arch aarch64
             ; ldr x9, [x20, #stack_limit]
             ; mov x10, sp
             ; cmp x10, x9
             ; b.lo => to_interpreter
-            ; ldr x10, [x20, #depth_budget]
-            ; cbz x10, => to_interpreter
-            ; ldr x11, [x20, #entry_table]
         );
-        if slot_offset <= 32760 {
-            dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x11, #slot_offset as u32]);
-        } else {
-            self.emit_mov_imm64(9, slot_offset as u64);
-            dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x11, x9]);
+        let load_entry = |this: &mut Self| {
+            dynasm!(this.ops ; .arch aarch64 ; ldr x11, [x20, #entry_table]);
+            if slot_offset <= 32760 {
+                dynasm!(this.ops ; .arch aarch64 ; ldr x16, [x11, #slot_offset as u32]);
+            } else {
+                this.emit_mov_imm64(9, slot_offset as u64);
+                dynasm!(this.ops ; .arch aarch64 ; ldr x16, [x11, x9]);
+            }
+        };
+        if self_entry.is_none() {
+            load_entry(self);
+            dynasm!(self.ops ; .arch aarch64 ; cbz x16, => to_interpreter);
         }
-        dynasm!(self.ops ; .arch aarch64 ; cbz x16, => to_interpreter);
 
         // Push the record (see `JitInlineRecord`): value_count, caller
         // regs, previous chain, alias mask, function, result register,
@@ -572,17 +580,32 @@ impl JitCompiler {
             ; str x0, [sp, 16]
         );
 
-        // The callee frame: every register Nil (tag 0), then the arguments.
+        // The callee frame: every register Nil (tag 0) — except those the
+        // arguments below overwrite whole (a helper-copied argument reads
+        // the old slot, so it keeps its Nil) — then the arguments.
+        let copied_whole = |this: &Self, index: usize, src_reg: u8| {
+            (index < 64 && alias_mask & (1 << index) != 0)
+                || matches!(
+                    this.scalar_registers.get(&src_reg),
+                    Some(ValueType::Int | ValueType::Bool | ValueType::Float)
+                )
+        };
         self.emit_sub_sp(frame_size);
         dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
         for reg in 0..callee_registers {
+            if sources
+                .get(usize::from(reg))
+                .is_some_and(|src| copied_whole(self, usize::from(reg), *src))
+            {
+                continue;
+            }
             let offset = super::registers::reg_offset(reg) as u32;
             dynasm!(self.ops ; .arch aarch64 ; strb wzr, [x11, #offset]);
         }
         // x16 (the entry) survives the argument moves unless one calls a
         // helper; then it is reloaded.
         let mut helper_called = false;
-        for (index, src_reg) in sources.into_iter().enumerate() {
+        for (index, src_reg) in sources.iter().copied().enumerate() {
             let dest_offset = index as i32 * value_size;
             if index < 64 && alias_mask & (1 << index) != 0 {
                 // Aliased: a bitwise copy the callee only reads and does
@@ -637,35 +660,21 @@ impl JitCompiler {
 
         // Enter the callee: x0 = its registers, x1 = VM, x2 = its record.
         // The entry is reloaded: the argument moves above may have called
-        // helpers through x16. The depth budget is spent for the call's
-        // duration.
-        if helper_called {
-            dynasm!(self.ops ; .arch aarch64 ; ldr x11, [x20, #entry_table]);
-            if slot_offset <= 32760 {
-                dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x11, #slot_offset as u32]);
-            } else {
-                self.emit_mov_imm64(9, slot_offset as u64);
-                dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x11, x9]);
-            }
+        // helpers through x16.
+        if helper_called && self_entry.is_none() {
+            load_entry(self);
         }
         dynasm!(self.ops
             ; .arch aarch64
-            ; ldr x9, [x20, #depth_budget]
-            ; sub x9, x9, 1
-            ; str x9, [x20, #depth_budget]
             ; mov x0, sp
             ; mov x1, x20
-            ; mov x11, sp
+            ; add x2, sp, #frame_size as u32
         );
-        self.emit_add_imm(2, 11, frame_size);
         self.emit_reg_addr(3, dest);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; blr x16
-            ; ldr x9, [x20, #depth_budget]
-            ; add x9, x9, 1
-            ; str x9, [x20, #depth_budget]
-        );
+        match self_entry {
+            Some(entry) => dynasm!(self.ops ; .arch aarch64 ; bl => entry),
+            None => dynasm!(self.ops ; .arch aarch64 ; blr x16),
+        }
         // Pop the frame and record; the callee's epilogue restored x19..x24.
         let pop = (frame_size + INLINE_METADATA_SIZE) as u32;
         if pop <= 4095 {
@@ -675,11 +684,10 @@ impl JitCompiler {
             self.emit_add_imm(11, 11, pop as i32);
             dynasm!(self.ops ; .arch aarch64 ; mov sp, x11);
         }
-        let returned_hi = (jit::NATIVE_RETURNED as u32) >> 16;
+        let returned_shifted = (jit::NATIVE_RETURNED as u32) >> 12;
         dynasm!(self.ops
             ; .arch aarch64
-            ; movz w9, #returned_hi, lsl #16
-            ; cmp w0, w9
+            ; cmp w0, #returned_shifted, lsl #12
             ; b.eq => done
             // Anything else is an exit that already materialized every
             // frame (ours included): propagate it.

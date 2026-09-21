@@ -128,6 +128,11 @@ pub struct JitCompiler {
     hot_d0: Option<u8>,
     hot_x0_in: Option<u8>,
     hot_d0_in: Option<u8>,
+    /// A register an inline `IsEnumVariant` just proved to be an enum of
+    /// the tested variant, on the path where the branch on its result
+    /// fell through: the payload read that follows skips those checks.
+    verified_enum: Option<u8>,
+    verified_enum_in: Option<u8>,
     /// Carried pins whose machine value may be newer than memory.
     dirty_pins: Vec<u8>,
     /// Loop-header ip of the trace being compiled: where a guard that fails
@@ -156,6 +161,9 @@ pub struct JitCompiler {
     /// Function mode: the epilogue, for propagating an exit that happened
     /// inside a native callee.
     function_epilogue: Option<dynasmrt::DynamicLabel>,
+    /// Function code: the function being compiled and the label at its
+    /// entry, so a call to itself is a direct branch.
+    function_self: Option<(usize, dynasmrt::DynamicLabel)>,
     /// Branch targets of the function being compiled, by bytecode ip.
     function_labels: HashMap<usize, dynasmrt::DynamicLabel>,
     /// Function mode: the exit being emitted hands a call to the

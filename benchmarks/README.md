@@ -158,15 +158,15 @@ timed), milliseconds, single run each:
 
 | program   | lust-vm | lust-jit | luajit | lua 5.5 |
 |-----------|--------:|---------:|-------:|--------:|
-| fields    |     696 |       46 |     57 |     119 |
-| array     |    1248 |       49 |     58 |      76 |
-| calls     |     726 |       62 |     30 |     130 |
-| methods   |    1166 |       61 |     30 |     216 |
-| strings   |     116 |      116 |    122 |     156 |
-| fib       |     165 |       32 |     22 |      37 |
-| nested    |     352 |       25 |     28 |      78 |
-| floatmath |     522 |       55 |     37 |      93 |
-| tree      |     683 |      102 |     41 |      53 |
+| fields    |     710 |       45 |     57 |     118 |
+| array     |    1249 |       48 |     59 |      79 |
+| calls     |     745 |       61 |     29 |     128 |
+| methods   |    1178 |       59 |     30 |     222 |
+| strings   |     113 |      113 |    121 |     154 |
+| fib       |     166 |       30 |     22 |      38 |
+| nested    |     372 |       26 |     30 |      77 |
+| floatmath |     543 |       52 |     37 |      87 |
+| tree      |     673 |      110 |     39 |      53 |
 
 (`strings` builds a 100,000-character string; it was 1,000,000 characters,
 14 s for every engine but Lua, until the suite got a per-program timeout.)
@@ -251,9 +251,25 @@ read as the value's bits with no reference count taken and nothing
 released at return; every exit to the interpreter retains what the
 borrowed registers hold first, and a copy of a borrow (`held = l`) is a
 clone the register owns. `tree`'s `sum` went 0.14 → 0.12 s for 200
-passes (suite 107 → 102). What remains in a node visit is the call
+passes (suite 107 → 102). What remained in a node visit was the call
 itself — stack and depth checks, the record, a frame of Nil registers,
-the argument copy, the result — about a third of the instructions.
+the argument copy, the result — about a third of the instructions. The
+call is now cheaper: the depth limit is folded into the stack limit the
+interpreter sets before entering native code (one compare against a
+stack address instead of a compare, a decrement and a store), a
+function calling itself branches to its own entry rather than loading
+the entry table, the callee's registers are initialised to Nil only
+where the caller has not already copied an argument in, the argument
+copy is placed relative to `sp` in one instruction, and a `Some(x)`
+whose variant the code just tested is read without re-checking the tag
+or the payload's niche. `fib(34)` went 85 → 73 ms and a method-call
+loop 936 → 871, but `tree` did not move (454 → 448 ms for 1,000
+passes; the suite's `tree` row reads 107–111 ms today with either
+binary, the 102 above was a cooler run): a node visit is now bound by
+the chain of dependent loads —
+node → fields vector → `Option` object → payload vector → child — not
+by the call around them, and shortening that chain means changing the
+representation again, not the call.
 `array` was
 204 ms for a reason that had nothing to do with its element loop: when
 the outer `pass` loop got hot and was recorded, the recorder skipped the

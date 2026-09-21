@@ -541,8 +541,16 @@ impl StructLayout {
 /// with the same text are the same allocation, so equality is a pointer
 /// comparison, and generated code compares a value's variant against a
 /// constant the same way.
-#[derive(Clone, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Eq, PartialOrd, Ord)]
 pub struct Name(Rc<str>);
+
+// Equal names (the same allocation, or the same text without `std`) hash
+// the same: the hash is the text's.
+impl Hash for Name {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
 
 #[cfg(feature = "std")]
 thread_local! {

@@ -233,6 +233,20 @@ the native stack, back to the interpreter at the call instruction. Exits
 from any depth of native calls turn the native frames into interpreter
 frames first, so errors and stack traces look the same either way.
 
+Values are reference-counted, and the compiled code keeps the counts
+itself: every heap value is one `Rc` (a `Value` is a tag and an 8-byte
+payload), so a clone is one increment and a release one decrement, with
+the runtime called only when a count reaches zero. A register the code can
+prove holds nothing owned — a fresh frame's unwritten registers, a scalar,
+a function index — is overwritten with no check at all. In a function
+that nothing it runs can make write a struct field (no `SetField`, no
+method or native call, every call to a bytecode function that is itself
+field-pure), a non-scalar field of a parameter the function never writes
+or returns, and the payload of such an enum, are *borrowed*: read as the
+value's bits with no count taken and nothing released, since the caller
+keeps the struct alive for the whole call; every exit to the interpreter
+retains what the borrowed registers hold first.
+
 Environment switches, read once at VM creation:
 
 - `LUST_JIT=0` disables the JIT entirely (the interpreter is the reference

@@ -226,20 +226,16 @@ fn probe_enum() -> Option<EnumLayout> {
     let variant_offset = unique_position(&object_words, variant.inner_ptr() as usize)? * 8;
     let values_ptr_offset = unique_position(&object_words, elements)? * 8;
     let values_len_offset = unique_position(&object_words, 3)? * 8;
-    if unique_position(&object_words, 7).is_none() {
-        return None;
-    }
+    let cap_word = unique_position(&object_words, 7)?;
     // A unit variant has no payload. `Option<Vec>` encodes `None` in a
     // niche — a null element pointer, or a capacity above `isize::MAX` —
     // and which one is measured, not assumed: the word of the `Vec` that
-    // holds an impossible value in a `None`.
+    // holds an impossible value in a `None`. The capacity niche is
+    // definitive when present; a null element pointer is the other
+    // encoding (the words a `None` does not use hold whatever was there,
+    // so a zero pointer next to a capacity niche means nothing).
     let unit = crate::bytecode::EnumObject::new(enum_name, variant, None);
     let unit_words = words(inner_of(&unit) as *const u8, object_words.len());
-    // The capacity niche is definitive when present; a null element
-    // pointer is the other encoding (the words a `None` does not use hold
-    // whatever was there, so a zero pointer next to a capacity niche means
-    // nothing).
-    let cap_word = unique_position(&object_words, 7)?;
     let ptr_word = values_ptr_offset / 8;
     let (unit_word_offset, unit_word_value) = if unit_words[cap_word] > isize::MAX as usize {
         (cap_word * 8, unit_words[cap_word])
@@ -305,9 +301,8 @@ fn cell_words(
     let at_rest = words(cell_ptr, 4);
     let ptr_word = unique_position(&at_rest, elements)?;
     let len_word = unique_position(&at_rest, 2)?;
-    if unique_position(&at_rest, 5).is_none() {
-        return None;
-    }
+    // The capacity (5) must be a word of its own too.
+    unique_position(&at_rest, 5)?;
     let borrowed = borrow();
     let changed: Vec<usize> = (0..4).filter(|i| borrowed[*i] != at_rest[*i]).collect();
     let borrow_word = match changed.as_slice() {

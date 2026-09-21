@@ -1,3 +1,6 @@
+// dynasm's register operands (`X(r)`, `D(r)`) convert a `u8` to a `u8`.
+#![allow(clippy::useless_conversion)]
+
 // AArch64 JIT codegen — requires the `std` feature and target_arch = "aarch64".
 //
 // This is a port of the x86_64 backend in `src/jit/codegen`. Every `dynasm!`

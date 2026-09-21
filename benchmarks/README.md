@@ -166,7 +166,7 @@ timed), milliseconds, single run each:
 | fib       |     165 |       32 |     22 |      37 |
 | nested    |     352 |       25 |     28 |      78 |
 | floatmath |     522 |       55 |     37 |      93 |
-| tree      |     671 |      112 |     39 |      53 |
+| tree      |     683 |      102 |     41 |      53 |
 
 (`strings` builds a 100,000-character string; it was 1,000,000 characters,
 14 s for every engine but Lua, until the suite got a per-program timeout.)
@@ -242,7 +242,19 @@ constant feeding an add is stored and used as an immediate rather than
 stored and reloaded, and the value a store leaves in x0 or d0 is what
 the next op reads — a comparison feeding a branch, a result feeding a
 return — instead of a reload (aarch64). `calls` 62 → 60, `methods` 61 →
-58, `tree` 112 → 107. `array` was
+58, `tree` 112 → 107. Then borrows: in a compiled function that nothing
+it runs can make write a struct field (no `SetField`, no method or
+native call, every call to a bytecode function that is field-pure
+itself — recursion included), a non-scalar field of a parameter the
+function never writes or returns, and the payload of such an enum, are
+read as the value's bits with no reference count taken and nothing
+released at return; every exit to the interpreter retains what the
+borrowed registers hold first, and a copy of a borrow (`held = l`) is a
+clone the register owns. `tree`'s `sum` went 0.14 → 0.12 s for 200
+passes (suite 107 → 102). What remains in a node visit is the call
+itself — stack and depth checks, the record, a frame of Nil registers,
+the argument copy, the result — about a third of the instructions.
+`array` was
 204 ms for a reason that had nothing to do with its element loop: when
 the outer `pass` loop got hot and was recorded, the recorder skipped the
 inner loop's iterations (a `NestedLoopCall` runs them through the inner

@@ -1521,6 +1521,7 @@ end
             frame_may_own: true,
             entry_scalars: Vec::new(),
             alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![TraceOp::GuardLoopContinue {
                 condition_register: 0,

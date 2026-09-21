@@ -539,3 +539,170 @@ mod refcount_tests {
         drop(leaf_a);
     }
 }
+
+#[cfg(all(test, feature = "std", any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod borrow_tests {
+    use crate::bytecode::Value;
+    use crate::embed::EmbeddedProgram;
+    use alloc::rc::Rc;
+
+    fn strong(value: &Value) -> usize {
+        match value {
+            Value::Struct(object) => Rc::strong_count(object),
+            other => panic!("not a struct: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn borrowed_fields_balance_reference_counts() {
+        let source = r#"
+            struct Node
+                value: int
+                weight: float
+                left: Option<Node>
+                right: Option<Node>
+            end
+            function build(depth: int, seed: int): Node
+                if depth == 0 then
+                    return Node { value = seed, weight = 0.5, left = Option.None, right = Option.None }
+                end
+                local l: Node = build(depth - 1, seed * 2)
+                local r: Node = build(depth - 1, seed * 2 + 1)
+                return Node { value = seed, weight = 1.5, left = Option.Some(l), right = Option.Some(r) }
+            end
+            function weigh(n: Node): float
+                local w: float = n.weight
+                if n.left is Some(l) then
+                    w = w + weigh(l)
+                end
+                if n.right is Some(r) then
+                    w = w + weigh(r)
+                end
+                return w
+            end
+            local tree: Node = build(2, 1)
+        "#;
+        let mut program = EmbeddedProgram::builder()
+            .module("main", source)
+            .entry_module("main")
+            .compile()
+            .expect("compile");
+        program.run_entry_script().expect("run entry script");
+        let tree = program.get_global_value("main.tree").expect("tree");
+        let before = strong(&tree);
+        let leaf = tree
+            .struct_get_field("left")
+            .and_then(|v| v.as_enum().and_then(|(_, _, vals)| vals.and_then(|v| v.first().cloned())))
+            .and_then(|v| v.struct_get_field("left"))
+            .and_then(|v| v.as_enum().and_then(|(_, _, vals)| vals.and_then(|v| v.first().cloned())))
+            .expect("leaf");
+        let leaf_before = strong(&leaf);
+        let left = tree
+            .struct_get_field("left")
+            .and_then(|v| v.as_enum().and_then(|(_, _, vals)| vals.and_then(|v| v.first().cloned())))
+            .expect("left");
+        let left_before = strong(&left);
+        let right = tree
+            .struct_get_field("right")
+            .and_then(|v| v.as_enum().and_then(|(_, _, vals)| vals.and_then(|v| v.first().cloned())))
+            .expect("right");
+        let right_before = strong(&right);
+        for round in 0..60 {
+            let total: f64 = program.call_typed("main.weigh", tree.clone()).expect("weigh");
+            assert_eq!(total, 1.5 + 2.0 * (1.5 + 2.0 * 0.5));
+            assert_eq!(strong(&tree), before, "root count after round {round}");
+            assert_eq!(strong(&left), left_before, "left count after round {round}");
+            assert_eq!(strong(&right), right_before, "right count after round {round}");
+            assert_eq!(strong(&leaf), leaf_before, "leaf count after round {round}");
+        }
+        let stats = program.jit_stats();
+        assert!(stats.functions_compiled >= 1, "{stats:?}");
+    }
+}
+
+#[cfg(all(test, feature = "std", any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod borrow_copy_tests {
+    use crate::bytecode::Value;
+    use crate::embed::EmbeddedProgram;
+    use alloc::rc::Rc;
+
+    fn strong(value: &Value) -> usize {
+        match value {
+            Value::Struct(object) => Rc::strong_count(object),
+            other => panic!("not a struct: {other:?}"),
+        }
+    }
+
+    /// `walk` with the given body, called directly (interpreted at the top,
+    /// compiled below) and from a compiled loop (compiled at the top too);
+    /// the root and its left leaf must come out with the counts they went
+    /// in with.
+    fn check(name: &str, body: &str) {
+        let source = format!(
+            r#"
+            struct Node
+                value: int
+                left: Option<Node>
+                right: Option<Node>
+            end
+            function walk(n: Node): int
+{body}
+            end
+            function churn(n: Node, count: int): int
+                local total: int = 0
+                local i: int = 0
+                while i < count do
+                    total = total + walk(n)
+                    i = i + 1
+                end
+                return total
+            end
+            local leaf_a: Node = Node {{ value = 1, left = Option.None, right = Option.None }}
+            local leaf_b: Node = Node {{ value = 2, left = Option.None, right = Option.None }}
+            local root: Node = Node {{ value = 3, left = Option.Some(leaf_a), right = Option.Some(leaf_b) }}
+        "#
+        );
+        let mut program = EmbeddedProgram::builder()
+            .module("main", &source)
+            .entry_module("main")
+            .compile()
+            .expect("compile");
+        program.run_entry_script().expect("run entry script");
+        let root = program.get_global_value("main.root").expect("root");
+        let leaf = program.get_global_value("main.leaf_a").expect("leaf");
+        let (root_before, leaf_before) = (strong(&root), strong(&leaf));
+        for _ in 0..80 {
+            let _: i64 = program.call_typed("main.walk", root.clone()).expect("walk");
+        }
+        for _ in 0..3 {
+            let _: i64 = program
+                .call_typed("main.churn", (root.clone(), 500i64))
+                .expect("churn");
+        }
+        assert_eq!(strong(&root), root_before, "{name}: root");
+        assert_eq!(strong(&leaf), leaf_before, "{name}: leaf");
+    }
+
+    #[test]
+    fn copies_of_borrowed_values_are_owned() {
+        // A copy of a borrow (`held = l`) is a clone the register owns, and
+        // a second copy into the same register releases the first: the
+        // combination with a native call in between leaked once.
+        check(
+            "walk + held",
+            "local s: int = 0\n if n.left is Some(l) then\n s = s + walk(l)\n local held: Node = l\n s = s + held.value end\n return s",
+        );
+        check(
+            "borrow + held",
+            "local s: int = 0\n if n.left is Some(l) then local held: Node = l\n s = s + held.value end\n return s",
+        );
+        check(
+            "copy + again",
+            "local copy: Node = n\n local again: Node = copy\n return again.value",
+        );
+        check(
+            "full",
+            "local s: int = n.value\n local copy: Node = n\n local again: Node = copy\n if n.left is Some(l) then\n s = s + walk(l)\n local held: Node = l\n s = s + held.value\n end\n if n.right is Some(r) then\n s = s + walk(r)\n end\n return s + again.value",
+        );
+    }
+}

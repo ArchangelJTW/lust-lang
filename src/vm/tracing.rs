@@ -334,6 +334,11 @@ pub struct JitCallSite {
     /// cloned, not moved, when the frame is materialized, and is not
     /// dropped with the frame.
     pub alias_mask: usize,
+    /// Bit i set: caller register i may hold a borrow (see
+    /// `TraceOp::BorrowField`) — bits copied without a reference count.
+    /// When the frames are materialized for the interpreter, what it
+    /// holds is retained first.
+    pub borrow_mask: usize,
     pub function_idx: usize,
     /// Caller register the callee's result goes to.
     pub return_dest: usize,
@@ -374,16 +379,39 @@ pub unsafe extern "C" fn jit_materialize_inline_frames(
         record = r.prev;
     }
     let root_regs = regs;
+    // A frame that made a call may hold borrows (`site.borrow_mask`, in
+    // the calling frame's registers): bits copied without a count. Frame
+    // `i` of the chain (innermost first) called frame `i - 1`, so that
+    // record's site names frame `i`'s borrows; the innermost frame's were
+    // retained by the exit that got here.
+    let borrowed_in = |frame_index: usize| -> usize {
+        frame_index
+            .checked_sub(1)
+            .map(|deeper| chain[deeper].1.borrow_mask)
+            .unwrap_or(0)
+    };
     if vm.is_null() {
-        for (_, site, regs) in chain {
+        for (index, (_, site, regs)) in chain.iter().enumerate() {
+            let borrows = borrowed_in(index);
             for i in 0..site.value_count {
-                if i < 64 && site.alias_mask & (1 << i) != 0 {
+                if i < 64 && (site.alias_mask | borrows) & (1 << i) != 0 {
                     continue;
                 }
                 unsafe { core::ptr::drop_in_place(regs.add(i)) };
             }
         }
         return root_regs;
+    }
+    // The interpreter will own whatever the borrowed registers hold: take
+    // the count now, before any frame is moved.
+    for (r, site, _) in &chain {
+        for i in 0..64 {
+            if site.borrow_mask & (1 << i) != 0 {
+                let slot = unsafe { r.caller_regs.add(i) };
+                let held = unsafe { (*slot).clone() };
+                core::mem::forget(held);
+            }
+        }
     }
     let vm = unsafe { &mut *vm };
     for (r, site, regs) in chain.into_iter().rev() {

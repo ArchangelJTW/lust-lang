@@ -2169,6 +2169,7 @@ impl VM {
         let globals = &self.globals;
         let natives = &self.natives;
         let global = |name: &str| globals.get(name).or_else(|| natives.get(name)).cloned();
+        let field_pure = |idx: usize| crate::jit::function::field_pure(functions, idx);
         let ctx = Context {
             callee_sig: &callee_sig,
             layout_of: &layout_of,
@@ -2176,6 +2177,7 @@ impl VM {
             global: &global,
             globals_version: self.globals_version,
             intrinsics: &self.jit.intrinsics,
+            field_pure: &field_pure,
         };
         let Some(trace) = translate(function, func_idx, &sig, &ctx) else {
             crate::jit::log(|| format!("🚫 JIT: function {} is not compilable", func_idx));

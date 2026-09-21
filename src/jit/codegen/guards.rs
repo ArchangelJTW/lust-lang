@@ -536,6 +536,7 @@ impl JitCompiler {
         let site = self.retain_call_site(crate::vm::JitCallSite {
             value_count: frame_value_count as usize,
             alias_mask: alias_mask as usize,
+            borrow_mask: self.function_borrows as usize,
             function_idx,
             return_dest: dest as usize,
             callee_reg: callee as usize,
@@ -686,6 +687,7 @@ impl JitCompiler {
             let value_size = mem::size_of::<Value>() as i32;
             for reg in 0..register_count {
                 if self.function_alias_params & (1u64 << reg) != 0
+                    || self.function_borrows & (1u64 << reg) != 0
                     || self.scalar_registers.contains_key(&reg)
                 {
                     continue;
@@ -746,6 +748,11 @@ impl JitCompiler {
                 ; mov eax, DWORD returned
                 ; jmp => epilogue
                 ; => interp_return
+            );
+            // The interpreter performs the return and drops the frame.
+            self.emit_retain_borrows();
+            dynasm!(self.ops
+                ; .arch x64
                 ; mov eax, DWORD code
                 ; jmp => exit_label
             );
@@ -813,6 +820,10 @@ impl JitCompiler {
             ; mov eax, DWORD returned
             ; jmp => epilogue
             ; => interp_return
+        );
+        self.emit_retain_borrows();
+        dynasm!(self.ops
+            ; .arch x64
             ; mov eax, DWORD code
             ; jmp => exit_label
         );

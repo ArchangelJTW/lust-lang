@@ -112,7 +112,8 @@ pub enum Expr {
     /// `[e, e, ...]`
     ArrLit(Vec<Expr>),
     /// `P { a = e, b = e, c = e }`
-    StructLit(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `P { a, b, c, next }`.
+    StructLit(Box<Expr>, Box<Expr>, Box<Expr>, Box<Expr>),
     Some(Box<Expr>),
     None,
     StrLit(&'static str),
@@ -335,13 +336,15 @@ fn render_expr(e: &Expr, out: &mut String) {
             }
             out.push(']');
         }
-        Expr::StructLit(a, b, c) => {
+        Expr::StructLit(a, b, c, next) => {
             out.push_str("P { a = ");
             render_expr(a, out);
             out.push_str(", b = ");
             render_expr(b, out);
             out.push_str(", c = ");
             render_expr(c, out);
+            out.push_str(", next = ");
+            render_expr(next, out);
             out.push_str(" }");
         }
         Expr::Some(x) => {
@@ -571,6 +574,7 @@ pub fn render(p: &Program) -> String {
     out.line("a: int");
     out.line("b: float");
     out.line("c: bool");
+    out.line("next: Option<P>");
     out.indent -= 1;
     out.line("end");
     out.line("");
@@ -732,6 +736,7 @@ pub fn program(seed: u64, size: u32) -> Program {
             3..=4 => funcs.extend(g.recursive_funcs()),
             5 => funcs.push(g.struct_func()),
             6 => funcs.push(g.opt_struct_func()),
+            7 => funcs.push(g.chain_func()),
             _ => funcs.push(g.func()),
         }
     }
@@ -956,6 +961,7 @@ impl Gen {
                 )),
                 Box::new(Expr::Field(p.clone(), "b")),
                 Box::new(Expr::Not(Box::new(Expr::Field(p.clone(), "c")))),
+                Box::new(Expr::SomeStruct(Box::new(Expr::Var(p.clone())))),
             ),
             _ => self.expr(Ty::Struct, 1),
         };
@@ -978,6 +984,75 @@ impl Gen {
             ret: Ty::Struct,
             body,
             ret_expr,
+            second: None,
+        }
+    }
+
+    /// A helper walking a struct's `next` chain: field-pure, so a compiled
+    /// version borrows each link and its payload rather than cloning them,
+    /// and every exit to the interpreter has to retain what it borrowed.
+    /// `d` is folded in so the call site's argument matters.
+    fn chain_func(&mut self) -> Func {
+        let name = self.fresh("c");
+        self.scopes.clear();
+        self.scopes.push(Vec::new());
+        let p = self.fresh("p");
+        let d = self.fresh("d");
+        let s = self.fresh("s");
+        let q = self.fresh("q");
+        self.in_func = true;
+        self.iter_scale = 1;
+        self.cur_work = 0;
+        let body = vec![
+            Stmt::Local {
+                name: s.clone(),
+                ty: Ty::Int,
+                init: Expr::Bin(
+                    Box::new(Expr::Field(p.clone(), "a")),
+                    BinOp::Add,
+                    Box::new(Expr::Var(d.clone())),
+                ),
+            },
+            Stmt::IfIsSomeStruct {
+                opt: format!("{p}.next"),
+                var: q.clone(),
+                body: vec![Stmt::Assign {
+                    name: s.clone(),
+                    expr: Expr::Bin(
+                        Box::new(Expr::Var(s.clone())),
+                        BinOp::Add,
+                        Box::new(Expr::Call(
+                            name.clone(),
+                            vec![
+                                Expr::Var(q.clone()),
+                                Expr::Bin(
+                                    Box::new(Expr::Var(d.clone())),
+                                    BinOp::Sub,
+                                    Box::new(Expr::Int(1)),
+                                ),
+                            ],
+                        )),
+                    ),
+                }],
+            },
+        ];
+        self.in_func = false;
+        self.iter_scale = 1;
+        self.cur_work = 0;
+        self.funcs.push(FuncSig {
+            name: name.clone(),
+            params: vec![Ty::Struct, Ty::Int],
+            ret: Ty::Int,
+            work: 8,
+            bound: None,
+            second: None,
+        });
+        Func {
+            name,
+            params: vec![(p, Ty::Struct), (d, Ty::Int)],
+            ret: Ty::Int,
+            body,
+            ret_expr: Expr::Var(s),
             second: None,
         }
     }
@@ -1680,10 +1755,19 @@ impl Gen {
                 if !vars.is_empty() && self.rng.chance(0.3) {
                     return Expr::Var(self.rng.pick(&vars).name.clone());
                 }
+                // A chain through `next` to an earlier struct, sometimes:
+                // helpers walk it (borrowing each link when compiled).
+                let next = match self.vars_of(Ty::Struct) {
+                    vars if !vars.is_empty() && self.rng.chance(0.5) => {
+                        Expr::SomeStruct(Box::new(Expr::Var(self.rng.pick(&vars).name.clone())))
+                    }
+                    _ => Expr::None,
+                };
                 Expr::StructLit(
                     Box::new(self.int_expr(1)),
                     Box::new(self.float_expr(1)),
                     Box::new(self.bool_expr(1)),
+                    Box::new(next),
                 )
             }
             Ty::OptStruct => {
@@ -2198,7 +2282,9 @@ fn contains_math(e: &Expr) -> bool {
             contains_math(d)
         }
         Expr::Concat(l, r) => contains_math(l) || contains_math(r),
-        Expr::StructLit(a, b, c) => contains_math(a) || contains_math(b) || contains_math(c),
+        Expr::StructLit(a, b, c, next) => {
+            contains_math(a) || contains_math(b) || contains_math(c) || contains_math(next)
+        }
         _ => false,
     }
 }

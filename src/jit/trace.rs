@@ -62,6 +62,11 @@ pub struct Trace {
     /// `FunctionSig::can_alias_param`). They never own anything in a
     /// native frame, so a return does not drop them.
     pub alias_params: u64,
+    /// Function code only: registers that hold a borrow at some point
+    /// (see `TraceOp::BorrowField`). They never hold an owned value, so
+    /// an exit to the interpreter retains whatever they hold (a no-op for
+    /// a scalar or Nil) and a native return does not release them.
+    pub borrowed_registers: Vec<Register>,
     /// Operations executed once at trace entry (unboxing, guards, etc.)
     pub preamble: Vec<TraceOp>,
     /// Operations in the trace loop body
@@ -343,6 +348,27 @@ pub enum TraceOp {
         enum_reg: Register,
         index: u8,
     },
+    /// Function code only: `dest` becomes a *borrow* of the strong field
+    /// `field_index` of the struct in `object` — the bits of the value,
+    /// with no reference count taken. The translator emits one only when
+    /// the struct outlives the function's frame (it is a parameter the
+    /// function never writes, or a borrow itself), nothing the function
+    /// runs can write a field, and `dest` is never returned or overwritten
+    /// with an owned value; every exit to the interpreter retains what the
+    /// borrowed registers hold first (see `Trace::borrowed_registers`).
+    BorrowField {
+        dest: Register,
+        object: Register,
+        field_index: usize,
+    },
+    /// Function code only: `dest` becomes a borrow of payload value
+    /// `index` of the enum in `enum_reg`, itself a borrow (an enum's
+    /// payload is immutable, so it lives as long as the enum).
+    BorrowEnumValue {
+        dest: Register,
+        enum_reg: Register,
+        index: u8,
+    },
     Guard {
         register: Register,
         expected_type: ValueType,
@@ -523,7 +549,9 @@ impl TraceOp {
             | TraceOp::IsEnumVariant { dest, .. }
             | TraceOp::TypeIs { dest, .. }
             | TraceOp::TryCast { dest, .. }
-            | TraceOp::GetEnumValue { dest, .. } => Some(*dest),
+            | TraceOp::GetEnumValue { dest, .. }
+            | TraceOp::BorrowField { dest, .. }
+            | TraceOp::BorrowEnumValue { dest, .. } => Some(*dest),
             _ => None,
         }
     }
@@ -550,7 +578,9 @@ impl TraceOp {
             | TraceOp::IsEnumVariant { dest, .. }
             | TraceOp::TypeIs { dest, .. }
             | TraceOp::TryCast { dest, .. }
-            | TraceOp::GetEnumValue { dest, .. } => *dest = register,
+            | TraceOp::GetEnumValue { dest, .. }
+            | TraceOp::BorrowField { dest, .. }
+            | TraceOp::BorrowEnumValue { dest, .. } => *dest = register,
             _ => {}
         }
     }
@@ -688,6 +718,7 @@ impl TraceRecorder {
                 frame_may_own: true,
                 entry_scalars: Vec::new(),
                 alias_params: 0,
+                borrowed_registers: Vec::new(),
                 preamble: Vec::new(),
                 ops: Vec::new(),
                 postamble: Vec::new(),
@@ -1003,7 +1034,9 @@ impl TraceRecorder {
             | TraceOp::IsEnumVariant { dest, .. }
             | TraceOp::TypeIs { dest, .. }
             | TraceOp::TryCast { dest, .. }
-            | TraceOp::GetEnumValue { dest, .. } => Some(*dest),
+            | TraceOp::GetEnumValue { dest, .. }
+            | TraceOp::BorrowField { dest, .. }
+            | TraceOp::BorrowEnumValue { dest, .. } => Some(*dest),
             TraceOp::SetField { .. }
             | TraceOp::ArrayIndexOk { .. }
             | TraceOp::Guard { .. }

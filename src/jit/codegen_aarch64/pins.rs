@@ -171,6 +171,9 @@ fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
         | TraceOp::GetEnumValue { dest, .. } => {
             env.remove(dest);
         }
+        TraceOp::BorrowField { dest, .. } | TraceOp::BorrowEnumValue { dest, .. } => {
+            set(env, *dest, Some(ValueType::Plain));
+        }
         TraceOp::Rebox { dest_reg, .. } => {
             env.remove(dest_reg);
         }
@@ -483,6 +486,14 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
             e.helper_writes.push(*dest);
         }
         TraceOp::GetEnumValue { dest, enum_reg, .. } => {
+            e.reads.push((*enum_reg, None));
+            e.helper_writes.push(*dest);
+        }
+        TraceOp::BorrowField { dest, object, .. } => {
+            e.reads.push((*object, None));
+            e.helper_writes.push(*dest);
+        }
+        TraceOp::BorrowEnumValue { dest, enum_reg, .. } => {
             e.reads.push((*enum_reg, None));
             e.helper_writes.push(*dest);
         }

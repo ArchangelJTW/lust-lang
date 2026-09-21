@@ -1109,6 +1109,84 @@ impl JitCompiler {
         Ok(())
     }
 
+    /// `dest` = the bits of strong field `index` of the struct in `object`,
+    /// with no count taken and nothing released (see
+    /// `TraceOp::BorrowField`). The struct tag and field count are checked;
+    /// anything else fails to the interpreter, which re-executes the read.
+    pub(super) fn compile_borrow_field(&mut self, dest: u8, object: u8, index: usize) -> Result<()> {
+        let Some(layout) = jit::layout::rc_vec_layout() else {
+            return Err(crate::LustError::RuntimeError {
+                message: "a borrow needs the measured struct layout".into(),
+            });
+        };
+        let struct_tag = ValueTag::Struct.as_u8() as u32;
+        let fields_offset = layout.struct_fields_offset as u32;
+        let len_offset = layout.struct_len_offset as u32;
+        let ptr_offset = layout.struct_ptr_offset as u32;
+        let element = (index * mem::size_of::<Value>()) as i32;
+        self.load_tag(0, object);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #struct_tag
+            ; b.ne >fail
+        );
+        self.emit_reg_addr(11, object);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x9, [x11, #fields_offset]
+            ; ldr x10, [x9, #len_offset]
+            ; cmp x10, #index as u32
+            ; b.ls >fail
+            ; ldr x11, [x9, #ptr_offset]
+        );
+        self.emit_add_imm(11, 11, element);
+        self.emit_reg_addr(9, dest);
+        self.emit_copy_x11_to_x9();
+        Ok(())
+    }
+
+    /// `dest` = the bits of payload value `index` of the enum in
+    /// `enum_reg`, a borrow of a borrow (see `TraceOp::BorrowEnumValue`).
+    pub(super) fn compile_borrow_enum_value(&mut self, dest: u8, enum_reg: u8, index: u8) -> Result<()> {
+        let Some(layout) = jit::layout::enum_layout() else {
+            return Err(crate::LustError::RuntimeError {
+                message: "a borrow needs the measured enum layout".into(),
+            });
+        };
+        let tag = layout.tag as u32;
+        let object_offset = layout.object_offset as u32;
+        let len_offset = layout.values_len_offset as u32;
+        let ptr_offset = layout.values_ptr_offset as u32;
+        let unit_offset = layout.unit_word_offset as u32;
+        let element = (index as usize * mem::size_of::<Value>()) as i32;
+        self.load_tag(0, enum_reg);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #tag
+            ; b.ne >fail
+        );
+        self.emit_reg_addr(11, enum_reg);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x9, [x11, #object_offset]
+            ; ldr x10, [x9, #unit_offset]
+        );
+        self.emit_mov_imm64(12, layout.unit_word_value as u64);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp x10, x12
+            ; b.eq >fail
+            ; ldr x10, [x9, #len_offset]
+            ; cmp x10, #index as u32
+            ; b.ls >fail
+            ; ldr x11, [x9, #ptr_offset]
+        );
+        self.emit_add_imm(11, 11, element);
+        self.emit_reg_addr(9, dest);
+        self.emit_copy_x11_to_x9();
+        Ok(())
+    }
+
     pub(super) fn compile_get_enum_value(
         &mut self,
         dest: u8,

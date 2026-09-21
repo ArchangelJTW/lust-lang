@@ -1261,6 +1261,83 @@ impl JitCompiler {
         Ok(())
     }
 
+    /// `dest` = the bits of strong field `index` of the struct in `object`,
+    /// with no count taken and nothing released (see
+    /// `TraceOp::BorrowField`). The struct tag and field count are checked;
+    /// anything else fails to the interpreter, which re-executes the read.
+    pub(super) fn compile_borrow_field(&mut self, dest: u8, object: u8, index: usize) -> Result<()> {
+        let Some(layout) = jit::layout::rc_vec_layout() else {
+            return Err(crate::LustError::RuntimeError {
+                message: "a borrow needs the measured struct layout".into(),
+            });
+        };
+        let value_size = mem::size_of::<Value>() as i32;
+        let object_offset = (object as i32) * value_size;
+        let dest_offset = (dest as i32) * value_size;
+        let struct_tag = ValueTag::Struct.as_u8() as i8;
+        let fields_offset = layout.struct_fields_offset as i32;
+        let len_offset = layout.struct_len_offset as i32;
+        let ptr_offset = layout.struct_ptr_offset as i32;
+        let element = (index * mem::size_of::<Value>()) as i32;
+        dynasm!(self.ops
+            ; .arch x64
+            ; cmp BYTE [r12 + object_offset], struct_tag
+            ; jne >fail
+            ; mov r9, [r12 + object_offset + fields_offset]
+            ; cmp QWORD [r9 + len_offset], index as i32
+            ; jbe >fail
+            ; mov r10, [r9 + ptr_offset]
+        );
+        for word in (0..value_size).step_by(8) {
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov rax, [r10 + element + word]
+                ; mov [r12 + dest_offset + word], rax
+            );
+        }
+        Ok(())
+    }
+
+    /// `dest` = the bits of payload value `index` of the enum in
+    /// `enum_reg`, a borrow of a borrow (see `TraceOp::BorrowEnumValue`).
+    pub(super) fn compile_borrow_enum_value(&mut self, dest: u8, enum_reg: u8, index: u8) -> Result<()> {
+        let Some(layout) = jit::layout::enum_layout() else {
+            return Err(crate::LustError::RuntimeError {
+                message: "a borrow needs the measured enum layout".into(),
+            });
+        };
+        let value_size = mem::size_of::<Value>() as i32;
+        let enum_offset = (enum_reg as i32) * value_size;
+        let dest_offset = (dest as i32) * value_size;
+        let tag = layout.tag as i8;
+        let object_offset = layout.object_offset as i32;
+        let len_offset = layout.values_len_offset as i32;
+        let ptr_offset = layout.values_ptr_offset as i32;
+        let unit_offset = layout.unit_word_offset as i32;
+        let element = (index as usize * mem::size_of::<Value>()) as i32;
+        // A unit variant (no payload) fails: its niche word says so.
+        dynasm!(self.ops
+            ; .arch x64
+            ; cmp BYTE [r12 + enum_offset], tag
+            ; jne >fail
+            ; mov r9, [r12 + enum_offset + object_offset]
+            ; mov rax, QWORD layout.unit_word_value as i64
+            ; cmp rax, [r9 + unit_offset]
+            ; je >fail
+            ; cmp QWORD [r9 + len_offset], index as i32
+            ; jbe >fail
+            ; mov r10, [r9 + ptr_offset]
+        );
+        for word in (0..value_size).step_by(8) {
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov rax, [r10 + element + word]
+                ; mov [r12 + dest_offset + word], rax
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn compile_get_enum_value(
         &mut self,
         dest: u8,

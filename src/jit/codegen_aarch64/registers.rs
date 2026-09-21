@@ -435,6 +435,7 @@ impl JitCompiler {
     pub(super) fn emit_guard_exit(&mut self, guard_return_value: i32) {
         let exit_label = self.current_exit_label();
         if self.function_mode {
+            self.emit_retain_borrows();
             let kind = if self.exit_is_handoff {
                 jit::EXIT_KIND_HANDOFF
             } else {
@@ -445,6 +446,23 @@ impl JitCompiler {
         }
         self.emit_mov_imm_i32(0, guard_return_value);
         dynasm!(self.ops ; .arch aarch64 ; b =>exit_label);
+    }
+
+    /// Before function code hands its frame to the interpreter: take a
+    /// reference count for whatever the borrowed registers hold (see
+    /// `Trace::borrowed_registers`), since the interpreter will own them.
+    /// A scalar or Nil there costs a tag compare. Clobbers x0–x15.
+    pub(super) fn emit_retain_borrows(&mut self) {
+        let mask = self.function_borrows;
+        if mask == 0 {
+            return;
+        }
+        for reg in 0..64u8 {
+            if mask & (1u64 << reg) != 0 {
+                self.emit_reg_addr(11, reg);
+                self.emit_retain_at_x11();
+            }
+        }
     }
 
     /// `JIT_EXIT_INFO = ip | kind << EXIT_KIND_SHIFT`.

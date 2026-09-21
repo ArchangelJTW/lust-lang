@@ -71,6 +71,11 @@ pub struct JitCompiler {
     function_frame: (u8, bool),
     /// Function code: parameters a native caller may alias (never dropped).
     function_alias_params: u64,
+    /// Function code: registers that may hold a borrow (bit i = register
+    /// i; see `Trace::borrowed_registers`). Every exit to the interpreter
+    /// retains what they hold first; a native return does not release
+    /// them; a call site records them for frame materialization.
+    function_borrows: u64,
     /// Function mode: the declared scalar return kind, if any. A native
     /// caller then takes the result from a register (see
     /// `compile_function_return`) instead of having it stored.
@@ -142,6 +147,7 @@ mod tests {
             frame_may_own: true,
             entry_scalars: Vec::new(),
             alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::LoadConst {
@@ -184,6 +190,7 @@ mod tests {
             frame_may_own: true,
             entry_scalars: Vec::new(),
             alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![TraceOp::Guard {
                 register: 0,
@@ -216,6 +223,7 @@ mod tests {
             frame_may_own: true,
             entry_scalars: Vec::new(),
             alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -353,6 +361,7 @@ mod tests {
                             frame_may_own: true,
                             entry_scalars: Vec::new(),
                             alias_params: 0,
+                            borrowed_registers: Vec::new(),
                             preamble: vec![TraceOp::Guard {
                                 register: 2,
                                 expected_type: ValueType::Bool,
@@ -423,6 +432,7 @@ mod tests {
             frame_may_own: true,
             entry_scalars: Vec::new(),
             alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Lt {
@@ -498,6 +508,7 @@ mod tests {
             frame_may_own: true,
             entry_scalars: Vec::new(),
             alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -556,6 +567,7 @@ mod tests {
             frame_may_own: true,
             entry_scalars: Vec::new(),
             alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -619,6 +631,7 @@ mod tests {
             frame_may_own: true,
             entry_scalars: Vec::new(),
             alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![TraceOp::Div {
                 dest: 0,
@@ -654,6 +667,7 @@ mod tests {
             frame_may_own: true,
             entry_scalars: Vec::new(),
             alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Div {
@@ -706,6 +720,7 @@ mod tests {
             frame_may_own: true,
             entry_scalars: Vec::new(),
             alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Lt {

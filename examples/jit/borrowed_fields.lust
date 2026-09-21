@@ -1,0 +1,93 @@
+-- Compiled functions that read fields and enum payloads of a parameter
+-- without cloning them (borrows): a tree walk, a walk that hands a borrow
+-- to a local and returns it (which must clone), a walk that fails deep in
+-- the recursion (every native frame is handed to the interpreter with its
+-- borrows retained), and an array field mutated through a borrow.
+struct Node
+    value: int
+    tags: Array<int>
+    left: Option<Node>
+    right: Option<Node>
+end
+
+function build(depth: int, value: int): Node
+    if depth == 0 then
+        return Node { value = value, tags = [value], left = Option.None, right = Option.None }
+    end
+    local l: Node = build(depth - 1, value * 2)
+    local r: Node = build(depth - 1, value * 2 + 1)
+    return Node { value = value, tags = [value, depth], left = Option.Some(l), right = Option.Some(r) }
+end
+
+function sum(node: Node): int
+    local s: int = node.value
+    if node.left is Some(l) then
+        s = s + sum(l)
+    end
+    if node.right is Some(r) then
+        s = s + sum(r)
+    end
+    return s
+end
+
+-- The payload borrow is copied into a local that is returned: a clone.
+function leftmost(node: Node): Node
+    if node.left is Some(l) then
+        local held: Node = l
+        return leftmost(held)
+    end
+    return node
+end
+
+-- Fails (integer division by zero) at the deepest level.
+function divide(node: Node, by: int): int
+    local d: int = by
+    if node.left is Some(l) then
+        d = divide(l, by - 1)
+    end
+    return node.value / d
+end
+
+-- A borrowed array is mutated in place; the struct still owns it.
+function bump_tags(node: Node): int
+    local tags: Array<int> = node.tags
+    tags[0] = 100
+    if node.left is Some(l) then
+        return 1 + bump_tags(l)
+    end
+    return 1
+end
+
+local tree: Node = build(5, 1)
+local total: int = 0
+local i: int = 0
+while i < 60 do
+    total = total + sum(tree)
+    i = i + 1
+end
+println(total)
+local lm: Node = leftmost(tree)
+i = 0
+while i < 60 do
+    lm = leftmost(tree)
+    i = i + 1
+end
+println(lm.value)
+i = 0
+local bumped: int = 0
+while i < 60 do
+    bumped = bumped + bump_tags(tree)
+    i = i + 1
+end
+println(bumped)
+if tree.left is Some(first) then
+    println(first.tags[0]:unwrap_or(-1))
+end
+i = 0
+local ok: int = 0
+while i < 40 do
+    ok = ok + divide(tree, 9)
+    i = i + 1
+end
+println(ok)
+println(divide(tree, 5))

@@ -23,6 +23,7 @@ impl JitCompiler {
             trace_start_ip: 0,
             function_mode: false,
             function_alias_params: 0,
+            function_borrows: 0,
             function_frame: (0, true),
             function_result: None,
             function_entry_table: 0,
@@ -121,6 +122,11 @@ impl JitCompiler {
         self.function_mode = true;
         self.function_frame = (register_count, trace.frame_may_own);
         self.function_alias_params = trace.alias_params;
+        self.function_borrows = trace
+            .borrowed_registers
+            .iter()
+            .filter(|r| **r < 64)
+            .fold(0u64, |mask, r| mask | (1u64 << r));
         self.function_result = result_type;
         self.function_entry_table = entry_table;
         self.function_labels.clear();
@@ -464,6 +470,7 @@ impl JitCompiler {
             ; fail:
         );
         if self.function_mode {
+            self.emit_retain_borrows();
             self.emit_exit_info(ip, jit::EXIT_KIND_FAIL);
         }
         self.emit_mov_imm_i32(0, code);
@@ -499,6 +506,8 @@ impl JitCompiler {
                 | TraceOp::NewEnumVariant { .. }
                 | TraceOp::TryCast { .. }
                 | TraceOp::GetEnumValue { .. }
+                | TraceOp::BorrowField { .. }
+                | TraceOp::BorrowEnumValue { .. }
                 | TraceOp::Unbox { .. }
                 | TraceOp::Rebox { .. }
                 | TraceOp::DropSpecialized { .. }
@@ -1114,6 +1123,22 @@ impl JitCompiler {
                     self.compile_get_enum_value(*dest, *enum_reg, *index)?;
                 }
 
+                TraceOp::BorrowField {
+                    dest,
+                    object,
+                    field_index,
+                } => {
+                    self.compile_borrow_field(*dest, *object, *field_index)?;
+                }
+
+                TraceOp::BorrowEnumValue {
+                    dest,
+                    enum_reg,
+                    index,
+                } => {
+                    self.compile_borrow_enum_value(*dest, *enum_reg, *index)?;
+                }
+
                 TraceOp::Guard {
                     register,
                     expected_type,
@@ -1595,6 +1620,8 @@ impl JitCompiler {
             | TraceOp::TypeIs { value, .. }
             | TraceOp::TryCast { value, .. } => *value == register,
             TraceOp::GetEnumValue { enum_reg, .. } => *enum_reg == register,
+            TraceOp::BorrowField { object, .. } => *object == register,
+            TraceOp::BorrowEnumValue { enum_reg, .. } => *enum_reg == register,
             TraceOp::GuardLoopContinue {
                 condition_register, ..
             } => *condition_register == register,
@@ -1667,7 +1694,9 @@ impl JitCompiler {
             | TraceOp::IsEnumVariant { dest, .. }
             | TraceOp::TypeIs { dest, .. }
             | TraceOp::TryCast { dest, .. }
-            | TraceOp::GetEnumValue { dest, .. } => *dest == register,
+            | TraceOp::GetEnumValue { dest, .. }
+            | TraceOp::BorrowField { dest, .. }
+            | TraceOp::BorrowEnumValue { dest, .. } => *dest == register,
             _ => false,
         }
     }
@@ -1706,7 +1735,13 @@ impl JitCompiler {
                 set(&mut self.scalar_registers, *dest, ty);
             }
             TraceOp::Move { dest, src } => {
-                let ty = self.scalar_registers.get(src).copied();
+                // A copy of a borrow is a clone the destination owns; a
+                // register that ever holds a borrow is read as one.
+                let ty = if *src < 64 && self.function_borrows & (1u64 << src) != 0 {
+                    None
+                } else {
+                    self.scalar_registers.get(src).copied()
+                };
                 set(&mut self.scalar_registers, *dest, ty);
             }
             TraceOp::Add {
@@ -1810,6 +1845,10 @@ impl JitCompiler {
             | TraceOp::TryCast { dest, .. }
             | TraceOp::GetEnumValue { dest, .. } => {
                 self.scalar_registers.remove(dest);
+            }
+            // A borrow owns nothing; the value is of no particular type.
+            TraceOp::BorrowField { dest, .. } | TraceOp::BorrowEnumValue { dest, .. } => {
+                self.scalar_registers.insert(*dest, ValueType::Plain);
             }
             TraceOp::Rebox { dest_reg, .. } => {
                 self.scalar_registers.remove(dest_reg);
@@ -1961,6 +2000,7 @@ impl JitCompiler {
             let site = self.retain_call_site(crate::vm::JitCallSite {
                 value_count: frame_value_count as usize,
                 alias_mask: alias_mask as usize,
+                borrow_mask: self.function_borrows as usize,
                 function_idx: trace.function_idx,
                 return_dest: dest as usize,
                 callee_reg: callee as usize,

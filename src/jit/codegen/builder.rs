@@ -12,6 +12,10 @@ impl JitCompiler {
             specialized_values: HashMap::new(),
             scalar_registers: HashMap::new(),
             pending_scalar: None,
+            hot_rax: None,
+            hot_xmm0: None,
+            hot_rax_in: None,
+            hot_xmm0_in: None,
             trace_start_ip: 0,
             function_mode: false,
             function_alias_params: 0,
@@ -463,6 +467,10 @@ impl JitCompiler {
         guards: &mut Vec<Guard>,
     ) -> Result<()> {
         let mut skip_through: Option<usize> = None;
+        // Each segment (preamble, body, postamble, an inlined body) starts
+        // at a label or in another frame: nothing is in rax / xmm0.
+        self.hot_rax = None;
+        self.hot_xmm0 = None;
         for (op_index, op) in ops.iter().enumerate() {
             if skip_through.is_some_and(|last| op_index <= last) {
                 continue;
@@ -474,6 +482,9 @@ impl JitCompiler {
                 self.current_fail_ip = Some(*ip);
                 continue;
             }
+            // What the previous op left in rax / xmm0 is this op's to use.
+            self.hot_rax_in = self.hot_rax.take();
+            self.hot_xmm0_in = self.hot_xmm0.take();
             // Fusion looks at the next real op; `At` markers are transparent.
             let next_index = (op_index + 1..ops.len())
                 .find(|&j| !matches!(ops[j], TraceOp::At { .. }));
@@ -493,6 +504,9 @@ impl JitCompiler {
                     guards.push(guard);
                     *guard_index += 1;
                     skip_through = Some(next_index);
+                    // The failed result's store is on the exit path only.
+                    self.hot_rax = None;
+                    self.hot_xmm0 = None;
                     continue;
                 }
                 if let TraceOp::LoadConst {
@@ -531,6 +545,9 @@ impl JitCompiler {
                 {
                     self.compile_load_const(*constant_register, value)?;
                     self.update_scalar_registers(op);
+                    // The constant's store is what rax now holds.
+                    self.hot_rax_in = self.hot_rax.take();
+                    self.hot_xmm0_in = self.hot_xmm0.take();
                     if self.compile_integer_add_immediate(op, next)? {
                         self.update_scalar_registers(next);
                         skip_through = Some(next_index);
@@ -1069,6 +1086,9 @@ impl JitCompiler {
                     let label = self.function_label(*id);
                     dynasm!(self.ops ; .arch x64 ; => label);
                     self.scalar_registers = scalars.iter().copied().collect();
+                    // Control also arrives here by jump.
+                    self.hot_rax_in = None;
+                    self.hot_xmm0_in = None;
                 }
 
                 TraceOp::Jump { label } => {
@@ -1118,12 +1138,70 @@ impl JitCompiler {
             if let Some((reg, ty)) = self.pending_scalar.take() {
                 self.scalar_registers.insert(reg, ty);
             }
+            if !self.result_stays_hot(op) {
+                self.hot_rax = None;
+                self.hot_xmm0 = None;
+            }
             if Self::op_may_fail(op) {
                 self.emit_fail_stub();
             }
         }
 
         Ok(())
+    }
+
+    /// Ops whose scalar store (`store_from_rax` / `store_xmm0_as_float`)
+    /// is the last instruction they emit on every path that continues, so
+    /// the payload is still in rax / xmm0 for the next op. Anything else
+    /// — a runtime merge after the store (a generic arithmetic path, an
+    /// `ArrayIndexOk` slow path), an inlined body, a call — forgets it.
+    /// The fail stub emitted after an op is jumped over on the normal
+    /// path and does not touch either register.
+    fn result_stays_hot(&self, op: &TraceOp) -> bool {
+        let numeric = |ty: ValueType| matches!(ty, ValueType::Int | ValueType::Float);
+        match op {
+            TraceOp::LoadConst {
+                value: Value::Int(_) | Value::Float(_) | Value::Bool(_),
+                ..
+            } => true,
+            TraceOp::Move { src, .. } => self.scalar_registers.get(src).is_some_and(|ty| {
+                matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool)
+            }),
+            TraceOp::Add {
+                lhs_type, rhs_type, ..
+            }
+            | TraceOp::Sub {
+                lhs_type, rhs_type, ..
+            }
+            | TraceOp::Mul {
+                lhs_type, rhs_type, ..
+            }
+            | TraceOp::Div {
+                lhs_type, rhs_type, ..
+            }
+            | TraceOp::Mod {
+                lhs_type, rhs_type, ..
+            } => numeric(*lhs_type) && numeric(*rhs_type),
+            TraceOp::Neg { src, .. } => self
+                .scalar_registers
+                .get(src)
+                .is_some_and(|ty| numeric(*ty)),
+            TraceOp::Lt { .. }
+            | TraceOp::Le { .. }
+            | TraceOp::Gt { .. }
+            | TraceOp::Ge { .. }
+            | TraceOp::Eq { .. }
+            | TraceOp::Ne { .. }
+            | TraceOp::And { .. }
+            | TraceOp::Or { .. }
+            | TraceOp::Not { .. }
+            | TraceOp::IsEnumVariant { .. }
+            | TraceOp::TypeIs { .. }
+            | TraceOp::ArrayLen { .. }
+            | TraceOp::GetField { .. }
+            | TraceOp::CallDirect { .. } => true,
+            _ => false,
+        }
     }
 
     /// After an op that can branch to `>fail`: bind those branches to a stub
@@ -1225,7 +1303,7 @@ impl JitCompiler {
             return Ok(false);
         };
 
-        self.load_to_rax(source);
+        self.operand_rax(source);
         if *immediate == 1 {
             dynasm!(self.ops ; .arch x64 ; inc rax);
         } else if *immediate == -1 {
@@ -1968,7 +2046,14 @@ impl JitCompiler {
             );
 
             let call_ip = self.current_fail_ip;
+            // The callee's registers are numbered from its own frame:
+            // nothing left in rax / xmm0 carries across the frame switch,
+            // either way (`compile_ops` clears on entry).
             let inline_result = self.compile_ops(&trace.body, guard_index, guards);
+            self.hot_rax = None;
+            self.hot_xmm0 = None;
+            self.hot_rax_in = None;
+            self.hot_xmm0_in = None;
             inline_result?;
             // A failed result move exits from the callee frame at its last
             // instruction; everything after the frame is popped is the

@@ -8,35 +8,12 @@ impl JitCompiler {
         lhs_type: ValueType,
         rhs_type: ValueType,
     ) -> bool {
-        let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-        let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
-            dynasm!(self.ops
-                ; .arch x64
-                ; mov rax, [r12 + lhs_offset + 8]
-                ; mov rcx, [r12 + rhs_offset + 8]
-            );
+            self.operands_rax_rcx(lhs, rhs);
             return false;
         }
 
-        if lhs_type == ValueType::Int {
-            dynasm!(self.ops
-                ; .arch x64
-                ; mov rax, [r12 + lhs_offset + 8]
-                ; cvtsi2sd xmm0, rax
-            );
-        } else {
-            dynasm!(self.ops ; .arch x64 ; movsd xmm0, [r12 + lhs_offset + 8]);
-        }
-        if rhs_type == ValueType::Int {
-            dynasm!(self.ops
-                ; .arch x64
-                ; mov rax, [r12 + rhs_offset + 8]
-                ; cvtsi2sd xmm1, rax
-            );
-        } else {
-            dynasm!(self.ops ; .arch x64 ; movsd xmm1, [r12 + rhs_offset + 8]);
-        }
+        self.operands_numeric_xmm(lhs, rhs, lhs_type, rhs_type);
         true
     }
 
@@ -122,26 +99,12 @@ impl JitCompiler {
             self.load_numeric_comparison_operands(lhs, rhs, lhs_type, rhs_type);
             dynasm!(self.ops ; .arch x64 ; ucomisd xmm0, xmm1 ; sete al ; setnp cl ; and al, cl ; movzx rax, al);
         } else {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
             if lhs_type == ValueType::Bool {
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov al, [r12 + lhs_offset + 8]
-                    ; mov cl, [r12 + rhs_offset + 8]
-                    ; cmp al, cl
-                    ; sete al
-                    ; movzx rax, al
-                );
+                self.operands_bool_eax_ecx(lhs, rhs);
+                dynasm!(self.ops ; .arch x64 ; cmp eax, ecx ; sete al ; movzx rax, al);
             } else {
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov rax, [r12 + lhs_offset + 8]
-                    ; mov rcx, [r12 + rhs_offset + 8]
-                    ; cmp rax, rcx
-                    ; sete al
-                    ; movzx rax, al
-                );
+                self.operands_rax_rcx(lhs, rhs);
+                dynasm!(self.ops ; .arch x64 ; cmp rax, rcx ; sete al ; movzx rax, al);
             }
         }
         self.store_from_rax(dest, 1);
@@ -162,26 +125,12 @@ impl JitCompiler {
             self.load_numeric_comparison_operands(lhs, rhs, lhs_type, rhs_type);
             dynasm!(self.ops ; .arch x64 ; ucomisd xmm0, xmm1 ; setne al ; setp cl ; or al, cl ; movzx rax, al);
         } else {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
             if lhs_type == ValueType::Bool {
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov al, [r12 + lhs_offset + 8]
-                    ; mov cl, [r12 + rhs_offset + 8]
-                    ; cmp al, cl
-                    ; setne al
-                    ; movzx rax, al
-                );
+                self.operands_bool_eax_ecx(lhs, rhs);
+                dynasm!(self.ops ; .arch x64 ; cmp eax, ecx ; setne al ; movzx rax, al);
             } else {
-                dynasm!(self.ops
-                    ; .arch x64
-                    ; mov rax, [r12 + lhs_offset + 8]
-                    ; mov rcx, [r12 + rhs_offset + 8]
-                    ; cmp rax, rcx
-                    ; setne al
-                    ; movzx rax, al
-                );
+                self.operands_rax_rcx(lhs, rhs);
+                dynasm!(self.ops ; .arch x64 ; cmp rax, rcx ; setne al ; movzx rax, al);
             }
         }
         self.store_from_rax(dest, 1);

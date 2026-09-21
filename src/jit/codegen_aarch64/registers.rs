@@ -156,6 +156,46 @@ impl JitCompiler {
         scratch
     }
 
+    /// X registers holding the int payloads of registers[lhs] and
+    /// registers[rhs]. An rhs still in x0 is read first, so it is copied
+    /// rather than lost to the lhs load.
+    pub(super) fn operand_pair_x(
+        &mut self,
+        lhs: u8,
+        rhs: u8,
+        lhs_scratch: u8,
+        rhs_scratch: u8,
+    ) -> (u8, u8) {
+        if self.hot_x0_in == Some(rhs) && lhs != rhs {
+            let b = self.operand_x(rhs, rhs_scratch);
+            let a = self.operand_x(lhs, lhs_scratch);
+            return (a, b);
+        }
+        let a = self.operand_x(lhs, lhs_scratch);
+        let b = self.operand_x(rhs, rhs_scratch);
+        (a, b)
+    }
+
+    /// D registers holding registers[lhs] and registers[rhs] as floats,
+    /// converting ints: d0 / d1 unless pinned. An rhs still in d0 is read
+    /// first (see `operand_pair_x`).
+    pub(super) fn operand_pair_numeric_d(
+        &mut self,
+        lhs: u8,
+        rhs: u8,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
+    ) -> (u8, u8) {
+        if self.hot_d0_in == Some(rhs) && lhs != rhs {
+            let b = self.operand_numeric_d(rhs, rhs_type, 1);
+            let a = self.operand_numeric_d(lhs, lhs_type, 0);
+            return (a, b);
+        }
+        let a = self.operand_numeric_d(lhs, lhs_type, 0);
+        let b = self.operand_numeric_d(rhs, rhs_type, 1);
+        (a, b)
+    }
+
     /// D register holding registers[vm_reg] as a float, converting an int.
     pub(super) fn operand_numeric_d(&mut self, vm_reg: u8, ty: ValueType, scratch: u8) -> u8 {
         if ty == ValueType::Int {

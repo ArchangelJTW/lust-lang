@@ -60,6 +60,16 @@ pub struct JitCompiler {
     /// destination (checked at runtime, so it holds on every path that
     /// continues), applied after the generic environment update.
     pub(super) pending_scalar: Option<(u8, ValueType)>,
+    /// The register whose int/bool payload the last store left in rax,
+    /// and the one whose float payload it left in xmm0: the next op may
+    /// read them there instead of from memory (`hot_rax_in` /
+    /// `hot_xmm0_in` are the values carried into the op being compiled).
+    /// Only ops listed in `result_stays_hot` keep the fact past their
+    /// last instruction.
+    hot_rax: Option<u8>,
+    hot_xmm0: Option<u8>,
+    hot_rax_in: Option<u8>,
+    hot_xmm0_in: Option<u8>,
     /// Loop-header ip of the trace being compiled: where a guard that fails
     /// before any instruction of the body has run resumes.
     pub(super) trace_start_ip: usize,

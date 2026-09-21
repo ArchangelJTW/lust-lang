@@ -20,12 +20,10 @@ impl JitCompiler {
         rhs_type: ValueType,
     ) -> Compare {
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
-            let a = self.operand_x(lhs, 0);
-            let b = self.operand_x(rhs, 10);
+            let (a, b) = self.operand_pair_x(lhs, rhs, 0, 10);
             return Compare::Int(a, b);
         }
-        let a = self.operand_numeric_d(lhs, lhs_type, 0);
-        let b = self.operand_numeric_d(rhs, rhs_type, 1);
+        let (a, b) = self.operand_pair_numeric_d(lhs, rhs, lhs_type, rhs_type);
         Compare::Float(a, b)
     }
 
@@ -145,8 +143,7 @@ impl JitCompiler {
                 dynasm!(self.ops ; .arch aarch64 ; cmp w0, w10);
             }
             _ => {
-                let a = self.operand_x(lhs, 0);
-                let b = self.operand_x(rhs, 10);
+                let (a, b) = self.operand_pair_x(lhs, rhs, 0, 10);
                 dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b));
             }
         }

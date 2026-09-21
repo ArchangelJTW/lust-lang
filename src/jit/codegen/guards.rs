@@ -398,7 +398,12 @@ impl JitCompiler {
         unsafe extern "C" {
             fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
         }
-        if self.scalar_registers.get(&condition_register) == Some(&ValueType::Bool) {
+        if self.hot_rax_in == Some(condition_register)
+            && self.scalar_registers.get(&condition_register) == Some(&ValueType::Bool)
+        {
+            // Still in eax (as 0 or 1) from the store the previous op made.
+            dynasm!(self.ops ; .arch x64 ; test eax, eax);
+        } else if self.scalar_registers.get(&condition_register) == Some(&ValueType::Bool) {
             dynasm!(self.ops ; .arch x64 ; cmp BYTE [r12 + cond_offset + 8], 0);
         } else {
             dynasm!(self.ops
@@ -470,8 +475,9 @@ impl JitCompiler {
         let label = self.function_label(label);
         let offset = (register as i32) * (mem::size_of::<Value>() as i32);
         if self.scalar_registers.get(&register) == Some(&ValueType::Bool) {
-            // Only the low byte of a Bool's payload is defined.
-            dynasm!(self.ops ; .arch x64 ; movzx eax, BYTE [r12 + offset + 8]);
+            // Only the low byte of a Bool's payload is defined (and it is
+            // still in eax when the previous op stored it).
+            self.operand_bool_eax(register);
         } else {
             unsafe extern "C" {
                 fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
@@ -763,11 +769,26 @@ impl JitCompiler {
             // A declared scalar result goes back in rdx (its payload bits;
             // the translator's guard before the `Return` proved the type)
             // and the caller stores it: no store here, no tag to check.
+            // The frame drop is a call, after which the payload must be
+            // reloaded; otherwise it may still sit in rax / xmm0 from the
+            // previous op's store.
+            let still_in_register = !may_own
+                && if ty == ValueType::Float {
+                    self.hot_xmm0_in == Some(reg)
+                } else {
+                    self.hot_rax_in == Some(reg)
+                };
             if may_own {
                 self.emit_drop_frame(register_count);
             }
             let payload = (reg as i32) * (mem::size_of::<Value>() as i32) + 8;
-            if ty == ValueType::Bool {
+            if still_in_register {
+                if ty == ValueType::Float {
+                    dynasm!(self.ops ; .arch x64 ; movq rdx, xmm0);
+                } else {
+                    dynasm!(self.ops ; .arch x64 ; mov rdx, rax);
+                }
+            } else if ty == ValueType::Bool {
                 dynasm!(self.ops ; .arch x64 ; movzx edx, BYTE [r12 + payload]);
             } else {
                 dynasm!(self.ops ; .arch x64 ; mov rdx, [r12 + payload]);

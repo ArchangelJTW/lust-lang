@@ -109,17 +109,17 @@ impl JitCompiler {
         // store (which drops whatever the destination held).
         match self.scalar_registers.get(&src).copied() {
             Some(ValueType::Float) => {
-                dynasm!(self.ops ; .arch x64 ; movq xmm0, QWORD [r12 + src_offset + 8]);
+                self.operand_xmm0(src);
                 self.store_xmm0_as_float(dest);
                 return Ok(());
             }
             Some(ValueType::Int) => {
-                self.load_to_rax(src);
+                self.operand_rax(src);
                 self.store_from_rax(dest, ValueTag::Int.as_u8());
                 return Ok(());
             }
             Some(ValueType::Bool) => {
-                dynasm!(self.ops ; .arch x64 ; movzx eax, BYTE [r12 + src_offset + 8]);
+                self.operand_bool_eax(src);
                 self.store_from_rax(dest, ValueTag::Bool.as_u8());
                 return Ok(());
             }

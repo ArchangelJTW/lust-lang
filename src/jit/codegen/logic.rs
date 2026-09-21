@@ -2,6 +2,26 @@ use super::*;
 impl JitCompiler {
     pub(super) fn compile_neg(&mut self, dest: u8, src: u8) -> Result<()> {
         let src_offset = (src as i32) * (mem::size_of::<Value>() as i32);
+        match self.scalar_registers.get(&src).copied() {
+            Some(ValueType::Int) => {
+                self.operand_rax(src);
+                dynasm!(self.ops ; .arch x64 ; neg rax);
+                self.store_from_rax(dest, 2);
+                return Ok(());
+            }
+            Some(ValueType::Float) => {
+                self.operand_xmm0(src);
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; mov rax, QWORD 0x8000000000000000u64 as _
+                    ; movq xmm1, rax
+                    ; xorpd xmm0, xmm1
+                );
+                self.store_xmm0_as_float(dest);
+                return Ok(());
+            }
+            _ => {}
+        }
         dynasm!(self.ops
             ; .arch x64
             ; mov al, [r12 + src_offset]
@@ -98,6 +118,12 @@ impl JitCompiler {
 
     pub(super) fn compile_not(&mut self, dest: u8, src: u8) -> Result<()> {
         let src_offset = (src as i32) * (mem::size_of::<Value>() as i32);
+        if self.scalar_registers.get(&src) == Some(&ValueType::Bool) {
+            self.operand_bool_eax(src);
+            dynasm!(self.ops ; .arch x64 ; xor eax, 1);
+            self.store_from_rax(dest, 1);
+            return Ok(());
+        }
         dynasm!(self.ops
             ; .arch x64
             ; mov al, [r12 + src_offset]

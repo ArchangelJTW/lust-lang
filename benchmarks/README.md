@@ -241,8 +241,17 @@ owned (after which every store into them skips its tag check), a
 constant feeding an add is stored and used as an immediate rather than
 stored and reloaded, and the value a store leaves in x0 or d0 is what
 the next op reads — a comparison feeding a branch, a result feeding a
-return — instead of a reload (aarch64). `calls` 62 → 60, `methods` 61 →
-58, `tree` 112 → 107. Then borrows: in a compiled function that nothing
+return — instead of a reload. `calls` 62 → 60, `methods` 61 →
+58, `tree` 112 → 107. The x86_64 backend does the same with rax and
+xmm0 (and when the value the last store left there is the *right*
+operand, both backends read it first and copy it, instead of losing it
+to the left operand's load). Under Rosetta, where that backend can be
+timed on this machine, `fib(34)` went 106 → 100 ms, `array` 63 → 59,
+`floatmath` 74 → 70, `nested` 23 → 21; an `idiv` keeps loading both
+its operands, because Rosetta runs a divide whose dividend arrives in
+rax from the previous op's ALU result markedly slower (a `(i * j) % 7`
+loop: 22 → 27 ms) — a translation artifact, not something real
+hardware would show, but the two loads cost nothing next to the divide. Then borrows: in a compiled function that nothing
 it runs can make write a struct field (no `SetField`, no method or
 native call, every call to a bytecode function that is field-pure
 itself — recursion included), a non-scalar field of a parameter the

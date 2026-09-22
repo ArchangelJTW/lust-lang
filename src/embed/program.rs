@@ -11,7 +11,7 @@ use crate::ast::{
     EnumDef, FieldOwnership, FunctionDef, ImplBlock, Item, ItemKind, Span, StructDef, TraitDef,
     Type, TypeKind,
 };
-use crate::bytecode::{Compiler, NativeCallResult, Value};
+use crate::bytecode::{Compiler, EnumObject, NativeCallResult, Value, native_fn};
 use crate::modules::{ModuleImports, ModuleLoader};
 use crate::typechecker::{FunctionSignature, TypeChecker};
 use crate::vm::{NativeExport, NativeExportParam, VM};
@@ -387,7 +387,7 @@ impl EmbeddedProgram {
     {
         let native_fn: Rc<dyn Fn(&[Value]) -> std::result::Result<NativeCallResult, String>> =
             Rc::new(func);
-        let value = Value::NativeFunction(native_fn);
+        let value = Value::NativeFunction(Rc::new(native_fn));
         let mut aliases: Vec<String> = Vec::new();
         aliases.push(canonical.clone());
         let canonical_normalized = normalize_global_name(&canonical);
@@ -539,7 +539,7 @@ impl EmbeddedProgram {
             })?;
         let mut values: Vec<TypedValue> =
             payload.into_iter().map(|v| v.into_typed_value()).collect();
-        let coerced_values: Option<Rc<Vec<Value>>> = match &enum_variant.fields {
+        let coerced_values: Option<Vec<Value>> = match &enum_variant.fields {
             None => {
                 if !values.is_empty() {
                     return Err(LustError::TypeError {
@@ -586,17 +586,17 @@ impl EmbeddedProgram {
                     collected.push(typed_value.into_value());
                 }
 
-                Some(Rc::new(collected))
+                Some(collected)
             }
         };
         Ok(EnumInstance::new(
             type_name.clone(),
             variant_name.clone(),
-            Value::Enum {
-                enum_name: type_name.into(),
-                variant: variant_name.into(),
-                values: coerced_values,
-            },
+            Value::Enum(EnumObject::new(
+                type_name.clone(),
+                variant_name.clone(),
+                coerced_values,
+            )),
         ))
     }
 
@@ -604,7 +604,7 @@ impl EmbeddedProgram {
     where
         F: Fn(&[Value]) -> std::result::Result<NativeCallResult, String> + 'static,
     {
-        let native = Value::NativeFunction(Rc::new(func));
+        let native = Value::NativeFunction(native_fn(func));
         self.vm.register_native(name, native);
     }
 

@@ -1,3 +1,4 @@
+use crate::bytecode::value::{ClosureObject, EnumObject, StructObject};
 use crate::bytecode::value::{IteratorState, Upvalue};
 use crate::bytecode::{LustMap, Value};
 use crate::vm::task::TaskInstance;
@@ -48,7 +49,7 @@ pub struct CycleCollector {
 enum ContainerKind {
     Array(Weak<RefCell<Vec<Value>>>),
     Map(Weak<RefCell<LustMap>>),
-    Struct(Weak<RefCell<Vec<Value>>>),
+    Struct(Weak<StructObject>),
     Iterator(Weak<RefCell<IteratorState>>),
 }
 
@@ -56,11 +57,11 @@ enum ContainerKind {
 enum NodeKind {
     Array(Weak<RefCell<Vec<Value>>>),
     Map(Weak<RefCell<LustMap>>),
-    Struct(Weak<RefCell<Vec<Value>>>),
+    Struct(Weak<StructObject>),
     Iterator(Weak<RefCell<IteratorState>>),
-    EnumValues(Weak<Vec<Value>>),
+    EnumValues(Weak<EnumObject>),
     TupleValues(Weak<Vec<Value>>),
-    ClosureUpvalues(Weak<Vec<Upvalue>>),
+    ClosureUpvalues(Weak<ClosureObject>),
     UpvalueCell(Weak<RefCell<Value>>),
 }
 
@@ -124,7 +125,8 @@ impl CycleCollector {
     /// Forget registrations whose container has already been freed.
     fn sweep_dead(&mut self) {
         self.containers.retain(|_, container| match container {
-            ContainerKind::Array(weak) | ContainerKind::Struct(weak) => weak.strong_count() > 0,
+            ContainerKind::Array(weak) => weak.strong_count() > 0,
+            ContainerKind::Struct(weak) => weak.strong_count() > 0,
             ContainerKind::Map(weak) => weak.strong_count() > 0,
             ContainerKind::Iterator(weak) => weak.strong_count() > 0,
         });
@@ -154,8 +156,7 @@ impl CycleCollector {
                 | Value::NativeFunction(_)
                 | Value::WeakStruct(_)
                 | Value::Task(_)
-                | Value::Enum { values: None, .. }
-        )
+        ) || matches!(value, Value::Enum(object) if object.values.is_none())
     }
 
     fn discover_vm_roots(&mut self, vm: &VM) {
@@ -269,15 +270,15 @@ impl CycleCollector {
                         }
                     }
                 }
-                Value::Struct { fields, .. } => {
-                    let key = (NODE_STRUCT, Rc::as_ptr(&fields) as usize);
-                    let registered = self.register_struct(&fields);
+                Value::Struct(object) => {
+                    let key = (NODE_STRUCT, Rc::as_ptr(&object) as usize);
+                    let registered = self.register_struct(&object);
                     if registered {
                         self.pending_registrations += 1;
                     }
                     if (registered || scan_existing)
                         && visited.insert(key)
-                        && let Ok(values) = fields.try_borrow()
+                        && let Ok(values) = object.fields.try_borrow()
                     {
                         self.work += values.len();
                         stack.extend(values.iter().filter(|v| !Self::is_leaf(v)).cloned());
@@ -319,19 +320,19 @@ impl CycleCollector {
                         stack.extend(values.iter().filter(|v| !Self::is_leaf(v)).cloned());
                     }
                 }
-                Value::Enum {
-                    values: Some(values),
-                    ..
-                } => {
-                    let key = (NODE_ENUM_VALUES, Rc::as_ptr(&values) as usize);
-                    if visited.insert(key) {
+                Value::Enum(object) => {
+                    let key = (NODE_ENUM_VALUES, Rc::as_ptr(&object) as usize);
+                    if let Some(values) = &object.values
+                        && visited.insert(key)
+                    {
                         self.work += values.len();
                         stack.extend(values.iter().filter(|v| !Self::is_leaf(v)).cloned());
                     }
                 }
-                Value::Closure { upvalues, .. } => {
-                    let key = (NODE_CLOSURE_UPVALUES, Rc::as_ptr(&upvalues) as usize);
+                Value::Closure(closure) => {
+                    let key = (NODE_CLOSURE_UPVALUES, Rc::as_ptr(&closure) as usize);
                     if visited.insert(key) {
+                        let upvalues = &closure.upvalues;
                         self.work += upvalues.len();
                         stack.extend(upvalues.iter().map(Upvalue::get).filter(|v| !Self::is_leaf(v)));
                     }
@@ -474,7 +475,7 @@ impl CycleCollector {
                 let Some(rc) = weak.upgrade() else {
                     return true;
                 };
-                let Ok(values) = rc.try_borrow() else {
+                let Ok(values) = rc.fields.try_borrow() else {
                     return false;
                 };
                 for value in values.iter() {
@@ -504,7 +505,15 @@ impl CycleCollector {
                     }
                 }
             }
-            NodeKind::EnumValues(weak) | NodeKind::TupleValues(weak) => {
+            NodeKind::EnumValues(weak) => {
+                let Some(object) = weak.upgrade() else {
+                    return true;
+                };
+                for value in object.values.iter().flatten() {
+                    self.scan_value(key, value, nodes);
+                }
+            }
+            NodeKind::TupleValues(weak) => {
                 let Some(values) = weak.upgrade() else {
                     return true;
                 };
@@ -513,10 +522,10 @@ impl CycleCollector {
                 }
             }
             NodeKind::ClosureUpvalues(weak) => {
-                let Some(upvalues) = weak.upgrade() else {
+                let Some(closure) = weak.upgrade() else {
                     return true;
                 };
-                for upvalue in upvalues.iter() {
+                for upvalue in closure.upvalues.iter() {
                     let cell = upvalue.cell();
                     let child = (NODE_UPVALUE_CELL, Rc::as_ptr(cell) as usize);
                     Self::add_edge(
@@ -566,15 +575,15 @@ impl CycleCollector {
                     NodeKind::Map(Rc::downgrade(rc)),
                 );
             }
-            Value::Struct { fields, .. } => {
-                self.register_struct(fields);
-                let child = (NODE_STRUCT, Rc::as_ptr(fields) as usize);
+            Value::Struct(object) => {
+                self.register_struct(object);
+                let child = (NODE_STRUCT, Rc::as_ptr(object) as usize);
                 Self::add_edge(
                     nodes,
                     owner,
                     child,
-                    Rc::strong_count(fields),
-                    NodeKind::Struct(Rc::downgrade(fields)),
+                    Rc::strong_count(object),
+                    NodeKind::Struct(Rc::downgrade(object)),
                 );
             }
             Value::Iterator(rc) => {
@@ -588,17 +597,14 @@ impl CycleCollector {
                     NodeKind::Iterator(Rc::downgrade(rc)),
                 );
             }
-            Value::Enum {
-                values: Some(values),
-                ..
-            } => {
-                let child = (NODE_ENUM_VALUES, Rc::as_ptr(values) as usize);
+            Value::Enum(object) if object.values.is_some() => {
+                let child = (NODE_ENUM_VALUES, Rc::as_ptr(object) as usize);
                 Self::add_edge(
                     nodes,
                     owner,
                     child,
-                    Rc::strong_count(values),
-                    NodeKind::EnumValues(Rc::downgrade(values)),
+                    Rc::strong_count(object),
+                    NodeKind::EnumValues(Rc::downgrade(object)),
                 );
             }
             Value::Tuple(values) => {
@@ -611,14 +617,14 @@ impl CycleCollector {
                     NodeKind::TupleValues(Rc::downgrade(values)),
                 );
             }
-            Value::Closure { upvalues, .. } => {
-                let child = (NODE_CLOSURE_UPVALUES, Rc::as_ptr(upvalues) as usize);
+            Value::Closure(closure) => {
+                let child = (NODE_CLOSURE_UPVALUES, Rc::as_ptr(closure) as usize);
                 Self::add_edge(
                     nodes,
                     owner,
                     child,
-                    Rc::strong_count(upvalues),
-                    NodeKind::ClosureUpvalues(Rc::downgrade(upvalues)),
+                    Rc::strong_count(closure),
+                    NodeKind::ClosureUpvalues(Rc::downgrade(closure)),
                 );
             }
             Value::WeakStruct(_) => {}
@@ -666,7 +672,7 @@ impl CycleCollector {
         )
     }
 
-    fn register_struct(&mut self, rc: &Rc<RefCell<Vec<Value>>>) -> bool {
+    fn register_struct(&mut self, rc: &Rc<StructObject>) -> bool {
         self.register_container(
             (NODE_STRUCT, Rc::as_ptr(rc) as usize),
             ContainerKind::Struct(Rc::downgrade(rc)),
@@ -737,7 +743,7 @@ impl ContainerKind {
                 let Some(rc) = weak.upgrade() else {
                     return ClearResult::Removed;
                 };
-                let Ok(mut fields) = rc.try_borrow_mut() else {
+                let Ok(mut fields) = rc.fields.try_borrow_mut() else {
                     return ClearResult::Retain;
                 };
                 for value in fields.iter_mut() {
@@ -802,10 +808,10 @@ mod tests {
             let root = match wrapper {
                 0 => Value::tuple(vec![array]),
                 1 => Value::enum_variant("Option", "Some", vec![array]),
-                _ => Value::Closure {
+                _ => Value::Closure(Rc::new(ClosureObject {
                     function_idx: 0,
-                    upvalues: Rc::new(vec![Upvalue::new(array)]),
-                },
+                    upvalues: vec![Upvalue::new(array)],
+                })),
             };
             collector.register_value(&root);
             assert_eq!(collector.containers.len(), 1);
@@ -865,10 +871,10 @@ mod tests {
         let mut collector = CycleCollector::new();
         let array = Value::array(Vec::new());
         let upvalue = Upvalue::new(Value::Nil);
-        let closure = Value::Closure {
+        let closure = Value::Closure(Rc::new(ClosureObject {
             function_idx: 0,
-            upvalues: Rc::new(vec![upvalue.clone()]),
-        };
+            upvalues: vec![upvalue.clone()],
+        }));
         array.array_push(closure).unwrap();
         upvalue.set(array.clone());
         collector.register_value(&array);
@@ -911,16 +917,12 @@ mod tests {
             Vec::new(),
             Vec::new(),
         ));
-        let fields = Rc::new(RefCell::new(vec![Value::Nil]));
-        let value = Value::Struct {
-            name: "Node".into(),
-            layout: layout.clone(),
-            fields: fields.clone(),
-        };
-        fields.borrow_mut()[0] = value.clone();
-        let weak_value = Value::WeakStruct(WeakStructRef::new("Node".to_string(), layout, &fields));
+        let object = StructObject::new("Node", layout, vec![Value::Nil]);
+        let value = Value::Struct(Rc::clone(&object));
+        object.fields.borrow_mut()[0] = value.clone();
+        let weak_value = Value::WeakStruct(WeakStructRef::new(&object));
         collector.register_value(&value);
-        drop((value, fields));
+        drop((value, object));
 
         collector.collect_registered();
 

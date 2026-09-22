@@ -1,6 +1,6 @@
 #![cfg(target_arch = "wasm32")]
 use crate::LustError;
-use crate::bytecode::{NativeCallResult, Value};
+use crate::bytecode::{NativeCallResult, Value, native_fn};
 use crate::embed::EmbeddedBuilder;
 use std::cell::RefCell;
 use std::fmt::Write;
@@ -29,7 +29,7 @@ fn install_print_hooks(vm: &mut crate::vm::VM, buffer: Rc<RefCell<String>>) {
 }
 
 fn make_print_closure(buffer: Rc<RefCell<String>>, newline: bool) -> Value {
-    Value::NativeFunction(Rc::new(move |args: &[Value]| {
+    Value::NativeFunction(native_fn(move |args: &[Value]| {
         let mut text = String::new();
         for (index, value) in args.iter().enumerate() {
             if index > 0 {

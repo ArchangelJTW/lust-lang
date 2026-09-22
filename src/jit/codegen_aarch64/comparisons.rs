@@ -20,12 +20,10 @@ impl JitCompiler {
         rhs_type: ValueType,
     ) -> Compare {
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
-            let a = self.operand_x(lhs, 0);
-            let b = self.operand_x(rhs, 10);
+            let (a, b) = self.operand_pair_x(lhs, rhs, 0, 10);
             return Compare::Int(a, b);
         }
-        let a = self.operand_numeric_d(lhs, lhs_type, 0);
-        let b = self.operand_numeric_d(rhs, rhs_type, 1);
+        let (a, b) = self.operand_pair_numeric_d(lhs, rhs, lhs_type, rhs_type);
         Compare::Float(a, b)
     }
 
@@ -69,8 +67,12 @@ impl JitCompiler {
         let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
         self.emit_compare(cmp);
         match cmp {
-            Compare::Float(..) => self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), mi)),
-            Compare::Int(..) => self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), lt)),
+            Compare::Float(..) => {
+                self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), mi))
+            }
+            Compare::Int(..) => {
+                self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), lt))
+            }
         }
         Ok(())
     }
@@ -86,8 +88,12 @@ impl JitCompiler {
         let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
         self.emit_compare(cmp);
         match cmp {
-            Compare::Float(..) => self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), ls)),
-            Compare::Int(..) => self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), le)),
+            Compare::Float(..) => {
+                self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), ls))
+            }
+            Compare::Int(..) => {
+                self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; cset X(d), le))
+            }
         }
         Ok(())
     }
@@ -131,7 +137,10 @@ impl JitCompiler {
     ) -> Result<()> {
         if lhs_type != rhs_type {
             let value = u32::from(!equal);
-            self.finish_bool(dest, |s, d| dynasm!(s.ops ; .arch aarch64 ; movz X(d), #value));
+            self.finish_bool(
+                dest,
+                |s, d| dynasm!(s.ops ; .arch aarch64 ; movz X(d), #value),
+            );
             return Ok(());
         }
         match lhs_type {
@@ -145,8 +154,7 @@ impl JitCompiler {
                 dynasm!(self.ops ; .arch aarch64 ; cmp w0, w10);
             }
             _ => {
-                let a = self.operand_x(lhs, 0);
-                let b = self.operand_x(rhs, 10);
+                let (a, b) = self.operand_pair_x(lhs, rhs, 0, 10);
                 dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b));
             }
         }

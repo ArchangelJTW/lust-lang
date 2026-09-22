@@ -1,0 +1,44 @@
+-- An array register that is a specialization candidate at trace entry (the
+-- inner array a previous iteration left in it) is overwritten by the loop
+-- and the array it held is then written through the boxed value. The copy
+-- taken at entry must not be published back over those writes at exit.
+local nest: Array<Array<int>> = [[1], [2], [3]]
+local i: int = 0
+while i < 100 do
+    if nest[0] is Ok(inner) then
+        array.push(inner, i)
+    end
+    i = i + 1
+end
+if nest[0] is Ok(first) then
+    println(array.len(first))
+end
+
+local grid: Array<Array<int>> = [[1], [2], [3]]
+i = 0
+while i < 100 do
+    if grid[i % 3] is Ok(row) then
+        if row[0] is Ok(a) then
+            row[0] = a + 1
+        end
+    end
+    i = i + 1
+end
+println(grid)
+
+-- The overwritten register's copy had been written: the loop is recorded
+-- again without specializing.
+local target: Array<int> = []
+local other: Array<int> = []
+i = 0
+while i < 200 do
+    local cur: Array<int> = target
+    array.push(cur, i)
+    cur = other
+    array.push(cur, i * 2)
+    i = i + 1
+end
+println(array.len(target))
+println(array.len(other))
+println(target[199])
+println(other[199])

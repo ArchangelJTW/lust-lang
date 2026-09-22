@@ -136,7 +136,7 @@ impl<'a> FromStructField<'a> for StringRef<'a> {
 impl<'a> FromStructField<'a> for EnumInstance {
     fn from_value(field: &str, value: ValueRef<'a>) -> Result<Self> {
         match value.as_value() {
-            Value::Enum { .. } => <EnumInstance as FromLustValue>::from_value(value.into_owned()),
+            Value::Enum(_) => <EnumInstance as FromLustValue>::from_value(value.into_owned()),
             other => Err(struct_field_type_error(field, "enum", other)),
         }
     }
@@ -616,7 +616,7 @@ impl IntoLustValue for FunctionHandle {
 impl FromLustValue for StructInstance {
     fn from_value(value: Value) -> Result<Self> {
         match &value {
-            Value::Struct { name, .. } => Ok(StructInstance::new(name.to_string(), value)),
+            Value::Struct(object) => Ok(StructInstance::new(object.name.to_string(), value)),
             other => Err(LustError::RuntimeError {
                 message: format!("Expected Lust value 'struct' but received '{:?}'", other),
             }),
@@ -691,9 +691,11 @@ impl IntoLustValue for EnumInstance {
 impl FromLustValue for EnumInstance {
     fn from_value(value: Value) -> Result<Self> {
         match &value {
-            Value::Enum {
-                enum_name, variant, ..
-            } => Ok(EnumInstance::new(enum_name.to_string(), variant.to_string(), value)),
+            Value::Enum(object) => Ok(EnumInstance::new(
+                object.enum_name.to_string(),
+                object.variant.to_string(),
+                value,
+            )),
             other => Err(LustError::RuntimeError {
                 message: format!("Expected Lust value 'enum' but received '{:?}'", other),
             }),

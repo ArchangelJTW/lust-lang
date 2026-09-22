@@ -10,9 +10,13 @@
 //! shown otherwise; a program either engine refuses to compile is a
 //! generator bug. Both are findings, both stop the run unless --keep-going.
 
+mod alloc_count;
 mod engine;
 mod writer;
 mod rng;
+
+#[global_allocator]
+static ALLOCATOR: alloc_count::Counting = alloc_count::Counting;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,6 +44,9 @@ enum Kind {
     Broke { message: String },
     /// Interpreter and JIT disagreed.
     Disagree { interp: Answer, jit: Answer },
+    /// Running the program left allocations behind, twice in a row (see
+    /// `alloc_count`): a reference count somewhere is never given back.
+    Leak { engine: &'static str, allocations: isize },
 }
 
 #[derive(Debug, Clone)]
@@ -349,7 +356,26 @@ fn print_finding(f: &Finding) {
             println!("  interpreter {}", interp.summary());
             println!("  jit         {}", jit.summary());
         }
+        Kind::Leak { engine, allocations } => {
+            println!("--- the {engine} leaks: {allocations} allocation(s) left behind per run");
+        }
     }
+}
+
+/// Run `source` through one engine and say what it left allocated. A first
+/// run may initialize something lazily; a leak is what a second run of the
+/// same program leaves behind again.
+fn run_checked(source: &str, jit: bool) -> Result<(Answer, isize), String> {
+    let before = alloc_count::live();
+    let answer = engine::run(source, jit)?;
+    let left = alloc_count::live() - before;
+    if left <= 0 {
+        return Ok((answer, 0));
+    }
+    let before = alloc_count::live();
+    let again = engine::run(source, jit)?;
+    drop(again);
+    Ok((answer, (alloc_count::live() - before).max(0)))
 }
 
 /// Run one program through both engines. `None` means they agreed.
@@ -363,14 +389,26 @@ fn run_case(program: &Program, seed: u64, stats: &mut Stats) -> Option<Finding> 
             kind,
         })
     };
-    let interp = match engine::run(&source, false) {
+    let (interp, interp_left) = match run_checked(&source, false) {
         Ok(a) => a,
         Err(message) => return finding(Kind::Broke { message }),
     };
-    let jit = match engine::run(&source, true) {
+    let (jit, jit_left) = match run_checked(&source, true) {
         Ok(a) => a,
         Err(message) => return finding(Kind::Broke { message }),
     };
+    if interp_left > 0 {
+        return finding(Kind::Leak {
+            engine: "interpreter",
+            allocations: interp_left,
+        });
+    }
+    if jit_left > 0 {
+        return finding(Kind::Leak {
+            engine: "JIT",
+            allocations: jit_left,
+        });
+    }
     stats.root_traces += jit.root_traces;
     stats.functions += jit.functions;
     stats.native_entries += jit.native_entries;
@@ -389,18 +427,19 @@ fn run_case(program: &Program, seed: u64, stats: &mut Stats) -> Option<Finding> 
     }
 }
 
-/// Does this (program, kind) still reproduce the finding? Only disagreements
-/// are shrunk; a refused program is a generator bug best read whole.
+/// Does this (program, kind) still reproduce the finding? Disagreements
+/// and leaks are shrunk; a refused program is a generator bug best read
+/// whole.
 fn still_fails(program: &Program) -> Option<Finding> {
     let mut stats = Stats::default();
     match run_case(program, 0, &mut stats) {
-        Some(f) if matches!(f.kind, Kind::Disagree { .. }) => Some(f),
+        Some(f) if matches!(f.kind, Kind::Disagree { .. } | Kind::Leak { .. }) => Some(f),
         _ => None,
     }
 }
 
 fn shrink(mut program: Program, finding: Finding) -> Finding {
-    if !matches!(finding.kind, Kind::Disagree { .. }) {
+    if !matches!(finding.kind, Kind::Disagree { .. } | Kind::Leak { .. }) {
         return finding;
     }
     let seed = finding.seed;

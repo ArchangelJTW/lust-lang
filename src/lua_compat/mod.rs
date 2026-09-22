@@ -2,7 +2,8 @@
 //! Lua 5.1 C API compatibility scaffolding.
 //! This module will host the runtime bridge and tracing that drive extern stub generation.
 
-use crate::bytecode::{Value, ValueKey};
+use crate::bytecode::value::EnumObject;
+use crate::bytecode::{Value, ValueKey, native_fn};
 use crate::number::{LustFloat, LustInt};
 use crate::vm::{NativeCallResult, VM};
 use alloc::rc::Rc;
@@ -413,7 +414,7 @@ fn register_c_function(
     let shared_state = state.clone();
     let cfunc_name = func.name.clone();
     let cfunc_upvalues = func.upvalues.clone();
-    let native = Value::NativeFunction(Rc::new(move |args: &[Value]| {
+    let native = Value::NativeFunction(native_fn(move |args: &[Value]| {
         let state_cell = shared_state.clone();
         VM::with_current(|vm| {
             let cfg = lua_trace_config();
@@ -540,7 +541,7 @@ fn register_lua_closure(
     let lua_func = LuaValue::Function(func.clone());
     let shared_state = state.clone();
 
-    let native = Value::NativeFunction(Rc::new(move |args: &[Value]| {
+    let native = Value::NativeFunction(native_fn(move |args: &[Value]| {
         VM::with_current(|vm| {
             let state_cell = shared_state.clone();
 
@@ -755,13 +756,12 @@ fn lua_to_lust_cached(
 }
 
 fn unwrap_lua_value_for_key(value: Value) -> Value {
-    if let Value::Enum {
-        enum_name,
-        variant,
-        values,
-    } = &value
-        && enum_name == "LuaValue"
+    if let Value::Enum(object) = &value
+        && object.enum_name == "LuaValue"
     {
+        let EnumObject {
+            variant, values, ..
+        } = object.as_ref();
         return match variant.as_str() {
             "Nil" => Value::Nil,
             "Bool" | "Int" | "Float" | "String" | "Table" | "Function" | "LightUserdata"
@@ -845,13 +845,10 @@ pub(crate) fn value_to_lua(value: &Value, vm: &VM) -> LuaValue {
         Value::Int(i) => LuaValue::Int(*i),
         Value::Float(f) => LuaValue::Float(*f),
         Value::String(s) => LuaValue::String((**s).clone()),
-        Value::Enum {
-            enum_name,
-            variant,
-            values,
-        } if enum_name == "LuaValue" => match variant.as_str() {
+        Value::Enum(object) if object.enum_name == "LuaValue" => match object.variant.as_str() {
             "Nil" => LuaValue::Nil,
-            "Bool" => values
+            "Bool" => object
+                .values
                 .as_ref()
                 .and_then(|v| v.first())
                 .and_then(|v| {
@@ -863,32 +860,37 @@ pub(crate) fn value_to_lua(value: &Value, vm: &VM) -> LuaValue {
                 })
                 .map(LuaValue::Bool)
                 .unwrap_or(LuaValue::Nil),
-            "Int" => values
+            "Int" => object
+                .values
                 .as_ref()
                 .and_then(|v| v.first())
                 .and_then(|v| v.as_int())
                 .map(LuaValue::Int)
                 .unwrap_or(LuaValue::Nil),
-            "Float" => values
+            "Float" => object
+                .values
                 .as_ref()
                 .and_then(|v| v.first())
                 .and_then(|v| v.as_float())
                 .map(LuaValue::Float)
                 .unwrap_or(LuaValue::Nil),
-            "String" => values
+            "String" => object
+                .values
                 .as_ref()
                 .and_then(|v| v.first())
                 .and_then(|v| v.as_string_rc())
                 .map(|s| LuaValue::String((*s).clone()))
                 .unwrap_or(LuaValue::Nil),
-            "LightUserdata" => values
+            "LightUserdata" => object
+                .values
                 .as_ref()
                 .and_then(|v| v.first())
                 .and_then(|v| v.as_int())
                 .map(|i| LuaValue::LightUserdata(i as usize))
                 .unwrap_or(LuaValue::LightUserdata(0)),
             "Function" => {
-                let handle = values
+                let handle = object
+                    .values
                     .as_ref()
                     .and_then(|vals| vals.first())
                     .and_then(|v| v.struct_get_field("handle"))
@@ -897,19 +899,22 @@ pub(crate) fn value_to_lua(value: &Value, vm: &VM) -> LuaValue {
                 LuaValue::Function(lua_function_from_handle(handle))
             }
             "Userdata" => {
-                let handle = values
+                let handle = object
+                    .values
                     .as_ref()
                     .and_then(|vals| vals.first())
                     .and_then(|v| v.struct_get_field("handle"))
                     .and_then(|v| v.as_int())
                     .unwrap_or(0) as usize;
-                let ptr = values
+                let ptr = object
+                    .values
                     .as_ref()
                     .and_then(|vals| vals.first())
                     .and_then(|v| v.struct_get_field("ptr"))
                     .and_then(|v| v.as_int())
                     .unwrap_or(0) as usize;
-                let state_ptr = values
+                let state_ptr = object
+                    .values
                     .as_ref()
                     .and_then(|vals| vals.first())
                     .and_then(|v| v.struct_get_field("state"))
@@ -922,7 +927,8 @@ pub(crate) fn value_to_lua(value: &Value, vm: &VM) -> LuaValue {
                 })
             }
             "Thread" => {
-                let handle = values
+                let handle = object
+                    .values
                     .as_ref()
                     .and_then(|vals| vals.first())
                     .and_then(|v| v.struct_get_field("handle"))
@@ -931,7 +937,7 @@ pub(crate) fn value_to_lua(value: &Value, vm: &VM) -> LuaValue {
                 LuaValue::Thread(LuaThread { id: handle })
             }
             "Table" => {
-                if let Some(values) = values
+                if let Some(values) = &object.values
                     && let Some(table_struct) = values.first()
                 {
                     let table_field = table_struct.struct_get_field("table");

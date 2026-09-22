@@ -1,6 +1,6 @@
 use super::*;
-use crate::jit::trace::{Operand, SpecializedOpKind};
 use crate::bytecode::value::JitVecSlot;
+use crate::jit::trace::{Operand, SpecializedOpKind};
 use crate::number::LustInt;
 
 fn is_int_vec(layout: &SpecializedLayout) -> Option<bool> {

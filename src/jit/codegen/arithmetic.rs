@@ -9,8 +9,7 @@ impl JitCompiler {
         rhs_type: ValueType,
     ) -> Result<()> {
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
-            self.load_to_rax(lhs);
-            self.load_to_rbx(rhs);
+            self.operands_rax_rbx(lhs, rhs);
             dynasm!(self.ops
                 ; .arch x64
                 ; add rax, rbx
@@ -20,42 +19,22 @@ impl JitCompiler {
         }
 
         if lhs_type == ValueType::Float && rhs_type == ValueType::Float {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
-            dynasm!(self.ops
-                ; .arch x64
-                ; movsd xmm0, [r12 + lhs_offset + 8]
-                ; movsd xmm1, [r12 + rhs_offset + 8]
-                ; addsd xmm0, xmm1
-            );
+            self.operands_numeric_xmm(lhs, rhs, ValueType::Float, ValueType::Float);
+            dynasm!(self.ops ; .arch x64 ; addsd xmm0, xmm1);
             self.store_xmm0_as_float(dest);
             return Ok(());
         }
 
         if lhs_type == ValueType::Int && rhs_type == ValueType::Float {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
-            dynasm!(self.ops
-                ; .arch x64
-                ; mov rax, [r12 + lhs_offset + 8]
-                ; cvtsi2sd xmm0, rax
-                ; movsd xmm1, [r12 + rhs_offset + 8]
-                ; addsd xmm0, xmm1
-            );
+            self.operands_numeric_xmm(lhs, rhs, ValueType::Int, ValueType::Float);
+            dynasm!(self.ops ; .arch x64 ; addsd xmm0, xmm1);
             self.store_xmm0_as_float(dest);
             return Ok(());
         }
 
         if lhs_type == ValueType::Float && rhs_type == ValueType::Int {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
-            dynasm!(self.ops
-                ; .arch x64
-                ; movsd xmm0, [r12 + lhs_offset + 8]
-                ; mov rax, [r12 + rhs_offset + 8]
-                ; cvtsi2sd xmm1, rax
-                ; addsd xmm0, xmm1
-            );
+            self.operands_numeric_xmm(lhs, rhs, ValueType::Float, ValueType::Int);
+            dynasm!(self.ops ; .arch x64 ; addsd xmm0, xmm1);
             self.store_xmm0_as_float(dest);
             return Ok(());
         }
@@ -122,8 +101,7 @@ impl JitCompiler {
         rhs_type: ValueType,
     ) -> Result<()> {
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
-            self.load_to_rax(lhs);
-            self.load_to_rbx(rhs);
+            self.operands_rax_rbx(lhs, rhs);
             dynasm!(self.ops
                 ; .arch x64
                 ; sub rax, rbx
@@ -133,42 +111,22 @@ impl JitCompiler {
         }
 
         if lhs_type == ValueType::Float && rhs_type == ValueType::Float {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
-            dynasm!(self.ops
-                ; .arch x64
-                ; movsd xmm0, [r12 + lhs_offset + 8]
-                ; movsd xmm1, [r12 + rhs_offset + 8]
-                ; subsd xmm0, xmm1
-            );
+            self.operands_numeric_xmm(lhs, rhs, ValueType::Float, ValueType::Float);
+            dynasm!(self.ops ; .arch x64 ; subsd xmm0, xmm1);
             self.store_xmm0_as_float(dest);
             return Ok(());
         }
 
         if lhs_type == ValueType::Int && rhs_type == ValueType::Float {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
-            dynasm!(self.ops
-                ; .arch x64
-                ; mov rax, [r12 + lhs_offset + 8]
-                ; cvtsi2sd xmm0, rax
-                ; movsd xmm1, [r12 + rhs_offset + 8]
-                ; subsd xmm0, xmm1
-            );
+            self.operands_numeric_xmm(lhs, rhs, ValueType::Int, ValueType::Float);
+            dynasm!(self.ops ; .arch x64 ; subsd xmm0, xmm1);
             self.store_xmm0_as_float(dest);
             return Ok(());
         }
 
         if lhs_type == ValueType::Float && rhs_type == ValueType::Int {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
-            dynasm!(self.ops
-                ; .arch x64
-                ; movsd xmm0, [r12 + lhs_offset + 8]
-                ; mov rax, [r12 + rhs_offset + 8]
-                ; cvtsi2sd xmm1, rax
-                ; subsd xmm0, xmm1
-            );
+            self.operands_numeric_xmm(lhs, rhs, ValueType::Float, ValueType::Int);
+            dynasm!(self.ops ; .arch x64 ; subsd xmm0, xmm1);
             self.store_xmm0_as_float(dest);
             return Ok(());
         }
@@ -235,8 +193,7 @@ impl JitCompiler {
         rhs_type: ValueType,
     ) -> Result<()> {
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
-            self.load_to_rax(lhs);
-            self.load_to_rbx(rhs);
+            self.operands_rax_rbx(lhs, rhs);
             dynasm!(self.ops
                 ; .arch x64
                 ; imul rax, rbx
@@ -246,42 +203,22 @@ impl JitCompiler {
         }
 
         if lhs_type == ValueType::Float && rhs_type == ValueType::Float {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
-            dynasm!(self.ops
-                ; .arch x64
-                ; movsd xmm0, [r12 + lhs_offset + 8]
-                ; movsd xmm1, [r12 + rhs_offset + 8]
-                ; mulsd xmm0, xmm1
-            );
+            self.operands_numeric_xmm(lhs, rhs, ValueType::Float, ValueType::Float);
+            dynasm!(self.ops ; .arch x64 ; mulsd xmm0, xmm1);
             self.store_xmm0_as_float(dest);
             return Ok(());
         }
 
         if lhs_type == ValueType::Int && rhs_type == ValueType::Float {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
-            dynasm!(self.ops
-                ; .arch x64
-                ; mov rax, [r12 + lhs_offset + 8]
-                ; cvtsi2sd xmm0, rax
-                ; movsd xmm1, [r12 + rhs_offset + 8]
-                ; mulsd xmm0, xmm1
-            );
+            self.operands_numeric_xmm(lhs, rhs, ValueType::Int, ValueType::Float);
+            dynasm!(self.ops ; .arch x64 ; mulsd xmm0, xmm1);
             self.store_xmm0_as_float(dest);
             return Ok(());
         }
 
         if lhs_type == ValueType::Float && rhs_type == ValueType::Int {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
-            dynasm!(self.ops
-                ; .arch x64
-                ; movsd xmm0, [r12 + lhs_offset + 8]
-                ; mov rax, [r12 + rhs_offset + 8]
-                ; cvtsi2sd xmm1, rax
-                ; mulsd xmm0, xmm1
-            );
+            self.operands_numeric_xmm(lhs, rhs, ValueType::Float, ValueType::Int);
+            dynasm!(self.ops ; .arch x64 ; mulsd xmm0, xmm1);
             self.store_xmm0_as_float(dest);
             return Ok(());
         }
@@ -348,50 +285,29 @@ impl JitCompiler {
         rhs_type: ValueType,
     ) -> Result<()> {
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
-            self.load_to_rax(lhs);
-            self.load_to_rbx(rhs);
+            self.operands_idiv(lhs, rhs);
             self.emit_int_div();
             self.store_from_rax(dest, 2);
             return Ok(());
         }
 
         if lhs_type == ValueType::Float && rhs_type == ValueType::Float {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
-            dynasm!(self.ops
-                ; .arch x64
-                ; movsd xmm0, [r12 + lhs_offset + 8]
-                ; movsd xmm1, [r12 + rhs_offset + 8]
-                ; divsd xmm0, xmm1
-            );
+            self.operands_numeric_xmm(lhs, rhs, ValueType::Float, ValueType::Float);
+            dynasm!(self.ops ; .arch x64 ; divsd xmm0, xmm1);
             self.store_xmm0_as_float(dest);
             return Ok(());
         }
 
         if lhs_type == ValueType::Int && rhs_type == ValueType::Float {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
-            dynasm!(self.ops
-                ; .arch x64
-                ; mov rax, [r12 + lhs_offset + 8]
-                ; cvtsi2sd xmm0, rax
-                ; movsd xmm1, [r12 + rhs_offset + 8]
-                ; divsd xmm0, xmm1
-            );
+            self.operands_numeric_xmm(lhs, rhs, ValueType::Int, ValueType::Float);
+            dynasm!(self.ops ; .arch x64 ; divsd xmm0, xmm1);
             self.store_xmm0_as_float(dest);
             return Ok(());
         }
 
         if lhs_type == ValueType::Float && rhs_type == ValueType::Int {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
-            dynasm!(self.ops
-                ; .arch x64
-                ; movsd xmm0, [r12 + lhs_offset + 8]
-                ; mov rax, [r12 + rhs_offset + 8]
-                ; cvtsi2sd xmm1, rax
-                ; divsd xmm0, xmm1
-            );
+            self.operands_numeric_xmm(lhs, rhs, ValueType::Float, ValueType::Int);
+            dynasm!(self.ops ; .arch x64 ; divsd xmm0, xmm1);
             self.store_xmm0_as_float(dest);
             return Ok(());
         }
@@ -461,8 +377,7 @@ impl JitCompiler {
         rhs_type: ValueType,
     ) -> Result<()> {
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
-            self.load_to_rax(lhs);
-            self.load_to_rbx(rhs);
+            self.operands_idiv(lhs, rhs);
             self.emit_int_mod();
             self.store_from_rax(dest, 2);
             return Ok(());
@@ -470,18 +385,7 @@ impl JitCompiler {
 
         let numeric = |ty: ValueType| matches!(ty, ValueType::Int | ValueType::Float);
         if numeric(lhs_type) && numeric(rhs_type) {
-            let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
-            let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);
-            if lhs_type == ValueType::Int {
-                dynasm!(self.ops ; .arch x64 ; mov rax, [r12 + lhs_offset + 8] ; cvtsi2sd xmm0, rax);
-            } else {
-                dynasm!(self.ops ; .arch x64 ; movsd xmm0, [r12 + lhs_offset + 8]);
-            }
-            if rhs_type == ValueType::Int {
-                dynasm!(self.ops ; .arch x64 ; mov rax, [r12 + rhs_offset + 8] ; cvtsi2sd xmm1, rax);
-            } else {
-                dynasm!(self.ops ; .arch x64 ; movsd xmm1, [r12 + rhs_offset + 8]);
-            }
+            self.operands_numeric_xmm(lhs, rhs, lhs_type, rhs_type);
             self.emit_float_mod();
             self.store_xmm0_as_float(dest);
             return Ok(());

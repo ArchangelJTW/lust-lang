@@ -33,6 +33,8 @@ pub enum Ty {
     FnIntInt,
     /// `Map<int, int>`
     MapIntInt,
+    /// `Option<P>`: a struct handed around through an enum payload.
+    OptStruct,
 }
 
 impl Ty {
@@ -48,6 +50,7 @@ impl Ty {
             Ty::Unknown => "unknown",
             Ty::FnIntInt => "function(int): int",
             Ty::MapIntInt => "Map<int, int>",
+            Ty::OptStruct => "Option<P>",
         }
     }
 }
@@ -109,7 +112,8 @@ pub enum Expr {
     /// `[e, e, ...]`
     ArrLit(Vec<Expr>),
     /// `P { a = e, b = e, c = e }`
-    StructLit(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// `P { a, b, c, next }`.
+    StructLit(Box<Expr>, Box<Expr>, Box<Expr>, Box<Expr>),
     Some(Box<Expr>),
     None,
     StrLit(&'static str),
@@ -133,6 +137,10 @@ pub enum Expr {
     Cast(String, &'static str),
     /// A named `function(int): int` helper used as a value.
     FnName(String),
+    /// A stdlib native (`math.abs`) used as a `function(int): int` value.
+    Native(&'static str),
+    /// `Option.Some(e)` over a struct.
+    SomeStruct(Box<Expr>),
     /// `function(x: int): int return e end`, `e` over `x` and captured locals.
     Closure(String, Box<Expr>),
     /// `f(e)` through a `function(int): int` variable.
@@ -188,6 +196,12 @@ pub enum Stmt {
         arr: String,
         expr: Expr,
     },
+    /// `arr[idx] = e` (an index out of range is a runtime error)
+    SetIndex {
+        arr: String,
+        idx: Expr,
+        expr: Expr,
+    },
     /// `if arr[idx] is Ok(v) then body end`
     IfIndex {
         arr: String,
@@ -203,6 +217,12 @@ pub enum Stmt {
     },
     /// `if opt is Some(v) then body end`
     IfIsSome {
+        opt: String,
+        var: String,
+        body: Vec<Stmt>,
+    },
+    /// `if opt is Some(q) then body end` over an `Option<P>`.
+    IfIsSomeStruct {
         opt: String,
         var: String,
         body: Vec<Stmt>,
@@ -322,13 +342,15 @@ fn render_expr(e: &Expr, out: &mut String) {
             }
             out.push(']');
         }
-        Expr::StructLit(a, b, c) => {
+        Expr::StructLit(a, b, c, next) => {
             out.push_str("P { a = ");
             render_expr(a, out);
             out.push_str(", b = ");
             render_expr(b, out);
             out.push_str(", c = ");
             render_expr(c, out);
+            out.push_str(", next = ");
+            render_expr(next, out);
             out.push_str(" }");
         }
         Expr::Some(x) => {
@@ -375,6 +397,12 @@ fn render_expr(e: &Expr, out: &mut String) {
         Expr::TypeIs(u, ty) => out.push_str(&format!("({u} is {ty})")),
         Expr::Cast(u, ty) => out.push_str(&format!("({u} as {ty})")),
         Expr::FnName(f) => out.push_str(f),
+        Expr::Native(f) => out.push_str(f),
+        Expr::SomeStruct(e) => {
+            out.push_str("Option.Some(");
+            render_expr(e, out);
+            out.push(')');
+        }
         Expr::Closure(x, body) => {
             out.push_str(&format!("function({x}: int): int return "));
             render_expr(body, out);
@@ -482,6 +510,11 @@ fn render_stmt(s: &Stmt, out: &mut Out) {
         Stmt::Break => out.line("break"),
         Stmt::Continue => out.line("continue"),
         Stmt::Push { arr, expr } => out.line(&format!("array.push({arr}, {})", expr_text(expr))),
+        Stmt::SetIndex { arr, idx, expr } => out.line(&format!(
+            "{arr}[{}] = {}",
+            expr_text(idx),
+            expr_text(expr)
+        )),
         Stmt::IfIndex { arr, idx, var, body } => {
             out.line(&format!("if {arr}[{}] is Ok({var}) then", expr_text(idx)));
             out.indent += 1;
@@ -497,7 +530,7 @@ fn render_stmt(s: &Stmt, out: &mut Out) {
             out.indent -= 1;
             out.line("end");
         }
-        Stmt::IfIsSome { opt, var, body } => {
+        Stmt::IfIsSome { opt, var, body } | Stmt::IfIsSomeStruct { opt, var, body } => {
             out.line(&format!("if {opt} is Some({var}) then"));
             out.indent += 1;
             render_block(body, out);
@@ -552,6 +585,7 @@ pub fn render(p: &Program) -> String {
     out.line("a: int");
     out.line("b: float");
     out.line("c: bool");
+    out.line("next: Option<P>");
     out.indent -= 1;
     out.line("end");
     out.line("");
@@ -707,10 +741,13 @@ pub fn program(seed: u64, size: u32) -> Program {
     let mut funcs = Vec::new();
     let func_count = g.rng.below(size as u64 + 1) as usize;
     for _ in 0..func_count {
-        match g.rng.below(10) {
+        match g.rng.below(12) {
             0..=1 => funcs.push(g.unary_func()),
             2 => funcs.push(g.pair_func()),
             3..=4 => funcs.extend(g.recursive_funcs()),
+            5 => funcs.push(g.struct_func()),
+            6 => funcs.push(g.opt_struct_func()),
+            7 => funcs.push(g.chain_func()),
             _ => funcs.push(g.func()),
         }
     }
@@ -893,6 +930,230 @@ impl Gen {
     }
 
     /// A pair-returning helper, `(int, float)` or `(int, bool)`.
+    /// A helper taking a struct (and an int) and returning a struct: the
+    /// parameter itself most of the time — a compiled caller passes it by
+    /// aliasing, and returning it must add a reference — else a fresh
+    /// struct built from it. The body may read and mutate the parameter.
+    fn struct_func(&mut self) -> Func {
+        let name = self.fresh("s");
+        self.scopes.clear();
+        self.scopes.push(Vec::new());
+        let p = self.fresh("p");
+        let k = self.fresh("k");
+        self.declare(&p, Ty::Struct, false);
+        self.declare(&k, Ty::Int, false);
+        self.in_func = true;
+        self.iter_scale = 1;
+        self.cur_work = 0;
+        let straight = self.rng.chance(0.5);
+        let saved_size = self.size;
+        if straight {
+            self.size = 1;
+        }
+        let mut body = if straight { Vec::new() } else { self.block(false) };
+        if self.rng.chance(0.4) {
+            body.push(Stmt::SetField {
+                obj: p.clone(),
+                field: "a",
+                expr: Expr::Bin(
+                    Box::new(Expr::Field(p.clone(), "a")),
+                    BinOp::Add,
+                    Box::new(Expr::Var(k.clone())),
+                ),
+            });
+        }
+        let ret_expr = match self.rng.below(10) {
+            0..=5 => Expr::Var(p.clone()),
+            6..=7 => Expr::StructLit(
+                Box::new(Expr::Bin(
+                    Box::new(Expr::Field(p.clone(), "a")),
+                    BinOp::Sub,
+                    Box::new(Expr::Var(k.clone())),
+                )),
+                Box::new(Expr::Field(p.clone(), "b")),
+                Box::new(Expr::Not(Box::new(Expr::Field(p.clone(), "c")))),
+                Box::new(Expr::SomeStruct(Box::new(Expr::Var(p.clone())))),
+            ),
+            _ => self.expr(Ty::Struct, 1),
+        };
+        self.size = saved_size;
+        self.in_func = false;
+        self.iter_scale = 1;
+        let work = self.cur_work.max(1);
+        self.cur_work = 0;
+        self.funcs.push(FuncSig {
+            name: name.clone(),
+            params: vec![Ty::Struct, Ty::Int],
+            ret: Ty::Struct,
+            work,
+            bound: None,
+            second: None,
+        });
+        Func {
+            name,
+            params: vec![(p, Ty::Struct), (k, Ty::Int)],
+            ret: Ty::Struct,
+            body,
+            ret_expr,
+            second: None,
+        }
+    }
+
+    /// A helper walking a struct's `next` chain: field-pure, so a compiled
+    /// version borrows each link and its payload rather than cloning them,
+    /// and every exit to the interpreter has to retain what it borrowed.
+    /// `d` is folded in so the call site's argument matters.
+    fn chain_func(&mut self) -> Func {
+        let name = self.fresh("c");
+        self.scopes.clear();
+        self.scopes.push(Vec::new());
+        let p = self.fresh("p");
+        let d = self.fresh("d");
+        let s = self.fresh("s");
+        let q = self.fresh("q");
+        self.in_func = true;
+        self.iter_scale = 1;
+        self.cur_work = 0;
+        let mut inner = vec![Stmt::Assign {
+            name: s.clone(),
+            expr: Expr::Bin(
+                Box::new(Expr::Var(s.clone())),
+                BinOp::Add,
+                Box::new(Expr::Call(
+                    name.clone(),
+                    vec![
+                        Expr::Var(q.clone()),
+                        Expr::Bin(
+                            Box::new(Expr::Var(d.clone())),
+                            BinOp::Sub,
+                            Box::new(Expr::Int(1)),
+                        ),
+                    ],
+                )),
+            ),
+        }];
+        // Sometimes the borrowed link is copied into a local — a clone
+        // the local owns — twice, so the second copy has to release the
+        // first, and read through.
+        if self.rng.chance(0.5) {
+            let h = self.fresh("h");
+            inner.push(Stmt::Local {
+                name: h.clone(),
+                ty: Ty::Struct,
+                init: Expr::Var(q.clone()),
+            });
+            inner.push(Stmt::Assign {
+                name: s.clone(),
+                expr: Expr::Bin(
+                    Box::new(Expr::Var(s.clone())),
+                    BinOp::Add,
+                    Box::new(Expr::Field(h.clone(), "a")),
+                ),
+            });
+            inner.push(Stmt::Assign {
+                name: h.clone(),
+                expr: Expr::Var(q.clone()),
+            });
+            inner.push(Stmt::Assign {
+                name: s.clone(),
+                expr: Expr::Bin(
+                    Box::new(Expr::Var(s.clone())),
+                    BinOp::Add,
+                    Box::new(Expr::Field(h, "a")),
+                ),
+            });
+        }
+        let body = vec![
+            Stmt::Local {
+                name: s.clone(),
+                ty: Ty::Int,
+                init: Expr::Bin(
+                    Box::new(Expr::Field(p.clone(), "a")),
+                    BinOp::Add,
+                    Box::new(Expr::Var(d.clone())),
+                ),
+            },
+            Stmt::IfIsSomeStruct {
+                opt: format!("{p}.next"),
+                var: q.clone(),
+                body: inner,
+            },
+        ];
+        self.in_func = false;
+        self.iter_scale = 1;
+        self.cur_work = 0;
+        self.funcs.push(FuncSig {
+            name: name.clone(),
+            params: vec![Ty::Struct, Ty::Int],
+            ret: Ty::Int,
+            work: 8,
+            bound: None,
+            second: None,
+        });
+        Func {
+            name,
+            params: vec![(p, Ty::Struct), (d, Ty::Int)],
+            ret: Ty::Int,
+            body,
+            ret_expr: Expr::Var(s),
+            second: None,
+        }
+    }
+
+    /// A helper returning `Option<P>`: the struct parameter wrapped in
+    /// `Some` (an enum payload the callee's frame gives up and the caller
+    /// unwraps again), or `None` depending on the flag.
+    fn opt_struct_func(&mut self) -> Func {
+        let name = self.fresh("o");
+        self.scopes.clear();
+        self.scopes.push(Vec::new());
+        let p = self.fresh("p");
+        let flag = self.fresh("b");
+        self.declare(&p, Ty::Struct, false);
+        self.declare(&flag, Ty::Bool, false);
+        self.in_func = true;
+        self.iter_scale = 1;
+        self.cur_work = 0;
+        let saved_size = self.size;
+        self.size = 1;
+        let body = if self.rng.chance(0.5) { Vec::new() } else { self.block(false) };
+        // `if not flag then return None end`, then `Some(p)`.
+        let mut body = body;
+        body.push(Stmt::If {
+            branches: vec![(
+                Expr::Not(Box::new(Expr::Var(flag.clone()))),
+                vec![Stmt::Return(Expr::None)],
+            )],
+            otherwise: None,
+        });
+        let ret_expr = if self.rng.chance(0.8) {
+            Expr::SomeStruct(Box::new(Expr::Var(p.clone())))
+        } else {
+            Expr::SomeStruct(Box::new(self.expr(Ty::Struct, 1)))
+        };
+        self.size = saved_size;
+        self.in_func = false;
+        self.iter_scale = 1;
+        let work = self.cur_work.max(1);
+        self.cur_work = 0;
+        self.funcs.push(FuncSig {
+            name: name.clone(),
+            params: vec![Ty::Struct, Ty::Bool],
+            ret: Ty::OptStruct,
+            work,
+            bound: None,
+            second: None,
+        });
+        Func {
+            name,
+            params: vec![(p, Ty::Struct), (flag, Ty::Bool)],
+            ret: Ty::OptStruct,
+            body,
+            ret_expr,
+            second: None,
+        }
+    }
+
     fn pair_func(&mut self) -> Func {
         let name = self.fresh("h");
         let scalar = [Ty::Int, Ty::Float, Ty::Bool];
@@ -1179,8 +1440,10 @@ impl Gen {
             66..=68 if !deep => self.for_in_loop(),
             69..=78 if !deep => Some(self.if_stmt()),
             79..=81 if self.loop_depth > 0 => Some(self.break_or_continue()),
-            82..=85 => self.push(),
-            86..=89 if !deep => self.if_index(),
+            82..=84 => self.push(),
+            85 => self.set_index(),
+            86..=88 if !deep => self.if_index(),
+            89 => self.set_index(),
             90..=92 if !deep => self.if_some(),
             93..=95 if !deep => self.if_is_some(),
             96..=97 => self.set_field(),
@@ -1228,7 +1491,7 @@ impl Gen {
     }
 
     fn local(&mut self) -> Stmt {
-        let ty = match self.rng.below(18) {
+        let ty = match self.rng.below(19) {
             0..=3 => Ty::Int,
             4..=5 => Ty::Float,
             6 => Ty::Bool,
@@ -1238,6 +1501,7 @@ impl Gen {
             11..=12 => Ty::Str,
             13 => Ty::Unknown,
             14..=15 => Ty::FnIntInt,
+            16 => Ty::OptStruct,
             _ => Ty::MapIntInt,
         };
         let name = self.fresh(match ty {
@@ -1251,6 +1515,7 @@ impl Gen {
             Ty::Unknown => "u",
             Ty::FnIntInt => "fn",
             Ty::MapIntInt => "m",
+            Ty::OptStruct => "op",
         });
         let init = self.expr(ty, 2);
         if let Expr::ArrLit(items) = &init {
@@ -1269,6 +1534,8 @@ impl Gen {
             Ty::OptInt,
             Ty::Str,
             Ty::FnIntInt,
+            Ty::Struct,
+            Ty::OptStruct,
         ]);
         let vars = self.mutable_vars_of(ty);
         if vars.is_empty() {
@@ -1374,6 +1641,18 @@ impl Gen {
     }
 
     fn if_is_some(&mut self) -> Option<Stmt> {
+        if self.rng.chance(0.4) {
+            let opts = self.vars_of(Ty::OptStruct);
+            if !opts.is_empty() {
+                let opt = self.rng.pick(&opts).name.clone();
+                let var = self.fresh("q");
+                self.scopes.push(Vec::new());
+                self.declare(&var, Ty::Struct, true);
+                let body = self.block(false);
+                self.scopes.pop();
+                return Some(Stmt::IfIsSomeStruct { opt, var, body });
+            }
+        }
         let vars = self.vars_of(Ty::OptInt);
         if vars.is_empty() {
             return Some(self.local());
@@ -1462,6 +1741,24 @@ impl Gen {
         Some(Stmt::Push { arr, expr })
     }
 
+    /// `arr[idx] = e`: the index is usually in range (a counter or a
+    /// literal below what has been pushed so far), sometimes anything.
+    fn set_index(&mut self) -> Option<Stmt> {
+        let vars = self.vars_of(Ty::ArrInt);
+        if vars.is_empty() {
+            return Some(self.local());
+        }
+        let arr = self.rng.pick(&vars).name.clone();
+        let pushed = self.array_bounds.get(&arr).copied().unwrap_or(0);
+        let idx = if pushed > 0 && self.rng.below(4) != 0 {
+            Expr::Int(self.rng.below(pushed as u64) as i64)
+        } else {
+            self.expr(Ty::Int, 2)
+        };
+        let expr = self.expr(Ty::Int, 2);
+        Some(Stmt::SetIndex { arr, idx, expr })
+    }
+
     fn if_index(&mut self) -> Option<Stmt> {
         let vars = self.vars_of(Ty::ArrInt);
         if vars.is_empty() {
@@ -1508,11 +1805,46 @@ impl Gen {
                 let items = (0..n).map(|_| self.int_expr(1)).collect();
                 Expr::ArrLit(items)
             }
-            Ty::Struct => Expr::StructLit(
-                Box::new(self.int_expr(1)),
-                Box::new(self.float_expr(1)),
-                Box::new(self.bool_expr(1)),
-            ),
+            Ty::Struct => {
+                // A struct-returning helper call (its argument a variable
+                // when one exists, so the callee's frame aliases it), an
+                // existing variable, or a literal.
+                if depth > 0 && self.rng.chance(0.4)
+                    && let Some(call) = self.call_returning(Ty::Struct, depth)
+                {
+                    return call;
+                }
+                let vars = self.vars_of(Ty::Struct);
+                if !vars.is_empty() && self.rng.chance(0.3) {
+                    return Expr::Var(self.rng.pick(&vars).name.clone());
+                }
+                // A chain through `next` to an earlier struct, sometimes:
+                // helpers walk it (borrowing each link when compiled).
+                let next = match self.vars_of(Ty::Struct) {
+                    vars if !vars.is_empty() && self.rng.chance(0.5) => {
+                        Expr::SomeStruct(Box::new(Expr::Var(self.rng.pick(&vars).name.clone())))
+                    }
+                    _ => Expr::None,
+                };
+                Expr::StructLit(
+                    Box::new(self.int_expr(1)),
+                    Box::new(self.float_expr(1)),
+                    Box::new(self.bool_expr(1)),
+                    Box::new(next),
+                )
+            }
+            Ty::OptStruct => {
+                if depth > 0 && self.rng.chance(0.6)
+                    && let Some(call) = self.call_returning(Ty::OptStruct, depth)
+                {
+                    return call;
+                }
+                if self.rng.chance(0.7) {
+                    Expr::SomeStruct(Box::new(self.expr(Ty::Struct, 1)))
+                } else {
+                    Expr::None
+                }
+            }
             Ty::OptInt => match self.rng.below(12) {
                 0..=4 => Expr::Some(Box::new(self.int_expr(1))),
                 5..=6 => Expr::None,
@@ -1558,6 +1890,9 @@ impl Gen {
             },
             Ty::Str => self.str_expr(depth),
             Ty::Unknown => {
+                if self.rng.chance(0.1) {
+                    return Expr::Native(*self.rng.pick(&["math.abs", "tostring"]));
+                }
                 let ty = *self.rng.pick(&[Ty::Int, Ty::Float, Ty::Bool, Ty::Str]);
                 self.expr(ty, 1)
             }
@@ -1575,9 +1910,12 @@ impl Gen {
             self.vars_of(Ty::FnIntInt)
         };
         let names = self.unary_names();
-        match self.rng.below(10) {
+        match self.rng.below(12) {
             0..=3 if !vars.is_empty() => Expr::Var(self.rng.pick(&vars).name.clone()),
             4..=6 if !names.is_empty() => Expr::FnName(self.rng.pick(&names).clone()),
+            // A native as a function value: an owning `NativeFunction` in
+            // a register, moved and called like any other.
+            10..=11 => Expr::Native("math.abs"),
             _ if depth > 0 && !self.in_closure => {
                 let x = self.fresh("x");
                 self.scopes.push(vec![Var {
@@ -2007,7 +2345,9 @@ fn contains_math(e: &Expr) -> bool {
             contains_math(d)
         }
         Expr::Concat(l, r) => contains_math(l) || contains_math(r),
-        Expr::StructLit(a, b, c) => contains_math(a) || contains_math(b) || contains_math(c),
+        Expr::StructLit(a, b, c, next) => {
+            contains_math(a) || contains_math(b) || contains_math(c) || contains_math(next)
+        }
         _ => false,
     }
 }
@@ -2057,7 +2397,8 @@ fn children(s: &Stmt) -> Vec<&Vec<Stmt>> {
         | Stmt::ForIn { body, .. }
         | Stmt::IfIndex { body, .. }
         | Stmt::IfSome { body, .. }
-        | Stmt::IfIsSome { body, .. } => vec![body],
+        | Stmt::IfIsSome { body, .. }
+        | Stmt::IfIsSomeStruct { body, .. } => vec![body],
         Stmt::If {
             branches,
             otherwise,
@@ -2080,7 +2421,8 @@ fn children_mut(s: &mut Stmt) -> Vec<&mut Vec<Stmt>> {
         | Stmt::ForIn { body, .. }
         | Stmt::IfIndex { body, .. }
         | Stmt::IfSome { body, .. }
-        | Stmt::IfIsSome { body, .. } => vec![body],
+        | Stmt::IfIsSome { body, .. }
+        | Stmt::IfIsSomeStruct { body, .. } => vec![body],
         Stmt::If {
             branches,
             otherwise,

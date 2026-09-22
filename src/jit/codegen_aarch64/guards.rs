@@ -7,6 +7,37 @@ impl JitCompiler {
         expected_type: ValueType,
         guard_index: usize,
     ) -> Result<Guard> {
+        let guard_return_value = (guard_index + 1) as i32;
+        // A guard is the proof of a register's type; it must look at memory
+        // even when the register is pinned.
+        self.load_tag_from_memory(0, register);
+        if expected_type == ValueType::Plain {
+            // Nothing owned: a scalar, a function index or a task handle.
+            let scalar_max_tag = ValueTag::Float.as_u8() as u32;
+            let plain_tags = jit::layout::ownership_layout()
+                .map(|own| own.plain_tags.to_vec())
+                .ok_or_else(|| crate::LustError::RuntimeError {
+                    message: "a Plain guard needs the measured layout".into(),
+                })?;
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #scalar_max_tag
+                ; b.ls >guard_ok
+            );
+            for tag in plain_tags {
+                if u32::from(tag) > scalar_max_tag {
+                    dynasm!(self.ops ; .arch aarch64 ; cmp w0, #tag as u32 ; b.eq >guard_ok);
+                }
+            }
+            self.emit_guard_exit(guard_return_value);
+            dynasm!(self.ops ; .arch aarch64 ; guard_ok:);
+            return Ok(Guard {
+                index: guard_index,
+                bailout_ip: self.guard_bailout_ip(),
+                kind: GuardKind::Plain { register },
+                fail_count: 0,
+            });
+        }
         let expected_tag = match expected_type {
             ValueType::Bool => ValueTag::Bool,
             ValueType::Int => ValueTag::Int,
@@ -15,12 +46,9 @@ impl JitCompiler {
             ValueType::Array => ValueTag::Array,
             ValueType::Tuple => ValueTag::Tuple,
             ValueType::Struct => ValueTag::Struct,
+            ValueType::Plain => unreachable!("handled above"),
         };
         let expected_discriminant = expected_tag.as_u8() as u32;
-        let guard_return_value = (guard_index + 1) as i32;
-        // A guard is the proof of a register's type; it must look at memory
-        // even when the register is pinned.
-        self.load_tag_from_memory(0, register);
         dynasm!(self.ops
             ; .arch aarch64
             ; cmp w0, #expected_discriminant
@@ -42,6 +70,7 @@ impl JitCompiler {
                 ValueType::Array => GuardKind::IntType { register },
                 ValueType::Tuple => GuardKind::IntType { register },
                 ValueType::Struct => GuardKind::IntType { register },
+                ValueType::Plain => unreachable!("handled above"),
             },
             fail_count: 0,
         })
@@ -150,7 +179,7 @@ impl JitCompiler {
         }
         if let Some(layout) = jit::layout::ownership_layout() {
             // Inline: the native-function tag, then the allocation pointer.
-            let tag = layout.single_rc_tags[4] as u32;
+            let tag = layout.native_tag as u32;
             let offset = layout.single_rc_offset as u32;
             self.load_tag(0, register);
             self.emit_reg_addr(11, register);
@@ -247,6 +276,7 @@ impl JitCompiler {
             // Inline: the struct tag, then the layout's allocation pointer
             // (`expected` is the `Rc`'s data pointer, 16 bytes in).
             let struct_tag = ValueTag::Struct.as_u8() as u32;
+            let object_offset = measured.struct_fields_offset as u32;
             let layout_offset = measured.struct_layout_offset as u32;
             let inner = (layout as usize).wrapping_sub(16) as u64;
             self.load_tag(0, register);
@@ -255,7 +285,8 @@ impl JitCompiler {
                 ; .arch aarch64
                 ; cmp w0, #struct_tag
                 ; b.ne >guard_fail
-                ; ldr x9, [x11, #layout_offset]
+                ; ldr x9, [x11, #object_offset]
+                ; ldr x9, [x9, #layout_offset]
             );
             self.emit_mov_imm64(10, inner);
             dynasm!(self.ops
@@ -364,7 +395,11 @@ impl JitCompiler {
         unsafe extern "C" {
             fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
         }
-        if self.scalar_registers.get(&condition_register) == Some(&ValueType::Bool) {
+        if self.hot_x0_in == Some(condition_register)
+            && self.scalar_registers.get(&condition_register) == Some(&ValueType::Bool)
+        {
+            // Still in w0 (as 0 or 1) from the store the previous op made.
+        } else if self.scalar_registers.get(&condition_register) == Some(&ValueType::Bool) {
             self.load_bool_payload(0, condition_register);
         } else {
             self.load_tag(0, condition_register);
@@ -428,7 +463,11 @@ impl JitCompiler {
     /// `expect_truthy`.
     pub(super) fn compile_branch_if(&mut self, register: u8, expect_truthy: bool, label: usize) {
         let label = self.function_label(label);
-        if self.scalar_registers.get(&register) == Some(&ValueType::Bool) {
+        if self.hot_x0_in == Some(register)
+            && self.scalar_registers.get(&register) == Some(&ValueType::Bool)
+        {
+            // Still in w0 (as 0 or 1) from the store the previous op made.
+        } else if self.scalar_registers.get(&register) == Some(&ValueType::Bool) {
             // Only the low byte of a Bool's payload is defined.
             self.load_bool_payload(0, register);
         } else {
@@ -476,7 +515,6 @@ impl JitCompiler {
         let value_size = mem::size_of::<Value>() as i32;
         let frame_value_count = callee_registers as i32;
         let frame_size = (frame_value_count * value_size + 15) & !15;
-        let metadata_size = INLINE_METADATA_SIZE as u32;
         // The receiver, then the arguments, into callee registers 0...
         let sources: Vec<u8> = receiver
             .into_iter()
@@ -487,68 +525,87 @@ impl JitCompiler {
         let epilogue = self
             .function_epilogue
             .expect("function code is compiled inside compile_trace");
-        let _ = result_type;
 
-        // Native stack limit (see `JIT_STACK_LIMIT`), the interpreter's
-        // frame depth limit (`JIT_DEPTH_BUDGET`) and the callee's entry
-        // point (from the entry table), all from their cells: the
-        // callee-saved registers are for pinned values.
-        let slot = self.function_entry_table + function_idx * mem::size_of::<usize>();
-        self.emit_mov_imm64(9, jit::stack_limit_cell() as u64);
+        // Native stack limit (which also bounds the frame depth, see
+        // `JitCells`) and the callee's entry point (from the entry table),
+        // from their cells: the callee-saved registers are for pinned
+        // values.
+        let slot_offset = function_idx * mem::size_of::<usize>();
+        let stack_limit = jit::STACK_LIMIT_OFFSET as u32;
+        let entry_table = jit::ENTRY_TABLE_OFFSET as u32;
+        // A call to the function being compiled is a direct branch to
+        // its own entry: no table lookup, and no way for it to be absent.
+        let self_entry = self
+            .function_self
+            .filter(|(idx, _)| *idx == function_idx)
+            .map(|(_, entry)| entry);
         dynasm!(self.ops
             ; .arch aarch64
-            ; ldr x9, [x9]
+            ; ldr x9, [x20, #stack_limit]
             ; mov x10, sp
             ; cmp x10, x9
             ; b.lo => to_interpreter
         );
-        self.emit_mov_imm64(9, jit::depth_budget_cell() as u64);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; ldr x10, [x9]
-            ; cbz x10, => to_interpreter
-        );
-        self.emit_mov_imm64(11, slot as u64);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; ldr x16, [x11]
-            ; cbz x16, => to_interpreter
-        );
+        let load_entry = |this: &mut Self| {
+            dynasm!(this.ops ; .arch aarch64 ; ldr x11, [x20, #entry_table]);
+            if slot_offset <= 32760 {
+                dynasm!(this.ops ; .arch aarch64 ; ldr x16, [x11, #slot_offset as u32]);
+            } else {
+                this.emit_mov_imm64(9, slot_offset as u64);
+                dynasm!(this.ops ; .arch aarch64 ; ldr x16, [x11, x9]);
+            }
+        };
+        if self_entry.is_none() {
+            load_entry(self);
+            dynasm!(self.ops ; .arch aarch64 ; cbz x16, => to_interpreter);
+        }
 
         // Push the record (see `JitInlineRecord`): value_count, caller
         // regs, previous chain, alias mask, function, result register,
         // callee register, where the caller resumes if the frame is
         // materialized.
+        let site = self.retain_call_site(crate::vm::JitCallSite {
+            value_count: frame_value_count as usize,
+            alias_mask: alias_mask as usize,
+            borrow_mask: self.function_borrows as usize,
+            function_idx,
+            return_dest: dest as usize,
+            callee_reg: callee as usize,
+            caller_resume_ip: resume_ip,
+        });
+        self.emit_mov_imm64(0, site as u64);
         dynasm!(self.ops
             ; .arch aarch64
-            ; sub sp, sp, #metadata_size
+            ; stp x19, x21, [sp, #-(INLINE_METADATA_SIZE)]!
+            ; str x0, [sp, 16]
         );
-        self.emit_mov_imm_i32(0, frame_value_count);
-        self.emit_mov_imm64(12, alias_mask);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; str x0, [sp]
-            ; str x19, [sp, 8]
-            ; str x21, [sp, 16]
-            ; str x12, [sp, 24]
-        );
-        self.emit_mov_imm64(0, function_idx as u64);
-        dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 32]);
-        self.emit_mov_imm64(0, dest as u64);
-        dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 40]);
-        self.emit_mov_imm64(0, callee as u64);
-        dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 48]);
-        self.emit_mov_imm64(0, resume_ip as u64);
-        dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 56]);
 
-        // The callee frame: every register Nil (tag 0), then the arguments.
+        // The callee frame: every register Nil (tag 0) — except those the
+        // arguments below overwrite whole (a helper-copied argument reads
+        // the old slot, so it keeps its Nil) — then the arguments.
+        let copied_whole = |this: &Self, index: usize, src_reg: u8| {
+            (index < 64 && alias_mask & (1 << index) != 0)
+                || matches!(
+                    this.scalar_registers.get(&src_reg),
+                    Some(ValueType::Int | ValueType::Bool | ValueType::Float)
+                )
+        };
         self.emit_sub_sp(frame_size);
         dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
         for reg in 0..callee_registers {
+            if sources
+                .get(usize::from(reg))
+                .is_some_and(|src| copied_whole(self, usize::from(reg), *src))
+            {
+                continue;
+            }
             let offset = super::registers::reg_offset(reg) as u32;
             dynasm!(self.ops ; .arch aarch64 ; strb wzr, [x11, #offset]);
         }
-        for (index, src_reg) in sources.into_iter().enumerate() {
+        // x16 (the entry) survives the argument moves unless one calls a
+        // helper; then it is reloaded.
+        let mut helper_called = false;
+        for (index, src_reg) in sources.iter().copied().enumerate() {
             let dest_offset = index as i32 * value_size;
             if index < 64 && alias_mask & (1 << index) != 0 {
                 // Aliased: a bitwise copy the callee only reads and does
@@ -589,6 +646,7 @@ impl JitCompiler {
                     );
                 }
                 _ => {
+                    helper_called = true;
                     self.emit_reg_addr(0, src_reg);
                     dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
                     self.emit_add_imm(1, 11, dest_offset);
@@ -602,32 +660,21 @@ impl JitCompiler {
 
         // Enter the callee: x0 = its registers, x1 = VM, x2 = its record.
         // The entry is reloaded: the argument moves above may have called
-        // helpers through x16. The depth budget is spent for the call's
-        // duration.
-        self.emit_mov_imm64(11, slot as u64);
-        dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x11]);
-        self.emit_mov_imm64(11, jit::depth_budget_cell() as u64);
+        // helpers through x16.
+        if helper_called && self_entry.is_none() {
+            load_entry(self);
+        }
         dynasm!(self.ops
             ; .arch aarch64
-            ; ldr x9, [x11]
-            ; sub x9, x9, 1
-            ; str x9, [x11]
             ; mov x0, sp
             ; mov x1, x20
-            ; mov x11, sp
+            ; add x2, sp, #frame_size as u32
         );
-        self.emit_add_imm(2, 11, frame_size);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; blr x16
-        );
-        self.emit_mov_imm64(11, jit::depth_budget_cell() as u64);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; ldr x9, [x11]
-            ; add x9, x9, 1
-            ; str x9, [x11]
-        );
+        self.emit_reg_addr(3, dest);
+        match self_entry {
+            Some(entry) => dynasm!(self.ops ; .arch aarch64 ; bl => entry),
+            None => dynasm!(self.ops ; .arch aarch64 ; blr x16),
+        }
         // Pop the frame and record; the callee's epilogue restored x19..x24.
         let pop = (frame_size + INLINE_METADATA_SIZE) as u32;
         if pop <= 4095 {
@@ -637,11 +684,10 @@ impl JitCompiler {
             self.emit_add_imm(11, 11, pop as i32);
             dynasm!(self.ops ; .arch aarch64 ; mov sp, x11);
         }
-        let returned_hi = (jit::NATIVE_RETURNED as u32) >> 16;
+        let returned_shifted = (jit::NATIVE_RETURNED as u32) >> 12;
         dynasm!(self.ops
             ; .arch aarch64
-            ; movz w9, #returned_hi, lsl #16
-            ; cmp w0, w9
+            ; cmp w0, #returned_shifted, lsl #12
             ; b.eq => done
             // Anything else is an exit that already materialized every
             // frame (ours included): propagate it.
@@ -660,7 +706,61 @@ impl JitCompiler {
         });
         *guard_index += 1;
         dynasm!(self.ops ; .arch aarch64 ; => done);
+        if let Some(ty) = result_type {
+            // The callee returned its declared scalar result in x1.
+            match ty {
+                ValueType::Float => {
+                    dynasm!(self.ops ; .arch aarch64 ; fmov d0, x1);
+                    self.store_d0_as_float(dest);
+                }
+                ValueType::Int => {
+                    dynasm!(self.ops ; .arch aarch64 ; mov x0, x1);
+                    self.store_from_x0(dest, ValueTag::Int.as_u8());
+                }
+                _ => {
+                    dynasm!(self.ops ; .arch aarch64 ; mov x0, x1);
+                    self.store_from_x0(dest, ValueTag::Bool.as_u8());
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Drop this frame's registers at a native return, except the aliased
+    /// arguments (the record's mask; no record when entered from the
+    /// interpreter), which are the caller's.
+    fn emit_drop_frame(&mut self, register_count: u8) {
+        unsafe extern "C" {
+            fn jit_drop_values_masked(values: *mut Value, len: usize, mask: u64);
+        }
+        // Only the registers that may own something here are released,
+        // inline: not the scalars, not the parameters a native caller
+        // aliased (the record's mask says which, but they own nothing
+        // either way — an unaliased one was copied as a scalar).
+        if register_count <= 64 {
+            for reg in 0..register_count {
+                if self.function_alias_params & (1u64 << reg) != 0
+                    || self.function_borrows & (1u64 << reg) != 0
+                    || self.scalar_registers.contains_key(&reg)
+                {
+                    continue;
+                }
+                self.emit_reg_addr(11, reg);
+                self.emit_release_at_x11();
+            }
+            return;
+        }
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; mov x0, x19
+            ; mov x2, xzr
+            ; cbz x21, >no_record
+            ; ldr x2, [x21, 16]
+            ; ldr x2, [x2, 8]
+            ; no_record:
+        );
+        self.emit_mov_imm_i32(1, i32::from(register_count));
+        self.emit_call(jit_drop_values_masked as *const ());
     }
 
     /// `Return` of function code. Called natively (x21 = our record): move
@@ -674,10 +774,8 @@ impl JitCompiler {
         _guard_index: &mut i32,
         _guards: &mut Vec<Guard>,
     ) -> Result<()> {
-        let value_size = mem::size_of::<Value>() as u32;
         unsafe extern "C" {
             fn jit_return_value(src: *mut Value, dest: *mut Value);
-            fn jit_drop_values_masked(values: *mut Value, len: usize, mask: u64);
         }
         let (register_count, may_own) = self.function_frame;
         let epilogue = self
@@ -687,12 +785,50 @@ impl JitCompiler {
         let interp_return = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
-            ; cbz x21, => interp_return
-            ; ldr x11, [x21, 8]
-            ; ldr x9, [x21, 40]
-            ; movz w10, #value_size
-            ; madd x1, x9, x10, x11
+            ; cbz x22, => interp_return
         );
+        if let (Some(ty), Some(reg)) = (self.function_result, value) {
+            // A declared scalar result goes back in x1 (its payload bits;
+            // the translator's guard before the `Return` proved the type)
+            // and the caller stores it: no store here, no tag to check.
+            // The frame drop is a call, after which the payload must be
+            // reloaded; otherwise it may still sit in x0 / d0 from the
+            // previous op's store.
+            let still_in_register = !may_own
+                && if ty == ValueType::Float {
+                    self.hot_d0_in == Some(reg)
+                } else {
+                    self.hot_x0_in == Some(reg)
+                };
+            if may_own {
+                self.emit_drop_frame(register_count);
+            }
+            if still_in_register {
+                if ty == ValueType::Float {
+                    dynasm!(self.ops ; .arch aarch64 ; fmov x1, d0);
+                } else {
+                    dynasm!(self.ops ; .arch aarch64 ; mov x1, x0);
+                }
+            } else if ty == ValueType::Bool {
+                self.load_bool_payload(1, reg);
+            } else {
+                self.load_payload(1, reg);
+            }
+            let returned_hi = (jit::NATIVE_RETURNED as u32) >> 16;
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; movz w0, #returned_hi, lsl #16
+                ; b => epilogue
+                ; => interp_return
+            );
+            // The interpreter performs the return and drops the frame.
+            self.emit_retain_borrows();
+            let code = jit::FUNCTION_RETURN_BASE + i32::from(reg);
+            self.emit_mov_imm_i32(0, code);
+            dynasm!(self.ops ; .arch aarch64 ; b => exit_label);
+            return Ok(());
+        }
+        dynasm!(self.ops ; .arch aarch64 ; mov x1, x22);
         // A scalar result of known type is stored directly when the
         // caller's register holds nothing owned (it usually holds Nil or
         // the previous scalar); the helper handles everything else.
@@ -736,18 +872,7 @@ impl JitCompiler {
         self.emit_call(jit_return_value as *const ());
         dynasm!(self.ops ; .arch aarch64 ; => stored);
         if may_own {
-            // Aliased arguments (the record's mask; no record when entered
-            // from the interpreter) are the caller's and are not dropped.
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; mov x0, x19
-                ; mov x2, xzr
-                ; cbz x21, >no_record
-                ; ldr x2, [x21, 24]
-                ; no_record:
-            );
-            self.emit_mov_imm_i32(1, i32::from(register_count));
-            self.emit_call(jit_drop_values_masked as *const ());
+            self.emit_drop_frame(register_count);
         }
         let returned_hi = (jit::NATIVE_RETURNED as u32) >> 16;
         dynasm!(self.ops
@@ -756,6 +881,7 @@ impl JitCompiler {
             ; b => epilogue
             ; => interp_return
         );
+        self.emit_retain_borrows();
         let code = jit::FUNCTION_RETURN_BASE + i32::from(value.unwrap_or(255));
         self.emit_mov_imm_i32(0, code);
         dynasm!(self.ops ; .arch aarch64 ; b => exit_label);

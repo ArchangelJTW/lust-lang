@@ -6,6 +6,7 @@ pub use chunk::{Chunk, Function};
 pub use compiler::Compiler;
 pub use instruction::{Instruction, OpCode, Register};
 pub use value::{
-    FieldStorage, LustMap, NativeCallResult, StructLayout, TaskHandle, Upvalue, Value, ValueKey,
-    ValueTag, ValueType,
+    ClosureObject, EnumObject, FieldStorage, LustMap, NativeCallResult, NativeFn, StructLayout,
+    StructObject, TaskHandle, Upvalue, Value, ValueKey, ValueTag, ValueType, WeakStructRef,
+    native_fn,
 };

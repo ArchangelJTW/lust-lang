@@ -48,11 +48,32 @@ impl JitCompiler {
         // coarser classification and numbers `Function` differently).
         // SAFETY: reading the first byte of a live `Value`.
         let tag = unsafe { *(value as *const Value as *const u8) } as i8;
+        // A destination known to hold nothing owned is simply overwritten.
+        if self.scalar_registers.contains_key(&dest) {
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov rax, QWORD payload as _
+                ; mov BYTE [r12 + offset], tag
+                ; mov [r12 + offset + 8], rax
+            );
+            return Ok(());
+        }
         let done = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch x64
             ; cmp BYTE [r12 + offset], scalar_max_tag
-            ; ja >owned
+            ; jbe >plain
+        );
+        // A function index held from the previous iteration of a loop that
+        // reloads it is as plain as a scalar.
+        if matches!(value, Value::Function(_)) {
+            dynasm!(self.ops ; .arch x64 ; cmp BYTE [r12 + offset], tag ; jne >owned);
+        } else {
+            dynasm!(self.ops ; .arch x64 ; jmp >owned);
+        }
+        dynasm!(self.ops
+            ; .arch x64
+            ; plain:
             ; mov rax, QWORD payload as _
             ; mov BYTE [r12 + offset], tag
             ; mov [r12 + offset + 8], rax
@@ -61,7 +82,6 @@ impl JitCompiler {
         );
         self.copy_owned_constant(dest, value)?;
         dynasm!(self.ops ; .arch x64 ; => done);
-        self.scalar_registers.remove(&dest);
         Ok(())
     }
 
@@ -89,17 +109,17 @@ impl JitCompiler {
         // store (which drops whatever the destination held).
         match self.scalar_registers.get(&src).copied() {
             Some(ValueType::Float) => {
-                dynasm!(self.ops ; .arch x64 ; movq xmm0, QWORD [r12 + src_offset + 8]);
+                self.operand_xmm0(src);
                 self.store_xmm0_as_float(dest);
                 return Ok(());
             }
             Some(ValueType::Int) => {
-                self.load_to_rax(src);
+                self.operand_rax(src);
                 self.store_from_rax(dest, ValueTag::Int.as_u8());
                 return Ok(());
             }
             Some(ValueType::Bool) => {
-                dynasm!(self.ops ; .arch x64 ; movzx eax, BYTE [r12 + src_offset + 8]);
+                self.operand_bool_eax(src);
                 self.store_from_rax(dest, ValueTag::Bool.as_u8());
                 return Ok(());
             }
@@ -163,6 +183,87 @@ impl JitCompiler {
             ; lea rdx, [r12 + index_offset]
             ; lea rcx, [r12 + dest_offset]
             ; mov rax, QWORD jit_array_index_result_safe as *const () as _
+            ; call rax
+            ; test al, al
+            ; jz >fail
+        );
+        Ok(())
+    }
+
+    /// `array[index] = value` (see the aarch64 backend): inline for a
+    /// known int index when neither the old element nor the value owns
+    /// anything, the helper otherwise.
+    pub(super) fn compile_set_index(&mut self, array: u8, index: u8, value: u8) -> Result<()> {
+        let array_offset = (array as i32) * (mem::size_of::<Value>() as i32);
+        let index_offset = (index as i32) * (mem::size_of::<Value>() as i32);
+        let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
+        unsafe extern "C" {
+            fn jit_array_set_index_safe(
+                array_value: *const Value,
+                index_value: *const Value,
+                value: *const Value,
+            ) -> u8;
+        }
+
+        if let (Some(layout), true) = (
+            jit::layout::rc_vec_layout(),
+            self.scalar_registers.get(&index) == Some(&ValueType::Int),
+        ) {
+            let array_tag = ValueTag::Array.as_u8() as i8;
+            let scalar_max_tag = ValueTag::Float.as_u8() as i8;
+            let rc_offset = layout.array_rc_offset as i32;
+            let len_offset = layout.len_offset as i32;
+            let ptr_offset = layout.ptr_offset as i32;
+            let value_size = mem::size_of::<Value>() as i32;
+            let done = self.ops.new_dynamic_label();
+            let slow = self.ops.new_dynamic_label();
+            dynasm!(self.ops
+                ; .arch x64
+                ; cmp BYTE [r12 + array_offset], array_tag
+                ; jne => slow
+                ; mov r8, [r12 + index_offset + 8]
+                ; mov r9, [r12 + array_offset + rc_offset]
+                ; cmp r8, [r9 + len_offset]
+                ; jae >fail
+                ; mov r10, [r9 + ptr_offset]
+                ; imul r8, r8, value_size
+                ; add r10, r8
+                ; cmp BYTE [r10], scalar_max_tag
+                ; ja => slow
+            );
+            if !self.scalar_registers.contains_key(&value) {
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; cmp BYTE [r12 + value_offset], scalar_max_tag
+                    ; ja => slow
+                );
+            }
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov rax, [r12 + value_offset]
+                ; mov rcx, [r12 + value_offset + 8]
+                ; mov [r10], rax
+                ; mov [r10 + 8], rcx
+                ; jmp => done
+                ; => slow
+                ; lea rdi, [r12 + array_offset]
+                ; lea rsi, [r12 + index_offset]
+                ; lea rdx, [r12 + value_offset]
+                ; mov rax, QWORD jit_array_set_index_safe as *const () as _
+                ; call rax
+                ; test al, al
+                ; jz >fail
+                ; => done
+            );
+            return Ok(());
+        }
+
+        dynasm!(self.ops
+            ; .arch x64
+            ; lea rdi, [r12 + array_offset]
+            ; lea rsi, [r12 + index_offset]
+            ; lea rdx, [r12 + value_offset]
+            ; mov rax, QWORD jit_array_set_index_safe as *const () as _
             ; call rax
             ; test al, al
             ; jz >fail
@@ -367,7 +468,8 @@ impl JitCompiler {
 
         if let (Some(index), Some(ty), Some(layout), false) = (
             field_index,
-            _value_type.filter(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool)),
+            _value_type
+                .filter(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool)),
             jit::layout::rc_vec_layout(),
             _is_weak,
         ) {
@@ -383,8 +485,8 @@ impl JitCompiler {
             .as_u8() as i8;
             let struct_tag = ValueTag::Struct.as_u8() as i8;
             let fields_offset = layout.struct_fields_offset as i32;
-            let len_offset = layout.len_offset as i32;
-            let ptr_offset = layout.ptr_offset as i32;
+            let len_offset = layout.struct_len_offset as i32;
+            let ptr_offset = layout.struct_ptr_offset as i32;
             let element = (index * mem::size_of::<Value>()) as i32;
             dynasm!(self.ops
                 ; .arch x64
@@ -415,14 +517,16 @@ impl JitCompiler {
             return Ok(());
         }
 
-        if let (Some(index), Some(layout), false) = (field_index, jit::layout::rc_vec_layout(), _is_weak) {
+        if let (Some(index), Some(layout), false) =
+            (field_index, jit::layout::rc_vec_layout(), _is_weak)
+        {
             // Any strong field read inline: struct tag and field count are
             // checked (anything else fails to the interpreter), then the
             // element is cloned into the register without the runtime.
             let struct_tag = ValueTag::Struct.as_u8() as i8;
             let fields_offset = layout.struct_fields_offset as i32;
-            let len_offset = layout.len_offset as i32;
-            let ptr_offset = layout.ptr_offset as i32;
+            let len_offset = layout.struct_len_offset as i32;
+            let ptr_offset = layout.struct_ptr_offset as i32;
             let element = (index * mem::size_of::<Value>()) as i32;
             dynasm!(self.ops
                 ; .arch x64
@@ -499,9 +603,12 @@ impl JitCompiler {
             .get(&value)
             .copied()
             .filter(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool));
-        if let (Some(index), Some(ty), Some(layout), false) =
-            (field_index, value_ty, jit::layout::rc_vec_layout(), _is_weak)
-        {
+        if let (Some(index), Some(ty), Some(layout), false) = (
+            field_index,
+            value_ty,
+            jit::layout::rc_vec_layout(),
+            _is_weak,
+        ) {
             // A scalar store inline when the field currently holds the same
             // scalar kind and the struct is not borrowed; any other
             // situation goes through the helper, which does the full
@@ -521,9 +628,9 @@ impl JitCompiler {
             .as_u8() as i8;
             let struct_tag = ValueTag::Struct.as_u8() as i8;
             let fields_offset = layout.struct_fields_offset as i32;
-            let len_offset = layout.len_offset as i32;
-            let ptr_offset = layout.ptr_offset as i32;
-            let borrow_offset = layout.borrow_offset as i32;
+            let len_offset = layout.struct_len_offset as i32;
+            let ptr_offset = layout.struct_ptr_offset as i32;
+            let borrow_offset = layout.struct_borrow_offset as i32;
             let element = (index * mem::size_of::<Value>()) as i32;
             dynasm!(self.ops
                 ; .arch x64
@@ -663,10 +770,11 @@ impl JitCompiler {
         Ok(())
     }
 
+    /// `array.push(array, value)` / `array:push(value)` (see the aarch64
+    /// backend).
     pub(super) fn compile_array_push(&mut self, array: u8, value: u8) -> Result<()> {
         let array_offset = (array as i32) * (mem::size_of::<Value>() as i32);
         let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
-
         unsafe extern "C" {
             fn jit_array_push_safe(
                 vm_ptr: *mut crate::VM,
@@ -675,18 +783,69 @@ impl JitCompiler {
             ) -> u8;
         }
 
-        // Guards have already verified the type, so directly call the helper
-        dynasm!(self.ops
-            ; .arch x64
-            ; mov rdi, r13
-            ; lea rsi, [r12 + array_offset]
-            ; lea rdx, [r12 + value_offset]
-            ; mov rax, QWORD jit_array_push_safe as *const () as _
-            ; call rax
-            ; test al, al
-            ; jz >fail
-        );
-
+        if let Some(layout) = jit::layout::rc_vec_layout() {
+            let array_tag = ValueTag::Array.as_u8() as i8;
+            let scalar_max_tag = ValueTag::Float.as_u8() as i8;
+            let rc_offset = layout.array_rc_offset as i32;
+            let borrow_offset = layout.borrow_offset as i32;
+            let len_offset = layout.len_offset as i32;
+            let cap_offset = layout.cap_offset as i32;
+            let ptr_offset = layout.ptr_offset as i32;
+            let value_size = mem::size_of::<Value>() as i32;
+            let done = self.ops.new_dynamic_label();
+            let slow = self.ops.new_dynamic_label();
+            dynasm!(self.ops
+                ; .arch x64
+                ; cmp BYTE [r12 + array_offset], array_tag
+                ; jne => slow
+                ; mov r9, [r12 + array_offset + rc_offset]
+                ; cmp QWORD [r9 + borrow_offset], 0
+                ; jne => slow
+                ; mov r8, [r9 + len_offset]
+                ; cmp r8, [r9 + cap_offset]
+                ; jae => slow
+            );
+            if !self.scalar_registers.contains_key(&value) {
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; cmp BYTE [r12 + value_offset], scalar_max_tag
+                    ; ja => slow
+                );
+            }
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov r10, [r9 + ptr_offset]
+                ; imul r11, r8, value_size
+                ; add r10, r11
+                ; mov rax, [r12 + value_offset]
+                ; mov rcx, [r12 + value_offset + 8]
+                ; mov [r10], rax
+                ; mov [r10 + 8], rcx
+                ; inc r8
+                ; mov [r9 + len_offset], r8
+                ; jmp => done
+                ; => slow
+                ; mov rdi, r13
+                ; lea rsi, [r12 + array_offset]
+                ; lea rdx, [r12 + value_offset]
+                ; mov rax, QWORD jit_array_push_safe as *const () as _
+                ; call rax
+                ; test al, al
+                ; jz >fail
+                ; => done
+            );
+        } else {
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov rdi, r13
+                ; lea rsi, [r12 + array_offset]
+                ; lea rdx, [r12 + value_offset]
+                ; mov rax, QWORD jit_array_push_safe as *const () as _
+                ; call rax
+                ; test al, al
+                ; jz >fail
+            );
+        }
         Ok(())
     }
 
@@ -748,9 +907,8 @@ impl JitCompiler {
         };
         dynasm!(self.ops
             ; .arch x64
-            ; mov rax, QWORD jit::call_ip_cell() as _
             ; mov r10, QWORD ip as i64
-            ; mov [rax], r10
+            ; mov [r13 + jit::CALL_IP_OFFSET as i32], r10
         );
     }
 
@@ -1031,32 +1189,11 @@ impl JitCompiler {
         enum_name: &str,
         variant_name: &str,
     ) -> Result<()> {
-        let dest_offset = (dest as i32) * (mem::size_of::<Value>() as i32);
-        unsafe extern "C" {
-            fn jit_new_enum_unit_safe(
-                vm_ptr: *mut crate::VM,
-                enum_name_ptr: *const u8,
-                enum_name_len: usize,
-                variant_name_ptr: *const u8,
-                variant_name_len: usize,
-                out: *mut Value,
-            ) -> u8;
-        }
-        let (enum_name_ptr, enum_name_len) = self.retain_string(enum_name);
-        let (variant_name_ptr, variant_name_len) = self.retain_string(variant_name);
-        dynasm!(self.ops
-            ; .arch x64
-            ; mov rdi, r13
-            ; mov rsi, QWORD enum_name_ptr as _
-            ; mov rdx, QWORD enum_name_len as _
-            ; mov rcx, QWORD variant_name_ptr as _
-            ; mov r8, QWORD variant_name_len as _
-            ; lea r9, [r12 + dest_offset]
-            ; mov rax, QWORD jit_new_enum_unit_safe as *const () as _
-            ; call rax
-            ; test al, al
-            ; jz >fail
-        );
+        // One shared unit value per site: the store is a copy and a count
+        // bump.
+        let unit = self.retain_value(Value::enum_unit(enum_name, variant_name));
+        dynasm!(self.ops ; .arch x64 ; mov rsi, QWORD unit as usize as _);
+        self.emit_clone_rsi_into(dest);
         Ok(())
     }
 
@@ -1136,6 +1273,7 @@ impl JitCompiler {
             let variant_ptr = self.retain_name(variant_name);
             let enum_ptr = (!enum_name.is_empty()).then(|| self.retain_name(enum_name));
             let tag = layout.tag as i8;
+            let object_offset = layout.object_offset as i32;
             let variant_offset = layout.variant_offset as i32;
             let enum_name_offset = layout.enum_name_offset as i32;
             dynasm!(self.ops
@@ -1143,15 +1281,16 @@ impl JitCompiler {
                 ; xor eax, eax
                 ; cmp BYTE [r12 + value_offset], tag
                 ; jne >done
+                ; mov r9, [r12 + value_offset + object_offset]
                 ; mov rcx, QWORD variant_ptr as i64
-                ; cmp rcx, [r12 + value_offset + variant_offset]
+                ; cmp rcx, [r9 + variant_offset]
                 ; jne >done
             );
             if let Some(enum_ptr) = enum_ptr {
                 dynasm!(self.ops
                     ; .arch x64
                     ; mov rcx, QWORD enum_ptr as i64
-                    ; cmp rcx, [r12 + value_offset + enum_name_offset]
+                    ; cmp rcx, [r9 + enum_name_offset]
                     ; jne >done
                 );
             }
@@ -1261,6 +1400,93 @@ impl JitCompiler {
         Ok(())
     }
 
+    /// `dest` = the bits of strong field `index` of the struct in `object`,
+    /// with no count taken and nothing released (see
+    /// `TraceOp::BorrowField`). The struct tag and field count are checked;
+    /// anything else fails to the interpreter, which re-executes the read.
+    pub(super) fn compile_borrow_field(
+        &mut self,
+        dest: u8,
+        object: u8,
+        index: usize,
+    ) -> Result<()> {
+        let Some(layout) = jit::layout::rc_vec_layout() else {
+            return Err(crate::LustError::RuntimeError {
+                message: "a borrow needs the measured struct layout".into(),
+            });
+        };
+        let value_size = mem::size_of::<Value>() as i32;
+        let object_offset = (object as i32) * value_size;
+        let dest_offset = (dest as i32) * value_size;
+        let struct_tag = ValueTag::Struct.as_u8() as i8;
+        let fields_offset = layout.struct_fields_offset as i32;
+        let len_offset = layout.struct_len_offset as i32;
+        let ptr_offset = layout.struct_ptr_offset as i32;
+        let element = (index * mem::size_of::<Value>()) as i32;
+        dynasm!(self.ops
+            ; .arch x64
+            ; cmp BYTE [r12 + object_offset], struct_tag
+            ; jne >fail
+            ; mov r9, [r12 + object_offset + fields_offset]
+            ; cmp QWORD [r9 + len_offset], index as i32
+            ; jbe >fail
+            ; mov r10, [r9 + ptr_offset]
+        );
+        for word in (0..value_size).step_by(8) {
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov rax, [r10 + element + word]
+                ; mov [r12 + dest_offset + word], rax
+            );
+        }
+        Ok(())
+    }
+
+    /// `dest` = the bits of payload value `index` of the enum in
+    /// `enum_reg`, a borrow of a borrow (see `TraceOp::BorrowEnumValue`).
+    pub(super) fn compile_borrow_enum_value(
+        &mut self,
+        dest: u8,
+        enum_reg: u8,
+        index: u8,
+    ) -> Result<()> {
+        let Some(layout) = jit::layout::enum_layout() else {
+            return Err(crate::LustError::RuntimeError {
+                message: "a borrow needs the measured enum layout".into(),
+            });
+        };
+        let value_size = mem::size_of::<Value>() as i32;
+        let enum_offset = (enum_reg as i32) * value_size;
+        let dest_offset = (dest as i32) * value_size;
+        let tag = layout.tag as i8;
+        let object_offset = layout.object_offset as i32;
+        let len_offset = layout.values_len_offset as i32;
+        let ptr_offset = layout.values_ptr_offset as i32;
+        let unit_offset = layout.unit_word_offset as i32;
+        let element = (index as usize * mem::size_of::<Value>()) as i32;
+        // A unit variant (no payload) fails: its niche word says so.
+        dynasm!(self.ops
+            ; .arch x64
+            ; cmp BYTE [r12 + enum_offset], tag
+            ; jne >fail
+            ; mov r9, [r12 + enum_offset + object_offset]
+            ; mov rax, QWORD layout.unit_word_value as i64
+            ; cmp rax, [r9 + unit_offset]
+            ; je >fail
+            ; cmp QWORD [r9 + len_offset], index as i32
+            ; jbe >fail
+            ; mov r10, [r9 + ptr_offset]
+        );
+        for word in (0..value_size).step_by(8) {
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov rax, [r10 + element + word]
+                ; mov [r12 + dest_offset + word], rax
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn compile_get_enum_value(
         &mut self,
         dest: u8,
@@ -1279,17 +1505,20 @@ impl JitCompiler {
             // (anything else fails to the interpreter), the value cloned
             // into the register without the runtime.
             let tag = layout.tag as i8;
-            let values_offset = layout.values_offset as i32;
+            let object_offset = layout.object_offset as i32;
             let len_offset = layout.values_len_offset as i32;
             let ptr_offset = layout.values_ptr_offset as i32;
+            let unit_offset = layout.unit_word_offset as i32;
             let element = (index_usize * mem::size_of::<Value>()) as i32;
+            // A unit variant (no payload) fails: its niche word says so.
             dynasm!(self.ops
                 ; .arch x64
                 ; cmp BYTE [r12 + enum_offset], tag
                 ; jne >fail
-                ; mov r9, [r12 + enum_offset + values_offset]
-                ; test r9, r9
-                ; jz >fail
+                ; mov r9, [r12 + enum_offset + object_offset]
+                ; mov rax, QWORD layout.unit_word_value as i64
+                ; cmp rax, [r9 + unit_offset]
+                ; je >fail
                 ; cmp QWORD [r9 + len_offset], index as i32
                 ; jbe >fail
                 ; mov rsi, [r9 + ptr_offset]

@@ -1,6 +1,7 @@
 use crate::LustError;
 use crate::bytecode::Instruction;
 use crate::bytecode::value::NativeFn;
+use crate::bytecode::value::StructObject;
 use crate::bytecode::{Register, Value};
 use alloc::{
     boxed::Box,
@@ -15,11 +16,11 @@ use hashbrown::{HashMap, HashSet};
 
 #[derive(Clone)]
 pub struct TracedNativeFn {
-    function: NativeFn,
+    function: Rc<NativeFn>,
 }
 
 impl TracedNativeFn {
-    pub fn new(function: NativeFn) -> Self {
+    pub fn new(function: Rc<NativeFn>) -> Self {
         Self { function }
     }
 
@@ -31,9 +32,9 @@ impl TracedNativeFn {
     /// function carries (the `Rc`'s own pointer word, not the data
     /// pointer `pointer` returns).
     pub fn inner_ptr(&self) -> usize {
-        // SAFETY: an `Rc<dyn Fn>` starts with its `NonNull<RcInner>`, a
-        // fat pointer whose first word is the allocation's address.
-        unsafe { *(&self.function as *const NativeFn as *const usize) }
+        // The `Rc` stores the allocation's address (`RcInner { strong,
+        // weak, value }`); `as_ptr` gives the value, two words in.
+        (Rc::as_ptr(&self.function) as usize) - 2 * core::mem::size_of::<usize>()
     }
 }
 
@@ -53,6 +54,19 @@ pub struct Trace {
     /// Function code only: may some register hold an owned value when the
     /// function returns? If not, the frame needs no drop pass.
     pub frame_may_own: bool,
+    /// Function code only: what the registers hold on entry — the scalar
+    /// parameters by their declared types, everything else `Nil`.
+    pub entry_scalars: Vec<(Register, ValueType)>,
+    /// Function code only: the parameters a native caller may alias into
+    /// the frame (bit `i` for parameter `i`; see
+    /// `FunctionSig::can_alias_param`). They never own anything in a
+    /// native frame, so a return does not drop them.
+    pub alias_params: u64,
+    /// Function code only: registers that hold a borrow at some point
+    /// (see `TraceOp::BorrowField`). They never hold an owned value, so
+    /// an exit to the interpreter retains whatever they hold (a no-op for
+    /// a scalar or Nil) and a native return does not release them.
+    pub borrowed_registers: Vec<Register>,
     /// Operations executed once at trace entry (unboxing, guards, etc.)
     pub preamble: Vec<TraceOp>,
     /// Operations in the trace loop body
@@ -208,6 +222,24 @@ pub enum TraceOp {
         array: Register,
         index: Register,
     },
+    /// `array[index] = value` on an `Array`: a clone of the value replaces
+    /// the element (the old one dropped), or the op fails to the
+    /// interpreter (out of bounds, not an array, not an int index) which
+    /// raises the error.
+    SetIndex {
+        array: Register,
+        index: Register,
+        value: Register,
+    },
+    /// `array.push(array, value)` on a plain (unspecialized) `Array`: a
+    /// clone of the value is appended and `dest` becomes Nil, or the op
+    /// fails to the interpreter (not an array, memory budget exceeded on
+    /// growth) which performs the call and raises the error.
+    ArrayPush {
+        dest: Register,
+        array: Register,
+        value: Register,
+    },
     ArrayIndexOk {
         value_dest: Register,
         condition_dest: Register,
@@ -330,6 +362,27 @@ pub enum TraceOp {
         type_name: String,
     },
     GetEnumValue {
+        dest: Register,
+        enum_reg: Register,
+        index: u8,
+    },
+    /// Function code only: `dest` becomes a *borrow* of the strong field
+    /// `field_index` of the struct in `object` — the bits of the value,
+    /// with no reference count taken. The translator emits one only when
+    /// the struct outlives the function's frame (it is a parameter the
+    /// function never writes, or a borrow itself), nothing the function
+    /// runs can write a field, and `dest` is never returned or overwritten
+    /// with an owned value; every exit to the interpreter retains what the
+    /// borrowed registers hold first (see `Trace::borrowed_registers`).
+    BorrowField {
+        dest: Register,
+        object: Register,
+        field_index: usize,
+    },
+    /// Function code only: `dest` becomes a borrow of payload value
+    /// `index` of the enum in `enum_reg`, itself a borrow (an enum's
+    /// payload is immutable, so it lives as long as the enum).
+    BorrowEnumValue {
         dest: Register,
         enum_reg: Register,
         index: u8,
@@ -482,6 +535,12 @@ pub enum ValueType {
     Array,
     Tuple,
     Struct,
+    /// A register that holds nothing owned — `Nil`, a `Bool`, an `Int` or
+    /// a `Float` — without saying which: a fresh frame's unwritten
+    /// registers, or one that holds different scalars on different paths.
+    /// Never recorded or guarded; the fact only tells the backend that a
+    /// store into the register has nothing to drop.
+    Plain,
 }
 
 impl TraceOp {
@@ -508,7 +567,9 @@ impl TraceOp {
             | TraceOp::IsEnumVariant { dest, .. }
             | TraceOp::TypeIs { dest, .. }
             | TraceOp::TryCast { dest, .. }
-            | TraceOp::GetEnumValue { dest, .. } => Some(*dest),
+            | TraceOp::GetEnumValue { dest, .. }
+            | TraceOp::BorrowField { dest, .. }
+            | TraceOp::BorrowEnumValue { dest, .. } => Some(*dest),
             _ => None,
         }
     }
@@ -535,7 +596,9 @@ impl TraceOp {
             | TraceOp::IsEnumVariant { dest, .. }
             | TraceOp::TypeIs { dest, .. }
             | TraceOp::TryCast { dest, .. }
-            | TraceOp::GetEnumValue { dest, .. } => *dest = register,
+            | TraceOp::GetEnumValue { dest, .. }
+            | TraceOp::BorrowField { dest, .. }
+            | TraceOp::BorrowEnumValue { dest, .. } => *dest = register,
             _ => {}
         }
     }
@@ -610,6 +673,10 @@ pub struct TraceRecorder {
     /// Set when the recording was abandoned because a mutated specialized
     /// array escaped; the site is then recorded again without specializing.
     pub specialization_escaped: bool,
+    /// A specialized array whose copy has been written was overwritten in
+    /// its register (see `remove_specialization_tracking`): the recording
+    /// is abandoned after the op that did it.
+    overwritten_specialization: bool,
     /// Bytecode ip of the instruction being recorded, not yet written as an
     /// `At` marker (see `flush_marker`).
     pending_marker: Option<usize>,
@@ -671,6 +738,9 @@ impl TraceRecorder {
                 start_ip,
                 is_function: false,
                 frame_may_own: true,
+                entry_scalars: Vec::new(),
+                alias_params: 0,
+                borrowed_registers: Vec::new(),
                 preamble: Vec::new(),
                 ops: Vec::new(),
                 postamble: Vec::new(),
@@ -688,6 +758,7 @@ impl TraceRecorder {
             globals_guarded: false,
             intrinsics: HashMap::new(),
             specialization_escaped: false,
+            overwritten_specialization: false,
             pending_marker: None,
             current_ip: 0,
             op_count: 0,
@@ -884,12 +955,15 @@ impl TraceRecorder {
         let Some(Value::Array(array)) = registers.get(register as usize) else {
             return None;
         };
-        self.specialized_registers.keys().copied().find(|candidate| {
-            matches!(
-                registers.get(*candidate as usize),
-                Some(Value::Array(candidate_array)) if Rc::ptr_eq(array, candidate_array)
-            )
-        })
+        self.specialized_registers
+            .keys()
+            .copied()
+            .find(|candidate| {
+                matches!(
+                    registers.get(*candidate as usize),
+                    Some(Value::Array(candidate_array)) if Rc::ptr_eq(array, candidate_array)
+                )
+            })
     }
 
     /// Code the recorder cannot see (a native, a call it does not inline)
@@ -952,7 +1026,7 @@ impl TraceRecorder {
             | TraceOp::Label { .. }
             | TraceOp::Jump { .. }
             | TraceOp::BranchIf { .. } => None,
-            TraceOp::CallDirect { dest, .. } => Some(*dest),
+            TraceOp::CallDirect { dest, .. } | TraceOp::ArrayPush { dest, .. } => Some(*dest),
             TraceOp::LoadConst { dest, .. }
             | TraceOp::Move { dest, .. }
             | TraceOp::Add { dest, .. }
@@ -986,8 +1060,11 @@ impl TraceRecorder {
             | TraceOp::IsEnumVariant { dest, .. }
             | TraceOp::TypeIs { dest, .. }
             | TraceOp::TryCast { dest, .. }
-            | TraceOp::GetEnumValue { dest, .. } => Some(*dest),
+            | TraceOp::GetEnumValue { dest, .. }
+            | TraceOp::BorrowField { dest, .. }
+            | TraceOp::BorrowEnumValue { dest, .. } => Some(*dest),
             TraceOp::SetField { .. }
+            | TraceOp::SetIndex { .. }
             | TraceOp::ArrayIndexOk { .. }
             | TraceOp::Guard { .. }
             | TraceOp::GuardNativeFunction { .. }
@@ -1227,20 +1304,31 @@ impl TraceRecorder {
         }
     }
 
-    /// Remove specialization tracking if register is about to be overwritten
-    /// The Vec data becomes "leaked" on the JIT stack but that's fine - it's cleaned
-    /// up when the stack frame is destroyed. The array is still managed by Rc<RefCell<>>.
+    /// The register a specialization describes is about to be overwritten.
+    /// A specialization nothing has used yet is dropped outright, `Unbox`
+    /// and all: the trace exit publishes every remaining copy back into the
+    /// array it was taken from, and a copy taken at entry would overwrite
+    /// whatever the trace itself wrote into that array through the boxed
+    /// value (`array.push` on an alias, `a[i] = v`) with the entry-time
+    /// contents. One already written to cannot simply be dropped, and after
+    /// the overwrite the next iteration would run its ops on a copy of the
+    /// wrong array: the recording is abandoned, and the site recorded again
+    /// without specializing.
     fn remove_specialization_tracking(&mut self, register: Register) {
-        if let Some((_specialized_id, _layout)) = self.specialized_registers.remove(&register) {
+        if !self.specialized_registers.contains_key(&register) {
+            return;
+        }
+        if self.disable_unused_specialization(register) {
             crate::jit::log(|| {
                 format!(
-                    "🗑️  JIT: Removing specialization tracking for reg {} (being overwritten)",
+                    "🗑️  JIT: Dropping the unused specialization of reg {} (being overwritten)",
                     register
                 )
             });
-            // Don't emit rebox - the Vec data stays on JIT stack but that's OK
-            // It will be cleaned up when the JIT stack frame is destroyed
+            return;
         }
+        self.specialized_registers.remove(&register);
+        self.overwritten_specialization = true;
     }
 
     fn rebox_specialized_register(&mut self, register: Register, context: &str) {
@@ -1308,6 +1396,43 @@ impl TraceRecorder {
     ) -> bool {
         self.specialized_owner(register, registers)
             .is_none_or(|owner| self.disable_unused_specialization(owner))
+    }
+
+    /// `array.push(a, v)` on a plain array, as one op instead of a native
+    /// call: the array's type is guarded, the value may be anything (a
+    /// specialized value is reboxed first). Nothing else can observe the
+    /// push, so live specializations stay unboxed. False when the call is
+    /// not that.
+    fn record_array_push(
+        &mut self,
+        native_ptr: usize,
+        first_arg: Register,
+        arg_count: u8,
+        dest_reg: Register,
+        registers: &[Value],
+    ) -> bool {
+        if self.intrinsics.get(&native_ptr) != Some(&crate::jit::Intrinsic::ArrayPush)
+            || arg_count != 2
+            || !matches!(registers.get(first_arg as usize), Some(Value::Array(_)))
+            || self.specialized_owner(first_arg, registers).is_some()
+        {
+            return false;
+        }
+        let value_reg = first_arg + 1;
+        self.rebox_specialized_register(value_reg, "array.push");
+        if !self.is_guarded(first_arg) {
+            self.push_op(TraceOp::Guard {
+                register: first_arg,
+                expected_type: ValueType::Array,
+            });
+            self.mark_guarded(first_arg);
+        }
+        self.push_op(TraceOp::ArrayPush {
+            dest: dest_reg,
+            array: first_arg,
+            value: value_reg,
+        });
+        true
     }
 
     /// `array.push(a, v)` / `array.len(a)` on a specialized array, as the
@@ -1612,6 +1737,16 @@ impl TraceRecorder {
                 Ok(())
             }
 
+            Instruction::LoadBool(dest, value) => {
+                self.remove_specialization_tracking(dest);
+                self.mark_guarded(dest);
+                self.push_op(TraceOp::LoadConst {
+                    dest,
+                    value: Value::Bool(value),
+                });
+                Ok(())
+            }
+
             Instruction::LoadGlobal(dest, _) => {
                 // The value is a snapshot: valid while `VM::globals_version`
                 // is what it was now, which every mutation of the globals
@@ -1670,6 +1805,18 @@ impl TraceRecorder {
                     });
                 }
 
+                // A scalar source, once guarded, moves as a payload copy
+                // and a typed store instead of a runtime clone and drop.
+                if let Some(ty @ (ValueType::Int | ValueType::Float | ValueType::Bool)) =
+                    Self::get_value_type(&registers[src as usize])
+                    && !self.is_guarded(src)
+                {
+                    self.push_op(TraceOp::Guard {
+                        register: src,
+                        expected_type: ty,
+                    });
+                    self.mark_guarded(src);
+                }
                 self.push_op(TraceOp::Move { dest, src });
                 if let Some((specialized_id, layout)) = moved_specialization {
                     // `push_op` invalidates the destination first; alias it
@@ -2071,7 +2218,8 @@ impl TraceRecorder {
                 // receiver as the first argument. The receiver's layout is
                 // guarded because trait dispatch can bring different structs
                 // to one call site.
-                if let Value::Struct { name, layout, .. } = &registers[obj_reg as usize] {
+                if let Value::Struct(object) = &registers[obj_reg as usize] {
+                    let StructObject { name, layout, .. } = object.as_ref();
                     let mangled = format!("{}:{}", name, method_name);
                     if let Some(function_idx) = functions.iter().position(|f| f.name == mangled) {
                         let callee_fn = &functions[function_idx];
@@ -2159,7 +2307,9 @@ impl TraceRecorder {
                 // Int/Float arms, not relaxing the check.
                 let receiver_supported = match &registers[obj_reg as usize] {
                     Value::Iterator(_) => true,
-                    Value::Enum { enum_name, .. } => enum_name == "Option" || enum_name == "Result",
+                    Value::Enum(object) => {
+                        object.enum_name == "Option" || object.enum_name == "Result"
+                    }
                     _ => false,
                 };
                 if !receiver_supported {
@@ -2193,7 +2343,8 @@ impl TraceRecorder {
                     .unwrap_or("unknown")
                     .to_string();
                 let (field_index, is_weak_field) = match &registers[obj_reg as usize] {
-                    Value::Struct { layout, .. } => {
+                    Value::Struct(object) => {
+                        let StructObject { layout, .. } = object.as_ref();
                         let idx = layout.index_of_str(&field_name);
                         let is_weak = idx.map(|i| layout.is_weak(i)).unwrap_or(false);
                         (idx, is_weak)
@@ -2229,7 +2380,8 @@ impl TraceRecorder {
                     .unwrap_or("unknown")
                     .to_string();
                 let (field_index, is_weak_field) = match &registers[obj_reg as usize] {
-                    Value::Struct { layout, .. } => {
+                    Value::Struct(object) => {
+                        let StructObject { layout, .. } = object.as_ref();
                         let idx = layout.index_of_str(&field_name);
                         let is_weak = idx.map(|i| layout.is_weak(i)).unwrap_or(false);
                         (idx, is_weak)
@@ -2460,6 +2612,15 @@ impl TraceRecorder {
                         ) {
                             return op;
                         }
+                        if self.record_array_push(
+                            Rc::as_ptr(native_fn) as *const () as usize,
+                            first_arg,
+                            arg_count,
+                            dest_reg,
+                            registers,
+                        ) {
+                            return Ok(());
+                        }
                         self.specializations_escape("a native call")?;
 
                         self.push_op(TraceOp::CallNative {
@@ -2520,11 +2681,10 @@ impl TraceRecorder {
                         Ok(())
                     }
 
-                    Value::Closure {
-                        function_idx,
-                        upvalues,
-                    } => {
-                        let upvalues_ptr = Rc::as_ptr(upvalues) as *const ();
+                    Value::Closure(closure) => {
+                        let function_idx = &closure.function_idx;
+                        // The closure's identity: the object every clone shares.
+                        let upvalues_ptr = Rc::as_ptr(closure) as *const ();
                         if !self.is_guarded(func_reg) {
                             self.push_op(TraceOp::GuardClosure {
                                 register: func_reg,
@@ -2669,7 +2829,43 @@ impl TraceRecorder {
                 Ok(())
             }
 
-            Instruction::NewMap(_) | Instruction::SetIndex(_, _, _) => {
+            Instruction::SetIndex(array, index, value) => {
+                if !matches!(registers.get(array as usize), Some(Value::Array(_))) {
+                    self.stop_recording();
+                    return Err(LustError::RuntimeError {
+                        message: "Trace aborted: index assignment currently supports arrays only"
+                            .to_string(),
+                    });
+                }
+                if !self.disable_unused_array_specialization(array, registers) {
+                    self.specialization_escaped = true;
+                    self.stop_recording();
+                    return Err(LustError::RuntimeError {
+                        message: "Trace aborted: array write follows a specialized mutation"
+                            .to_string(),
+                    });
+                }
+                self.rebox_specialized_register(value, "SetIndex");
+                for reg in [array, index] {
+                    if let Some(ty) = Self::get_value_type(&registers[reg as usize])
+                        && !self.is_guarded(reg)
+                    {
+                        self.push_op(TraceOp::Guard {
+                            register: reg,
+                            expected_type: ty,
+                        });
+                        self.mark_guarded(reg);
+                    }
+                }
+                self.push_op(TraceOp::SetIndex {
+                    array,
+                    index,
+                    value,
+                });
+                Ok(())
+            }
+
+            Instruction::NewMap(_) => {
                 self.stop_recording();
                 Err(LustError::RuntimeError {
                     message: "Trace aborted: unsupported index operation".to_string(),
@@ -2877,6 +3073,14 @@ impl TraceRecorder {
 
         outcome?;
 
+        if self.overwritten_specialization {
+            self.specialization_escaped = true;
+            self.stop_recording();
+            return Err(LustError::RuntimeError {
+                message: "Trace aborted: a written specialized array was overwritten".to_string(),
+            });
+        }
+
         if self.op_count >= self.max_length {
             self.stop_recording();
             return Err(LustError::RuntimeError {
@@ -2980,7 +3184,7 @@ impl TraceRecorder {
             Value::String(_) => Some(ValueType::String),
             Value::Array(_) => Some(ValueType::Array),
             Value::Tuple(_) => Some(ValueType::Tuple),
-            Value::Struct { .. } => Some(ValueType::Struct),
+            Value::Struct(_) => Some(ValueType::Struct),
             _ => None,
         }
     }
@@ -3017,6 +3221,13 @@ impl TraceRecorder {
 
     pub fn is_recording(&self) -> bool {
         self.recording
+    }
+
+    /// The nested loop whose iterations are not being recorded, as
+    /// `(function_idx, loop_start_ip)`: its own root trace may run them.
+    pub fn skipped_loop(&self) -> Option<(usize, usize)> {
+        self.nested_skip
+            .map(|skip| (skip.function_idx, skip.loop_start_ip))
     }
 
     pub fn is_complete(&self) -> bool {
@@ -3062,8 +3273,20 @@ mod tests {
             .filter(|op| !matches!(op, TraceOp::At { .. }))
             .collect();
         assert!(matches!(ops[0], TraceOp::GuardGlobals { version: 5 }));
-        assert!(matches!(ops[1], TraceOp::LoadConst { dest: 0, value: Value::Int(7) }));
-        assert!(matches!(ops[2], TraceOp::LoadConst { dest: 0, value: Value::Int(7) }));
+        assert!(matches!(
+            ops[1],
+            TraceOp::LoadConst {
+                dest: 0,
+                value: Value::Int(7)
+            }
+        ));
+        assert!(matches!(
+            ops[2],
+            TraceOp::LoadConst {
+                dest: 0,
+                value: Value::Int(7)
+            }
+        ));
         assert_eq!(ops.len(), 3);
 
         // A store still aborts: it would fail the trace's own guard.

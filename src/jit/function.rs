@@ -88,6 +88,62 @@ pub fn written_registers(function: &Function) -> u64 {
     mask
 }
 
+/// Does nothing this function runs write a struct field? True when its
+/// bytecode has no `SetField`, no method call, no closure, and every
+/// `Call` goes through a register only ever loaded with a bytecode
+/// function constant that is field-pure itself (recursion counts as
+/// pure: a cycle is pure if everything on it is). A borrow of a field
+/// (see `TraceOp::BorrowField`) is only safe in such a function.
+pub fn field_pure(functions: &[Function], idx: usize) -> bool {
+    fn check(functions: &[Function], idx: usize, visiting: &mut Vec<usize>) -> bool {
+        if visiting.contains(&idx) {
+            return true;
+        }
+        let Some(function) = functions.get(idx) else {
+            return false;
+        };
+        visiting.push(idx);
+        let instructions = &function.chunk.instructions;
+        let Some(targets) = jump_targets(instructions) else {
+            visiting.pop();
+            return false;
+        };
+        // The callee of a `Call`: the last write to its register before
+        // the call must be a function constant, with no jump target in
+        // between (so no other path reaches the call).
+        let callee_of = |call_ip: usize, func_reg: Register| -> Option<usize> {
+            let load_ip = (0..call_ip)
+                .rev()
+                .find(|ip| instructions[*ip].defined_register() == Some(func_reg))?;
+            if (load_ip + 1..=call_ip).any(|ip| targets.contains(&ip)) {
+                return None;
+            }
+            match instructions[load_ip] {
+                Instruction::LoadConst(_, k) => match function.chunk.constants.get(k as usize) {
+                    Some(Value::Function(callee)) => Some(*callee),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let pure = instructions
+            .iter()
+            .enumerate()
+            .all(|(ip, instruction)| match instruction {
+                Instruction::SetField(..)
+                | Instruction::CallMethod(..)
+                | Instruction::Closure(..)
+                | Instruction::StoreUpvalue(..) => false,
+                Instruction::Call(func_reg, ..) => callee_of(ip, *func_reg)
+                    .is_some_and(|callee| check(functions, callee, visiting)),
+                _ => true,
+            });
+        visiting.pop();
+        pure
+    }
+    check(functions, idx, &mut Vec::new())
+}
+
 /// The registers a function returns directly, as a mask (see
 /// `FunctionSig::returned_registers`). `Return(255)` returns Nil and owns
 /// nothing; a register outside the mask's range is treated as returned.
@@ -121,6 +177,9 @@ pub struct Context<'a> {
     pub globals_version: u64,
     /// Natives with a native-code equivalent (`JitState::intrinsics`).
     pub intrinsics: &'a HashMap<usize, super::Intrinsic>,
+    /// Is the function field-pure (see `field_pure`)? Borrows are only
+    /// taken in one that is.
+    pub field_pure: &'a dyn Fn(usize) -> bool,
 }
 
 /// Largest function (in instructions) worth compiling whole.
@@ -133,6 +192,9 @@ const MAX_FIXPOINT_PASSES: usize = 8;
 #[derive(Clone, Default)]
 struct Env {
     scalars: HashMap<Register, ValueType>,
+    /// Registers holding a borrow (see `TraceOp::BorrowField`): the
+    /// value's bits without a count, valid while the frame lives.
+    borrows: HashSet<Register>,
     /// Registers known to hold a given bytecode function (loaded from a
     /// constant), so a call through them needs no identity guard.
     functions: HashMap<Register, usize>,
@@ -173,16 +235,21 @@ impl Env {
         self.elements.remove(&reg);
         self.constants.remove(&reg);
         self.natives_guarded.remove(&reg);
+        self.borrows.remove(&reg);
     }
 
     /// Facts both environments agree on.
     fn merge(&self, other: &Env) -> Env {
         Env {
+            borrows: self.borrows.intersection(&other.borrows).copied().collect(),
+            // Two scalars of different types still hold nothing owned.
             scalars: self
                 .scalars
                 .iter()
-                .filter(|(reg, ty)| other.scalars.get(*reg) == Some(*ty))
-                .map(|(reg, ty)| (*reg, *ty))
+                .filter_map(|(reg, ty)| {
+                    let other = other.scalars.get(reg)?;
+                    Some((*reg, if other == ty { *ty } else { ValueType::Plain }))
+                })
                 .collect(),
             functions: self
                 .functions
@@ -251,6 +318,7 @@ impl Env {
             })
             && self.natives_guarded == other.natives_guarded
             && self.globals_guarded == other.globals_guarded
+            && self.borrows == other.borrows
     }
 
     /// Give `to` the facts `from` has, then restore `from`'s facts from
@@ -262,7 +330,11 @@ impl Env {
         let elements = self.elements.get(&from).copied();
         let constant = self.constants.get(&from).cloned();
         let native_guarded = self.natives_guarded.contains(&from);
+        let borrowed = self.borrows.contains(&from);
         self.write(to, scalar);
+        if borrowed {
+            self.borrows.insert(to);
+        }
         if let Some(idx) = function {
             self.functions.insert(to, idx);
         }
@@ -293,6 +365,9 @@ impl Env {
         }
         if previous.natives_guarded.contains(&from) {
             self.natives_guarded.insert(from);
+        }
+        if previous.borrows.contains(&from) {
+            self.borrows.insert(from);
         }
     }
 
@@ -378,6 +453,18 @@ struct Translator<'a> {
     /// else — a label, a marker — came between).
     previous_env: Env,
     previous_is_last_op: bool,
+    /// Borrows are only taken in a field-pure function (see `field_pure`)
+    /// whose frame fits the masks.
+    borrows_allowed: bool,
+    /// Registers that must not take a borrow: a previous pass saw them
+    /// hold an owned value somewhere.
+    borrow_disabled: &'a HashSet<Register>,
+    /// Registers that took a borrow in this pass.
+    borrowed_registers: HashSet<Register>,
+    /// Registers written with an owned value in this pass.
+    owned_written: HashSet<Register>,
+    /// Registers returned while holding a borrow in this pass.
+    borrow_returned: HashSet<Register>,
 }
 
 impl<'a> Translator<'a> {
@@ -394,8 +481,27 @@ impl<'a> Translator<'a> {
     fn write(&mut self, reg: Register, ty: Option<ValueType>) {
         if ty.is_none() {
             self.frame_may_own = true;
+            self.owned_written.insert(reg);
         }
         self.env.write(reg, ty);
+    }
+
+    /// May `dest` take a borrow of a value reached through `source`?
+    /// `source` must outlive the frame — a parameter this function never
+    /// writes or returns (its caller keeps it), or a borrow itself.
+    fn may_borrow(&self, dest: Register, source: Register) -> bool {
+        if !self.borrows_allowed || dest >= 64 || self.borrow_disabled.contains(&dest) {
+            return false;
+        }
+        self.env.borrows.contains(&source)
+            || ((source as usize) < self.sig.params.len()
+                && self.sig.can_alias_param(source as usize))
+    }
+
+    fn take_borrow(&mut self, dest: Register) {
+        self.write(dest, Some(ValueType::Plain));
+        self.env.borrows.insert(dest);
+        self.borrowed_registers.insert(dest);
     }
 
     /// The register now holds a value of this declared type.
@@ -633,7 +739,9 @@ impl<'a> Translator<'a> {
                 && is_scalar(*kind)
             {
                 self.guard(*reg, *kind);
-            } else if sig.can_alias_param(index) && !self.env.scalars.contains_key(reg) {
+            } else if sig.can_alias_param(index)
+                && !self.env.scalars.get(reg).is_some_and(|ty| is_scalar(*ty))
+            {
                 // The callee only reads this parameter, and never returns
                 // it: pass the caller's value by aliasing rather than
                 // cloning and dropping it.
@@ -667,7 +775,7 @@ impl<'a> Translator<'a> {
                     dest,
                     value: Value::Nil,
                 });
-                self.env.write(dest, None);
+                self.write(dest, Some(ValueType::Plain));
             }
             Instruction::LoadBool(dest, value) => {
                 self.ops.push(TraceOp::LoadConst {
@@ -683,11 +791,23 @@ impl<'a> Translator<'a> {
                     Value::Function(idx) => Some(*idx),
                     _ => None,
                 };
-                if ty.is_none() && function.is_none() {
+                let plain = matches!(value, Value::Function(_) | Value::Nil);
+                if ty.is_none() && !plain {
                     self.frame_may_own = true;
                 }
+                // A function constant the register is already proven to
+                // hold (reloaded by the bytecode on every iteration of a
+                // loop making the same call) need not be stored again.
+                if let Some(idx) = function
+                    && self.env.functions.get(&dest) == Some(&idx)
+                {
+                    return Some(());
+                }
                 self.ops.push(TraceOp::LoadConst { dest, value });
-                self.env.write(dest, ty);
+                // A function index or Nil is plain: nothing to drop when
+                // the register is written again.
+                self.env
+                    .write(dest, ty.or(plain.then_some(ValueType::Plain)));
                 if let Some(idx) = function {
                     self.env.functions.insert(dest, idx);
                 }
@@ -721,7 +841,11 @@ impl<'a> Translator<'a> {
                 // A temporary moved into a local right after being
                 // produced: let the producer write the local and skip the
                 // copy (a clone and a drop for an owned value).
+                // A borrow only moves into a register that may hold one.
+                let borrow_may_move = !self.env.borrows.contains(&src)
+                    || (dest < 64 && !self.borrow_disabled.contains(&dest));
                 if dest != src
+                    && borrow_may_move
                     && self.previous_is_last_op
                     && self
                         .ops
@@ -759,6 +883,12 @@ impl<'a> Translator<'a> {
                 let constant = self.env.constants.get(&src).cloned();
                 let native_guarded = self.env.natives_guarded.contains(&src);
                 self.ops.push(TraceOp::Move { dest, src });
+                // A copy of a borrow is a clone: the destination owns it.
+                let ty = if self.env.borrows.contains(&src) {
+                    None
+                } else {
+                    ty
+                };
                 self.write(dest, ty);
                 if let Some(idx) = function {
                     self.env.functions.insert(dest, idx);
@@ -854,6 +984,17 @@ impl<'a> Translator<'a> {
                         self.write(dest, Some(ValueType::Int));
                         return Some(());
                     }
+                    if intrinsic == Some(super::Intrinsic::ArrayPush) && arg_count == 2 {
+                        // `array.push(a, v)`: the array's type is checked by
+                        // the op (anything else fails to the interpreter).
+                        self.ops.push(TraceOp::ArrayPush {
+                            dest,
+                            array: first_arg,
+                            value: first_arg + 1,
+                        });
+                        self.write(dest, Some(ValueType::Plain));
+                        return Some(());
+                    }
                     self.ops.push(TraceOp::CallNative {
                         dest,
                         callee,
@@ -901,6 +1042,12 @@ impl<'a> Translator<'a> {
                     {
                         self.guard(value, kind);
                     }
+                    // A `Return` moves its register out: a borrow there
+                    // would leave with no count. The register is excluded
+                    // and the pass rerun.
+                    if self.env.borrows.contains(&value) {
+                        self.borrow_returned.insert(value);
+                    }
                     self.ops.push(TraceOp::Return { value: Some(value) });
                 }
                 self.reachable = false;
@@ -934,6 +1081,18 @@ impl<'a> Translator<'a> {
                         let kind = layout.field_type(index).kind.clone();
                         let is_weak = layout.is_weak(index);
                         let value_type = scalar_kind(&kind);
+                        // A non-scalar strong field of a struct that
+                        // outlives the frame is borrowed, not cloned.
+                        if value_type.is_none() && !is_weak && self.may_borrow(dest, object) {
+                            self.ops.push(TraceOp::BorrowField {
+                                dest,
+                                object,
+                                field_index: index,
+                            });
+                            self.take_borrow(dest);
+                            self.note_type(dest, &kind);
+                            return Some(());
+                        }
                         self.ops.push(TraceOp::GetField {
                             dest,
                             object,
@@ -979,6 +1138,14 @@ impl<'a> Translator<'a> {
             Instruction::ArrayLen(dest, array) => {
                 self.ops.push(TraceOp::ArrayLen { dest, array });
                 self.write(dest, Some(ValueType::Int));
+            }
+            Instruction::SetIndex(array, index, value) => {
+                self.guard(index, ValueType::Int);
+                self.ops.push(TraceOp::SetIndex {
+                    array,
+                    index,
+                    value,
+                });
             }
             Instruction::GetIndex(dest, array, index) => {
                 self.guard(index, ValueType::Int);
@@ -1058,7 +1225,13 @@ impl<'a> Translator<'a> {
                 self.ops.push(TraceOp::Concat { dest, lhs, rhs });
                 self.write(dest, None);
             }
-            Instruction::NewStruct(dest, name_idx, first_field_name_idx, first_field, field_count) => {
+            Instruction::NewStruct(
+                dest,
+                name_idx,
+                first_field_name_idx,
+                first_field,
+                field_count,
+            ) => {
                 let struct_name = self.constant_string(name_idx)?;
                 let mut field_names = Vec::with_capacity(field_count as usize);
                 let mut field_registers = Vec::with_capacity(field_count as usize);
@@ -1105,6 +1278,18 @@ impl<'a> Translator<'a> {
                 self.write(dest, Some(ValueType::Bool));
             }
             Instruction::GetEnumValue(dest, enum_reg, index) => {
+                // The payload of an enum that outlives the frame (a borrow,
+                // or a parameter the caller keeps) is borrowed: an enum's
+                // payload is immutable.
+                if self.may_borrow(dest, enum_reg) {
+                    self.ops.push(TraceOp::BorrowEnumValue {
+                        dest,
+                        enum_reg,
+                        index,
+                    });
+                    self.take_borrow(dest);
+                    return Some(());
+                }
                 self.ops.push(TraceOp::GetEnumValue {
                     dest,
                     enum_reg,
@@ -1225,6 +1410,13 @@ fn entry_env(sig: &FunctionSig, ctx: &Context) -> (Env, bool) {
             _ => {}
         }
     }
+    // Every other register is `Nil` on entry: the interpreter resets a
+    // frame before it copies the arguments in, and a native caller blanks
+    // the callee's frame the same way. The first store into such a register
+    // has nothing to drop.
+    for reg in sig.params.len()..usize::from(sig.register_count) {
+        env.scalars.insert(reg as u8, ValueType::Plain);
+    }
     (env, frame_may_own)
 }
 
@@ -1235,6 +1427,11 @@ struct Pass {
     /// The environment each back edge arrived with.
     back_edges: HashMap<usize, Env>,
     frame_may_own: bool,
+    entry_scalars: Vec<(Register, ValueType)>,
+    borrowed_registers: Vec<Register>,
+    /// Registers that took a borrow and also held an owned value: the
+    /// next pass must not borrow into them.
+    borrow_conflicts: HashSet<Register>,
 }
 
 /// One translation pass with the given loop-header environments, or
@@ -1246,9 +1443,12 @@ fn translate_pass(
     ctx: &Context,
     targets: &HashSet<usize>,
     loop_envs: &HashMap<usize, Env>,
+    borrows_allowed: bool,
+    borrow_disabled: &HashSet<Register>,
 ) -> Option<Pass> {
     let instructions = &function.chunk.instructions;
     let (env, frame_may_own) = entry_env(sig, ctx);
+    let entry_scalars = env.label_scalars();
     let mut t = Translator {
         function,
         sig,
@@ -1263,6 +1463,11 @@ fn translate_pass(
         frame_may_own,
         previous_env: Env::default(),
         previous_is_last_op: false,
+        borrows_allowed,
+        borrow_disabled,
+        borrowed_registers: HashSet::new(),
+        owned_written: HashSet::new(),
+        borrow_returned: HashSet::new(),
     };
     let mut label_envs: HashMap<usize, Env> = HashMap::new();
     let mut ip = 0;
@@ -1313,11 +1518,31 @@ fn translate_pass(
         // A jump past the last instruction.
         return None;
     }
+    // The registers the borrow ops write, as they stand after move
+    // elision retargeted any of them.
+    let borrowed: HashSet<Register> = t
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            TraceOp::BorrowField { dest, .. } | TraceOp::BorrowEnumValue { dest, .. } => {
+                Some(*dest)
+            }
+            _ => None,
+        })
+        .collect();
+    let mut borrow_conflicts: HashSet<Register> =
+        borrowed.intersection(&t.owned_written).copied().collect();
+    borrow_conflicts.extend(t.borrow_returned.iter().copied());
+    let mut borrowed_registers: Vec<Register> = borrowed.iter().copied().collect();
+    borrowed_registers.sort_unstable();
     Some(Pass {
         ops: t.ops,
         label_envs,
         back_edges: t.back_edges,
         frame_may_own: t.frame_may_own,
+        entry_scalars,
+        borrowed_registers,
+        borrow_conflicts,
     })
 }
 
@@ -1344,9 +1569,26 @@ pub fn translate(
     // narrows them to what the back edges also guarantee, until a pass
     // finds every back edge covered.
     let mut loop_envs: HashMap<usize, Env> = HashMap::new();
+    // Borrows (see `TraceOp::BorrowField`) need a field-pure function and
+    // a frame the masks cover; a register a pass finds both borrowed and
+    // owned is excluded and the pass rerun.
+    let borrows_allowed = function.register_count <= 64 && (ctx.field_pure)(function_idx);
+    let mut borrow_disabled: HashSet<Register> = HashSet::new();
     for _ in 0..MAX_FIXPOINT_PASSES {
-        let pass = translate_pass(function, sig, ctx, &targets, &loop_envs)?;
+        let pass = translate_pass(
+            function,
+            sig,
+            ctx,
+            &targets,
+            &loop_envs,
+            borrows_allowed,
+            &borrow_disabled,
+        )?;
         let mut stable = true;
+        if !pass.borrow_conflicts.is_empty() {
+            borrow_disabled.extend(pass.borrow_conflicts.iter().copied());
+            stable = false;
+        }
         for (target, env) in &pass.back_edges {
             let label_env = pass.label_envs.get(target)?;
             if !env.covers(label_env) {
@@ -1360,6 +1602,11 @@ pub fn translate(
                 start_ip: 0,
                 is_function: true,
                 frame_may_own: pass.frame_may_own,
+                entry_scalars: pass.entry_scalars,
+                alias_params: (0..sig.params.len().min(64))
+                    .filter(|index| sig.can_alias_param(*index))
+                    .fold(0, |mask, index| mask | (1u64 << index)),
+                borrowed_registers: pass.borrowed_registers,
                 preamble: Vec::new(),
                 ops: pass.ops,
                 postamble: Vec::new(),
@@ -1386,6 +1633,7 @@ mod tests {
             global: &|_| None,
             globals_version: 0,
             intrinsics: NO_INTRINSICS.get_or_init(HashMap::new),
+            field_pure: &|_| false,
         }
     }
 
@@ -1455,7 +1703,10 @@ mod tests {
             2
         );
         assert!(matches!(
-            trace.ops.iter().find(|op| matches!(op, TraceOp::Label { .. })),
+            trace
+                .ops
+                .iter()
+                .find(|op| matches!(op, TraceOp::Label { .. })),
             Some(TraceOp::Label { id: 5, .. })
         ));
         assert!(trace.ops.iter().any(|op| matches!(
@@ -1506,9 +1757,17 @@ mod tests {
                 _ => None,
             })
             .expect("loop header label");
+        // The counters stay Int; the two temporaries hold a Bool (the
+        // comparison) or nothing yet, so nothing owned either way.
         assert_eq!(
             header,
-            vec![(0, ValueType::Int), (1, ValueType::Int), (2, ValueType::Int)]
+            vec![
+                (0, ValueType::Int),
+                (1, ValueType::Int),
+                (2, ValueType::Int),
+                (3, ValueType::Plain),
+                (4, ValueType::Plain)
+            ]
         );
         assert!(
             trace
@@ -1546,7 +1805,17 @@ mod tests {
                 _ => None,
             })
             .expect("loop header label");
-        assert_eq!(header, vec![(0, ValueType::Int)]);
+        // x is an Int or a Float — nothing owned, no particular type; the
+        // comparison result and the unused register 3 likewise.
+        assert_eq!(
+            header,
+            vec![
+                (0, ValueType::Int),
+                (1, ValueType::Plain),
+                (2, ValueType::Plain),
+                (3, ValueType::Plain)
+            ]
+        );
         assert!(trace.ops.iter().any(|op| matches!(
             op,
             TraceOp::Guard {
@@ -1578,7 +1847,11 @@ mod tests {
 /// End-to-end regressions for whole-function compilation: a program is run
 /// until its functions are compiled (see `FUNCTION_HOT_THRESHOLD`) and the
 /// results are compared against the interpreter's semantics.
-#[cfg(all(test, feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod compiled_semantics_tests {
     use crate::bytecode::Value;
     use crate::embed::EmbeddedProgram;
@@ -1661,14 +1934,21 @@ mod compiled_semantics_tests {
         );
         let min = crate::LustInt::MIN;
         for _ in 0..80 {
-            let quotient: crate::LustInt = program.call_typed("main.divide", (min, -1)).expect("divide");
-            let remainder: crate::LustInt = program.call_typed("main.modulo", (min, -1)).expect("modulo");
+            let quotient: crate::LustInt = program
+                .call_typed("main.divide", (min, -1))
+                .expect("divide");
+            let remainder: crate::LustInt = program
+                .call_typed("main.modulo", (min, -1))
+                .expect("modulo");
             assert_eq!(quotient, min.wrapping_div(-1));
             assert_eq!(remainder, min.wrapping_rem(-1));
         }
         // Again through a traced loop calling both.
         let pair = program
-            .call_raw("main.drive", alloc::vec![Value::Int(min), Value::Int(-1), Value::Int(200)])
+            .call_raw(
+                "main.drive",
+                alloc::vec![Value::Int(min), Value::Int(-1), Value::Int(200)],
+            )
             .expect("drive");
         let Value::Tuple(values) = &pair else {
             panic!("expected a tuple, got {pair:?}")
@@ -1677,7 +1957,15 @@ mod compiled_semantics_tests {
         assert_eq!(values[1].as_int(), Some(min.wrapping_rem(-1)));
 
         // Division by zero is still an error, not a wrap.
-        assert!(program.call_typed::<_, crate::LustInt>("main.divide", (1, 0)).is_err());
-        assert!(program.call_typed::<_, crate::LustInt>("main.modulo", (1, 0)).is_err());
+        assert!(
+            program
+                .call_typed::<_, crate::LustInt>("main.divide", (1, 0))
+                .is_err()
+        );
+        assert!(
+            program
+                .call_typed::<_, crate::LustInt>("main.modulo", (1, 0))
+                .is_err()
+        );
     }
 }

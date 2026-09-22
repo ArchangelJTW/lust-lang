@@ -210,11 +210,20 @@ is recorded as the value seen, guarded by the VM's globals version, which
 every assignment to a global bumps; the guard failing evicts the trace. Struct
 fields of scalar type and `Array` elements are read and written inline through
 the measured layout of the runtime's `Rc<RefCell<Vec<_>>>` (see
-`src/jit/layout.rs`), falling back to the runtime helpers for anything else.
+`src/jit/layout.rs`), falling back to the runtime helpers for anything else:
+`a[i] = v` stores the value's two words over an element that owns nothing,
+and `array.push(a, v)` on any array appends them while there is capacity
+(growth, which charges the memory budget, goes through the helper).
 An `Array<int>` a loop reads and writes is unboxed into a native vector for
 the trace's duration (`array.push` / `array.len` on it become native
 operations); when the array also escapes to a native or a non-inlined call,
-the recording is abandoned and the site is recorded again without unboxing.
+or its register is overwritten after the copy has been written to, the
+recording is abandoned and the site is recorded again without unboxing.
+
+Under a gas budget (`VM::set_gas_budget`), compiled loops charge each
+back-edge and hand the loop to the interpreter — which raises the error —
+when the budget runs out; code compiled before the budget was set is
+discarded when it is.
 
 Functions are also compiled whole after thirty calls: their bytecode is
 translated statically, every branch and loop included (types flow to a
@@ -232,6 +241,20 @@ caller hands a call to an uncompiled function, or one that would exhaust
 the native stack, back to the interpreter at the call instruction. Exits
 from any depth of native calls turn the native frames into interpreter
 frames first, so errors and stack traces look the same either way.
+
+Values are reference-counted, and the compiled code keeps the counts
+itself: every heap value is one `Rc` (a `Value` is a tag and an 8-byte
+payload), so a clone is one increment and a release one decrement, with
+the runtime called only when a count reaches zero. A register the code can
+prove holds nothing owned — a fresh frame's unwritten registers, a scalar,
+a function index — is overwritten with no check at all. In a function
+that nothing it runs can make write a struct field (no `SetField`, no
+method or native call, every call to a bytecode function that is itself
+field-pure), a non-scalar field of a parameter the function never writes
+or returns, and the payload of such an enum, are *borrowed*: read as the
+value's bits with no count taken and nothing released, since the caller
+keeps the struct alive for the whole call; every exit to the interpreter
+retains what the borrowed registers hold first.
 
 Environment switches, read once at VM creation:
 
@@ -251,12 +274,30 @@ backend change:
   differential fuzzer (a workspace member, so it is not built by a plain
   `cargo build`). `lust-fuzz run --cases 20000 --size 4 --jobs 6 --keep-going`
   generates programs (loops, branches, calls, recursion, function values and
-  closures, arrays, maps, structs, options, strings, pair returns), runs each
+  closures, arrays with pushes and index assignment, maps, structs, options,
+  strings, pair returns), runs each
   both ways in-process and reports every disagreement with a shrunk
-  reproducer; `lust-fuzz one --seed S` prints a
+  reproducer. Helpers take and return structs (often the parameter
+  itself) and `Option<P>`, walk a `next` chain of structs (which a
+  compiled helper borrows link by link), and natives are passed around
+  as function values. The fuzzer's allocator counts each thread's live
+  allocations, so a program that leaves any behind after its VM is
+  dropped — a reference count never given back, which the outputs would
+  never show — is a finding too (shrunk like a disagreement; a first
+  run's lazy initialization is ruled out by running the program again). A debug build of the fuzzer (`cargo build -p lust-fuzz`, run
+  with `LUST_JIT_QUIET=1`, and `MallocScribble=1` on macOS) adds overflow
+  checks and debug assertions and makes freed memory visible, at about a
+  sixth of the speed; `lust-fuzz one --seed S` prints a
   program and `lust-fuzz replay --seed S` reruns it with timings. `--size`
   scales program length, `--fg` runs the workers at normal priority (they
   default to background QoS), and a watchdog kills cases over 120 s or 2 GB.
+  To fuzz the x86_64 backend on an Apple Silicon Mac, build with
+  `--target x86_64-apple-darwin` and run the fuzzer under `arch -x86_64` as
+  several `--jobs 1` processes: a multi-threaded fuzzer process under
+  Rosetta produces about one spurious disagreement or segfault per 6,000
+  cases on any commit, none of which replays, apparently Rosetta's
+  translation cache and JIT buffers being mapped and unmapped from several
+  threads; single-worker processes are clean.
 
 Embedders can inspect cumulative activation counters after calling Lust code:
 

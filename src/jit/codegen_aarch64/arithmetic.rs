@@ -164,16 +164,14 @@ impl JitCompiler {
         op: BinOp,
     ) -> Result<()> {
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
-            let a = self.operand_x(lhs, 0);
-            let b = self.operand_x(rhs, 9);
+            let (a, b) = self.operand_pair_x(lhs, rhs, 0, 9);
             self.finish_int_op(op, dest, a, b);
             return Ok(());
         }
 
         let numeric = |ty: ValueType| matches!(ty, ValueType::Int | ValueType::Float);
         if numeric(lhs_type) && numeric(rhs_type) {
-            let a = self.operand_numeric_d(lhs, lhs_type, 0);
-            let b = self.operand_numeric_d(rhs, rhs_type, 1);
+            let (a, b) = self.operand_pair_numeric_d(lhs, rhs, lhs_type, rhs_type);
             self.finish_float_op(op, dest, a, b);
             return Ok(());
         }
@@ -309,8 +307,7 @@ impl JitCompiler {
         rhs_type: ValueType,
     ) -> Result<()> {
         if lhs_type == ValueType::Int && rhs_type == ValueType::Int {
-            let a = self.operand_x(lhs, 0);
-            let b = self.operand_x(rhs, 9);
+            let (a, b) = self.operand_pair_x(lhs, rhs, 0, 9);
             match self.direct_dest_x(dest) {
                 Some(d) => self.emit_int_mod_regs(d, a, b),
                 None => {
@@ -324,8 +321,7 @@ impl JitCompiler {
         let numeric = |ty: ValueType| matches!(ty, ValueType::Int | ValueType::Float);
         if numeric(lhs_type) && numeric(rhs_type) {
             // fmod takes its arguments in d0/d1 and returns in d0.
-            let a = self.operand_numeric_d(lhs, lhs_type, 0);
-            let b = self.operand_numeric_d(rhs, rhs_type, 1);
+            let (a, b) = self.operand_pair_numeric_d(lhs, rhs, lhs_type, rhs_type);
             if a != 0 {
                 dynasm!(self.ops ; .arch aarch64 ; fmov d0, D(a));
             }

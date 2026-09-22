@@ -15,6 +15,11 @@ impl JitCompiler {
             ValueType::Array => ValueTag::Array,
             ValueType::Tuple => ValueTag::Tuple,
             ValueType::Struct => ValueTag::Struct,
+            ValueType::Plain => {
+                return Err(crate::LustError::RuntimeError {
+                    message: "a guard cannot expect Plain".into(),
+                });
+            }
         };
         let expected_disc = expected_tag.as_u8() as i32;
         let guard_return_value = (guard_index + 1) as i32;

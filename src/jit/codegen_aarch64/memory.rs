@@ -10,6 +10,7 @@ impl JitCompiler {
 
             Value::Float(f) => {
                 self.emit_mov_imm64(0, f.to_bits());
+                self.hot_d0_in = None;
                 dynasm!(self.ops ; .arch aarch64 ; fmov d0, x0);
                 self.store_d0_as_float(dest);
                 Ok(())
@@ -37,13 +38,28 @@ impl JitCompiler {
         // coarser classification and numbers `Function` differently).
         // SAFETY: reading the first byte of a live `Value`.
         let tag = unsafe { *(value as *const Value as *const u8) } as u32;
+        // A destination known to hold nothing owned is simply overwritten.
+        if self.scalar_registers.contains_key(&dest) {
+            self.emit_mov_imm64(0, payload);
+            self.store_tag_imm(dest, tag as u8);
+            self.store_payload(dest, 0);
+            return Ok(());
+        }
         let done = self.ops.new_dynamic_label();
         self.load_tag_from_memory(9, dest);
         dynasm!(self.ops
             ; .arch aarch64
             ; cmp w9, #scalar_max_tag
-            ; b.hi >owned
+            ; b.ls >plain
         );
+        // A function index held from the previous iteration of a loop that
+        // reloads it is as plain as a scalar.
+        if matches!(value, Value::Function(_)) {
+            dynasm!(self.ops ; .arch aarch64 ; cmp w9, #tag ; b.ne >owned);
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; b >owned);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; plain:);
         self.emit_mov_imm64(0, payload);
         self.store_tag_imm(dest, tag as u8);
         self.store_payload(dest, 0);
@@ -54,7 +70,6 @@ impl JitCompiler {
         );
         self.copy_owned_constant(dest, value)?;
         dynasm!(self.ops ; .arch aarch64 ; => done);
-        self.scalar_registers.remove(&dest);
         Ok(())
     }
 
@@ -164,6 +179,87 @@ impl JitCompiler {
         self.emit_reg_addr(2, index);
         self.emit_reg_addr(3, dest);
         self.emit_call(jit_array_index_result_safe as *const ());
+        self.emit_fail_if_w0_zero();
+        Ok(())
+    }
+
+    /// `array[index] = value`. Inline when the index is a known int: the
+    /// array tag, the bounds, and that neither the old element nor the
+    /// value owns anything are checked, then the value's two words replace
+    /// the element. Anything else goes through the helper, which fails to
+    /// the interpreter for an error.
+    pub(super) fn compile_set_index(&mut self, array: u8, index: u8, value: u8) -> Result<()> {
+        unsafe extern "C" {
+            fn jit_array_set_index_safe(
+                array_value: *const Value,
+                index_value: *const Value,
+                value: *const Value,
+            ) -> u8;
+        }
+
+        if let (Some(layout), true) = (
+            jit::layout::rc_vec_layout(),
+            self.scalar_registers.get(&index) == Some(&ValueType::Int),
+        ) {
+            let array_tag = ValueTag::Array.as_u8() as u32;
+            let scalar_max_tag = ValueTag::Float.as_u8() as u32;
+            let rc_offset = layout.array_rc_offset as u32;
+            let len_offset = layout.len_offset as u32;
+            let ptr_offset = layout.ptr_offset as u32;
+            let value_size = mem::size_of::<Value>() as u32;
+            let done = self.ops.new_dynamic_label();
+            let slow = self.ops.new_dynamic_label();
+            self.load_tag(0, array);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #array_tag
+                ; b.ne => slow
+            );
+            self.load_payload(12, index);
+            self.emit_reg_addr(11, array);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x9, [x11, #rc_offset]
+                ; ldr x10, [x9, #len_offset]
+                ; cmp x12, x10
+                ; b.hs >fail
+                ; ldr x10, [x9, #ptr_offset]
+                ; movz w13, #value_size
+                ; madd x10, x12, x13, x10
+                ; ldrb w9, [x10]
+                ; cmp w9, #scalar_max_tag
+                ; b.hi => slow
+            );
+            if !self.scalar_registers.contains_key(&value) {
+                // The value's own tag says whether a plain copy is enough.
+                self.load_tag_from_memory(13, value);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w13, #scalar_max_tag
+                    ; b.hi => slow
+                );
+            }
+            self.emit_reg_addr(11, value);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldp x0, x1, [x11]
+                ; stp x0, x1, [x10]
+                ; b => done
+                ; => slow
+            );
+            self.emit_reg_addr(0, array);
+            self.emit_reg_addr(1, index);
+            self.emit_reg_addr(2, value);
+            self.emit_call(jit_array_set_index_safe as *const ());
+            self.emit_fail_if_w0_zero();
+            dynasm!(self.ops ; .arch aarch64 ; => done);
+            return Ok(());
+        }
+
+        self.emit_reg_addr(0, array);
+        self.emit_reg_addr(1, index);
+        self.emit_reg_addr(2, value);
+        self.emit_call(jit_array_set_index_safe as *const ());
         self.emit_fail_if_w0_zero();
         Ok(())
     }
@@ -367,7 +463,8 @@ impl JitCompiler {
 
         if let (Some(index), Some(ty), Some(layout), false) = (
             field_index,
-            _value_type.filter(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool)),
+            _value_type
+                .filter(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool)),
             jit::layout::rc_vec_layout(),
             _is_weak,
         ) {
@@ -383,8 +480,8 @@ impl JitCompiler {
             .as_u8() as u32;
             let struct_tag = ValueTag::Struct.as_u8() as u32;
             let fields_offset = layout.struct_fields_offset as u32;
-            let len_offset = layout.len_offset as u32;
-            let ptr_offset = layout.ptr_offset as u32;
+            let len_offset = layout.struct_len_offset as u32;
+            let ptr_offset = layout.struct_ptr_offset as u32;
             let element = (index * mem::size_of::<Value>()) as i32;
             self.load_tag(0, object);
             dynasm!(self.ops
@@ -426,14 +523,16 @@ impl JitCompiler {
             return Ok(());
         }
 
-        if let (Some(index), Some(layout), false) = (field_index, jit::layout::rc_vec_layout(), _is_weak) {
+        if let (Some(index), Some(layout), false) =
+            (field_index, jit::layout::rc_vec_layout(), _is_weak)
+        {
             // Any strong field read inline: struct tag and field count are
             // checked (anything else fails to the interpreter), then the
             // element is cloned into the register without the runtime.
             let struct_tag = ValueTag::Struct.as_u8() as u32;
             let fields_offset = layout.struct_fields_offset as u32;
-            let len_offset = layout.len_offset as u32;
-            let ptr_offset = layout.ptr_offset as u32;
+            let len_offset = layout.struct_len_offset as u32;
+            let ptr_offset = layout.struct_ptr_offset as u32;
             let element = (index * mem::size_of::<Value>()) as i32;
             self.load_tag(0, object);
             dynasm!(self.ops
@@ -508,9 +607,12 @@ impl JitCompiler {
             .get(&value)
             .copied()
             .filter(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool));
-        if let (Some(index), Some(ty), Some(layout), false) =
-            (field_index, value_ty, jit::layout::rc_vec_layout(), _is_weak)
-        {
+        if let (Some(index), Some(ty), Some(layout), false) = (
+            field_index,
+            value_ty,
+            jit::layout::rc_vec_layout(),
+            _is_weak,
+        ) {
             // A scalar store inline when the field currently holds the same
             // scalar kind and the struct is not borrowed; any other
             // situation goes through the helper, which does the full
@@ -523,9 +625,9 @@ impl JitCompiler {
             .as_u8() as u32;
             let struct_tag = ValueTag::Struct.as_u8() as u32;
             let fields_offset = layout.struct_fields_offset as u32;
-            let len_offset = layout.len_offset as u32;
-            let ptr_offset = layout.ptr_offset as u32;
-            let borrow_offset = layout.borrow_offset as u32;
+            let len_offset = layout.struct_len_offset as u32;
+            let ptr_offset = layout.struct_ptr_offset as u32;
+            let borrow_offset = layout.struct_borrow_offset as u32;
             let element = (index * mem::size_of::<Value>()) as i32;
             let done = self.ops.new_dynamic_label();
             self.load_tag(0, object);
@@ -635,6 +737,12 @@ impl JitCompiler {
         Ok(())
     }
 
+    /// `array.push(array, value)` / `array:push(value)`. Inline when the
+    /// array has spare capacity, is not borrowed, and the value owns
+    /// nothing: the value's two words go after the last element and the
+    /// length grows. Growth (the memory budget is charged), a borrowed
+    /// array or an owning value go through the helper, which fails to the
+    /// interpreter for an error.
     pub(super) fn compile_array_push(&mut self, array: u8, value: u8) -> Result<()> {
         unsafe extern "C" {
             fn jit_array_push_safe(
@@ -644,13 +752,68 @@ impl JitCompiler {
             ) -> u8;
         }
 
-        // Guards have already verified the type, so directly call the helper
-        dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
-        self.emit_reg_addr(1, array);
-        self.emit_reg_addr(2, value);
-        self.emit_call(jit_array_push_safe as *const ());
-        self.emit_fail_if_w0_zero();
-
+        if let Some(layout) = jit::layout::rc_vec_layout() {
+            let array_tag = ValueTag::Array.as_u8() as u32;
+            let scalar_max_tag = ValueTag::Float.as_u8() as u32;
+            let rc_offset = layout.array_rc_offset as u32;
+            let borrow_offset = layout.borrow_offset as u32;
+            let len_offset = layout.len_offset as u32;
+            let cap_offset = layout.cap_offset as u32;
+            let ptr_offset = layout.ptr_offset as u32;
+            let value_size = mem::size_of::<Value>() as u32;
+            let done = self.ops.new_dynamic_label();
+            let slow = self.ops.new_dynamic_label();
+            self.load_tag(0, array);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #array_tag
+                ; b.ne => slow
+            );
+            self.emit_reg_addr(11, array);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x9, [x11, #rc_offset]
+                ; ldr x10, [x9, #borrow_offset]
+                ; cbnz x10, => slow
+                ; ldr x12, [x9, #len_offset]
+                ; ldr x10, [x9, #cap_offset]
+                ; cmp x12, x10
+                ; b.hs => slow
+            );
+            if !self.scalar_registers.contains_key(&value) {
+                self.load_tag_from_memory(13, value);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w13, #scalar_max_tag
+                    ; b.hi => slow
+                );
+            }
+            self.emit_reg_addr(11, value);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x10, [x9, #ptr_offset]
+                ; movz w13, #value_size
+                ; madd x10, x12, x13, x10
+                ; ldp x0, x1, [x11]
+                ; stp x0, x1, [x10]
+                ; add x12, x12, #1
+                ; str x12, [x9, #len_offset]
+                ; b => done
+                ; => slow
+            );
+            dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
+            self.emit_reg_addr(1, array);
+            self.emit_reg_addr(2, value);
+            self.emit_call(jit_array_push_safe as *const ());
+            self.emit_fail_if_w0_zero();
+            dynasm!(self.ops ; .arch aarch64 ; => done);
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
+            self.emit_reg_addr(1, array);
+            self.emit_reg_addr(2, value);
+            self.emit_call(jit_array_push_safe as *const ());
+            self.emit_fail_if_w0_zero();
+        }
         Ok(())
     }
 
@@ -780,9 +943,9 @@ impl JitCompiler {
         } else {
             usize::MAX
         };
-        self.emit_mov_imm64(11, jit::call_ip_cell() as u64);
+        let offset = jit::CALL_IP_OFFSET as u32;
         self.emit_mov_imm64(12, ip as u64);
-        dynasm!(self.ops ; .arch aarch64 ; str x12, [x11]);
+        dynasm!(self.ops ; .arch aarch64 ; str x12, [x20, #offset]);
     }
 
     fn emit_call_result_out(&mut self, x: u8, dest: u8) {
@@ -905,26 +1068,11 @@ impl JitCompiler {
         enum_name: &str,
         variant_name: &str,
     ) -> Result<()> {
-        unsafe extern "C" {
-            fn jit_new_enum_unit_safe(
-                vm_ptr: *mut crate::VM,
-                enum_name_ptr: *const u8,
-                enum_name_len: usize,
-                variant_name_ptr: *const u8,
-                variant_name_len: usize,
-                out: *mut Value,
-            ) -> u8;
-        }
-        let (enum_name_ptr, enum_name_len) = self.retain_string(enum_name);
-        let (variant_name_ptr, variant_name_len) = self.retain_string(variant_name);
-        dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
-        self.emit_mov_imm64(1, enum_name_ptr as usize as u64);
-        self.emit_mov_imm64(2, enum_name_len as u64);
-        self.emit_mov_imm64(3, variant_name_ptr as usize as u64);
-        self.emit_mov_imm64(4, variant_name_len as u64);
-        self.emit_reg_addr(5, dest);
-        self.emit_call(jit_new_enum_unit_safe as *const ());
-        self.emit_fail_if_w0_zero();
+        // One shared unit value per site: the store is a copy and a count
+        // bump.
+        let unit = self.retain_value(Value::enum_unit(enum_name, variant_name));
+        self.emit_mov_imm64(11, unit as usize as u64);
+        self.emit_clone_x11_into(dest);
         Ok(())
     }
 
@@ -966,13 +1114,16 @@ impl JitCompiler {
         Ok(())
     }
 
+    /// Returns whether the test was compiled inline (the enum's tag and
+    /// names compared), so a following branch knows what a true result
+    /// proves.
     pub(super) fn compile_is_enum_variant(
         &mut self,
         dest: u8,
         value: u8,
         enum_name: &str,
         variant_name: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         unsafe extern "C" {
             fn jit_is_enum_variant_safe(
                 value_ptr: *const Value,
@@ -989,6 +1140,7 @@ impl JitCompiler {
             let variant_ptr = self.retain_name(variant_name);
             let enum_ptr = (!enum_name.is_empty()).then(|| self.retain_name(enum_name));
             let tag = layout.tag as u32;
+            let object_offset = layout.object_offset as u32;
             let variant_offset = layout.variant_offset as u32;
             let enum_name_offset = layout.enum_name_offset as u32;
             self.load_tag(0, value);
@@ -997,6 +1149,7 @@ impl JitCompiler {
                 ; .arch aarch64
                 ; cmp w0, #tag
                 ; b.ne >no
+                ; ldr x11, [x11, #object_offset]
                 ; ldr x9, [x11, #variant_offset]
             );
             self.emit_mov_imm64(10, variant_ptr as u64);
@@ -1023,7 +1176,7 @@ impl JitCompiler {
                 ; done:
             );
             self.store_from_x0(dest, ValueTag::Bool.as_u8());
-            return Ok(());
+            return Ok(true);
         }
         let (enum_name_ptr, enum_name_len) = self.retain_string(enum_name);
         let (variant_name_ptr, variant_name_len) = self.retain_string(variant_name);
@@ -1035,7 +1188,7 @@ impl JitCompiler {
         self.emit_call(jit_is_enum_variant_safe as *const ());
         dynasm!(self.ops ; .arch aarch64 ; and x0, x0, 0xff);
         self.store_from_x0(dest, ValueTag::Bool.as_u8());
-        Ok(())
+        Ok(false)
     }
 
     pub(super) fn compile_type_is(&mut self, dest: u8, value: u8, type_name: &str) -> Result<()> {
@@ -1107,6 +1260,101 @@ impl JitCompiler {
         Ok(())
     }
 
+    /// `dest` = the bits of strong field `index` of the struct in `object`,
+    /// with no count taken and nothing released (see
+    /// `TraceOp::BorrowField`). The struct tag and field count are checked;
+    /// anything else fails to the interpreter, which re-executes the read.
+    pub(super) fn compile_borrow_field(
+        &mut self,
+        dest: u8,
+        object: u8,
+        index: usize,
+    ) -> Result<()> {
+        let Some(layout) = jit::layout::rc_vec_layout() else {
+            return Err(crate::LustError::RuntimeError {
+                message: "a borrow needs the measured struct layout".into(),
+            });
+        };
+        let struct_tag = ValueTag::Struct.as_u8() as u32;
+        let fields_offset = layout.struct_fields_offset as u32;
+        let len_offset = layout.struct_len_offset as u32;
+        let ptr_offset = layout.struct_ptr_offset as u32;
+        let element = (index * mem::size_of::<Value>()) as i32;
+        self.load_tag(0, object);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #struct_tag
+            ; b.ne >fail
+        );
+        self.emit_reg_addr(11, object);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x9, [x11, #fields_offset]
+            ; ldr x10, [x9, #len_offset]
+            ; cmp x10, #index as u32
+            ; b.ls >fail
+            ; ldr x11, [x9, #ptr_offset]
+        );
+        self.emit_add_imm(11, 11, element);
+        self.emit_reg_addr(9, dest);
+        self.emit_copy_x11_to_x9();
+        Ok(())
+    }
+
+    /// `dest` = the bits of payload value `index` of the enum in
+    /// `enum_reg`, a borrow of a borrow (see `TraceOp::BorrowEnumValue`).
+    pub(super) fn compile_borrow_enum_value(
+        &mut self,
+        dest: u8,
+        enum_reg: u8,
+        index: u8,
+    ) -> Result<()> {
+        let Some(layout) = jit::layout::enum_layout() else {
+            return Err(crate::LustError::RuntimeError {
+                message: "a borrow needs the measured enum layout".into(),
+            });
+        };
+        let tag = layout.tag as u32;
+        let object_offset = layout.object_offset as u32;
+        let len_offset = layout.values_len_offset as u32;
+        let ptr_offset = layout.values_ptr_offset as u32;
+        let unit_offset = layout.unit_word_offset as u32;
+        let element = (index as usize * mem::size_of::<Value>()) as i32;
+        // The enum test this read follows already proved the tag and the
+        // variant; only the payload length is left to check.
+        let verified = self.verified_enum_in == Some(enum_reg);
+        if !verified {
+            self.load_tag(0, enum_reg);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #tag
+                ; b.ne >fail
+            );
+        }
+        self.emit_reg_addr(11, enum_reg);
+        dynasm!(self.ops ; .arch aarch64 ; ldr x9, [x11, #object_offset]);
+        if !verified {
+            dynasm!(self.ops ; .arch aarch64 ; ldr x10, [x9, #unit_offset]);
+            self.emit_mov_imm64(12, layout.unit_word_value as u64);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp x10, x12
+                ; b.eq >fail
+            );
+        }
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x10, [x9, #len_offset]
+            ; cmp x10, #index as u32
+            ; b.ls >fail
+            ; ldr x11, [x9, #ptr_offset]
+        );
+        self.emit_add_imm(11, 11, element);
+        self.emit_reg_addr(9, dest);
+        self.emit_copy_x11_to_x9();
+        Ok(())
+    }
+
     pub(super) fn compile_get_enum_value(
         &mut self,
         dest: u8,
@@ -1122,9 +1370,10 @@ impl JitCompiler {
             // (anything else fails to the interpreter), the value cloned
             // into the register without the runtime.
             let tag = layout.tag as u32;
-            let values_offset = layout.values_offset as u32;
+            let object_offset = layout.object_offset as u32;
             let len_offset = layout.values_len_offset as u32;
             let ptr_offset = layout.values_ptr_offset as u32;
+            let unit_offset = layout.unit_word_offset as u32;
             let element = (index as usize * mem::size_of::<Value>()) as i32;
             self.load_tag(0, enum_reg);
             dynasm!(self.ops
@@ -1133,10 +1382,17 @@ impl JitCompiler {
                 ; b.ne >fail
             );
             self.emit_reg_addr(11, enum_reg);
+            // A unit variant (no payload) fails: its niche word says so.
             dynasm!(self.ops
                 ; .arch aarch64
-                ; ldr x9, [x11, #values_offset]
-                ; cbz x9, >fail
+                ; ldr x9, [x11, #object_offset]
+                ; ldr x10, [x9, #unit_offset]
+            );
+            self.emit_mov_imm64(12, layout.unit_word_value as u64);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp x10, x12
+                ; b.eq >fail
                 ; ldr x10, [x9, #len_offset]
                 ; cmp x10, #index as u32
                 ; b.ls >fail

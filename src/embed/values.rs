@@ -1,7 +1,8 @@
 use super::conversions::{FromLustValue, FunctionArgs, IntoTypedValue};
 use super::program::{EmbeddedProgram, ensure_return_type, normalize_global_name};
 use crate::ast::{Type, TypeKind};
-use crate::bytecode::{FieldStorage, LustMap, StructLayout, Value, ValueKey};
+use crate::bytecode::value::{EnumObject, StructObject};
+use crate::bytecode::{FieldStorage, LustMap, Value, ValueKey};
 use crate::number::{LustFloat, LustInt};
 use crate::typechecker::FunctionSignature;
 use crate::{LustError, Result};
@@ -106,7 +107,8 @@ impl StructInstance {
 
     pub fn borrow_field(&self, field: &str) -> Result<ValueRef<'_>> {
         match &self.value {
-            Value::Struct { layout, fields, .. } => {
+            Value::Struct(object) => {
+                let StructObject { layout, fields, .. } = object.as_ref();
                 let index = layout
                     .index_of_str(field)
                     .ok_or_else(|| LustError::RuntimeError {
@@ -159,7 +161,8 @@ impl StructInstance {
 
     pub fn set_field<V: IntoTypedValue>(&self, field: &str, value: V) -> Result<()> {
         match &self.value {
-            Value::Struct { layout, fields, .. } => {
+            Value::Struct(object) => {
+                let StructObject { layout, fields, .. } = object.as_ref();
                 let index = layout
                     .index_of_str(field)
                     .ok_or_else(|| LustError::RuntimeError {
@@ -206,7 +209,8 @@ impl StructInstance {
         V: IntoTypedValue,
     {
         match &self.value {
-            Value::Struct { layout, fields, .. } => {
+            Value::Struct(object) => {
+                let StructObject { layout, fields, .. } = object.as_ref();
                 let index = layout
                     .index_of_str(field)
                     .ok_or_else(|| LustError::RuntimeError {
@@ -314,7 +318,7 @@ impl FunctionHandle {
     fn function_index(&self) -> Option<usize> {
         match &self.value {
             Value::Function(idx) => Some(*idx),
-            Value::Closure { function_idx, .. } => Some(*function_idx),
+            Value::Closure(closure) => Some(closure.function_idx),
             _ => None,
         }
     }
@@ -399,17 +403,9 @@ impl StructHandle {
         Self { instance }
     }
 
-    fn from_parts(
-        name: &crate::bytecode::value::Name,
-        layout: &Rc<StructLayout>,
-        fields: &Rc<RefCell<Vec<Value>>>,
-    ) -> Self {
-        let value = Value::Struct {
-            name: name.clone(),
-            layout: layout.clone(),
-            fields: fields.clone(),
-        };
-        Self::from_instance(StructInstance::new(name.to_string(), value))
+    fn from_object(object: &Rc<crate::bytecode::StructObject>) -> Self {
+        let value = Value::Struct(Rc::clone(object));
+        Self::from_instance(StructInstance::new(object.name.to_string(), value))
     }
 
     pub fn from_value(value: Value) -> Result<Self> {
@@ -567,11 +563,7 @@ impl<'a> ValueRef<'a> {
 
     pub fn as_struct_handle(&self) -> Option<StructHandle> {
         match self.as_value() {
-            Value::Struct {
-                name,
-                layout,
-                fields,
-            } => Some(StructHandle::from_parts(name, layout, fields)),
+            Value::Struct(object) => Some(StructHandle::from_object(object)),
             Value::WeakStruct(weak) => weak
                 .upgrade()
                 .and_then(|value| StructHandle::from_value(value).ok()),
@@ -793,14 +785,15 @@ impl EnumInstance {
 
     pub fn payload_len(&self) -> usize {
         match &self.value {
-            Value::Enum { values, .. } => values.as_ref().map(|v| v.len()).unwrap_or(0),
+            Value::Enum(object) => object.values.as_ref().map(|v| v.len()).unwrap_or(0),
             _ => 0,
         }
     }
 
     pub fn payload<T: FromLustValue>(&self, index: usize) -> Result<T> {
         match &self.value {
-            Value::Enum { values, .. } => {
+            Value::Enum(object) => {
+                let EnumObject { values, .. } = object.as_ref();
                 let values = values.as_ref().ok_or_else(|| LustError::RuntimeError {
                     message: format!(
                         "Enum variant '{}.{}' carries no payload",
@@ -836,11 +829,11 @@ impl EnumInstance {
 
 pub(crate) fn matches_lust_struct(value: &Value, ty: &Type) -> bool {
     match (value, &ty.kind) {
-        (Value::Struct { name, .. }, TypeKind::Named(expected)) => {
-            lust_type_names_match(name, expected)
+        (Value::Struct(object), TypeKind::Named(expected)) => {
+            lust_type_names_match(&object.name, expected)
         }
-        (Value::Struct { name, .. }, TypeKind::GenericInstance { name: expected, .. }) => {
-            lust_type_names_match(name, expected)
+        (Value::Struct(object), TypeKind::GenericInstance { name: expected, .. }) => {
+            lust_type_names_match(&object.name, expected)
         }
 
         (value, TypeKind::Union(types)) => types.iter().any(|alt| matches_lust_struct(value, alt)),
@@ -851,11 +844,11 @@ pub(crate) fn matches_lust_struct(value: &Value, ty: &Type) -> bool {
 
 pub(crate) fn matches_lust_enum(value: &Value, ty: &Type) -> bool {
     match (value, &ty.kind) {
-        (Value::Enum { enum_name, .. }, TypeKind::Named(expected)) => {
-            lust_type_names_match(enum_name, expected)
+        (Value::Enum(object), TypeKind::Named(expected)) => {
+            lust_type_names_match(&object.enum_name, expected)
         }
-        (Value::Enum { enum_name, .. }, TypeKind::GenericInstance { name: expected, .. }) => {
-            lust_type_names_match(enum_name, expected)
+        (Value::Enum(object), TypeKind::GenericInstance { name: expected, .. }) => {
+            lust_type_names_match(&object.enum_name, expected)
         }
 
         (value, TypeKind::Union(types)) => types.iter().any(|alt| matches_lust_enum(value, alt)),
@@ -1661,7 +1654,7 @@ mod tests {
             .call_raw("main.make", Vec::new())
             .expect("call make");
         match point_value {
-            Value::Struct { name, .. } => assert_eq!(name, "math.Point"),
+            Value::Struct(object) => assert_eq!(object.name, "math.Point"),
             other => panic!("expected struct value, found {other:?}"),
         }
 

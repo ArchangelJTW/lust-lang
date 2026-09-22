@@ -130,14 +130,11 @@ impl From<Rc<String>> for ValueKey {
 
 /// Helper function to unwrap LuaValue enums for key comparison
 fn unwrap_lua_value_for_key(value: &Value) -> Value {
-    if let Value::Enum {
-        enum_name,
-        variant,
-        values,
-    } = value
-        && enum_name == "LuaValue"
+    if let Value::Enum(object) = value
+        && object.enum_name == "LuaValue"
     {
-        return match variant.as_str() {
+        let values = &object.values;
+        return match object.variant.as_str() {
             "Nil" => Value::Nil,
             "Bool" => values
                 .as_ref()
@@ -174,8 +171,8 @@ fn value_key_eq(left: &Value, right: &Value) -> bool {
     use Value::*;
 
     // Check if either side is a LuaValue enum and unwrap if needed
-    let is_lua_value_left = matches!(left, Enum { enum_name, .. } if enum_name == "LuaValue");
-    let is_lua_value_right = matches!(right, Enum { enum_name, .. } if enum_name == "LuaValue");
+    let is_lua_value_left = matches!(left, Enum(object) if object.enum_name == "LuaValue");
+    let is_lua_value_right = matches!(right, Enum(object) if object.enum_name == "LuaValue");
 
     // If either side is a LuaValue, unwrap both and compare
     if is_lua_value_left || is_lua_value_right {
@@ -199,32 +196,20 @@ fn value_key_eq(left: &Value, right: &Value) -> bool {
         (Array(a), Array(b)) => Rc::ptr_eq(a, b),
         (Tuple(a), Tuple(b)) => Rc::ptr_eq(a, b),
         (Map(a), Map(b)) => Rc::ptr_eq(a, b),
-        (Struct { fields: f1, .. }, Struct { fields: f2, .. }) => Rc::ptr_eq(f1, f2),
-        (WeakStruct(a), WeakStruct(b)) => Weak::ptr_eq(a.fields(), b.fields()),
-        (
-            Enum {
-                enum_name: n1,
-                variant: v1,
-                values: vals1,
-            },
-            Enum {
-                enum_name: n2,
-                variant: v2,
-                values: vals2,
-            },
-        ) => n1 == n2 && v1 == v2 && values_ptr_eq(vals1, vals2),
+        (Struct(a), Struct(b)) => Rc::ptr_eq(a, b),
+        (WeakStruct(a), WeakStruct(b)) => Weak::ptr_eq(a.inner(), b.inner()),
+        // Two enum values are the same value or two unit values of the
+        // same variant; a payload is identity, not contents.
+        (Enum(a), Enum(b)) => {
+            Rc::ptr_eq(a, b)
+                || (a.enum_name == b.enum_name
+                    && a.variant == b.variant
+                    && a.values.is_none()
+                    && b.values.is_none())
+        }
         (Function(a), Function(b)) => a == b,
         (NativeFunction(a), NativeFunction(b)) => Rc::ptr_eq(a, b),
-        (
-            Closure {
-                function_idx: f1,
-                upvalues: u1,
-            },
-            Closure {
-                function_idx: f2,
-                upvalues: u2,
-            },
-        ) => f1 == f2 && Rc::ptr_eq(u1, u2),
+        (Closure(a), Closure(b)) => Rc::ptr_eq(a, b),
         (Iterator(a), Iterator(b)) => Rc::ptr_eq(a, b),
         (Task(a), Task(b)) => a == b,
         _ => false,
@@ -235,7 +220,7 @@ fn hash_value_for_key<H: Hasher>(value: &Value, state: &mut H) {
     use Value::*;
 
     // Check if this is a LuaValue enum and unwrap it for consistent hashing
-    if matches!(value, Enum { enum_name, .. } if enum_name == "LuaValue") {
+    if matches!(value, Enum(object) if object.enum_name == "LuaValue") {
         let unwrapped = unwrap_lua_value_for_key(value);
         return hash_value_for_key(&unwrapped, state);
     }
@@ -276,25 +261,22 @@ fn hash_value_for_key<H: Hasher>(value: &Value, state: &mut H) {
             7u8.hash(state);
             (Rc::as_ptr(map) as usize).hash(state);
         }
-        Struct { fields, .. } => {
+        Struct(object) => {
             8u8.hash(state);
-            (Rc::as_ptr(fields) as usize).hash(state);
+            (Rc::as_ptr(object) as usize).hash(state);
         }
         WeakStruct(weak) => {
             9u8.hash(state);
-            (weak.fields_ptr() as usize).hash(state);
+            (weak.object_ptr() as usize).hash(state);
         }
-        Enum {
-            enum_name,
-            variant,
-            values,
-        } => {
+        Enum(object) => {
             10u8.hash(state);
-            enum_name.hash(state);
-            variant.hash(state);
-            values
+            object.enum_name.hash(state);
+            object.variant.hash(state);
+            object
+                .values
                 .as_ref()
-                .map(|rc| Rc::as_ptr(rc) as usize)
+                .map(|_| Rc::as_ptr(object) as usize)
                 .hash(state);
         }
         Function(idx) => {
@@ -305,13 +287,9 @@ fn hash_value_for_key<H: Hasher>(value: &Value, state: &mut H) {
             12u8.hash(state);
             (Rc::as_ptr(func) as *const () as usize).hash(state);
         }
-        Closure {
-            function_idx,
-            upvalues,
-        } => {
+        Closure(closure) => {
             13u8.hash(state);
-            function_idx.hash(state);
-            (Rc::as_ptr(upvalues) as usize).hash(state);
+            (Rc::as_ptr(closure) as usize).hash(state);
         }
         Iterator(iter) => {
             14u8.hash(state);
@@ -321,14 +299,6 @@ fn hash_value_for_key<H: Hasher>(value: &Value, state: &mut H) {
             15u8.hash(state);
             handle.hash(state);
         }
-    }
-}
-
-fn values_ptr_eq(left: &Option<Rc<Vec<Value>>>, right: &Option<Rc<Vec<Value>>>) -> bool {
-    match (left, right) {
-        (Some(a), Some(b)) => Rc::ptr_eq(a, b),
-        (None, None) => true,
-        _ => false,
     }
 }
 
@@ -481,11 +451,9 @@ impl StructLayout {
     fn canonicalize_weak_field(&self, index: usize, value: Value) -> Result<Value, String> {
         let field_name = self.field_names[index].as_str();
         match value {
-            Value::Enum {
-                enum_name,
-                variant,
-                values,
-            } if enum_name == "Option" => {
+            Value::Enum(object) if object.enum_name == "Option" => {
+                let variant = &object.variant;
+                let values = &object.values;
                 if variant == "Some" {
                     if let Some(inner_values) = values {
                         if let Some(inner) = inner_values.first() {
@@ -517,11 +485,9 @@ impl StructLayout {
 
     fn materialize_weak_field(&self, value: Value) -> Value {
         match value {
-            Value::Enum {
-                enum_name,
-                variant,
-                values,
-            } if enum_name == "Option" => {
+            Value::Enum(object) if object.enum_name == "Option" => {
+                let variant = &object.variant;
+                let values = &object.values;
                 if variant == "Some" {
                     if let Some(inner_values) = values {
                         if let Some(inner) = inner_values.first() {
@@ -554,11 +520,7 @@ impl StructLayout {
 
     fn to_weak_struct(&self, field_name: &str, value: Value) -> Result<Value, String> {
         match value {
-            Value::Struct {
-                name,
-                layout,
-                fields,
-            } => Ok(Value::WeakStruct(WeakStructRef::new(name, layout, &fields))),
+            Value::Struct(object) => Ok(Value::WeakStruct(WeakStructRef::new(&object))),
             Value::WeakStruct(_) => Ok(value),
             other => {
                 let ty = other.type_of();
@@ -579,8 +541,16 @@ impl StructLayout {
 /// with the same text are the same allocation, so equality is a pointer
 /// comparison, and generated code compares a value's variant against a
 /// constant the same way.
-#[derive(Clone, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Eq, PartialOrd, Ord)]
 pub struct Name(Rc<str>);
+
+// Equal names (the same allocation, or the same text without `std`) hash
+// the same: the hash is the text's.
+impl Hash for Name {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
 
 #[cfg(feature = "std")]
 thread_local! {
@@ -711,9 +681,11 @@ impl From<Name> for String {
     }
 }
 
-// The JIT copies values 16 bytes at a time and lays registers out at
-// `size_of::<Value>()` strides; both need the size to stay a multiple of 16.
-const _: () = assert!(core::mem::size_of::<Value>() % 16 == 0);
+// Every heap variant is one thin `Rc`, so a `Value` is a tag and an 8-byte
+// payload: the JIT lays registers out at that stride and copies values as
+// one 16-byte pair, and everything that holds nothing owned is a scalar,
+// a function index or a task handle.
+const _: () = assert!(core::mem::size_of::<Value>() == 16);
 
 #[repr(C, u8)]
 #[derive(Clone)]
@@ -726,65 +698,131 @@ pub enum Value {
     Array(Rc<RefCell<Vec<Value>>>),
     Tuple(Rc<Vec<Value>>),
     Map(Rc<RefCell<LustMap>>),
-    Struct {
-        name: Name,
-        layout: Rc<StructLayout>,
-        fields: Rc<RefCell<Vec<Value>>>,
-    },
+    Struct(Rc<StructObject>),
     WeakStruct(WeakStructRef),
-    Enum {
-        enum_name: Name,
-        variant: Name,
-        values: Option<Rc<Vec<Value>>>,
-    },
+    Enum(Rc<EnumObject>),
     Function(usize),
-    NativeFunction(NativeFn),
-    Closure {
-        function_idx: usize,
-        upvalues: Rc<Vec<Upvalue>>,
-    },
+    NativeFunction(Rc<NativeFn>),
+    Closure(Rc<ClosureObject>),
     Iterator(Rc<RefCell<IteratorState>>),
     Task(TaskHandle),
 }
 
-#[derive(Debug, Clone)]
-pub struct WeakStructRef {
-    name: Name,
-    layout: Rc<StructLayout>,
-    fields: Weak<RefCell<Vec<Value>>>,
+/// A struct value: its name, its layout and its fields, in one allocation
+/// that every clone of the value shares.
+#[repr(C)]
+pub struct StructObject {
+    pub name: Name,
+    pub layout: Rc<StructLayout>,
+    pub fields: RefCell<Vec<Value>>,
 }
 
-impl WeakStructRef {
-    pub fn new(
-        name: impl Into<Name>,
-        layout: Rc<StructLayout>,
-        fields: &Rc<RefCell<Vec<Value>>>,
-    ) -> Self {
-        Self {
+impl StructObject {
+    pub fn new(name: impl Into<Name>, layout: Rc<StructLayout>, fields: Vec<Value>) -> Rc<Self> {
+        Rc::new(Self {
             name: name.into(),
             layout,
-            fields: Rc::downgrade(fields),
-        }
+            fields: RefCell::new(fields),
+        })
+    }
+}
+
+impl fmt::Debug for StructObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Struct {{ name: {:?}, fields: {:?} }}",
+            self.name.as_str(),
+            self.fields.borrow()
+        )
+    }
+}
+
+/// An enum value: the enum's name, the variant's, and the variant's payload
+/// (`None` for a unit variant).
+#[repr(C)]
+pub struct EnumObject {
+    pub enum_name: Name,
+    pub variant: Name,
+    pub values: Option<Vec<Value>>,
+}
+
+impl EnumObject {
+    pub fn new(
+        enum_name: impl Into<Name>,
+        variant: impl Into<Name>,
+        values: Option<Vec<Value>>,
+    ) -> Rc<Self> {
+        Rc::new(Self {
+            enum_name: enum_name.into(),
+            variant: variant.into(),
+            values,
+        })
+    }
+}
+
+impl fmt::Debug for EnumObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Enum {{ enum: {:?}, variant: {:?}, values: {:?} }}",
+            self.enum_name.as_str(),
+            self.variant.as_str(),
+            self.values
+        )
+    }
+}
+
+/// A closure: the function and the upvalues it captured.
+#[repr(C)]
+pub struct ClosureObject {
+    pub function_idx: usize,
+    pub upvalues: Vec<Upvalue>,
+}
+
+impl fmt::Debug for ClosureObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Closure {{ function: {}, upvalues: {:?} }}",
+            self.function_idx, self.upvalues
+        )
+    }
+}
+
+/// Wrap a native function for a `Value::NativeFunction`.
+pub fn native_fn<F>(f: F) -> Rc<NativeFn>
+where
+    F: Fn(&[Value]) -> Result<NativeCallResult, String> + 'static,
+{
+    Rc::new(Rc::new(f))
+}
+
+/// A weak reference to a struct value (a `weak` field): upgrades to the
+/// struct while some strong reference keeps it alive.
+#[derive(Debug, Clone)]
+pub struct WeakStructRef(Weak<StructObject>);
+
+impl WeakStructRef {
+    pub fn new(object: &Rc<StructObject>) -> Self {
+        Self(Rc::downgrade(object))
     }
 
     pub fn upgrade(&self) -> Option<Value> {
-        self.fields.upgrade().map(|fields| Value::Struct {
-            name: self.name.clone(),
-            layout: self.layout.clone(),
-            fields,
-        })
+        self.0.upgrade().map(Value::Struct)
     }
 
-    pub fn struct_name(&self) -> &str {
-        &self.name
+    /// The struct's name, while it is alive.
+    pub fn struct_name(&self) -> Option<Name> {
+        self.0.upgrade().map(|object| object.name.clone())
     }
 
-    pub(crate) fn fields(&self) -> &Weak<RefCell<Vec<Value>>> {
-        &self.fields
+    pub(crate) fn inner(&self) -> &Weak<StructObject> {
+        &self.0
     }
 
-    pub(crate) fn fields_ptr(&self) -> *const RefCell<Vec<Value>> {
-        self.fields.as_ptr()
+    pub(crate) fn object_ptr(&self) -> *const StructObject {
+        self.0.as_ptr()
     }
 }
 
@@ -877,10 +915,10 @@ impl Value {
             Value::Tuple(_) => ValueTag::Tuple,
             Value::Map(_) => ValueTag::Map,
             Value::Struct { .. } | Value::WeakStruct(_) => ValueTag::Struct,
-            Value::Enum { .. } => ValueTag::Enum,
+            Value::Enum(_) => ValueTag::Enum,
             Value::Function(_) => ValueTag::Function,
             Value::NativeFunction(_) => ValueTag::NativeFunction,
-            Value::Closure { .. } => ValueTag::Closure,
+            Value::Closure(_) => ValueTag::Closure,
             Value::Iterator(_) => ValueTag::Iterator,
             Value::Task(_) => ValueTag::Task,
         }
@@ -897,10 +935,10 @@ impl Value {
             Value::Tuple(_) => ValueType::Tuple,
             Value::Map(_) => ValueType::Map,
             Value::Struct { .. } | Value::WeakStruct(_) => ValueType::Struct,
-            Value::Enum { .. } => ValueType::Enum,
+            Value::Enum(_) => ValueType::Enum,
             Value::Function(_) => ValueType::Function,
             Value::NativeFunction(_) => ValueType::NativeFunction,
-            Value::Closure { .. } => ValueType::Closure,
+            Value::Closure(_) => ValueType::Closure,
             Value::Iterator(_) => ValueType::Iterator,
             Value::Task(_) => ValueType::Task,
         }
@@ -938,9 +976,9 @@ impl Value {
         match self {
             Value::Nil => false,
             Value::Bool(false) => false,
-            Value::Enum {
-                enum_name, variant, ..
-            } if enum_name == "Option" && variant == "None" => false,
+            Value::Enum(object) if object.enum_name == "Option" && object.variant == "None" => {
+                false
+            }
             _ => true,
         }
     }
@@ -1107,21 +1145,24 @@ impl Value {
 
     pub fn struct_get_field_rc(&self, field: &Rc<String>) -> Option<Value> {
         match self {
-            Value::Struct { layout, fields, .. } => layout
+            Value::Struct(object) => object
+                .layout
                 .index_of_rc(field)
-                .or_else(|| layout.index_of_str(field.as_str()))
+                .or_else(|| object.layout.index_of_str(field.as_str()))
                 .or_else(|| {
-                    layout
+                    object
+                        .layout
                         .field_names()
                         .iter()
                         .position(|name| name.as_str() == field.as_str())
                 })
                 .and_then(|idx| {
-                    fields
+                    object
+                        .fields
                         .borrow()
                         .get(idx)
                         .cloned()
-                        .map(|value| layout.materialize_field_value(idx, value))
+                        .map(|value| object.layout.materialize_field_value(idx, value))
                 }),
             _ => None,
         }
@@ -1129,12 +1170,13 @@ impl Value {
 
     pub fn struct_get_field(&self, field: &str) -> Option<Value> {
         match self {
-            Value::Struct { layout, fields, .. } => layout.index_of_str(field).and_then(|idx| {
-                fields
+            Value::Struct(object) => object.layout.index_of_str(field).and_then(|idx| {
+                object
+                    .fields
                     .borrow()
                     .get(idx)
                     .cloned()
-                    .map(|value| layout.materialize_field_value(idx, value))
+                    .map(|value| object.layout.materialize_field_value(idx, value))
             }),
             _ => None,
         }
@@ -1142,18 +1184,20 @@ impl Value {
 
     pub fn struct_get_field_indexed(&self, index: usize) -> Option<Value> {
         match self {
-            Value::Struct { layout, fields, .. } => fields
+            Value::Struct(object) => object
+                .fields
                 .borrow()
                 .get(index)
                 .cloned()
-                .map(|value| layout.materialize_field_value(index, value)),
+                .map(|value| object.layout.materialize_field_value(index, value)),
             _ => None,
         }
     }
 
     pub fn struct_set_field_rc(&self, field: &Rc<String>, value: Value) -> Result<(), String> {
         match self {
-            Value::Struct { layout, .. } => {
+            Value::Struct(object) => {
+                let layout = &object.layout;
                 if let Some(index) = layout
                     .index_of_rc(field)
                     .or_else(|| layout.index_of_str(field.as_str()))
@@ -1174,7 +1218,8 @@ impl Value {
 
     pub fn struct_set_field(&self, field: &str, value: Value) -> Result<(), String> {
         match self {
-            Value::Struct { layout, .. } => {
+            Value::Struct(object) => {
+                let layout = &object.layout;
                 if let Some(index) = layout.index_of_str(field) {
                     self.struct_set_field_indexed(index, value)
                 } else {
@@ -1192,20 +1237,16 @@ impl Value {
 
     pub fn struct_set_field_indexed(&self, index: usize, value: Value) -> Result<(), String> {
         match self {
-            Value::Struct {
-                name,
-                layout,
-                fields,
-            } => {
-                let mut borrowed = fields.borrow_mut();
+            Value::Struct(object) => {
+                let mut borrowed = object.fields.borrow_mut();
                 if index < borrowed.len() {
-                    let canonical = layout.canonicalize_field_value(index, value)?;
+                    let canonical = object.layout.canonicalize_field_value(index, value)?;
                     borrowed[index] = canonical;
                     Ok(())
                 } else {
                     Err(format!(
                         "Struct '{}' field index {} out of bounds (len {})",
-                        name,
+                        object.name,
                         index,
                         borrowed.len()
                     ))
@@ -1217,11 +1258,7 @@ impl Value {
     }
 
     pub fn enum_unit(enum_name: impl Into<Name>, variant: impl Into<Name>) -> Self {
-        Value::Enum {
-            enum_name: enum_name.into(),
-            variant: variant.into(),
-            values: None,
-        }
+        Value::Enum(EnumObject::new(enum_name, variant, None))
     }
 
     pub fn enum_variant(
@@ -1229,23 +1266,15 @@ impl Value {
         variant: impl Into<Name>,
         values: Vec<Value>,
     ) -> Self {
-        Value::Enum {
-            enum_name: enum_name.into(),
-            variant: variant.into(),
-            values: Some(Rc::new(values)),
-        }
+        Value::Enum(EnumObject::new(enum_name, variant, Some(values)))
     }
 
     pub fn as_enum(&self) -> Option<(&str, &str, Option<&[Value]>)> {
         match self {
-            Value::Enum {
-                enum_name,
-                variant,
-                values,
-            } => Some((
-                enum_name.as_str(),
-                variant.as_str(),
-                values.as_ref().map(|v| v.as_slice()),
+            Value::Enum(object) => Some((
+                object.enum_name.as_str(),
+                object.variant.as_str(),
+                object.values.as_deref(),
             )),
             _ => None,
         }
@@ -1253,11 +1282,9 @@ impl Value {
 
     pub fn is_enum_variant(&self, enum_name: &str, variant: &str) -> bool {
         match self {
-            Value::Enum {
-                enum_name: en,
-                variant: v,
-                ..
-            } => (enum_name.is_empty() || en == enum_name) && v == variant,
+            Value::Enum(object) => {
+                (enum_name.is_empty() || object.enum_name == enum_name) && object.variant == variant
+            }
             _ => false,
         }
     }
@@ -1295,11 +1322,12 @@ impl fmt::Debug for Value {
             Value::Array(arr) => write!(f, "Array({:?})", arr.borrow()),
             Value::Tuple(values) => write!(f, "Tuple({:?})", values),
             Value::Map(map) => write!(f, "Map({:?})", map.borrow()),
-            Value::Struct {
-                name,
-                layout,
-                fields,
-            } => {
+            Value::Struct(object) => {
+                let StructObject {
+                    name,
+                    layout,
+                    fields,
+                } = object.as_ref();
                 let borrowed = fields.borrow();
                 let mut display_fields = Vec::with_capacity(borrowed.len());
                 for (idx, field_name) in layout.field_names().iter().enumerate() {
@@ -1322,11 +1350,12 @@ impl fmt::Debug for Value {
                 }
             }
 
-            Value::Enum {
-                enum_name,
-                variant,
-                values,
-            } => {
+            Value::Enum(object) => {
+                let EnumObject {
+                    enum_name,
+                    variant,
+                    values,
+                } = object.as_ref();
                 write!(
                     f,
                     "Enum {{ enum: {:?}, variant: {:?}, values: {:?} }}",
@@ -1336,10 +1365,11 @@ impl fmt::Debug for Value {
 
             Value::Function(idx) => write!(f, "Function({})", idx),
             Value::NativeFunction(_) => write!(f, "NativeFunction(<fn>)"),
-            Value::Closure {
-                function_idx,
-                upvalues,
-            } => {
+            Value::Closure(closure) => {
+                let ClosureObject {
+                    function_idx,
+                    upvalues,
+                } = closure.as_ref();
                 write!(
                     f,
                     "Closure {{ function: {}, upvalues: {:?} }}",
@@ -1402,11 +1432,12 @@ impl fmt::Display for Value {
                 write!(f, "}}")
             }
 
-            Value::Struct {
-                name,
-                layout,
-                fields,
-            } => {
+            Value::Struct(object) => {
+                let StructObject {
+                    name,
+                    layout,
+                    fields,
+                } = object.as_ref();
                 let borrowed = fields.borrow();
                 write!(f, "{} {{", name)?;
                 for (i, field_name) in layout.field_names().iter().enumerate() {
@@ -1429,11 +1460,12 @@ impl fmt::Display for Value {
                 }
             }
 
-            Value::Enum {
-                enum_name,
-                variant,
-                values,
-            } => {
+            Value::Enum(object) => {
+                let EnumObject {
+                    enum_name,
+                    variant,
+                    values,
+                } = object.as_ref();
                 write!(f, "{}.{}", enum_name, variant)?;
                 if let Some(vals) = values {
                     write!(f, "(")?;
@@ -1453,7 +1485,7 @@ impl fmt::Display for Value {
 
             Value::Function(idx) => write!(f, "<function@{}>", idx),
             Value::NativeFunction(_) => write!(f, "<native function>"),
-            Value::Closure { function_idx, .. } => write!(f, "<closure@{}>", function_idx),
+            Value::Closure(closure) => write!(f, "<closure@{}>", closure.function_idx),
             Value::Iterator(_) => write!(f, "<iterator>"),
             Value::Task(handle) => write!(f, "<task {}>", handle.0),
         }
@@ -1471,18 +1503,9 @@ impl PartialEq for Value {
             (Value::Array(a), Value::Array(b)) => *a.borrow() == *b.borrow(),
             (Value::Tuple(a), Value::Tuple(b)) => *a == *b,
             (Value::Map(a), Value::Map(b)) => *a.borrow() == *b.borrow(),
-            (
-                Value::Struct {
-                    name: n1,
-                    layout: l1,
-                    fields: f1,
-                },
-                Value::Struct {
-                    name: n2,
-                    layout: l2,
-                    fields: f2,
-                },
-            ) => {
+            (Value::Struct(a), Value::Struct(b)) => {
+                let (n1, l1, f1) = (&a.name, &a.layout, &a.fields);
+                let (n2, l2, f2) = (&b.name, &b.layout, &b.fields);
                 if n1 != n2 {
                     return false;
                 }
@@ -1529,29 +1552,11 @@ impl PartialEq for Value {
                 .upgrade()
                 .map(|upgraded| *value == upgraded)
                 .unwrap_or(matches!(value, Value::Nil)),
-            (
-                Value::Enum {
-                    enum_name: e1,
-                    variant: v1,
-                    values: vals1,
-                },
-                Value::Enum {
-                    enum_name: e2,
-                    variant: v2,
-                    values: vals2,
-                },
-            ) => e1 == e2 && v1 == v2 && vals1 == vals2,
+            (Value::Enum(a), Value::Enum(b)) => {
+                a.enum_name == b.enum_name && a.variant == b.variant && a.values == b.values
+            }
             (Value::Function(a), Value::Function(b)) => a == b,
-            (
-                Value::Closure {
-                    function_idx: f1,
-                    upvalues: u1,
-                },
-                Value::Closure {
-                    function_idx: f2,
-                    upvalues: u2,
-                },
-            ) => f1 == f2 && Rc::ptr_eq(u1, u2),
+            (Value::Closure(a), Value::Closure(b)) => Rc::ptr_eq(a, b),
             (Value::Iterator(_), Value::Iterator(_)) => false,
             (Value::Task(a), Value::Task(b)) => a == b,
             _ => false,
@@ -1817,6 +1822,44 @@ pub unsafe extern "C" fn jit_array_index_ok_safe(
     }
 }
 
+/// `array[index] = value` for an `Array` and an in-range int index: the
+/// element becomes a clone of the value. Returns 0 without touching
+/// anything for any other case (the interpreter then raises the error).
+///
+/// # Safety
+/// The pointers are null or point to live values.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_array_set_index_safe(
+    array_value_ptr: *const Value,
+    index_value_ptr: *const Value,
+    value_ptr: *const Value,
+) -> u8 {
+    unsafe {
+        if array_value_ptr.is_null() || index_value_ptr.is_null() || value_ptr.is_null() {
+            return 0;
+        }
+        let Value::Array(array) = &*array_value_ptr else {
+            return 0;
+        };
+        let Some(index) = (&*index_value_ptr).as_int() else {
+            return 0;
+        };
+        let Ok(mut borrowed) = array.try_borrow_mut() else {
+            return 0;
+        };
+        if index < 0 || index as usize >= borrowed.len() {
+            return 0;
+        }
+        // The value is cloned before the old element is dropped: `a[i] = a`
+        // must not drop the array's only owner first, and the element may
+        // be the value itself.
+        let value = (*value_ptr).clone();
+        borrowed[index as usize] = value;
+        1
+    }
+}
+
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_array_len_safe(array_value_ptr: *const Value) -> i64 {
@@ -1906,9 +1949,11 @@ pub unsafe extern "C" fn jit_array_push_safe(
 
         match array_value {
             Value::Array(arr) => {
-                // Use unchecked borrow for maximum performance
-                let cell_ptr = arr.as_ptr();
-                let vec_ref = &mut *cell_ptr;
+                // A borrowed array (an iteration in progress, say) is left
+                // to the interpreter, which reports it as the native would.
+                let Ok(mut vec_ref) = arr.try_borrow_mut() else {
+                    return 0;
+                };
                 if !vm_ptr.is_null() {
                     let vm = &mut *vm_ptr;
                     let len = vec_ref.len();
@@ -2116,7 +2161,8 @@ pub unsafe extern "C" fn jit_enum_is_some_safe(enum_ptr: *const Value, out_ptr: 
 
         let enum_value = &*enum_ptr;
         match enum_value {
-            Value::Enum { variant, .. } => {
+            Value::Enum(object) => {
+                let EnumObject { variant, .. } = object.as_ref();
                 let is_some = variant == "Some";
                 replace_value(out_ptr, Value::Bool(is_some));
                 1
@@ -2140,23 +2186,21 @@ pub unsafe extern "C" fn jit_enum_unwrap_safe(
 
         let enum_value = &*enum_ptr;
         match enum_value {
-            Value::Enum {
-                enum_name,
-                variant,
-                values: Some(vals),
-            } if vals.len() == 1
-                && ((enum_name == "Option" && variant == "Some")
-                    || (enum_name == "Result" && variant == "Ok")) =>
+            Value::Enum(object)
+                if object.values.as_ref().is_some_and(|vals| vals.len() == 1)
+                    && ((object.enum_name == "Option" && object.variant == "Some")
+                        || (object.enum_name == "Result" && object.variant == "Ok")) =>
             {
-                let value = vals[0].clone();
+                let value = object.values.as_ref().expect("checked")[0].clone();
                 replace_value(out_ptr, value);
                 1
             }
-            Value::Enum {
-                enum_name,
-                variant,
-                values,
-            } => {
+            Value::Enum(object) => {
+                let EnumObject {
+                    enum_name,
+                    variant,
+                    values,
+                } = object.as_ref();
                 let detail = values
                     .as_ref()
                     .and_then(|values| values.first())
@@ -2193,7 +2237,8 @@ pub unsafe extern "C" fn jit_set_field_strong_safe(
         let value = (&*value_ptr).clone();
 
         match object {
-            Value::Struct { fields, .. } => {
+            Value::Struct(object) => {
+                let StructObject { fields, .. } = object.as_ref();
                 // Skip canonicalization for strong fields - just set directly
                 match fields.try_borrow_mut() {
                     Ok(mut borrowed) => {
@@ -2303,13 +2348,16 @@ pub unsafe extern "C" fn jit_guard_native_function(
 
 /// Does the value hold a struct whose layout is `expected`?
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn jit_guard_struct_layout(value_ptr: *const Value, expected: *const ()) -> u8 {
+pub unsafe extern "C" fn jit_guard_struct_layout(
+    value_ptr: *const Value,
+    expected: *const (),
+) -> u8 {
     unsafe {
         if value_ptr.is_null() {
             return 0;
         }
         match &*value_ptr {
-            Value::Struct { layout, .. } => u8::from(Rc::as_ptr(layout) as *const () == expected),
+            Value::Struct(object) => u8::from(Rc::as_ptr(&object.layout) as *const () == expected),
             _ => 0,
         }
     }
@@ -2345,13 +2393,8 @@ pub unsafe extern "C" fn jit_guard_function_identity(
                 }
             }
 
-            (
-                1,
-                Value::Closure {
-                    function_idx,
-                    upvalues,
-                },
-            ) => {
+            (1, Value::Closure(closure)) => {
+                let function_idx = &closure.function_idx;
                 if *function_idx != expected_function_idx {
                     jit::log(|| {
                         format!(
@@ -2362,7 +2405,8 @@ pub unsafe extern "C" fn jit_guard_function_identity(
                     return 0;
                 }
 
-                let actual_ptr = Rc::as_ptr(upvalues) as *const ();
+                // The closure's identity: the object every clone shares.
+                let actual_ptr = Rc::as_ptr(closure) as *const ();
                 if actual_ptr == expected_upvalues {
                     1
                 } else {
@@ -2376,7 +2420,8 @@ pub unsafe extern "C" fn jit_guard_function_identity(
                 }
             }
 
-            (0, Value::Closure { function_idx, .. }) => {
+            (0, Value::Closure(closure)) => {
+                let function_idx = closure.function_idx;
                 jit::log(|| {
                     format!(
                         "jit_guard_function_identity: expected function, saw closure (reg {}, idx {})",
@@ -2466,7 +2511,7 @@ pub unsafe extern "C" fn jit_call_native_safe(
         }
 
         // The caller's frame shows the call's line if the native fails.
-        if let Some(ip) = jit::take_call_ip()
+        if let Some(ip) = (&mut *vm_ptr).take_call_ip()
             && let Some(frame) = (&mut *vm_ptr).call_stack.last_mut()
         {
             frame.ip = ip + 1;
@@ -2589,7 +2634,7 @@ pub unsafe extern "C" fn jit_call_function_safe(
 
         let vm = &mut *vm_ptr;
         // The caller's frame shows the call's line in a stack trace.
-        if let Some(ip) = jit::take_call_ip()
+        if let Some(ip) = vm.take_call_ip()
             && let Some(frame) = vm.call_stack.last_mut()
         {
             frame.ip = ip + 1;
@@ -2693,17 +2738,11 @@ pub unsafe extern "C" fn jit_new_enum_unit_safe(
             Err(_) => return 0,
         };
 
-        if !vm_ptr.is_null() {
-            let vm = &mut *vm_ptr;
-            let bytes = enum_name_len.saturating_add(variant_name_len);
-            if !vm.try_charge_memory_bytes(bytes) {
-                return 0;
-            }
-        }
-
-        let enum_name = enum_name_str.to_string();
-        let variant_name = variant_name_str.to_string();
-        let value = Value::enum_unit(enum_name, variant_name);
+        let value = if vm_ptr.is_null() {
+            Value::enum_unit(enum_name_str, variant_name_str)
+        } else {
+            (*vm_ptr).unit_enum(enum_name_str, variant_name_str)
+        };
         replace_value(out, value);
         1
     }
@@ -2956,9 +2995,9 @@ fn call_builtin_method_simple(
     args: Vec<Value>,
 ) -> Result<Value, String> {
     match object {
-        Value::Struct { name, .. } => Err(format!(
+        Value::Struct(object) => Err(format!(
             "User-defined methods on {} require deoptimization",
-            name
+            object.name
         )),
         Value::Iterator(state_rc) => match method_name {
             "next" => {
@@ -2991,74 +3030,90 @@ fn call_builtin_method_simple(
                 method_name
             )),
         },
-        Value::Enum {
-            enum_name,
-            variant,
-            values,
-        } if enum_name == "Option" => match method_name {
-            "is_some" => Ok(Value::Bool(variant == "Some")),
-            "is_none" => Ok(Value::Bool(variant == "None")),
-            "unwrap" => {
-                if variant == "Some" {
-                    if let Some(vals) = values {
-                        if vals.len() == 1 {
-                            Ok(vals[0].clone())
-                        } else {
-                            Err("Option::Some should have exactly 1 value".to_string())
-                        }
-                    } else {
-                        Err("Option::Some should have a value".to_string())
-                    }
-                } else {
-                    Err("Called unwrap() on Option::None".to_string())
-                }
-            }
-
-            _ => Err(format!(
-                "Option method '{}' not supported in JIT",
-                method_name
-            )),
-        },
-        Value::Enum {
-            enum_name,
-            variant,
-            values,
-        } if enum_name == "Result" => match method_name {
-            "is_ok" => Ok(Value::Bool(variant == "Ok")),
-            "is_err" => Ok(Value::Bool(variant == "Err")),
-            "unwrap" => {
-                if variant == "Ok" {
-                    values
-                        .as_ref()
-                        .and_then(|values| values.first())
-                        .cloned()
-                        .ok_or_else(|| "Result::Ok should have exactly 1 value".to_string())
-                } else {
-                    Err("Called unwrap() on Result::Err".to_string())
-                }
-            }
-            "unwrap_or" => {
-                let default = args
-                    .first()
-                    .cloned()
-                    .ok_or_else(|| "Result:unwrap_or requires a default value".to_string())?;
-                if variant == "Ok" {
-                    Ok(values
-                        .as_ref()
-                        .and_then(|values| values.first())
-                        .cloned()
-                        .unwrap_or(default))
-                } else {
-                    Ok(default)
-                }
-            }
-            _ => Err(format!(
-                "Result method '{}' not supported in JIT",
-                method_name
-            )),
-        },
+        Value::Enum(object) if object.enum_name == "Option" => {
+            match_option_method(object, method_name, args)
+        }
+        Value::Enum(object) if object.enum_name == "Result" => {
+            match_result_method(object, method_name, args)
+        }
         _ => Err(format!(
             "Method '{}' not supported in JIT (deoptimizing)",
+            method_name
+        )),
+    }
+}
+
+fn match_option_method(
+    object: &EnumObject,
+    method_name: &str,
+    _args: Vec<Value>,
+) -> Result<Value, String> {
+    let variant = &object.variant;
+    let values = &object.values;
+    match method_name {
+        "is_some" => Ok(Value::Bool(variant == "Some")),
+        "is_none" => Ok(Value::Bool(variant == "None")),
+        "unwrap" => {
+            if variant == "Some" {
+                if let Some(vals) = values {
+                    if vals.len() == 1 {
+                        Ok(vals[0].clone())
+                    } else {
+                        Err("Option::Some should have exactly 1 value".to_string())
+                    }
+                } else {
+                    Err("Option::Some should have a value".to_string())
+                }
+            } else {
+                Err("Called unwrap() on Option::None".to_string())
+            }
+        }
+
+        _ => Err(format!(
+            "Option method '{}' not supported in JIT",
+            method_name
+        )),
+    }
+}
+
+fn match_result_method(
+    object: &EnumObject,
+    method_name: &str,
+    args: Vec<Value>,
+) -> Result<Value, String> {
+    let variant = &object.variant;
+    let values = &object.values;
+    match method_name {
+        "is_ok" => Ok(Value::Bool(variant == "Ok")),
+        "is_err" => Ok(Value::Bool(variant == "Err")),
+        "unwrap" => {
+            if variant == "Ok" {
+                values
+                    .as_ref()
+                    .and_then(|values| values.first())
+                    .cloned()
+                    .ok_or_else(|| "Result::Ok should have exactly 1 value".to_string())
+            } else {
+                Err("Called unwrap() on Result::Err".to_string())
+            }
+        }
+        "unwrap_or" => {
+            let default = args
+                .first()
+                .cloned()
+                .ok_or_else(|| "Result:unwrap_or requires a default value".to_string())?;
+            if variant == "Ok" {
+                Ok(values
+                    .as_ref()
+                    .and_then(|values| values.first())
+                    .cloned()
+                    .unwrap_or(default))
+            } else {
+                Ok(default)
+            }
+        }
+        _ => Err(format!(
+            "Result method '{}' not supported in JIT",
             method_name
         )),
     }
@@ -3083,8 +3138,8 @@ pub unsafe extern "C" fn jit_get_field_safe(
         };
         let object = &*object_ptr;
         let field_value = match object {
-            Value::Struct { layout, fields, .. } => match layout.index_of_str(field_name) {
-                Some(idx) => match fields.borrow().get(idx) {
+            Value::Struct(object) => match object.layout.index_of_str(field_name) {
+                Some(idx) => match object.fields.borrow().get(idx) {
                     Some(val) => val.clone(),
                     None => return 0,
                 },
@@ -3145,7 +3200,7 @@ pub unsafe extern "C" fn jit_set_field_safe(
         let object = &*object_ptr;
         let value = (&*value_ptr).clone();
         match object {
-            Value::Struct { .. } => match object.struct_set_field(field_name, value) {
+            Value::Struct(_) => match object.struct_set_field(field_name, value) {
                 Ok(()) => 1,
                 Err(_) => 0,
             },
@@ -3218,7 +3273,8 @@ pub unsafe extern "C" fn jit_get_field_indexed_int_fast(
         let object = &*object_ptr;
         let out_ref = &mut *out;
         match object {
-            Value::Struct { layout, fields, .. } => {
+            Value::Struct(object) => {
+                let StructObject { layout, fields, .. } = object.as_ref();
                 if layout.is_weak(field_index) {
                     return 0;
                 }
@@ -3256,7 +3312,8 @@ pub unsafe extern "C" fn jit_set_field_indexed_int_fast(
             _ => return 0,
         };
         match object {
-            Value::Struct { layout, fields, .. } => {
+            Value::Struct(object) => {
+                let StructObject { layout, fields, .. } = object.as_ref();
                 if layout.is_weak(field_index) {
                     return 0;
                 }
@@ -3387,7 +3444,7 @@ mod value_ownership_tests {
     /// the count and the overwrite would not release it.
     #[test]
     fn native_functions_are_not_plain_values() {
-        let native: NativeFn = Rc::new(|_args: &[Value]| Ok(NativeCallResult::Return(Value::Nil)));
+        let native = native_fn(|_args: &[Value]| Ok(NativeCallResult::Return(Value::Nil)));
         let value = Value::NativeFunction(Rc::clone(&native));
         assert!(!value.is_plain());
         assert_eq!(Rc::strong_count(&native), 2);
@@ -3496,7 +3553,9 @@ mod jit_replacement_tests {
     #[test]
     fn rebox_publishes_into_the_unboxed_array() {
         let value = Value::array(vec![Value::Int(1), Value::Int(2)]);
-        let Value::Array(rc) = &value else { unreachable!() };
+        let Value::Array(rc) = &value else {
+            unreachable!()
+        };
         let mut slot = empty_slot();
         assert_eq!(unsafe { jit_unbox_array_int(&value, &mut slot) }, 1);
         assert_eq!(Rc::strong_count(rc), 2);

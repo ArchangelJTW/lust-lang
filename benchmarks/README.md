@@ -145,27 +145,33 @@ static lowering described above. RISC-V codegen has not been modified.
 
 ## Cross-language suite (`benchmarks/suite`)
 
-`benchmarks/suite/run.sh` runs nine small programs — struct fields, array
-indexing, function calls, struct method calls, string building, recursive
-fib, nested loops, float math, tree recursion over structs plus an
-array-scanning function — through the Lust interpreter (`LUST_JIT=0`),
+`benchmarks/suite/run.sh` runs ten small programs — struct fields, array
+indexing, a sieve of Eratosthenes (index assignment into a 10,000,001
+element `Array<bool>`), function calls, struct method calls, string
+building, recursive fib, nested loops, float math, tree recursion over
+structs plus an array-scanning function — through the Lust interpreter (`LUST_JIT=0`),
 the Lust JIT, LuaJIT and Lua, checking that all outputs agree. Each program
 has a `.lust` and an equivalent `.lua`.
 
-Measured on an Apple M5 (native aarch64 backend, branch `aarch64-jit`),
-milliseconds, single run each:
+Measured on an Apple M5 (native aarch64 backend; the x86_64 backend has the
+same optimizations but was only checked for agreement under Rosetta, not
+timed), milliseconds, single run each:
 
 | program   | lust-vm | lust-jit | luajit | lua 5.5 |
 |-----------|--------:|---------:|-------:|--------:|
-| fields    |     737 |       44 |     55 |     111 |
-| array     |    1327 |      205 |     55 |      77 |
-| calls     |     770 |      104 |     27 |     125 |
-| methods   |    1384 |       73 |     27 |     214 |
-| strings   |   13987 |    13783 |  25994 |    7311 |
-| fib       |     175 |       37 |     20 |      36 |
-| nested    |     365 |       23 |     27 |      76 |
-| floatmath |     552 |       53 |     34 |      95 |
-| tree      |     746 |      134 |     36 |      53 |
+| fields    |     710 |       45 |     57 |     118 |
+| array     |    1249 |       48 |     59 |      79 |
+| sieve     |    3335 |      306 |     92 |     286 |
+| calls     |     745 |       61 |     29 |     128 |
+| methods   |    1178 |       59 |     30 |     222 |
+| strings   |     113 |      113 |    121 |     154 |
+| fib       |     166 |       30 |     22 |      38 |
+| nested    |     372 |       26 |     30 |      77 |
+| floatmath |     543 |       52 |     37 |      87 |
+| tree      |     673 |      110 |     39 |      53 |
+
+(`strings` builds a 100,000-character string; it was 1,000,000 characters,
+14 s for every engine but Lua, until the suite got a per-program timeout.)
 
 The interpreter numbers were 3-90x worse before the fixes to cycle
 collection cost, call-frame copying and argument checking on this branch
@@ -195,7 +201,116 @@ value moves stopped calling the runtime (interned names, measured
 layouts, inline reference counting), arguments were aliased into callee
 frames instead of cloned, and the cycle collector stopped collecting on
 allocation. Remaining gaps against Lua: `strings`, where every engine is
-quadratic in `s = s .. x`; `array`, whose element loop still writes every
-value through to the frame; and `tree`, where a node visit is three
+quadratic in `s = s .. x`, and `tree`, where a node visit is three
 native calls with frames and records each, against LuaJIT's register
-passing.
+passing. A native call has since lost its per-call site materialization
+(the callee's argument mask, function index and resume point are one
+record the trace's data owns, pushed by pointer), its function-constant
+reload, its entry-table address load (the table, the stack limit, the
+depth budget and the exit word live in the VM at fixed offsets from the
+pinned VM pointer) and, for a declared `int`, `float` or `bool` result,
+its result store: the callee hands the payload back in a register and
+the caller stores it. `fib(34)` went from 0.12 to 0.08 s. Registers
+known to hold nothing owned — a fresh frame's unwritten registers, a
+function index, a scalar of either of two types on two paths (the
+`Plain` fact) — are then overwritten without a tag check, a scalar
+source is guarded once so its moves are typed copies, a loop reloading
+the same function constant into the same register stores it without
+calling the runtime (that call ran on every iteration: 1.55 → 0.97 s
+for 200,000,000 calls to a one-line function), a clone into a plain
+register skips the release, the inline retain and release test struct
+and enum tags before the five single-count ones, and a function's
+return releases only the registers that may own something instead of
+calling a helper that dropped the frame. `calls` went 107 → 64 ms.
+`tree` (138 → 126) was then all generated code: each node visit clones
+the `Option` field and its payload and releases both, and every clone
+or release of a struct or enum was three reference-count updates, two of
+them on the interned name and layout every node shares. That was the
+shape of `Value`: a struct was a name, a layout pointer and a fields
+pointer, an enum two names and a payload pointer, and the widest variant
+made every value 48 bytes. Every heap variant is now one thin `Rc` to an
+object holding the parts, so a `Value` is 16 bytes (a tag and a payload
+word), a register move copies two words, frames and arrays are a third
+of the size, and a struct or enum clone is one count on the value's own
+allocation. `tree` went 126 → 112 (its `sum` alone 0.18 → 0.14 s for
+200 passes), `methods` 70 → 61, `array` 58 → 49, and the interpreter
+gained 5–12% across the suite (`methods` 1330 → 1166, `tree` 748 →
+671). A round of codegen cleanups followed: a loop's type guards on
+registers it never writes with another type move to the trace entry
+(checked once, not per iteration), registers the loop overwrites with
+scalars before reading them get an entry check that they hold nothing
+owned (after which every store into them skips its tag check), a
+constant feeding an add is stored and used as an immediate rather than
+stored and reloaded, and the value a store leaves in x0 or d0 is what
+the next op reads — a comparison feeding a branch, a result feeding a
+return — instead of a reload. `calls` 62 → 60, `methods` 61 →
+58, `tree` 112 → 107. The x86_64 backend does the same with rax and
+xmm0 (and when the value the last store left there is the *right*
+operand, both backends read it first and copy it, instead of losing it
+to the left operand's load). Under Rosetta, where that backend can be
+timed on this machine, `fib(34)` went 106 → 100 ms, `array` 63 → 59,
+`floatmath` 74 → 70, `nested` 23 → 21; an `idiv` keeps loading both
+its operands, because Rosetta runs a divide whose dividend arrives in
+rax from the previous op's ALU result markedly slower (a `(i * j) % 7`
+loop: 22 → 27 ms) — a translation artifact, not something real
+hardware would show, but the two loads cost nothing next to the divide. Then borrows: in a compiled function that nothing
+it runs can make write a struct field (no `SetField`, no method or
+native call, every call to a bytecode function that is field-pure
+itself — recursion included), a non-scalar field of a parameter the
+function never writes or returns, and the payload of such an enum, are
+read as the value's bits with no reference count taken and nothing
+released at return; every exit to the interpreter retains what the
+borrowed registers hold first, and a copy of a borrow (`held = l`) is a
+clone the register owns. `tree`'s `sum` went 0.14 → 0.12 s for 200
+passes (suite 107 → 102). What remained in a node visit was the call
+itself — stack and depth checks, the record, a frame of Nil registers,
+the argument copy, the result — about a third of the instructions. The
+call is now cheaper: the depth limit is folded into the stack limit the
+interpreter sets before entering native code (one compare against a
+stack address instead of a compare, a decrement and a store), a
+function calling itself branches to its own entry rather than loading
+the entry table, the callee's registers are initialised to Nil only
+where the caller has not already copied an argument in, the argument
+copy is placed relative to `sp` in one instruction, and a `Some(x)`
+whose variant the code just tested is read without re-checking the tag
+or the payload's niche. `fib(34)` went 85 → 73 ms and a method-call
+loop 936 → 871, but `tree` did not move (454 → 448 ms for 1,000
+passes; the suite's `tree` row reads 107–111 ms today with either
+binary, the 102 above was a cooler run): a node visit is now bound by
+the chain of dependent loads —
+node → fields vector → `Option` object → payload vector → child — not
+by the call around them, and shortening that chain means changing the
+representation again, not the call.
+`array` was
+204 ms for a reason that had nothing to do with its element loop: when
+the outer `pass` loop got hot and was recorded, the recorder skipped the
+inner loop's iterations (a `NestedLoopCall` runs them through the inner
+loop's own trace) but the interpreter still executed them, all million,
+at interpreter speed — 160 of the 204 ms. The skipped loop's root trace
+now runs during the recording.
+
+`sieve` (added when a benchmark of the owner's found it 15x slower than
+plain Lua) could not be traced at all: the loop recorder had no case for
+the `LoadBool` a `true` or `false` literal compiles to, so any loop with
+one in it ran interpreted, and `a[i] = v` was unsupported in every kind
+of compiled code. Both are ops now — the index assignment inline when the
+index is a known int and neither the old element nor the value owns
+anything, and `array.push(a, v)` on a plain array is one op too: a
+two-word store after the last element while there is capacity, the
+helper (which charges the memory budget) on growth. 2.7 s → 0.28
+(LuaJIT 0.08, Lua 0.26). What is left is the push loop's `array.push`
+lookup, a hash-table probe of the mutable `array` module table on every
+iteration (12 of the 28 ns an iteration costs); hoisting it needs a way
+to know the table has not changed. Two things came out of the work. A
+gas budget was not enforced inside compiled loops (a trace charged once
+per entry and looped natively; `while true do end` had only been caught
+because `LoadBool` kept it out of the JIT): code compiled while a budget
+is set now charges each loop back-edge against a remaining-gas cell and
+leaves the loop to the interpreter when it runs out, at no measurable
+cost, and setting a budget discards code compiled without the checks.
+And a trace whose entry-time copy of an array (the unboxed `Array<int>`
+specialization) was still published back into the array at exit after
+the register holding it had been overwritten — clobbering anything the
+trace itself had written into that array through an alias (`array.push`
+on `nest[0]`, printed 8 for 101) — now drops the copy if it was never
+written, or gives up the recording if it was.

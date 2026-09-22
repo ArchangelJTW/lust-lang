@@ -15,13 +15,26 @@ impl JitCompiler {
             scalar_registers: HashMap::new(),
             pins: HashMap::new(),
             pin_active: false,
+            hot_x0: None,
+            hot_d0: None,
+            hot_x0_in: None,
+            hot_d0_in: None,
+            verified_enum: None,
+            verified_enum_in: None,
             dirty_pins: Vec::new(),
             trace_start_ip: 0,
             function_mode: false,
+            function_alias_params: 0,
+            function_borrows: 0,
             function_frame: (0, true),
+            function_result: None,
             function_entry_table: 0,
             function_epilogue: None,
+            function_self: None,
             function_labels: HashMap::new(),
+            gas_checked: false,
+            op_counter: 0,
+            label_positions: HashMap::new(),
             exit_is_handoff: false,
             pending_scalar: None,
             current_fail_ip: None,
@@ -65,6 +78,14 @@ impl JitCompiler {
         ptr
     }
 
+    /// Keep a call site's fixed facts with the code (see `JitInlineRecord`).
+    pub(super) fn retain_call_site(&mut self, site: crate::vm::JitCallSite) -> usize {
+        let site = Box::new(site);
+        let ptr = site.as_ref() as *const crate::vm::JitCallSite as usize;
+        self.data.push(JitData::CallSite(site));
+        ptr
+    }
+
     pub(super) fn retain_value(&mut self, value: Value) -> *const Value {
         let value = Box::new(value);
         let ptr = value.as_ref() as *const Value;
@@ -96,15 +117,29 @@ impl JitCompiler {
     /// Compile whole-function code (see `jit::function`). `entry_table` is
     /// the address of the compiled-function entry table, which the code
     /// reads at each `CallDirect`.
+    /// Compile loop back-edges with a gas charge (see `JitCells::gas_left`).
+    pub fn with_gas_checks(mut self, checked: bool) -> Self {
+        self.gas_checked = checked;
+        self
+    }
+
     pub fn compile_function(
         &mut self,
         trace: &Trace,
         trace_id: TraceId,
         register_count: u8,
         entry_table: usize,
+        result_type: Option<ValueType>,
     ) -> Result<CompiledTrace> {
         self.function_mode = true;
         self.function_frame = (register_count, trace.frame_may_own);
+        self.function_alias_params = trace.alias_params;
+        self.function_borrows = trace
+            .borrowed_registers
+            .iter()
+            .filter(|r| **r < 64)
+            .fold(0u64, |mask, r| mask | (1u64 << r));
+        self.function_result = result_type;
         self.function_entry_table = entry_table;
         self.function_labels.clear();
         let result = self.compile_trace(trace, trace_id, Vec::new());
@@ -127,7 +162,7 @@ impl JitCompiler {
         trace_id: TraceId,
         hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
-        self.scalar_registers.clear();
+        self.scalar_registers = trace.entry_scalars.iter().copied().collect();
         self.trace_start_ip = trace.start_ip;
         self.last_fail_island = self.ops.offset().0;
         self.pins = if self.function_mode {
@@ -151,7 +186,7 @@ impl JitCompiler {
         self.dirty_pins.clear();
         self.current_fail_ip = None;
         self.fail_sites.clear();
-        let stack_size = Self::compute_stack_size(trace);
+        let stack_size = self.compute_stack_size(trace);
         let mut guards = Vec::new();
         let mut guard_index = 0i32;
         // Exits from the preamble and the loop prologue: nothing pinned yet.
@@ -172,6 +207,11 @@ impl JitCompiler {
         });
 
         // Entry: x0 = *mut Value (registers), x1 = *mut VM, x2 = *const Function
+        if self.function_mode {
+            let entry = self.ops.new_dynamic_label();
+            dynasm!(self.ops ; .arch aarch64 ; => entry);
+            self.function_self = Some((trace.function_idx, entry));
+        }
         dynasm!(self.ops
             ; .arch aarch64
             ; stp x29, x30, [sp, -16]!
@@ -204,7 +244,9 @@ impl JitCompiler {
             ; mov x20, x1
         );
         if self.function_mode {
-            dynasm!(self.ops ; .arch aarch64 ; mov x21, x2);
+            // x3 = where a native caller wants the result (null from the
+            // interpreter, which takes it from the return code).
+            dynasm!(self.ops ; .arch aarch64 ; mov x21, x2 ; mov x22, x3);
         } else {
             dynasm!(self.ops ; .arch aarch64 ; mov x21, xzr);
         }
@@ -284,6 +326,7 @@ impl JitCompiler {
             );
         } else {
             // At end of loop body, jump back to loop_start to loop
+            self.emit_gas_check(trace.ops.len());
             dynasm!(self.ops
                 ; .arch aarch64
                 ; b => loop_start_label
@@ -386,12 +429,15 @@ impl JitCompiler {
             ; b => exit_label
         );
         crate::jit::log(|| {
-            format!("📏 JIT(aarch64): trace code size {} bytes", self.ops.offset().0)
+            format!(
+                "📏 JIT(aarch64): trace code size {} bytes",
+                self.ops.offset().0
+            )
         });
         let ops = mem::replace(&mut self.ops, Assembler::new().unwrap());
         let exec_buffer = ops.finalize().unwrap();
         let entry_point = exec_buffer.ptr(dynasmrt::AssemblyOffset(0));
-        let entry: extern "C" fn(*mut Value, *mut VM, *const Function) -> i32 =
+        let entry: extern "C" fn(*mut Value, *mut VM, *const Function, *mut Value) -> i32 =
             unsafe { mem::transmute(entry_point) };
         #[cfg(feature = "std")]
         {
@@ -403,8 +449,7 @@ impl JitCompiler {
                 let _ = fs::create_dir_all(&path);
                 path.push(format!(
                     "jit_trace_{}_{}.bin",
-                    trace_id.0,
-                    trace.function_idx
+                    trace_id.0, trace.function_idx
                 ));
                 if let Err(err) = fs::write(&path, bytes) {
                     crate::jit::log(|| {
@@ -432,6 +477,58 @@ impl JitCompiler {
     /// that exits with this op's fail-site code, so the interpreter resumes
     /// at the instruction the op came from. Without a known ip the branches
     /// fall through to the trace's generic `fail:` (-1).
+    /// A jump to a label already bound is a loop back-edge: charge the ops
+    /// between (before the jump, whether or not a conditional one is
+    /// taken).
+    fn emit_back_edge_gas_check(&mut self, label: usize) {
+        if let Some(position) = self.label_positions.get(&label).copied() {
+            self.emit_gas_check(self.op_counter.saturating_sub(position));
+        }
+    }
+
+    /// Charge `cost` gas at a loop back-edge (code compiled under a gas
+    /// budget only). When it runs out the loop is left to the interpreter:
+    /// a loop trace returns 0 (loop again: the interpreter's entry charge
+    /// then raises the error), function code exits at the jump's ip like
+    /// a failed op. The fall-through path leaves x0 / d0 alone.
+    fn emit_gas_check(&mut self, cost: usize) {
+        if !self.gas_checked {
+            return;
+        }
+        let gas = jit::GAS_LEFT_OFFSET as u32;
+        let cost = cost.clamp(1, i32::MAX as usize) as i32;
+        let exit_label = self.current_exit_label();
+        dynasm!(self.ops ; .arch aarch64 ; ldr x9, [x20, #gas]);
+        if cost <= registers::IMM12_MAX {
+            let cost = cost as u32;
+            dynasm!(self.ops ; .arch aarch64 ; subs x9, x9, #cost);
+        } else {
+            self.emit_mov_imm32(10, cost as u32);
+            dynasm!(self.ops ; .arch aarch64 ; subs x9, x9, x10);
+        }
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b.lo >gas_out
+            ; str x9, [x20, #gas]
+            ; b >gas_ok
+            ; gas_out:
+            ; str xzr, [x20, #gas]
+        );
+        if self.function_mode {
+            let ip = self.current_fail_ip.unwrap_or(usize::MAX >> 16);
+            self.emit_retain_borrows();
+            self.emit_exit_info(ip, jit::EXIT_KIND_FAIL);
+            dynasm!(self.ops ; .arch aarch64 ; movn w0, 0);
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; mov w0, wzr);
+        }
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b => exit_label
+            ; gas_ok:
+        );
+    }
+
     pub(super) fn emit_fail_stub(&mut self) {
         let Some(ip) = self.current_fail_ip else {
             return;
@@ -445,6 +542,7 @@ impl JitCompiler {
             ; fail:
         );
         if self.function_mode {
+            self.emit_retain_borrows();
             self.emit_exit_info(ip, jit::EXIT_KIND_FAIL);
         }
         self.emit_mov_imm_i32(0, code);
@@ -465,6 +563,8 @@ impl JitCompiler {
                 | TraceOp::Concat { .. }
                 | TraceOp::GetIndex { .. }
                 | TraceOp::TryGetIndex { .. }
+                | TraceOp::SetIndex { .. }
+                | TraceOp::ArrayPush { .. }
                 | TraceOp::ArrayIndexOk { .. }
                 | TraceOp::ArrayLen { .. }
                 | TraceOp::CallNative { .. }
@@ -480,6 +580,8 @@ impl JitCompiler {
                 | TraceOp::NewEnumVariant { .. }
                 | TraceOp::TryCast { .. }
                 | TraceOp::GetEnumValue { .. }
+                | TraceOp::BorrowField { .. }
+                | TraceOp::BorrowEnumValue { .. }
                 | TraceOp::Unbox { .. }
                 | TraceOp::Rebox { .. }
                 | TraceOp::DropSpecialized { .. }
@@ -577,6 +679,11 @@ impl JitCompiler {
                 self.current_fail_ip = Some(*ip);
                 continue;
             }
+            self.op_counter += 1;
+            // What the previous op left in x0 / d0 is this op's to use.
+            self.hot_x0_in = self.hot_x0.take();
+            self.hot_d0_in = self.hot_d0.take();
+            self.verified_enum_in = self.verified_enum.take();
             if self.pin_active && pins::op_touches_register_memory(op) {
                 self.flush_dirty_pins();
             }
@@ -598,8 +705,8 @@ impl JitCompiler {
                 continue;
             }
             // Fusion looks at the next real op; `At` markers are transparent.
-            let next_index = (op_index + 1..ops.len())
-                .find(|&j| !matches!(ops[j], TraceOp::At { .. }));
+            let next_index =
+                (op_index + 1..ops.len()).find(|&j| !matches!(ops[j], TraceOp::At { .. }));
             if let Some(next_index) = next_index {
                 let next = &ops[next_index];
                 if let TraceOp::GuardLoopContinue {
@@ -632,6 +739,29 @@ impl JitCompiler {
                 {
                     self.update_scalar_registers(next);
                     skip_through = Some(next_index);
+                    continue;
+                }
+                // A constant that stays live is still stored, but the
+                // arithmetic takes it as an immediate rather than loading
+                // it back.
+                if let TraceOp::LoadConst {
+                    dest: constant_register,
+                    value,
+                } = op
+                    && self.scalar_registers.contains_key(constant_register)
+                    && Self::folds_as_immediate(op, next)
+                {
+                    self.compile_load_const(*constant_register, value)?;
+                    self.update_scalar_registers(op);
+                    // The constant's store is what x0 / d0 now hold.
+                    self.hot_x0_in = self.hot_x0.take();
+                    self.hot_d0_in = self.hot_d0.take();
+                    if self.compile_integer_add_immediate(op, next)?
+                        || self.compile_float_op_immediate(op, next)?
+                    {
+                        self.update_scalar_registers(next);
+                        skip_through = Some(next_index);
+                    }
                     continue;
                 }
             }
@@ -783,6 +913,20 @@ impl JitCompiler {
                     self.compile_try_get_index(*dest, *array, *index)?;
                 }
 
+                TraceOp::SetIndex {
+                    array,
+                    index,
+                    value,
+                } => {
+                    self.compile_set_index(*array, *index, *value)?;
+                }
+
+                TraceOp::ArrayPush { dest, array, value } => {
+                    self.compile_array_push(*array, *value)?;
+                    // `array.push` returns Nil.
+                    self.compile_load_const(*dest, &Value::Nil)?;
+                }
+
                 TraceOp::ArrayIndexOk {
                     value_dest,
                     condition_dest,
@@ -922,8 +1066,14 @@ impl JitCompiler {
                     let outer_scalar_registers = mem::take(&mut self.scalar_registers);
                     let outer_pin_active = self.pin_active;
                     self.pin_active = false;
-                    let result =
-                        self.compile_inline_call(*dest, *callee, trace, &arg_types, guard_index, guards);
+                    let result = self.compile_inline_call(
+                        *dest,
+                        *callee,
+                        trace,
+                        &arg_types,
+                        guard_index,
+                        guards,
+                    );
                     self.pin_active = outer_pin_active;
                     self.scalar_registers = outer_scalar_registers;
                     let result_type = result?;
@@ -1042,7 +1192,21 @@ impl JitCompiler {
                     enum_name,
                     variant_name,
                 } => {
-                    self.compile_is_enum_variant(*dest, *value, enum_name, variant_name)?;
+                    let inline =
+                        self.compile_is_enum_variant(*dest, *value, enum_name, variant_name)?;
+                    // Followed by a branch away on false: the fallthrough
+                    // has the enum proven, for the payload read after it.
+                    if inline
+                        && let Some(next_index) = next_index
+                        && let TraceOp::BranchIf {
+                            condition_register,
+                            expect_truthy: false,
+                            ..
+                        } = &ops[next_index]
+                        && condition_register == dest
+                    {
+                        self.verified_enum = Some(*value);
+                    }
                 }
 
                 TraceOp::TypeIs {
@@ -1067,6 +1231,22 @@ impl JitCompiler {
                     index,
                 } => {
                     self.compile_get_enum_value(*dest, *enum_reg, *index)?;
+                }
+
+                TraceOp::BorrowField {
+                    dest,
+                    object,
+                    field_index,
+                } => {
+                    self.compile_borrow_field(*dest, *object, *field_index)?;
+                }
+
+                TraceOp::BorrowEnumValue {
+                    dest,
+                    enum_reg,
+                    index,
+                } => {
+                    self.compile_borrow_enum_value(*dest, *enum_reg, *index)?;
                 }
 
                 TraceOp::Guard {
@@ -1147,10 +1327,16 @@ impl JitCompiler {
                 TraceOp::Label { id, scalars } => {
                     let label = self.function_label(*id);
                     dynasm!(self.ops ; .arch aarch64 ; => label);
+                    self.label_positions.insert(*id, self.op_counter);
                     self.scalar_registers = scalars.iter().copied().collect();
+                    // Control also arrives here by jump.
+                    self.hot_x0_in = None;
+                    self.hot_d0_in = None;
+                    self.verified_enum_in = None;
                 }
 
                 TraceOp::Jump { label } => {
+                    self.emit_back_edge_gas_check(*label);
                     let label = self.function_label(*label);
                     dynasm!(self.ops ; .arch aarch64 ; b => label);
                 }
@@ -1160,7 +1346,11 @@ impl JitCompiler {
                     expect_truthy,
                     label,
                 } => {
+                    let verified = self.verified_enum_in.take();
+                    self.emit_back_edge_gas_check(*label);
                     self.compile_branch_if(*condition_register, *expect_truthy, *label);
+                    // Carried past the branch to the payload read.
+                    self.verified_enum = verified;
                 }
 
                 TraceOp::CallDirect {
@@ -1222,6 +1412,46 @@ impl JitCompiler {
             ; fail_island_skip:
         );
         self.last_fail_island = self.ops.offset().0;
+    }
+
+    /// Is `arithmetic` an `Add` (or a float op) on the constant `load`
+    /// produces, written elsewhere than the constant's register? Mirrors
+    /// what `compile_integer_add_immediate` and
+    /// `compile_float_op_immediate` accept, without emitting anything.
+    fn folds_as_immediate(load: &TraceOp, arithmetic: &TraceOp) -> bool {
+        let TraceOp::LoadConst {
+            dest: constant_register,
+            value,
+        } = load
+        else {
+            return false;
+        };
+        match (value, arithmetic) {
+            (
+                Value::Int(_),
+                TraceOp::Add {
+                    dest,
+                    lhs,
+                    rhs,
+                    lhs_type: ValueType::Int,
+                    rhs_type: ValueType::Int,
+                },
+            ) => {
+                (lhs == constant_register) != (rhs == constant_register)
+                    && dest != constant_register
+            }
+            (
+                Value::Float(_),
+                TraceOp::Add { dest, lhs, rhs, .. }
+                | TraceOp::Sub { dest, lhs, rhs, .. }
+                | TraceOp::Mul { dest, lhs, rhs, .. }
+                | TraceOp::Div { dest, lhs, rhs, .. },
+            ) => {
+                (lhs == constant_register) != (rhs == constant_register)
+                    && dest != constant_register
+            }
+            _ => false,
+        }
     }
 
     fn compile_integer_add_immediate(
@@ -1403,6 +1633,8 @@ impl JitCompiler {
                 | TraceOp::Concat { .. }
                 | TraceOp::GetIndex { .. }
                 | TraceOp::TryGetIndex { .. }
+                | TraceOp::SetIndex { .. }
+                | TraceOp::ArrayPush { .. }
                 | TraceOp::ArrayIndexOk { .. }
                 | TraceOp::ArrayLen { .. }
                 | TraceOp::GuardNativeFunction { .. }
@@ -1498,6 +1730,12 @@ impl JitCompiler {
             TraceOp::SetField { object, value, .. } => {
                 *object == register || *value == register
             }
+            TraceOp::SetIndex {
+                array,
+                index,
+                value,
+            } => *array == register || *index == register || *value == register,
+            TraceOp::ArrayPush { array, value, .. } => *array == register || *value == register,
             TraceOp::NewArray {
                 first_element,
                 count,
@@ -1513,6 +1751,8 @@ impl JitCompiler {
             | TraceOp::TypeIs { value, .. }
             | TraceOp::TryCast { value, .. } => *value == register,
             TraceOp::GetEnumValue { enum_reg, .. } => *enum_reg == register,
+            TraceOp::BorrowField { object, .. } => *object == register,
+            TraceOp::BorrowEnumValue { enum_reg, .. } => *enum_reg == register,
             TraceOp::GuardLoopContinue {
                 condition_register, ..
             } => *condition_register == register,
@@ -1571,6 +1811,7 @@ impl JitCompiler {
             | TraceOp::Concat { dest, .. }
             | TraceOp::GetIndex { dest, .. }
             | TraceOp::TryGetIndex { dest, .. }
+            | TraceOp::ArrayPush { dest, .. }
             | TraceOp::ArrayLen { dest, .. }
             | TraceOp::CallNative { dest, .. }
             | TraceOp::CallFunction { dest, .. }
@@ -1585,7 +1826,9 @@ impl JitCompiler {
             | TraceOp::IsEnumVariant { dest, .. }
             | TraceOp::TypeIs { dest, .. }
             | TraceOp::TryCast { dest, .. }
-            | TraceOp::GetEnumValue { dest, .. } => *dest == register,
+            | TraceOp::GetEnumValue { dest, .. }
+            | TraceOp::BorrowField { dest, .. }
+            | TraceOp::BorrowEnumValue { dest, .. } => *dest == register,
             _ => false,
         }
     }
@@ -1595,7 +1838,11 @@ impl JitCompiler {
             return;
         }
         let scalar_type = |ty: ValueType| {
-            matches!(ty, ValueType::Bool | ValueType::Int | ValueType::Float).then_some(ty)
+            matches!(
+                ty,
+                ValueType::Bool | ValueType::Int | ValueType::Float | ValueType::Plain
+            )
+            .then_some(ty)
         };
         let set = |registers: &mut HashMap<u8, ValueType>, register, ty| {
             if let Some(ty) = ty {
@@ -1612,12 +1859,21 @@ impl JitCompiler {
                     Value::Bool(_) => Some(ValueType::Bool),
                     Value::Int(_) => Some(ValueType::Int),
                     Value::Float(_) => Some(ValueType::Float),
+                    // A function index or Nil: nothing to drop, no particular
+                    // type.
+                    Value::Function(_) | Value::Nil => Some(ValueType::Plain),
                     _ => None,
                 };
                 set(&mut self.scalar_registers, *dest, ty);
             }
             TraceOp::Move { dest, src } => {
-                let ty = self.scalar_registers.get(src).copied();
+                // A copy of a borrow is a clone the destination owns; a
+                // register that ever holds a borrow is read as one.
+                let ty = if *src < 64 && self.function_borrows & (1u64 << src) != 0 {
+                    None
+                } else {
+                    self.scalar_registers.get(src).copied()
+                };
                 set(&mut self.scalar_registers, *dest, ty);
             }
             TraceOp::Add {
@@ -1722,6 +1978,10 @@ impl JitCompiler {
             | TraceOp::GetEnumValue { dest, .. } => {
                 self.scalar_registers.remove(dest);
             }
+            // A borrow owns nothing; the value is of no particular type.
+            TraceOp::BorrowField { dest, .. } | TraceOp::BorrowEnumValue { dest, .. } => {
+                self.scalar_registers.insert(*dest, ValueType::Plain);
+            }
             TraceOp::Rebox { dest_reg, .. } => {
                 self.scalar_registers.remove(dest_reg);
             }
@@ -1732,7 +1992,12 @@ impl JitCompiler {
                     }
                 }
             }
+            TraceOp::ArrayPush { dest, .. } => {
+                // `array.push` returns Nil.
+                self.scalar_registers.insert(*dest, ValueType::Plain);
+            }
             TraceOp::SetField { .. }
+            | TraceOp::SetIndex { .. }
             | TraceOp::GuardNativeFunction { .. }
             | TraceOp::GuardGlobals { .. }
             | TraceOp::GuardStructLayout { .. }
@@ -1752,11 +2017,21 @@ impl JitCompiler {
         }
     }
 
-    fn compute_stack_size(trace: &Trace) -> i32 {
+    fn compute_stack_size(&self, trace: &Trace) -> i32 {
         let specialized_slots = Self::count_specialized_slots(trace) as i32;
         let specialized_bytes =
             SPECIALIZED_STACK_BASE + (specialized_slots * SPECIALIZED_SLOT_SIZE);
-        let size = MIN_JIT_STACK_SIZE.max(specialized_bytes);
+        // Function code pays for its local area on every call, so it takes
+        // only what its specialized values need — nothing, usually.
+        let size = if self.function_mode {
+            if specialized_slots == 0 {
+                0
+            } else {
+                specialized_bytes
+            }
+        } else {
+            MIN_JIT_STACK_SIZE.max(specialized_bytes)
+        };
         let size = (size + 15) & !15;
         crate::jit::log(|| {
             format!(
@@ -1839,7 +2114,9 @@ impl JitCompiler {
             // Push the inline record (see `JitInlineRecord`). It is linked
             // into the unwind chain only once the frame below it is fully
             // built, so a failure while building it exits cleanly.
-            let caller_resume_ip = self.current_fail_ip.map_or(0, |ip| ip + trace.resume_offset);
+            let caller_resume_ip = self
+                .current_fail_ip
+                .map_or(0, |ip| ip + trace.resume_offset);
             // An argument of unknown type whose callee register the body
             // never writes is aliased: its bits are copied without touching
             // the reference count, and the register is neither dropped at
@@ -1863,38 +2140,36 @@ impl JitCompiler {
                 })
                 .map(|(arg_index, _)| 1u64 << arg_index)
                 .fold(0, |mask, bit| mask | bit);
+            let site = self.retain_call_site(crate::vm::JitCallSite {
+                value_count: frame_value_count as usize,
+                alias_mask: alias_mask as usize,
+                borrow_mask: self.function_borrows as usize,
+                function_idx: trace.function_idx,
+                return_dest: dest as usize,
+                callee_reg: callee as usize,
+                caller_resume_ip,
+            });
+            self.emit_mov_imm64(0, site as u64);
             dynasm!(self.ops
                 ; .arch aarch64
-                ; sub sp, sp, #metadata_size
+                ; stp x19, x21, [sp, #-(INLINE_METADATA_SIZE)]!
+                ; str x0, [sp, 16]
             );
-            self.emit_mov_imm_i32(0, frame_value_count);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; str x0, [sp]
-                ; str x19, [sp, 8]
-                ; str x21, [sp, 16]
-            );
-            self.emit_mov_imm64(0, alias_mask);
-            dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 24]);
-            self.emit_mov_imm64(0, trace.function_idx as u64);
-            dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 32]);
-            self.emit_mov_imm64(0, dest as u64);
-            dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 40]);
-            self.emit_mov_imm64(0, callee as u64);
-            dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 48]);
-            self.emit_mov_imm64(0, caller_resume_ip as u64);
-            dynasm!(self.ops ; .arch aarch64 ; str x0, [sp, 56]);
             // Allocate space for callee registers and initialise every one
             // to Nil (discriminant 0) — what `jit_init_nil` does, without a
             // call per register — so the argument moves below find nothing to
             // drop. x19 still addresses the caller's registers here.
             self.emit_sub_sp(frame_size);
-            let nil_tag = ValueTag::Nil.as_u8() as u32;
-            dynasm!(self.ops ; .arch aarch64 ; movz w13, #nil_tag);
+            dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
             for reg in 0..trace.register_count {
-                dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
-                self.emit_add_imm(11, 11, super::registers::reg_offset(reg));
-                dynasm!(self.ops ; .arch aarch64 ; strb w13, [x11]);
+                let offset = super::registers::reg_offset(reg);
+                if offset < 4096 {
+                    dynasm!(self.ops ; .arch aarch64 ; strb wzr, [x11, #offset as u32]);
+                } else {
+                    dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
+                    self.emit_add_imm(11, 11, offset);
+                    dynasm!(self.ops ; .arch aarch64 ; strb wzr, [x11] ; mov x11, sp);
+                }
             }
 
             // Copy positional arguments into the callee frame. A scalar of
@@ -1911,14 +2186,15 @@ impl JitCompiler {
                             _ => ValueTag::Float,
                         }
                         .as_u8() as u32;
+                        let payload_offset = (dest_offset + 8) as u32;
+                        let tag_offset = dest_offset as u32;
                         self.load_payload(0, *src_reg);
-                        dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
-                        self.emit_add_imm(11, 11, dest_offset);
                         dynasm!(self.ops
                             ; .arch aarch64
+                            ; mov x11, sp
                             ; movz w13, #tag
-                            ; strb w13, [x11]
-                            ; str x0, [x11, 8]
+                            ; strb w13, [x11, #tag_offset]
+                            ; str x0, [x11, #payload_offset]
                         );
                     }
                     _ if alias_mask & (1u64 << arg_index) != 0 => {
@@ -1953,17 +2229,27 @@ impl JitCompiler {
                     self.scalar_registers.insert(arg_index as u8, *ty);
                 }
             }
+            // The rest of the frame is still Nil: the first store into
+            // any of those registers has nothing to drop.
+            for reg in trace.arg_registers.len() as u8..trace.register_count {
+                self.scalar_registers.insert(reg, ValueType::Plain);
+            }
 
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; mov x19, sp
-            );
+            dynasm!(self.ops ; .arch aarch64 ; mov x19, sp);
             // Link the record into the unwind chain.
-            dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
-            self.emit_add_imm(21, 11, frame_size);
+            self.emit_add_imm(21, 19, frame_size);
 
             let call_ip = self.current_fail_ip;
+            // The callee's registers are numbered from its own frame:
+            // nothing left in x0 / d0 carries across the frame switch,
+            // either way.
+            self.hot_x0 = None;
+            self.hot_d0 = None;
             let inline_result = self.compile_ops(&trace.body, guard_index, guards);
+            self.hot_x0 = None;
+            self.hot_d0 = None;
+            self.hot_x0_in = None;
+            self.hot_d0_in = None;
             inline_result?;
             // A failed result move exits from the callee frame at its last
             // instruction; everything after the frame is popped is the
@@ -1993,7 +2279,7 @@ impl JitCompiler {
                     let dest_offset = (dest as i32) * value_size;
                     dynasm!(self.ops
                         ; .arch aarch64
-                        ; ldr x11, [x21, 8]
+                        ; ldr x11, [x21]
                     );
                     self.emit_reg_addr(0, ret_reg);
                     self.emit_add_imm(1, 11, dest_offset);
@@ -2011,7 +2297,10 @@ impl JitCompiler {
             let may_own = (0..trace.register_count).any(|reg| {
                 !self.scalar_registers.contains_key(&reg)
                     && (helper_copied.contains(&reg)
-                        || trace.body.iter().any(|op| Self::op_writes_register(op, reg)))
+                        || trace
+                            .body
+                            .iter()
+                            .any(|op| Self::op_writes_register(op, reg)))
             });
             if may_own {
                 for reg in 0..trace.register_count.min(64) {
@@ -2029,8 +2318,8 @@ impl JitCompiler {
             dynasm!(self.ops
                 ; .arch aarch64
                 ; add sp, x21, #metadata_size
-                ; ldr x19, [x21, 8]
-                ; ldr x21, [x21, 16]
+                ; ldr x19, [x21]
+                ; ldr x21, [x21, 8]
             );
 
             // Back in the caller's frame: the caller's environment is

@@ -40,7 +40,6 @@ impl Profiler {
         self.backedges.get(&(func_idx, ip)).copied().unwrap_or(0)
     }
 
-
     pub fn mark_hot(&mut self, func_idx: usize, ip: usize) {
         let iterations = self.get_count(func_idx, ip);
         self.hot_spots.push(HotSpot {

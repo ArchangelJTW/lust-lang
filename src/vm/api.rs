@@ -1,6 +1,6 @@
 use super::*;
 use crate::ast::Type;
-use crate::bytecode::{LustMap, ValueKey};
+use crate::bytecode::{LustMap, ValueKey, native_fn};
 use crate::config::LustConfig;
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -107,6 +107,8 @@ impl VM {
             natives: HashMap::new(),
             globals: HashMap::new(),
             globals_version: 0,
+            jit_cells: crate::jit::JitCells::default(),
+            unit_enums: HashMap::new(),
             map_hasher: DefaultHashBuilder::default(),
             call_stack: Vec::new(),
             frame_pool: Vec::new(),
@@ -232,6 +234,7 @@ impl VM {
         }
         self.jit.invalidate_compiled_code();
         self.jit.reset_function_tables(functions.len());
+        self.jit_cells.entry_table = self.jit.function_entry_table();
         self.call_meta = functions.iter().map(CallMeta::of).collect();
         self.functions = functions;
     }
@@ -385,11 +388,11 @@ impl VM {
             });
         }
 
-        Ok(Value::Struct {
-            name: struct_name.into(),
+        Ok(Value::Struct(crate::bytecode::StructObject::new(
+            struct_name,
             layout,
-            fields: Rc::new(RefCell::new(ordered)),
-        })
+            ordered,
+        )))
     }
 
     pub fn register_trait_impl(&mut self, type_name: String, trait_name: String) {
@@ -409,7 +412,7 @@ impl VM {
                     // This registration is executing in an extension's runtime copy.
                     // Resolve the calling VM at invocation time, then expose it to
                     // the extension's VM::with_current for the duration of the call.
-                    Value::NativeFunction(Rc::new(move |args| {
+                    Value::NativeFunction(native_fn(move |args| {
                         let _context = host_lookup().map(super::CurrentVmGuard::new);
                         func(args)
                     }))
@@ -494,7 +497,7 @@ impl VM {
         let return_type = export.return_type.clone();
         let type_module = self.export_prefix();
         self.push_export_metadata(export);
-        let native = Value::NativeFunction(Rc::new(move |args| {
+        let native = Value::NativeFunction(native_fn(move |args| {
             if args.len() != params.len() {
                 return Err(format!(
                     "Native expects {} arguments, got {}",
@@ -1075,17 +1078,17 @@ end
             ty(TypeKind::Int),
             Value::Int(7),
         );
-        let lua_table = Value::Struct {
-            name: "LuaTable".into(),
-            layout: Rc::new(StructLayout::new(
+        let lua_table = Value::Struct(crate::bytecode::StructObject::new(
+            "LuaTable",
+            Rc::new(StructLayout::new(
                 "LuaTable".to_string(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
             )),
-            fields: Rc::new(RefCell::new(Vec::new())),
-        };
+            Vec::new(),
+        ));
         let mut vm = VM::new();
         vm.load_functions(vec![function]);
 
@@ -1230,7 +1233,7 @@ end
         );
         registration_vm.register_native(
             "panic_in_callback",
-            Value::NativeFunction(Rc::new(|_| {
+            Value::NativeFunction(native_fn(|_| {
                 VM::with_current::<_, ()>(|_| panic!("callback panic"))?;
                 unreachable!()
             })),
@@ -1516,6 +1519,9 @@ end
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![TraceOp::GuardLoopContinue {
                 condition_register: 0,

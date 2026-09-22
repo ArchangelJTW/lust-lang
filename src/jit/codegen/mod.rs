@@ -28,7 +28,7 @@ pub(super) const SPECIALIZED_STACK_BASE: i32 = 72;
 /// Size of the record pushed for each inlined call frame: a
 /// `crate::vm::JitInlineRecord` (value_count, caller r12, previous r15,
 /// alias_mask, function_idx, return_dest, callee_reg, caller_resume_ip).
-pub(super) const INLINE_METADATA_SIZE: i32 = 64;
+pub(super) const INLINE_METADATA_SIZE: i32 = 32;
 mod arithmetic;
 mod builder;
 mod comparisons;
@@ -60,6 +60,16 @@ pub struct JitCompiler {
     /// destination (checked at runtime, so it holds on every path that
     /// continues), applied after the generic environment update.
     pub(super) pending_scalar: Option<(u8, ValueType)>,
+    /// The register whose int/bool payload the last store left in rax,
+    /// and the one whose float payload it left in xmm0: the next op may
+    /// read them there instead of from memory (`hot_rax_in` /
+    /// `hot_xmm0_in` are the values carried into the op being compiled).
+    /// Only ops listed in `result_stays_hot` keep the fact past their
+    /// last instruction.
+    hot_rax: Option<u8>,
+    hot_xmm0: Option<u8>,
+    hot_rax_in: Option<u8>,
+    hot_xmm0_in: Option<u8>,
     /// Loop-header ip of the trace being compiled: where a guard that fails
     /// before any instruction of the body has run resumes.
     pub(super) trace_start_ip: usize,
@@ -69,13 +79,35 @@ pub struct JitCompiler {
     /// Function mode: (frame register count, may any register own a value
     /// at return) of the function being compiled.
     function_frame: (u8, bool),
+    /// Function code: parameters a native caller may alias (never dropped).
+    function_alias_params: u64,
+    /// Function code: registers that may hold a borrow (bit i = register
+    /// i; see `Trace::borrowed_registers`). Every exit to the interpreter
+    /// retains what they hold first; a native return does not release
+    /// them; a call site records them for frame materialization.
+    function_borrows: u64,
+    /// Function mode: the declared scalar return kind, if any. A native
+    /// caller then takes the result from a register (see
+    /// `compile_function_return`) instead of having it stored.
+    function_result: Option<ValueType>,
     /// Function mode: address of the compiled-function entry table.
     function_entry_table: usize,
     /// Function mode: the epilogue, for propagating an exit that happened
     /// inside a native callee.
     function_epilogue: Option<dynasmrt::DynamicLabel>,
+    /// Function code: the function being compiled and the label at its
+    /// entry, so a call to itself is a direct call.
+    function_self: Option<(usize, dynasmrt::DynamicLabel)>,
     /// Branch targets of the function being compiled, by bytecode ip.
     function_labels: HashMap<usize, dynasmrt::DynamicLabel>,
+    /// Compiled under a gas budget: loop back-edges charge
+    /// `JitCells::gas_left` and leave the loop when it runs out.
+    gas_checked: bool,
+    /// Ops compiled so far (across inlined bodies), and the count at which
+    /// each function label was bound: a jump to a bound label is a loop
+    /// back-edge, charged the ops between.
+    op_counter: usize,
+    label_positions: HashMap<usize, usize>,
     /// Function mode: the exit being emitted hands a call to the
     /// interpreter rather than reporting a failed guard.
     exit_is_handoff: bool,
@@ -134,6 +166,9 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::LoadConst {
@@ -174,6 +209,9 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![TraceOp::Guard {
                 register: 0,
@@ -204,6 +242,9 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -339,6 +380,9 @@ mod tests {
                             start_ip: 0,
                             is_function: false,
                             frame_may_own: true,
+                            entry_scalars: Vec::new(),
+                            alias_params: 0,
+                            borrowed_registers: Vec::new(),
                             preamble: vec![TraceOp::Guard {
                                 register: 2,
                                 expected_type: ValueType::Bool,
@@ -407,6 +451,9 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Lt {
@@ -480,6 +527,9 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -536,6 +586,9 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Guard {
@@ -597,6 +650,9 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![TraceOp::Div {
                 dest: 0,
@@ -630,6 +686,9 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Div {
@@ -680,6 +739,9 @@ mod tests {
             start_ip: 0,
             is_function: false,
             frame_may_own: true,
+            entry_scalars: Vec::new(),
+            alias_params: 0,
+            borrowed_registers: Vec::new(),
             preamble: Vec::new(),
             ops: vec![
                 TraceOp::Lt {

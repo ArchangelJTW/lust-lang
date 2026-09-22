@@ -90,7 +90,10 @@ fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
         }
     };
     match op {
-        TraceOp::At { .. } | TraceOp::Label { .. } | TraceOp::Jump { .. } | TraceOp::BranchIf { .. } => {}
+        TraceOp::At { .. }
+        | TraceOp::Label { .. }
+        | TraceOp::Jump { .. }
+        | TraceOp::BranchIf { .. } => {}
         TraceOp::CallDirect { dest, .. } => set(env, *dest, None),
         TraceOp::LoadConst { dest, value } => set(env, *dest, const_type(value)),
         TraceOp::Move { dest, src } => {
@@ -171,6 +174,9 @@ fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
         | TraceOp::GetEnumValue { dest, .. } => {
             env.remove(dest);
         }
+        TraceOp::BorrowField { dest, .. } | TraceOp::BorrowEnumValue { dest, .. } => {
+            set(env, *dest, Some(ValueType::Plain));
+        }
         TraceOp::Rebox { dest_reg, .. } => {
             env.remove(dest_reg);
         }
@@ -181,7 +187,9 @@ fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
                 }
             }
         }
+        TraceOp::ArrayPush { dest, .. } => set(env, *dest, Some(ValueType::Plain)),
         TraceOp::SetField { .. }
+        | TraceOp::SetIndex { .. }
         | TraceOp::GuardNativeFunction { .. }
         | TraceOp::GuardGlobals { .. }
         | TraceOp::GuardStructLayout { .. }
@@ -304,7 +312,8 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
         } => {
             e.reads.push((*lhs, typed(*lhs_type)));
             e.reads.push((*rhs, typed(*rhs_type)));
-            e.native_writes.push((*dest, arith_type(*lhs_type, *rhs_type)));
+            e.native_writes
+                .push((*dest, arith_type(*lhs_type, *rhs_type)));
         }
         TraceOp::Mod {
             dest,
@@ -315,7 +324,8 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
         } => {
             e.reads.push((*lhs, typed(*lhs_type)));
             e.reads.push((*rhs, typed(*rhs_type)));
-            e.native_writes.push((*dest, mod_type(*lhs_type, *rhs_type)));
+            e.native_writes
+                .push((*dest, mod_type(*lhs_type, *rhs_type)));
         }
         TraceOp::Neg { dest, src } => {
             let ty = env.get(src).copied();
@@ -425,9 +435,14 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
             e.reads.extend(range(*first_arg, *arg_count));
             e.helper_writes.push(*dest);
         }
-        TraceOp::InlineCall { dest, callee, trace } => {
+        TraceOp::InlineCall {
+            dest,
+            callee,
+            trace,
+        } => {
             e.reads.push((*callee, None));
-            e.reads.extend(trace.arg_registers.iter().map(|r| (*r, None)));
+            e.reads
+                .extend(trace.arg_registers.iter().map(|r| (*r, None)));
             e.helper_writes.push(*dest);
         }
         TraceOp::CallMethod {
@@ -448,6 +463,20 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
         TraceOp::SetField { object, value, .. } => {
             e.reads.push((*object, None));
             e.reads.push((*value, None));
+        }
+        TraceOp::SetIndex {
+            array,
+            index,
+            value,
+        } => {
+            e.reads.push((*array, None));
+            e.reads.push((*index, None));
+            e.reads.push((*value, None));
+        }
+        TraceOp::ArrayPush { dest, array, value } => {
+            e.reads.push((*array, None));
+            e.reads.push((*value, None));
+            e.helper_writes.push(*dest);
         }
         TraceOp::NewArray {
             dest,
@@ -483,6 +512,14 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
             e.helper_writes.push(*dest);
         }
         TraceOp::GetEnumValue { dest, enum_reg, .. } => {
+            e.reads.push((*enum_reg, None));
+            e.helper_writes.push(*dest);
+        }
+        TraceOp::BorrowField { dest, object, .. } => {
+            e.reads.push((*object, None));
+            e.helper_writes.push(*dest);
+        }
+        TraceOp::BorrowEnumValue { dest, enum_reg, .. } => {
             e.reads.push((*enum_reg, None));
             e.helper_writes.push(*dest);
         }
@@ -523,9 +560,10 @@ pub(super) fn op_touches_register_memory(op: &TraceOp) -> bool {
         op,
         TraceOp::At { .. }
             | TraceOp::LoadConst {
-            value: Value::Int(_) | Value::Float(_) | Value::Bool(_),
-            ..
-        } | TraceOp::Add { .. }
+                value: Value::Int(_) | Value::Float(_) | Value::Bool(_),
+                ..
+            }
+            | TraceOp::Add { .. }
             | TraceOp::Sub { .. }
             | TraceOp::Mul { .. }
             | TraceOp::Div { .. }
@@ -714,7 +752,12 @@ pub(super) fn plan(
         }
         let mut ty: Option<ValueType> = None;
         let mut consistent = true;
-        for t in cand.write_types.iter().flatten().chain(cand.guard_types.iter()) {
+        for t in cand
+            .write_types
+            .iter()
+            .flatten()
+            .chain(cand.guard_types.iter())
+        {
             match ty {
                 None => ty = Some(*t),
                 Some(prev) if prev == *t => {}
@@ -747,7 +790,9 @@ pub(super) fn plan(
                 (PinClass::Carried, true)
             }
         };
-        let Some(ty) = ty.and_then(scalar) else { continue };
+        let Some(ty) = ty.and_then(scalar) else {
+            continue;
+        };
         eligible.push((
             r,
             Pin {

@@ -1,0 +1,23 @@
+local N: int = 10000000
+local flags: Array<bool> = []
+local i: int = 0
+while i <= N do
+    array.push(flags, true)
+    i = i + 1
+end
+local count: int = 0
+i = 2
+while i <= N do
+    if flags[i] is Ok(f) then
+        if f then
+            count = count + 1
+            local j: int = i * i
+            while j <= N do
+                flags[j] = false
+                j = j + i
+            end
+        end
+    end
+    i = i + 1
+end
+println(count)

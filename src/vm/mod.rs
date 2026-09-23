@@ -377,7 +377,12 @@ impl CallFrame {
 
     /// Reset a frame that ran `function_idx` (which used the first
     /// `register_count` registers) so it can be handed out again.
-    pub(super) fn reset(&mut self, function_idx: usize, return_dest: Option<Register>, register_count: u8) {
+    pub(super) fn reset(
+        &mut self,
+        function_idx: usize,
+        return_dest: Option<Register>,
+        register_count: u8,
+    ) {
         for value in &mut self.registers[..register_count as usize] {
             if value.is_plain() {
                 // SAFETY: nothing to drop.

@@ -1,7 +1,7 @@
 use crate::analysis::{AnalysisSnapshot, FunctionInfo, ModuleSnapshot};
 use crate::utils::{
-    build_hover_body, compute_line_offsets, is_word_char, nth_char_byte_index, span_from_identifier,
-    span_to_range,
+    build_hover_body, compute_line_offsets, is_word_char, nth_char_byte_index,
+    span_from_identifier, span_to_range,
 };
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
@@ -152,8 +152,11 @@ pub(crate) fn hover_for_function(info: &FunctionInfo) -> Hover {
         .collect::<Vec<_>>()
         .join(", ");
     let prefix = if info.is_extern { "extern " } else { "" };
-    let mut signature =
-        format!("{prefix}function {}({})", crate::utils::simple_type_name(&def.name), params);
+    let mut signature = format!(
+        "{prefix}function {}({})",
+        crate::utils::simple_type_name(&def.name),
+        params
+    );
     if let Some(ret) = &def.return_type {
         signature.push_str(": ");
         signature.push_str(&ret.to_string());

@@ -277,7 +277,11 @@ impl Parser {
         Ok(Item::new(kind, self.make_span(&start_token, &end_token)))
     }
 
-    fn parse_function(&mut self, visibility: Visibility, doc: Option<String>) -> Result<FunctionDef> {
+    fn parse_function(
+        &mut self,
+        visibility: Visibility,
+        doc: Option<String>,
+    ) -> Result<FunctionDef> {
         self.consume(TokenKind::Function, "Expected 'function'")?;
         let first_name = self.expect_identifier()?;
         let (name, is_method) = if self.match_token(&[TokenKind::Colon]) {
@@ -625,7 +629,8 @@ impl Parser {
         Ok(ExternParam { name, ty })
     }
 
-    fn parse_type_params_with_bounds(&mut self) -> Result<(Vec<String>, Vec<TraitBound>)> {        if !self.match_token(&[TokenKind::Less]) {
+    fn parse_type_params_with_bounds(&mut self) -> Result<(Vec<String>, Vec<TraitBound>)> {
+        if !self.match_token(&[TokenKind::Less]) {
             return Ok((vec![], vec![]));
         }
 

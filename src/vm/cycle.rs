@@ -334,7 +334,12 @@ impl CycleCollector {
                     if visited.insert(key) {
                         let upvalues = &closure.upvalues;
                         self.work += upvalues.len();
-                        stack.extend(upvalues.iter().map(Upvalue::get).filter(|v| !Self::is_leaf(v)));
+                        stack.extend(
+                            upvalues
+                                .iter()
+                                .map(Upvalue::get)
+                                .filter(|v| !Self::is_leaf(v)),
+                        );
                     }
                 }
                 Value::WeakStruct(_) => {}

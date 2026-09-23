@@ -460,16 +460,27 @@ fn render_block(stmts: &[Stmt], out: &mut Out) {
 fn render_stmt(s: &Stmt, out: &mut Out) {
     match s {
         Stmt::Local { name, ty, init } => {
-            out.line(&format!("local {name}: {} = {}", ty.name(), expr_text(init)));
+            out.line(&format!(
+                "local {name}: {} = {}",
+                ty.name(),
+                expr_text(init)
+            ));
         }
         Stmt::Assign { name, expr } => out.line(&format!("{name} = {}", expr_text(expr))),
         Stmt::SetField { obj, field, expr } => {
             out.line(&format!("{obj}.{field} = {}", expr_text(expr)));
         }
         Stmt::Observe(e) => {
-            out.line(&format!("out = out .. tostring({}) .. \"\\n\"", expr_text(e)));
+            out.line(&format!(
+                "out = out .. tostring({}) .. \"\\n\"",
+                expr_text(e)
+            ));
         }
-        Stmt::While { counter, bound, body } => {
+        Stmt::While {
+            counter,
+            bound,
+            body,
+        } => {
             // The counter advances before the body so a `continue` can
             // never skip it; every while loop terminates by construction.
             out.line(&format!("local {counter}: int = 0"));
@@ -491,7 +502,10 @@ fn render_stmt(s: &Stmt, out: &mut Out) {
             out.indent -= 1;
             out.line("end");
         }
-        Stmt::If { branches, otherwise } => {
+        Stmt::If {
+            branches,
+            otherwise,
+        } => {
             for (i, (cond, body)) in branches.iter().enumerate() {
                 let kw = if i == 0 { "if" } else { "elseif" };
                 out.line(&format!("{kw} {} then", expr_text(cond)));
@@ -510,12 +524,15 @@ fn render_stmt(s: &Stmt, out: &mut Out) {
         Stmt::Break => out.line("break"),
         Stmt::Continue => out.line("continue"),
         Stmt::Push { arr, expr } => out.line(&format!("array.push({arr}, {})", expr_text(expr))),
-        Stmt::SetIndex { arr, idx, expr } => out.line(&format!(
-            "{arr}[{}] = {}",
-            expr_text(idx),
-            expr_text(expr)
-        )),
-        Stmt::IfIndex { arr, idx, var, body } => {
+        Stmt::SetIndex { arr, idx, expr } => {
+            out.line(&format!("{arr}[{}] = {}", expr_text(idx), expr_text(expr)))
+        }
+        Stmt::IfIndex {
+            arr,
+            idx,
+            var,
+            body,
+        } => {
             out.line(&format!("if {arr}[{}] is Ok({var}) then", expr_text(idx)));
             out.indent += 1;
             render_block(body, out);
@@ -551,7 +568,10 @@ fn render_stmt(s: &Stmt, out: &mut Out) {
             body,
         } => {
             out.line(&format!("local {counter}: int = 0"));
-            out.line(&format!("while {counter} < {bound} and {} do", expr_text(cond)));
+            out.line(&format!(
+                "while {counter} < {bound} and {} do",
+                expr_text(cond)
+            ));
             out.indent += 1;
             out.line(&format!("{counter} = {counter} + 1"));
             render_block(body, out);
@@ -950,7 +970,11 @@ impl Gen {
         if straight {
             self.size = 1;
         }
-        let mut body = if straight { Vec::new() } else { self.block(false) };
+        let mut body = if straight {
+            Vec::new()
+        } else {
+            self.block(false)
+        };
         if self.rng.chance(0.4) {
             body.push(Stmt::SetField {
                 obj: p.clone(),
@@ -1116,7 +1140,11 @@ impl Gen {
         self.cur_work = 0;
         let saved_size = self.size;
         self.size = 1;
-        let body = if self.rng.chance(0.5) { Vec::new() } else { self.block(false) };
+        let body = if self.rng.chance(0.5) {
+            Vec::new()
+        } else {
+            self.block(false)
+        };
         // `if not flag then return None end`, then `Some(p)`.
         let mut body = body;
         body.push(Stmt::If {
@@ -1229,7 +1257,11 @@ impl Gen {
         self.iter_scale = bound;
         let mut body = vec![Stmt::If {
             branches: vec![(
-                Expr::Bin(Box::new(Expr::Var(n.clone())), BinOp::Le, Box::new(Expr::Int(0))),
+                Expr::Bin(
+                    Box::new(Expr::Var(n.clone())),
+                    BinOp::Le,
+                    Box::new(Expr::Int(0)),
+                ),
                 vec![Stmt::Return(Expr::Var(acc.clone()))],
             )],
             otherwise: None,
@@ -1259,7 +1291,11 @@ impl Gen {
         let ret_expr = Expr::Call(
             name.clone(),
             vec![
-                Expr::Bin(Box::new(Expr::Var(n.clone())), BinOp::Sub, Box::new(Expr::Int(step))),
+                Expr::Bin(
+                    Box::new(Expr::Var(n.clone())),
+                    BinOp::Sub,
+                    Box::new(Expr::Int(step)),
+                ),
                 next_acc,
             ],
         );
@@ -1292,7 +1328,11 @@ impl Gen {
         self.scopes.push(Vec::new());
         self.declare(&n, Ty::Int, true);
         let bound = self.rng.range(2, 13);
-        let base = Expr::Bin(Box::new(Expr::Var(n.clone())), BinOp::Le, Box::new(Expr::Int(1)));
+        let base = Expr::Bin(
+            Box::new(Expr::Var(n.clone())),
+            BinOp::Le,
+            Box::new(Expr::Int(1)),
+        );
         let body = vec![Stmt::If {
             branches: vec![(base, vec![Stmt::Return(Expr::Var(n.clone()))])],
             otherwise: None,
@@ -1310,14 +1350,22 @@ impl Gen {
         let ret_expr = match self.rng.below(3) {
             0 => Expr::Bin(Box::new(call(1)), BinOp::Add, Box::new(call(2))),
             1 => Expr::Bin(
-                Box::new(Expr::Bin(Box::new(call(1)), BinOp::Mul, Box::new(Expr::Int(2)))),
+                Box::new(Expr::Bin(
+                    Box::new(call(1)),
+                    BinOp::Mul,
+                    Box::new(Expr::Int(2)),
+                )),
                 BinOp::Sub,
                 Box::new(call(2)),
             ),
             _ => Expr::Bin(
                 Box::new(call(1)),
                 BinOp::Add,
-                Box::new(Expr::Bin(Box::new(call(3)), BinOp::Mod, Box::new(Expr::Int(7)))),
+                Box::new(Expr::Bin(
+                    Box::new(call(3)),
+                    BinOp::Mod,
+                    Box::new(Expr::Int(7)),
+                )),
             ),
         };
         self.funcs.push(FuncSig {
@@ -1344,7 +1392,11 @@ impl Gen {
         let bound = self.rng.range(1, 60);
         let make = |name: String, other: &str, base: bool| {
             let n = format!("n_{name}");
-            let cond = Expr::Bin(Box::new(Expr::Var(n.clone())), BinOp::Le, Box::new(Expr::Int(0)));
+            let cond = Expr::Bin(
+                Box::new(Expr::Var(n.clone())),
+                BinOp::Le,
+                Box::new(Expr::Int(0)),
+            );
             Func {
                 name,
                 params: vec![(n.clone(), Ty::Int)],
@@ -1364,7 +1416,10 @@ impl Gen {
                 second: None,
             }
         };
-        let funcs = vec![make(even.clone(), &odd, true), make(odd.clone(), &even, false)];
+        let funcs = vec![
+            make(even.clone(), &odd, true),
+            make(odd.clone(), &even, false),
+        ];
         for name in [even, odd] {
             self.funcs.push(FuncSig {
                 name,
@@ -1385,7 +1440,11 @@ impl Gen {
     fn block(&mut self, entry: bool) -> Vec<Stmt> {
         self.scopes.push(Vec::new());
         self.depth += 1;
-        let max = if entry { self.size * 3 + 2 } else { self.size + 1 };
+        let max = if entry {
+            self.size * 3 + 2
+        } else {
+            self.size + 1
+        };
         let count = self.rng.range(1, max as i64) as usize;
         let mut stmts = Vec::new();
         for _ in 0..count {
@@ -1552,7 +1611,9 @@ impl Gen {
             return Some(self.local());
         }
         let obj = self.rng.pick(&vars).name.clone();
-        let (field, ty) = *self.rng.pick(&[("a", Ty::Int), ("b", Ty::Float), ("c", Ty::Bool)]);
+        let (field, ty) = *self
+            .rng
+            .pick(&[("a", Ty::Int), ("b", Ty::Float), ("c", Ty::Bool)]);
         let expr = self.expr(ty, 2);
         Some(Stmt::SetField { obj, field, expr })
     }
@@ -1809,7 +1870,8 @@ impl Gen {
                 // A struct-returning helper call (its argument a variable
                 // when one exists, so the callee's frame aliases it), an
                 // existing variable, or a literal.
-                if depth > 0 && self.rng.chance(0.4)
+                if depth > 0
+                    && self.rng.chance(0.4)
                     && let Some(call) = self.call_returning(Ty::Struct, depth)
                 {
                     return call;
@@ -1834,7 +1896,8 @@ impl Gen {
                 )
             }
             Ty::OptStruct => {
-                if depth > 0 && self.rng.chance(0.6)
+                if depth > 0
+                    && self.rng.chance(0.6)
                     && let Some(call) = self.call_returning(Ty::OptStruct, depth)
                 {
                     return call;

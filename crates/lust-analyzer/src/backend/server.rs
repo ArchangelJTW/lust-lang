@@ -779,9 +779,7 @@ impl LanguageServer for Backend {
             } else {
                 None
             };
-            let imported_hover = if let (Some(module), Some(word)) =
-                (module, word.as_deref())
-            {
+            let imported_hover = if let (Some(module), Some(word)) = (module, word.as_deref()) {
                 snapshot
                     .resolve_imported_symbol(module, word)
                     .map(|symbol| match symbol {

@@ -12,8 +12,8 @@
 
 mod alloc_count;
 mod engine;
-mod writer;
 mod rng;
+mod writer;
 
 #[global_allocator]
 static ALLOCATOR: alloc_count::Counting = alloc_count::Counting;
@@ -46,7 +46,10 @@ enum Kind {
     Disagree { interp: Answer, jit: Answer },
     /// Running the program left allocations behind, twice in a row (see
     /// `alloc_count`): a reference count somewhere is never given back.
-    Leak { engine: &'static str, allocations: isize },
+    Leak {
+        engine: &'static str,
+        allocations: isize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -83,7 +86,9 @@ impl Stats {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: lust-fuzz run --cases N [--seed S] [--size K] [--jobs J] [--keep-going] [--no-shrink] [--fg]");
+    eprintln!(
+        "usage: lust-fuzz run --cases N [--seed S] [--size K] [--jobs J] [--keep-going] [--no-shrink] [--fg]"
+    );
     eprintln!("       lust-fuzz one --seed S [--size K]");
     eprintln!("       lust-fuzz replay --seed S [--size K]");
     std::process::exit(64)
@@ -164,7 +169,10 @@ fn main() {
     // takes the whole run down; at least say which seed did it.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        eprintln!("\n=== panic while running seed {} ===", CURRENT_SEED.with(|c| c.get()));
+        eprintln!(
+            "\n=== panic while running seed {} ===",
+            CURRENT_SEED.with(|c| c.get())
+        );
         default_hook(info);
     }));
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -356,7 +364,10 @@ fn print_finding(f: &Finding) {
             println!("  interpreter {}", interp.summary());
             println!("  jit         {}", jit.summary());
         }
-        Kind::Leak { engine, allocations } => {
+        Kind::Leak {
+            engine,
+            allocations,
+        } => {
             println!("--- the {engine} leaks: {allocations} allocation(s) left behind per run");
         }
     }

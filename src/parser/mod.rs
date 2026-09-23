@@ -301,16 +301,13 @@ mod tests {
         let mut interner = Interner::new();
         let mut lexer = Lexer::new(source, &mut interner);
         let tokens = lexer.tokenize().expect("tokenize");
-        Parser::new(tokens)
-            .parse()
-            .expect("parse")
+        Parser::new(tokens).parse().expect("parse")
     }
 
     #[test]
     fn doc_comments_attach_to_declarations() {
-        let items = parse_source(
-            "--- Adds one.\nfunction add_one(x: int): int\n    return x + 1\nend\n",
-        );
+        let items =
+            parse_source("--- Adds one.\nfunction add_one(x: int): int\n    return x + 1\nend\n");
         assert_eq!(items.len(), 1);
         match &items[0].kind {
             ItemKind::Function(func) => {
@@ -322,9 +319,7 @@ mod tests {
 
     #[test]
     fn multiple_doc_lines_join() {
-        let items = parse_source(
-            "--- Line one.\n--- Line two.\nstruct Widget\n    x: int\nend\n",
-        );
+        let items = parse_source("--- Line one.\n--- Line two.\nstruct Widget\n    x: int\nend\n");
         match &items[0].kind {
             ItemKind::Struct(def) => {
                 assert_eq!(def.doc.as_deref(), Some("Line one.\nLine two."));
@@ -335,9 +330,8 @@ mod tests {
 
     #[test]
     fn four_dashes_is_a_regular_comment() {
-        let items = parse_source(
-            "---- not a doc\nfunction add_one(x: int): int\n    return x + 1\nend\n",
-        );
+        let items =
+            parse_source("---- not a doc\nfunction add_one(x: int): int\n    return x + 1\nend\n");
         match &items[0].kind {
             ItemKind::Function(func) => assert!(func.doc.is_none()),
             other => panic!("expected function item, got {:?}", other),
@@ -346,9 +340,8 @@ mod tests {
 
     #[test]
     fn three_dashes_without_space_is_a_regular_comment() {
-        let items = parse_source(
-            "---not a doc\nfunction add_one(x: int): int\n    return x + 1\nend\n",
-        );
+        let items =
+            parse_source("---not a doc\nfunction add_one(x: int): int\n    return x + 1\nend\n");
         match &items[0].kind {
             ItemKind::Function(func) => assert!(func.doc.is_none()),
             other => panic!("expected function item, got {:?}", other),
@@ -357,9 +350,8 @@ mod tests {
 
     #[test]
     fn double_dash_is_a_regular_comment() {
-        let items = parse_source(
-            "-- not a doc\nfunction add_one(x: int): int\n    return x + 1\nend\n",
-        );
+        let items =
+            parse_source("-- not a doc\nfunction add_one(x: int): int\n    return x + 1\nend\n");
         match &items[0].kind {
             ItemKind::Function(func) => assert!(func.doc.is_none()),
             other => panic!("expected function item, got {:?}", other),
@@ -382,11 +374,13 @@ mod tests {
 
     #[test]
     fn doc_comments_attach_to_extern_functions() {
-        let items = parse_source(
-            "extern\n    --- Host callback.\n    function on_event(int)\nend\n",
-        );
+        let items =
+            parse_source("extern\n    --- Host callback.\n    function on_event(int)\nend\n");
         match &items[0].kind {
-            ItemKind::Extern { items: extern_items, .. } => match &extern_items[0] {
+            ItemKind::Extern {
+                items: extern_items,
+                ..
+            } => match &extern_items[0] {
                 ExternItem::Function { doc, .. } => {
                     assert_eq!(doc.as_deref(), Some("Host callback."));
                 }
@@ -402,7 +396,10 @@ mod tests {
             "--- Host callback.\nextern\n    function on_event(int)\n    function other(int)\nend\n",
         );
         match &items[0].kind {
-            ItemKind::Extern { items: extern_items, .. } => {
+            ItemKind::Extern {
+                items: extern_items,
+                ..
+            } => {
                 match &extern_items[0] {
                     ExternItem::Function { doc, .. } => {
                         assert_eq!(doc.as_deref(), Some("Host callback."));
@@ -442,7 +439,10 @@ mod tests {
             "extern\n    function on_event(kind: string, count: int, raw): int\nend\n",
         );
         match &items[0].kind {
-            ItemKind::Extern { items: extern_items, .. } => match &extern_items[0] {
+            ItemKind::Extern {
+                items: extern_items,
+                ..
+            } => match &extern_items[0] {
                 ExternItem::Function { name, params, .. } => {
                     assert_eq!(name, "on_event");
                     assert_eq!(params.len(), 3);

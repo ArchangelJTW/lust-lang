@@ -483,7 +483,10 @@ impl AnalysisSnapshot {
                         }
                     }
 
-                    ItemKind::Extern { abi, items: extern_items } => {
+                    ItemKind::Extern {
+                        abi,
+                        items: extern_items,
+                    } => {
                         for extern_item in extern_items {
                             let ExternItem::Function {
                                 name,
@@ -500,8 +503,7 @@ impl AnalysisSnapshot {
                                 .unwrap_or(name);
                             let Some((type_part, method_part)) = unadorned.rsplit_once(':') else {
                                 let simple_name = simple_type_name(unadorned).to_string();
-                                let qualified_name =
-                                    qualify_type_name(&module_path, &simple_name);
+                                let qualified_name = qualify_type_name(&module_path, &simple_name);
                                 let def = FunctionDef {
                                     name: qualified_name.clone(),
                                     type_params: Vec::new(),
@@ -537,8 +539,7 @@ impl AnalysisSnapshot {
                                 continue;
                             };
 
-                            let qualified_type =
-                                qualify_type_name(&module_path, type_part);
+                            let qualified_type = qualify_type_name(&module_path, type_part);
                             let simple_owner = simple_type_name(&qualified_type).to_string();
                             let method_name = method_part.to_string();
                             let info = MethodInfo {
@@ -882,7 +883,8 @@ impl AnalysisSnapshot {
         &self,
         func_name: &str,
         module_path: Option<&str>,
-    ) -> Option<&FunctionInfo> {        if let Some(info) = self.functions_by_qualified.get(func_name) {
+    ) -> Option<&FunctionInfo> {
+        if let Some(info) = self.functions_by_qualified.get(func_name) {
             return Some(info);
         }
         let simple = simple_type_name(func_name);

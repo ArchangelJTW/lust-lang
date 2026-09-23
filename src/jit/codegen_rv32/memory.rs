@@ -417,10 +417,12 @@ impl JitCompiler {
                 args_ptr: *const Value,
                 arg_count: u8,
                 dest_reg: u8,
+                out: *mut Value,
             ) -> u8;
             fn jit_current_registers(vm_ptr: *mut crate::VM) -> *mut Value;
         }
         dynasm!(self.ops ; .arch riscv32i ; mv a0, s3);
+        self.emit_call_result_out_a(5, dest);
         self.emit_addr_in_t2(callee, 0);
         dynasm!(self.ops ; .arch riscv32i ; mv a1, t2);
         self.emit_addr_in_t2(first_arg, 0);
@@ -441,6 +443,28 @@ impl JitCompiler {
         Ok(())
     }
 
+    /// The helpers' `out` argument, in `a{reg}`: inside an inlined body the
+    /// destination register lives in the inline frame, not in the VM's
+    /// frame, so the helper is given its address; otherwise null, and the
+    /// helper writes the VM frame's `dest_reg` (the call may have
+    /// reallocated it).
+    fn emit_call_result_out_a(&mut self, reg: u8, dest: u8) {
+        if self.inline_depth > 0 {
+            self.emit_addr_in_t2(dest, 0);
+            match reg {
+                5 => dynasm!(self.ops ; .arch riscv32i ; mv a5, t2),
+                7 => dynasm!(self.ops ; .arch riscv32i ; mv a7, t2),
+                _ => unreachable!("out pointer register"),
+            }
+        } else {
+            match reg {
+                5 => dynasm!(self.ops ; .arch riscv32i ; li a5, 0),
+                7 => dynasm!(self.ops ; .arch riscv32i ; li a7, 0),
+                _ => unreachable!("out pointer register"),
+            }
+        }
+    }
+
     pub(super) fn compile_call_method(
         &mut self,
         dest: u8,
@@ -458,6 +482,7 @@ impl JitCompiler {
                 args_ptr: *const Value,
                 arg_count: u8,
                 dest_reg: u8,
+                out: *mut Value,
             ) -> u8;
             fn jit_current_registers(vm_ptr: *mut crate::VM) -> *mut Value;
         }
@@ -466,6 +491,7 @@ impl JitCompiler {
         let name_len = name_len as i32;
 
         dynasm!(self.ops ; .arch riscv32i ; mv a0, s3);
+        self.emit_call_result_out_a(7, dest);
         self.emit_addr_in_t2(object, 0);
         dynasm!(self.ops ; .arch riscv32i ; mv a1, t2);
         dynasm!(self.ops ; .arch riscv32i ; li a2, name_ptr);

@@ -13,7 +13,13 @@ impl JitCompiler {
             specialization_registry: SpecializationRegistry::new(),
             specialized_values: HashMap::new(),
             next_specialized_id: 0,
+            gas_checked: false,
         }
+    }
+
+    pub fn with_gas_checks(mut self, checked: bool) -> Self {
+        self.gas_checked = checked;
+        self
     }
 
     pub(super) fn current_fail_label(&self) -> dynasmrt::DynamicLabel {
@@ -79,6 +85,11 @@ impl JitCompiler {
         trace_id: TraceId,
         hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
+        if self.gas_checked {
+            return Err(crate::LustError::RuntimeError {
+                message: "loops under a gas budget are not compiled on riscv32".to_string(),
+            });
+        }
         let frame_size = Self::compute_frame_size(trace);
 
         // Saved-register offsets from the top of the frame (sp+frame_size).
@@ -225,7 +236,10 @@ impl JitCompiler {
         let ops = mem::replace(&mut self.ops, Assembler::new().unwrap());
         let exec_buf = ops.finalize().unwrap();
         let entry_point = exec_buf.ptr(dynasmrt::AssemblyOffset(0));
-        let entry: extern "C" fn(*mut Value, *mut VM, *const Function) -> i32 =
+        // The fourth argument (a native caller's result slot) is for
+        // function code, which this backend does not compile; the trace
+        // never reads a3.
+        let entry: extern "C" fn(*mut Value, *mut VM, *const Function, *mut Value) -> i32 =
             unsafe { mem::transmute(entry_point) };
 
         let data = mem::take(&mut self.data);
@@ -680,6 +694,21 @@ impl JitCompiler {
                     return Err(crate::LustError::RuntimeError {
                         message: "whole-function compilation is not supported on riscv32"
                             .to_string(),
+                    });
+                }
+                // Instruction markers name where a failing op resumes; this
+                // backend has no fail sites and restarts the iteration.
+                TraceOp::At { .. } => {}
+                // Not implemented here: the trace is not compiled and the
+                // loop runs in the interpreter. (Borrows only occur in
+                // function code.)
+                TraceOp::GuardStructLayout { .. }
+                | TraceOp::SetIndex { .. }
+                | TraceOp::ArrayPush { .. }
+                | TraceOp::BorrowField { .. }
+                | TraceOp::BorrowEnumValue { .. } => {
+                    return Err(crate::LustError::RuntimeError {
+                        message: format!("{op:?} is not supported on riscv32"),
                     });
                 }
             }

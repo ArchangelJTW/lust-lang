@@ -10,7 +10,7 @@ use crate::utils::{
 };
 use hashbrown::{HashMap, HashSet};
 use lust::ast::{Item, ItemKind, TypeKind};
-#[cfg(all(not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 use lust::{packages::prepare_rust_dependencies, resolve_dependencies};
 use lust::{Compiler, LustConfig, ModuleLoader, Span, TypeChecker};
 use std::{
@@ -160,7 +160,7 @@ impl Backend {
                 return HashMap::new();
             }
         };
-        #[cfg(all(not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         let dependency_resolution = match resolve_dependencies(&config, &entry_dir) {
             Ok(res) => res,
             Err(err) => {
@@ -173,7 +173,7 @@ impl Backend {
                 return HashMap::new();
             }
         };
-        #[cfg(all(not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         let prepared_rust = match prepare_rust_dependencies(&dependency_resolution, &entry_dir) {
             Ok(list) => list,
             Err(err) => {
@@ -186,7 +186,7 @@ impl Backend {
                 Vec::new()
             }
         };
-        #[cfg(all(not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         let dependency_root_set: HashSet<String> = dependency_resolution
             .lust()
             .iter()
@@ -198,12 +198,12 @@ impl Backend {
                 names
             })
             .collect();
-        #[cfg(any(target_arch = "wasm32"))]
+        #[cfg(target_arch = "wasm32")]
         let dependency_root_set = HashSet::new();
 
         let mut loader = ModuleLoader::new(entry_dir.clone());
         loader.set_source_overrides(overrides.clone());
-        #[cfg(all(not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         for dependency in dependency_resolution.lust() {
             loader.add_module_root(
                 dependency.name.clone(),
@@ -218,7 +218,7 @@ impl Backend {
                 );
             }
         }
-        #[cfg(all(not(target_arch = "wasm32")))]
+        #[cfg(not(target_arch = "wasm32"))]
         {
             use hashbrown::HashSet;
             let mut seen: HashSet<(String, PathBuf)> = HashSet::new();
@@ -340,9 +340,7 @@ impl Backend {
         entry_version: i32,
         mut new_diagnostics: HashMap<Url, Vec<Diagnostic>>,
     ) {
-        new_diagnostics
-            .entry(entry_uri.clone())
-            .or_insert_with(Vec::new);
+        new_diagnostics.entry(entry_uri.clone()).or_default();
         let associated_uris: HashSet<Url> = new_diagnostics.keys().cloned().collect();
         let previous_uris = {
             let mut tracker = self.last_published.write().await;
@@ -905,7 +903,7 @@ impl LanguageServer for Backend {
                     if let Some(def) = snapshot.definition_by_qualified(word) {
                         def_clone = Some(def.clone());
                     } else if let Some(defs) = snapshot.definitions_by_simple(word) {
-                        if let Some(def) = choose_definition(defs, module_path.as_deref()) {
+                        if let Some(def) = choose_definition(defs, module_path) {
                             def_clone = Some(def.clone());
                         }
                     }
@@ -1087,6 +1085,6 @@ impl LanguageServer for Backend {
 pub async fn run() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    let (service, socket) = LspService::build(|client| Backend::new(client)).finish();
+    let (service, socket) = LspService::build(Backend::new).finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 }

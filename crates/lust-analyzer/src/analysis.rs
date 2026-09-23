@@ -647,7 +647,7 @@ impl AnalysisSnapshot {
         let project_module_roots = entry_module_path
             .as_deref()
             .and_then(|path| path.parent())
-            .map(|root| collect_project_module_roots(root))
+            .map(collect_project_module_roots)
             .unwrap_or_default();
         if !project_module_roots.is_empty() {
             module_children
@@ -2291,13 +2291,13 @@ impl TypeIndex {
     fn insert(&mut self, def: TypeDefinition) {
         self.by_simple
             .entry(def.name.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(def.clone());
         self.by_qualified
             .insert(def.qualified_name.clone(), def.clone());
         self.by_file
             .entry(def.file_path.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(def);
     }
 

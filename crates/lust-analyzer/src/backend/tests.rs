@@ -1476,7 +1476,7 @@ local sum = add(1, 2)
     let add_offset = source
         .rfind("add(1, 2)")
         .expect("find function call");
-    let position = offset_to_position(&source, add_offset, &line_offsets);
+    let _position = offset_to_position(&source, add_offset, &line_offsets);
     let function_hover = hover_for_function(
         snapshot.function_info_for("add", Some(module_path.as_str()))
             .expect("function info"),

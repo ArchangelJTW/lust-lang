@@ -1457,10 +1457,11 @@ impl Gen {
             }
         }
         // Make sure loop bodies and branches do something visible.
-        if !self.in_func && self.rng.chance(0.7) {
-            if let Some(e) = self.observable() {
-                stmts.push(Stmt::Observe(e));
-            }
+        if !self.in_func
+            && self.rng.chance(0.7)
+            && let Some(e) = self.observable()
+        {
+            stmts.push(Stmt::Observe(e));
         }
         self.depth -= 1;
         self.scopes.pop();
@@ -1954,7 +1955,7 @@ impl Gen {
             Ty::Str => self.str_expr(depth),
             Ty::Unknown => {
                 if self.rng.chance(0.1) {
-                    return Expr::Native(*self.rng.pick(&["math.abs", "tostring"]));
+                    return Expr::Native(self.rng.pick(&["math.abs", "tostring"]));
                 }
                 let ty = *self.rng.pick(&[Ty::Int, Ty::Float, Ty::Bool, Ty::Str]);
                 self.expr(ty, 1)

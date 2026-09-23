@@ -1,8 +1,21 @@
+// The `jit_*` `extern "C"` helpers in this file share one contract, stated
+// here instead of on each function.
+#![allow(clippy::missing_safety_doc)]
+//! Runtime values, and the `extern "C"` helpers compiled code calls.
+//!
+//! # Safety
+//!
+//! The `jit_*` functions are called by code the JIT generates, never by
+//! hand. Each `*const Value` / `*mut Value` argument points to a live,
+//! initialised `Value` — a VM register, a native frame's register or a
+//! trace slot — that nothing else accesses during the call (several check
+//! for null as well, but callers must not rely on it); a `vm_ptr` is the VM
+//! running that code; a name or string argument is a pointer and length
+//! into memory the compiled code keeps alive.
 use crate::ast::Type;
 use crate::jit;
 use crate::number::{
     LustFloat, LustInt, float_from_int, float_is_nan, float_to_hash_bits, int_from_float,
-    int_from_usize,
 };
 use crate::vm::{VM, pop_vm_ptr, push_vm_ptr};
 use alloc::{
@@ -1871,7 +1884,7 @@ pub unsafe extern "C" fn jit_array_len_safe(array_value_ptr: *const Value) -> i6
         let array_value = &*array_value_ptr;
         match array_value {
             Value::Array(arr) => match arr.try_borrow() {
-                Ok(borrowed) => int_from_usize(borrowed.len()),
+                Ok(borrowed) => crate::number::int_from_usize(borrowed.len()),
                 Err(_) => -1,
             },
             _ => -1,

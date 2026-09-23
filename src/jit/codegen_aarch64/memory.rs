@@ -894,6 +894,7 @@ impl JitCompiler {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn compile_call_function(
         &mut self,
         dest: u8,

@@ -257,7 +257,7 @@ fn run(s: &Settings) {
     let totals: Mutex<Stats> = Mutex::new(Stats::default());
     let start = Instant::now();
     std::thread::scope(|scope| {
-        for w in 0..s.jobs {
+        for slot in in_flight.iter().take(s.jobs) {
             let (next, stop, done, findings, totals) = (&next, &stop, &done, &findings, &totals);
             scope.spawn(move || {
                 if !s.foreground {
@@ -276,9 +276,9 @@ fn run(s: &Settings) {
                     CURRENT_SEED.with(|c| c.set(seed));
                     let program = writer::program(seed, s.size);
                     let started = Instant::now();
-                    *in_flight[w].lock().unwrap() = Some((seed, started));
+                    *slot.lock().unwrap() = Some((seed, started));
                     let result = run_case(&program, seed, &mut stats);
-                    *in_flight[w].lock().unwrap() = None;
+                    *slot.lock().unwrap() = None;
                     let took = started.elapsed();
                     if took.as_secs_f64() > 5.0 {
                         eprintln!("\nslow: seed {seed} took {:.1}s", took.as_secs_f64());
@@ -474,13 +474,13 @@ fn shrink(mut program: Program, finding: Finding) -> Finding {
             }
         }
         let mut candidate = program.clone();
-        if writer::shrink_loops(&mut candidate) {
-            if let Some(mut f) = still_fails(&candidate) {
-                f.seed = seed;
-                best = f;
-                program = candidate;
-                progressed = true;
-            }
+        if writer::shrink_loops(&mut candidate)
+            && let Some(mut f) = still_fails(&candidate)
+        {
+            f.seed = seed;
+            best = f;
+            program = candidate;
+            progressed = true;
         }
         if !progressed {
             break;

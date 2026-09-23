@@ -1,3 +1,8 @@
+// Dependency resolution fails on a cold path, once per run; boxing the
+// `toml` error inside `ManifestError` to shrink these `Result`s would change
+// public error types for no measurable gain.
+#![allow(clippy::result_large_err)]
+
 use super::{
     PackageManager,
     manifest::{ManifestError, ManifestKind, PackageManifest},

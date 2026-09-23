@@ -34,7 +34,7 @@ pub(crate) fn position_to_offset(
     let line_end = line_offsets
         .get(line_idx + 1)
         .copied()
-        .unwrap_or_else(|| text.len());
+        .unwrap_or(text.len());
     if line_start > line_end || line_end > text.len() {
         return None;
     }
@@ -67,7 +67,7 @@ pub(crate) fn prev_char_index(text: &str, mut offset: usize) -> Option<(usize, c
     }
 
     let slice = &text[..offset];
-    slice.char_indices().rev().next()
+    slice.char_indices().next_back()
 }
 
 pub(crate) fn char_at_index(text: &str, mut offset: usize) -> Option<(usize, char)> {
@@ -194,7 +194,7 @@ pub(crate) fn identifier_name_at_span<'a>(
     let line_end = line_offsets
         .get(line_idx + 1)
         .copied()
-        .unwrap_or_else(|| text.len());
+        .unwrap_or(text.len());
     if line_start > line_end || line_end > text.len() {
         return None;
     }
@@ -251,10 +251,7 @@ pub(crate) fn base_type_name(ty: &Type) -> Option<String> {
 }
 
 pub(crate) fn method_display_name(full: &str) -> String {
-    full.rsplit(|c| c == ':' || c == '.')
-        .next()
-        .unwrap_or(full)
-        .to_string()
+    full.rsplit([':', '.']).next().unwrap_or(full).to_string()
 }
 
 pub(crate) fn split_type_member(name: &str) -> Option<(String, String, bool)> {
@@ -429,7 +426,7 @@ pub(crate) fn span_for_identifier(
     let line_end = line_offsets
         .get(line_idx + 1)
         .copied()
-        .unwrap_or_else(|| text.len());
+        .unwrap_or(text.len());
     if line_start >= line_end {
         return None;
     }
@@ -447,10 +444,8 @@ pub(crate) fn span_for_identifier(
     };
     let byte_index = if let Some(local_offset) = search_slice.find(name) {
         approx_byte.saturating_add(local_offset)
-    } else if let Some(global_offset) = line_text.find(name) {
-        global_offset
     } else {
-        return None;
+        line_text.find(name)?
     };
     if byte_index > line_text.len() {
         return None;

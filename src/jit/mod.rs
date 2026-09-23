@@ -37,6 +37,11 @@ impl JitCompiler {
         Self
     }
 
+    /// Nothing is compiled here, so there are no loops to charge.
+    pub fn with_gas_checks(self, _checked: bool) -> Self {
+        self
+    }
+
     pub fn compile_trace(
         &mut self,
         _trace: &Trace,
@@ -414,6 +419,11 @@ impl JitState {
         self.function_evictions = alloc::vec![0; count];
     }
 
+    // Function code is compiled for std on x86_64 / aarch64 only.
+    #[cfg_attr(
+        not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        allow(dead_code)
+    )]
     pub(crate) fn function_code(&self, func_idx: usize) -> Option<Rc<CompiledTrace>> {
         self.function_code.get(func_idx).and_then(|c| c.clone())
     }
@@ -425,6 +435,10 @@ impl JitState {
     /// Count a call; true when the function should be compiled now.
     /// `LUST_JIT_NOFN=1` disables whole-function compilation (loop traces
     /// stay on), for bisecting.
+    #[cfg_attr(
+        not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        allow(dead_code)
+    )]
     pub(crate) fn record_function_entry(&mut self, func_idx: usize) -> bool {
         #[cfg(feature = "std")]
         {
@@ -442,6 +456,10 @@ impl JitState {
             .is_some_and(|next| *next != u32::MAX && *count >= *next)
     }
 
+    #[cfg_attr(
+        not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        allow(dead_code)
+    )]
     pub(crate) fn store_function_code(&mut self, func_idx: usize, code: CompiledTrace) {
         let entry = code.entry as usize;
         self.function_code[func_idx] = Some(Rc::new(code));
@@ -450,6 +468,10 @@ impl JitState {
     }
 
     /// The function cannot be compiled: never try again.
+    #[cfg_attr(
+        not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        allow(dead_code)
+    )]
     pub(crate) fn function_not_compilable(&mut self, func_idx: usize) {
         if let Some(next) = self.function_next_compile.get_mut(func_idx) {
             *next = u32::MAX;
@@ -458,6 +480,10 @@ impl JitState {
 
     /// Forget a function's code after an unexpected guard failure; retried
     /// after a delay that doubles per eviction.
+    #[cfg_attr(
+        not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        allow(dead_code)
+    )]
     pub(crate) fn evict_function_code(&mut self, func_idx: usize) {
         if let Some(slot) = self.function_code.get_mut(func_idx) {
             *slot = None;

@@ -418,7 +418,13 @@ fn create_os_create_file_fn() -> Value {
                 ))));
             }
         };
-        match fs::OpenOptions::new().write(true).create(true).open(path) {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            // An existing file is opened as is, not emptied.
+            .truncate(false)
+            .open(path)
+        {
             Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),

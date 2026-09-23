@@ -1534,6 +1534,7 @@ impl TraceRecorder {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_inline_context(
         &mut self,
         function_idx: usize,

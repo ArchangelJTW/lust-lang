@@ -1,8 +1,8 @@
 use super::VM;
 use super::task::{TaskInstance, TaskKind, TaskState};
 use crate::LustError;
+use crate::bytecode::value::EnumObject;
 use crate::bytecode::value::IteratorState;
-use crate::bytecode::value::{EnumObject, StructObject};
 use crate::bytecode::{NativeCallResult, Value, ValueKey, native_fn};
 use crate::number::{LustFloat, LustInt};
 use alloc::format;
@@ -662,7 +662,7 @@ fn create_lua_module(vm: &VM) -> Value {
 
                     // Try to find method on object
                     let method = if let Value::Struct(object) = &unwrapped_obj {
-                        let StructObject { name, .. } = object.as_ref();
+                        let crate::bytecode::value::StructObject { name, .. } = object.as_ref();
                         // #[cfg(feature = "std")]
                         // eprintln!("[call_method] Struct name: {}", name);
 

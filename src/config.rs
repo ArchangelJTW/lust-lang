@@ -89,6 +89,7 @@ pub struct LustConfig {
     /// - Not storing expression types and variable types
     /// - Not storing short-circuit type flow analysis
     /// - Clearing typechecker data immediately after use
+    ///
     /// Intended for constrained no_std environments like ESP32.
     low_memory_mode: bool,
     /// When enabled, strips detailed type information from compiled functions:

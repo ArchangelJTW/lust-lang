@@ -27,6 +27,7 @@ pub(super) use alloc::{
     vec,
     vec::Vec,
 };
+#[cfg(feature = "std")]
 use core::cell::RefCell;
 // FixedState (not hashbrown's DefaultHashBuilder/foldhash RandomState): RandomState
 // resolves its global seed from a per-crate-copy static, so maps created by the host
@@ -37,6 +38,8 @@ mod api;
 mod execution;
 mod tasks;
 mod tracing;
+// Used by the std-only extern stub writers (`externs`, `packages`).
+#[cfg(feature = "std")]
 pub(crate) use self::api::format_doc_comment;
 pub use self::api::{NativeExport, NativeExportParam};
 pub(crate) use self::tracing::JitCallSite;
@@ -308,6 +311,10 @@ impl ShallowKind {
 
 impl ShallowKind {
     /// The JIT's scalar type for this kind, when it is one.
+    #[cfg_attr(
+        not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        allow(dead_code)
+    )]
     pub(super) fn value_type(self) -> Option<crate::jit::trace::ValueType> {
         use crate::jit::trace::ValueType;
         match self {

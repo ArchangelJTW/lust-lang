@@ -57,7 +57,7 @@ pub(crate) fn collect_semantic_tokens_for_module(
 }
 
 fn encode_semantic_tokens(mut raw: Vec<RawSemanticToken>) -> Vec<SemanticToken> {
-    raw.sort_by(|a, b| (a.line, a.start).cmp(&(b.line, b.start)));
+    raw.sort_by_key(|a| (a.line, a.start));
     let mut tokens = Vec::with_capacity(raw.len());
     let mut prev_line = 0u32;
     let mut prev_start = 0u32;
@@ -283,6 +283,7 @@ fn collect_tokens_from_item(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_definition_token(
     text: &str,
     line_offsets: &[usize],
@@ -672,6 +673,7 @@ fn collect_tokens_from_type(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_identifier_token(
     text: &str,
     line_offsets: &[usize],

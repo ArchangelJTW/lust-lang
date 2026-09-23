@@ -1,6 +1,19 @@
 #![allow(non_snake_case, non_camel_case_types, clippy::not_unsafe_ptr_arg_deref)]
+// The `extern "C"` functions below are the Lua 5.1 C API and share its
+// contract, stated once in the module docs instead of on each function.
+#![allow(clippy::missing_safety_doc)]
 //! Lua 5.1 C API compatibility scaffolding.
 //! This module will host the runtime bridge and tracing that drive extern stub generation.
+//!
+//! # Safety
+//!
+//! The exported `lua_*` / `luaL_*` functions follow the Lua 5.1 reference
+//! manual's contract for their C counterparts: a `lua_State` pointer is one
+//! this module created and has not closed (a null pointer is tolerated and
+//! does nothing), stack indices are acceptable indices in the manual's
+//! sense, and every other pointer argument — C strings, buffers, lengths
+//! — is valid for the access the manual describes for the call's
+//! duration.
 
 use crate::bytecode::value::EnumObject;
 use crate::bytecode::{Value, ValueKey, native_fn};
@@ -838,6 +851,9 @@ fn lua_function_from_handle(handle: usize) -> LuaFunction {
     }
 }
 
+// `vm` is unused today but part of the conversion's signature: callers
+// convert inside the VM's context (`VM::with_current`).
+#[allow(clippy::only_used_in_recursion)]
 pub(crate) fn value_to_lua(value: &Value, vm: &VM) -> LuaValue {
     match value {
         Value::Nil => LuaValue::Nil,
@@ -1068,6 +1084,10 @@ impl LuaState {
 
     pub fn len(&self) -> usize {
         self.stack.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stack.is_empty()
     }
 
     pub fn record_call(&mut self, function: impl Into<String>, args: Vec<String>) {
@@ -1422,7 +1442,7 @@ pub fn trace_luaopen(spec: &LuaModuleSpec) -> Result<Vec<LuaOpenResult>, String>
     Ok(results)
 }
 
-/// --- C ABI shims ---
+// --- C ABI shims ---
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn luaL_newstate() -> *mut lua_State {
@@ -3040,6 +3060,72 @@ pub unsafe extern "C" fn luaL_addvalue(B: *mut luaL_Buffer) {
     }
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn luaL_openlibs(_L: *mut lua_State) {
+    // No-op stub for compatibility; libraries will be installed manually as needed.
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lua_newuserdata(L: *mut lua_State, sz: usize) -> *mut c_void {
+    if let Some(state) = state_from_ptr(L) {
+        let id = state.next_userdata_id();
+        let word_size = core::mem::size_of::<usize>();
+        let words = sz.div_ceil(word_size);
+        let mut blob: Box<[usize]> = vec![0usize; words].into_boxed_slice();
+        let ptr = blob.as_mut_ptr() as *mut c_void;
+        state.userdata_storage.insert(id, (blob, sz));
+        state.push(LuaValue::Userdata(LuaUserdata {
+            id,
+            data: ptr,
+            state: L,
+        }));
+        state.record_call("lua_newuserdata", vec![sz.to_string()]);
+        return ptr;
+    }
+    core::ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c_void {
+    if let Some(state) = state_from_ptr(L) {
+        state.record_call("lua_touserdata", vec![idx.to_string()]);
+        if let Some(LuaValue::Userdata(data)) = value_at(state, idx) {
+            return data.data;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lua_tocfunction(L: *mut lua_State, idx: c_int) -> lua_CFunction {
+    if let Some(state) = state_from_ptr(L) {
+        state.record_call("lua_tocfunction", vec![idx.to_string()]);
+        if let Some(LuaValue::Function(func)) = value_at(state, idx) {
+            return func.cfunc;
+        }
+    }
+    None
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lua_topointer(L: *mut lua_State, idx: c_int) -> *const c_void {
+    if let Some(state) = state_from_ptr(L) {
+        state.record_call("lua_topointer", vec![idx.to_string()]);
+        if let Some(value) = value_at(state, idx) {
+            let ptr_val = match value {
+                LuaValue::Table(handle) => Rc::as_ptr(&handle) as *const c_void,
+                LuaValue::Function(f) => &f as *const _ as *const c_void,
+                LuaValue::Userdata(u) => u.data,
+                LuaValue::Thread(t) => &t as *const _ as *const c_void,
+                LuaValue::LightUserdata(p) => p as *const c_void,
+                _ => core::ptr::null(),
+            };
+            return ptr_val;
+        }
+    }
+    core::ptr::null()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3119,78 +3205,12 @@ mod tests {
         let L = unsafe { luaL_newstate() };
         assert!(!L.is_null());
         unsafe {
-            lua_pushstring(L, b"*l\0".as_ptr() as *const c_char);
+            lua_pushstring(L, c"*l".as_ptr());
             assert_eq!(lua_isnumber(L, -1), 0);
             lua_settop(L, 0);
-            lua_pushstring(L, b"123\0".as_ptr() as *const c_char);
+            lua_pushstring(L, c"123".as_ptr());
             assert_eq!(lua_isnumber(L, -1), 1);
             lua_close(L);
         }
     }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn luaL_openlibs(_L: *mut lua_State) {
-    // No-op stub for compatibility; libraries will be installed manually as needed.
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn lua_newuserdata(L: *mut lua_State, sz: usize) -> *mut c_void {
-    if let Some(state) = state_from_ptr(L) {
-        let id = state.next_userdata_id();
-        let word_size = core::mem::size_of::<usize>();
-        let words = sz.div_ceil(word_size);
-        let mut blob: Box<[usize]> = vec![0usize; words].into_boxed_slice();
-        let ptr = blob.as_mut_ptr() as *mut c_void;
-        state.userdata_storage.insert(id, (blob, sz));
-        state.push(LuaValue::Userdata(LuaUserdata {
-            id,
-            data: ptr,
-            state: L,
-        }));
-        state.record_call("lua_newuserdata", vec![sz.to_string()]);
-        return ptr;
-    }
-    core::ptr::null_mut()
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c_void {
-    if let Some(state) = state_from_ptr(L) {
-        state.record_call("lua_touserdata", vec![idx.to_string()]);
-        if let Some(LuaValue::Userdata(data)) = value_at(state, idx) {
-            return data.data;
-        }
-    }
-    core::ptr::null_mut()
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn lua_tocfunction(L: *mut lua_State, idx: c_int) -> lua_CFunction {
-    if let Some(state) = state_from_ptr(L) {
-        state.record_call("lua_tocfunction", vec![idx.to_string()]);
-        if let Some(LuaValue::Function(func)) = value_at(state, idx) {
-            return func.cfunc;
-        }
-    }
-    None
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn lua_topointer(L: *mut lua_State, idx: c_int) -> *const c_void {
-    if let Some(state) = state_from_ptr(L) {
-        state.record_call("lua_topointer", vec![idx.to_string()]);
-        if let Some(value) = value_at(state, idx) {
-            let ptr_val = match value {
-                LuaValue::Table(handle) => Rc::as_ptr(&handle) as *const c_void,
-                LuaValue::Function(f) => &f as *const _ as *const c_void,
-                LuaValue::Userdata(u) => u.data,
-                LuaValue::Thread(t) => &t as *const _ as *const c_void,
-                LuaValue::LightUserdata(p) => p as *const c_void,
-                _ => core::ptr::null(),
-            };
-            return ptr_val;
-        }
-    }
-    core::ptr::null()
 }

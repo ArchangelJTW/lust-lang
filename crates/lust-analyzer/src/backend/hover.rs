@@ -32,7 +32,7 @@ pub(crate) fn hover_for_method_call(
     let line_end = line_offsets
         .get(line_idx + 1)
         .copied()
-        .unwrap_or_else(|| text.len());
+        .unwrap_or(text.len());
     if line_start >= line_end || line_end > text.len() {
         return None;
     }
@@ -86,10 +86,7 @@ pub(crate) fn hover_for_method_call(
     let method_end_byte = method_start_byte + method_segment.len();
     let start_offset = line_start + method_start_byte;
     let end_offset = line_start + method_end_byte;
-    let next_char = text[end_offset..]
-        .chars()
-        .skip_while(|c| c.is_whitespace())
-        .next();
+    let next_char = text[end_offset..].chars().find(|c| !c.is_whitespace());
     if next_char != Some('(') {
         return None;
     }

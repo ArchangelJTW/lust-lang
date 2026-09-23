@@ -385,9 +385,7 @@ impl EmbeddedProgram {
     where
         F: Fn(&[Value]) -> std::result::Result<NativeCallResult, String> + 'static,
     {
-        let native_fn: Rc<dyn Fn(&[Value]) -> std::result::Result<NativeCallResult, String>> =
-            Rc::new(func);
-        let value = Value::NativeFunction(Rc::new(native_fn));
+        let value = Value::NativeFunction(native_fn(func));
         let mut aliases: Vec<String> = Vec::new();
         aliases.push(canonical.clone());
         let canonical_normalized = normalize_global_name(&canonical);

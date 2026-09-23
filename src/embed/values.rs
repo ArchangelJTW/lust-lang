@@ -10,9 +10,12 @@ use std::cell::{Ref, RefCell, RefMut};
 use std::ops::Deref;
 use std::rc::Rc;
 
+/// Whether a value matches a declared type (see `TypedValue`).
+type TypeMatcher = Box<dyn Fn(&Value, &Type) -> bool>;
+
 pub struct TypedValue {
     value: Value,
-    matcher: Box<dyn Fn(&Value, &Type) -> bool>,
+    matcher: TypeMatcher,
     description: &'static str,
 }
 

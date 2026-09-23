@@ -10,7 +10,9 @@
 //! binary, mutual) whose depth is bounded by their first argument,
 //! function-typed values (named `function(int): int` helpers and closures
 //! capturing locals) called directly and through the `apply`/`twice`
-//! prelude, `Array<int>` push/len/index, `Map<int, int>`, a struct with
+//! prelude, arrays of int, float, bool and string and arrays of arrays
+//! (push, index assignment, checked reads, and writes through an inner
+//! array read out of an outer one), `Map<int, int>`, a struct with
 //! int/float/bool fields, `Option<int>`, and pair-returning helpers with
 //! destructuring. Every observation is appended to a string the entry
 //! function returns, so the two engines' outputs can be compared directly.
@@ -24,6 +26,13 @@ pub enum Ty {
     Float,
     Bool,
     ArrInt,
+    ArrFloat,
+    ArrBool,
+    ArrStr,
+    /// `Array<Array<int>>`: its elements are only ever fresh literals, so
+    /// an inner array is reachable from one outer array and from the
+    /// aliases `if outer[i] is Ok(inner)` binds, never from a named local.
+    ArrArr,
     Struct,
     OptInt,
     Str,
@@ -44,6 +53,10 @@ impl Ty {
             Ty::Float => "float",
             Ty::Bool => "bool",
             Ty::ArrInt => "Array<int>",
+            Ty::ArrFloat => "Array<float>",
+            Ty::ArrBool => "Array<bool>",
+            Ty::ArrStr => "Array<string>",
+            Ty::ArrArr => "Array<Array<int>>",
             Ty::Struct => "P",
             Ty::OptInt => "Option<int>",
             Ty::Str => "string",
@@ -51,6 +64,26 @@ impl Ty {
             Ty::FnIntInt => "function(int): int",
             Ty::MapIntInt => "Map<int, int>",
             Ty::OptStruct => "Option<P>",
+        }
+    }
+
+    const ARRAYS: [Ty; 5] = [
+        Ty::ArrInt,
+        Ty::ArrFloat,
+        Ty::ArrBool,
+        Ty::ArrStr,
+        Ty::ArrArr,
+    ];
+
+    /// The element type of an array type.
+    fn element(self) -> Option<Ty> {
+        match self {
+            Ty::ArrInt => Some(Ty::Int),
+            Ty::ArrFloat => Some(Ty::Float),
+            Ty::ArrBool => Some(Ty::Bool),
+            Ty::ArrStr => Some(Ty::Str),
+            Ty::ArrArr => Some(Ty::ArrInt),
+            _ => None,
         }
     }
 }
@@ -802,6 +835,16 @@ impl Gen {
             .collect()
     }
 
+    /// Variables of any array type.
+    fn array_vars(&self) -> Vec<Var> {
+        self.scopes
+            .iter()
+            .flatten()
+            .filter(|v| Ty::ARRAYS.contains(&v.ty))
+            .cloned()
+            .collect()
+    }
+
     fn mutable_vars_of(&self, ty: Ty) -> Vec<Var> {
         self.scopes
             .iter()
@@ -1463,6 +1506,23 @@ impl Gen {
         {
             stmts.push(Stmt::Observe(e));
         }
+        if entry {
+            // Every array `run` declared, whole, at the end: a write inside
+            // a loop that a trace lost or put in the wrong array shows here
+            // even if nothing read it back (an observation inside the loop
+            // would itself change what the JIT does there).
+            let arrays: Vec<String> = self
+                .scopes
+                .last()
+                .unwrap()
+                .iter()
+                .filter(|v| Ty::ARRAYS.contains(&v.ty))
+                .map(|v| v.name.clone())
+                .collect();
+            for arr in arrays {
+                stmts.push(Stmt::Observe(Expr::Var(arr)));
+            }
+        }
         self.depth -= 1;
         self.scopes.pop();
         stmts
@@ -1474,9 +1534,16 @@ impl Gen {
         if !vars.is_empty() && self.rng.chance(0.75) {
             return Some(Expr::Var(self.rng.pick(&vars).name.clone()));
         }
-        let arrays = self.vars_of(Ty::ArrInt);
+        let arrays = self.array_vars();
         if !arrays.is_empty() && self.rng.chance(0.3) {
-            return Some(Expr::ArrLen(self.rng.pick(&arrays).name.clone()));
+            let arr = self.rng.pick(&arrays).name.clone();
+            // The whole array (`tostring` prints its elements) catches a
+            // write that went missing or landed in the wrong array.
+            return Some(if self.rng.chance(0.5) {
+                Expr::Var(arr)
+            } else {
+                Expr::ArrLen(arr)
+            });
         }
         Some(self.expr(ty, 2))
     }
@@ -1551,7 +1618,7 @@ impl Gen {
     }
 
     fn local(&mut self) -> Stmt {
-        let ty = match self.rng.below(19) {
+        let ty = match self.rng.below(23) {
             0..=3 => Ty::Int,
             4..=5 => Ty::Float,
             6 => Ty::Bool,
@@ -1562,13 +1629,21 @@ impl Gen {
             13 => Ty::Unknown,
             14..=15 => Ty::FnIntInt,
             16 => Ty::OptStruct,
-            _ => Ty::MapIntInt,
+            17 => Ty::MapIntInt,
+            18 => Ty::ArrFloat,
+            19 => Ty::ArrBool,
+            20 => Ty::ArrStr,
+            _ => Ty::ArrArr,
         };
         let name = self.fresh(match ty {
             Ty::Int => "n",
             Ty::Float => "x",
             Ty::Bool => "b",
             Ty::ArrInt => "arr",
+            Ty::ArrFloat => "af",
+            Ty::ArrBool => "ab",
+            Ty::ArrStr => "as",
+            Ty::ArrArr => "aa",
             Ty::Struct => "p",
             Ty::OptInt => "o",
             Ty::Str => "s",
@@ -1586,6 +1661,24 @@ impl Gen {
     }
 
     fn assign(&mut self) -> Option<Stmt> {
+        if self.rng.chance(0.1) {
+            // An array local replaced by a fresh literal: never another
+            // variable, so no two names share an array a `for … in` could
+            // be walking while the other grows it.
+            let arrays: Vec<Var> = self.array_vars().into_iter().filter(|v| !v.fixed).collect();
+            if !arrays.is_empty() {
+                let var = self.rng.pick(&arrays).clone();
+                let expr = self.expr(var.ty, 2);
+                if let Expr::ArrLit(items) = &expr {
+                    let bound = self.array_bounds.entry(var.name.clone()).or_insert(0);
+                    *bound = (*bound).max(items.len() as i64);
+                }
+                return Some(Stmt::Assign {
+                    name: var.name,
+                    expr,
+                });
+            }
+        }
         let ty = *self.rng.pick(&[
             Ty::Int,
             Ty::Int,
@@ -1675,7 +1768,11 @@ impl Gen {
     }
 
     fn for_in_loop(&mut self) -> Option<Stmt> {
-        let vars = self.vars_of(Ty::ArrInt);
+        let vars: Vec<Var> = self
+            .vars_of(Ty::ArrInt)
+            .into_iter()
+            .filter(|v| !v.fixed)
+            .collect();
         if vars.is_empty() {
             return Some(self.for_loop());
         }
@@ -1785,7 +1882,7 @@ impl Gen {
     /// Arrays that may be resized here: not the ones an enclosing
     /// `for … in` is walking.
     fn resizable_arrays(&self) -> Vec<Var> {
-        self.vars_of(Ty::ArrInt)
+        self.array_vars()
             .into_iter()
             .filter(|v| !self.iterating.contains(&v.name))
             .collect()
@@ -1796,8 +1893,9 @@ impl Gen {
         if vars.is_empty() {
             return Some(self.local());
         }
-        let arr = self.rng.pick(&vars).name.clone();
-        let expr = self.expr(Ty::Int, 2);
+        let var = self.rng.pick(&vars).clone();
+        let arr = var.name;
+        let expr = self.expr(var.ty.element().unwrap(), 2);
         let bound = self.array_bounds.entry(arr.clone()).or_insert(0);
         *bound = (*bound + self.iter_scale).min(MAX_WORK);
         Some(Stmt::Push { arr, expr })
@@ -1806,32 +1904,94 @@ impl Gen {
     /// `arr[idx] = e`: the index is usually in range (a counter or a
     /// literal below what has been pushed so far), sometimes anything.
     fn set_index(&mut self) -> Option<Stmt> {
-        let vars = self.vars_of(Ty::ArrInt);
+        let vars = self.array_vars();
         if vars.is_empty() {
             return Some(self.local());
         }
-        let arr = self.rng.pick(&vars).name.clone();
+        let var = self.rng.pick(&vars).clone();
+        let arr = var.name;
         let pushed = self.array_bounds.get(&arr).copied().unwrap_or(0);
         let idx = if pushed > 0 && self.rng.below(4) != 0 {
             Expr::Int(self.rng.below(pushed as u64) as i64)
         } else {
             self.expr(Ty::Int, 2)
         };
-        let expr = self.expr(Ty::Int, 2);
+        let expr = self.expr(var.ty.element().unwrap(), 2);
         Some(Stmt::SetIndex { arr, idx, expr })
     }
 
     fn if_index(&mut self) -> Option<Stmt> {
-        let vars = self.vars_of(Ty::ArrInt);
+        let vars = self.array_vars();
         if vars.is_empty() {
             return Some(self.local());
         }
-        let arr = self.rng.pick(&vars).name.clone();
-        let idx = self.expr(Ty::Int, 2);
+        // Arrays of arrays often, preferably one declared outside the
+        // current block (inside a loop, one that outlives the iteration):
+        // the inner array a read binds is an alias the body can write
+        // through, and a trace entered with last iteration's alias in the
+        // register holds a copy of that inner array.
+        let outer: Vec<Var> = self.scopes[..self.scopes.len() - 1]
+            .iter()
+            .flatten()
+            .filter(|v| v.ty == Ty::ArrArr)
+            .cloned()
+            .collect();
+        let nested: Vec<Var> = if !outer.is_empty() && self.rng.chance(0.7) {
+            outer
+        } else {
+            vars.iter()
+                .filter(|v| v.ty == Ty::ArrArr)
+                .cloned()
+                .collect()
+        };
+        let picked = if !nested.is_empty() && self.rng.chance(0.5) {
+            self.rng.pick(&nested).clone()
+        } else {
+            self.rng.pick(&vars).clone()
+        };
+        let arr = picked.name;
+        let pushed = self.array_bounds.get(&arr).copied().unwrap_or(0);
+        let idx = if pushed > 0 && self.rng.chance(0.5) {
+            Expr::Int(self.rng.below(pushed as u64) as i64)
+        } else {
+            self.expr(Ty::Int, 2)
+        };
         let var = self.fresh("v");
         self.scopes.push(Vec::new());
-        self.declare(&var, Ty::Int, true);
-        let body = self.block(false);
+        // Fixed, like every pattern-bound name; an inner array bound here
+        // is an alias of an element of `arr`, which the body may push to
+        // or assign into, but never walk with `for … in`.
+        self.declare(&var, picked.ty.element().unwrap(), true);
+        let alias_write = picked.ty == Ty::ArrArr && self.rng.chance(0.75);
+        // Often nothing but the write: a body that calls a native (an
+        // observation's `tostring`) makes the recorder give the unboxed
+        // copy up, and with it the case worth testing.
+        let mut body = if alias_write && self.rng.chance(0.5) {
+            Vec::new()
+        } else {
+            self.block(false)
+        };
+        if alias_write {
+            // Write into the inner array through the alias, first thing:
+            // the element of `arr` changes without `arr` being named.
+            let expr = self.expr(Ty::Int, 2);
+            let write = if self.rng.chance(0.6) {
+                let bound = self.array_bounds.entry(var.clone()).or_insert(0);
+                *bound = (*bound + self.iter_scale).min(MAX_WORK);
+                Stmt::Push {
+                    arr: var.clone(),
+                    expr,
+                }
+            } else {
+                let idx = Expr::Int(self.rng.below(3) as i64);
+                Stmt::SetIndex {
+                    arr: var.clone(),
+                    idx,
+                    expr,
+                }
+            };
+            body.insert(0, write);
+        }
         self.scopes.pop();
         Some(Stmt::IfIndex {
             arr,
@@ -1865,6 +2025,17 @@ impl Gen {
             Ty::ArrInt => {
                 let n = self.rng.below(5) as usize;
                 let items = (0..n).map(|_| self.int_expr(1)).collect();
+                Expr::ArrLit(items)
+            }
+            Ty::ArrFloat | Ty::ArrBool | Ty::ArrStr => {
+                let element = ty.element().unwrap();
+                let n = self.rng.below(5) as usize;
+                let items = (0..n).map(|_| self.expr(element, 1)).collect();
+                Expr::ArrLit(items)
+            }
+            Ty::ArrArr => {
+                let n = self.rng.below(4) as usize;
+                let items = (0..n).map(|_| self.expr(Ty::ArrInt, 1)).collect();
                 Expr::ArrLit(items)
             }
             Ty::Struct => {
@@ -1938,7 +2109,12 @@ impl Gen {
                     }
                 }
                 8 => {
-                    let arrays = self.resizable_arrays();
+                    // `array.pop` here is an `Option<int>`.
+                    let arrays: Vec<Var> = self
+                        .resizable_arrays()
+                        .into_iter()
+                        .filter(|v| v.ty == Ty::ArrInt)
+                        .collect();
                     match arrays.is_empty() {
                         true => Expr::None,
                         false => Expr::ArrayPop(self.rng.pick(&arrays).name.clone()),
@@ -2163,7 +2339,7 @@ impl Gen {
                 }
             }
             80..=82 => {
-                let vars = self.vars_of(Ty::ArrInt);
+                let vars = self.array_vars();
                 if vars.is_empty() {
                     self.int_lit()
                 } else {

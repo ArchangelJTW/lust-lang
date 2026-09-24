@@ -35,10 +35,9 @@ end
 "#;
 
 fn main() -> lust::Result<()> {
-    assert!(
-        cfg!(any(target_arch = "x86_64", target_arch = "aarch64")),
-        "this benchmark targets x86_64 or aarch64"
-    );
+    if !cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
+        panic!("this benchmark targets x86_64 or aarch64");
+    }
     for jit in [false, true] {
         let mut config = LustConfig::default();
         config.set_jit_enabled(jit);

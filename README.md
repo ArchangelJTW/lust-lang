@@ -274,8 +274,10 @@ backend change:
   differential fuzzer (a workspace member, so it is not built by a plain
   `cargo build`). `lust-fuzz run --cases 20000 --size 4 --jobs 6 --keep-going`
   generates programs (loops, branches, calls, recursion, function values and
-  closures, arrays with pushes and index assignment, maps, structs, options,
-  strings, pair returns), runs each
+  closures, arrays of int, float, bool and string and arrays of arrays —
+  pushed to, assigned into, read, replaced, and written through an inner
+  array read out of an outer one — maps, structs, options, strings, pair
+  returns), runs each
   both ways in-process and reports every disagreement with a shrunk
   reproducer. Helpers take and return structs (often the parameter
   itself) and `Option<P>`, walk a `next` chain of structs (which a

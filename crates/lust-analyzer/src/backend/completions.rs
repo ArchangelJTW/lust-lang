@@ -166,10 +166,12 @@ pub(crate) fn struct_field_completions(
                 continue;
             }
 
-            let mut item = CompletionItem::default();
-            item.label = field.name.clone();
-            item.kind = Some(CompletionItemKind::FIELD);
-            item.detail = Some(field.ty.to_string());
+            let item = CompletionItem {
+                label: field.name.clone(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some(field.ty.to_string()),
+                ..Default::default()
+            };
             items.push(item);
         }
     }
@@ -206,9 +208,11 @@ pub(crate) fn enum_variant_completions(
                 continue;
             }
 
-            let mut item = CompletionItem::default();
-            item.label = variant.name.clone();
-            item.kind = Some(CompletionItemKind::ENUM_MEMBER);
+            let mut item = CompletionItem {
+                label: variant.name.clone(),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                ..Default::default()
+            };
             if let Some(fields) = &variant.fields {
                 let field_types = fields
                     .iter()
@@ -242,9 +246,11 @@ pub(crate) fn enum_variant_completions(
                 continue;
             }
 
-            let mut item = CompletionItem::default();
-            item.label = variant_name.to_string();
-            item.kind = Some(CompletionItemKind::ENUM_MEMBER);
+            let mut item = CompletionItem {
+                label: variant_name.to_string(),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                ..Default::default()
+            };
             if arity > 0 {
                 item.detail = Some(format!("{} variant", variant_name));
                 let snippet_args = (0..arity)
@@ -284,9 +290,11 @@ pub(crate) fn identifier_completions(
             return;
         }
 
-        let mut item = CompletionItem::default();
-        item.label = name;
-        item.kind = Some(kind);
+        let mut item = CompletionItem {
+            label: name,
+            kind: Some(kind),
+            ..Default::default()
+        };
         if let Some(detail) = detail {
             if !detail.is_empty() {
                 item.detail = Some(detail);
@@ -468,10 +476,12 @@ pub(crate) fn identifier_completions(
             continue;
         }
 
-        let mut item = CompletionItem::default();
-        item.label = label;
-        item.kind = Some(CompletionItemKind::MODULE);
-        item.detail = Some(module.description().to_string());
+        let mut item = CompletionItem {
+            label,
+            kind: Some(CompletionItemKind::MODULE),
+            detail: Some(module.description().to_string()),
+            ..Default::default()
+        };
         item.documentation = Some(Documentation::MarkupContent(MarkupContent {
             kind: MarkupKind::Markdown,
             value: module.description().to_string(),
@@ -498,9 +508,11 @@ pub(crate) fn identifier_completions(
             TypeDefinitionKind::Enum => CompletionItemKind::ENUM,
             TypeDefinitionKind::Trait => CompletionItemKind::INTERFACE,
         };
-        let mut item = CompletionItem::default();
-        item.label = label;
-        item.kind = Some(kind);
+        let mut item = CompletionItem {
+            label,
+            kind: Some(kind),
+            ..Default::default()
+        };
         if !def.layout.is_empty() {
             item.detail = Some(def.layout.clone());
             item.documentation = completion_documentation(&def.layout, "");
@@ -569,9 +581,11 @@ pub(crate) fn module_alias_member_completions(
             return;
         }
 
-        let mut item = CompletionItem::default();
-        item.label = name;
-        item.kind = Some(kind);
+        let mut item = CompletionItem {
+            label: name,
+            kind: Some(kind),
+            ..Default::default()
+        };
         if let Some(detail) = detail {
             item.detail = Some(detail);
         }
@@ -609,7 +623,7 @@ pub(crate) fn module_alias_member_completions(
 
     if let Some(target) = snapshot.module_for_name(&resolved_path) {
         let mut functions: Vec<_> = target.module.exports.functions.iter().collect();
-        functions.sort_by(|(a, _), (b, _)| a.cmp(b));
+        functions.sort_by_key(|(a, _)| *a);
         for (name, qualified) in functions {
             push_item(
                 name.clone(),
@@ -619,7 +633,7 @@ pub(crate) fn module_alias_member_completions(
         }
 
         let mut types: Vec<_> = target.module.exports.types.iter().collect();
-        types.sort_by(|(a, _), (b, _)| a.cmp(b));
+        types.sort_by_key(|(a, _)| *a);
         for (name, qualified) in types {
             let kind = type_completion_kind(snapshot, qualified);
             push_item(name.clone(), kind, Some(qualified.clone()));
@@ -649,9 +663,11 @@ pub(crate) fn module_path_completions(
             return;
         }
 
-        let mut item = CompletionItem::default();
-        item.label = name;
-        item.kind = Some(kind);
+        let mut item = CompletionItem {
+            label: name,
+            kind: Some(kind),
+            ..Default::default()
+        };
         if let Some(detail) = detail {
             item.detail = Some(detail);
         }
@@ -675,7 +691,7 @@ pub(crate) fn module_path_completions(
 
     if let Some(target) = snapshot.module_for_name(&resolved_path) {
         let mut functions: Vec<_> = target.module.exports.functions.iter().collect();
-        functions.sort_by(|(a, _), (b, _)| a.cmp(b));
+        functions.sort_by_key(|(a, _)| *a);
         for (name, qualified) in functions {
             push_item(
                 name.clone(),
@@ -685,7 +701,7 @@ pub(crate) fn module_path_completions(
         }
 
         let mut types: Vec<_> = target.module.exports.types.iter().collect();
-        types.sort_by(|(a, _), (b, _)| a.cmp(b));
+        types.sort_by_key(|(a, _)| *a);
         for (name, qualified) in types {
             let kind = type_completion_kind(snapshot, qualified);
             push_item(name.clone(), kind, Some(qualified.clone()));
@@ -849,11 +865,13 @@ fn function_completion(func: &BuiltinFunction, module: Option<&str>) -> Completi
         func.name.to_string()
     };
     let (insert_text, insert_format) = build_insert_text(&label, func.param_names);
-    let mut item = CompletionItem::default();
-    item.label = label;
-    item.kind = Some(CompletionItemKind::FUNCTION);
-    item.insert_text = Some(insert_text);
-    item.insert_text_format = insert_format;
+    let mut item = CompletionItem {
+        label,
+        kind: Some(CompletionItemKind::FUNCTION),
+        insert_text: Some(insert_text),
+        insert_text_format: insert_format,
+        ..Default::default()
+    };
     let detail = function_detail(func, module);
     item.detail = Some(detail.clone());
     item.documentation = completion_documentation(&detail, func.description);
@@ -876,11 +894,13 @@ fn method_detail(method: &BuiltinMethod) -> String {
 
 fn method_completion(method: &BuiltinMethod) -> CompletionItem {
     let (insert_text, insert_format) = build_insert_text(method.name, method.param_names);
-    let mut item = CompletionItem::default();
-    item.label = method.name.to_string();
-    item.kind = Some(CompletionItemKind::METHOD);
-    item.insert_text = Some(insert_text);
-    item.insert_text_format = insert_format;
+    let mut item = CompletionItem {
+        label: method.name.to_string(),
+        kind: Some(CompletionItemKind::METHOD),
+        insert_text: Some(insert_text),
+        insert_text_format: insert_format,
+        ..Default::default()
+    };
     let detail = method_detail(method);
     item.detail = Some(detail.clone());
     item.documentation = completion_documentation(&detail, method.description);
@@ -981,11 +1001,13 @@ pub(crate) fn static_method_completions(
             }
 
             let (insert_text, insert_format) = method_insert_text(method);
-            let mut item = CompletionItem::default();
-            item.label = method.name.clone();
-            item.kind = Some(CompletionItemKind::FUNCTION);
-            item.detail = Some(format_method_signature(method));
-            item.insert_text = Some(insert_text);
+            let mut item = CompletionItem {
+                label: method.name.clone(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some(format_method_signature(method)),
+                insert_text: Some(insert_text),
+                ..Default::default()
+            };
             if let Some(format) = insert_format {
                 item.insert_text_format = Some(format);
             }
@@ -1036,11 +1058,13 @@ pub(crate) fn instance_method_completions(
             }
 
             let (insert_text, insert_format) = method_insert_text(method);
-            let mut item = CompletionItem::default();
-            item.label = method.name.clone();
-            item.kind = Some(CompletionItemKind::METHOD);
-            item.detail = Some(format_method_signature(method));
-            item.insert_text = Some(insert_text);
+            let mut item = CompletionItem {
+                label: method.name.clone(),
+                kind: Some(CompletionItemKind::METHOD),
+                detail: Some(format_method_signature(method)),
+                insert_text: Some(insert_text),
+                ..Default::default()
+            };
             if let Some(format) = insert_format {
                 item.insert_text_format = Some(format);
             }
@@ -1253,7 +1277,7 @@ pub(crate) fn analyze_pattern_context(text: &str, offset: usize) -> Option<Compl
     Some(CompletionContext {
         kind: CompletionKind::Pattern,
         object_start: Some(object_start),
-        object_end: object_end,
+        object_end,
         object_name: Some(object_name),
         prefix,
         path_segments: Vec::new(),
@@ -1387,12 +1411,11 @@ fn is_within_use_item(items: &[Item], position: &Position) -> bool {
                 }
             }
 
-            ItemKind::Module { items: inner, .. } => {
+            ItemKind::Module { items: inner, .. }
                 if span_contains_position(item.span, position)
-                    && is_within_use_item(inner, position)
-                {
-                    return true;
-                }
+                    && is_within_use_item(inner, position) =>
+            {
+                return true;
             }
 
             _ => {}
@@ -1739,18 +1762,16 @@ fn stmts_contain_position(stmts: &[Stmt], position: &Position) -> bool {
                 elseif_branches,
                 else_block,
                 ..
-            } => {
-                if stmts_contain_position(then_block, position)
-                    || elseif_branches
-                        .iter()
-                        .any(|(_, branch)| stmts_contain_position(branch, position))
-                    || else_block
-                        .as_ref()
-                        .map(|block| stmts_contain_position(block, position))
-                        .unwrap_or(false)
-                {
-                    return true;
-                }
+            } if (stmts_contain_position(then_block, position)
+                || elseif_branches
+                    .iter()
+                    .any(|(_, branch)| stmts_contain_position(branch, position))
+                || else_block
+                    .as_ref()
+                    .map(|block| stmts_contain_position(block, position))
+                    .unwrap_or(false)) =>
+            {
+                return true;
             }
 
             _ => {}
@@ -2008,7 +2029,7 @@ pub(crate) fn resolve_base_type_name_for_context(
         }
     }
 
-    let mut base_name = value_type.as_ref().and_then(|ty| base_type_name(ty));
+    let mut base_name = value_type.as_ref().and_then(base_type_name);
     if base_name.is_none() {
         base_name =
             infer_struct_literal_base_name(text, context.object_end, module, snapshot, module_path);

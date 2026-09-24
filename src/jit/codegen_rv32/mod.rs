@@ -81,6 +81,10 @@ pub struct JitCompiler {
     pub(super) specialization_registry: SpecializationRegistry,
     pub(super) specialized_values: HashMap<usize, SpecializedValue>,
     pub(super) next_specialized_id: usize,
+    /// Compiling under a gas budget, which this backend cannot charge
+    /// inside a loop: `compile_trace` then declines, and the interpreter
+    /// runs the loop (see `JitCells::gas_left` for the other backends).
+    gas_checked: bool,
 }
 
 impl Default for JitCompiler {

@@ -883,6 +883,7 @@ impl VM {
                             && object.enum_name == "LuaValue"
                             && (object.variant == "Table" || object.variant == "Userdata")
                         {
+                            #[cfg(feature = "std")]
                             let EnumObject { variant, .. } = object.as_ref();
                             #[cfg(feature = "std")]
                             eprintln!(
@@ -1420,7 +1421,7 @@ impl VM {
                         let key = (
                             Rc::as_ptr(&receiver.layout) as usize,
                             func_idx,
-                            method_name_idx as u16,
+                            method_name_idx,
                         );
                         if let Some(&target) = self.method_cache.get(&key) {
                             let mut args = core::mem::take(&mut self.arg_scratch);
@@ -1470,7 +1471,7 @@ impl VM {
                                 let StructObject { layout, .. } = object.as_ref();
                                 let caller = self.call_stack.last().unwrap().function_idx;
                                 self.method_cache.insert(
-                                    (Rc::as_ptr(layout) as usize, caller, method_name_idx as u16),
+                                    (Rc::as_ptr(layout) as usize, caller, method_name_idx),
                                     func_idx,
                                 );
                             }

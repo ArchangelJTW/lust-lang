@@ -1557,11 +1557,12 @@ impl TypeChecker {
                         return Ok(expected.clone());
                     }
 
-                    TypeKind::GenericInstance { name, type_args } => {
-                        if name == &enum_def.name && type_args.len() == enum_def.type_params.len() {
-                            self.validate_type(expected)?;
-                            return Ok(expected.clone());
-                        }
+                    TypeKind::GenericInstance { name, type_args }
+                        if name == &enum_def.name
+                            && type_args.len() == enum_def.type_params.len() =>
+                    {
+                        self.validate_type(expected)?;
+                        return Ok(expected.clone());
                     }
 
                     _ => {}

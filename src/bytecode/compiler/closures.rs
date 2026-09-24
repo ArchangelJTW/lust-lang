@@ -135,9 +135,10 @@ impl Compiler {
                 self.find_free_vars_in_expr(expr, free_vars, bound_vars);
             }
 
-            ExprKind::IsPattern { expr, pattern } => {
+            // A pattern binds names but reads none (its literals and type
+            // tests are constants), so only the scrutinee can be free.
+            ExprKind::IsPattern { expr, .. } => {
                 self.find_free_vars_in_expr(expr, free_vars, bound_vars);
-                self.find_free_vars_in_pattern(pattern, free_vars, bound_vars);
             }
 
             ExprKind::Range { start, end, .. } => {
@@ -282,30 +283,6 @@ impl Compiler {
             }
 
             StmtKind::Break | StmtKind::Continue => {}
-        }
-    }
-
-    pub(super) fn find_free_vars_in_pattern(
-        &self,
-        pattern: &crate::ast::Pattern,
-        free_vars: &mut HashSet<String>,
-        bound_vars: &HashSet<String>,
-    ) {
-        use crate::ast::Pattern;
-        match pattern {
-            Pattern::Wildcard | Pattern::Literal(_) | Pattern::TypeCheck(_) => {}
-            Pattern::Identifier(_) => {}
-            Pattern::Enum { bindings, .. } => {
-                for binding in bindings {
-                    self.find_free_vars_in_pattern(binding, free_vars, bound_vars);
-                }
-            }
-
-            Pattern::Struct { fields, .. } => {
-                for (_, pat) in fields {
-                    self.find_free_vars_in_pattern(pat, free_vars, bound_vars);
-                }
-            }
         }
     }
 }

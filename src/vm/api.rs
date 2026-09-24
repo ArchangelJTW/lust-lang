@@ -78,6 +78,7 @@ impl NativeExport {
 
 /// Formats a doc string as Lust doc comments (`--- text`), one `---` line per
 /// source line, indented by `indent`.
+#[cfg(feature = "std")]
 pub(crate) fn format_doc_comment(doc: &str, indent: &str) -> String {
     let mut out = String::new();
     for line in doc.lines() {

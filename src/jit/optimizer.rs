@@ -1,7 +1,7 @@
 use crate::bytecode::{Register, Value};
 use crate::jit;
 use crate::jit::trace::{Trace, TraceOp};
-use alloc::{format, string::ToString, vec::Vec};
+use alloc::{format, string::ToString, vec, vec::Vec};
 use hashbrown::{HashMap, HashSet};
 pub struct TraceOptimizer {
     hoisted_constants: Vec<(Register, Value)>,
@@ -906,6 +906,18 @@ impl Default for TraceOptimizer {
     }
 }
 
+/// Constants are compared structurally; two `LoadConst`s targeting the same
+/// register are only interchangeable if they load the very same value.
+fn values_identical(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Nil, Value::Nil) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1091,17 +1103,5 @@ mod tests {
             })
             .collect();
         assert_eq!(guarded_registers, vec![0, 2]);
-    }
-}
-
-/// Constants are compared structurally; two `LoadConst`s targeting the same
-/// register are only interchangeable if they load the very same value.
-fn values_identical(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
-        (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::Nil, Value::Nil) => true,
-        _ => false,
     }
 }

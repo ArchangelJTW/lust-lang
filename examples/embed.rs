@@ -280,27 +280,27 @@ fn main() -> lust::Result<()> {
         println!("Async fetch returned {value}");
     }
 
-    if let Some(lust_point_value) = program.get_global_value("main.lust_point") {
-        if let Ok(lust_point_struct) = StructInstance::from_value(lust_point_value) {
-            println!(
-                "Read Lust Point ({}, {}, \"{}\")",
-                lust_point_struct.field::<i64>("x")?,
-                lust_point_struct.field::<i64>("y")?,
-                lust_point_struct.field::<String>("name")?
-            );
-        }
+    if let Some(lust_point_value) = program.get_global_value("main.lust_point")
+        && let Ok(lust_point_struct) = StructInstance::from_value(lust_point_value)
+    {
+        println!(
+            "Read Lust Point ({}, {}, \"{}\")",
+            lust_point_struct.field::<i64>("x")?,
+            lust_point_struct.field::<i64>("y")?,
+            lust_point_struct.field::<String>("name")?
+        );
     }
 
-    if let Some(map_value) = program.get_global_value("main.map_global") {
-        if let Ok(map) = MapHandle::from_value(map_value) {
-            map.insert("three", Value::Int(3));
-            let snapshot = map.with_ref(|view| {
-                view.iter()
-                    .map(|(k, v)| (format!("{:?}", k), v.as_int().unwrap_or_default()))
-                    .collect::<Vec<_>>()
-            });
-            println!("Modified map = {:?}", snapshot);
-        }
+    if let Some(map_value) = program.get_global_value("main.map_global")
+        && let Ok(map) = MapHandle::from_value(map_value)
+    {
+        map.insert("three", Value::Int(3));
+        let snapshot = map.with_ref(|view| {
+            view.iter()
+                .map(|(k, v)| (format!("{:?}", k), v.as_int().unwrap_or_default()))
+                .collect::<Vec<_>>()
+        });
+        println!("Modified map = {:?}", snapshot);
     }
 
     if let Ok(dir) = std::env::var("LUST_DUMP_EXTERNS") {

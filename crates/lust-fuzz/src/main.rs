@@ -12,8 +12,8 @@
 
 mod alloc_count;
 mod engine;
-mod writer;
 mod rng;
+mod writer;
 
 #[global_allocator]
 static ALLOCATOR: alloc_count::Counting = alloc_count::Counting;
@@ -46,7 +46,10 @@ enum Kind {
     Disagree { interp: Answer, jit: Answer },
     /// Running the program left allocations behind, twice in a row (see
     /// `alloc_count`): a reference count somewhere is never given back.
-    Leak { engine: &'static str, allocations: isize },
+    Leak {
+        engine: &'static str,
+        allocations: isize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -83,7 +86,9 @@ impl Stats {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: lust-fuzz run --cases N [--seed S] [--size K] [--jobs J] [--keep-going] [--no-shrink] [--fg]");
+    eprintln!(
+        "usage: lust-fuzz run --cases N [--seed S] [--size K] [--jobs J] [--keep-going] [--no-shrink] [--fg]"
+    );
     eprintln!("       lust-fuzz one --seed S [--size K]");
     eprintln!("       lust-fuzz replay --seed S [--size K]");
     std::process::exit(64)
@@ -164,7 +169,10 @@ fn main() {
     // takes the whole run down; at least say which seed did it.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        eprintln!("\n=== panic while running seed {} ===", CURRENT_SEED.with(|c| c.get()));
+        eprintln!(
+            "\n=== panic while running seed {} ===",
+            CURRENT_SEED.with(|c| c.get())
+        );
         default_hook(info);
     }));
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -249,7 +257,7 @@ fn run(s: &Settings) {
     let totals: Mutex<Stats> = Mutex::new(Stats::default());
     let start = Instant::now();
     std::thread::scope(|scope| {
-        for w in 0..s.jobs {
+        for slot in in_flight.iter().take(s.jobs) {
             let (next, stop, done, findings, totals) = (&next, &stop, &done, &findings, &totals);
             scope.spawn(move || {
                 if !s.foreground {
@@ -268,9 +276,9 @@ fn run(s: &Settings) {
                     CURRENT_SEED.with(|c| c.set(seed));
                     let program = writer::program(seed, s.size);
                     let started = Instant::now();
-                    *in_flight[w].lock().unwrap() = Some((seed, started));
+                    *slot.lock().unwrap() = Some((seed, started));
                     let result = run_case(&program, seed, &mut stats);
-                    *in_flight[w].lock().unwrap() = None;
+                    *slot.lock().unwrap() = None;
                     let took = started.elapsed();
                     if took.as_secs_f64() > 5.0 {
                         eprintln!("\nslow: seed {seed} took {:.1}s", took.as_secs_f64());
@@ -356,7 +364,10 @@ fn print_finding(f: &Finding) {
             println!("  interpreter {}", interp.summary());
             println!("  jit         {}", jit.summary());
         }
-        Kind::Leak { engine, allocations } => {
+        Kind::Leak {
+            engine,
+            allocations,
+        } => {
             println!("--- the {engine} leaks: {allocations} allocation(s) left behind per run");
         }
     }
@@ -463,13 +474,13 @@ fn shrink(mut program: Program, finding: Finding) -> Finding {
             }
         }
         let mut candidate = program.clone();
-        if writer::shrink_loops(&mut candidate) {
-            if let Some(mut f) = still_fails(&candidate) {
-                f.seed = seed;
-                best = f;
-                program = candidate;
-                progressed = true;
-            }
+        if writer::shrink_loops(&mut candidate)
+            && let Some(mut f) = still_fails(&candidate)
+        {
+            f.seed = seed;
+            best = f;
+            program = candidate;
+            progressed = true;
         }
         if !progressed {
             break;

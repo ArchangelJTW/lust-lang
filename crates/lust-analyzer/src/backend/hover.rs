@@ -1,7 +1,7 @@
 use crate::analysis::{AnalysisSnapshot, FunctionInfo, ModuleSnapshot};
 use crate::utils::{
-    build_hover_body, compute_line_offsets, is_word_char, nth_char_byte_index, span_from_identifier,
-    span_to_range,
+    build_hover_body, compute_line_offsets, is_word_char, nth_char_byte_index,
+    span_from_identifier, span_to_range,
 };
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
@@ -32,7 +32,7 @@ pub(crate) fn hover_for_method_call(
     let line_end = line_offsets
         .get(line_idx + 1)
         .copied()
-        .unwrap_or_else(|| text.len());
+        .unwrap_or(text.len());
     if line_start >= line_end || line_end > text.len() {
         return None;
     }
@@ -86,10 +86,7 @@ pub(crate) fn hover_for_method_call(
     let method_end_byte = method_start_byte + method_segment.len();
     let start_offset = line_start + method_start_byte;
     let end_offset = line_start + method_end_byte;
-    let next_char = text[end_offset..]
-        .chars()
-        .skip_while(|c| c.is_whitespace())
-        .next();
+    let next_char = text[end_offset..].chars().find(|c| !c.is_whitespace());
     if next_char != Some('(') {
         return None;
     }
@@ -152,8 +149,11 @@ pub(crate) fn hover_for_function(info: &FunctionInfo) -> Hover {
         .collect::<Vec<_>>()
         .join(", ");
     let prefix = if info.is_extern { "extern " } else { "" };
-    let mut signature =
-        format!("{prefix}function {}({})", crate::utils::simple_type_name(&def.name), params);
+    let mut signature = format!(
+        "{prefix}function {}({})",
+        crate::utils::simple_type_name(&def.name),
+        params
+    );
     if let Some(ret) = &def.return_type {
         signature.push_str(": ");
         signature.push_str(&ret.to_string());

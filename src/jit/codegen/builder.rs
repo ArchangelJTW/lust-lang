@@ -371,7 +371,7 @@ impl JitCompiler {
             if std::env::var("LUST_JIT_DUMP").is_ok() {
                 use std::{fs, path::PathBuf};
                 let len = exec_buffer.len();
-                let bytes = unsafe { std::slice::from_raw_parts(entry_point as *const u8, len) };
+                let bytes = unsafe { std::slice::from_raw_parts(entry_point, len) };
                 let mut path = PathBuf::from("target");
                 let _ = fs::create_dir_all(&path);
                 path.push(format!(

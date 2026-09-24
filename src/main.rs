@@ -1366,6 +1366,16 @@ fn run_file(filename: &str, disassemble: bool) {
     }
 }
 
+/// What `compile_program` produces: the compiled functions, the trait
+/// impls and the module init functions the VM registers, and the struct
+/// definitions.
+type CompiledProgram = (
+    Vec<lust::bytecode::Function>,
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+    hashbrown::HashMap<String, lust::ast::StructDef>,
+);
+
 fn compile_program(
     entry_filename: &str,
     config: &LustConfig,
@@ -1375,15 +1385,7 @@ fn compile_program(
     #[cfg(all(feature = "packages", not(target_arch = "wasm32")))] prepared_rust: Option<
         &[PreparedRustDependency],
     >,
-) -> Result<
-    (
-        Vec<lust::bytecode::Function>,
-        Vec<(String, String)>,
-        Vec<(String, String)>,
-        hashbrown::HashMap<String, lust::ast::StructDef>,
-    ),
-    lust::LustError,
-> {
+) -> Result<CompiledProgram, lust::LustError> {
     use hashbrown::{HashMap, HashSet};
 
     let entry_path = Path::new(entry_filename);

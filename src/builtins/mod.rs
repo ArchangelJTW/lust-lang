@@ -1238,6 +1238,16 @@ fn build_io_functions() -> Vec<BuiltinFunction> {
             TypeExpr::Result(Box::new(TypeExpr::String), Box::new(TypeExpr::String)),
         ),
         func(
+            "io.read_dir",
+            "Read the file names of a directory",
+            &["path"],
+            vec![TypeExpr::String],
+            TypeExpr::Result(
+                Box::new(TypeExpr::Array(Box::new(TypeExpr::String))),
+                Box::new(TypeExpr::String),
+            ),
+        ),
+        func(
             "io.read_file_bytes",
             "Read the contents of a file as byte values",
             &["path"],

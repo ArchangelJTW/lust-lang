@@ -179,6 +179,7 @@ pub(crate) fn create_select_fn() -> Value {
 fn create_io_module(vm: &VM) -> Value {
     let entries = [
         (string_key("read_file"), create_io_read_file_fn()),
+        (string_key("read_dir"), create_io_read_dir_fn()),
         (
             string_key("read_file_bytes"),
             create_io_read_file_bytes_fn(),
@@ -242,6 +243,42 @@ fn create_io_read_file_bytes_fn() -> Value {
                 Ok(NativeCallResult::Return(Value::ok(Value::array(values))))
             }
 
+            Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
+                err.to_string(),
+            )))),
+        }
+    }))
+}
+
+fn create_io_read_dir_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() != 1 {
+            return Ok(NativeCallResult::Return(Value::err(Value::string(
+                "io.read_dir(path) requires a single string path",
+            ))));
+        }
+
+        let path = match args[0].as_string() {
+            Some(path) => path,
+            None => {
+                return Ok(NativeCallResult::Return(Value::err(Value::string(
+                    "io.read_dir(path) requires a string path",
+                ))));
+            }
+        };
+
+        let entries = fs::read_dir(path).and_then(|entries| {
+            entries
+                .map(|entry| {
+                    entry.map(|entry| {
+                        Value::string(entry.file_name().to_string_lossy().into_owned())
+                    })
+                })
+                .collect::<std::io::Result<Vec<_>>>()
+        });
+
+        match entries {
+            Ok(names) => Ok(NativeCallResult::Return(Value::ok(Value::array(names)))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
             )))),

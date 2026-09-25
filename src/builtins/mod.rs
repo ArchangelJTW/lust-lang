@@ -1238,6 +1238,16 @@ fn build_io_functions() -> Vec<BuiltinFunction> {
             TypeExpr::Result(Box::new(TypeExpr::String), Box::new(TypeExpr::String)),
         ),
         func(
+            "io.read_dir",
+            "Read the file names of a directory",
+            &["path"],
+            vec![TypeExpr::String],
+            TypeExpr::Result(
+                Box::new(TypeExpr::Array(Box::new(TypeExpr::String))),
+                Box::new(TypeExpr::String),
+            ),
+        ),
+        func(
             "io.read_file_bytes",
             "Read the contents of a file as byte values",
             &["path"],
@@ -1328,6 +1338,16 @@ fn build_os_functions() -> Vec<BuiltinFunction> {
             &["from", "to"],
             vec![TypeExpr::String, TypeExpr::String],
             TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
+        ),
+        func(
+            "os.get_env",
+            "Get an environment variable",
+            &["name"],
+            vec![TypeExpr::String],
+            TypeExpr::Result(
+                Box::new(TypeExpr::Option(Box::new(TypeExpr::String))),
+                Box::new(TypeExpr::String),
+            ),
         ),
     ]
 }

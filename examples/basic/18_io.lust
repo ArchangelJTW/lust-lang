@@ -22,7 +22,40 @@ if stdout_result is Err(message) then
     println("Failed to write to stdout: " .. message)
 end
 
+-- Create a known directory entry to demonstrate io.read_dir.
+local listing_dir = "io_example_dir"
+local listing_file = listing_dir .. "/listed.txt"
+local mkdir_result = os.create_dir(listing_dir)
+if mkdir_result is Err(message) then
+    println("Failed to create listing directory: " .. message)
+    return
+end
+
+local listing_write_result = io.write_file(listing_file, "This file should appear in the directory listing.\n")
+if listing_write_result is Err(message) then
+    println("Failed to create listing file: " .. message)
+else
+    local dir_result = io.read_dir(listing_dir)
+    if dir_result is Ok(names) then
+        println("Directory entries:")
+        for name in names do
+            println("  " .. name)
+        end
+    elseif dir_result is Err(message) then
+        println("Failed to read directory: " .. message)
+    end
+end
+
 -- Clean up
+local listing_file_cleanup = os.remove_file(listing_file)
+if listing_file_cleanup is Err(message) then
+    println("Failed to remove listing file: " .. message)
+end
+local listing_dir_cleanup = os.remove_dir(listing_dir)
+if listing_dir_cleanup is Err(message) then
+    println("Failed to remove listing directory: " .. message)
+end
+
 local cleanup_result = os.remove_file(path)
 if cleanup_result is Err(message) then
     println("Failed to remove file: " .. message)

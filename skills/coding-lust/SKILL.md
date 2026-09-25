@@ -442,6 +442,7 @@ use lib.math.*
 
 ### `io` Module *(Requires `stdlib_modules = ["io"]` in `lust-config.toml`)*
 - `io.read_file(path: string): Result<string, string>`
+- `io.read_dir(path: string): Result<Array<string>, string>`
 - `io.read_file_bytes(path: string): Result<Array<int>, string>`
 - `io.write_file(path: string, contents: unknown): Result<(), string>`
 - `io.read_stdin(): Result<string, string>`
@@ -452,6 +453,7 @@ use lib.math.*
 
 ### `os` Module *(Requires `stdlib_modules = ["os"]` in `lust-config.toml`)*
 - `os.time(): float` (Unix timestamp in seconds with sub-second precision)
+- `os.get_env(name: string): Result<Option<string>, string>` (returns `Ok(Some(value))` when set to a Unicode value, `Ok(None)` when unset, or `Err(message)` when the value is not valid Unicode)
 - `os.sleep(seconds: float): Result<(), string>`
 - `os.create_file(path: string): Result<(), string>`
 - `os.create_dir(path: string): Result<(), string>`

@@ -382,6 +382,7 @@ fn create_os_module(vm: &VM) -> Value {
         (string_key("remove_file"), create_os_remove_file_fn()),
         (string_key("remove_dir"), create_os_remove_dir_fn()),
         (string_key("rename"), create_os_rename_fn()),
+        (string_key("get_env"), create_os_get_env_fn()),
     ];
     vm.map_with_entries(entries)
 }
@@ -574,6 +575,41 @@ fn create_os_rename_fn() -> Value {
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
             )))),
+        }
+    }))
+}
+
+fn create_os_get_env_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        // check for one value in args
+        if args.len() != 1 {
+            return Ok(NativeCallResult::Return(Value::err(Value::string(
+                "os.get_env(name) requires a single string name",
+            ))));
+        }
+
+        // convert the value with as_string().
+        // return Lust Err if it is not a string
+        let name = match args[0].as_string() {
+            Some(p) => p,
+            None => {
+                return Ok(NativeCallResult::Return(Value::err(Value::string(
+                    "os.get_env(name) requires a string name",
+                ))));
+            }
+        };
+
+        // match on std::env::var(name)
+        match std::env::var(name) {
+            Ok(value) => Ok(NativeCallResult::Return(Value::ok(Value::some(
+                Value::string(value),
+            )))),
+            Err(std::env::VarError::NotPresent) => {
+                Ok(NativeCallResult::Return(Value::ok(Value::none())))
+            }
+            Err(std::env::VarError::NotUnicode(_)) => Ok(NativeCallResult::Return(Value::err(
+                Value::string("os.get_env(name) found a value that is not valid Unicode"),
+            ))),
         }
     }))
 }

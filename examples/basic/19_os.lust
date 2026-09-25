@@ -4,6 +4,9 @@
 local dir = "os_example_tmp"
 local original = dir .. "/note.txt"
 local renamed = dir .. "/note-renamed.txt"
+local env_var_name = "PATH"
+local fake_env_var_name = "MISSING_VAR_69"
+local non_unicode_var_name = "LUST_NON_UNICODE_TEST"
 
 local create_dir_result = os.create_dir(dir)
 if create_dir_result is Ok(_) then
@@ -39,3 +42,37 @@ if remove_dir_result is Ok(_) then
 elseif remove_dir_result is Err(message) then
     println("Failed to remove directory: " .. message)
 end
+
+local get_env_result = os.get_env(env_var_name)
+if get_env_result is Ok(option_val) then
+    if option_val is Some(val) then
+        println("Got an ENV VAR!")
+    elseif option_val is None then
+        println("That ENV VAR does not exist")
+    end
+elseif get_env_result is Err(e) then
+    println("Got err: " .. e)
+end
+
+local get_fake_env_res = os.get_env(fake_env_var_name)
+if get_fake_env_res is Ok(option_value) then
+   if option_value is Some(val) then
+       println("Got an ENV VAR: " .. val)
+   elseif option_value is None then
+       println("That ENV VAR does not exist")
+   end
+elseif get_fake_env_res is Err(e) then
+   println("Got err: " .. e)
+end
+
+local get_non_unicode_env_res = os.get_env(non_unicode_var_name)
+if get_non_unicode_env_res is Ok(option_value) then
+   if option_value is Some(val) then
+       println("Got an ENV VAR: " .. val)
+   elseif option_value is None then
+       println("That ENV VAR does not exist")
+   end
+elseif get_non_unicode_env_res is Err(e) then
+   println("Got err: " .. e)
+end
+

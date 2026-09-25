@@ -453,6 +453,7 @@ use lib.math.*
 
 ### `os` Module *(Requires `stdlib_modules = ["os"]` in `lust-config.toml`)*
 - `os.time(): float` (Unix timestamp in seconds with sub-second precision)
+- `os.get_env(name: string): Result<Option<string>, string>` (returns `Ok(Some(value))` when set to a Unicode value, `Ok(None)` when unset, or `Err(message)` when the value is not valid Unicode)
 - `os.sleep(seconds: float): Result<(), string>`
 - `os.create_file(path: string): Result<(), string>`
 - `os.create_dir(path: string): Result<(), string>`

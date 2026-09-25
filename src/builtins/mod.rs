@@ -1339,6 +1339,16 @@ fn build_os_functions() -> Vec<BuiltinFunction> {
             vec![TypeExpr::String, TypeExpr::String],
             TypeExpr::Result(Box::new(TypeExpr::Unit), Box::new(TypeExpr::String)),
         ),
+        func(
+            "os.get_env",
+            "Get an environment variable",
+            &["name"],
+            vec![TypeExpr::String],
+            TypeExpr::Result(
+                Box::new(TypeExpr::Option(Box::new(TypeExpr::String))),
+                Box::new(TypeExpr::String),
+            ),
+        ),
     ]
 }
 

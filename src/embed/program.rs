@@ -26,6 +26,7 @@ use std::task::{Context, Poll};
 
 pub struct EmbeddedBuilder {
     base_dir: PathBuf,
+    base_dir_provided: bool,
     modules: HashMap<String, String>,
     entry_module: Option<String>,
     config: LustConfig,
@@ -36,6 +37,7 @@ impl Default for EmbeddedBuilder {
     fn default() -> Self {
         Self {
             base_dir: PathBuf::from("__embedded__"),
+            base_dir_provided: false,
             modules: HashMap::new(),
             entry_module: None,
             config: LustConfig::default(),
@@ -49,15 +51,30 @@ impl EmbeddedBuilder {
         Self::default()
     }
 
+    /// Set the root directory used to resolve Lust module files.
+    ///
+    /// Modules registered in memory with [`Self::module`] or [`Self::add_module`]
+    /// override files under this directory. If the selected entry module has no
+    /// registered source, [`Self::compile`] loads it from the corresponding path under
+    /// this directory.
     pub fn with_base_dir(self, base_dir: impl Into<PathBuf>) -> Self {
         self.set_base_dir(base_dir)
     }
 
+    /// Set the root directory used to resolve Lust module files.
+    ///
+    /// Setting a base directory also allows [`Self::compile`] to load an
+    /// unregistered entry module from disk.
     pub fn set_base_dir(mut self, base_dir: impl Into<PathBuf>) -> Self {
         self.base_dir = base_dir.into();
+        self.base_dir_provided = true;
         self
     }
 
+    /// Register an in-memory source for a module.
+    ///
+    /// This source takes precedence over the corresponding file under the
+    /// configured base directory.
     pub fn module(mut self, module_path: impl Into<String>, source: impl Into<String>) -> Self {
         self.modules.insert(module_path.into(), source.into());
         self
@@ -140,6 +157,10 @@ impl EmbeddedBuilder {
         self
     }
 
+    /// Select the entry module to compile and execute.
+    ///
+    /// Its source must either be registered with [`Self::module`] / [`Self::add_module`]
+    /// or be available under a base directory set with [`Self::with_base_dir`].
     pub fn entry_module(mut self, module_path: impl Into<String>) -> Self {
         self.set_entry_module(module_path);
         self
@@ -154,10 +175,10 @@ impl EmbeddedBuilder {
         let entry_module = self
             .entry_module
             .ok_or_else(|| LustError::Unknown("No entry module configured for embedding".into()))?;
-        let has_entry = self.modules.contains_key(&entry_module);
-        if !has_entry {
+        let has_entry_source = self.modules.contains_key(&entry_module);
+        if !has_entry_source && !self.base_dir_provided {
             return Err(LustError::Unknown(format!(
-                "Entry module '{}' was not provided via EmbeddedBuilder::module",
+                "Entry module '{}' was not provided via EmbeddedBuilder::module and no base directory was set",
                 entry_module
             )));
         }
@@ -1145,4 +1166,86 @@ fn native_export_from_signature(
         .collect::<Vec<_>>();
     let return_type = normalize_extern_type_string(signature.return_type.to_string());
     NativeExport::new(name, params, return_type)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn base_dir_loads_entry_and_imported_modules_without_module_sources() {
+        let dir = tempdir().expect("temporary directory");
+        fs::write(
+            dir.path().join("main.lust"),
+            "use helper.{answer}\nfunction result(): int\n    return answer()\nend\n",
+        )
+        .expect("write entry script");
+        fs::write(
+            dir.path().join("helper.lust"),
+            "function answer(): int\n    return 41\nend\n",
+        )
+        .expect("write helper module");
+
+        let mut program = EmbeddedProgram::builder()
+            .with_base_dir(dir.path())
+            .entry_module("main")
+            .compile()
+            .expect("load entry and imported module from base directory");
+        let result: crate::LustInt = program
+            .call_typed("main.result", ())
+            .expect("call imported function");
+
+        assert_eq!(result, 41);
+    }
+
+    #[test]
+    fn registered_entry_source_overrides_file_under_base_dir() {
+        let dir = tempdir().expect("temporary directory");
+        fs::write(
+            dir.path().join("main.lust"),
+            "function result(): int\n    return 1\nend\n",
+        )
+        .expect("write on-disk entry script");
+
+        let mut program = EmbeddedProgram::builder()
+            .with_base_dir(dir.path())
+            .module("main", "function result(): int\n    return 42\nend\n")
+            .entry_module("main")
+            .compile()
+            .expect("compile with in-memory entry override");
+        let result: crate::LustInt = program
+            .call_typed("main.result", ())
+            .expect("call overridden entry function");
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn registered_module_source_overrides_file_under_base_dir() {
+        let dir = tempdir().expect("temporary directory");
+        fs::write(
+            dir.path().join("main.lust"),
+            "use helper.{answer}\nfunction result(): int\n    return answer()\nend\n",
+        )
+        .expect("write entry script");
+        fs::write(
+            dir.path().join("helper.lust"),
+            "function answer(): int\n    return 1\nend\n",
+        )
+        .expect("write on-disk helper module");
+
+        let mut program = EmbeddedProgram::builder()
+            .with_base_dir(dir.path())
+            .module("helper", "function answer(): int\n    return 42\nend\n")
+            .entry_module("main")
+            .compile()
+            .expect("compile with in-memory module override");
+        let result: crate::LustInt = program
+            .call_typed("main.result", ())
+            .expect("call overridden helper function");
+
+        assert_eq!(result, 42);
+    }
 }

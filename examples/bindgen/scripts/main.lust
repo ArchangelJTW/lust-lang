@@ -1,0 +1,51 @@
+struct Player
+    id: int
+    name: string
+end
+
+---@bindgen(name = "GameStatus")
+enum Status
+    Ready
+    Score(int)
+    Player(Player)
+end
+
+--- Return the player identified by id.
+---@bindgen
+function get_player(id: int): Player
+    return Player {
+        id = id,
+        name = "player-" .. tostring(id)
+    }
+end
+
+---@bindgen
+function rename_player(player: Player, new_name: string): Player
+    player.name = new_name
+    return player
+end
+
+--- Look up an optional display name.
+---@bindgen
+function lookup_name(id: int): Option<string>
+    if id <= 0 then
+        return Option.None
+    end
+    return Option.Some("player-" .. tostring(id))
+end
+
+--- Return an integer with a generated Rust name override.
+---@bindgen(name = "double_id")
+function twice(id: int): int
+    return id * 2
+end
+
+---@bindgen
+function get_status(): Status
+    return Status.Player(get_player(42))
+end
+
+---@bindgen
+function echo_status(status: Status): Status
+    return status
+end

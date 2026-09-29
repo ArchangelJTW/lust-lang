@@ -59,6 +59,83 @@ you can write Lust-readable extern stubs to disk from your embedder:
 let _ = program.dump_externs_to_dir("externs");
 ```
 
+## Generate Rust bindings from Lust
+
+Mark public free functions for binding generation with a doc tag. The separator
+space is optional, and optional settings can rename the Rust method:
+
+```lust
+--- Add two numbers.
+---@bindgen
+function add(a: int, b: int): int
+    return a + b
+end
+
+---@bindgen(name = "get_player")
+function lookup_player(id: int): Player
+    ...
+end
+```
+
+Run `lust bindgen scripts/main.lust` to write `scripts/main_bindings.rs`.
+Use `--out <path>` and `--name <RustType>` to customize the output. Bindgen
+typechecks the module graph without running Lust code; signatures come from the
+checked Lust declarations. Public nongeneric structs are emitted as handle-backed
+Rust wrappers with typed accessors (for example, `player.id()?`), and
+nonrecursive enums are emitted as Rust enums. Add `---@bindgen(name = "RustPlayer")`
+to a type to override its generated Rust name. Generic/recursive types and
+otherwise dynamic types use runtime handles or `Value`. Bindings use
+`LustInt`/`LustFloat`, `&str` arguments, owned `String` results, and Rust
+`Option`/`Result`.
+
+For a complete runnable example, see [`examples/bindgen`](examples/bindgen). Run it with
+`cargo run --manifest-path examples/bindgen/Cargo.toml`; its `build.rs` generates and
+compiles the bindings on every relevant source change.
+
+For automatic generation during a Cargo build, enable the `bindgen` feature as
+a build dependency:
+
+```toml
+[dependencies]
+lust = { package = "lust-rs", version = "3" }
+
+[build-dependencies]
+lust = { package = "lust-rs", version = "3", features = ["bindgen"] }
+```
+
+```rust
+// build.rs
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let generated = lust::bindgen::RustBindingsBuilder::new("scripts/main.lust")
+        .bindings_name("GameBindings")
+        .generate()?;
+    for path in generated.input_files() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    generated.write_to(
+        std::path::PathBuf::from(std::env::var("OUT_DIR")?).join("lust_bindings.rs"),
+    )?;
+    Ok(())
+}
+```
+
+Then include the generated file in your Rust crate:
+
+```rust
+pub mod game_bindings {
+    include!(concat!(env!("OUT_DIR"), "/lust_bindings.rs"));
+}
+```
+
+```rust
+fn call_lust(program: &mut lust::EmbeddedProgram) -> lust::Result<()> {
+    let mut bindings = game_bindings::GameBindings::from_program(program);
+    let player = bindings.get_player(42)?;
+    let _id = player.id()?;
+    Ok(())
+}
+```
+
 The `is` operator tests and binds patterns:
 
 ```lust

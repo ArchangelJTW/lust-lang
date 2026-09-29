@@ -518,9 +518,9 @@ impl<'a> Lexer<'a> {
                             continue;
                         }
 
-                        // Doc comments are exactly three dashes followed by a
-                        // space; leave them for take_doc_comment to tokenize.
-                        if self.peek(2) == Some('-') && self.peek(3) == Some(' ') {
+                        // Exactly three leading dashes mark a doc comment;
+                        // a fourth dash keeps the line an ordinary comment.
+                        if self.peek(2) == Some('-') && self.peek(3) != Some('-') {
                             break;
                         }
 
@@ -548,14 +548,14 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    /// Scans a doc comment (`--- text`, exactly three dashes followed by a
-    /// space) at the current position into a `DocComment` token. Returns
-    /// `None` if the current position is not a doc comment.
+    /// Scans a doc comment beginning with exactly three dashes. Leading
+    /// horizontal whitespace after the marker is ignored; a fourth dash makes
+    /// it an ordinary comment.
     fn take_doc_comment(&mut self) -> Option<Token> {
         if self.current_char() != '-'
             || self.peek(1) != Some('-')
             || self.peek(2) != Some('-')
-            || self.peek(3) != Some(' ')
+            || self.peek(3) == Some('-')
         {
             return None;
         }
@@ -565,7 +565,9 @@ impl<'a> Lexer<'a> {
         self.advance();
         self.advance();
         self.advance();
-        self.advance(); // the separating space
+        while matches!(self.current_char(), ' ' | '\t' | '\r') {
+            self.advance();
+        }
 
         let mut text = String::new();
         while !self.is_at_end() && self.current_char() != '\n' {

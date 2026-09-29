@@ -90,36 +90,34 @@ fn register_functions(vm: &mut VM) -> Result<(), String> {
             .and_then(|value| value.as_int())
             .ok_or_else(|| "expected int value".to_string())?;
 
-        let result = match operation {
-            Value::Enum {
-                enum_name,
-                variant,
-                values: payload,
-            } if enum_name == "lust_triple.Operation"
-                || enum_name == "externs.lust_triple.Operation"
-                || enum_name == "Operation" =>
-            {
-                match variant.as_str() {
-                    "Double" => input * 2,
-                    "Triple" => input * 3,
-                    "Scale" => {
-                        let factor = payload
-                            .as_ref()
-                            .and_then(|values| values.get(0))
-                            .and_then(|value| value.as_int())
-                            .ok_or_else(|| "Scale variant requires factor".to_string())?;
-                        input * factor
-                    }
-                    other => {
-                        return Err(format!("Unknown Operation variant '{}'", other));
-                    }
-                }
+        let Some((enum_name, variant, payload)) = operation.as_enum() else {
+            return Err(format!(
+                "Expected lust_triple.Operation but received {:?}",
+                operation
+            ));
+        };
+        if enum_name != "lust_triple.Operation"
+            && enum_name != "externs.lust_triple.Operation"
+            && enum_name != "Operation"
+        {
+            return Err(format!(
+                "Expected lust_triple.Operation but received {:?}",
+                operation
+            ));
+        }
+
+        let result = match variant {
+            "Double" => input * 2,
+            "Triple" => input * 3,
+            "Scale" => {
+                let factor = payload
+                    .and_then(|values| values.first())
+                    .and_then(Value::as_int)
+                    .ok_or_else(|| "Scale variant requires factor".to_string())?;
+                input * factor
             }
             other => {
-                return Err(format!(
-                    "Expected lust_triple.Operation but received {:?}",
-                    other
-                ));
+                return Err(format!("Unknown Operation variant '{}'", other));
             }
         };
 

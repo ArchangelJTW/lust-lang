@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+
+[package]
+name = "lust-bindgen-example"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+lust = { package = "lust-rs", path = "../.." }
+
+[build-dependencies]
+lust = { package = "lust-rs", path = "../..", features = ["bindgen"] }

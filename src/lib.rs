@@ -4,6 +4,8 @@
 extern crate alloc;
 
 pub mod ast;
+#[cfg(feature = "bindgen")]
+pub mod bindgen;
 pub mod builtins;
 pub mod bytecode;
 pub mod config;

@@ -18,5 +18,5 @@ pub use native_types::{
 pub use program::{AsyncDriver, EmbeddedBuilder, EmbeddedProgram};
 pub use values::{
     ArrayHandle, EnumInstance, FunctionHandle, MapHandle, StringRef, StructField, StructHandle,
-    StructInstance, TypedValue, ValueRef, struct_field,
+    StructInstance, TypedValue, ValueRef, matches_lust_nominal_type, struct_field,
 };

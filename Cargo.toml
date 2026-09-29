@@ -42,7 +42,8 @@ name = "lust"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["std", "packages"]
+default = ["std", "packages", "bindgen"]
+bindgen = ["std"]
 std = [
   "dep:dynasmrt",
   "dep:toml",

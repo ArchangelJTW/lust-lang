@@ -339,12 +339,46 @@ mod tests {
     }
 
     #[test]
-    fn three_dashes_without_space_is_a_regular_comment() {
+    fn three_dashes_without_space_attach_as_doc() {
         let items =
             parse_source("---not a doc\nfunction add_one(x: int): int\n    return x + 1\nend\n");
         match &items[0].kind {
-            ItemKind::Function(func) => assert!(func.doc.is_none()),
+            ItemKind::Function(func) => {
+                assert_eq!(func.doc.as_deref(), Some("not a doc"));
+            }
             other => panic!("expected function item, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn bindgen_doc_tags_allow_both_comment_styles() {
+        for source in [
+            "---@bindgen\nfunction add_one(x: int): int\n    return x + 1\nend\n",
+            "--- @bindgen\nfunction add_one(x: int): int\n    return x + 1\nend\n",
+            "---   @bindgen\nfunction add_one(x: int): int\n    return x + 1\nend\n",
+            "---\t@bindgen\nfunction add_one(x: int): int\n    return x + 1\nend\n",
+        ] {
+            let items = parse_source(source);
+            match &items[0].kind {
+                ItemKind::Function(func) => {
+                    assert_eq!(func.doc.as_deref(), Some("@bindgen"));
+                }
+                other => panic!("expected function item, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn empty_doc_comment_is_allowed() {
+        for source in [
+            "---\nfunction add_one(): int\n    return 1\nend\n",
+            "--- \nfunction add_one(): int\n    return 1\nend\n",
+        ] {
+            let items = parse_source(source);
+            match &items[0].kind {
+                ItemKind::Function(func) => assert_eq!(func.doc.as_deref(), Some("")),
+                other => panic!("expected function item, got {:?}", other),
+            }
         }
     }
 

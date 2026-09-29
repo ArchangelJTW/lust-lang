@@ -1,0 +1,39 @@
+====================
+Bindgen doc comments
+====================
+
+---@bindgen
+function add()
+end
+
+--- @bindgen(name = "renamed")
+function lookup()
+end
+
+---
+function blank_doc()
+end
+
+---- ordinary comment
+function ordinary()
+end
+
+---
+
+(source_file
+  (doc_comment)
+  (function_declaration
+    (identifier)
+    (parameter_list))
+  (doc_comment)
+  (function_declaration
+    (identifier)
+    (parameter_list))
+  (doc_comment)
+  (function_declaration
+    (identifier)
+    (parameter_list))
+  (comment)
+  (function_declaration
+    (identifier)
+    (parameter_list)))

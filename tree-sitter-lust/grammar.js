@@ -62,6 +62,7 @@ module.exports = grammar({
 
     // Comments
     comment: $ => token(choice(
+      prec(2, seq('----', /[^\n]*/)),
       seq(
         '--[[',
         repeat(choice(
@@ -74,8 +75,13 @@ module.exports = grammar({
       seq('#', /[^\n]*/),
     )),
 
-    // Doc comments: exactly three dashes followed by a space
-    doc_comment: $ => token(prec(1, seq('---', ' ', /[^\n]*/))),
+    // Doc comments start with exactly three dashes. A fourth dash keeps the
+    // line an ordinary comment; horizontal whitespace after the marker is optional.
+    doc_comment: $ => token(prec(1, choice(
+      seq('---', /[^-\n][^\n]*/),
+      seq('---', /[ \t\r]*/, '\n'),
+      '---',
+    ))),
 
     // Function declaration
     function_declaration: $ => seq(

@@ -915,6 +915,145 @@ impl FromLustValue for () {
     }
 }
 
+impl<T> IntoLustValue for Option<T>
+where
+    T: IntoLustValue,
+{
+    fn into_value(self) -> Value {
+        match self {
+            Some(value) => Value::enum_variant("Option", "Some", vec![value.into_value()]),
+            None => Value::enum_unit("Option", "None"),
+        }
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::Option(inner) => T::matches_lust_type(inner),
+            TypeKind::Unknown => true,
+            TypeKind::Union(types) => types.iter().any(Self::matches_lust_type),
+            _ => false,
+        }
+    }
+
+    fn type_description() -> &'static str {
+        "Option"
+    }
+}
+
+impl<T> FromLustValue for Option<T>
+where
+    T: FromLustValue,
+{
+    fn from_value(value: Value) -> Result<Self> {
+        let (variant, payload) = expected_enum_parts(&value, "Option")?;
+        match (variant, payload) {
+            ("None", None) => Ok(None),
+            ("Some", Some([value])) => T::from_value(value.clone()).map(Some),
+            ("None", Some(_)) => Err(LustError::RuntimeError {
+                message: "Lust Option.None unexpectedly carries a payload".to_string(),
+            }),
+            ("Some", _) => Err(LustError::RuntimeError {
+                message: "Lust Option.Some must carry exactly one payload".to_string(),
+            }),
+            (other, _) => Err(LustError::RuntimeError {
+                message: format!("Unexpected Lust Option variant '{other}'"),
+            }),
+        }
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::Option(inner) => T::matches_lust_type(inner),
+            TypeKind::Unknown => true,
+            TypeKind::Union(types) => types.iter().any(Self::matches_lust_type),
+            _ => false,
+        }
+    }
+
+    fn type_description() -> &'static str {
+        "Option"
+    }
+}
+
+impl<T, E> IntoLustValue for core::result::Result<T, E>
+where
+    T: IntoLustValue,
+    E: IntoLustValue,
+{
+    fn into_value(self) -> Value {
+        match self {
+            Ok(value) => Value::enum_variant("Result", "Ok", vec![value.into_value()]),
+            Err(error) => Value::enum_variant("Result", "Err", vec![error.into_value()]),
+        }
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::Result(ok, err) => T::matches_lust_type(ok) && E::matches_lust_type(err),
+            TypeKind::Unknown => true,
+            TypeKind::Union(types) => types.iter().any(Self::matches_lust_type),
+            _ => false,
+        }
+    }
+
+    fn type_description() -> &'static str {
+        "Result"
+    }
+}
+
+impl<T, E> FromLustValue for core::result::Result<T, E>
+where
+    T: FromLustValue,
+    E: FromLustValue,
+{
+    fn from_value(value: Value) -> Result<Self> {
+        let (variant, payload) = expected_enum_parts(&value, "Result")?;
+        match (variant, payload) {
+            ("Ok", Some([value])) => T::from_value(value.clone()).map(Ok),
+            ("Err", Some([error])) => E::from_value(error.clone()).map(Err),
+            ("Ok", _) => Err(LustError::RuntimeError {
+                message: "Lust Result.Ok must carry exactly one payload".to_string(),
+            }),
+            ("Err", _) => Err(LustError::RuntimeError {
+                message: "Lust Result.Err must carry exactly one payload".to_string(),
+            }),
+            (other, _) => Err(LustError::RuntimeError {
+                message: format!("Unexpected Lust Result variant '{other}'"),
+            }),
+        }
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        match &ty.kind {
+            TypeKind::Result(ok, err) => T::matches_lust_type(ok) && E::matches_lust_type(err),
+            TypeKind::Unknown => true,
+            TypeKind::Union(types) => types.iter().any(Self::matches_lust_type),
+            _ => false,
+        }
+    }
+
+    fn type_description() -> &'static str {
+        "Result"
+    }
+}
+
+fn expected_enum_parts<'a>(
+    value: &'a Value,
+    expected: &str,
+) -> Result<(&'a str, Option<&'a [Value]>)> {
+    let Some((enum_name, variant, payload)) = value.as_enum() else {
+        return Err(LustError::RuntimeError {
+            message: format!("Expected Lust enum '{expected}' but received '{:?}'", value),
+        });
+    };
+    if enum_name != expected {
+        return Err(LustError::RuntimeError {
+            message: format!("Expected Lust enum '{expected}' but received '{enum_name}'"),
+        });
+    }
+    Ok((variant, payload))
+}
+
 impl<T> FunctionArgs for T
 where
     T: IntoLustValue + 'static,

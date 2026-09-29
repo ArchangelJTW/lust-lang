@@ -468,6 +468,22 @@ impl StructHandle {
             })
         }
     }
+
+    /// Ensures the fully qualified Lust type name matches exactly. Unlike
+    /// [`Self::ensure_type`], this does not accept a match by short type name.
+    pub fn ensure_exact_type(&self, expected: &str) -> Result<()> {
+        if lust_type_names_match_exact(self.type_name(), expected) {
+            Ok(())
+        } else {
+            Err(LustError::TypeError {
+                message: format!(
+                    "Struct '{}' does not exactly match expected type '{}'",
+                    self.type_name(),
+                    expected
+                ),
+            })
+        }
+    }
 }
 
 impl StructInstance {
@@ -782,6 +798,21 @@ impl EnumInstance {
         &self.type_name
     }
 
+    /// Ensures the fully qualified Lust enum name matches exactly.
+    pub fn ensure_exact_type(&self, expected: &str) -> Result<()> {
+        if lust_type_names_match_exact(self.type_name(), expected) {
+            Ok(())
+        } else {
+            Err(LustError::TypeError {
+                message: format!(
+                    "Enum '{}' does not exactly match expected type '{}'",
+                    self.type_name(),
+                    expected
+                ),
+            })
+        }
+    }
+
     pub fn variant(&self) -> &str {
         &self.variant
     }
@@ -874,6 +905,28 @@ pub(crate) fn lust_type_names_match(value: &str, expected: &str) -> bool {
     simple_type_name(&normalized_value) == simple_type_name(&normalized_expected)
 }
 
+fn lust_type_names_match_exact(value: &str, expected: &str) -> bool {
+    normalize_global_name(value) == normalize_global_name(expected)
+}
+
+/// Checks a checked Lust type against a fully qualified nominal type name.
+/// Unknown types and unions are handled conservatively for embedding
+/// conversions; runtime values should still be validated with the handle's
+/// `ensure_exact_type` method.
+#[doc(hidden)]
+pub fn matches_lust_nominal_type(ty: &Type, expected: &str) -> bool {
+    match &ty.kind {
+        TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => {
+            lust_type_names_match_exact(name, expected)
+        }
+        TypeKind::Unknown => true,
+        TypeKind::Union(types) => types
+            .iter()
+            .any(|alternative| matches_lust_nominal_type(alternative, expected)),
+        _ => false,
+    }
+}
+
 pub(crate) fn simple_type_name(name: &str) -> &str {
     name.rsplit(['.', ':']).next().unwrap_or(name)
 }
@@ -954,6 +1007,45 @@ mod tests {
             .entry_module("main")
             .compile()
             .expect("compile embedded program")
+    }
+
+    #[test]
+    fn exact_nominal_type_matching_does_not_fall_back_to_short_names() {
+        assert!(lust_type_names_match_exact("game.Player", "game::Player"));
+        assert!(!lust_type_names_match_exact("other.Player", "game.Player"));
+    }
+
+    #[test]
+    fn call_typed_converts_option_and_result_values_bidirectionally() {
+        let _guard = serial_guard();
+        let source = r#"
+            function echo_option(value: Option<int>): Option<int>
+                return value
+            end
+
+            function echo_result(value: Result<int, string>): Result<int, string>
+                return value
+            end
+        "#;
+        let mut program = build_program(source);
+
+        let some: Option<i64> = program
+            .call_typed("main.echo_option", Some(7_i64))
+            .expect("option Some round trip");
+        assert_eq!(some, Some(7));
+        let none: Option<i64> = program
+            .call_typed("main.echo_option", None::<i64>)
+            .expect("option None round trip");
+        assert_eq!(none, None);
+
+        let ok: core::result::Result<i64, String> = program
+            .call_typed("main.echo_result", Ok::<i64, String>(9_i64))
+            .expect("result Ok round trip");
+        assert_eq!(ok, Ok(9));
+        let err: core::result::Result<i64, String> = program
+            .call_typed("main.echo_result", Err::<i64, String>("no".to_string()))
+            .expect("result Err round trip");
+        assert_eq!(err, Err("no".to_string()));
     }
 
     #[test]

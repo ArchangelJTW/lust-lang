@@ -94,6 +94,8 @@ fn main() {
             dump_externs(&args[2]);
         }
 
+        "bindgen" => bindgen_command(&args[2..]),
+
         #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
         "pkg" => {
             if let Err(err) = handle_pkg_command(&args) {
@@ -110,6 +112,11 @@ fn main() {
 
 fn print_usage(program: &str) {
     eprintln!("Usage: {} [options] <script.lust>", program);
+    #[cfg(feature = "bindgen")]
+    eprintln!(
+        "       {} bindgen <entry.lust> [--out <file.rs>] [--name Bindings]",
+        program
+    );
     eprintln!("       {} --help", program);
     eprintln!("       {} --version", program);
     #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
@@ -142,6 +149,11 @@ fn print_help(program: &str) {
     );
     println!(
         "    {} --dump-externs <script.lust>    Create extern stubs for rust or Lua 5.1 C API library modules; reads from lust-config.toml",
+        program
+    );
+    #[cfg(feature = "bindgen")]
+    println!(
+        "    {} bindgen <entry.lust>            Generate checked Rust bindings for @bindgen functions",
         program
     );
     #[cfg(feature = "lua_transpile")]
@@ -1214,6 +1226,100 @@ fn dump_externs(filename: &str) {
 fn dump_externs(_: &str) {
     eprintln!("This build of the Lust CLI was compiled without package support.");
     process::exit(1);
+}
+
+fn bindgen_command(args: &[String]) {
+    #[cfg(feature = "bindgen")]
+    {
+        if args
+            .first()
+            .is_some_and(|arg| arg == "--help" || arg == "-h")
+        {
+            eprintln!("Usage: lust bindgen <entry.lust> [--out <file.rs>] [--name Bindings]");
+            return;
+        }
+        let Some(entry_arg) = args.first() else {
+            eprintln!("Error: lust bindgen requires an entry file");
+            process::exit(1);
+        };
+
+        let entry = PathBuf::from(entry_arg);
+        let mut output = None;
+        let mut bindings_name = "Bindings".to_string();
+        let mut index = 1;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--out" | "--output" | "-o" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        eprintln!("Error: {} requires a path", args[index - 1]);
+                        process::exit(1);
+                    };
+                    output = Some(PathBuf::from(value));
+                }
+                "--name" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        eprintln!("Error: --name requires a Rust type name");
+                        process::exit(1);
+                    };
+                    bindings_name = value.clone();
+                }
+                option => {
+                    eprintln!("Error: unknown bindgen option '{option}'");
+                    eprintln!(
+                        "Usage: lust bindgen <entry.lust> [--out <file.rs>] [--name Bindings]"
+                    );
+                    process::exit(1);
+                }
+            }
+            index += 1;
+        }
+
+        let generated = match lust::bindgen::RustBindingsBuilder::new(&entry)
+            .bindings_name(bindings_name)
+            .generate()
+        {
+            Ok(generated) => generated,
+            Err(err) => {
+                eprintln!("Bindgen failed: {err}");
+                process::exit(1);
+            }
+        };
+        let output = output.unwrap_or_else(|| {
+            let stem = entry
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("lust");
+            let parent = entry
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            parent.join(format!("{stem}_bindings.rs"))
+        });
+        if let Err(err) = generated.write_to(&output) {
+            eprintln!("Failed to write '{}': {err}", output.display());
+            process::exit(1);
+        }
+        println!(
+            "Generated {} Lust binding(s) -> {}",
+            generated
+                .source
+                .matches("    pub fn ")
+                .count()
+                .saturating_sub(1),
+            output.display()
+        );
+    }
+
+    #[cfg(not(feature = "bindgen"))]
+    {
+        let _ = args;
+        eprintln!(
+            "This build of the Lust CLI does not include bindgen; rebuild with --features bindgen."
+        );
+        process::exit(1);
+    }
 }
 
 fn run_file(filename: &str, disassemble: bool) {

@@ -1,10 +1,15 @@
 //! Rust binding generation for checked Lust modules.
 //!
-//! Bind public free functions marked with `---@bindgen` (or
-//! `--- @bindgen`). An optional `name` setting changes the generated Rust
-//! method name. Public nongeneric structs and enums are also emitted as Rust
-//! types; add the same tag to a type to override its Rust type name. Struct
-//! wrappers expose typed field getter methods, while enums become Rust enums.
+//! Bind public free functions and selected public `impl` methods marked with
+//! `---@bindgen` (or `--- @bindgen`). For trait methods, put the tag on the
+//! concrete implementation method. An optional `name` setting changes the
+//! generated Rust method name. Public nongeneric structs and enums are also
+//! emitted as Rust types; add the same tag to a type to override its Rust type
+//! name. Struct wrappers expose typed field getters, while enums become Rust
+//! enums. Instance methods on generated structs are callable directly on the
+//! wrapper. Static methods take the bindings facade explicitly; enum instance
+//! methods do too because Rust enum wrappers have no place to retain a program
+//! context.
 //!
 //! ```lust
 //! --- Fetch a player by id.
@@ -12,12 +17,32 @@
 //! function lookup_player(id: int): Player
 //!     ...
 //! end
+//!
+//! impl Player
+//!     ---@bindgen
+//!     function display_label(self): string
+//!         return self.name .. "#" .. tostring(self.id)
+//!     end
+//!
+//!     ---@bindgen
+//!     function new(id: int): Player
+//!         ...
+//!     end
+//! end
 //! ```
+//!
+//! The generated struct wrapper supports `player.display_label()`. Static
+//! Lust methods are called as `Player::new(&mut bindings, id)` so the target
+//! embedded program is explicit. Instance methods on Rust enum wrappers also
+//! take `&mut bindings`, because the generated enums remain ordinary matchable
+//! Rust enums rather than storing a hidden runtime context.
 //!
 //! The module is available with the `bindgen` Cargo feature. It typechecks the
 //! Lust module graph without executing it and emits an inspectable Rust source
-//! file. Generated methods borrow a [`crate::EmbeddedProgram`] mutably and call
-//! [`crate::EmbeddedProgram::call_typed`], so runtime signature checks remain active.
+//! file. Generated methods call [`crate::EmbeddedProgram::call_typed`], so
+//! runtime signature checks remain active. Returned struct wrappers retain a
+//! scoped handle to their program, allowing instance methods to be called
+//! without passing the program on every call.
 //!
 //! A build script can generate bindings into Cargo's `OUT_DIR`:
 //!
@@ -43,14 +68,14 @@ use crate::ast::{
     EnumDef, ExternItem, FunctionDef, Item, ItemKind, StructDef, Type, TypeKind, Visibility,
 };
 use crate::embed::ExternRegistry;
-use crate::modules::{ModuleLoader, Program};
+use crate::modules::{ModuleImports, ModuleLoader, Program};
 use crate::typechecker::{FunctionSignature, TypeChecker};
 use crate::{LustConfig, LustError, Result};
 use hashbrown::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-/// Generates Rust bindings from tagged public Lust functions and public nominal types.
+/// Generates Rust bindings from tagged public Lust functions and impl methods, plus public nominal types.
 #[derive(Clone)]
 pub struct RustBindingsBuilder {
     entry_file: PathBuf,
@@ -142,13 +167,22 @@ impl RustBindingsBuilder {
             &declared_enums,
             &self.bindings_name,
         )?;
-        let functions = collect_bindings(&program, &signatures)?;
+        let lifetime_types = collect_lifetime_types(&nominal_types, &wrapped_types);
+        let (functions, methods) = collect_bindings(
+            &program,
+            &signatures,
+            &wrapped_types,
+            &struct_defs,
+            &enum_defs,
+        )?;
         let source = generate_source(
             &self.bindings_name,
             &self.runtime_crate_path,
             &functions,
+            &methods,
             &nominal_types,
             &wrapped_types,
+            &lifetime_types,
             &struct_defs,
             &enum_defs,
         )?;
@@ -217,6 +251,19 @@ struct BoundNominal {
     rust_name: String,
     docs: Vec<String>,
     kind: BoundNominalKind,
+}
+
+#[derive(Clone, Debug)]
+struct BoundMethod {
+    lust_name: String,
+    rust_name: String,
+    target_lust_name: String,
+    target_rust_name: String,
+    has_receiver: bool,
+    target_is_struct: bool,
+    docs: Vec<String>,
+    params: Vec<(String, Type)>,
+    return_type: Type,
 }
 
 #[derive(Clone, Debug)]
@@ -325,6 +372,69 @@ fn collect_nominal_types(
     }
 
     Ok((nominal_types, wrapped_types))
+}
+
+fn collect_lifetime_types(
+    nominal_types: &[BoundNominal],
+    wrapped_types: &HashMap<String, String>,
+) -> HashSet<String> {
+    // Struct wrappers retain a scoped program context so their Lust methods can
+    // be called directly. Enums need the same lifetime only when their Rust
+    // variants contain one of those wrappers.
+    let mut lifetime_types = nominal_types
+        .iter()
+        .filter_map(|nominal| {
+            matches!(nominal.kind, BoundNominalKind::Struct(_)).then(|| nominal.lust_name.clone())
+        })
+        .collect::<HashSet<_>>();
+
+    loop {
+        let mut changed = false;
+        for nominal in nominal_types {
+            if lifetime_types.contains(&nominal.lust_name) {
+                continue;
+            }
+            let BoundNominalKind::Enum(def) = &nominal.kind else {
+                continue;
+            };
+            let contains_context = def
+                .variants
+                .iter()
+                .flat_map(|variant| variant.fields.as_deref().unwrap_or_default())
+                .any(|ty| type_contains_lifetime(ty, &lifetime_types, wrapped_types));
+            if contains_context {
+                changed |= lifetime_types.insert(nominal.lust_name.clone());
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Keep only emitted wrappers. A referenced type may be private/generic and
+    // use a runtime handle instead of a generated lifetime-bearing wrapper.
+    lifetime_types.retain(|name| wrapped_types.contains_key(name));
+    lifetime_types
+}
+
+fn type_contains_lifetime(
+    ty: &Type,
+    lifetime_types: &HashSet<String>,
+    wrapped_types: &HashMap<String, String>,
+) -> bool {
+    match &ty.kind {
+        TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => {
+            wrapped_types.contains_key(name) && lifetime_types.contains(name)
+        }
+        TypeKind::Array(inner) | TypeKind::Option(inner) => {
+            type_contains_lifetime(inner, lifetime_types, wrapped_types)
+        }
+        TypeKind::Result(ok, err) => {
+            type_contains_lifetime(ok, lifetime_types, wrapped_types)
+                || type_contains_lifetime(err, lifetime_types, wrapped_types)
+        }
+        _ => false,
+    }
 }
 
 fn collect_declared_nominal_names(
@@ -478,22 +588,50 @@ fn enum_reaches_start(
 fn collect_bindings(
     program: &Program,
     signatures: &HashMap<String, FunctionSignature>,
-) -> Result<Vec<BoundFunction>> {
+    wrapped_types: &HashMap<String, String>,
+    struct_defs: &HashMap<String, StructDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+) -> Result<(Vec<BoundFunction>, Vec<BoundMethod>)> {
     let mut functions = Vec::new();
+    let mut methods = Vec::new();
+    let mut function_names = HashSet::new();
     let mut method_names = HashSet::new();
 
     for module in &program.modules {
-        collect_items(&module.items, signatures, &mut functions, &mut method_names)?;
+        collect_items(
+            &module.items,
+            &module.path,
+            &module.imports,
+            signatures,
+            wrapped_types,
+            struct_defs,
+            enum_defs,
+            &mut functions,
+            &mut methods,
+            &mut function_names,
+            &mut method_names,
+        )?;
     }
     functions.sort_by(|left, right| left.lust_name.cmp(&right.lust_name));
+    methods.sort_by(|left, right| {
+        (&left.target_lust_name, &left.lust_name).cmp(&(&right.target_lust_name, &right.lust_name))
+    });
 
-    Ok(functions)
+    Ok((functions, methods))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_items(
     items: &[Item],
+    module_path: &str,
+    imports: &ModuleImports,
     signatures: &HashMap<String, FunctionSignature>,
+    wrapped_types: &HashMap<String, String>,
+    struct_defs: &HashMap<String, StructDef>,
+    enum_defs: &HashMap<String, EnumDef>,
     functions: &mut Vec<BoundFunction>,
+    methods: &mut Vec<BoundMethod>,
+    function_names: &mut HashSet<String>,
     method_names: &mut HashSet<String>,
 ) -> Result<()> {
     for item in items {
@@ -507,31 +645,43 @@ fn collect_items(
                         parsed_doc.prose,
                         signatures,
                         functions,
-                        method_names,
+                        function_names,
                     )?;
                 }
             }
             ItemKind::Impl(impl_block) => {
                 for method in &impl_block.methods {
-                    if parse_doc(method.doc.as_deref())?.bindgen.is_some() {
-                        return Err(bindgen_error(format!(
-                            "@bindgen is currently supported on free functions, not method '{}'",
-                            method.name
-                        )));
+                    let parsed_doc = parse_doc(method.doc.as_deref())?;
+                    if let Some(directive) = parsed_doc.bindgen {
+                        let target_lust_name =
+                            canonical_impl_target(module_path, imports, &impl_block.target_type)?;
+                        add_method_binding(
+                            method,
+                            directive,
+                            parsed_doc.prose,
+                            &target_lust_name,
+                            impl_block,
+                            signatures,
+                            wrapped_types,
+                            struct_defs,
+                            enum_defs,
+                            methods,
+                            method_names,
+                        )?;
                     }
                 }
             }
             ItemKind::Trait(trait_def) => {
                 if parse_doc(trait_def.doc.as_deref())?.bindgen.is_some() {
                     return Err(bindgen_error(format!(
-                        "@bindgen is currently supported on free functions, not trait '{}'",
+                        "@bindgen is supported on concrete impl methods, not trait '{}'",
                         trait_def.name
                     )));
                 }
                 for method in &trait_def.methods {
                     if parse_doc(method.doc.as_deref())?.bindgen.is_some() {
                         return Err(bindgen_error(format!(
-                            "@bindgen is currently supported on free functions, not trait method '{}:{}'",
+                            "@bindgen is supported on concrete impl methods, not trait method '{}:{}'",
                             trait_def.name, method.name
                         )));
                     }
@@ -549,14 +699,14 @@ fn collect_items(
                         ExternItem::Function { name, doc, .. } => {
                             if parse_doc(doc.as_deref())?.bindgen.is_some() {
                                 return Err(bindgen_error(format!(
-                                    "@bindgen is currently supported on Lust-defined free functions, not extern function '{name}'"
+                                    "@bindgen is currently supported on Lust-defined functions and concrete impl methods, not extern function '{name}'"
                                 )));
                             }
                         }
                         ExternItem::Const { name, doc, .. } => {
                             if parse_doc(doc.as_deref())?.bindgen.is_some() {
                                 return Err(bindgen_error(format!(
-                                    "@bindgen is currently supported on Lust-defined free functions, not extern constant '{name}'"
+                                    "@bindgen is currently supported on Lust-defined functions and concrete impl methods, not extern constant '{name}'"
                                 )));
                             }
                         }
@@ -569,13 +719,252 @@ fn collect_items(
                     }
                 }
             }
-            ItemKind::Module { items, .. } => {
-                collect_items(items, signatures, functions, method_names)?;
+            ItemKind::Module { name, items } => {
+                let child_module = if name.contains('.') || name.contains("::") {
+                    name.replace("::", ".")
+                } else if module_path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{module_path}.{name}")
+                };
+                collect_items(
+                    items,
+                    &child_module,
+                    imports,
+                    signatures,
+                    wrapped_types,
+                    struct_defs,
+                    enum_defs,
+                    functions,
+                    methods,
+                    function_names,
+                    method_names,
+                )?;
             }
             ItemKind::Script(_) | ItemKind::Use { .. } => {}
         }
     }
 
+    Ok(())
+}
+
+fn canonical_impl_target(
+    module_path: &str,
+    imports: &ModuleImports,
+    target_type: &Type,
+) -> Result<String> {
+    let raw_name = match &target_type.kind {
+        TypeKind::Named(name) => name,
+        TypeKind::GenericInstance { name, .. } => name,
+        _ => {
+            return Err(bindgen_error(format!(
+                "@bindgen methods require a named impl target, found '{target_type}'"
+            )));
+        }
+    };
+    let normalized = raw_name.replace("::", ".");
+    if let Some((head, tail)) = normalized.split_once('.') {
+        if let Some(real_module) = imports.module_aliases.get(head) {
+            return Ok(format!("{real_module}.{tail}"));
+        }
+        return Ok(normalized);
+    }
+    if let Some(imported_type) = imports.type_aliases.get(&normalized) {
+        return Ok(imported_type.clone());
+    }
+    if module_path.is_empty() {
+        Ok(normalized)
+    } else {
+        Ok(format!("{module_path}.{normalized}"))
+    }
+}
+
+fn generated_struct_accessor_names(def: &StructDef) -> Result<HashSet<String>> {
+    let mut accessors = [
+        "from_handle",
+        "as_handle",
+        "into_handle",
+        "LUST_TYPE_NAME",
+        "__lust_bind_context",
+        "__lust_check_context",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<HashSet<_>>();
+    for field in &def.fields {
+        if field.visibility != Visibility::Public {
+            continue;
+        }
+        let (accessor, collision_key) =
+            rust_identifier(&field.name, "generated struct field accessor")?;
+        let (_, collision_key) = if accessors.contains(&collision_key) {
+            rust_identifier(
+                &format!("get_{}", collision_key.trim_start_matches("r#")),
+                "generated struct field accessor",
+            )?
+        } else {
+            (accessor, collision_key)
+        };
+        if !accessors.insert(collision_key.clone()) {
+            return Err(bindgen_error(format!(
+                "generated accessor '{collision_key}' conflicts with another field or wrapper method"
+            )));
+        }
+    }
+    Ok(accessors)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_method_binding(
+    method: &FunctionDef,
+    directive: BindgenDirective,
+    docs: Vec<String>,
+    target_lust_name: &str,
+    impl_block: &crate::ast::ImplBlock,
+    signatures: &HashMap<String, FunctionSignature>,
+    wrapped_types: &HashMap<String, String>,
+    struct_defs: &HashMap<String, StructDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    methods: &mut Vec<BoundMethod>,
+    method_names: &mut HashSet<String>,
+) -> Result<()> {
+    if !impl_block.type_params.is_empty()
+        || !method.type_params.is_empty()
+        || !method.trait_bounds.is_empty()
+    {
+        return Err(bindgen_error(format!(
+            "generic impl methods are not yet supported by bindgen ('{target_lust_name}.{}')",
+            method.name
+        )));
+    }
+    let Some(target_rust_name) = wrapped_types.get(target_lust_name).cloned() else {
+        return Err(bindgen_error(format!(
+            "cannot bind method '{}': impl target '{}' has no generated public, nongeneric Rust wrapper",
+            method.name, target_lust_name
+        )));
+    };
+    if method.visibility != Visibility::Public {
+        return Err(bindgen_error(format!(
+            "method '{}.{}' is marked @bindgen but is not public",
+            target_lust_name, method.name
+        )));
+    }
+
+    let has_receiver = method
+        .params
+        .iter()
+        .any(|param| param.is_self || param.name == "self");
+    let simple_method_name = method
+        .name
+        .rsplit([':', '.'])
+        .next()
+        .unwrap_or(&method.name);
+    let lust_name = if method.name.contains(':') || method.name.contains('.') {
+        method.name.clone()
+    } else if has_receiver {
+        format!("{target_lust_name}:{simple_method_name}")
+    } else {
+        format!("{target_lust_name}.{simple_method_name}")
+    };
+    let signature = signatures.get(&lust_name).ok_or_else(|| {
+        bindgen_error(format!(
+            "no checked Lust signature found for tagged method '{}'; expected runtime name '{lust_name}'",
+            method.name
+        ))
+    })?;
+    if signature.is_method != has_receiver || !signature.type_params.is_empty() {
+        return Err(bindgen_error(format!(
+            "generic or inconsistently typed impl methods are not supported by bindgen ('{lust_name}')"
+        )));
+    }
+    if signature.params.len() != method.params.len() {
+        return Err(bindgen_error(format!(
+            "checked signature for method '{lust_name}' does not match its source parameters"
+        )));
+    }
+    if signature.params.len() > 5 {
+        return Err(bindgen_error(format!(
+            "method '{lust_name}' has {} parameter(s); generated typed bindings currently support at most five",
+            signature.params.len()
+        )));
+    }
+
+    let receiver_index = method
+        .params
+        .iter()
+        .position(|param| param.is_self || param.name == "self");
+    if has_receiver && receiver_index != Some(0) {
+        return Err(bindgen_error(format!(
+            "method '{lust_name}' must declare self as its first parameter"
+        )));
+    }
+    let target_is_struct = struct_defs.contains_key(target_lust_name);
+    if has_receiver && !target_is_struct && !enum_defs.contains_key(target_lust_name) {
+        return Err(bindgen_error(format!(
+            "instance method '{lust_name}' requires a generated struct or enum wrapper"
+        )));
+    }
+
+    let mut params = Vec::new();
+    let mut seen_params = HashSet::new();
+    for (index, (param, ty)) in method.params.iter().zip(&signature.params).enumerate() {
+        if Some(index) == receiver_index {
+            continue;
+        }
+        let (rust_param_name, collision_key) =
+            rust_identifier(&param.name, "generated method parameter name")?;
+        if !seen_params.insert(collision_key.clone()) {
+            return Err(bindgen_error(format!(
+                "method '{lust_name}' has duplicate Rust parameter name '{collision_key}'"
+            )));
+        }
+        if matches!(ty.kind, TypeKind::Unit) {
+            return Err(bindgen_error(format!(
+                "unit-valued parameter '{}' in '{lust_name}' cannot be represented by call_typed",
+                param.name
+            )));
+        }
+        params.push((rust_param_name, ty.clone()));
+    }
+
+    let default_name = simple_method_name;
+    let requested_name = directive.name.as_deref().unwrap_or(default_name);
+    let (rust_name, collision_key) = rust_identifier(requested_name, "generated Rust method name")?;
+    if let Some(def) = struct_defs.get(target_lust_name)
+        && generated_struct_accessor_names(def)?.contains(&collision_key)
+    {
+        return Err(bindgen_error(format!(
+            "method '{lust_name}' maps to Rust name '{collision_key}', which conflicts with a generated field accessor or wrapper method; use @bindgen(name = \"...\")"
+        )));
+    }
+    if let Some(def) = enum_defs.get(target_lust_name)
+        && def.variants.iter().any(|variant| {
+            rust_identifier(&variant.name, "generated enum variant name")
+                .is_ok_and(|(_, key)| key == collision_key)
+        })
+    {
+        return Err(bindgen_error(format!(
+            "method '{lust_name}' maps to Rust name '{collision_key}', which conflicts with an enum variant; use @bindgen(name = \"...\")"
+        )));
+    }
+    let method_key = format!("{target_rust_name}::{collision_key}");
+    if !method_names.insert(method_key.clone()) {
+        return Err(bindgen_error(format!(
+            "multiple methods on '{target_lust_name}' map to Rust method '{collision_key}'; set distinct names with @bindgen(name = \"...\")"
+        )));
+    }
+
+    methods.push(BoundMethod {
+        lust_name,
+        rust_name,
+        target_lust_name: target_lust_name.to_string(),
+        target_rust_name,
+        has_receiver,
+        target_is_struct,
+        docs,
+        params,
+        return_type: signature.return_type.clone(),
+    });
     Ok(())
 }
 
@@ -751,8 +1140,10 @@ fn generate_source(
     bindings_name: &str,
     runtime_crate_path: &str,
     functions: &[BoundFunction],
+    methods: &[BoundMethod],
     nominal_types: &[BoundNominal],
     wrapped_types: &HashMap<String, String>,
+    lifetime_types: &HashSet<String>,
     struct_defs: &HashMap<String, StructDef>,
     enum_defs: &HashMap<String, EnumDef>,
 ) -> Result<String> {
@@ -761,23 +1152,48 @@ fn generate_source(
     let mut source = String::new();
     let runtime = runtime_crate_path.trim_end_matches("::");
     writeln!(source, "// @generated by `lust bindgen`; do not edit.").unwrap();
+    writeln!(
+        source,
+        "type __LustProgramContext<'a> = ::std::rc::Rc<::std::cell::RefCell<&'a mut {runtime}::EmbeddedProgram>>;"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "fn __lust_call_typed<'a, Args, R>(context: &__LustProgramContext<'a>, name: &str, args: Args) -> {runtime}::Result<R>"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "where Args: {runtime}::FunctionArgs, R: {runtime}::FromLustValue {{"
+    )
+    .unwrap();
+    writeln!(source, "    let mut program = context.try_borrow_mut().map_err(|_| {runtime}::LustError::RuntimeError {{").unwrap();
+    writeln!(
+        source,
+        "        message: \"the embedded Lust program is already mutably borrowed\".to_string(),"
+    )
+    .unwrap();
+    writeln!(source, "    }})?;").unwrap();
+    writeln!(
+        source,
+        "    let program: &mut {runtime}::EmbeddedProgram = &mut **program;"
+    )
+    .unwrap();
+    writeln!(source, "    program.call_typed(name, args)").unwrap();
+    writeln!(source, "}}\n").unwrap();
     for nominal in nominal_types {
         emit_nominal_type(
             &mut source,
             nominal,
             runtime,
             wrapped_types,
+            lifetime_types,
             struct_defs,
             enum_defs,
         )?;
     }
     writeln!(source, "pub struct {bindings_name}<'a> {{").unwrap();
-    writeln!(
-        source,
-        "    __lust_program: &'a mut {}::EmbeddedProgram,",
-        runtime_crate_path.trim_end_matches("::")
-    )
-    .unwrap();
+    writeln!(source, "    __lust_context: __LustProgramContext<'a>,").unwrap();
     writeln!(source, "}}\n").unwrap();
     writeln!(source, "impl<'a> {bindings_name}<'a> {{").unwrap();
     writeln!(
@@ -786,7 +1202,11 @@ fn generate_source(
         runtime_crate_path.trim_end_matches("::")
     )
     .unwrap();
-    writeln!(source, "        Self {{ __lust_program: program }}").unwrap();
+    writeln!(
+        source,
+        "        Self {{ __lust_context: ::std::rc::Rc::new(::std::cell::RefCell::new(program)) }}"
+    )
+    .unwrap();
     writeln!(source, "    }}\n").unwrap();
 
     for function in functions {
@@ -797,7 +1217,15 @@ fn generate_source(
             .map(|(name, ty)| {
                 Ok(format!(
                     "{name}: {}",
-                    rust_type(ty, true, runtime, wrapped_types, struct_defs, enum_defs)?
+                    rust_type(
+                        ty,
+                        true,
+                        runtime,
+                        wrapped_types,
+                        lifetime_types,
+                        struct_defs,
+                        enum_defs,
+                    )?
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -806,6 +1234,7 @@ fn generate_source(
             false,
             runtime,
             wrapped_types,
+            lifetime_types,
             struct_defs,
             enum_defs,
         )?;
@@ -846,10 +1275,23 @@ fn generate_source(
                 enum_defs,
                 0,
             )?;
+            emit_context_validation(
+                &mut source,
+                ty,
+                name,
+                "&self.__lust_context",
+                "        ",
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+                0,
+            )?;
         }
         writeln!(
             source,
-            "        let __lust_result: {return_type} = self.__lust_program.call_typed({}, {args})?;",
+            "        let mut __lust_result: {return_type} = __lust_call_typed(&self.__lust_context, {}, {args})?;",
             rust_string_literal(&function.lust_name)
         )
         .unwrap();
@@ -862,13 +1304,195 @@ fn generate_source(
             enum_defs,
             0,
         )?;
+        emit_context_binding(
+            &mut source,
+            &function.return_type,
+            "__lust_result",
+            "&self.__lust_context",
+            "        ",
+            runtime,
+            wrapped_types,
+            lifetime_types,
+            struct_defs,
+            enum_defs,
+            0,
+        )?;
         writeln!(source, "        Ok(__lust_result)").unwrap();
         writeln!(source, "    }}\n").unwrap();
     }
 
-    writeln!(source, "}}")
+    writeln!(source, "}}\n")
         .map_err(|err| LustError::Unknown(format!("failed to format Rust bindings: {err}")))?;
+    for method in methods {
+        emit_bound_method(
+            &mut source,
+            method,
+            &bindings_name,
+            runtime,
+            wrapped_types,
+            lifetime_types,
+            struct_defs,
+            enum_defs,
+        )?;
+    }
     Ok(source)
+}
+
+fn emit_bound_method(
+    source: &mut String,
+    method: &BoundMethod,
+    bindings_name: &str,
+    runtime: &str,
+    wrapped_types: &HashMap<String, String>,
+    lifetime_types: &HashSet<String>,
+    struct_defs: &HashMap<String, StructDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+) -> Result<()> {
+    let target_type = nominal_rust_type(
+        &method.target_rust_name,
+        &method.target_lust_name,
+        lifetime_types,
+    );
+    let mut params = Vec::new();
+    if !method.has_receiver {
+        params.push(format!("bindings: &mut {bindings_name}<'a>"));
+    } else if !method.target_is_struct {
+        params.push(format!("bindings: &mut {bindings_name}<'a>"));
+    }
+    for (name, ty) in &method.params {
+        params.push(format!(
+            "{name}: {}",
+            rust_type(
+                ty,
+                true,
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+            )?
+        ));
+    }
+    let return_type = rust_type(
+        &method.return_type,
+        false,
+        runtime,
+        wrapped_types,
+        lifetime_types,
+        struct_defs,
+        enum_defs,
+    )?;
+
+    let method_generics =
+        if method.target_is_struct || lifetime_types.contains(&method.target_lust_name) {
+            ""
+        } else {
+            "<'a>"
+        };
+    if method.target_is_struct {
+        writeln!(source, "impl<'a> {target_type} {{").unwrap();
+    } else if lifetime_types.contains(&method.target_lust_name) {
+        writeln!(source, "impl<'a> {target_type} {{").unwrap();
+    } else {
+        writeln!(source, "impl {target_type} {{").unwrap();
+    }
+    emit_docs_at(source, &method.docs, "    ");
+    writeln!(
+        source,
+        "    pub fn {}{method_generics}({}) -> {runtime}::Result<{return_type}> {{",
+        method.rust_name,
+        if method.has_receiver {
+            format!(
+                "&self{}{}",
+                if params.is_empty() { "" } else { ", " },
+                params.join(", ")
+            )
+        } else {
+            params.join(", ")
+        }
+    )
+    .unwrap();
+
+    if method.has_receiver && method.target_is_struct {
+        writeln!(source, "        let context = self.__lust_context.as_ref().ok_or_else(|| {runtime}::LustError::TypeError {{").unwrap();
+        writeln!(source, "            message: \"Lust value is not bound to an embedded program; obtain it through the generated bindings facade\".to_string(),").unwrap();
+        writeln!(source, "        }})?.clone();").unwrap();
+    } else {
+        writeln!(
+            source,
+            "        let context = bindings.__lust_context.clone();"
+        )
+        .unwrap();
+        if method.has_receiver && lifetime_types.contains(&method.target_lust_name) {
+            writeln!(source, "        self.__lust_check_context(&context)?;").unwrap();
+        }
+    }
+
+    for (name, ty) in &method.params {
+        emit_runtime_validation(source, ty, name, wrapped_types, struct_defs, enum_defs, 0)?;
+        emit_context_validation(
+            source,
+            ty,
+            name,
+            "&context",
+            "        ",
+            runtime,
+            wrapped_types,
+            lifetime_types,
+            struct_defs,
+            enum_defs,
+            0,
+        )?;
+    }
+
+    let mut call_args = Vec::new();
+    if method.has_receiver {
+        call_args.push("self.clone()".to_string());
+    }
+    call_args.extend(method.params.iter().map(|(name, ty)| {
+        if matches!(ty.kind, TypeKind::String) {
+            format!("{name}.to_string()")
+        } else {
+            name.clone()
+        }
+    }));
+    let args = match call_args.as_slice() {
+        [] => "()".to_string(),
+        [arg] => arg.clone(),
+        many => format!("({})", many.join(", ")),
+    };
+    writeln!(
+        source,
+        "        let mut __lust_result: {return_type} = __lust_call_typed(&context, {}, {args})?;",
+        rust_string_literal(&method.lust_name)
+    )
+    .unwrap();
+    emit_runtime_validation(
+        source,
+        &method.return_type,
+        "__lust_result",
+        wrapped_types,
+        struct_defs,
+        enum_defs,
+        0,
+    )?;
+    emit_context_binding(
+        source,
+        &method.return_type,
+        "__lust_result",
+        "&context",
+        "        ",
+        runtime,
+        wrapped_types,
+        lifetime_types,
+        struct_defs,
+        enum_defs,
+        0,
+    )?;
+    writeln!(source, "        Ok(__lust_result)").unwrap();
+    writeln!(source, "    }}").unwrap();
+    writeln!(source, "}}\n").unwrap();
+    Ok(())
 }
 
 fn emit_nominal_type(
@@ -876,6 +1500,7 @@ fn emit_nominal_type(
     nominal: &BoundNominal,
     runtime: &str,
     wrapped_types: &HashMap<String, String>,
+    lifetime_types: &HashSet<String>,
     struct_defs: &HashMap<String, StructDef>,
     enum_defs: &HashMap<String, EnumDef>,
 ) -> Result<()> {
@@ -886,6 +1511,7 @@ fn emit_nominal_type(
             def,
             runtime,
             wrapped_types,
+            lifetime_types,
             struct_defs,
             enum_defs,
         ),
@@ -895,6 +1521,7 @@ fn emit_nominal_type(
             def,
             runtime,
             wrapped_types,
+            lifetime_types,
             struct_defs,
             enum_defs,
         ),
@@ -907,15 +1534,21 @@ fn emit_struct_wrapper(
     def: &StructDef,
     runtime: &str,
     wrapped_types: &HashMap<String, String>,
+    lifetime_types: &HashSet<String>,
     struct_defs: &HashMap<String, StructDef>,
     enum_defs: &HashMap<String, EnumDef>,
 ) -> Result<()> {
     emit_docs_at(source, &nominal.docs, "");
     writeln!(source, "#[derive(Clone)]").unwrap();
-    writeln!(source, "pub struct {} {{", nominal.rust_name).unwrap();
+    writeln!(source, "pub struct {}<'a> {{", nominal.rust_name).unwrap();
     writeln!(source, "    __lust_handle: {runtime}::StructHandle,").unwrap();
+    writeln!(
+        source,
+        "    __lust_context: Option<__LustProgramContext<'a>>,"
+    )
+    .unwrap();
     writeln!(source, "}}\n").unwrap();
-    writeln!(source, "impl {} {{", nominal.rust_name).unwrap();
+    writeln!(source, "impl<'a> {}<'a> {{", nominal.rust_name).unwrap();
     writeln!(
         source,
         "    pub const LUST_TYPE_NAME: &'static str = {};",
@@ -932,7 +1565,11 @@ fn emit_struct_wrapper(
         "        handle.ensure_exact_type(Self::LUST_TYPE_NAME)?;"
     )
     .unwrap();
-    writeln!(source, "        Ok(Self {{ __lust_handle: handle }})").unwrap();
+    writeln!(
+        source,
+        "        Ok(Self {{ __lust_handle: handle, __lust_context: None }})"
+    )
+    .unwrap();
     writeln!(source, "    }}\n").unwrap();
     writeln!(
         source,
@@ -949,10 +1586,17 @@ fn emit_struct_wrapper(
     writeln!(source, "        self.__lust_handle").unwrap();
     writeln!(source, "    }}").unwrap();
 
-    let mut accessors = ["from_handle", "as_handle", "into_handle"]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<HashSet<_>>();
+    let mut accessors = [
+        "from_handle",
+        "as_handle",
+        "into_handle",
+        "LUST_TYPE_NAME",
+        "__lust_bind_context",
+        "__lust_check_context",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<HashSet<_>>();
     for field in &def.fields {
         if field.visibility != Visibility::Public {
             continue;
@@ -978,6 +1622,7 @@ fn emit_struct_wrapper(
             false,
             runtime,
             wrapped_types,
+            lifetime_types,
             struct_defs,
             enum_defs,
         )?;
@@ -986,19 +1631,79 @@ fn emit_struct_wrapper(
             "\n    pub fn {accessor}(&self) -> {runtime}::Result<{field_type}> {{"
         )
         .unwrap();
-        writeln!(
-            source,
-            "        self.__lust_handle.field::<{field_type}>({})",
-            rust_string_literal(&field.name)
-        )
-        .unwrap();
+        if type_contains_lifetime(&field.ty, lifetime_types, wrapped_types) {
+            writeln!(
+                source,
+                "        let mut value = self.__lust_handle.field::<{field_type}>({})?;",
+                rust_string_literal(&field.name)
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "        if let Some(context) = &self.__lust_context {{"
+            )
+            .unwrap();
+            emit_context_binding(
+                source,
+                &field.ty,
+                "value",
+                "context",
+                "            ",
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+                0,
+            )?;
+            writeln!(source, "        }}").unwrap();
+            writeln!(source, "        Ok(value)").unwrap();
+        } else {
+            writeln!(
+                source,
+                "        self.__lust_handle.field::<{field_type}>({})",
+                rust_string_literal(&field.name)
+            )
+            .unwrap();
+        }
         writeln!(source, "    }}").unwrap();
     }
+    writeln!(source, "\n    fn __lust_bind_context(&mut self, context: &__LustProgramContext<'a>) -> {runtime}::Result<()> {{").unwrap();
+    writeln!(
+        source,
+        "        if let Some(existing) = &self.__lust_context {{"
+    )
+    .unwrap();
+    writeln!(
+        source,
+        "            if !::std::rc::Rc::ptr_eq(existing, context) {{"
+    )
+    .unwrap();
+    writeln!(source, "                return Err({runtime}::LustError::TypeError {{ message: \"Lust value belongs to a different embedded program\".to_string() }});").unwrap();
+    writeln!(source, "            }}").unwrap();
+    writeln!(source, "        }}").unwrap();
+    writeln!(
+        source,
+        "        self.__lust_context = Some(context.clone());"
+    )
+    .unwrap();
+    writeln!(source, "        Ok(())").unwrap();
+    writeln!(source, "    }}\n").unwrap();
+    writeln!(source, "    fn __lust_check_context(&self, context: &__LustProgramContext<'a>) -> {runtime}::Result<()> {{").unwrap();
+    writeln!(source, "        match &self.__lust_context {{").unwrap();
+    writeln!(
+        source,
+        "            Some(existing) if ::std::rc::Rc::ptr_eq(existing, context) => Ok(()),"
+    )
+    .unwrap();
+    writeln!(source, "            _ => Err({runtime}::LustError::TypeError {{ message: \"Lust value is not bound to this embedded program\".to_string() }}),").unwrap();
+    writeln!(source, "        }}").unwrap();
+    writeln!(source, "    }}").unwrap();
     writeln!(source, "}}\n").unwrap();
 
     writeln!(
         source,
-        "impl {runtime}::FromLustValue for {} {{",
+        "impl<'a> {runtime}::FromLustValue for {}<'a> {{",
         nominal.rust_name
     )
     .unwrap();
@@ -1023,7 +1728,7 @@ fn emit_struct_wrapper(
 
     writeln!(
         source,
-        "impl {runtime}::IntoLustValue for {} {{",
+        "impl<'a> {runtime}::IntoLustValue for {}<'a> {{",
         nominal.rust_name
     )
     .unwrap();
@@ -1050,12 +1755,19 @@ fn emit_enum_wrapper(
     def: &EnumDef,
     runtime: &str,
     wrapped_types: &HashMap<String, String>,
+    lifetime_types: &HashSet<String>,
     struct_defs: &HashMap<String, StructDef>,
     enum_defs: &HashMap<String, EnumDef>,
 ) -> Result<()> {
     emit_docs_at(source, &nominal.docs, "");
+    let rust_type_name = nominal_rust_type(&nominal.rust_name, &nominal.lust_name, lifetime_types);
+    let impl_generics = if lifetime_types.contains(&nominal.lust_name) {
+        "<'a>"
+    } else {
+        ""
+    };
     writeln!(source, "#[derive(Clone)]").unwrap();
-    writeln!(source, "pub enum {} {{", nominal.rust_name).unwrap();
+    writeln!(source, "pub enum {rust_type_name} {{").unwrap();
     let mut variant_names = HashSet::new();
     for variant in &def.variants {
         let (variant_name, collision_key) =
@@ -1073,20 +1785,47 @@ fn emit_enum_wrapper(
             let field_types = fields
                 .iter()
                 .map(|field| {
-                    rust_type(field, false, runtime, wrapped_types, struct_defs, enum_defs)
+                    rust_type(
+                        field,
+                        false,
+                        runtime,
+                        wrapped_types,
+                        lifetime_types,
+                        struct_defs,
+                        enum_defs,
+                    )
                 })
                 .collect::<Result<Vec<_>>>()?;
             writeln!(source, "    {variant_name}({}),", field_types.join(", ")).unwrap();
         }
     }
     writeln!(source, "}}\n").unwrap();
+    if lifetime_types.contains(&nominal.lust_name) {
+        emit_enum_context_methods(
+            source,
+            nominal,
+            def,
+            runtime,
+            wrapped_types,
+            lifetime_types,
+            struct_defs,
+            enum_defs,
+        )?;
+    }
 
-    writeln!(
-        source,
-        "impl {runtime}::FromLustValue for {} {{",
-        nominal.rust_name
-    )
-    .unwrap();
+    if lifetime_types.contains(&nominal.lust_name) {
+        writeln!(
+            source,
+            "impl<'a> {runtime}::FromLustValue for {rust_type_name} {{"
+        )
+        .unwrap();
+    } else {
+        writeln!(
+            source,
+            "impl {runtime}::FromLustValue for {rust_type_name} {{"
+        )
+        .unwrap();
+    }
     writeln!(
         source,
         "    fn from_value(value: {runtime}::Value) -> {runtime}::Result<Self> {{"
@@ -1125,7 +1864,15 @@ fn emit_enum_wrapper(
                 .map(|(index, ty)| {
                     Ok(format!(
                         "__lust_enum.payload::<{}>({index})?",
-                        rust_type(ty, false, runtime, wrapped_types, struct_defs, enum_defs)?
+                        rust_type(
+                            ty,
+                            false,
+                            runtime,
+                            wrapped_types,
+                            lifetime_types,
+                            struct_defs,
+                            enum_defs,
+                        )?
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1163,8 +1910,7 @@ fn emit_enum_wrapper(
 
     writeln!(
         source,
-        "impl {runtime}::IntoLustValue for {} {{",
-        nominal.rust_name
+        "impl{impl_generics} {runtime}::IntoLustValue for {rust_type_name} {{"
     )
     .unwrap();
     writeln!(source, "    fn into_value(self) -> {runtime}::Value {{").unwrap();
@@ -1190,8 +1936,15 @@ fn emit_enum_wrapper(
                 .map(|(ty, name)| {
                     Ok(format!(
                         "<{as_type} as {runtime}::IntoLustValue>::into_value({name})",
-                        as_type =
-                            rust_type(ty, false, runtime, wrapped_types, struct_defs, enum_defs)?
+                        as_type = rust_type(
+                            ty,
+                            false,
+                            runtime,
+                            wrapped_types,
+                            lifetime_types,
+                            struct_defs,
+                            enum_defs,
+                        )?
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1244,11 +1997,20 @@ fn emit_docs_at(source: &mut String, docs: &[String], indent: &str) {
     }
 }
 
+fn nominal_rust_type(rust_name: &str, lust_name: &str, lifetime_types: &HashSet<String>) -> String {
+    if lifetime_types.contains(lust_name) {
+        format!("{rust_name}<'a>")
+    } else {
+        rust_name.to_string()
+    }
+}
+
 fn rust_type(
     ty: &Type,
     direct_argument: bool,
     runtime: &str,
     wrapped_types: &HashMap<String, String>,
+    lifetime_types: &HashSet<String>,
     struct_defs: &HashMap<String, StructDef>,
     enum_defs: &HashMap<String, EnumDef>,
 ) -> Result<String> {
@@ -1261,23 +2023,55 @@ fn rust_type(
         TypeKind::Unit => "()".to_string(),
         TypeKind::Array(inner) => format!(
             "::std::vec::Vec<{}>",
-            rust_type(inner, false, runtime, wrapped_types, struct_defs, enum_defs)?
+            rust_type(
+                inner,
+                false,
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+            )?
         ),
         TypeKind::Option(inner) => format!(
             "::std::option::Option<{}>",
-            rust_type(inner, false, runtime, wrapped_types, struct_defs, enum_defs)?
+            rust_type(
+                inner,
+                false,
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+            )?
         ),
         TypeKind::Result(ok, err) => format!(
             "::std::result::Result<{}, {}>",
-            rust_type(ok, false, runtime, wrapped_types, struct_defs, enum_defs)?,
-            rust_type(err, false, runtime, wrapped_types, struct_defs, enum_defs)?
+            rust_type(
+                ok,
+                false,
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+            )?,
+            rust_type(
+                err,
+                false,
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+            )?
         ),
         TypeKind::Map(_, _) => format!("{runtime}::MapHandle"),
         TypeKind::Function { .. } => format!("{runtime}::FunctionHandle"),
         TypeKind::Named(name) | TypeKind::GenericInstance { name, .. }
             if wrapped_types.contains_key(name) =>
         {
-            wrapped_types[name].clone()
+            nominal_rust_type(&wrapped_types[name], name, lifetime_types)
         }
         TypeKind::Named(name) | TypeKind::GenericInstance { name, .. }
             if struct_defs.contains_key(name) =>
@@ -1294,6 +2088,331 @@ fn rust_type(
         _ => format!("{runtime}::Value"),
     };
     Ok(result)
+}
+
+fn emit_context_binding(
+    source: &mut String,
+    ty: &Type,
+    expression: &str,
+    context: &str,
+    indent: &str,
+    runtime: &str,
+    wrapped_types: &HashMap<String, String>,
+    lifetime_types: &HashSet<String>,
+    struct_defs: &HashMap<String, StructDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    depth: usize,
+) -> Result<()> {
+    if !type_contains_lifetime(ty, lifetime_types, wrapped_types) {
+        return Ok(());
+    }
+    match &ty.kind {
+        TypeKind::Named(name) | TypeKind::GenericInstance { name, .. }
+            if wrapped_types.contains_key(name) && lifetime_types.contains(name) =>
+        {
+            writeln!(
+                source,
+                "{indent}{expression}.__lust_bind_context({context})?;"
+            )
+            .unwrap();
+        }
+        TypeKind::Array(inner) => {
+            let item_name = format!("__lust_context_item_{depth}");
+            writeln!(source, "{indent}for {item_name} in &mut {expression} {{").unwrap();
+            emit_context_binding(
+                source,
+                inner,
+                &item_name,
+                context,
+                &format!("{indent}    "),
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+                depth + 1,
+            )?;
+            writeln!(source, "{indent}}}").unwrap();
+        }
+        TypeKind::Option(inner) => {
+            let item_name = format!("__lust_context_item_{depth}");
+            writeln!(
+                source,
+                "{indent}if let Some({item_name}) = &mut {expression} {{"
+            )
+            .unwrap();
+            emit_context_binding(
+                source,
+                inner,
+                &item_name,
+                context,
+                &format!("{indent}    "),
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+                depth + 1,
+            )?;
+            writeln!(source, "{indent}}}").unwrap();
+        }
+        TypeKind::Result(ok, err) => {
+            let ok_name = format!("__lust_context_ok_{depth}");
+            let err_name = format!("__lust_context_err_{depth}");
+            writeln!(source, "{indent}match &mut {expression} {{").unwrap();
+            writeln!(
+                source,
+                "{indent}    ::std::result::Result::Ok({ok_name}) => {{"
+            )
+            .unwrap();
+            emit_context_binding(
+                source,
+                ok,
+                &ok_name,
+                context,
+                &format!("{indent}        "),
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+                depth + 1,
+            )?;
+            writeln!(source, "{indent}    }}").unwrap();
+            writeln!(
+                source,
+                "{indent}    ::std::result::Result::Err({err_name}) => {{"
+            )
+            .unwrap();
+            emit_context_binding(
+                source,
+                err,
+                &err_name,
+                context,
+                &format!("{indent}        "),
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+                depth + 1,
+            )?;
+            writeln!(source, "{indent}    }}").unwrap();
+            writeln!(source, "{indent}}}").unwrap();
+        }
+        _ => {}
+    }
+    let _ = (runtime, struct_defs, enum_defs);
+    Ok(())
+}
+
+fn emit_context_validation(
+    source: &mut String,
+    ty: &Type,
+    expression: &str,
+    context: &str,
+    indent: &str,
+    runtime: &str,
+    wrapped_types: &HashMap<String, String>,
+    lifetime_types: &HashSet<String>,
+    struct_defs: &HashMap<String, StructDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+    depth: usize,
+) -> Result<()> {
+    if !type_contains_lifetime(ty, lifetime_types, wrapped_types) {
+        return Ok(());
+    }
+    match &ty.kind {
+        TypeKind::Named(name) | TypeKind::GenericInstance { name, .. }
+            if wrapped_types.contains_key(name) && lifetime_types.contains(name) =>
+        {
+            writeln!(
+                source,
+                "{indent}{expression}.__lust_check_context({context})?;"
+            )
+            .unwrap();
+        }
+        TypeKind::Array(inner) => {
+            let item_name = format!("__lust_context_item_{depth}");
+            writeln!(source, "{indent}for {item_name} in &{expression} {{").unwrap();
+            emit_context_validation(
+                source,
+                inner,
+                &item_name,
+                context,
+                &format!("{indent}    "),
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+                depth + 1,
+            )?;
+            writeln!(source, "{indent}}}").unwrap();
+        }
+        TypeKind::Option(inner) => {
+            let item_name = format!("__lust_context_item_{depth}");
+            writeln!(
+                source,
+                "{indent}if let Some({item_name}) = &{expression} {{"
+            )
+            .unwrap();
+            emit_context_validation(
+                source,
+                inner,
+                &item_name,
+                context,
+                &format!("{indent}    "),
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+                depth + 1,
+            )?;
+            writeln!(source, "{indent}}}").unwrap();
+        }
+        TypeKind::Result(ok, err) => {
+            let ok_name = format!("__lust_context_ok_{depth}");
+            let err_name = format!("__lust_context_err_{depth}");
+            writeln!(source, "{indent}match &{expression} {{").unwrap();
+            writeln!(
+                source,
+                "{indent}    ::std::result::Result::Ok({ok_name}) => {{"
+            )
+            .unwrap();
+            emit_context_validation(
+                source,
+                ok,
+                &ok_name,
+                context,
+                &format!("{indent}        "),
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+                depth + 1,
+            )?;
+            writeln!(source, "{indent}    }}").unwrap();
+            writeln!(
+                source,
+                "{indent}    ::std::result::Result::Err({err_name}) => {{"
+            )
+            .unwrap();
+            emit_context_validation(
+                source,
+                err,
+                &err_name,
+                context,
+                &format!("{indent}        "),
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+                depth + 1,
+            )?;
+            writeln!(source, "{indent}    }}").unwrap();
+            writeln!(source, "{indent}}}").unwrap();
+        }
+        _ => {}
+    }
+    let _ = runtime;
+    Ok(())
+}
+
+fn emit_enum_context_methods(
+    source: &mut String,
+    nominal: &BoundNominal,
+    def: &EnumDef,
+    runtime: &str,
+    wrapped_types: &HashMap<String, String>,
+    lifetime_types: &HashSet<String>,
+    struct_defs: &HashMap<String, StructDef>,
+    enum_defs: &HashMap<String, EnumDef>,
+) -> Result<()> {
+    let rust_type_name = nominal_rust_type(&nominal.rust_name, &nominal.lust_name, lifetime_types);
+    writeln!(source, "impl<'a> {rust_type_name} {{").unwrap();
+    writeln!(source, "    fn __lust_bind_context(&mut self, context: &__LustProgramContext<'a>) -> {runtime}::Result<()> {{").unwrap();
+    writeln!(source, "        match self {{").unwrap();
+    for variant in &def.variants {
+        let (variant_name, _) = rust_identifier(&variant.name, "generated enum variant name")?;
+        let fields = variant.fields.as_deref().unwrap_or(&[]);
+        if fields.is_empty() {
+            writeln!(source, "            Self::{variant_name} => {{}},").unwrap();
+            continue;
+        }
+        let names = (0..fields.len())
+            .map(|index| format!("__lust_field_{index}"))
+            .collect::<Vec<_>>();
+        writeln!(
+            source,
+            "            Self::{variant_name}({}) => {{",
+            names.join(", ")
+        )
+        .unwrap();
+        for (ty, name) in fields.iter().zip(&names) {
+            emit_context_binding(
+                source,
+                ty,
+                name,
+                "context",
+                "                ",
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+                0,
+            )?;
+        }
+        writeln!(source, "            }},").unwrap();
+    }
+    writeln!(source, "        }}").unwrap();
+    writeln!(source, "        Ok(())").unwrap();
+    writeln!(source, "    }}\n").unwrap();
+
+    writeln!(source, "    fn __lust_check_context(&self, context: &__LustProgramContext<'a>) -> {runtime}::Result<()> {{").unwrap();
+    writeln!(source, "        match self {{").unwrap();
+    for variant in &def.variants {
+        let (variant_name, _) = rust_identifier(&variant.name, "generated enum variant name")?;
+        let fields = variant.fields.as_deref().unwrap_or(&[]);
+        if fields.is_empty() {
+            writeln!(source, "            Self::{variant_name} => {{}},").unwrap();
+            continue;
+        }
+        let names = (0..fields.len())
+            .map(|index| format!("__lust_field_{index}"))
+            .collect::<Vec<_>>();
+        writeln!(
+            source,
+            "            Self::{variant_name}({}) => {{",
+            names.join(", ")
+        )
+        .unwrap();
+        for (ty, name) in fields.iter().zip(&names) {
+            emit_context_validation(
+                source,
+                ty,
+                name,
+                "context",
+                "                ",
+                runtime,
+                wrapped_types,
+                lifetime_types,
+                struct_defs,
+                enum_defs,
+                0,
+            )?;
+        }
+        writeln!(source, "            }},").unwrap();
+    }
+    writeln!(source, "        }}").unwrap();
+    writeln!(source, "        Ok(())").unwrap();
+    writeln!(source, "    }}").unwrap();
+    writeln!(source, "}}\n").unwrap();
+    Ok(())
 }
 
 fn emit_runtime_validation(
@@ -1562,9 +2681,9 @@ end
         );
         assert!(generated.source.contains("\"main.add\""));
         assert!(generated.source.contains(
-            "pub fn get_player(&mut self, id: ::lust::LustInt) -> ::lust::Result<Player>"
+            "pub fn get_player(&mut self, id: ::lust::LustInt) -> ::lust::Result<Player<'a>>"
         ));
-        assert!(generated.source.contains("pub struct Player"));
+        assert!(generated.source.contains("pub struct Player<'a>"));
         assert!(
             generated
                 .source
@@ -1587,7 +2706,11 @@ end
                 .source
                 .contains("ensure_exact_type(\"main.Status\")?")
         );
-        assert!(generated.source.contains("::std::option::Option<Player>"));
+        assert!(
+            generated
+                .source
+                .contains("::std::option::Option<Player<'a>>")
+        );
         assert!(generated.source.contains("pub enum RustStatus"));
         assert!(generated.source.contains("::lust::Result<RustStatus>"));
         assert!(!generated.source.contains("pub struct IndexError"));
@@ -1596,17 +2719,111 @@ end
                 .source
                 .contains("pub fn echo_name(&mut self, name: &str)")
         );
-        assert!(
-            generated
-                .source
-                .contains("call_typed(\"main.echo_name\", name.to_string())")
-        );
+        assert!(generated.source.contains(
+            "__lust_call_typed(&self.__lust_context, \"main.echo_name\", name.to_string())"
+        ));
         assert!(!generated.source.contains("internal_helper"));
         assert!(generated.source.contains("/// Adds two values."));
         assert!(
             generated
                 .input_files
                 .contains(&entry.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn generates_instance_static_and_trait_impl_method_wrappers() {
+        let dir = TempDir::new().expect("temp dir");
+        let entry = dir.path().join("main.lust");
+        fs::write(
+            &entry,
+            r#"
+struct Player
+    id: int
+end
+
+enum Level
+    Low
+    High
+end
+
+impl Level
+    --- Return a numeric representation of this level.
+    ---@bindgen
+    function ordinal(self): int
+        return 1
+    end
+end
+
+trait Named
+    function display_name(self): string
+end
+
+impl Player
+    --- Return this player's id doubled.
+    ---@bindgen
+    function double_id(self): int
+        return self.id * 2
+    end
+
+    --- Create a player from an id.
+    ---@bindgen
+    function from_id(id: int): Player
+        return Player { id = id }
+    end
+end
+
+impl Named for Player
+    --- Describe a player via its trait implementation.
+    ---@bindgen(name = "trait_display_name")
+    function display_name(self): string
+        return "player-" .. tostring(self.id)
+    end
+end
+"#,
+        )
+        .expect("write Lust source");
+
+        let generated = RustBindingsBuilder::new(&entry)
+            .bindings_name("GameBindings")
+            .generate()
+            .expect("generate method bindings");
+
+        assert!(
+            generated
+                .source
+                .contains("pub fn double_id(&self) -> ::lust::Result<::lust::LustInt>")
+        );
+        assert!(
+            generated
+                .source
+                .contains("__lust_call_typed(&context, \"main.Player:double_id\", self.clone())")
+        );
+        assert!(generated.source.contains(
+            "pub fn from_id(bindings: &mut GameBindings<'a>, id: ::lust::LustInt) -> ::lust::Result<Player<'a>>"
+        ));
+        assert!(
+            generated
+                .source
+                .contains("__lust_call_typed(&context, \"main.Player.from_id\", id)")
+        );
+        assert!(
+            generated.source.contains(
+                "pub fn trait_display_name(&self) -> ::lust::Result<::std::string::String>"
+            )
+        );
+        assert!(
+            generated.source.contains(
+                "__lust_call_typed(&context, \"main.Player:display_name\", self.clone())"
+            )
+        );
+        assert!(generated.source.contains(
+            "pub fn ordinal<'a>(&self, bindings: &mut GameBindings<'a>) -> ::lust::Result<::lust::LustInt>"
+        ));
+        assert!(
+            generated
+                .source
+                .contains("__lust_call_typed(&context, \"main.Level:ordinal\", self.clone())")
         );
     }
 

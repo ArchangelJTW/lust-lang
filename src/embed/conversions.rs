@@ -7,7 +7,6 @@ use crate::ast::{Span, Type, TypeKind};
 use crate::bytecode::Value;
 use crate::number::{LustFloat, LustInt};
 use crate::{LustError, Result};
-use std::any::TypeId;
 use std::rc::Rc;
 
 fn struct_field_type_error(field: &str, expected: &str, actual: &Value) -> LustError {
@@ -385,6 +384,12 @@ pub trait IntoLustValue: Sized {
     fn into_value(self) -> Value;
     fn matches_lust_type(ty: &Type) -> bool;
     fn type_description() -> &'static str;
+
+    /// Whether this Rust value represents zero Lust arguments rather than one
+    /// unit-valued argument. Defaults to `false` for custom conversions.
+    fn is_unit() -> bool {
+        false
+    }
 }
 
 pub trait FromLustValue: Sized {
@@ -429,6 +434,10 @@ impl FromLustValue for Value {
 impl IntoLustValue for () {
     fn into_value(self) -> Value {
         Value::Nil
+    }
+
+    fn is_unit() -> bool {
+        true
     }
 
     fn matches_lust_type(ty: &Type) -> bool {
@@ -1056,10 +1065,10 @@ fn expected_enum_parts<'a>(
 
 impl<T> FunctionArgs for T
 where
-    T: IntoLustValue + 'static,
+    T: IntoLustValue,
 {
     fn into_values(self) -> Vec<Value> {
-        if TypeId::of::<T>() == TypeId::of::<()>() {
+        if T::is_unit() {
             Vec::new()
         } else {
             vec![self.into_value()]
@@ -1067,7 +1076,7 @@ where
     }
 
     fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
-        if TypeId::of::<T>() == TypeId::of::<()>() {
+        if T::is_unit() {
             ensure_arity(function_name, params, 0)
         } else {
             ensure_arity(function_name, params, 1)?;

@@ -3,6 +3,10 @@ struct Player
     name: string
 end
 
+struct PlayerRecord
+    player: Player
+end
+
 --- Return the player identified by id.
 ---@bindgen
 function get_player(id: int): Player
@@ -13,7 +17,50 @@ function get_player(id: int): Player
 end
 
 ---@bindgen
+function get_record(id: int): PlayerRecord
+    return PlayerRecord {
+        player = get_player(id)
+    }
+end
+
+---@bindgen
 function rename_player(player: Player, new_name: string): Player
     player.name = new_name
     return player
+end
+
+impl Player
+    --- Build a display label for this player.
+    ---@bindgen
+    function display_label(self): string
+        return self.name .. "#" .. tostring(self.id)
+    end
+
+    --- Rename this player and return the updated value.
+    ---@bindgen
+    function rename(self, new_name: string): Player
+        self.name = new_name
+        return self
+    end
+
+    --- Construct a player from an id.
+    ---@bindgen
+    function new(id: int): Player
+        return Player {
+            id = id,
+            name = "player-" .. tostring(id)
+        }
+    end
+end
+
+trait Describable
+    function describe(self): string
+end
+
+impl Describable for Player
+    --- Describe this player through its trait implementation.
+    ---@bindgen
+    function describe(self): string
+        return "Player " .. self.name
+    end
 end

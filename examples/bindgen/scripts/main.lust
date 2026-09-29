@@ -7,6 +7,14 @@ enum Status
     Player(Player)
 end
 
+impl Status
+    --- Check whether this status is ready.
+    ---@bindgen
+    function is_ready(self): bool
+        return self is Ready
+    end
+end
+
 --- Look up an optional display name.
 ---@bindgen
 function lookup_name(id: int): Option<string>

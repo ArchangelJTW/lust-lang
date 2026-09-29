@@ -4,8 +4,10 @@ pub mod game_bindings {
 
 fn main() -> lust::Result<()> {
     let source = include_str!("../scripts/main.lust");
+    let scripts_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts");
+    // Resolve `use player.*` from scripts/player.lust without listing it manually.
     let mut program = lust::EmbeddedProgram::builder()
-        .module("main", source)
+        .with_base_dir(scripts_dir)
         .entry_module("main")
         .compile()?;
 

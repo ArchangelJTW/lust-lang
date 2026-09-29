@@ -1,0 +1,19 @@
+struct Player
+    id: int
+    name: string
+end
+
+--- Return the player identified by id.
+---@bindgen
+function get_player(id: int): Player
+    return Player {
+        id = id,
+        name = "player-" .. tostring(id)
+    }
+end
+
+---@bindgen
+function rename_player(player: Player, new_name: string): Player
+    player.name = new_name
+    return player
+end

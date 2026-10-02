@@ -4,7 +4,7 @@ use crate::bytecode::{LustMap, Value};
 use crate::vm::task::TaskInstance;
 use crate::vm::{CallFrame, TaskSignal, VM};
 use alloc::rc::{Rc, Weak};
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::cell::RefCell;
 use hashbrown::{HashMap, HashSet, hash_map::Entry};
 
@@ -230,14 +230,19 @@ impl CycleCollector {
         if Self::is_leaf(value) {
             return;
         }
-        let mut stack = vec![value.clone()];
+        // Borrow the root; most writes merely re-observe a registered
+        // container or wrap a scalar in Result/Option. Neither case needs
+        // an owning traversal stack or a visited-set allocation.
+        let mut stack = Vec::new();
         let mut visited = HashSet::new();
-        while let Some(value) = stack.pop() {
+        let mut current = None;
+        loop {
+            let value = current.as_ref().unwrap_or(value);
             self.work += 1;
             match value {
                 Value::Array(rc) => {
-                    let key = (NODE_ARRAY, Rc::as_ptr(&rc) as usize);
-                    let registered = self.register_array(&rc);
+                    let key = (NODE_ARRAY, Rc::as_ptr(rc) as usize);
+                    let registered = self.register_array(rc);
                     if registered {
                         self.pending_registrations += 1;
                     }
@@ -250,8 +255,8 @@ impl CycleCollector {
                     }
                 }
                 Value::Map(rc) => {
-                    let key = (NODE_MAP, Rc::as_ptr(&rc) as usize);
-                    let registered = self.register_map(&rc);
+                    let key = (NODE_MAP, Rc::as_ptr(rc) as usize);
+                    let registered = self.register_map(rc);
                     if registered {
                         self.pending_registrations += 1;
                     }
@@ -271,8 +276,8 @@ impl CycleCollector {
                     }
                 }
                 Value::Struct(object) => {
-                    let key = (NODE_STRUCT, Rc::as_ptr(&object) as usize);
-                    let registered = self.register_struct(&object);
+                    let key = (NODE_STRUCT, Rc::as_ptr(object) as usize);
+                    let registered = self.register_struct(object);
                     if registered {
                         self.pending_registrations += 1;
                     }
@@ -285,8 +290,8 @@ impl CycleCollector {
                     }
                 }
                 Value::Iterator(rc) => {
-                    let key = (NODE_ITERATOR, Rc::as_ptr(&rc) as usize);
-                    let registered = self.register_iterator(&rc);
+                    let key = (NODE_ITERATOR, Rc::as_ptr(rc) as usize);
+                    let registered = self.register_iterator(rc);
                     if registered {
                         self.pending_registrations += 1;
                     }
@@ -314,23 +319,27 @@ impl CycleCollector {
                     }
                 }
                 Value::Tuple(values) => {
-                    let key = (NODE_TUPLE_VALUES, Rc::as_ptr(&values) as usize);
-                    if visited.insert(key) {
+                    let key = (NODE_TUPLE_VALUES, Rc::as_ptr(values) as usize);
+                    if values.iter().all(Self::is_leaf) {
+                        self.work += values.len();
+                    } else if visited.insert(key) {
                         self.work += values.len();
                         stack.extend(values.iter().filter(|v| !Self::is_leaf(v)).cloned());
                     }
                 }
                 Value::Enum(object) => {
-                    let key = (NODE_ENUM_VALUES, Rc::as_ptr(&object) as usize);
-                    if let Some(values) = &object.values
-                        && visited.insert(key)
-                    {
-                        self.work += values.len();
-                        stack.extend(values.iter().filter(|v| !Self::is_leaf(v)).cloned());
+                    let key = (NODE_ENUM_VALUES, Rc::as_ptr(object) as usize);
+                    if let Some(values) = &object.values {
+                        if values.iter().all(Self::is_leaf) {
+                            self.work += values.len();
+                        } else if visited.insert(key) {
+                            self.work += values.len();
+                            stack.extend(values.iter().filter(|v| !Self::is_leaf(v)).cloned());
+                        }
                     }
                 }
                 Value::Closure(closure) => {
-                    let key = (NODE_CLOSURE_UPVALUES, Rc::as_ptr(&closure) as usize);
+                    let key = (NODE_CLOSURE_UPVALUES, Rc::as_ptr(closure) as usize);
                     if visited.insert(key) {
                         let upvalues = &closure.upvalues;
                         self.work += upvalues.len();
@@ -344,6 +353,10 @@ impl CycleCollector {
                 }
                 Value::WeakStruct(_) => {}
                 _ => {}
+            }
+            current = stack.pop();
+            if current.is_none() {
+                break;
             }
         }
     }
@@ -664,43 +677,40 @@ impl CycleCollector {
     }
 
     fn register_array(&mut self, rc: &Rc<RefCell<Vec<Value>>>) -> bool {
-        self.register_container(
-            (NODE_ARRAY, Rc::as_ptr(rc) as usize),
-            ContainerKind::Array(Rc::downgrade(rc)),
-        )
+        self.register_container((NODE_ARRAY, Rc::as_ptr(rc) as usize), || {
+            ContainerKind::Array(Rc::downgrade(rc))
+        })
     }
 
     fn register_map(&mut self, rc: &Rc<RefCell<LustMap>>) -> bool {
-        self.register_container(
-            (NODE_MAP, Rc::as_ptr(rc) as usize),
-            ContainerKind::Map(Rc::downgrade(rc)),
-        )
+        self.register_container((NODE_MAP, Rc::as_ptr(rc) as usize), || {
+            ContainerKind::Map(Rc::downgrade(rc))
+        })
     }
 
     fn register_struct(&mut self, rc: &Rc<StructObject>) -> bool {
-        self.register_container(
-            (NODE_STRUCT, Rc::as_ptr(rc) as usize),
-            ContainerKind::Struct(Rc::downgrade(rc)),
-        )
+        self.register_container((NODE_STRUCT, Rc::as_ptr(rc) as usize), || {
+            ContainerKind::Struct(Rc::downgrade(rc))
+        })
     }
 
     fn register_iterator(&mut self, rc: &Rc<RefCell<IteratorState>>) -> bool {
-        self.register_container(
-            (NODE_ITERATOR, Rc::as_ptr(rc) as usize),
-            ContainerKind::Iterator(Rc::downgrade(rc)),
-        )
+        self.register_container((NODE_ITERATOR, Rc::as_ptr(rc) as usize), || {
+            ContainerKind::Iterator(Rc::downgrade(rc))
+        })
     }
 
-    fn register_container(&mut self, key: NodeKey, kind: ContainerKind) -> bool {
+    fn register_container(&mut self, key: NodeKey, kind: impl FnOnce() -> ContainerKind) -> bool {
         match self.containers.entry(key) {
             Entry::Vacant(entry) => {
-                entry.insert(kind);
+                entry.insert(kind());
                 true
             }
-            Entry::Occupied(mut entry) => {
-                *entry.get_mut() = kind;
-                false
-            }
+            // The existing Weak keeps this allocation's address reserved,
+            // even after its last strong reference is dropped. An occupied
+            // key therefore names the same allocation; don't replace its
+            // Weak or touch the reference counts on every observation.
+            Entry::Occupied(_) => false,
         }
     }
 
@@ -784,7 +794,7 @@ mod tests {
     use super::*;
     use crate::bytecode::value::WeakStructRef;
     use crate::bytecode::{StructLayout, Upvalue, ValueKey};
-    use alloc::string::ToString;
+    use alloc::{string::ToString, vec};
 
     #[test]
     fn registration_skips_leaves_but_follows_owning_wrappers() {
@@ -826,6 +836,53 @@ mod tests {
             collector.collect_registered();
             assert!(weak.upgrade().is_none());
         }
+    }
+
+    #[test]
+    fn repeated_registration_reuses_the_weak_handle() {
+        let mut collector = CycleCollector::new();
+        let array = Rc::new(RefCell::new(Vec::new()));
+        let key = (NODE_ARRAY, Rc::as_ptr(&array) as usize);
+        assert!(collector.register_array(&array));
+        assert_eq!(Rc::weak_count(&array), 1);
+        assert!(!collector.register_container(key, || {
+            panic!("an existing registration must not rebuild its Weak")
+        }));
+        assert_eq!(Rc::weak_count(&array), 1);
+    }
+
+    #[test]
+    fn collection_discovers_children_added_after_registration() {
+        let mut collector = CycleCollector::new();
+        let root = Value::array(Vec::new());
+        collector.register_value(&root);
+        let mut vm = VM::new();
+        vm.set_global("root", root.clone());
+
+        let child = Value::array(Vec::new());
+        child.array_push(child.clone()).unwrap();
+        let weak = match &child {
+            Value::Array(rc) => Rc::downgrade(rc),
+            _ => unreachable!(),
+        };
+        // Mixed and nested immutable payloads must still lead discovery to
+        // a newly added mutable container, even when the root is registered.
+        root.array_push(Value::some(Value::tuple(vec![Value::Int(7), child])))
+            .unwrap();
+        collector.register_value(&root);
+        assert_eq!(collector.containers.len(), 1);
+        collector.collect(&vm);
+        assert!(
+            collector
+                .containers
+                .contains_key(&(NODE_ARRAY, weak.as_ptr() as usize))
+        );
+        assert!(weak.upgrade().is_some());
+
+        vm.set_global("root", Value::Nil);
+        drop(root);
+        collector.collect(&vm);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

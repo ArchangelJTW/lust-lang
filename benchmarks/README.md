@@ -14,6 +14,95 @@ and executed. The VM runs 250,000 iterations per call and the JIT runs
 100,000,000. The example target uses the ordinary release profile, including
 its `panic = "abort"` setting.
 
+## VM Dispatch and Cycle Discovery
+
+For a paired comparison of two CLI binaries, save the clean baseline before
+editing/rebuilding, then use:
+
+```sh
+cargo build --release --locked --bin lust
+cp target/release/lust /tmp/lust-before
+# Make the changes and rebuild with the same release profile.
+cargo build --release --locked --bin lust
+taskset -c 2 python3 benchmarks/suite/compare.py /tmp/lust-before target/release/lust
+```
+
+`taskset` is optional (Linux CPU affinity). The comparison harness alternates
+before/after order, performs one untimed warmup per binary, and reports the
+median of five samples by default. It uses a monotonic timer and checks full
+stdout across both binaries and both modes. A nonzero exit, timeout, or output
+mismatch fails the comparison. Like `run.sh`, times include process startup,
+frontend compilation, and initial JIT compilation; unlike `run.sh`, they do
+not include separate shell/Python timer subprocesses. Use `--mode vm`,
+`--programs fields array`, or `--json results.json` to narrow a run or retain
+individual samples.
+
+### Changes
+
+- Inline register writes so scalar instructions can write their tag/payload
+  directly instead of passing a temporary `Value` to an out-of-line helper.
+  Keep actual whole-heap collection in a separate cold function.
+- Select an interpreter-only dispatch loop when JIT is disabled. Its compiled
+  copy contains no backedge profiling or post-instruction trace recording.
+- Borrow the root during cycle discovery and allocate the traversal stack only
+  when there are children to visit. Scalar-only enum/tuple payloads no longer
+  allocate a visited set; repeated observations of registered mutable containers
+  no longer allocate a root stack or clone the root.
+- Create a registration's `Weak` only on insertion, rather than replacing it on
+  every observation. The existing weak reference reserves the allocation's
+  address, so an occupied registry key cannot refer to a different allocation.
+- Inline the transparent strong-field conversion and use scalar-aware field
+  clones, keeping weak-field canonicalization/materialization out of that path.
+
+Type checks, owned-value drops, gas accounting, weak-field behavior, and periodic
+cycle collection are retained. In particular, mutable containers are still
+registered even when they initially contain only scalars, and collection still
+scans existing containers for children added after registration.
+
+### Measurements
+
+Compared with clean `d8d513a`, using unchanged release settings, Rust 1.98.1,
+and a Ryzen 7 7800X3D, pinned to logical CPU 2. These are paired medians of five
+CLI runs in milliseconds; the benchmark sources are unchanged.
+
+| Program | VM before | VM after | VM speedup | JIT before | JIT after |
+|---|---:|---:|---:|---:|---:|
+| fields | 1153.0 | 964.3 | 1.20x | 29.3 | 29.3 |
+| array | 1676.3 | 1217.3 | 1.38x | 63.5 | 63.8 |
+| sieve | 4405.7 | 3444.8 | 1.28x | 508.2 | 499.9 |
+| calls | 1253.9 | 1086.0 | 1.15x | 45.8 | 45.9 |
+| methods | 2077.2 | 1666.8 | 1.25x | 52.8 | 52.3 |
+| strings | 114.0 | 111.6 | 1.02x | 111.4 | 110.2 |
+| fib | 246.6 | 207.0 | 1.19x | 12.5 | 13.4 |
+| nested | 640.6 | 513.7 | 1.25x | 15.1 | 15.3 |
+| floatmath | 937.8 | 756.1 | 1.24x | 51.2 | 51.3 |
+| tree | 996.1 | 747.7 | 1.33x | 168.5 | 165.4 |
+
+The sum of VM row medians fell from 13.50 s to 10.72 s (about 21% less time).
+This is a suite result, not a general language speedup claim. Strings remain
+essentially unchanged; their concatenation/allocation cost dominates dispatch.
+JIT performance is essentially unchanged as well: a 21-pair followup of the
+small `fib` and `nested` rows measured 11.82 -> 11.75 ms and 13.87 -> 13.92 ms,
+respectively, rather than reproducing the small `fib` regression above. No
+native-code speedup is claimed.
+
+### Verification
+
+- Workspace tests with and without `lua_transpile`: 221 passed, three doctests
+  ignored.
+- `cargo rustc --no-default-features --locked --lib --crate-type rlib`: passed
+  (warnings in unchanged modules).
+- New allocation-counting integration test: copying scalar-payload enums/tuples
+  and already registered arrays/maps/structs 1,000 times allocates no more than
+  copying them once, below the periodic collection threshold.
+- New collection regression: a cycle added below an already registered root
+  through mixed enum/tuple payloads is discovered, preserved while rooted, and
+  collected after the root is removed.
+- Differential/leak fuzzer: 10,000 cases agreed; 5,469 ran native code and 1,042
+  intentionally raised matching runtime errors; no findings.
+- The original cross-language suite reports matching outputs for every row
+  (with the existing Lua float-printing precision note).
+
 ## Typed Numeric Lowering
 
 The typechecker now passes compact per-expression `Int`/`Float` facts to the

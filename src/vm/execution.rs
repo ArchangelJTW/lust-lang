@@ -96,6 +96,17 @@ impl VM {
     }
 
     pub(super) fn run(&mut self) -> Result<Value> {
+        // JIT enablement is fixed when the VM is created. Specialize the
+        // dispatch loop once rather than testing it around every instruction;
+        // the interpreter-only copy has no trace bookkeeping or JIT backedges.
+        if self.jit.enabled {
+            self.run_inner::<true>()
+        } else {
+            self.run_inner::<false>()
+        }
+    }
+
+    fn run_inner<const JIT_ENABLED: bool>(&mut self) -> Result<Value> {
         'dispatch: loop {
             if let Some(target_depth) = self.call_until_depth
                 && self.call_stack.len() == target_depth
@@ -162,7 +173,7 @@ impl VM {
             } else {
                 (false, 0)
             };
-            if should_check_jit && self.jit.enabled {
+            if should_check_jit && JIT_ENABLED {
                 let count = self.jit.profiler.record_backedge(func_idx, loop_start_ip);
                 let backedge_ip = ip_before_execution.saturating_sub(1);
                 let loop_in_hierarchy =
@@ -835,7 +846,7 @@ impl VM {
                         self.bytecode_call_frame(func_reg, first_arg, arg_count, dest_reg)?;
                     let callee_idx = frame.function_idx;
                     self.call_stack.push(frame);
-                    if self.jit.enabled
+                    if JIT_ENABLED
                         && self.trace_recorder.is_none()
                         && let Some(finished) = self.run_compiled_function(callee_idx)?
                     {
@@ -1439,7 +1450,7 @@ impl VM {
                             // Fall through to the trace recorder below: it
                             // inlines user-defined struct methods like calls.
                             self.call_stack.push(frame);
-                            if self.jit.enabled
+                            if JIT_ENABLED
                                 && self.trace_recorder.is_none()
                                 && let Some(finished) = self.run_compiled_function(target)?
                             {
@@ -1686,7 +1697,7 @@ impl VM {
                 }
             }
 
-            if self.jit.enabled
+            if JIT_ENABLED
                 && let Some(recorder) = &mut self.trace_recorder
                 && recorder.is_recording()
             {
@@ -2616,7 +2627,9 @@ impl VM {
         Ok(&frame.registers[reg as usize])
     }
 
-    #[inline]
+    // Inlining lets scalar instructions write their tag/payload directly,
+    // without materializing a temporary Value for an out-of-line call.
+    #[inline(always)]
     pub(super) fn set_register(&mut self, reg: Register, value: Value) -> Result<()> {
         self.cycle_collector.register_value(&value);
         let frame = self

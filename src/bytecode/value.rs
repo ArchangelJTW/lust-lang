@@ -447,6 +447,9 @@ impl StructLayout {
         matches!(self.field_storage(index), FieldStorage::Weak)
     }
 
+    // Strong fields pass their Value through unchanged. Inline that common
+    // case, but keep the allocating weak-field conversions out of its path.
+    #[inline(always)]
     pub fn canonicalize_field_value(&self, index: usize, value: Value) -> Result<Value, String> {
         match self.field_storage(index) {
             FieldStorage::Strong => Ok(value),
@@ -454,6 +457,7 @@ impl StructLayout {
         }
     }
 
+    #[inline(always)]
     pub fn materialize_field_value(&self, index: usize, value: Value) -> Value {
         match self.field_storage(index) {
             FieldStorage::Strong => value,
@@ -461,6 +465,7 @@ impl StructLayout {
         }
     }
 
+    #[inline(never)]
     fn canonicalize_weak_field(&self, index: usize, value: Value) -> Result<Value, String> {
         let field_name = self.field_names[index].as_str();
         match value {
@@ -496,6 +501,7 @@ impl StructLayout {
         }
     }
 
+    #[inline(never)]
     fn materialize_weak_field(&self, value: Value) -> Value {
         match value {
             Value::Enum(object) if object.enum_name == "Option" => {
@@ -1174,7 +1180,7 @@ impl Value {
                         .fields
                         .borrow()
                         .get(idx)
-                        .cloned()
+                        .map(Value::fast_clone)
                         .map(|value| object.layout.materialize_field_value(idx, value))
                 }),
             _ => None,
@@ -1188,7 +1194,7 @@ impl Value {
                     .fields
                     .borrow()
                     .get(idx)
-                    .cloned()
+                    .map(Value::fast_clone)
                     .map(|value| object.layout.materialize_field_value(idx, value))
             }),
             _ => None,
@@ -1201,7 +1207,7 @@ impl Value {
                 .fields
                 .borrow()
                 .get(index)
-                .cloned()
+                .map(Value::fast_clone)
                 .map(|value| object.layout.materialize_field_value(index, value)),
             _ => None,
         }

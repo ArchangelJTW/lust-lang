@@ -203,9 +203,16 @@ impl VM {
     pub(super) fn maybe_collect_cycles(&mut self) {
         // The trigger check is on every register write; only an actual
         // collection needs the collector taken out to borrow the VM.
-        if !self.cycle_collector.should_collect() {
-            return;
+        if self.cycle_collector.should_collect() {
+            self.collect_cycles();
         }
+    }
+
+    // Keep the whole-heap walk (and the collector's move/drop machinery) out
+    // of scalar register writes so the small write path can be inlined.
+    #[cold]
+    #[inline(never)]
+    fn collect_cycles(&mut self) {
         let mut collector = mem::take(&mut self.cycle_collector);
         collector.collect(self);
         self.cycle_collector = collector;

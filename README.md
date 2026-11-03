@@ -59,6 +59,12 @@ you can write Lust-readable extern stubs to disk from your embedder:
 let _ = program.dump_externs_to_dir("externs");
 ```
 
+`EmbeddedProgram` is neither `Send` nor `Sync`. In a concurrent host, construct,
+compile, use, and drop each program on its owning OS thread; send owned requests
+and replies between threads through channels. An `EmbeddedBuilder` can cross the
+thread boundary before compilation. See the [Tokio concurrency example](examples/tokio-concurrency/README.md).
+Tokio is an example dependency, not a dependency of the Lust runtime.
+
 ## Generate Rust bindings from Lust
 
 Mark public free functions for binding generation with a doc tag. The separator

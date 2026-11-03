@@ -26,7 +26,7 @@ Key runtime facts:
 
 - All Lust values are `lust::bytecode::Value` (`Nil`, `Bool`, `Int`, `Float`, `String`, `Array`, `Tuple`, `Map`, `Struct`, `Enum`, `Function`, `NativeFunction`, `Closure`, `Iterator`, `Task`).
 - Functions are named by dotted module path: a function `greet` in module `main` is `main.greet`. Top-level statements of the **entry** module compile into a `__script` function; top-level statements of **non-entry** modules become `__init@<module>` functions that run automatically at compile time.
-- The VM uses `Rc`/`RefCell` internally, so `EmbeddedProgram` is **not `Send`/`Sync`**. Keep a program on one thread.
+- The VM uses `Rc`/`RefCell` and other thread-local internals, so `EmbeddedProgram` is neither `Send` nor `Sync`. Construct, compile, use, and drop each program on one owning OS thread. The async registry is one of several reasons; changing it alone would not make the program transferable. To serve other threads, move an `EmbeddedBuilder` or owned source/configuration to the owner thread and compile there. A mutex does not make the compiled program transferable. See the [Tokio concurrency example](../../examples/tokio-concurrency/README.md).
 - Number types: `lust::LustInt` is `i64` under `std` (`i32` in `no_std`), `lust::LustFloat` is `f64`/`f32`. Prefer the aliases over hardcoded `i64`/`f64`.
 
 ---
@@ -696,7 +696,7 @@ Supported C surface: builder create/add module/set entry/compile, `lust_program_
 1. **Unqualified names in `call_typed`** — signatures are keyed by dotted module paths (`"main.add"`), not `"add"`. List candidates with `program.typed_functions()`.
 2. **Registering a native for an undeclared function** — `register_typed_native` must be able to resolve a Lust signature; declare the function in Lust (usually in an `extern` block) first. Use `register_native_fn` when you deliberately don't want signature checking.
 3. **Argument tuple limits** — a no-arg call is `call_typed("main.tick", ())`, and a zero-arg native closure takes `|_: ()|`. Typed Lust calls accept tuples of 2–12 values; typed native callback tuples currently accept up to 5.
-4. **Thread sharing** — the VM is not `Send`/`Sync`; move the whole `EmbeddedProgram` between threads instead of sharing it.
+4. **Thread ownership** — `EmbeddedProgram` is neither `Send` nor `Sync`. Construct, compile, use, and drop it on its owning OS thread. Move an `EmbeddedBuilder` or owned source/configuration to that thread and compile there; exchange owned thread-safe request/reply data through channels. Do not move a compiled program between threads. `Arc<Mutex<_>>` does not make it transferable. See the [Tokio concurrency example](../../examples/tokio-concurrency/README.md).
 5. **Type mismatches surface as `LustError::TypeError`/`RuntimeError`** — both carry a human-readable `message`; match on the enum for structured handling.
 6. **Weak `ref` fields** — a struct field declared `ref T` is stored as `Option<T>`; `set_field` accepts the inner type directly, and `borrow_field` materializes an owned `ValueRef` for it.
 7. **Generics are runtime-erased** — raw VM/native boundaries cannot revalidate generic arguments; validate in typed Lust code or in your conversion layer.

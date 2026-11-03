@@ -1172,13 +1172,37 @@ mod function_args_tests {
     use crate::{EmbeddedProgram, LustInt};
 
     #[test]
-    fn typed_calls_preserve_order_for_six_and_twelve_arguments() {
+    fn typed_calls_preserve_order_for_six_through_twelve_arguments() {
         let mut program = EmbeddedProgram::builder()
             .module(
                 "main",
                 r#"
 function six(a: int, b: int, c: int, d: int, e: int, f: int): int
     return a * 100000 + b * 10000 + c * 1000 + d * 100 + e * 10 + f
+end
+
+function seven(a: int, b: int, c: int, d: int, e: int, f: int, g: int): int
+    return a * 1000000 + b * 100000 + c * 10000 + d * 1000 + e * 100 + f * 10 + g
+end
+
+function eight(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int): int
+    return a * 10000000 + b * 1000000 + c * 100000 + d * 10000 + e * 1000 + f * 100 + g * 10 + h
+end
+
+function nine(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int): int
+    return a * 100000000 + b * 10000000 + c * 1000000 + d * 100000 + e * 10000 + f * 1000 + g * 100 + h * 10 + i
+end
+
+function ten(a: int, b: int, c: int, d: int, e: int, f: int,
+             g: int, h: int, i: int, j: int): int
+    return a * 1000000000 + b * 100000000 + c * 10000000 + d * 1000000 +
+           e * 100000 + f * 10000 + g * 1000 + h * 100 + i * 10 + j
+end
+
+function eleven(a: int, b: int, c: int, d: int, e: int, f: int,
+                g: int, h: int, i: int, j: int, k: int): int
+    return a * 10000000000 + b * 1000000000 + c * 100000000 + d * 10000000 +
+           e * 1000000 + f * 100000 + g * 10000 + h * 1000 + i * 100 + j * 10 + k
 end
 
 function twelve(a: int, b: int, c: int, d: int, e: int, f: int,
@@ -1193,10 +1217,95 @@ end
             .compile()
             .expect("compile typed-call fixture");
 
+        // Arity 6: both direct and handle calls
         let six: LustInt = program
             .call_typed("main.six", (1, 2, 3, 4, 5, 6))
             .expect("call with six arguments");
         assert_eq!(six, 123456);
+
+        let six_handle = program
+            .function_handle("main.six")
+            .expect("get six-argument handle");
+        let six_via_handle: LustInt = six_handle
+            .call_typed(&mut program, (1, 2, 3, 4, 5, 6))
+            .expect("call handle with six arguments");
+        assert_eq!(six_via_handle, 123456);
+
+        // Arity 7: both direct and handle calls
+        let seven: LustInt = program
+            .call_typed("main.seven", (1, 2, 3, 4, 5, 6, 7))
+            .expect("call with seven arguments");
+        assert_eq!(seven, 1234567);
+
+        let seven_handle = program
+            .function_handle("main.seven")
+            .expect("get seven-argument handle");
+        let seven_via_handle: LustInt = seven_handle
+            .call_typed(&mut program, (1, 2, 3, 4, 5, 6, 7))
+            .expect("call handle with seven arguments");
+        assert_eq!(seven_via_handle, 1234567);
+
+        // Arity 8: both direct and handle calls
+        let eight: LustInt = program
+            .call_typed("main.eight", (1, 2, 3, 4, 5, 6, 7, 8))
+            .expect("call with eight arguments");
+        assert_eq!(eight, 12345678);
+
+        let eight_handle = program
+            .function_handle("main.eight")
+            .expect("get eight-argument handle");
+        let eight_via_handle: LustInt = eight_handle
+            .call_typed(&mut program, (1, 2, 3, 4, 5, 6, 7, 8))
+            .expect("call handle with eight arguments");
+        assert_eq!(eight_via_handle, 12345678);
+
+        // Arity 9: both direct and handle calls
+        let nine: LustInt = program
+            .call_typed("main.nine", (1, 2, 3, 4, 5, 6, 7, 8, 9))
+            .expect("call with nine arguments");
+        assert_eq!(nine, 123456789);
+
+        let nine_handle = program
+            .function_handle("main.nine")
+            .expect("get nine-argument handle");
+        let nine_via_handle: LustInt = nine_handle
+            .call_typed(&mut program, (1, 2, 3, 4, 5, 6, 7, 8, 9))
+            .expect("call handle with nine arguments");
+        assert_eq!(nine_via_handle, 123456789);
+
+        // Arity 10: both direct and handle calls
+        let ten: LustInt = program
+            .call_typed("main.ten", (1, 2, 3, 4, 5, 6, 7, 8, 9, 10))
+            .expect("call with ten arguments");
+        assert_eq!(ten, 1234567900);
+
+        let ten_handle = program
+            .function_handle("main.ten")
+            .expect("get ten-argument handle");
+        let ten_via_handle: LustInt = ten_handle
+            .call_typed(&mut program, (1, 2, 3, 4, 5, 6, 7, 8, 9, 10))
+            .expect("call handle with ten arguments");
+        assert_eq!(ten_via_handle, 1234567900);
+
+        // Arity 11: both direct and handle calls
+        let eleven: LustInt = program
+            .call_typed("main.eleven", (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11))
+            .expect("call with eleven arguments");
+        assert_eq!(eleven, 12345679011);
+
+        let eleven_handle = program
+            .function_handle("main.eleven")
+            .expect("get eleven-argument handle");
+        let eleven_via_handle: LustInt = eleven_handle
+            .call_typed(&mut program, (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11))
+            .expect("call handle with eleven arguments");
+        assert_eq!(eleven_via_handle, 12345679011);
+
+        // Arity 12: both direct and handle calls
+        let twelve_direct: LustInt = program
+            .call_typed("main.twelve", (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12))
+            .expect("call with twelve arguments");
+        assert_eq!(twelve_direct, 123456790122);
 
         let twelve_handle = program
             .function_handle("main.twelve")

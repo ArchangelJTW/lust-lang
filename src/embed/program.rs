@@ -268,8 +268,10 @@ impl EmbeddedProgram {
 
     /// Set a memory budget in bytes.
     ///
-    /// While a memory budget is active, effective execution safely falls back to the
-    /// interpreter (Stage A containment) to ensure all allocations are charged.
+    /// While a memory budget is active, effective execution safely switches to the
+    /// interpreter (Stage A) so existing logical array and growth checks apply.
+    /// This does not charge all allocations or guarantee RSS/physical memory containment;
+    /// other allocation classes and complete process containment are out of scope.
     /// Configured JIT preferences are preserved and will resume if the budget is cleared.
     ///
     /// # Errors
@@ -283,8 +285,10 @@ impl EmbeddedProgram {
 
     /// Set a memory budget in kilobytes (1 KB = 1024 bytes).
     ///
-    /// While a memory budget is active, effective execution safely falls back to the
-    /// interpreter (Stage A containment) to ensure all allocations are charged.
+    /// While a memory budget is active, effective execution safely switches to the
+    /// interpreter (Stage A) so existing logical array and growth checks apply.
+    /// This does not charge all allocations or guarantee RSS/physical memory containment;
+    /// other allocation classes and complete process containment are out of scope.
     ///
     /// # Errors
     /// Returns `Err` if called while VM execution is active (e.g. inside a native callback,

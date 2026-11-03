@@ -567,7 +567,7 @@ program.reset_memory_counter()?;
 program.clear_memory_budget()?;
 ```
 
-Budgets are ideal for sandboxing untrusted scripts. While a memory budget is active, execution safely falls back to the interpreter (Stage A containment) to ensure vector and array allocations are accounted for; clearing the budget restores unmetered execution and recompiles hot code. Budget setters reject mid-execution calls (e.g. from callbacks) to prevent unmetered native execution under a newly set limit.
+Budgets are ideal for sandboxing untrusted scripts. While a memory budget is active, execution safely switches to the interpreter (Stage A) so existing logical array and growth checks apply; clearing the budget restores unmetered execution and recompiles hot code. This does not charge all allocations or guarantee RSS/physical memory containment; other allocation classes and complete process containment are out of scope. Budget setters reject mid-execution calls (e.g. from callbacks) to prevent policy changes while the VM is not idle.
 
 ### JIT inspection
 

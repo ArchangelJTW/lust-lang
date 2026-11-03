@@ -174,8 +174,10 @@ impl VM {
 
     /// Set a memory budget in bytes.
     ///
-    /// While a memory budget is active, effective execution safely falls back to the
-    /// interpreter (Stage A containment) to ensure all allocations are charged.
+    /// While a memory budget is active, effective execution safely switches to the
+    /// interpreter (Stage A) so existing logical array and growth checks apply.
+    /// This does not charge all allocations or guarantee RSS/physical memory containment;
+    /// other allocation classes and complete process containment are out of scope.
     /// Configured JIT preferences are preserved and will resume if the budget is cleared.
     ///
     /// # Errors
@@ -196,8 +198,10 @@ impl VM {
 
     /// Set a memory budget in kilobytes (1 KB = 1024 bytes).
     ///
-    /// While a memory budget is active, effective execution safely falls back to the
-    /// interpreter (Stage A containment) to ensure all allocations are charged.
+    /// While a memory budget is active, effective execution safely switches to the
+    /// interpreter (Stage A) so existing logical array and growth checks apply.
+    /// This does not charge all allocations or guarantee RSS/physical memory containment;
+    /// other allocation classes and complete process containment are out of scope.
     ///
     /// # Errors
     /// Returns `Err` if called while VM execution is active (e.g. inside a native callback,
@@ -463,8 +467,9 @@ mod tests {
         #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             assert!(
-                warm_stats.native_trace_entries > 0 || warm_stats.root_traces_compiled > 0,
-                "expected native code to be warm before enabling budget"
+                warm_stats.native_trace_entries > 0,
+                "expected native code to be warm and entered before enabling budget, got: {:?}",
+                warm_stats
             );
         }
 
@@ -538,6 +543,21 @@ mod tests {
             crate::Value::Int(3000)
         );
 
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let warm_stats = program.vm().jit_stats();
+            assert!(
+                warm_stats.functions_compiled > 0,
+                "expected functions to be compiled before setting budget, got: {:?}",
+                warm_stats
+            );
+            assert!(
+                warm_stats.native_trace_entries > 0,
+                "expected native entry before setting budget, got: {:?}",
+                warm_stats
+            );
+        }
+
         // Set memory budget
         program.set_memory_budget_bytes(1024 * 1024)?;
         assert!(!program.effective_jit_enabled());
@@ -551,6 +571,10 @@ mod tests {
         assert_eq!(
             post_call_stats.native_trace_entries, pre_call_stats.native_trace_entries,
             "no native entry should occur for whole-function call when budget is active"
+        );
+        assert_eq!(
+            post_call_stats.functions_compiled, pre_call_stats.functions_compiled,
+            "no additional function compilation should occur when budget is active"
         );
 
         Ok(())
@@ -683,6 +707,136 @@ mod tests {
         // State after returning to host must also remain exactly as before
         assert_eq!(program.memory_remaining_bytes(), Some(50_000));
         assert_eq!(program.memory_used_bytes(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn root_trace_invoking_callback_rejects_budget_mutations() -> Result<()> {
+        let source = r#"
+            extern
+                function host_callback(step: int): int
+            end
+            function loop_with_callback(count: int): int
+                local i: int = 0
+                local sum: int = 0
+                while i < count do
+                    sum = sum + host_callback(i)
+                    i = i + 1
+                end
+                return sum
+            end
+        "#;
+        let mut program = EmbeddedProgram::builder()
+            .module("main", source)
+            .entry_module("main")
+            .compile()?;
+
+        assert!(program.jit_configured_enabled());
+        assert!(program.effective_jit_enabled());
+
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let call_count = Arc::new(AtomicU64::new(0));
+        let saw_active_jit = Arc::new(AtomicBool::new(false));
+        let saw_native_entry = Arc::new(AtomicBool::new(false));
+
+        let call_count_cb = Arc::clone(&call_count);
+        let saw_active_jit_cb = Arc::clone(&saw_active_jit);
+        let saw_native_entry_cb = Arc::clone(&saw_native_entry);
+
+        program.register_typed_native(
+            "host_callback",
+            move |step: i64| -> std::result::Result<i64, String> {
+                let _count = call_count_cb.fetch_add(1, Ordering::SeqCst);
+                crate::VM::with_current(|vm| {
+                    assert!(
+                        !vm.is_idle(),
+                        "VM must not be idle during callback execution"
+                    );
+
+                    if vm.active_jit_depth > 0 {
+                        saw_active_jit_cb.store(true, Ordering::SeqCst);
+                    }
+                    if vm.jit_stats().native_trace_entries > 0 {
+                        saw_native_entry_cb.store(true, Ordering::SeqCst);
+                    }
+
+                    // 1. Attempt set_memory_budget_bytes
+                    let err_set = vm.set_memory_budget_bytes(100).unwrap_err();
+                    assert!(
+                        format!("{err_set}")
+                            .contains("Cannot modify memory budget while VM execution is active")
+                    );
+
+                    // 2. Attempt set_memory_budget_kb
+                    let err_kb = vm.set_memory_budget_kb(2).unwrap_err();
+                    assert!(
+                        format!("{err_kb}")
+                            .contains("Cannot modify memory budget while VM execution is active")
+                    );
+
+                    // 3. Attempt clear_memory_budget
+                    let err_clear = vm.clear_memory_budget().unwrap_err();
+                    assert!(
+                        format!("{err_clear}")
+                            .contains("Cannot clear memory budget while VM execution is active")
+                    );
+
+                    // 4. Attempt reset_memory_counter
+                    let err_reset = vm.reset_memory_counter().unwrap_err();
+                    assert!(
+                        format!("{err_reset}")
+                            .contains("Cannot reset memory counter while VM execution is active")
+                    );
+
+                    // 5. Test ignored Result: must not alter state
+                    let _ = vm.set_memory_budget_bytes(1);
+                    let _ = vm.clear_memory_budget();
+                    let _ = vm.reset_memory_counter();
+
+                    // State must remain completely unchanged (unmetered: None / 0 used)
+                    assert_eq!(vm.memory_remaining_bytes(), None);
+                    assert_eq!(vm.memory_used_bytes(), 0);
+                    assert!(vm.effective_jit_enabled());
+
+                    Ok(step)
+                })
+            },
+        )?;
+
+        let sum = program.call_typed::<_, i64>("main.loop_with_callback", 50i64)?;
+        assert_eq!(sum, (0..50).sum::<i64>());
+        assert_eq!(call_count.load(Ordering::SeqCst), 50);
+
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let stats = program.vm().jit_stats();
+            assert!(
+                stats.root_traces_compiled > 0,
+                "expected root trace to compile, got: {:?}",
+                stats
+            );
+            assert!(
+                stats.native_trace_entries > 0,
+                "expected native trace entries, got: {:?}",
+                stats
+            );
+            assert!(
+                saw_active_jit.load(Ordering::SeqCst),
+                "expected callback to be executed from active JIT trace"
+            );
+            assert!(
+                saw_native_entry.load(Ordering::SeqCst),
+                "expected native trace entry to have been witnessed during/before callback"
+            );
+        }
+
+        // State after returning to host must remain unmetered and effective JIT enabled
+        assert_eq!(program.memory_remaining_bytes(), None);
+        assert_eq!(program.memory_used_bytes(), 0);
+        assert!(program.effective_jit_enabled());
 
         Ok(())
     }

@@ -270,8 +270,10 @@ impl VM {
 
     /// Whether JIT execution is effectively active.
     ///
-    /// When a memory budget is active, the effective execution policy falls back to
-    /// the interpreter (Stage A containment) to ensure all allocations are charged.
+    /// When a memory budget is active, the effective execution policy switches to
+    /// the interpreter (Stage A) so existing logical array and growth checks apply.
+    /// This does not charge all allocations or guarantee RSS/physical memory containment;
+    /// other allocation classes and complete process containment are out of scope.
     #[inline]
     pub fn effective_jit_enabled(&self) -> bool {
         self.jit.enabled && !self.budgets.mem_budget_enabled()

@@ -190,8 +190,11 @@ To prevent side-effects during malformed requests, execution follows a strict se
 ### 5.3 Diagnostic Messages and Side-Effect Rules
 
 - **Thread-Local Error Message:** On non-zero status, a concise diagnostic string (at most 1024 bytes, NUL-terminated) is stored in thread-local storage, accessible via `lust_last_error_message()`.
-- **Pre-execution Failures:** Any failure occurring in Steps 1–4 guarantees **zero VM side-effects** (globals and callbacks remain unaltered).
-- **Post-invocation Failures:** Failures in Step 5 (VM runtime error) or Step 6 (serialization/cycle/limit error) are **non-transactional**: function side effects (global mutations, host I/O) may have already taken effect. No automatic rollback or retry is attempted.
+- **Pre-execution Failures (Zero Observable Pre-Execution Effects):** As a proposed future contract, any failure occurring during pre-execution phases (Steps 1–4: pointer/limits validation, parsing/input quotas, target resolution, signature/arity/type validation, conversion and accounting before invocation) guarantees **zero pre-execution effects** scoped to observable program state:
+  - Program globals remain unchanged.
+  - No host callbacks or VM bytecode are executed.
+  - Target symbol resolution and signature validation must be strictly **metadata-only**, resolving and inspecting symbol existence, arity, and parameter types without executing VM bytecode/callbacks or mutating globals.
+- **Post-invocation Failures (Non-Transactional Execution):** Failures occurring in Step 5 (VM runtime error) or Step 6 (serialization/cycle/limit error) remain **non-transactional**: function side effects (such as global mutations, host I/O, or state alterations) may have already taken effect during script execution. No automatic rollback or retry is attempted.
 
 ---
 
@@ -220,15 +223,21 @@ When `limits == NULL`, the following hard ceilings apply:
 
 The `max_bridge_bytes` limit is defined as a **proposed peak simultaneously-live requested-capacity ledger**, not merely a retroactive counter of committed heap bytes:
 1. **Capacity-Aware Checks Before Growth:** Before expanding any buffer or requesting container capacity (e.g. vector reallocations, string buffers, decoded key sets, AST scratch buffers), the bridge must verify that `current_requested_capacity + additional_capacity <= max_bridge_bytes`. If the ceiling would be breached, the operation must abort immediately with `LUST_JSON_LIMIT_V1` without attempting the allocation.
-2. **Covered Allocation Components:** The ledger tracks all live staging memory across the call lifecycle:
+2. **Exclusion of Caller-Owned Borrowed Buffers:** The existing caller-owned borrowed byte ranges/capacity of `json_args`, `function_name`, and `limits` are explicitly **excluded** from `max_bridge_bytes` (they are pre-existing host-allocated byte ranges, not bridge-created requested capacity).
+3. **Independent Validation Limits for Excluded Inputs:** Excluding caller-owned buffers from `max_bridge_bytes` does not bypass bounds checks; independent validation limits remain strictly applicable:
+   - `json_args` is governed by `max_input_bytes` (as well as UTF-8 validation).
+   - `function_name` is governed by name validity, maximum symbol length bounds, and valid UTF-8.
+   - `limits` is governed by `sizeof(LustJsonLimitsV1)` and reserved layout validation.
+4. **Covered Allocation Components (Bridge-Created Requested Capacity Charged Before Growth):** The ledger tracks and charges all live staging memory created by the bridge across the call lifecycle before growth occurs:
+   - Bridge-created decoded copies (e.g. decoded string copies and intermediate representations).
    - Parser scratch buffers and decoder working state.
    - Decoded key tracking sets (hash sets or deduplication tables across active object scopes used to detect duplicate and escape-equivalent keys).
    - Intermediate converted Lust input `Value` instances before transfer to the VM.
    - Return traversal structures (active-ancestor recursion stack, cycle detection sets, and intermediate buffers).
-   - Serialized output buffer capacity, including the trailing NUL terminator byte.
-3. **Exact-Once Transfer into VM Accounting:** Converted input allocations that are retained and handed off to the VM must be transferred **exactly once into existing VM memory accounting** upon call boundary crossing. If exact-once transfer into VM accounting is not demonstrable in the future implementation codebase, the implementation must stop or rescope before advertising VM budget coverage.
-4. **Proposed Requirements vs. Implemented Guarantees:** All quotas, ledger checks, and accounting transfers are **proposed design requirements**, not implemented guarantees. No runtime ledger or bridge logic currently exists in the codebase.
-5. **Distinction from RSS and VM Heap Limits:** `max_bridge_bytes` is strictly a bridge-internal requested-capacity ceiling:
+   - Serialized output buffer capacity, charged before allocation/growth, including the trailing NUL terminator byte.
+5. **Exact-Once Transfer into VM Accounting:** Converted input allocations that are retained and handed off to the VM must be transferred **exactly once into existing VM memory accounting** upon call boundary crossing. If exact-once transfer into VM accounting is not demonstrable in the future implementation codebase, the implementation must stop or rescope before advertising VM budget coverage.
+6. **Proposed Requirements vs. Implemented Guarantees:** All quotas, ledger checks, and accounting transfers are **proposed design requirements**, not implemented guarantees. No runtime ledger or bridge logic currently exists in the codebase.
+7. **Distinction from RSS and VM Heap Limits:** `max_bridge_bytes` is strictly a bridge-internal requested-capacity ceiling:
    - It **does not track or bound operating system Resident Set Size (RSS)**, allocator fragmentation, or non-bridge host allocations.
    - It **does not substitute for VM heap quotas or instruction/gas limits**, which govern script execution inside the VM.
 
@@ -263,9 +272,9 @@ Future implementation work (outside the scope of this RFC) will target the follo
 | **A05** | Float Boundary | Finite `f64` values round-trip; non-finite floats, overflow, and underflow-to-zero rejected. |
 | **A06** | Unicode & NUL Handling | Valid UTF-8 and escaped `\u0000` preserved; raw NUL or invalid UTF-8 rejected. |
 | **A07** | Duplicate Keys, Escape Equivalence & Bounded Streaming Syntax | Non-array root and duplicate keys (including escape-equivalent variants like `\u0061` vs `a`) rejected with `LUST_JSON_INVALID_JSON_V1`. Parser must enforce quotas via a bounded streaming visitor or equivalent before unbounded allocation or work; prohibit unlimited DOM then check. Parser scratch and key tracking accounted in bridge ledger. |
-| **A08** | Canonical Symbol Resolution, Signature Validation & Preflight | Target symbol resolved once to exact canonical function target. Same canonical target used for bounded recursive signature/arity/supported-type validation and synchronous invocation (no permissive alias/raw-call split). Wrong arity or unsupported parameter types fail with zero VM side effects. Unresolved status precedence verified. |
+| **A08** | Canonical Symbol Resolution, Signature Validation & Pre-Call Invariants | Target symbol resolved once to exact canonical function target via metadata-only inspection without executing VM bytecode/callbacks or mutating globals. Same canonical target used for bounded recursive signature/arity/supported-type validation and synchronous invocation (no permissive alias/raw-call split). Tests must prove that observable state (host callback counters and global variable counters) remains zero across each pre-call failure category: (1) pointer/limits validation, (2) parsing/input quotas, (3) target resolution, (4) signature/arity/type validation, and (5) argument conversion/accounting before invocation. Unresolved status precedence verified. |
 | **A09** | Unsupported Types | Returning Struct, Tuple, or Enum returns `LUST_JSON_UNSUPPORTED_V1`. |
-| **A10** | Capacity-Aware Quota Ceilings & Bridge Ledger | Exceeding byte, depth, node, or bridge limits returns `LUST_JSON_LIMIT_V1`. `max_bridge_bytes` verified as a peak simultaneously-live requested-capacity ledger with capacity-aware checks before buffer growth across parser scratch, key tracking, converted inputs, traversal state, and output+NUL. Clearly differentiated from process RSS and VM heap limits. |
+| **A10** | Capacity-Aware Quota Ceilings & Bridge Ledger | Exceeding byte, depth, node, or bridge limits returns `LUST_JSON_LIMIT_V1`. Tests must prove caller-owned borrowed buffers (`json_args`, `function_name`, `limits`) are excluded from `max_bridge_bytes` while relevant independent limits (`max_input_bytes`, name validity/length bounds, struct layout) remain strictly enforced. `max_bridge_bytes` verified as a peak simultaneously-live requested-capacity ledger charging bridge-created decoded copies, parser scratch/working state, duplicate-key tracking sets, converted values before transfer, traversal structures, and output capacity before buffer growth. Clearly differentiated from process RSS and VM heap limits. |
 | **A11** | Cycle & Borrow Safety | Cyclic containers return `LUST_JSON_CYCLE_V1`; conflicting borrows return `LUST_JSON_BORROW_V1`. |
 | **A12** | Input Validation | Null pointers, empty names, or invalid struct sizes return `LUST_JSON_INVALID_ARGUMENT_V1`. |
 | **A13** | Leak & Lifecycle Check | Output buffers freed with `lust_string_free` show no leaks under AddressSanitizer/Valgrind. |

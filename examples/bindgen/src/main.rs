@@ -35,6 +35,10 @@ fn main() -> lust::Result<()> {
     let record_label = record_player.display_label()?;
     let optional_name = bindings.lookup_name(id)?;
     let doubled_id = bindings.double_id(id)?;
+    let ordered_six = bindings.ordered_six(1, 2, 3, 4, 5, 6)?;
+    let ordered_twelve = bindings.ordered_twelve(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)?;
+    assert_eq!(ordered_six, 123456);
+    assert_eq!(ordered_twelve, 123456790122);
     let status = bindings.get_status()?;
     let ready = status.is_ready(&mut bindings)?;
     let status = bindings.echo_status(status)?;
@@ -45,7 +49,7 @@ fn main() -> lust::Result<()> {
     };
 
     println!(
-        "player={name} ({label}; {description}), id={id}, doubled={doubled_id}, optional={optional_name:?}, other={}, nested={record_label}, ready={ready}, status={status_text}",
+        "player={name} ({label}; {description}), id={id}, doubled={doubled_id}, ordered={ordered_six}/{ordered_twelve}, optional={optional_name:?}, other={}, nested={record_label}, ready={ready}, status={status_text}",
         fetched.name()?
     );
     Ok(())

@@ -39,3 +39,16 @@ end
 function echo_status(status: Status): Status
     return status
 end
+
+---@bindgen
+function ordered_six(a: int, b: int, c: int, d: int, e: int, f: int): int
+    return a * 100000 + b * 10000 + c * 1000 + d * 100 + e * 10 + f
+end
+
+---@bindgen
+function ordered_twelve(a: int, b: int, c: int, d: int, e: int, f: int,
+                        g: int, h: int, i: int, j: int, k: int, l: int): int
+    return a * 100000000000 + b * 10000000000 + c * 1000000000 + d * 100000000 +
+           e * 10000000 + f * 1000000 + g * 100000 + h * 10000 + i * 1000 +
+           j * 100 + k * 10 + l
+end

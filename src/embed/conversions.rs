@@ -399,6 +399,7 @@ pub trait FromLustValue: Sized {
 }
 
 pub trait FunctionArgs {
+    /// Bundles a Rust value, unit, or a tuple of 2 through 12 values for a typed call.
     fn into_values(self) -> Vec<Value>;
     fn validate_signature(function_name: &str, params: &[Type]) -> Result<()>;
 }
@@ -1085,100 +1086,37 @@ where
     }
 }
 
-impl<A, B> FunctionArgs for (A, B)
-where
-    A: IntoLustValue,
-    B: IntoLustValue,
-{
-    fn into_values(self) -> Vec<Value> {
-        vec![self.0.into_value(), self.1.into_value()]
-    }
+macro_rules! impl_function_args {
+    ($($index:tt: $T:ident),+ $(,)?) => {
+        impl<$($T),+> FunctionArgs for ($($T,)+)
+        where
+            $($T: IntoLustValue,)+
+        {
+            fn into_values(self) -> Vec<Value> {
+                vec![$(self.$index.into_value()),+]
+            }
 
-    fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
-        ensure_arity(function_name, params, 2)?;
-        ensure_arg_type::<A>(function_name, params, 0)?;
-        ensure_arg_type::<B>(function_name, params, 1)?;
-        Ok(())
-    }
+            fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
+                const ARITY: usize = count_idents!($($T),+);
+                ensure_arity(function_name, params, ARITY)?;
+                $(ensure_arg_type::<$T>(function_name, params, $index)?;)+
+                Ok(())
+            }
+        }
+    };
 }
 
-impl<A, B, C> FunctionArgs for (A, B, C)
-where
-    A: IntoLustValue,
-    B: IntoLustValue,
-    C: IntoLustValue,
-{
-    fn into_values(self) -> Vec<Value> {
-        vec![
-            self.0.into_value(),
-            self.1.into_value(),
-            self.2.into_value(),
-        ]
-    }
-
-    fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
-        ensure_arity(function_name, params, 3)?;
-        ensure_arg_type::<A>(function_name, params, 0)?;
-        ensure_arg_type::<B>(function_name, params, 1)?;
-        ensure_arg_type::<C>(function_name, params, 2)?;
-        Ok(())
-    }
-}
-
-impl<A, B, C, D> FunctionArgs for (A, B, C, D)
-where
-    A: IntoLustValue,
-    B: IntoLustValue,
-    C: IntoLustValue,
-    D: IntoLustValue,
-{
-    fn into_values(self) -> Vec<Value> {
-        vec![
-            self.0.into_value(),
-            self.1.into_value(),
-            self.2.into_value(),
-            self.3.into_value(),
-        ]
-    }
-
-    fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
-        ensure_arity(function_name, params, 4)?;
-        ensure_arg_type::<A>(function_name, params, 0)?;
-        ensure_arg_type::<B>(function_name, params, 1)?;
-        ensure_arg_type::<C>(function_name, params, 2)?;
-        ensure_arg_type::<D>(function_name, params, 3)?;
-        Ok(())
-    }
-}
-
-impl<A, B, C, D, E> FunctionArgs for (A, B, C, D, E)
-where
-    A: IntoLustValue,
-    B: IntoLustValue,
-    C: IntoLustValue,
-    D: IntoLustValue,
-    E: IntoLustValue,
-{
-    fn into_values(self) -> Vec<Value> {
-        vec![
-            self.0.into_value(),
-            self.1.into_value(),
-            self.2.into_value(),
-            self.3.into_value(),
-            self.4.into_value(),
-        ]
-    }
-
-    fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
-        ensure_arity(function_name, params, 5)?;
-        ensure_arg_type::<A>(function_name, params, 0)?;
-        ensure_arg_type::<B>(function_name, params, 1)?;
-        ensure_arg_type::<C>(function_name, params, 2)?;
-        ensure_arg_type::<D>(function_name, params, 3)?;
-        ensure_arg_type::<E>(function_name, params, 4)?;
-        Ok(())
-    }
-}
+impl_function_args!(0: A, 1: B);
+impl_function_args!(0: A, 1: B, 2: C);
+impl_function_args!(0: A, 1: B, 2: C, 3: D);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J, 10: K);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J, 10: K, 11: L);
 
 fn ensure_arity(function_name: &str, params: &[Type], provided: usize) -> Result<()> {
     if params.len() == provided {
@@ -1226,5 +1164,172 @@ fn argument_type_mismatch(
             lust_type,
             rust_type
         ),
+    }
+}
+
+#[cfg(test)]
+mod function_args_tests {
+    use crate::{EmbeddedProgram, LustInt};
+
+    #[test]
+    fn typed_calls_preserve_order_for_six_through_twelve_arguments() {
+        let mut program = EmbeddedProgram::builder()
+            .module(
+                "main",
+                r#"
+function six(a: int, b: int, c: int, d: int, e: int, f: int): int
+    return a * 1048576 + b * 65536 + c * 4096 + d * 256 + e * 16 + f
+end
+
+function seven(a: int, b: int, c: int, d: int, e: int, f: int, g: int): int
+    return a * 16777216 + b * 1048576 + c * 65536 + d * 4096 + e * 256 + f * 16 + g
+end
+
+function eight(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int): int
+    return a * 268435456 + b * 16777216 + c * 1048576 + d * 65536 + e * 4096 + f * 256 + g * 16 + h
+end
+
+function nine(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int): int
+    return a * 4294967296 + b * 268435456 + c * 16777216 + d * 1048576 + e * 65536 + f * 4096 + g * 256 + h * 16 + i
+end
+
+function ten(a: int, b: int, c: int, d: int, e: int, f: int,
+             g: int, h: int, i: int, j: int): int
+    return a * 68719476736 + b * 4294967296 + c * 268435456 + d * 16777216 +
+           e * 1048576 + f * 65536 + g * 4096 + h * 256 + i * 16 + j
+end
+
+function eleven(a: int, b: int, c: int, d: int, e: int, f: int,
+                g: int, h: int, i: int, j: int, k: int): int
+    return a * 1099511627776 + b * 68719476736 + c * 4294967296 + d * 268435456 +
+           e * 16777216 + f * 1048576 + g * 65536 + h * 4096 + i * 256 + j * 16 + k
+end
+
+function twelve(a: int, b: int, c: int, d: int, e: int, f: int,
+                g: int, h: int, i: int, j: int, k: int, l: int): int
+    return a * 17592186044416 + b * 1099511627776 + c * 68719476736 + d * 4294967296 +
+           e * 268435456 + f * 16777216 + g * 1048576 + h * 65536 + i * 4096 +
+           j * 256 + k * 16 + l
+end
+"#
+            )
+            .entry_module("main")
+            .compile()
+            .expect("compile typed-call fixture");
+
+        // Arity 6: both direct and handle calls
+        let six: LustInt = program
+            .call_typed("main.six", (1, 2, 3, 4, 5, 6))
+            .expect("call with six arguments");
+        assert_eq!(six, 1193046);
+
+        let six_handle = program
+            .function_handle("main.six")
+            .expect("get six-argument handle");
+        let six_via_handle: LustInt = six_handle
+            .call_typed(&mut program, (1, 2, 3, 4, 5, 6))
+            .expect("call handle with six arguments");
+        assert_eq!(six_via_handle, 1193046);
+
+        // Arity 7: both direct and handle calls
+        let seven: LustInt = program
+            .call_typed("main.seven", (1, 2, 3, 4, 5, 6, 7))
+            .expect("call with seven arguments");
+        assert_eq!(seven, 19088743);
+
+        let seven_handle = program
+            .function_handle("main.seven")
+            .expect("get seven-argument handle");
+        let seven_via_handle: LustInt = seven_handle
+            .call_typed(&mut program, (1, 2, 3, 4, 5, 6, 7))
+            .expect("call handle with seven arguments");
+        assert_eq!(seven_via_handle, 19088743);
+
+        // Arity 8: both direct and handle calls
+        let eight: LustInt = program
+            .call_typed("main.eight", (1, 2, 3, 4, 5, 6, 7, 8))
+            .expect("call with eight arguments");
+        assert_eq!(eight, 305419896);
+
+        let eight_handle = program
+            .function_handle("main.eight")
+            .expect("get eight-argument handle");
+        let eight_via_handle: LustInt = eight_handle
+            .call_typed(&mut program, (1, 2, 3, 4, 5, 6, 7, 8))
+            .expect("call handle with eight arguments");
+        assert_eq!(eight_via_handle, 305419896);
+
+        // Arity 9: both direct and handle calls
+        let nine: LustInt = program
+            .call_typed("main.nine", (1, 2, 3, 4, 5, 6, 7, 8, 9))
+            .expect("call with nine arguments");
+        assert_eq!(nine, 4886718345);
+
+        let nine_handle = program
+            .function_handle("main.nine")
+            .expect("get nine-argument handle");
+        let nine_via_handle: LustInt = nine_handle
+            .call_typed(&mut program, (1, 2, 3, 4, 5, 6, 7, 8, 9))
+            .expect("call handle with nine arguments");
+        assert_eq!(nine_via_handle, 4886718345);
+
+        // Arity 10: both direct and handle calls
+        let ten: LustInt = program
+            .call_typed("main.ten", (1, 2, 3, 4, 5, 6, 7, 8, 9, 10))
+            .expect("call with ten arguments");
+        assert_eq!(ten, 78187493530);
+
+        let ten_handle = program
+            .function_handle("main.ten")
+            .expect("get ten-argument handle");
+        let ten_via_handle: LustInt = ten_handle
+            .call_typed(&mut program, (1, 2, 3, 4, 5, 6, 7, 8, 9, 10))
+            .expect("call handle with ten arguments");
+        assert_eq!(ten_via_handle, 78187493530);
+
+        // Arity 11: both direct and handle calls
+        let eleven: LustInt = program
+            .call_typed("main.eleven", (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11))
+            .expect("call with eleven arguments");
+        assert_eq!(eleven, 1250999896491);
+
+        let eleven_handle = program
+            .function_handle("main.eleven")
+            .expect("get eleven-argument handle");
+        let eleven_via_handle: LustInt = eleven_handle
+            .call_typed(&mut program, (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11))
+            .expect("call handle with eleven arguments");
+        assert_eq!(eleven_via_handle, 1250999896491);
+
+        // Arity 12: both direct and handle calls
+        let twelve_direct: LustInt = program
+            .call_typed("main.twelve", (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12))
+            .expect("call with twelve arguments");
+        assert_eq!(twelve_direct, 20015998343868);
+
+        let twelve_handle = program
+            .function_handle("main.twelve")
+            .expect("get twelve-argument handle");
+        let twelve: LustInt = twelve_handle
+            .call_typed(&mut program, (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12))
+            .expect("call handle with twelve arguments");
+        assert_eq!(twelve, 20015998343868);
+
+        let arity_error = program
+            .call_typed::<_, LustInt>("main.six", (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12))
+            .expect_err("wrong tuple arity should be rejected before indexed checks");
+        assert!(
+            arity_error
+                .to_string()
+                .contains("expects 6 argument(s) but 12 were supplied")
+        );
+
+        let type_error = program
+            .call_typed::<_, LustInt>(
+                "main.twelve",
+                (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, String::from("wrong")),
+            )
+            .expect_err("the final tuple slot should be validated");
+        assert!(type_error.to_string().contains("parameter 12"));
     }
 }

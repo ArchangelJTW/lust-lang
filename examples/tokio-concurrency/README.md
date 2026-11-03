@@ -14,9 +14,11 @@ The example demonstrates deterministic actor lifecycle and error handling:
   capacity (`capacity == 0`) before channel creation.
 - **Pre-publication compilation:** The dedicated OS worker thread compiles the
   `EmbeddedBuilder` before announcing readiness or publishing any `Client`.
-- **Startup failure cleanup:** On compilation or initialization failure, the
-  worker reports the error through a startup channel and joins the spawned OS
-  thread before returning `Err`, ensuring no leaked worker threads.
+- **Startup failure cleanup:** The demonstrated startup failure is a builder
+  compilation failure; the worker reports it through the startup channel and
+  attempts to join the spawned OS thread before returning `Err`. Cleanup is
+  established only if that join completes successfully; join-task failure or
+  cancellation does not establish that the worker thread joined.
 - **Graceful shutdown and drain:** A `shutdown` request enqueues a close sentinel,
   closes the receiver against new sends, drains accepted jobs, and joins the
   worker thread.

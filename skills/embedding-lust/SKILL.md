@@ -134,7 +134,7 @@ let hi: String = program.call_typed("main.greet", "Lust")?;       // single arg,
 let nothing: () = program.call_typed("main.tick", ())?;           // zero args
 ```
 
-- `Args` is either a single value implementing `IntoLustValue`, a tuple of up to 5 values, or `()` for no arguments.
+- `Args` is either a single value implementing `IntoLustValue`, a tuple of 2 through 12 values, or `()` for no arguments.
 - `R` implements `FromLustValue`. A `TypeError` is returned if argument or return types don't match the Lust signature.
 - Names must match the signature key exactly (dotted form, e.g. `"main.add"`). Use `program.typed_functions()` to list available names and signatures.
 
@@ -213,7 +213,7 @@ Struct/enum names must be known to the program (defined in Lust source or declar
 |---|---|
 | `IntoLustValue` | Rust → Lust (`into_value()`, `matches_lust_type(&Type)`, `type_description()`). |
 | `FromLustValue` | Lust → Rust (`from_value(Value)`, same introspection methods). |
-| `FunctionArgs` | Argument bundles for `call_typed` (single value, `()`, tuples ≤ 5). |
+| `FunctionArgs` | Argument bundles for `call_typed` (single value, `()`, tuples of 2–12). |
 | `FromLustArgs` | Argument bundles for natives (single value, `()`, tuples ≤ 5). |
 | `IntoTypedValue` | Rust → a type-checked value for globals/struct fields. |
 | `FromStructField<'a>` | Field extraction for `LustStructView` derives. |
@@ -695,12 +695,12 @@ Supported C surface: builder create/add module/set entry/compile, `lust_program_
 
 1. **Unqualified names in `call_typed`** — signatures are keyed by dotted module paths (`"main.add"`), not `"add"`. List candidates with `program.typed_functions()`.
 2. **Registering a native for an undeclared function** — `register_typed_native` must be able to resolve a Lust signature; declare the function in Lust (usually in an `extern` block) first. Use `register_native_fn` when you deliberately don't want signature checking.
-3. **`()` for zero-arg natives and calls** — a no-arg call is `call_typed("main.tick", ())`, and a zero-arg native closure takes `|_: ()|`. Tuples only go up to 5 elements.
+3. **Argument tuple limits** — a no-arg call is `call_typed("main.tick", ())`, and a zero-arg native closure takes `|_: ()|`. Typed Lust calls accept tuples of 2–12 values; typed native callback tuples currently accept up to 5.
 4. **Thread sharing** — the VM is not `Send`/`Sync`; move the whole `EmbeddedProgram` between threads instead of sharing it.
 5. **Type mismatches surface as `LustError::TypeError`/`RuntimeError`** — both carry a human-readable `message`; match on the enum for structured handling.
 6. **Weak `ref` fields** — a struct field declared `ref T` is stored as `Option<T>`; `set_field` accepts the inner type directly, and `borrow_field` materializes an owned `ValueRef` for it.
 7. **Generics are runtime-erased** — raw VM/native boundaries cannot revalidate generic arguments; validate in typed Lust code or in your conversion layer.
-8. **`call_typed` on an `unknown`-typed function fails** — the program has no signature for it; use `call_raw` or a `FunctionHandle`.
+8. **`call_typed` on an `unknown`-typed function fails** — the program has no signature for it; use `call_raw` or a `FunctionHandle`. Typed calls support tuple arities 2–12; typed native callbacks remain limited to 5 tuple elements.
 9. **Entry module must be registered** — `compile()` errors if `.entry_module(...)` names a module never passed to `.module(...)`.
 10. **Async natives need a running VM** — register before running, but they only execute (and create tasks) when invoked from Lust code; completion requires pumping `AsyncDriver`.
 11. **Budget errors are ordinary runtime errors** — "Out of gas …" / "Out of memory budget …" propagate out of `call`/`call_typed`; catch and reset counters between runs.

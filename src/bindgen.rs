@@ -75,6 +75,8 @@ use hashbrown::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+const MAX_TYPED_BINDGEN_ARITY: usize = 12;
+
 /// Generates Rust bindings from tagged public Lust functions and impl methods, plus public nominal types.
 #[derive(Clone)]
 pub struct RustBindingsBuilder {
@@ -882,10 +884,10 @@ fn add_method_binding(
             "checked signature for method '{lust_name}' does not match its source parameters"
         )));
     }
-    if signature.params.len() > 5 {
+    if signature.params.len() > MAX_TYPED_BINDGEN_ARITY {
         return Err(bindgen_error(format!(
-            "method '{lust_name}' has {} parameter(s); generated typed bindings currently support at most five",
-            signature.params.len()
+            "method '{lust_name}' has {} parameter(s); generated typed bindings currently support at most {MAX_TYPED_BINDGEN_ARITY}",
+            signature.params.len(),
         )));
     }
 
@@ -1007,9 +1009,9 @@ fn add_function_binding(
             function.name
         )));
     }
-    if signature.params.len() > 5 {
+    if signature.params.len() > MAX_TYPED_BINDGEN_ARITY {
         return Err(bindgen_error(format!(
-            "function '{}' has {} parameters; generated typed bindings currently support at most five",
+            "function '{}' has {} parameters; generated typed bindings currently support at most {MAX_TYPED_BINDGEN_ARITY}",
             function.name,
             signature.params.len()
         )));
@@ -2825,6 +2827,86 @@ end
                 .source
                 .contains("__lust_call_typed(&context, \"main.Level:ordinal\", self.clone())")
         );
+    }
+
+    #[test]
+    fn bindgen_accepts_twelve_total_arguments_and_rejects_thirteen() {
+        let dir = TempDir::new().expect("temp dir");
+        let entry = dir.path().join("main.lust");
+        fs::write(
+            &entry,
+            r#"
+struct Item
+    value: int
+end
+
+---@bindgen
+function twelve(a: int, b: int, c: int, d: int, e: int, f: int,
+               g: int, h: int, i: int, j: int, k: int, l: int): int
+    return a + b + c + d + e + f + g + h + i + j + k + l
+end
+
+impl Item
+    ---@bindgen
+    function with_twelve(self, a: int, b: int, c: int, d: int, e: int,
+                         f: int, g: int, h: int, i: int, j: int, k: int): int
+        return self.value + a + b + c + d + e + f + g + h + i + j + k
+    end
+end
+"#,
+        )
+        .expect("write maximum-arity Lust source");
+
+        let generated = RustBindingsBuilder::new(&entry)
+            .generate()
+            .expect("twelve total arguments should be supported");
+        assert!(generated.source.contains(
+            "__lust_call_typed(&self.__lust_context, \"main.twelve\", (a, b, c, d, e, f, g, h, i, j, k, l))"
+        ));
+        assert!(generated.source.contains(
+            "__lust_call_typed(&context, \"main.Item:with_twelve\", (self.clone(), a, b, c, d, e, f, g, h, i, j, k))"
+        ));
+
+        fs::write(
+            &entry,
+            r#"
+---@bindgen
+function thirteen(a: int, b: int, c: int, d: int, e: int, f: int,
+                  g: int, h: int, i: int, j: int, k: int, l: int,
+                  m: int): int
+    return a
+end
+"#,
+        )
+        .expect("write above-limit Lust source");
+        let error = RustBindingsBuilder::new(&entry)
+            .generate()
+            .expect_err("thirteen arguments should remain outside the limit");
+        assert!(error.to_string().contains("support at most 12"));
+        assert!(error.to_string().contains("13 parameters"));
+
+        fs::write(
+            &entry,
+            r#"
+struct Item
+    value: int
+end
+
+impl Item
+    ---@bindgen
+    function above_limit(self, a: int, b: int, c: int, d: int, e: int,
+                         f: int, g: int, h: int, i: int, j: int, k: int, l: int): int
+        return self.value
+    end
+end
+"#,
+        )
+        .expect("write above-limit method source");
+        let error = RustBindingsBuilder::new(&entry)
+            .generate()
+            .expect_err("receiver plus twelve arguments should exceed the total limit");
+        assert!(error.to_string().contains("support at most 12"));
+        assert!(error.to_string().contains("13 parameter(s)"));
     }
 
     #[test]

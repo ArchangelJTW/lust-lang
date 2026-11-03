@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "lust-rs"
-version = "3.5.7"
+version = "3.5.8"
 dependencies = [
  "console_error_panic_hook",
  "dirs",

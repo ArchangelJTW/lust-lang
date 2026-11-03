@@ -399,6 +399,7 @@ pub trait FromLustValue: Sized {
 }
 
 pub trait FunctionArgs {
+    /// Bundles a Rust value, unit, or a tuple of 2 through 12 values for a typed call.
     fn into_values(self) -> Vec<Value>;
     fn validate_signature(function_name: &str, params: &[Type]) -> Result<()>;
 }
@@ -1085,100 +1086,37 @@ where
     }
 }
 
-impl<A, B> FunctionArgs for (A, B)
-where
-    A: IntoLustValue,
-    B: IntoLustValue,
-{
-    fn into_values(self) -> Vec<Value> {
-        vec![self.0.into_value(), self.1.into_value()]
-    }
+macro_rules! impl_function_args {
+    ($($index:tt: $T:ident),+ $(,)?) => {
+        impl<$($T),+> FunctionArgs for ($($T,)+)
+        where
+            $($T: IntoLustValue,)+
+        {
+            fn into_values(self) -> Vec<Value> {
+                vec![$(self.$index.into_value()),+]
+            }
 
-    fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
-        ensure_arity(function_name, params, 2)?;
-        ensure_arg_type::<A>(function_name, params, 0)?;
-        ensure_arg_type::<B>(function_name, params, 1)?;
-        Ok(())
-    }
+            fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
+                const ARITY: usize = count_idents!($($T),+);
+                ensure_arity(function_name, params, ARITY)?;
+                $(ensure_arg_type::<$T>(function_name, params, $index)?;)+
+                Ok(())
+            }
+        }
+    };
 }
 
-impl<A, B, C> FunctionArgs for (A, B, C)
-where
-    A: IntoLustValue,
-    B: IntoLustValue,
-    C: IntoLustValue,
-{
-    fn into_values(self) -> Vec<Value> {
-        vec![
-            self.0.into_value(),
-            self.1.into_value(),
-            self.2.into_value(),
-        ]
-    }
-
-    fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
-        ensure_arity(function_name, params, 3)?;
-        ensure_arg_type::<A>(function_name, params, 0)?;
-        ensure_arg_type::<B>(function_name, params, 1)?;
-        ensure_arg_type::<C>(function_name, params, 2)?;
-        Ok(())
-    }
-}
-
-impl<A, B, C, D> FunctionArgs for (A, B, C, D)
-where
-    A: IntoLustValue,
-    B: IntoLustValue,
-    C: IntoLustValue,
-    D: IntoLustValue,
-{
-    fn into_values(self) -> Vec<Value> {
-        vec![
-            self.0.into_value(),
-            self.1.into_value(),
-            self.2.into_value(),
-            self.3.into_value(),
-        ]
-    }
-
-    fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
-        ensure_arity(function_name, params, 4)?;
-        ensure_arg_type::<A>(function_name, params, 0)?;
-        ensure_arg_type::<B>(function_name, params, 1)?;
-        ensure_arg_type::<C>(function_name, params, 2)?;
-        ensure_arg_type::<D>(function_name, params, 3)?;
-        Ok(())
-    }
-}
-
-impl<A, B, C, D, E> FunctionArgs for (A, B, C, D, E)
-where
-    A: IntoLustValue,
-    B: IntoLustValue,
-    C: IntoLustValue,
-    D: IntoLustValue,
-    E: IntoLustValue,
-{
-    fn into_values(self) -> Vec<Value> {
-        vec![
-            self.0.into_value(),
-            self.1.into_value(),
-            self.2.into_value(),
-            self.3.into_value(),
-            self.4.into_value(),
-        ]
-    }
-
-    fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
-        ensure_arity(function_name, params, 5)?;
-        ensure_arg_type::<A>(function_name, params, 0)?;
-        ensure_arg_type::<B>(function_name, params, 1)?;
-        ensure_arg_type::<C>(function_name, params, 2)?;
-        ensure_arg_type::<D>(function_name, params, 3)?;
-        ensure_arg_type::<E>(function_name, params, 4)?;
-        Ok(())
-    }
-}
+impl_function_args!(0: A, 1: B);
+impl_function_args!(0: A, 1: B, 2: C);
+impl_function_args!(0: A, 1: B, 2: C, 3: D);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J, 10: K);
+impl_function_args!(0: A, 1: B, 2: C, 3: D, 4: E, 5: F, 6: G, 7: H, 8: I, 9: J, 10: K, 11: L);
 
 fn ensure_arity(function_name: &str, params: &[Type], provided: usize) -> Result<()> {
     if params.len() == provided {
@@ -1226,5 +1164,63 @@ fn argument_type_mismatch(
             lust_type,
             rust_type
         ),
+    }
+}
+
+#[cfg(test)]
+mod function_args_tests {
+    use crate::{EmbeddedProgram, LustInt};
+
+    #[test]
+    fn typed_calls_preserve_order_for_six_and_twelve_arguments() {
+        let mut program = EmbeddedProgram::builder()
+            .module(
+                "main",
+                r#"
+function six(a: int, b: int, c: int, d: int, e: int, f: int): int
+    return a * 100000 + b * 10000 + c * 1000 + d * 100 + e * 10 + f
+end
+
+function twelve(a: int, b: int, c: int, d: int, e: int, f: int,
+                g: int, h: int, i: int, j: int, k: int, l: int): int
+    return a * 100000000000 + b * 10000000000 + c * 1000000000 + d * 100000000 +
+           e * 10000000 + f * 1000000 + g * 100000 + h * 10000 + i * 1000 +
+           j * 100 + k * 10 + l
+end
+"#,
+            )
+            .entry_module("main")
+            .compile()
+            .expect("compile typed-call fixture");
+
+        let six: LustInt = program
+            .call_typed("main.six", (1, 2, 3, 4, 5, 6))
+            .expect("call with six arguments");
+        assert_eq!(six, 123456);
+
+        let twelve_handle = program
+            .function_handle("main.twelve")
+            .expect("get twelve-argument handle");
+        let twelve: LustInt = twelve_handle
+            .call_typed(&mut program, (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12))
+            .expect("call handle with twelve arguments");
+        assert_eq!(twelve, 123456790122);
+
+        let arity_error = program
+            .call_typed::<_, LustInt>("main.six", (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12))
+            .expect_err("wrong tuple arity should be rejected before indexed checks");
+        assert!(
+            arity_error
+                .to_string()
+                .contains("expects 6 argument(s) but 12 were supplied")
+        );
+
+        let type_error = program
+            .call_typed::<_, LustInt>(
+                "main.twelve",
+                (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, String::from("wrong")),
+            )
+            .expect_err("the final tuple slot should be validated");
+        assert!(type_error.to_string().contains("parameter 12"));
     }
 }

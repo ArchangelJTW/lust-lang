@@ -559,14 +559,15 @@ let _ = program.gas_remaining();          // Option<u64>
 program.reset_gas_counter();
 program.clear_gas_budget();
 
-program.set_memory_budget_bytes(1 << 20); // allocation accounting (also set_memory_budget_kb)
+// Memory budget mutations return Result<()> and reject while VM execution is active
+program.set_memory_budget_bytes(1 << 20)?; // allocation accounting (also set_memory_budget_kb)
 let _ = program.memory_used_bytes();
 let _ = program.memory_remaining_bytes(); // Option<usize>
-program.reset_memory_counter();
-program.clear_memory_budget();
+program.reset_memory_counter()?;
+program.clear_memory_budget()?;
 ```
 
-Budgets are ideal for sandboxing untrusted scripts.
+Budgets are ideal for sandboxing untrusted scripts. While a memory budget is active, execution safely falls back to the interpreter (Stage A containment) to ensure vector and array allocations are accounted for; clearing the budget restores unmetered execution and recompiles hot code. Budget setters reject mid-execution calls (e.g. from callbacks) to prevent unmetered native execution under a newly set limit.
 
 ### JIT inspection
 

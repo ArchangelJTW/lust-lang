@@ -266,20 +266,73 @@ impl EmbeddedProgram {
         self.vm.gas_remaining()
     }
 
-    pub fn set_memory_budget_bytes(&mut self, limit_bytes: usize) {
-        self.vm.set_memory_budget_bytes(limit_bytes);
+    /// Set a memory budget in bytes.
+    ///
+    /// While a memory budget is active, effective execution safely falls back to the
+    /// interpreter (Stage A containment) to ensure all allocations are charged.
+    /// Configured JIT preferences are preserved and will resume if the budget is cleared.
+    ///
+    /// # Errors
+    /// Returns `Err` if called while VM execution is active (e.g. inside a native callback,
+    /// reentrant call, or executing JIT/bytecode frame). An error leaves the previous
+    /// budget policy and counters completely unchanged.
+    #[must_use = "memory budget mutations are fallible and must not be ignored; an ignored error leaves the previous budget policy and counters unchanged"]
+    pub fn set_memory_budget_bytes(&mut self, limit_bytes: usize) -> Result<()> {
+        self.vm.set_memory_budget_bytes(limit_bytes)
     }
 
-    pub fn set_memory_budget_kb(&mut self, limit_kb: u64) {
-        self.vm.set_memory_budget_kb(limit_kb);
+    /// Set a memory budget in kilobytes (1 KB = 1024 bytes).
+    ///
+    /// While a memory budget is active, effective execution safely falls back to the
+    /// interpreter (Stage A containment) to ensure all allocations are charged.
+    ///
+    /// # Errors
+    /// Returns `Err` if called while VM execution is active (e.g. inside a native callback,
+    /// reentrant call, or executing JIT/bytecode frame). An error leaves the previous
+    /// budget policy and counters completely unchanged.
+    #[must_use = "memory budget mutations are fallible and must not be ignored; an ignored error leaves the previous budget policy and counters unchanged"]
+    pub fn set_memory_budget_kb(&mut self, limit_kb: u64) -> Result<()> {
+        self.vm.set_memory_budget_kb(limit_kb)
     }
 
-    pub fn clear_memory_budget(&mut self) {
-        self.vm.clear_memory_budget();
+    /// Clear the active memory budget and reset the memory counter.
+    ///
+    /// When cleared, execution transitions back to normal unmetered execution
+    /// (with JIT enabled if configured), and previously compiled code is invalidated
+    /// so stale entries are never reused.
+    ///
+    /// # Errors
+    /// Returns `Err` if called while VM execution is active (e.g. inside a native callback,
+    /// reentrant call, or executing JIT/bytecode frame). An error leaves the previous
+    /// budget policy and counters completely unchanged.
+    #[must_use = "memory budget mutations are fallible and must not be ignored; an ignored error leaves the previous budget policy and counters unchanged"]
+    pub fn clear_memory_budget(&mut self) -> Result<()> {
+        self.vm.clear_memory_budget()
     }
 
-    pub fn reset_memory_counter(&mut self) {
-        self.vm.reset_memory_counter();
+    /// Reset the cumulative memory usage counter to zero without clearing the limit.
+    ///
+    /// # Errors
+    /// Returns `Err` if called while VM execution is active (e.g. inside a native callback,
+    /// reentrant call, or executing JIT/bytecode frame). An error leaves the previous
+    /// budget policy and counters completely unchanged.
+    #[must_use = "memory budget mutations are fallible and must not be ignored; an ignored error leaves the previous budget policy and counters unchanged"]
+    pub fn reset_memory_counter(&mut self) -> Result<()> {
+        self.vm.reset_memory_counter()
+    }
+
+    /// Whether JIT compilation and native execution are configured to be enabled.
+    #[inline]
+    pub fn jit_configured_enabled(&self) -> bool {
+        self.vm.jit_configured_enabled()
+    }
+
+    /// Whether JIT execution is effectively active.
+    ///
+    /// Returns true only when JIT is configured enabled AND no memory budget is active.
+    #[inline]
+    pub fn effective_jit_enabled(&self) -> bool {
+        self.vm.effective_jit_enabled()
     }
 
     pub fn memory_used_bytes(&self) -> usize {

@@ -8,4 +8,8 @@ publish = false
 
 [dependencies]
 lust = { package = "lust-rs", path = "../..", default-features = false, features = ["std"] }
-tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[features]
+fail-move = []
+fail-sync = []

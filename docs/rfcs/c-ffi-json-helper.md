@@ -1,0 +1,295 @@
+# RFC: Bounded JSON Calls Through the C FFI (Option A)
+
+- **Feature Name:** `c_ffi_json_helper`
+- **Start Date:** 2026-11-03
+- **Target Components:** `include/lust_ffi.h`, `src/ffi.rs`
+- **Status:** Proposal / RFC (Design proposal only; no code or runtime changes; Option B handles deferred)
+- **Upstream Issue:** [ArchangelJTW/lust-lang#11](https://github.com/ArchangelJTW/lust-lang/issues/11)
+- **Pinned Base Commit:** `f2f81fe71e3961af6d5d4b5c9658f9ce184094e3` (Lust 3.5.8)
+
+---
+
+## 1. Summary
+
+This RFC proposes an additive, bounded convenience helper for the C foreign function interface (FFI): **Option A: JSON text decoded into a bounded subset of Lust values, one synchronous function call, and JSON encoding of its return value**.
+
+All declarations and semantics specified here are **proposals for future implementation** and are **not present or available** in the pinned upstream release (`f2f81fe71e3961af6d5d4b5c9658f9ce184094e3`).
+
+Key boundaries of this proposal:
+1. **Preserves Existing Scalar ABI:** The existing scalar tags (`NIL`, `BOOL`, `INT`, `FLOAT`, `STRING`), structs, and `lust_program_call` symbols remain untouched and binary-compatible.
+2. **Option A Scope:** Transports and converts structured data (nested arrays and string-keyed maps) across the C boundary via bounded JSON parsing and serialization, without exposing internal bytecode or runtime layout details.
+3. **Option B Deferred:** Mutable opaque object handles (e.g. `LustFfiArray`, `LustFfiMap`) are explicitly **deferred to a separate future RFC**. Handles require independent lifecycle, ownership, mutation accounting, and stale-pointer policies.
+4. **No Runtime or Evaluation Changes:** This proposal does not modify the current evaluator runtime, standard library, or existing evaluation harnesses.
+
+---
+
+## 2. Motivation and Current Source Facts
+
+### 2.1 Current ABI State (`f2f81fe71e3961af6d5d4b5c9658f9ce184094e3`)
+
+Inspection of the pinned upstream source confirms the following facts:
+- **Scalar-Only ABI:** In `include/lust_ffi.h:12–28` and `src/ffi.rs:78–138`, `LustFfiValueTag` is strictly limited to primitive scalar kinds (`LUST_FFI_VALUE_NIL`, `BOOL`, `INT`, `FLOAT`, `STRING`).
+- **Structured Values Rejected:** If a called Lust function returns an `Array`, `Map`, or `Struct`, `value_to_ffi` fails with `"Unsupported Lust value for FFI conversion"`.
+- **No Bytecode Constructors in C:** The C ABI does not expose public functions to construct Lust bytecode containers (`Array`, `Map`, `Struct`) directly.
+- **No Standard-Library JSON Parser:** Searching `src/vm/stdlib.rs` confirms that the registered standard library modules do not include a built-in JSON parser. While a caller can pass JSON text as an ordinary `LUST_FFI_VALUE_STRING`, the script runtime does not automatically parse it into structured values without host-provided glue.
+
+### 2.2 Polyglot Embedding Use Case
+
+Hosts embedding Lust from languages with C FFI bindings (such as Python, Go, C++, or Zig) frequently need to pass structured configuration or tabular records into a Lust function and receive structured results without authoring manual serialization wrappers in both host code and Lust script.
+
+---
+
+## 3. Proposed Public C Interface
+
+The declarations below are proposed additions to `include/lust_ffi.h`, guarded by a caller compile-time macro `LUST_ENABLE_FFI_JSON_V1` and a new optional Cargo feature `ffi-json = ["std", "dep:serde_json"]`.
+
+```c
+#ifdef LUST_ENABLE_FFI_JSON_V1
+
+typedef int32_t LustJsonStatusV1;
+
+#define LUST_JSON_OK_V1               0
+#define LUST_JSON_INVALID_ARGUMENT_V1  1
+#define LUST_JSON_INVALID_JSON_V1      2
+#define LUST_JSON_NUMBER_RANGE_V1      3
+#define LUST_JSON_LIMIT_V1             4
+#define LUST_JSON_TYPE_V1              5
+#define LUST_JSON_CALL_V1              6
+#define LUST_JSON_UNSUPPORTED_V1       7
+#define LUST_JSON_CYCLE_V1             8
+#define LUST_JSON_BORROW_V1            9
+#define LUST_JSON_INTERNAL_V1         10
+
+typedef struct LustJsonLimitsV1 {
+    uint32_t struct_size;          /* Must be sizeof(LustJsonLimitsV1) */
+    uint32_t reserved;             /* Must be 0 */
+    uint64_t max_input_bytes;      /* Total input JSON byte limit */
+    uint64_t max_output_bytes;     /* Total output JSON byte limit */
+    uint64_t max_depth;            /* Container nesting depth ceiling */
+    uint64_t max_nodes;            /* Max total nodes traversed */
+    uint64_t max_args;             /* Max positional argument count */
+    uint64_t max_bridge_bytes;     /* Max staging & bridge allocation bytes */
+} LustJsonLimitsV1;
+
+/**
+ * Call a Lust function with a positional argument list encoded as a JSON array,
+ * returning a detached JSON-encoded result.
+ *
+ * Parameters:
+ *   program:              Non-null pointer to live EmbeddedProgram.
+ *   function_name:        UTF-8 function symbol name (e.g. "module.fn").
+ *   function_name_len:    Length of function_name in bytes (excluding NUL).
+ *   json_args:            Length-delimited UTF-8 JSON array of positional arguments.
+ *   json_args_len:        Length of json_args in bytes.
+ *   limits:               Optional resource quotas (NULL selects documented defaults).
+ *   out_json_result:      Output slot receiving newly allocated UTF-8 JSON buffer.
+ *   out_json_result_len:  Output slot receiving length of out_json_result in bytes.
+ *
+ * Returns:
+ *   LUST_JSON_OK_V1 (0) on success, or non-zero status code on failure.
+ *   On success, *out_json_result must be freed exactly once using lust_string_free().
+ *   On failure, output slots are set to NULL / 0.
+ */
+LustJsonStatusV1 lust_program_call_json_v1(
+    EmbeddedProgram *program,
+    const char *function_name,
+    size_t function_name_len,
+    const char *json_args,
+    size_t json_args_len,
+    const LustJsonLimitsV1 *limits,
+    char **out_json_result,
+    size_t *out_json_result_len
+);
+
+#endif /* LUST_ENABLE_FFI_JSON_V1 */
+```
+
+### 3.1 Parameter and Memory Invariants
+
+1. **Length-Delimited UTF-8:** `function_name` and `json_args` are byte-length delimited. Neither requires a trailing NUL byte; raw interior NUL bytes are rejected as invalid JSON.
+2. **Positional Arguments:** The outer JSON document in `json_args` must be an array (`[...]`). Its elements map positionally to the target function's parameters:
+   - `[]` passes 0 arguments.
+   - `[1, 2]` passes 2 integer arguments.
+   - `[[1, 2]]` passes 1 argument (an Array).
+3. **Explicit Limits:** If `limits` is non-NULL, `struct_size` must equal `sizeof(LustJsonLimitsV1)` and `reserved` must be 0. Unknown layouts or zero values are rejected with `LUST_JSON_INVALID_ARGUMENT_V1`.
+4. **Ownership of Result:** The output buffer is owned by the caller upon `LUST_JSON_OK_V1` and must be released using the matching library's `lust_string_free(char *ptr)`.
+
+---
+
+## 4. JSON ↔ Lust Mapping (Normative Specification)
+
+| JSON Input Token | Converted Lust Value | Lust Return Value → JSON Output |
+| :--- | :--- | :--- |
+| `null` | `Value::Nil` | `Value::Nil` → `null` |
+| `true` / `false` | `Value::Bool` | `Value::Bool` → `true` / `false` |
+| Integer token (no decimal point or exponent) | `Value::Int` (exact signed 64-bit) | `Value::Int` → exact decimal integer |
+| Decimal / exponent token (`1.0`, `1e3`) | `Value::Float` (finite binary64 `f64`) | `Value::Float` → round-trip `f64` JSON number with decimal/exponent marker |
+| String token | `Value::String` (valid UTF-8) | `Value::String` → escaped JSON string |
+| Array element within positional list | `Value::Array` (recursively converted) | `Value::Array` → JSON array (`[...]`) |
+| Object (`{...}`) | `Value::Map` (keys must be Strings) | `Value::Map` → JSON object (`{...}`) |
+
+### 4.1 Boundary Constraints and Type Invariants
+
+- **Parser Architecture and Bounded Streaming (Proposed Requirements):**
+  - Parsing must be performed using a bounded streaming visitor or equivalent parser architecture.
+  - The specification explicitly **prohibits unlimited DOM materialization followed by post-hoc checks** (i.e. parsing an entire unbounded document into a generic AST or `serde_json::Value` DOM before checking depth, nodes, or byte limits is strictly prohibited).
+  - Quotas (depth, node count, input byte ceiling, and capacity ledger allocations) must be enforced progressively *before* any unbounded memory allocation or computation takes place.
+  - The streaming visitor or equivalent must strictly preserve lexical token class: integer tokens (e.g. `42`) must map to `Value::Int` (exact signed 64-bit), while decimal/exponent tokens (e.g. `42.0`, `4.2e1`) must map to `Value::Float` (finite binary64 `f64`). Integer tokens must not silently convert to float.
+  - Parser scratch buffers and working state must be accounted in the `max_bridge_bytes` requested-capacity ledger.
+  - Relying on `serde_json` alone does not prove bounded parsing: standard `serde_json` deserialization can allocate an unbounded DOM tree and does not reject duplicate keys by default. Dependency selection, specific parser crate versions, feature flags, and actual parsing capabilities are treated as **future empirical gates** to be demonstrated during implementation.
+- **Numeric Boundaries:**
+  - Integer tokens outside `[i64::MIN, i64::MAX]` return `LUST_JSON_NUMBER_RANGE_V1`. No silent conversion to floating-point is permitted.
+  - Floating-point tokens must be finite binary64. Non-finite values (`NaN`, `Infinity`, `-Infinity`) return `LUST_JSON_NUMBER_RANGE_V1`. Overflow and underflow-to-zero are rejected.
+  - Floating zero (`-0.0`) preserves its negative sign in float formatting; integer `-0` normalizes to `Int(0)`.
+- **Object and Key Semantics:**
+  - JSON objects map strictly to `Value::Map`. **No automatic or inferred named struct creation** is performed.
+  - Duplicate keys in input JSON objects are strictly rejected with `LUST_JSON_INVALID_JSON_V1`. This rejection must hold for decoded duplicate keys as well as escape-equivalent keys (e.g., `"key"` and `"\\u006b\\u0065\\u0079"` or `"\\u0061"` and `"a"` which resolve to identical decoded UTF-8 strings).
+  - Decoded key tracking sets or collision buffers maintained during object traversal must be charged against the `max_bridge_bytes` ledger.
+  - Returned Maps with non-string keys produce `LUST_JSON_UNSUPPORTED_V1`.
+- **Unsupported Types:**
+  - `Struct`, `WeakStruct`, `Tuple`, `Enum`, `Function`, `NativeFunction`, `Closure`, `Iterator`, and `Task` are unsupported on both input and return boundaries. Attempting to pass or return these types returns `LUST_JSON_TYPE_V1` (for input signatures) or `LUST_JSON_UNSUPPORTED_V1` (for return values).
+  - No heuristic `$type` envelope or automatic struct field deduction is allowed in v1.
+- **Status of Guarantees:**
+  - All token mapping, parsing constraints, and quota checks are **proposed design requirements**, not implemented runtime guarantees.
+
+---
+
+## 5. Execution, Status Codes, and State Management
+
+### 5.1 Step-by-Step Execution Pipeline
+
+To prevent side-effects during malformed requests, execution follows a strict sequential pipeline:
+1. **Pointer & Limits Preflight:** Validate non-null pointers, valid non-zero lengths, and matching `limits->struct_size`. Initialize the bridge requested-capacity ledger against `max_bridge_bytes`.
+2. **Bounded Streaming Parse & Quota Enforcement:** Parse `json_args` using a bounded streaming visitor (or equivalent) under active memory, depth, and node quotas. Capacity and quota checks must be enforced before growth and work; **unlimited DOM parsing followed by post-hoc checks is strictly prohibited**. The parser preserves integer versus decimal/exponent token fidelity, rejects non-array roots, and rejects decoded duplicate or escape-equivalent keys. Parser scratch buffers and decoded key tracking structures are charged against the `max_bridge_bytes` ledger.
+3. **Exact Fully Qualified Symbol Resolution & Signature Verification:** Resolve the target function symbol **once** to its exact canonical function target. The **exact same canonical target reference** must be used for both:
+   (a) bounded recursive validation of the fully resolved signature, arity, and supported parameter types (rejecting unsupported types prior to call), and
+   (b) the subsequent invocation in Step 5.
+   No permissive alias / raw-call split is permitted (e.g. checking one alias table while invoking another or bypassing resolution).
+   *Note on Status Code Precedence:* Status code precedence among overlapping failure modes (e.g. malformed JSON vs unresolved symbol vs quota exhaustion) remains **explicitly open** for resolution during implementation.
+4. **Argument Conversion & Accounting Transfer:** Convert parsed JSON items into Lust `Value` instances within the bridge memory ledger. Converted input allocations that are retained and passed to the VM must undergo an **exact-once transfer into existing VM memory accounting** upon call boundary crossing. If exact-once transfer into VM accounting is not demonstrable in the future implementation codebase, the implementation must stop or rescope before advertising VM budget coverage.
+5. **Synchronous Invocation:** Execute the function once using the **exact canonical target** resolved in Step 3 (`vm.call_raw` or direct invocation of the canonical reference).
+6. **Return Traversal & Serialization:** Traverse returned `Value`, checking for cyclic structures (using an active-ancestor identity stack), borrow conflicts, and supported kinds under output size and depth limits. Traversal scratch state and serialized output buffer capacity are accounted in the bridge ledger.
+7. **Publication:** Allocate NUL-terminated C string (accounted in the bridge ledger), assign output pointers, and return `LUST_JSON_OK_V1`.
+
+### 5.2 Status Code Meanings
+
+| Status Constant | Code | Meaning and Trigger Conditions |
+| :--- | :---: | :--- |
+| `LUST_JSON_OK_V1` | `0` | Call completed successfully; detached JSON string published. |
+| `LUST_JSON_INVALID_ARGUMENT_V1` | `1` | Null program, empty name/input, invalid name UTF-8, incompatible limits layout. |
+| `LUST_JSON_INVALID_JSON_V1` | `2` | Syntax error, non-array root, invalid UTF-8, duplicate object key. |
+| `LUST_JSON_NUMBER_RANGE_V1` | `3` | Integer overflow beyond `i64`, float overflow/underflow, `NaN`/`Infinity`. |
+| `LUST_JSON_LIMIT_V1` | `4` | Exceeded `max_input_bytes`, `max_output_bytes`, `max_depth`, `max_nodes`, `max_args`, or `max_bridge_bytes`. |
+| `LUST_JSON_TYPE_V1` | `5` | Wrong parameter arity, incompatible parameter type, or unsupported input schema. |
+| `LUST_JSON_CALL_V1` | `6` | Missing function symbol, unhandled VM runtime error, gas/instruction exhaustion. |
+| `LUST_JSON_UNSUPPORTED_V1` | `7` | Return value is an unsupported Lust kind (e.g. Struct, Tuple, Closure) or Map with non-string keys. |
+| `LUST_JSON_CYCLE_V1` | `8` | Cyclic container reference detected during return serialization. |
+| `LUST_JSON_BORROW_V1` | `9` | `try_borrow` failed during container traversal. |
+| `LUST_JSON_INTERNAL_V1` | `10` | Caught Rust panic or unexpected internal bridge error. |
+
+### 5.3 Diagnostic Messages and Side-Effect Rules
+
+- **Thread-Local Error Message:** On non-zero status, a concise diagnostic string (at most 1024 bytes, NUL-terminated) is stored in thread-local storage, accessible via `lust_last_error_message()`.
+- **Pre-execution Failures (Zero Observable Pre-Execution Effects):** As a proposed future contract, any failure occurring during pre-execution phases (Steps 1–4: pointer/limits validation, parsing/input quotas, target resolution, signature/arity/type validation, conversion and accounting before invocation) guarantees **zero pre-execution effects** scoped to observable program state:
+  - Program globals remain unchanged.
+  - No host callbacks or VM bytecode are executed.
+  - Target symbol resolution and signature validation must be strictly **metadata-only**, resolving and inspecting symbol existence, arity, and parameter types without executing VM bytecode/callbacks or mutating globals.
+- **Post-invocation Failures (Non-Transactional Execution):** Failures occurring in Step 5 (VM runtime error) or Step 6 (serialization/cycle/limit error) remain **non-transactional**: function side effects (such as global mutations, host I/O, or state alterations) may have already taken effect during script execution. No automatic rollback or retry is attempted.
+
+---
+
+## 6. Ownership, Thread Safety, and Resource Quotas
+
+### 6.1 Ownership and Thread Constraints
+
+- **Borrowed Inputs:** `json_args` and `limits` are borrowed synchronously for the duration of the call and never retained across call boundaries.
+- **Detached Output:** The published result is an independent heap-allocated C string. It remains valid even if `EmbeddedProgram` is destroyed, and must be freed using `lust_string_free()`.
+- **Single-Threaded Model:** Lust's `EmbeddedProgram` and internal values use `Rc<RefCell<...>>` and are strictly **not thread-safe (`!Send`, `!Sync`)**. All invocations for a single program instance must occur on its owning OS thread.
+
+### 6.2 Default Resource Ceilings and Bridge Allocation Ledger
+
+When `limits == NULL`, the following hard ceilings apply:
+
+| Limit Parameter | Default Value | Scope / Description |
+| :--- | :--- | :--- |
+| `max_input_bytes` | `1,048,576` (1 MiB) | Maximum total byte length of `json_args`. |
+| `max_output_bytes` | `1,048,576` (1 MiB) | Maximum serialized output length excluding trailing NUL. |
+| `max_depth` | `64` | Maximum container nesting depth for inputs and outputs. |
+| `max_nodes` | `65,536` | Maximum total values and object keys traversed. |
+| `max_args` | `256` | Maximum number of positional arguments in outer list. |
+| `max_bridge_bytes` | `16,777,216` (16 MiB) | Proposed peak simultaneously-live requested-capacity ledger ceiling. |
+
+#### 6.2.1 Bridge Memory Ledger Definition (`max_bridge_bytes`)
+
+The `max_bridge_bytes` limit is defined as a **proposed peak simultaneously-live requested-capacity ledger**, not merely a retroactive counter of committed heap bytes:
+1. **Capacity-Aware Checks Before Growth:** Before expanding any buffer or requesting container capacity (e.g. vector reallocations, string buffers, decoded key sets, AST scratch buffers), the bridge must verify that `current_requested_capacity + additional_capacity <= max_bridge_bytes`. If the ceiling would be breached, the operation must abort immediately with `LUST_JSON_LIMIT_V1` without attempting the allocation.
+2. **Exclusion of Caller-Owned Borrowed Buffers:** The existing caller-owned borrowed byte ranges/capacity of `json_args`, `function_name`, and `limits` are explicitly **excluded** from `max_bridge_bytes` (they are pre-existing host-allocated byte ranges, not bridge-created requested capacity).
+3. **Independent Validation Limits for Excluded Inputs:** Excluding caller-owned buffers from `max_bridge_bytes` does not bypass bounds checks; independent validation limits remain strictly applicable:
+   - `json_args` is governed by `max_input_bytes` (as well as UTF-8 validation).
+   - `function_name` is governed by name validity, maximum symbol length bounds, and valid UTF-8.
+   - `limits` is governed by `sizeof(LustJsonLimitsV1)` and reserved layout validation.
+4. **Covered Allocation Components (Bridge-Created Requested Capacity Charged Before Growth):** The ledger tracks and charges all live staging memory created by the bridge across the call lifecycle before growth occurs:
+   - Bridge-created decoded copies (e.g. decoded string copies and intermediate representations).
+   - Parser scratch buffers and decoder working state.
+   - Decoded key tracking sets (hash sets or deduplication tables across active object scopes used to detect duplicate and escape-equivalent keys).
+   - Intermediate converted Lust input `Value` instances before transfer to the VM.
+   - Return traversal structures (active-ancestor recursion stack, cycle detection sets, and intermediate buffers).
+   - Serialized output buffer capacity, charged before allocation/growth, including the trailing NUL terminator byte.
+5. **Exact-Once Transfer into VM Accounting:** Converted input allocations that are retained and handed off to the VM must be transferred **exactly once into existing VM memory accounting** upon call boundary crossing. If exact-once transfer into VM accounting is not demonstrable in the future implementation codebase, the implementation must stop or rescope before advertising VM budget coverage.
+6. **Proposed Requirements vs. Implemented Guarantees:** All quotas, ledger checks, and accounting transfers are **proposed design requirements**, not implemented guarantees. No runtime ledger or bridge logic currently exists in the codebase.
+7. **Distinction from RSS and VM Heap Limits:** `max_bridge_bytes` is strictly a bridge-internal requested-capacity ceiling:
+   - It **does not track or bound operating system Resident Set Size (RSS)**, allocator fragmentation, or non-bridge host allocations.
+   - It **does not substitute for VM heap quotas or instruction/gas limits**, which govern script execution inside the VM.
+
+- **Cycle Detection:** Container serialization tracks active ancestor identities to detect cyclic structures and reject them with `LUST_JSON_CYCLE_V1`.
+
+---
+
+## 7. Future Upstream Implementation Areas
+
+Future implementation work (outside the scope of this RFC) will target the following boundaries:
+
+1. `include/lust_ffi.h`: Add feature-guarded `LustJsonStatusV1`, `LustJsonLimitsV1`, and `lust_program_call_json_v1` declarations.
+2. `src/ffi.rs`: Add FFI bridge entrypoint, exact fully qualified canonical symbol resolution once (with no permissive alias/raw-call split), TLS error message recording, and CString publication.
+3. `src/ffi/json.rs` (new private module): Implement bounded streaming JSON parser, token mapping preserving integer vs decimal/exponent token fidelity, decoded duplicate/escape-equivalent key rejection, cycle-checking serializer, and `max_bridge_bytes` requested-capacity ledger with capacity-aware checks before growth. Strictly prohibit unlimited DOM materialization followed by post-hoc checks.
+4. **Parser Dependencies and Empirical Capability Gates:** Crate dependencies (whether `serde_json`, a custom streaming visitor, or alternative parsing libraries), specific crate versions, feature flags, and actual parsing capabilities are **future empirical gates**. Simply declaring a dependency on `serde_json` does not prove bounded parsing or duplicate key rejection; implementation PRs must empirically prove that chosen dependencies or visitors enforce capacity checks before growth and preserve token distinctions.
+5. **VM Memory Accounting Integration Gate:** Implementation must provide an empirical proof of exact-once transfer of retained converted input allocations into existing VM memory accounting. If exact-once accounting transfer is not demonstrable within Lust's VM architecture, the implementation must stop or rescope before claiming VM budget coverage.
+6. **Status Code Precedence Resolution:** Formally establish the precedence order among overlapping status codes (`LUST_JSON_INVALID_ARGUMENT_V1`, `LUST_JSON_INVALID_JSON_V1`, `LUST_JSON_LIMIT_V1`, `LUST_JSON_TYPE_V1`, `LUST_JSON_CALL_V1`).
+7. `examples/c-ffi-json/`: Add self-contained runnable C embedding example exercising structured calls and status checks.
+
+*Note:* This document remains an optional design-only RFC. No runtime, C ABI, or evaluator code is implemented in this PR; no changes are made to E09, and no handles or schema expansions are introduced.
+
+---
+
+## 8. Planned Acceptance Test Matrix (Requirements for Future PR)
+
+| Test ID | Test Focus | Planned Acceptance Criteria |
+| :--- | :--- | :--- |
+| **A01** | Real C/C++ Embedding | C and C++ programs compile against `include/lust_ffi.h` and link against `liblust`. |
+| **A02** | Backward Compatibility | Existing scalar FFI functions and `lust_program_call` work identically. |
+| **A03** | Round-Trip Types | Correct mapping for null, bool, int, float, string, nested arrays, and string-keyed maps. |
+| **A04** | Integer Boundary | Exact `i64` preserved; values outside `[i64::MIN, i64::MAX]` return `LUST_JSON_NUMBER_RANGE_V1`. |
+| **A05** | Float Boundary | Finite `f64` values round-trip; non-finite floats, overflow, and underflow-to-zero rejected. |
+| **A06** | Unicode & NUL Handling | Valid UTF-8 and escaped `\u0000` preserved; raw NUL or invalid UTF-8 rejected. |
+| **A07** | Duplicate Keys, Escape Equivalence & Bounded Streaming Syntax | Non-array root and duplicate keys (including escape-equivalent variants like `\u0061` vs `a`) rejected with `LUST_JSON_INVALID_JSON_V1`. Parser must enforce quotas via a bounded streaming visitor or equivalent before unbounded allocation or work; prohibit unlimited DOM then check. Parser scratch and key tracking accounted in bridge ledger. |
+| **A08** | Canonical Symbol Resolution, Signature Validation & Pre-Call Invariants | Target symbol resolved once to exact canonical function target via metadata-only inspection without executing VM bytecode/callbacks or mutating globals. Same canonical target used for bounded recursive signature/arity/supported-type validation and synchronous invocation (no permissive alias/raw-call split). Tests must prove that observable state (host callback counters and global variable counters) remains zero across each pre-call failure category: (1) pointer/limits validation, (2) parsing/input quotas, (3) target resolution, (4) signature/arity/type validation, and (5) argument conversion/accounting before invocation. Unresolved status precedence verified. |
+| **A09** | Unsupported Types | Returning Struct, Tuple, or Enum returns `LUST_JSON_UNSUPPORTED_V1`. |
+| **A10** | Capacity-Aware Quota Ceilings & Bridge Ledger | Exceeding byte, depth, node, or bridge limits returns `LUST_JSON_LIMIT_V1`. Tests must prove caller-owned borrowed buffers (`json_args`, `function_name`, `limits`) are excluded from `max_bridge_bytes` while relevant independent limits (`max_input_bytes`, name validity/length bounds, struct layout) remain strictly enforced. `max_bridge_bytes` verified as a peak simultaneously-live requested-capacity ledger charging bridge-created decoded copies, parser scratch/working state, duplicate-key tracking sets, converted values before transfer, traversal structures, and output capacity before buffer growth. Clearly differentiated from process RSS and VM heap limits. |
+| **A11** | Cycle & Borrow Safety | Cyclic containers return `LUST_JSON_CYCLE_V1`; conflicting borrows return `LUST_JSON_BORROW_V1`. |
+| **A12** | Input Validation | Null pointers, empty names, or invalid struct sizes return `LUST_JSON_INVALID_ARGUMENT_V1`. |
+| **A13** | Leak & Lifecycle Check | Output buffers freed with `lust_string_free` show no leaks under AddressSanitizer/Valgrind. |
+| **A14** | Non-Transactional Errors | Side-effects documented for post-invocation errors; no duplicate function execution. |
+| **A15** | Independent Programs | Separate programs on independent threads operate without crosstalk. |
+| **A16** | VM Accounting Transfer Empirical Gate | Demonstrate exact-once transfer of retained converted input allocations into existing VM memory accounting prior to execution. If transfer into VM accounting is not demonstrable, implementation must stop or rescope before advertising VM budget coverage. |
+| **A17** | Panic Boundary | Catchable Rust panics converted to `LUST_JSON_INTERNAL_V1`; abort behavior documented. |
+| **A18** | Reusability After Errors | Program remains valid for subsequent calls after recoverable parsing/type errors. |
+
+---
+
+## 9. Open Questions and Maintainer Approval Gates
+
+1. **Map-Only Representation:** Does the maintainer group agree that JSON objects should strictly map to `Value::Map`, deferring typed struct/enum synthesis to a separate schema RFC?
+2. **Ceiling Tuning:** Are the proposed default limits (1 MiB input/output, 64 depth, 65,536 nodes) appropriate for standard embedding workloads?
+3. **Symbol Naming:** Is `lust_program_call_json_v1` the preferred naming convention for versioned FFI additions?
+4. **Option B Deferral:** Confirm that mutable handle APIs (`LustFfiArray`, `LustFfiMap`) remain out-of-scope until Option A is evaluated and stabilized.
+5. **Status Code Precedence:** In situations where multiple error conditions coincide (e.g. malformed JSON syntax vs missing function symbol vs limits exceeded), what is the normative precedence order among status codes (`INVALID_ARGUMENT`, `INVALID_JSON`, `LIMIT`, `TYPE`, `CALL`)?

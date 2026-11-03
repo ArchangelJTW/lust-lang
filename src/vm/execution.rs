@@ -96,10 +96,10 @@ impl VM {
     }
 
     pub(super) fn run(&mut self) -> Result<Value> {
-        // JIT enablement is fixed when the VM is created. Specialize the
-        // dispatch loop once rather than testing it around every instruction;
-        // the interpreter-only copy has no trace bookkeeping or JIT backedges.
-        if self.jit.enabled {
+        // Specialize the dispatch loop once rather than testing it around every
+        // instruction; the interpreter-only copy has no trace bookkeeping or JIT backedges.
+        // When a memory budget is active, effective execution is the interpreter.
+        if self.effective_jit_enabled() {
             self.run_inner::<true>()
         } else {
             self.run_inner::<false>()
@@ -232,7 +232,9 @@ impl VM {
                         };
 
                         let vm_ptr = self as *mut VM;
+                        let _jit_guard = self.enter_jit_scope();
                         let result = trace.execute(registers_ptr, vm_ptr, ptr::null());
+                        drop(_jit_guard);
                         drop(trace);
                         self.sync_gas_from_cells();
 
@@ -976,9 +978,11 @@ impl VM {
                                 args.push(self.get_register(first_arg + i)?.clone());
                             }
 
+                            let _native_guard = self.enter_native_scope();
                             self.push_current_vm();
                             let outcome = native_fn(&args);
                             self.pop_current_vm();
+                            drop(_native_guard);
                             let outcome =
                                 outcome.map_err(|e| LustError::RuntimeError { message: e })?;
                             self.handle_native_call_outcome(dest_reg, outcome)?;
@@ -2049,6 +2053,9 @@ impl VM {
     /// interpreter runs every call itself and loops are still traced.
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn run_compiled_function(&mut self, func_idx: usize) -> Result<Option<Value>> {
+        if !self.effective_jit_enabled() {
+            return Ok(None);
+        }
         let code = match self.jit.function_code(func_idx) {
             Some(code) => code,
             None => {
@@ -2084,7 +2091,9 @@ impl VM {
         self.jit_cells.exit_info = usize::MAX;
         let registers_ptr = self.call_stack.last_mut().unwrap().registers.as_mut_ptr();
         let vm_ptr = self as *mut VM;
+        let _jit_guard = self.enter_jit_scope();
         let result = code.execute(registers_ptr, vm_ptr, ptr::null());
+        drop(_jit_guard);
         self.jit_cells.stack_limit = outer_limit;
         self.sync_gas_from_cells();
         crate::jit::log(|| format!("🎯 JIT: function {} native result {}", func_idx, result));
@@ -2150,6 +2159,9 @@ impl VM {
     /// as not compilable.
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn compile_function(&mut self, func_idx: usize) {
+        if !self.effective_jit_enabled() {
+            return;
+        }
         use crate::jit::function::{Context, FunctionSig, translate};
         let sig_of = |meta: &CallMeta, function: &Function| FunctionSig {
             params: meta.params.iter().map(|kind| kind.value_type()).collect(),
@@ -2821,7 +2833,7 @@ impl VM {
                 // Compiled code for the function runs it now; `run` then
                 // either hands back the pending return value or carries on
                 // interpreting from wherever the native code exited.
-                let native = if self.jit.enabled && self.trace_recorder.is_none() {
+                let native = if self.effective_jit_enabled() && self.trace_recorder.is_none() {
                     self.run_compiled_function(*func_idx).map(|_| ())
                 } else {
                     Ok(())
@@ -2884,9 +2896,11 @@ impl VM {
             }
 
             Value::NativeFunction(native_fn) => {
+                let _native_guard = self.enter_native_scope();
                 self.push_current_vm();
                 let outcome = native_fn(&args);
                 self.pop_current_vm();
+                drop(_native_guard);
                 let outcome = outcome.map_err(|e| LustError::RuntimeError { message: e })?;
                 match outcome {
                     NativeCallResult::Return(value) => Ok(value),

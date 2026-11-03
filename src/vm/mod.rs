@@ -161,6 +161,34 @@ impl Drop for CurrentVmGuard {
     }
 }
 
+pub(crate) struct ActiveNativeGuard {
+    vm: *mut VM,
+}
+
+impl Drop for ActiveNativeGuard {
+    fn drop(&mut self) {
+        if !self.vm.is_null() {
+            unsafe {
+                (*self.vm).active_native_depth = (*self.vm).active_native_depth.saturating_sub(1);
+            }
+        }
+    }
+}
+
+pub(crate) struct ActiveJitGuard {
+    vm: *mut VM,
+}
+
+impl Drop for ActiveJitGuard {
+    fn drop(&mut self) {
+        if !self.vm.is_null() {
+            unsafe {
+                (*self.vm).active_jit_depth = (*self.vm).active_jit_depth.saturating_sub(1);
+            }
+        }
+    }
+}
+
 pub(super) const TO_STRING_TRAIT: &str = "ToString";
 pub(super) const TO_STRING_METHOD: &str = "to_string";
 pub(super) const HASH_KEY_TRAIT: &str = "HashKey";
@@ -223,6 +251,56 @@ pub struct VM {
     pub(super) export_prefix_stack: Vec<String>,
     #[cfg(feature = "std")]
     pub(super) exported_type_stubs: Vec<ModuleStub>,
+    pub(super) active_native_depth: usize,
+    pub(super) active_jit_depth: usize,
+}
+
+impl VM {
+    /// Whether the VM is currently idle (no executing call frame, native callback, or JIT code).
+    #[inline]
+    pub fn is_idle(&self) -> bool {
+        self.call_stack.is_empty() && self.active_native_depth == 0 && self.active_jit_depth == 0
+    }
+
+    /// Whether JIT compilation and native execution are configured to be enabled.
+    #[inline]
+    pub fn jit_configured_enabled(&self) -> bool {
+        self.jit.enabled
+    }
+
+    /// Whether JIT execution is effectively active.
+    ///
+    /// When a memory budget is active, the effective execution policy switches to
+    /// the interpreter (Stage A) so existing logical array and growth checks apply.
+    /// This does not charge all allocations or guarantee RSS/physical memory containment;
+    /// other allocation classes and complete process containment are out of scope.
+    #[inline]
+    pub fn effective_jit_enabled(&self) -> bool {
+        self.jit.enabled && !self.budgets.mem_budget_enabled()
+    }
+
+    #[inline]
+    pub(crate) fn enter_native_scope(&mut self) -> ActiveNativeGuard {
+        self.active_native_depth = self.active_native_depth.saturating_add(1);
+        ActiveNativeGuard {
+            vm: self as *mut VM,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn enter_jit_scope(&mut self) -> ActiveJitGuard {
+        self.active_jit_depth = self.active_jit_depth.saturating_add(1);
+        ActiveJitGuard {
+            vm: self as *mut VM,
+        }
+    }
+
+    pub(crate) fn invalidate_jit_code(&mut self) {
+        self.trace_recorder = None;
+        self.skip_next_trace_record = false;
+        self.jit.invalidate_compiled_code();
+        self.jit_cells.entry_table = self.jit.function_entry_table();
+    }
 }
 
 #[derive(Debug, Clone)]

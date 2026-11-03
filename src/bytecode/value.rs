@@ -2535,9 +2535,11 @@ pub unsafe extern "C" fn jit_call_native_safe(
         {
             frame.ip = ip + 1;
         }
+        let _native_guard = (&mut *vm_ptr).enter_native_scope();
         push_vm_ptr(vm_ptr);
         let outcome = native_fn(&args);
         pop_vm_ptr();
+        drop(_native_guard);
 
         let outcome = match outcome {
             Ok(result) => result,
@@ -2978,9 +2980,11 @@ pub unsafe extern "C" fn jit_call_method_safe(
             args.push((&*arg_ptr).clone());
         }
 
+        let _native_guard = (&mut *vm_ptr).enter_native_scope();
         crate::vm::push_vm_ptr(vm_ptr);
         let outcome = call_builtin_method_simple(&object, method_name, args);
         crate::vm::pop_vm_ptr();
+        drop(_native_guard);
         match outcome {
             Ok(val) => {
                 if !out.is_null() {

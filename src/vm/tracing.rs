@@ -185,7 +185,7 @@ impl VM {
         guard_index: usize,
         _func_idx: usize,
     ) -> Result<()> {
-        if !self.jit.enabled {
+        if !self.effective_jit_enabled() {
             return Ok(());
         }
         if let Some(trace) = self.jit.get_trace_mut(trace_id)
@@ -231,6 +231,9 @@ pub unsafe extern "C" fn jit_run_nested_loop(
         return 1;
     }
     let vm = unsafe { &mut *vm };
+    if !vm.effective_jit_enabled() {
+        return 1;
+    }
     let Some(trace_id) = vm
         .jit
         .root_traces
@@ -251,7 +254,9 @@ pub unsafe extern "C" fn jit_run_nested_loop(
         vm.publish_gas_to_cells();
         vm.jit.record_native_entry();
         vm.pending_jit_error = None;
+        let _jit_guard = vm.enter_jit_scope();
         let result = trace.execute(registers, vm as *mut VM, core::ptr::null());
+        drop(_jit_guard);
         drop(trace);
         vm.sync_gas_from_cells();
         if result == 0 {

@@ -1184,8 +1184,12 @@ mod tests {
             .call_raw("main.make_counter", vec![])
             .expect("counter");
         let values = Value::array(vec![Value::Int(7)]);
-        program.set_memory_budget_bytes(core::mem::size_of::<Value>() * 37);
-        program.reset_memory_counter();
+        program
+            .set_memory_budget_bytes(core::mem::size_of::<Value>() * 37)
+            .expect("set memory budget");
+        program
+            .reset_memory_counter()
+            .expect("reset memory counter");
         assert!(
             program
                 .call_raw(

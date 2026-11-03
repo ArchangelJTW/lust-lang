@@ -135,6 +135,8 @@ impl VM {
             export_prefix_stack: Vec::new(),
             #[cfg(feature = "std")]
             exported_type_stubs: Vec::new(),
+            active_native_depth: 0,
+            active_jit_depth: 0,
         };
         vm.jit.enabled = vm.jit.enabled && config.jit_enabled();
         vm.trait_impls

@@ -189,6 +189,7 @@ pub struct JitCompiler {
     /// Next ID for specialized values
     #[allow(dead_code)]
     pub(super) next_specialized_id: usize,
+    pub(super) cached_select_imms: Option<(i64, i64)>,
 }
 
 impl Default for JitCompiler {

@@ -402,6 +402,17 @@ pub trait FunctionArgs {
     /// Bundles a Rust value, unit, or a tuple of 2 through 12 values for a typed call.
     fn into_values(self) -> Vec<Value>;
     fn validate_signature(function_name: &str, params: &[Type]) -> Result<()>;
+
+    /// OPT-07: Write arguments directly into destination slice without heap allocation.
+    fn write_args(self, dst: &mut [Value]) -> usize
+    where
+        Self: Sized,
+    {
+        let values = self.into_values();
+        let len = values.len();
+        dst[..len].clone_from_slice(&values);
+        len
+    }
 }
 
 impl IntoLustValue for Value {
@@ -1076,6 +1087,17 @@ where
         }
     }
 
+    fn write_args(self, dst: &mut [Value]) -> usize {
+        if T::is_unit() {
+            0
+        } else {
+            if !dst.is_empty() {
+                dst[0] = self.into_value();
+            }
+            1
+        }
+    }
+
     fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
         if T::is_unit() {
             ensure_arity(function_name, params, 0)
@@ -1094,6 +1116,14 @@ macro_rules! impl_function_args {
         {
             fn into_values(self) -> Vec<Value> {
                 vec![$(self.$index.into_value()),+]
+            }
+
+            fn write_args(self, dst: &mut [Value]) -> usize {
+                const ARITY: usize = count_idents!($($T),+);
+                if dst.len() >= ARITY {
+                    $(dst[$index] = self.$index.into_value();)+
+                }
+                ARITY
             }
 
             fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {

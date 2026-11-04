@@ -5,7 +5,7 @@ use core::ptr;
 
 /// How thoroughly a call's arguments are checked against the signature.
 #[derive(Clone, Copy)]
-enum ArgCheck {
+pub(super) enum ArgCheck {
     /// Full validation, including container contents (host and dynamic calls).
     Deep,
     /// Kinds only; the typechecker proved the rest (bytecode calls).
@@ -176,8 +176,6 @@ impl VM {
             if should_check_jit && JIT_ENABLED {
                 let count = self.jit.profiler.record_backedge(func_idx, loop_start_ip);
                 let backedge_ip = ip_before_execution.saturating_sub(1);
-                let loop_in_hierarchy =
-                    self.is_loop_in_hierarchy(func_idx, loop_start_ip, backedge_ip);
                 if self
                     .trace_recorder
                     .as_ref()
@@ -436,13 +434,33 @@ impl VM {
                             .jit
                             .root_traces
                             .contains_key(&(func_idx, loop_start_ip))
-                        && self.jit.should_record_root(
+                    {
+                        let loop_in_hierarchy = match self
+                            .jit
+                            .profiler
+                            .get_cached_loop_hierarchy(func_idx, loop_start_ip)
+                        {
+                            Some(cached) => cached,
+                            None => {
+                                let calculated = self.is_loop_in_hierarchy(
+                                    func_idx,
+                                    loop_start_ip,
+                                    backedge_ip,
+                                );
+                                self.jit.profiler.set_cached_loop_hierarchy(
+                                    func_idx,
+                                    loop_start_ip,
+                                    calculated,
+                                );
+                                calculated
+                            }
+                        };
+                        if self.jit.should_record_root(
                             func_idx,
                             loop_start_ip,
                             count,
                             crate::jit::HOT_THRESHOLD + u32::from(loop_in_hierarchy),
-                        )
-                    {
+                        ) {
                         crate::jit::log(|| {
                             format!(
                                 "🔥 JIT: Hot loop detected at func {} ip {} - starting trace recording!",
@@ -466,6 +484,7 @@ impl VM {
                         self.trace_recorder = Some(recorder);
                         self.jit.recording_started();
                         self.skip_next_trace_record = true;
+                        }
                     }
                 }
             }
@@ -2052,7 +2071,7 @@ impl VM {
     /// (x86_64 and aarch64, with `std`) have function code; elsewhere the
     /// interpreter runs every call itself and loops are still traced.
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    fn run_compiled_function(&mut self, func_idx: usize) -> Result<Option<Value>> {
+    pub(super) fn run_compiled_function(&mut self, func_idx: usize) -> Result<Option<Value>> {
         if !self.effective_jit_enabled() {
             return Ok(None);
         }
@@ -2247,7 +2266,7 @@ impl VM {
     /// Targets without a whole-function backend: the call stays
     /// interpreted (see the compiled version above).
     #[cfg(not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))))]
-    fn run_compiled_function(&mut self, _func_idx: usize) -> Result<Option<Value>> {
+    pub(super) fn run_compiled_function(&mut self, _func_idx: usize) -> Result<Option<Value>> {
         Ok(None)
     }
 
@@ -2349,6 +2368,66 @@ impl VM {
         upvalues: Vec<Value>,
     ) -> Result<Box<CallFrame>> {
         self.make_call_frame_with(function_idx, return_dest, args, upvalues, ArgCheck::Deep)
+    }
+
+    pub(super) fn make_call_frame_slice(
+        &mut self,
+        function_idx: usize,
+        return_dest: Option<Register>,
+        args: &[Value],
+        check: ArgCheck,
+    ) -> Result<Box<CallFrame>> {
+        let function = self
+            .functions
+            .get(function_idx)
+            .ok_or_else(|| LustError::RuntimeError {
+                message: format!("Invalid function index {}", function_idx),
+            })?;
+        if args.len() != function.param_count as usize {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Function {} expects {} arguments, got {}",
+                    function.name,
+                    function.param_count,
+                    args.len()
+                ),
+            });
+        }
+        if let Some(signature) = &function.signature
+            && signature.params.len() == args.len()
+        {
+            for (index, (value, ty)) in args.iter().zip(&signature.params).enumerate() {
+                let ok = match check {
+                    ArgCheck::Deep => self.value_matches_type(value, ty),
+                    ArgCheck::Shallow => Self::value_matches_type_shallow(value, ty),
+                };
+                if !ok {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "Function {} argument {} expects {}, got {:?}",
+                            function.name,
+                            index + 1,
+                            ty,
+                            value.type_of()
+                        ),
+                    });
+                }
+            }
+        }
+
+        let register_count = function.register_count;
+        let mut frame = self.take_frame(function_idx, return_dest, register_count)?;
+        let recursive = self
+            .call_stack
+            .iter()
+            .any(|existing| existing.function_idx == function_idx);
+        self.jit.record_function_call(recursive);
+        frame.upvalues.clear();
+        for (index, arg) in args.iter().enumerate() {
+            self.observe_value_graph(arg);
+            frame.registers[index] = arg.fast_clone();
+        }
+        Ok(frame)
     }
 
     fn make_call_frame_with(

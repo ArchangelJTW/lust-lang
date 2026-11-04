@@ -9,7 +9,7 @@ use hashbrown::HashMap;
 use std::collections::BTreeMap;
 
 /// Aggregates Lust type declarations that originate from Rust.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ExternRegistry {
     structs: Vec<StructDef>,
     enums: Vec<EnumDef>,
@@ -22,6 +22,15 @@ pub struct ExternRegistry {
 impl ExternRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.structs.is_empty()
+            && self.enums.is_empty()
+            && self.traits.is_empty()
+            && self.impls.is_empty()
+            && self.functions.is_empty()
+            && self.constants.is_empty()
     }
 
     pub fn add_struct(&mut self, def: StructDef) -> &mut Self {

@@ -456,6 +456,7 @@ impl JitCompiler {
     pub(super) fn emit_call(&mut self, function: *const ()) {
         self.hot_x0_in = None;
         self.hot_d0_in = None;
+        self.cached_select_imms = None;
         self.emit_mov_imm64(16, function as usize as u64);
         dynasm!(self.ops ; .arch aarch64 ; blr x16);
     }

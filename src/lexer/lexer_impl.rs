@@ -371,40 +371,31 @@ impl<'a> Lexer<'a> {
             _ => {}
         }
 
-        // Variable tokens - need string allocation
-        let (kind, lexeme) = match ch {
-            '"' | '\'' => self.scan_string()?,
-            '0'..='9' => self.scan_number()?,
-            'a'..='z' | 'A'..='Z' | '_' => self.scan_identifier()?,
-            _ => {
-                return Err(LustError::LexerError {
-                    line: start_line,
-                    column: start_column,
-                    message: format!("Unexpected character: {}", ch),
-                    module: None,
-                });
-            }
-        };
-        Ok(Token::new(kind, lexeme, start_line, start_column))
+        // Variable tokens - zero-copy slice scanning
+        match ch {
+            '"' | '\'' => self.scan_string(start_line, start_column),
+            '0'..='9' => self.scan_number(start_line, start_column),
+            'a'..='z' | 'A'..='Z' | '_' => self.scan_identifier(start_line, start_column),
+            _ => Err(LustError::LexerError {
+                line: start_line,
+                column: start_column,
+                message: format!("Unexpected character: {}", ch),
+                module: None,
+            }),
+        }
     }
 
-    fn scan_string(&mut self) -> Result<(TokenKind, String)> {
+    fn scan_string(&mut self, start_line: usize, start_column: usize) -> Result<Token> {
         let quote = self.current_char();
-        let start_line = self.line;
-        let start_column = self.column;
+        let start_pos = self.position;
         self.advance();
-        let mut value = String::new();
-        value.push(quote);
         while !self.is_at_end() && self.current_char() != quote {
             if self.current_char() == '\\' {
-                value.push(self.current_char());
                 self.advance();
                 if !self.is_at_end() {
-                    value.push(self.current_char());
                     self.advance();
                 }
             } else {
-                value.push(self.current_char());
                 self.advance();
             }
         }
@@ -418,20 +409,18 @@ impl<'a> Lexer<'a> {
             });
         }
 
-        value.push(self.current_char());
         self.advance();
 
-        // Intern the string literal to save memory
-        let symbol = self.interner.intern(&value);
+        let slice = &self.input[start_pos..self.position];
+        let symbol = self.interner.intern(slice);
         let interned = self.interner.get(symbol).to_string();
-        Ok((TokenKind::String, interned))
+        Ok(Token::new(TokenKind::String, interned, start_line, start_column))
     }
 
-    fn scan_number(&mut self) -> Result<(TokenKind, String)> {
-        let mut value = String::new();
+    fn scan_number(&mut self, start_line: usize, start_column: usize) -> Result<Token> {
+        let start_pos = self.position;
         let mut is_float = false;
-        while !self.is_at_end() && self.current_char().is_ascii_digit() {
-            value.push(self.current_char());
+        while !self.is_at_end() && self.input.as_bytes()[self.position].is_ascii_digit() {
             self.advance();
         }
 
@@ -441,25 +430,20 @@ impl<'a> Lexer<'a> {
             && self.peek(1).is_some_and(|c| c.is_ascii_digit())
         {
             is_float = true;
-            value.push(self.current_char());
             self.advance();
-            while !self.is_at_end() && self.current_char().is_ascii_digit() {
-                value.push(self.current_char());
+            while !self.is_at_end() && self.input.as_bytes()[self.position].is_ascii_digit() {
                 self.advance();
             }
         }
 
         if !self.is_at_end() && (self.current_char() == 'e' || self.current_char() == 'E') {
             is_float = true;
-            value.push(self.current_char());
             self.advance();
             if !self.is_at_end() && (self.current_char() == '+' || self.current_char() == '-') {
-                value.push(self.current_char());
                 self.advance();
             }
 
-            while !self.is_at_end() && self.current_char().is_ascii_digit() {
-                value.push(self.current_char());
+            while !self.is_at_end() && self.input.as_bytes()[self.position].is_ascii_digit() {
                 self.advance();
             }
         }
@@ -470,28 +454,38 @@ impl<'a> Lexer<'a> {
             TokenKind::Integer
         };
 
-        // Intern numbers to save memory (many repeated literals like 0, 1, 2)
-        let symbol = self.interner.intern(&value);
+        let slice = &self.input[start_pos..self.position];
+        let symbol = self.interner.intern(slice);
         let interned = self.interner.get(symbol).to_string();
-        Ok((kind, interned))
+        Ok(Token::new(kind, interned, start_line, start_column))
     }
 
-    fn scan_identifier(&mut self) -> Result<(TokenKind, String)> {
-        let mut value = String::new();
-        while !self.is_at_end()
-            && (self.current_char().is_alphanumeric() || self.current_char() == '_')
-        {
-            value.push(self.current_char());
-            self.advance();
+    fn scan_identifier(&mut self, start_line: usize, start_column: usize) -> Result<Token> {
+        let start_pos = self.position;
+        while !self.is_at_end() {
+            let b = self.input.as_bytes()[self.position];
+            if b.is_ascii_alphanumeric() || b == b'_' {
+                self.advance();
+            } else if !b.is_ascii() {
+                let ch = self.current_char();
+                if ch.is_alphanumeric() || ch == '_' {
+                    self.advance();
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
         }
 
-        let kind = TokenKind::keyword(&value).unwrap_or(TokenKind::Identifier);
+        let slice = &self.input[start_pos..self.position];
+        if let Some(kind) = TokenKind::keyword(slice) {
+            return Ok(Token::simple(kind, start_line, start_column));
+        }
 
-        // Intern identifiers - this is the big win!
-        // Identifiers like 'local', 'int', 'function' appear many times
-        let symbol = self.interner.intern(&value);
+        let symbol = self.interner.intern(slice);
         let interned = self.interner.get(symbol).to_string();
-        Ok((kind, interned))
+        Ok(Token::new(TokenKind::Identifier, interned, start_line, start_column))
     }
 
     fn skip_whitespace_and_comments(&mut self) -> Result<()> {
@@ -569,14 +563,14 @@ impl<'a> Lexer<'a> {
             self.advance();
         }
 
-        let mut text = String::new();
+        let content_start = self.position;
         while !self.is_at_end() && self.current_char() != '\n' {
-            text.push(self.current_char());
             self.advance();
         }
-        while text.ends_with(' ') || text.ends_with('\t') || text.ends_with('\r') {
-            text.pop();
-        }
+        let content_end = self.position;
+        let text = self.input[content_start..content_end]
+            .trim_end_matches([' ', '\t', '\r'])
+            .to_string();
 
         Some(Token::new(TokenKind::DocComment, text, line, column))
     }

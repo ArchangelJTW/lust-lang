@@ -424,7 +424,7 @@ fn jump_targets(instructions: &[Instruction]) -> Option<HashSet<usize>> {
             _ => continue,
         };
         let target = jump_target(ip, offset)?;
-        if target >= instructions.len() {
+        if target > instructions.len() {
             return None;
         }
         targets.insert(target);
@@ -1478,8 +1478,11 @@ fn translate_pass(
                 (Some(incoming), true) => incoming.merge(&t.env),
                 (Some(incoming), false) => incoming,
                 (None, true) => t.env.clone(),
-                // Only reachable through a back edge: not structured code.
-                (None, false) => return None,
+                // Dead code: no forward edges arrive here and straight-line flow terminated.
+                (None, false) => {
+                    ip += 1;
+                    continue;
+                }
             };
             if let Some(loop_env) = t.loop_envs.get(&ip) {
                 env = env.merge(loop_env);
@@ -1966,6 +1969,32 @@ mod compiled_semantics_tests {
             program
                 .call_typed::<_, crate::LustInt>("main.modulo", (1, 0))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn b05_recursion_compiles_and_runs() {
+        let mut program = program(
+            r#"
+            function b05_recursion(depth: int): int
+                if depth <= 0 then
+                    return 0
+                else
+                    return depth + b05_recursion(depth - 1)
+                end
+            end
+            "#,
+        );
+        for _ in 0..40 {
+            let res: crate::LustInt = program
+                .call_typed("main.b05_recursion", 10i64)
+                .expect("call");
+            assert_eq!(res, 55);
+        }
+        assert!(
+            program.jit_stats().functions_compiled >= 1,
+            "functions_compiled: {}",
+            program.jit_stats().functions_compiled
         );
     }
 }

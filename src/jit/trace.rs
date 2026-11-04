@@ -428,6 +428,27 @@ pub enum TraceOp {
         expect_truthy: bool,
         label: usize,
     },
+    /// Branchless conditional select: dest = if cond is truthy { on_true } else { on_false }
+    Select {
+        dest: Register,
+        cond: Register,
+        on_true: Value,
+        on_false: Value,
+    },
+    /// Branchless conditional select based on bitmask test: (src & mask) == 0 ? on_zero : on_nonzero
+    SelectBitZero {
+        dest: Register,
+        src: Register,
+        mask: u64,
+        on_zero: Value,
+        on_nonzero: Value,
+    },
+    /// Integer modulo by positive immediate constant: dest = src % divisor
+    ModImm {
+        dest: Register,
+        src: Register,
+        divisor: i64,
+    },
     /// A call from compiled function code to a bytecode function whose
     /// identity is known at compile time. Runs the callee's compiled code
     /// natively when it has some, otherwise exits to the interpreter at
@@ -569,7 +590,8 @@ impl TraceOp {
             | TraceOp::TryCast { dest, .. }
             | TraceOp::GetEnumValue { dest, .. }
             | TraceOp::BorrowField { dest, .. }
-            | TraceOp::BorrowEnumValue { dest, .. } => Some(*dest),
+            | TraceOp::BorrowEnumValue { dest, .. }
+            | TraceOp::Select { dest, .. } => Some(*dest),
             _ => None,
         }
     }
@@ -598,7 +620,8 @@ impl TraceOp {
             | TraceOp::TryCast { dest, .. }
             | TraceOp::GetEnumValue { dest, .. }
             | TraceOp::BorrowField { dest, .. }
-            | TraceOp::BorrowEnumValue { dest, .. } => *dest = register,
+            | TraceOp::BorrowEnumValue { dest, .. }
+            | TraceOp::Select { dest, .. } => *dest = register,
             _ => {}
         }
     }
@@ -697,6 +720,9 @@ pub struct TraceRecorder {
     /// While execution is inside a nested loop that a `NestedLoopCall` will
     /// run through its own trace, nothing is recorded (see `skip_nested`).
     nested_skip: Option<NestedSkip>,
+    /// While execution is inside a folded branchless select, instructions
+    /// up to `until_ip` are skipped during recording.
+    skip_until_ip: Option<(usize, usize)>,
 }
 
 /// The nested loop currently being skipped: its bytecode range in
@@ -768,6 +794,7 @@ impl TraceRecorder {
             loop_iterations: HashMap::new(),
             leaked_specialized_values: Vec::new(),
             nested_skip: None,
+            skip_until_ip: None,
         }
     }
 
@@ -946,6 +973,199 @@ impl TraceRecorder {
         self.intrinsics = intrinsics.clone();
     }
 
+    fn try_detect_select(
+        &self,
+        cond: Register,
+        jump_if_not: bool,
+        this_ip: usize,
+        target_ip: usize,
+        function: &crate::bytecode::Function,
+        registers: &[Value],
+    ) -> Option<(Register, Value, Value, usize)> {
+        let instructions = &function.chunk.instructions;
+        if target_ip <= this_ip + 1 || target_ip > instructions.len() {
+            return None;
+        }
+
+        let same_scalar_type = |a: &Value, b: &Value| -> bool {
+            matches!(
+                (a, b),
+                (Value::Int(_), Value::Int(_))
+                    | (Value::Bool(_), Value::Bool(_))
+                    | (Value::Float(_), Value::Float(_))
+            )
+        };
+
+        // Pattern 1: if-then-else
+        if target_ip > this_ip + 1 {
+            if let Some(Instruction::Jump(else_offset)) =
+                instructions.get(target_ip.saturating_sub(1))
+            {
+                let else_target = (target_ip as isize + *else_offset as isize) as usize;
+                if else_target > target_ip && else_target <= instructions.len() {
+                    let then_slice = &instructions[this_ip + 1..target_ip.saturating_sub(1)];
+                    let else_slice = &instructions[target_ip..else_target];
+                    if let (Some(then_eff), Some(else_eff)) = (
+                        try_eval_pure_branch(then_slice, &function.chunk, registers, cond, else_target),
+                        try_eval_pure_branch(else_slice, &function.chunk, registers, cond, else_target),
+                    ) {
+                        if then_eff.dest == else_eff.dest {
+                            let (on_true, on_false) = if jump_if_not {
+                                (then_eff.value, else_eff.value)
+                            } else {
+                                (else_eff.value, then_eff.value)
+                            };
+                            if same_scalar_type(&on_true, &on_false) {
+                                return Some((then_eff.dest, on_true, on_false, else_target));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pattern 2: if-then (no else block)
+        let then_slice = &instructions[this_ip + 1..target_ip];
+        let then_eff = try_eval_pure_branch(then_slice, &function.chunk, registers, cond, target_ip)?;
+        let dest = then_eff.dest;
+        let prev_val = registers.get(dest as usize)?.clone();
+        let (on_true, on_false) = if jump_if_not {
+            (then_eff.value, prev_val)
+        } else {
+            (prev_val, then_eff.value)
+        };
+        if same_scalar_type(&on_true, &on_false) {
+            return Some((dest, on_true, on_false, target_ip));
+        }
+
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BranchEffect {
+    dest: Register,
+    value: Value,
+}
+
+fn try_eval_pure_branch(
+    slice: &[Instruction],
+    chunk: &crate::bytecode::Chunk,
+    registers: &[Value],
+    cond: Register,
+    target_ip: usize,
+) -> Option<BranchEffect> {
+    if slice.is_empty() || slice.len() > 8 {
+        return None;
+    }
+    let body = if let Some(Instruction::Jump(_)) = slice.last() {
+        &slice[..slice.len() - 1]
+    } else {
+        slice
+    };
+    if body.is_empty() {
+        return None;
+    }
+
+    let mut temp_regs: hashbrown::HashMap<Register, Value> = hashbrown::HashMap::new();
+    let mut written_regs: Vec<Register> = Vec::new();
+
+    let get_reg_val = |reg: Register, temp_regs: &hashbrown::HashMap<Register, Value>| -> Option<Value> {
+        temp_regs.get(&reg).cloned().or_else(|| registers.get(reg as usize).cloned())
+    };
+
+    for &inst in body {
+        match inst {
+            Instruction::LoadConst(dest, const_idx) => {
+                let val = chunk.constants.get(const_idx as usize)?.clone();
+                temp_regs.insert(dest, val);
+                if !written_regs.contains(&dest) {
+                    written_regs.push(dest);
+                }
+            }
+            Instruction::LoadBool(dest, b) => {
+                temp_regs.insert(dest, Value::Bool(b));
+                if !written_regs.contains(&dest) {
+                    written_regs.push(dest);
+                }
+            }
+            Instruction::Move(dest, src) => {
+                let val = get_reg_val(src, &temp_regs)?;
+                temp_regs.insert(dest, val);
+                if !written_regs.contains(&dest) {
+                    written_regs.push(dest);
+                }
+            }
+            Instruction::AddInt(dest, lhs, rhs) => {
+                let l = match get_reg_val(lhs, &temp_regs)? {
+                    Value::Int(i) => i,
+                    _ => return None,
+                };
+                let r = match get_reg_val(rhs, &temp_regs)? {
+                    Value::Int(i) => i,
+                    _ => return None,
+                };
+                temp_regs.insert(dest, Value::Int(l.wrapping_add(r)));
+                if !written_regs.contains(&dest) {
+                    written_regs.push(dest);
+                }
+            }
+            Instruction::SubInt(dest, lhs, rhs) => {
+                let l = match get_reg_val(lhs, &temp_regs)? {
+                    Value::Int(i) => i,
+                    _ => return None,
+                };
+                let r = match get_reg_val(rhs, &temp_regs)? {
+                    Value::Int(i) => i,
+                    _ => return None,
+                };
+                temp_regs.insert(dest, Value::Int(l.wrapping_sub(r)));
+                if !written_regs.contains(&dest) {
+                    written_regs.push(dest);
+                }
+            }
+            Instruction::MulInt(dest, lhs, rhs) => {
+                let l = match get_reg_val(lhs, &temp_regs)? {
+                    Value::Int(i) => i,
+                    _ => return None,
+                };
+                let r = match get_reg_val(rhs, &temp_regs)? {
+                    Value::Int(i) => i,
+                    _ => return None,
+                };
+                temp_regs.insert(dest, Value::Int(l.wrapping_mul(r)));
+                if !written_regs.contains(&dest) {
+                    written_regs.push(dest);
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    if written_regs.contains(&cond) {
+        return None;
+    }
+
+    let &dest = written_regs.last()?;
+    let value = temp_regs.get(&dest)?.clone();
+
+    // Verify all written temporary registers (other than dest) are dead downstream
+    for &temp_reg in &written_regs[..written_regs.len() - 1] {
+        for inst in &chunk.instructions[target_ip..] {
+            if inst.reads_register(temp_reg) {
+                return None;
+            }
+            if inst.defined_register() == Some(temp_reg) {
+                break;
+            }
+        }
+    }
+
+    Some(BranchEffect { dest, value })
+}
+
+impl TraceRecorder {
+
     /// The tracked register whose specialized array `register` holds (the
     /// register itself or an alias sharing its `Rc`).
     fn specialized_owner(&self, register: Register, registers: &[Value]) -> Option<Register> {
@@ -1062,7 +1282,10 @@ impl TraceRecorder {
             | TraceOp::TryCast { dest, .. }
             | TraceOp::GetEnumValue { dest, .. }
             | TraceOp::BorrowField { dest, .. }
-            | TraceOp::BorrowEnumValue { dest, .. } => Some(*dest),
+            | TraceOp::BorrowEnumValue { dest, .. }
+            | TraceOp::Select { dest, .. }
+            | TraceOp::SelectBitZero { dest, .. }
+            | TraceOp::ModImm { dest, .. } => Some(*dest),
             TraceOp::SetField { .. }
             | TraceOp::SetIndex { .. }
             | TraceOp::ArrayIndexOk { .. }
@@ -1660,6 +1883,14 @@ impl TraceRecorder {
 
         if self.skip_nested(instruction, current_ip, function_idx)? {
             return Ok(());
+        }
+
+        if let Some((fn_idx, until_ip)) = self.skip_until_ip {
+            let this_ip = current_ip.saturating_sub(1);
+            if function_idx == fn_idx && this_ip < until_ip {
+                return Ok(());
+            }
+            self.skip_until_ip = None;
         }
 
         if let Some(dest) = instruction.defined_register() {
@@ -3023,14 +3254,27 @@ impl TraceRecorder {
             }
 
             Instruction::JumpIf(cond, offset) => {
-                let condition = &registers[cond as usize];
-                let is_truthy = condition.is_truthy();
+                let this_ip = current_ip.saturating_sub(1);
                 let target_offset = (current_ip as isize) + (offset as isize);
                 let target = if target_offset < 0 {
                     0
                 } else {
                     target_offset as usize
                 };
+                if let Some((dest, on_true, on_false, end_ip)) =
+                    self.try_detect_select(cond, false, this_ip, target, function, registers)
+                {
+                    self.push_op(TraceOp::Select {
+                        dest,
+                        cond,
+                        on_true,
+                        on_false,
+                    });
+                    self.skip_until_ip = Some((function_idx, end_ip));
+                    return Ok(());
+                }
+                let condition = &registers[cond as usize];
+                let is_truthy = condition.is_truthy();
                 let bailout_ip = if is_truthy { current_ip } else { target };
                 self.push_op(TraceOp::GuardLoopContinue {
                     condition_register: cond,
@@ -3041,14 +3285,27 @@ impl TraceRecorder {
             }
 
             Instruction::JumpIfNot(cond, offset) => {
-                let condition = &registers[cond as usize];
-                let is_truthy = condition.is_truthy();
+                let this_ip = current_ip.saturating_sub(1);
                 let target_offset = (current_ip as isize) + (offset as isize);
                 let target = if target_offset < 0 {
                     0
                 } else {
                     target_offset as usize
                 };
+                if let Some((dest, on_true, on_false, end_ip)) =
+                    self.try_detect_select(cond, true, this_ip, target, function, registers)
+                {
+                    self.push_op(TraceOp::Select {
+                        dest,
+                        cond,
+                        on_true,
+                        on_false,
+                    });
+                    self.skip_until_ip = Some((function_idx, end_ip));
+                    return Ok(());
+                }
+                let condition = &registers[cond as usize];
+                let is_truthy = condition.is_truthy();
                 let bailout_ip = if !is_truthy { current_ip } else { target };
                 self.push_op(TraceOp::GuardLoopContinue {
                     condition_register: cond,

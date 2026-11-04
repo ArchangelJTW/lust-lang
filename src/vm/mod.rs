@@ -251,6 +251,8 @@ pub struct VM {
     pub(super) export_prefix_stack: Vec<String>,
     #[cfg(feature = "std")]
     pub(super) exported_type_stubs: Vec<ModuleStub>,
+    pub(super) last_dispatched_target: Option<(usize, String)>,
+    pub(super) root_frame: Option<Box<CallFrame>>,
     pub(super) active_native_depth: usize,
     pub(super) active_jit_depth: usize,
 }
@@ -451,7 +453,7 @@ impl CallFrame {
             function_idx,
             ip: 0,
             #[cfg(feature = "std")]
-            registers: core::array::from_fn(|_| Value::Nil),
+            registers: [const { Value::Nil }; 256],
             #[cfg(not(feature = "std"))]
             registers: alloc::vec![Value::Nil; register_count as usize],
             base_register: 0,

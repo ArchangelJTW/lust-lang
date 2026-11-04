@@ -55,7 +55,7 @@ pub(super) struct Pin {
 pub(super) const INT_PIN_REGS: [u8; 6] = [23, 24, 25, 26, 27, 28];
 pub(super) const FLOAT_PIN_REGS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Access {
     Read,
     Write,
@@ -200,6 +200,9 @@ fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
         | TraceOp::Return { .. }
         | TraceOp::Unbox { .. }
         | TraceOp::DropSpecialized { .. } => {}
+        TraceOp::Select { dest, on_true, .. } => set(env, *dest, const_type(on_true)),
+        TraceOp::SelectBitZero { dest, on_zero, .. } => set(env, *dest, const_type(on_zero)),
+        TraceOp::ModImm { dest, .. } => set(env, *dest, Some(ValueType::Int)),
     }
 }
 
@@ -540,6 +543,21 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
         }
         TraceOp::Unbox { source_reg, .. } => e.reads.push((*source_reg, None)),
         TraceOp::Rebox { dest_reg, .. } => e.helper_writes.push(*dest_reg),
+        TraceOp::Select { dest, cond, on_true, .. } => {
+            let cond_ty = env.get(cond).copied();
+            e.reads.push((*cond, cond_ty));
+            e.native_writes.push((*dest, const_type(on_true)));
+        }
+        TraceOp::SelectBitZero { dest, src, on_zero, .. } => {
+            let src_ty = env.get(src).copied();
+            e.reads.push((*src, src_ty));
+            e.native_writes.push((*dest, const_type(on_zero)));
+        }
+        TraceOp::ModImm { dest, src, .. } => {
+            let src_ty = env.get(src).copied();
+            e.reads.push((*src, src_ty));
+            e.native_writes.push((*dest, Some(ValueType::Int)));
+        }
         TraceOp::SpecializedOp { operands, .. } => {
             for operand in operands {
                 if let Operand::Register(r) = operand {
@@ -563,6 +581,9 @@ pub(super) fn op_touches_register_memory(op: &TraceOp) -> bool {
                 value: Value::Int(_) | Value::Float(_) | Value::Bool(_),
                 ..
             }
+            | TraceOp::Select { .. }
+            | TraceOp::SelectBitZero { .. }
+            | TraceOp::ModImm { .. }
             | TraceOp::Add { .. }
             | TraceOp::Sub { .. }
             | TraceOp::Mul { .. }
@@ -805,8 +826,17 @@ pub(super) fn plan(
         ));
     }
 
-    // Hottest first; ties by register number for determinism.
-    eligible.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    // Carried pins keep loop state in machine registers across iterations and
+    // avoid memory round-trips; prioritize them over write-through Local pins,
+    // then hottest first; ties by register number for determinism.
+    eligible.sort_by(|a, b| {
+        let a_carried = a.1.class == PinClass::Carried;
+        let b_carried = b.1.class == PinClass::Carried;
+        b_carried
+            .cmp(&a_carried)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     let mut ints = INT_PIN_REGS.iter();
     let mut floats = FLOAT_PIN_REGS.iter();
     let mut pins = HashMap::new();

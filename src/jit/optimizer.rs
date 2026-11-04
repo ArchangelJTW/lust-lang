@@ -24,6 +24,7 @@ impl TraceOptimizer {
         self.eliminate_dead_stores_before_select(trace);
         self.optimize_modulo_select(trace);
         self.optimize_constant_modulo(trace);
+        self.isolate_loop_constants(trace);
         self.hoist_constants(trace);
         self.unroll_loop(trace, crate::jit::UNROLL_FACTOR);
         self.forward_struct_fields(trace);
@@ -263,6 +264,171 @@ impl TraceOptimizer {
             i += 1;
         }
         trace.ops = ops;
+    }
+
+    fn remap_op_reads(op: &mut TraceOp, from: Register, to: Register) {
+        match op {
+            TraceOp::Move { src, .. }
+            | TraceOp::Neg { src, .. }
+            | TraceOp::Not { src, .. }
+            | TraceOp::ModImm { src, .. }
+            | TraceOp::SelectBitZero { src, .. } => {
+                if *src == from {
+                    *src = to;
+                }
+            }
+            TraceOp::Add { lhs, rhs, .. }
+            | TraceOp::Sub { lhs, rhs, .. }
+            | TraceOp::Mul { lhs, rhs, .. }
+            | TraceOp::Div { lhs, rhs, .. }
+            | TraceOp::Mod { lhs, rhs, .. }
+            | TraceOp::Eq { lhs, rhs, .. }
+            | TraceOp::Ne { lhs, rhs, .. }
+            | TraceOp::Lt { lhs, rhs, .. }
+            | TraceOp::Le { lhs, rhs, .. }
+            | TraceOp::Gt { lhs, rhs, .. }
+            | TraceOp::Ge { lhs, rhs, .. }
+            | TraceOp::And { lhs, rhs, .. }
+            | TraceOp::Or { lhs, rhs, .. } => {
+                if *lhs == from {
+                    *lhs = to;
+                }
+                if *rhs == from {
+                    *rhs = to;
+                }
+            }
+            TraceOp::Guard { register, .. } => {
+                if *register == from {
+                    *register = to;
+                }
+            }
+            TraceOp::Select { cond, .. } => {
+                if *cond == from {
+                    *cond = to;
+                }
+            }
+            TraceOp::GuardLoopContinue {
+                condition_register, ..
+            } => {
+                if *condition_register == from {
+                    *condition_register = to;
+                }
+            }
+            TraceOp::SetField { value, .. } => {
+                if *value == from {
+                    *value = to;
+                }
+            }
+            TraceOp::SetIndex { index, value, .. } => {
+                if *index == from {
+                    *index = to;
+                }
+                if *value == from {
+                    *value = to;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn isolate_loop_constants(&mut self, trace: &mut Trace) {
+        if trace.ops.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::NestedLoopCall { .. }
+                    | TraceOp::CallFunction { .. }
+                    | TraceOp::CallNative { .. }
+                    | TraceOp::CallMethod { .. }
+                    | TraceOp::InlineCall { .. }
+            )
+        }) {
+            return;
+        }
+
+        let mut max_reg = 0u8;
+        for op in trace
+            .preamble
+            .iter()
+            .chain(&trace.ops)
+            .chain(&trace.postamble)
+        {
+            if let Some(d) = Self::dest_of(op) {
+                max_reg = max_reg.max(d);
+            }
+            for r in Self::reads_of(op) {
+                max_reg = max_reg.max(r);
+            }
+            for w in Self::other_writes(op) {
+                max_reg = max_reg.max(w);
+            }
+        }
+
+        let mut clobbered: HashSet<Register> = HashSet::new();
+        let mut const_values: HashMap<Register, Value> = HashMap::new();
+        for op in &trace.ops {
+            match op {
+                TraceOp::LoadConst { dest, value } => match const_values.get(dest) {
+                    Some(seen) if !values_identical(seen, value) => {
+                        clobbered.insert(*dest);
+                    }
+                    None => {
+                        const_values.insert(*dest, value.clone());
+                    }
+                    _ => {}
+                },
+                other => {
+                    for w in Self::other_writes(other).into_iter().chain(Self::dest_of(other)) {
+                        clobbered.insert(w);
+                    }
+                }
+            }
+        }
+
+        let mut constant_to_fresh: Vec<(Value, Register)> = Vec::new();
+
+        for i in 0..trace.ops.len() {
+            let (dest, val) = match &trace.ops[i] {
+                TraceOp::LoadConst { dest, value }
+                    if clobbered.contains(dest)
+                        && matches!(
+                            value,
+                            Value::Int(_) | Value::Float(_) | Value::Bool(_)
+                        ) =>
+                {
+                    (*dest, value.clone())
+                }
+                _ => continue,
+            };
+
+            if max_reg >= 220 {
+                break;
+            }
+
+            let fresh_reg = if let Some((_, reg)) = constant_to_fresh
+                .iter()
+                .find(|(v, _)| values_identical(v, &val))
+            {
+                *reg
+            } else {
+                max_reg = max_reg.saturating_add(1);
+                constant_to_fresh.push((val.clone(), max_reg));
+                max_reg
+            };
+
+            trace.ops[i] = TraceOp::LoadConst {
+                dest: fresh_reg,
+                value: val,
+            };
+
+            for j in (i + 1)..trace.ops.len() {
+                Self::remap_op_reads(&mut trace.ops[j], dest, fresh_reg);
+                if Self::dest_of(&trace.ops[j]) == Some(dest)
+                    || Self::other_writes(&trace.ops[j]).contains(&dest)
+                {
+                    break;
+                }
+            }
+        }
     }
 
     fn hoist_constants(&mut self, trace: &mut Trace) {

@@ -22,8 +22,8 @@ rust_bin = suite_dir / "rust/target/release/suite-rust"
 
 programs = ["fields", "array", "sieve", "calls", "methods", "strings", "fib", "nested", "floatmath", "tree"]
 
-def run_cmd(cmd, env=None):
-    with tempfile.TemporaryDirectory() as td:
+with tempfile.TemporaryDirectory() as td:
+    def run_cmd(cmd, env=None):
         e = os.environ.copy()
         if env:
             e.update(env)
@@ -36,19 +36,19 @@ def run_cmd(cmd, env=None):
         except subprocess.TimeoutExpired:
             return "timeout", "<timeout>"
 
-print(f"{'program':<10} {'rust':>9} {'lust-jit':>10} {'luajit':>9} {'lust-vm':>10} {'lua':>9}   outputs")
+    print(f"{'program':<10} {'rust':>9} {'lust-jit':>10} {'luajit':>9} {'lust-vm':>10} {'lua':>9}   outputs")
 
-for prog in programs:
-    t_rust, o_rust = run_cmd([str(rust_bin), prog])
-    t_jit, o_jit = run_cmd([str(lust_bin), str(suite_dir / f"{prog}.lust")], {"LUST_JIT": "1"})
-    t_vm, o_vm = run_cmd([str(lust_bin), str(suite_dir / f"{prog}.lust")], {"LUST_JIT": "0"})
-    t_lj, o_lj = run_cmd(["luajit", str(suite_dir / f"{prog}.lua")])
-    t_lua, o_lua = run_cmd(["lua", str(suite_dir / f"{prog}.lua")])
-    
-    same = "same"
-    if o_vm != o_jit:
-        same = "LUST DIFFERS"
-    if o_jit != o_lj:
-        same += f" (luajit prints {o_lj})"
-    print(f"{prog:<10} {t_rust:>9} {t_jit:>10} {t_lj:>9} {t_vm:>10} {t_lua:>9}   {same}")
+    for prog in programs:
+        t_rust, o_rust = run_cmd([str(rust_bin), prog])
+        t_jit, o_jit = run_cmd([str(lust_bin), str(suite_dir / f"{prog}.lust")], {"LUST_JIT": "1"})
+        t_vm, o_vm = run_cmd([str(lust_bin), str(suite_dir / f"{prog}.lust")], {"LUST_JIT": "0"})
+        t_lj, o_lj = run_cmd(["luajit", str(suite_dir / f"{prog}.lua")])
+        t_lua, o_lua = run_cmd(["lua", str(suite_dir / f"{prog}.lua")])
+        
+        same = "same"
+        if o_vm != o_jit:
+            same = "LUST DIFFERS"
+        if o_jit != o_lj:
+            same += f" (luajit prints {o_lj})"
+        print(f"{prog:<10} {t_rust:>9} {t_jit:>10} {t_lj:>9} {t_vm:>10} {t_lua:>9}   {same}")
 EOF

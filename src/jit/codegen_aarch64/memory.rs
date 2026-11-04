@@ -206,7 +206,7 @@ impl JitCompiler {
             let rc_offset = layout.array_rc_offset as u32;
             let len_offset = layout.len_offset as u32;
             let ptr_offset = layout.ptr_offset as u32;
-            let value_size = mem::size_of::<Value>() as u32;
+            let _value_size = mem::size_of::<Value>() as u32;
             let done = self.ops.new_dynamic_label();
             let slow = self.ops.new_dynamic_label();
             self.load_tag(0, array);
@@ -224,29 +224,44 @@ impl JitCompiler {
                 ; cmp x12, x10
                 ; b.hs >fail
                 ; ldr x10, [x9, #ptr_offset]
-                ; movz w13, #value_size
-                ; madd x10, x12, x13, x10
+                ; add x10, x10, x12, lsl #4
                 ; ldrb w9, [x10]
                 ; cmp w9, #scalar_max_tag
                 ; b.hi => slow
             );
-            if !self.scalar_registers.contains_key(&value) {
-                // The value's own tag says whether a plain copy is enough.
+            if let Some(ty) = self.scalar_registers.get(&value).copied() {
+                let tag = match ty {
+                    ValueType::Int => ValueTag::Int.as_u8(),
+                    ValueType::Float => ValueTag::Float.as_u8(),
+                    _ => ValueTag::Bool.as_u8(),
+                } as u32;
+                if ty == ValueType::Bool {
+                    self.load_bool_payload(1, value);
+                } else {
+                    self.load_payload(1, value);
+                }
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; movz x0, #tag
+                    ; stp x0, x1, [x10]
+                    ; b => done
+                );
+            } else {
                 self.load_tag_from_memory(13, value);
                 dynasm!(self.ops
                     ; .arch aarch64
                     ; cmp w13, #scalar_max_tag
                     ; b.hi => slow
                 );
+                self.emit_reg_addr(11, value);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldp x0, x1, [x11]
+                    ; stp x0, x1, [x10]
+                    ; b => done
+                );
             }
-            self.emit_reg_addr(11, value);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; ldp x0, x1, [x11]
-                ; stp x0, x1, [x10]
-                ; b => done
-                ; => slow
-            );
+            dynasm!(self.ops ; .arch aarch64 ; => slow);
             self.emit_reg_addr(0, array);
             self.emit_reg_addr(1, index);
             self.emit_reg_addr(2, value);
@@ -293,7 +308,7 @@ impl JitCompiler {
             let rc_offset = layout.array_rc_offset as u32;
             let len_offset = layout.len_offset as u32;
             let ptr_offset = layout.ptr_offset as u32;
-            let value_size = mem::size_of::<Value>() as u32;
+            let _value_size = mem::size_of::<Value>() as u32;
             let done = self.ops.new_dynamic_label();
             let out_of_range = self.ops.new_dynamic_label();
             let slow = self.ops.new_dynamic_label();
@@ -312,8 +327,7 @@ impl JitCompiler {
                 ; cmp x12, x10
                 ; b.hs => out_of_range
                 ; ldr x10, [x9, #ptr_offset]
-                ; movz w13, #value_size
-                ; madd x10, x12, x13, x10
+                ; add x10, x10, x12, lsl #4
                 ; ldrb w9, [x10]
             );
             if let Some(ty) = value_type {
@@ -761,7 +775,7 @@ impl JitCompiler {
             let len_offset = layout.len_offset as u32;
             let cap_offset = layout.cap_offset as u32;
             let ptr_offset = layout.ptr_offset as u32;
-            let value_size = mem::size_of::<Value>() as u32;
+            let _value_size = mem::size_of::<Value>() as u32;
             let done = self.ops.new_dynamic_label();
             let slow = self.ops.new_dynamic_label();
             self.load_tag(0, array);
@@ -793,8 +807,7 @@ impl JitCompiler {
             dynasm!(self.ops
                 ; .arch aarch64
                 ; ldr x10, [x9, #ptr_offset]
-                ; movz w13, #value_size
-                ; madd x10, x12, x13, x10
+                ; add x10, x10, x12, lsl #4
                 ; ldp x0, x1, [x11]
                 ; stp x0, x1, [x10]
                 ; add x12, x12, #1

@@ -1312,26 +1312,51 @@ impl VM {
                 }
 
                 Instruction::Concat(dest, lhs, rhs) => {
-                    let (left, right) = {
-                        let frame =
-                            self.call_stack
-                                .last_mut()
-                                .ok_or_else(|| LustError::RuntimeError {
-                                    message: "Empty call stack".to_string(),
-                                })?;
-                        let left = frame.registers[lhs as usize].clone();
-                        let right = frame.registers[rhs as usize].clone();
-                        (left, right)
-                    };
-                    let left_str = self.value_to_string_for_concat(&left)?;
-                    let right_str = self.value_to_string_for_concat(&right)?;
-                    let cap = left_str.len().saturating_add(right_str.len());
-                    self.budgets.charge_mem_bytes(cap)?;
-                    let mut combined = String::with_capacity(cap);
-                    combined.push_str(left_str.as_ref());
-                    combined.push_str(right_str.as_ref());
-                    let result = Value::string(combined);
-                    self.set_register(dest, result)?;
+                    let mut in_place_done = false;
+                    if dest == lhs {
+                        let right = {
+                            let frame = self.call_stack.last().ok_or_else(|| LustError::RuntimeError {
+                                message: "Empty call stack".to_string(),
+                            })?;
+                            frame.registers[rhs as usize].clone()
+                        };
+                        let right_str = self.value_to_string_for_concat(&right)?;
+                        let right_len = right_str.len();
+
+                        let frame = self.call_stack.last_mut().ok_or_else(|| LustError::RuntimeError {
+                            message: "Empty call stack".to_string(),
+                        })?;
+                        if let Value::String(ref mut rc) = frame.registers[dest as usize] {
+                            if let Some(s_mut) = Rc::get_mut(rc) {
+                                self.budgets.charge_mem_bytes(right_len)?;
+                                s_mut.push_str(right_str.as_ref());
+                                in_place_done = true;
+                            }
+                        }
+                    }
+
+                    if !in_place_done {
+                        let (left, right) = {
+                            let frame =
+                                self.call_stack
+                                    .last_mut()
+                                    .ok_or_else(|| LustError::RuntimeError {
+                                        message: "Empty call stack".to_string(),
+                                    })?;
+                            let left = frame.registers[lhs as usize].clone();
+                            let right = frame.registers[rhs as usize].clone();
+                            (left, right)
+                        };
+                        let left_str = self.value_to_string_for_concat(&left)?;
+                        let right_str = self.value_to_string_for_concat(&right)?;
+                        let cap = left_str.len().saturating_add(right_str.len());
+                        self.budgets.charge_mem_bytes(cap)?;
+                        let mut combined = String::with_capacity(if dest == lhs { cap.max(left_str.len() * 2) } else { cap });
+                        combined.push_str(left_str.as_ref());
+                        combined.push_str(right_str.as_ref());
+                        let result = Value::string(combined);
+                        self.set_register(dest, result)?;
+                    }
                 }
 
                 Instruction::GetIndex(dest, array_reg, index_reg) => {

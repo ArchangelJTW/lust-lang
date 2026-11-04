@@ -606,6 +606,7 @@ impl JitCompiler {
             .scalar_registers
             .get(&value)
             .copied()
+            .or(_value_type)
             .filter(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool));
         if let (Some(index), Some(ty), Some(layout), false) = (
             field_index,

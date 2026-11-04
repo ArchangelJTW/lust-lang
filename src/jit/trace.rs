@@ -1896,8 +1896,8 @@ impl TraceRecorder {
         }
 
         if let Some(dest) = instruction.defined_register() {
-            let preserves_numeric_inputs =
-                instruction
+            let preserves_inputs = matches!(instruction, Instruction::Concat(..))
+                || instruction
                     .numeric_specialization()
                     .is_some_and(|(generic, _, _, _)| {
                         matches!(
@@ -1910,7 +1910,7 @@ impl TraceRecorder {
                                 | Instruction::Neg(..)
                         )
                     });
-            if instruction.reads_register(dest) && !preserves_numeric_inputs && !frame_pushed {
+            if instruction.reads_register(dest) && !preserves_inputs && !frame_pushed {
                 self.stop_recording();
                 return Err(LustError::RuntimeError {
                     message: format!(

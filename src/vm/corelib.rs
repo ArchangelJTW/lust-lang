@@ -286,16 +286,31 @@ fn create_ipairs_fn() -> Value {
     }))
 }
 
+thread_local! {
+    static SMALL_INT_STRINGS: [Rc<String>; 256] = core::array::from_fn(|i| Rc::new(i.to_string()));
+}
+
 pub(super) fn create_tostring_fn() -> Value {
     Value::NativeFunction(native_fn(|args: &[Value]| {
         if args.is_empty() {
             return Err("tostring() requires at least one argument".to_string());
         }
 
-        Ok(NativeCallResult::Return(Value::string(format!(
-            "{}",
-            args[0]
-        ))))
+        match &args[0] {
+            Value::Int(n) if (0..256).contains(n) => {
+                let rc = SMALL_INT_STRINGS.with(|table| table[*n as usize].clone());
+                Ok(NativeCallResult::Return(Value::String(rc)))
+            }
+            Value::Bool(b) => {
+                Ok(NativeCallResult::Return(Value::string(if *b {
+                    "true"
+                } else {
+                    "false"
+                })))
+            }
+            Value::String(s) => Ok(NativeCallResult::Return(Value::String(s.clone()))),
+            other => Ok(NativeCallResult::Return(Value::string(format!("{other}")))),
+        }
     }))
 }
 

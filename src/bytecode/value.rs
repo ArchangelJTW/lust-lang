@@ -2289,31 +2289,76 @@ pub unsafe extern "C" fn jit_concat_safe(
             return 0;
         }
 
-        let left = &*left_value_ptr;
-        let right = &*right_value_ptr;
-        let (left_str, right_str) = if !vm_ptr.is_null() {
-            let vm = &mut *vm_ptr;
-            let left_copy = left.clone();
-            let right_copy = right.clone();
-            let left_str = match vm.value_to_string_for_concat(&left_copy) {
-                Ok(rc) => rc,
-                Err(_) => return 0,
-            };
-            let right_str = match vm.value_to_string_for_concat(&right_copy) {
-                Ok(rc) => rc,
-                Err(_) => return 0,
-            };
-            (left_str, right_str)
+        let mut vm = if !vm_ptr.is_null() {
+            Some(&mut *vm_ptr)
         } else {
-            (Rc::new(left.to_string()), Rc::new(right.to_string()))
+            None
         };
-        let cap = left_str.len().saturating_add(right_str.len());
-        if !vm_ptr.is_null() {
-            let vm = &mut *vm_ptr;
-            if !vm.try_charge_memory_bytes(cap) {
+
+        let right = &*right_value_ptr;
+        let right_str = match right {
+            Value::String(s) => s.clone(),
+            _ => {
+                if let Some(vm) = vm.as_deref_mut() {
+                    let right_copy = right.clone();
+                    match vm.value_to_string_for_concat(&right_copy) {
+                        Ok(rc) => rc,
+                        Err(_) => return 0,
+                    }
+                } else {
+                    Rc::new(right.to_string())
+                }
+            }
+        };
+
+        let right_len = right_str.len();
+
+        // High-performance fast path: in-place append when out == left_value_ptr
+        // and left has a unique reference to its buffer (Rc::get_mut).
+        if left_value_ptr == (out as *const Value) {
+            let left_mut = &mut *out;
+            if let Value::String(rc_str) = left_mut {
+                if let Some(s_mut) = Rc::get_mut(rc_str) {
+                    if let Some(vm) = vm.as_deref_mut() {
+                        if !vm.try_charge_memory_bytes(right_len) {
+                            return 0;
+                        }
+                    }
+                    s_mut.push_str(right_str.as_ref());
+                    return 1;
+                }
+            }
+        }
+
+        let left = &*left_value_ptr;
+        let left_str = match left {
+            Value::String(s) => s.clone(),
+            _ => {
+                if let Some(vm) = vm.as_deref_mut() {
+                    let left_copy = left.clone();
+                    match vm.value_to_string_for_concat(&left_copy) {
+                        Ok(rc) => rc,
+                        Err(_) => return 0,
+                    }
+                } else {
+                    Rc::new(left.to_string())
+                }
+            }
+        };
+
+        let total_len = left_str.len().saturating_add(right_len);
+        if let Some(vm) = vm.as_deref_mut() {
+            if !vm.try_charge_memory_bytes(total_len) {
                 return 0;
             }
         }
+
+        let cap = if left_value_ptr == (out as *const Value) {
+            total_len.max(left_str.len() * 2)
+        } else {
+            total_len
+        };
+
         let mut combined = String::with_capacity(cap);
         combined.push_str(left_str.as_ref());
         combined.push_str(right_str.as_ref());

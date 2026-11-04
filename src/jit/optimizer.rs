@@ -18,6 +18,7 @@ impl TraceOptimizer {
         jit::log(|| "🔧 JIT Optimizer: Starting optimization...".to_string());
         let original_ops = trace.ops.len();
         self.inline_leaf_functions(trace);
+        self.forward_struct_fields(trace);
         self.fuse_try_get_index_patterns(trace);
         self.fuse_try_cast_patterns(trace);
         self.eliminate_dead_stores_before_select(trace);
@@ -25,6 +26,7 @@ impl TraceOptimizer {
         self.optimize_constant_modulo(trace);
         self.hoist_constants(trace);
         self.unroll_loop(trace, crate::jit::UNROLL_FACTOR);
+        self.forward_struct_fields(trace);
         self.hoist_entry_guards(trace);
         self.eliminate_redundant_type_guards(trace);
         self.coalesce_registers(trace);
@@ -37,6 +39,52 @@ impl TraceOptimizer {
             )
         });
         self.hoisted_constants.clone()
+    }
+
+    fn forward_struct_fields(&mut self, trace: &mut Trace) {
+        let mut last_stores: HashMap<(Register, String), Register> = HashMap::new();
+        for op in &mut trace.ops {
+            match op {
+                TraceOp::SetField {
+                    object,
+                    field_name,
+                    value,
+                    ..
+                } => {
+                    last_stores.retain(|_, val| *val != *value);
+                    last_stores.insert((*object, field_name.clone()), *value);
+                }
+                TraceOp::GetField {
+                    dest,
+                    object,
+                    field_name,
+                    ..
+                } => {
+                    let d = *dest;
+                    let o = *object;
+                    let fn_name = field_name.clone();
+                    if let Some(&val_reg) = last_stores.get(&(o, fn_name)) {
+                        *op = TraceOp::Move {
+                            dest: d,
+                            src: val_reg,
+                        };
+                    }
+                    last_stores.retain(|(obj, _), val| *obj != d && *val != d);
+                }
+                TraceOp::CallNative { .. }
+                | TraceOp::CallFunction { .. }
+                | TraceOp::CallMethod { .. }
+                | TraceOp::InlineCall { .. }
+                | TraceOp::GuardLoopContinue { .. } => {
+                    last_stores.clear();
+                }
+                _ => {
+                    if let Some(dest) = Self::dest_of(op) {
+                        last_stores.retain(|(obj, _), val| *obj != dest && *val != dest);
+                    }
+                }
+            }
+        }
     }
 
     /// Separate `At` markers from the ops they precede, so a pass can match
@@ -932,6 +980,8 @@ impl TraceOptimizer {
                 | TraceOp::Not { .. }
                 | TraceOp::Select { .. }
                 | TraceOp::SelectBitZero { .. }
+                | TraceOp::GetField { .. }
+                | TraceOp::SetField { .. }
                 | TraceOp::Guard { .. }
                 | TraceOp::At { .. } => {}
                 _ => return false,
@@ -1148,6 +1198,36 @@ impl TraceOptimizer {
                 register: r(register),
                 expected_type: *expected_type,
             },
+            TraceOp::GetField {
+                dest,
+                object,
+                field_name,
+                field_index,
+                value_type,
+                is_weak,
+            } => TraceOp::GetField {
+                dest: r(dest),
+                object: r(object),
+                field_name: field_name.clone(),
+                field_index: *field_index,
+                value_type: *value_type,
+                is_weak: *is_weak,
+            },
+            TraceOp::SetField {
+                object,
+                field_name,
+                value,
+                field_index,
+                value_type,
+                is_weak,
+            } => TraceOp::SetField {
+                object: r(object),
+                field_name: field_name.clone(),
+                value: r(value),
+                field_index: *field_index,
+                value_type: *value_type,
+                is_weak: *is_weak,
+            },
             TraceOp::At { ip } => TraceOp::At { ip: *ip },
             other => other.clone(),
         }
@@ -1197,7 +1277,8 @@ impl TraceOptimizer {
                     let mut reg_map: HashMap<Register, Register> = HashMap::new();
                     let mut prelude_moves = Vec::new();
 
-                    for i in 0..inline_trace.arg_count {
+                    let num_args = inline_trace.arg_registers.len() as u8;
+                    for i in 0..num_args {
                         let writes_param = inline_trace.body.iter().any(|callee_op| {
                             Self::dest_of(callee_op) == Some(i)
                                 || Self::other_writes(callee_op).contains(&i)
@@ -1217,10 +1298,10 @@ impl TraceOptimizer {
                     }
 
                     let ret_reg = inline_trace.return_register.unwrap();
-                    let can_direct_return = ret_reg >= inline_trace.arg_count
+                    let can_direct_return = ret_reg >= num_args
                         && !inline_trace.arg_registers.contains(&inline_dest);
 
-                    for r in inline_trace.arg_count..inline_trace.register_count {
+                    for r in num_args..inline_trace.register_count {
                         if r == ret_reg && can_direct_return {
                             reg_map.insert(r, inline_dest);
                         } else {

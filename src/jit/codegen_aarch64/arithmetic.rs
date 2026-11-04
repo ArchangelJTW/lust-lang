@@ -446,4 +446,32 @@ impl JitCompiler {
         );
         Ok(())
     }
+
+    pub(super) fn compile_mod_imm(&mut self, dest: u8, src: u8, divisor: i64) -> Result<()> {
+        if divisor == 0 {
+            dynasm!(self.ops ; .arch aarch64 ; b >fail);
+            return Ok(());
+        }
+        if divisor == 1 || divisor == -1 {
+            let d = self.direct_dest_x(dest).unwrap_or(0);
+            dynasm!(self.ops ; .arch aarch64 ; mov X(d), xzr);
+            if d == 0 {
+                self.store_from_x0(dest, ValueTag::Int.as_u8());
+            }
+            return Ok(());
+        }
+
+        let src_reg = self.operand_x(src, 10);
+        let d = self.direct_dest_x(dest).unwrap_or(0);
+        self.emit_mov_imm64(11, divisor as u64);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; sdiv x12, X(src_reg), x11
+            ; msub X(d), x12, x11, X(src_reg)
+        );
+        if d == 0 {
+            self.store_from_x0(dest, ValueTag::Int.as_u8());
+        }
+        Ok(())
+    }
 }

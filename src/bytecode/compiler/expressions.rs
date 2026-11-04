@@ -689,6 +689,9 @@ impl Compiler {
     }
 
     fn compile_and_expr(&mut self, span: Span, left: &Expr, right: &Expr) -> Result<Register> {
+        // The result must not alias a local used as the left operand: writing
+        // the selected value back into that register mutates the local itself.
+        let result_reg = self.allocate_register();
         let left_bindings = self.extract_all_pattern_bindings(left);
         let right_bindings = self.extract_all_pattern_bindings(right);
 
@@ -708,6 +711,7 @@ impl Compiler {
         } else {
             self.compile_expr(left)?
         };
+        self.emit(Instruction::Move(result_reg, left_reg), 0);
         let skip_right = self.emit(Instruction::JumpIfNot(left_reg, 0), 0);
         let wrap_option = self.should_wrap_option(span);
         let option_indices = if wrap_option {
@@ -772,13 +776,14 @@ impl Compiler {
 
         if let Some((option_idx, some_idx, _)) = option_indices {
             self.emit(
-                Instruction::NewEnumVariant(left_reg, option_idx, some_idx, right_reg, 1),
+                Instruction::NewEnumVariant(result_reg, option_idx, some_idx, right_reg, 1),
                 0,
             );
         } else {
-            self.emit(Instruction::Move(left_reg, right_reg), 0);
+            self.emit(Instruction::Move(result_reg, right_reg), 0);
         }
         self.free_register(right_reg);
+        self.free_register(left_reg);
 
         let jump_to_end = if wrap_option {
             Some(self.emit(Instruction::Jump(0), 0))
@@ -790,18 +795,24 @@ impl Compiler {
         self.current_chunk_mut().patch_jump(skip_right, end_idx);
 
         if let Some((option_idx, _, none_idx)) = option_indices {
-            self.emit(Instruction::NewEnumUnit(left_reg, option_idx, none_idx), 0);
+            self.emit(
+                Instruction::NewEnumUnit(result_reg, option_idx, none_idx),
+                0,
+            );
         }
 
         if let Some(jump_idx) = jump_to_end {
             let exit_idx = self.current_chunk().instructions.len();
             self.current_chunk_mut().patch_jump(jump_idx, exit_idx);
         }
-        Ok(left_reg)
+        Ok(result_reg)
     }
 
     fn compile_or_expr(&mut self, left: &Expr, right: &Expr) -> Result<Register> {
+        // Preserve a local left operand when the short-circuit branch wins.
+        let result_reg = self.allocate_register();
         let left_reg = self.compile_expr(left)?;
+        self.emit(Instruction::Move(result_reg, left_reg), 0);
         let skip_right = self.emit(Instruction::JumpIf(left_reg, 0), 0);
 
         let saved_next = self.next_register;
@@ -810,12 +821,13 @@ impl Compiler {
             self.next_register = saved_next;
         }
 
-        self.emit(Instruction::Move(left_reg, right_reg), 0);
+        self.emit(Instruction::Move(result_reg, right_reg), 0);
         self.free_register(right_reg);
+        self.free_register(left_reg);
 
         let end_idx = self.current_chunk().instructions.len();
         self.current_chunk_mut().patch_jump(skip_right, end_idx);
-        Ok(left_reg)
+        Ok(result_reg)
     }
 
     pub(super) fn compile_binary_op(

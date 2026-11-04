@@ -145,6 +145,80 @@ impl JitCompiler {
         Ok(())
     }
 
+    pub(super) fn compile_select(
+        &mut self,
+        dest: u8,
+        cond: u8,
+        on_true: &Value,
+        on_false: &Value,
+    ) -> Result<()> {
+        let cond_offset = (cond as i32) * (mem::size_of::<Value>() as i32);
+        let bool_tag = ValueTag::Bool.as_u8() as i8;
+        let scalar_max_tag = ValueTag::Float.as_u8() as i8;
+        unsafe extern "C" {
+            fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
+        }
+        if self.hot_rax_in == Some(cond)
+            && self.scalar_registers.get(&cond) == Some(&ValueType::Bool)
+        {
+            dynasm!(self.ops ; .arch x64 ; test al, al);
+        } else if self.scalar_registers.get(&cond) == Some(&ValueType::Bool) {
+            dynasm!(self.ops ; .arch x64 ; cmp BYTE [r12 + cond_offset + 8], 0);
+        } else {
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov al, BYTE [r12 + cond_offset]
+                ; cmp al, scalar_max_tag
+                ; ja >generic_truthiness
+                ; cmp al, bool_tag
+                ; je >load_bool
+                ; test al, al
+                ; setnz al
+                ; jmp >truthiness_ready
+                ; load_bool:
+                ; mov al, BYTE [r12 + cond_offset + 8]
+                ; jmp >truthiness_ready
+                ; generic_truthiness:
+                ; lea rdi, [r12 + cond_offset]
+                ; mov rax, QWORD jit_value_is_truthy as _
+                ; call rax
+                ; truthiness_ready:
+                ; test al, al
+            );
+        }
+
+        match (on_true, on_false) {
+            (Value::Int(t), Value::Int(f)) => {
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; mov rdx, QWORD *f as _
+                    ; mov rcx, QWORD *t as _
+                    ; cmovnz rdx, rcx
+                    ; mov rax, rdx
+                );
+                self.store_from_rax(dest, 2);
+            }
+            (Value::Bool(t), Value::Bool(f)) => {
+                let t_val = *t as i64;
+                let f_val = *f as i64;
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; mov rdx, QWORD f_val as _
+                    ; mov rcx, QWORD t_val as _
+                    ; cmovnz rdx, rcx
+                    ; mov rax, rdx
+                );
+                self.store_from_rax(dest, 1);
+            }
+            _ => {
+                return Err(crate::LustError::RuntimeError {
+                    message: "Select with unsupported or mismatched types".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn compile_concat(&mut self, dest: u8, lhs: u8, rhs: u8) -> Result<()> {
         let lhs_offset = (lhs as i32) * (mem::size_of::<Value>() as i32);
         let rhs_offset = (rhs as i32) * (mem::size_of::<Value>() as i32);

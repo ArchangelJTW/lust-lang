@@ -120,11 +120,7 @@ fn create_type_fn() -> Value {
             Value::Iterator(_) => "iterator",
             Value::Task(_) => "task",
         };
-        Ok(NativeCallResult::Return(Value::enum_variant(
-            "LuaValue",
-            "String",
-            vec![Value::string(type_name)],
-        )))
+        Ok(NativeCallResult::Return(Value::string(type_name)))
     }))
 }
 

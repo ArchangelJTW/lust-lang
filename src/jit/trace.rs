@@ -1036,20 +1036,9 @@ impl TraceRecorder {
             }
         }
 
-        // Pattern 2: if-then (no else block)
-        let then_slice = &instructions[this_ip + 1..target_ip];
-        let then_eff =
-            try_eval_pure_branch(then_slice, &function.chunk, registers, cond, target_ip)?;
-        let dest = then_eff.dest;
-        let prev_val = registers.get(dest as usize)?.clone();
-        let (on_true, on_false) = if jump_if_not {
-            (then_eff.value, prev_val)
-        } else {
-            (prev_val, then_eff.value)
-        };
-        if same_scalar_type(&on_true, &on_false) {
-            return Some((dest, on_true, on_false, target_ip));
-        }
+        // Pattern 2: if-then (no else block) - disabled for safety:
+        // TraceOp::Select writes a constant on_false into dest, which clobbers
+        // dynamic loop variables or accumulators (e.g. c = c + 1).
 
         None
     }
@@ -1064,7 +1053,7 @@ struct BranchEffect {
 fn try_eval_pure_branch(
     slice: &[Instruction],
     chunk: &crate::bytecode::Chunk,
-    registers: &[Value],
+    _registers: &[Value],
     cond: Register,
     target_ip: usize,
 ) -> Option<BranchEffect> {
@@ -1085,10 +1074,7 @@ fn try_eval_pure_branch(
 
     let get_reg_val =
         |reg: Register, temp_regs: &hashbrown::HashMap<Register, Value>| -> Option<Value> {
-            temp_regs
-                .get(&reg)
-                .cloned()
-                .or_else(|| registers.get(reg as usize).cloned())
+            temp_regs.get(&reg).cloned()
         };
 
     for &inst in body {

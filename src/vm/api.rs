@@ -1296,6 +1296,35 @@ end
     }
 
     #[test]
+    fn regression_while_loop_conditional_accumulator() {
+        let source = r#"
+function count(): int
+    local c: int = 0
+    local i: int = 0
+    while i < 1000 do
+        if i % 2 == 0 then
+            c = c + 1
+        end
+        i = i + 1
+    end
+    return c
+end
+"#;
+        for jit in [false, true] {
+            let mut config = LustConfig::default();
+            config.set_jit_enabled(jit);
+            let mut program = crate::EmbeddedProgram::builder()
+                .with_config(config)
+                .module("main", source)
+                .entry_module("main")
+                .compile()
+                .unwrap();
+            let result = program.call_raw("main.count", vec![]).unwrap();
+            assert_eq!(result, Value::Int(500), "jit: {jit}");
+        }
+    }
+
+    #[test]
     fn standalone_vm_can_construct_index_errors() {
         let mut vm = VM::new();
         let array = Value::array(vec![Value::Int(1)]);

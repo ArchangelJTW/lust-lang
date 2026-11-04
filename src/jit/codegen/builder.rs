@@ -571,6 +571,37 @@ impl JitCompiler {
                     self.compile_load_const(*dest, value)?;
                 }
 
+                TraceOp::Select {
+                    dest,
+                    cond,
+                    on_true,
+                    on_false,
+                } => {
+                    self.compile_select(*dest, *cond, on_true, on_false)?;
+                }
+
+                TraceOp::SelectBitZero {
+                    dest,
+                    src,
+                    mask: _,
+                    on_zero,
+                    on_nonzero,
+                } => {
+                    self.compile_select(*dest, *src, on_zero, on_nonzero)?;
+                }
+
+                TraceOp::ModImm { dest, src, divisor } => {
+                    let lhs_offset = reg_offset(*src);
+                    let div = *divisor;
+                    dynasm!(self.ops
+                        ; .arch x64
+                        ; mov rax, [r12 + lhs_offset + 8]
+                        ; mov rbx, QWORD div
+                    );
+                    self.emit_int_mod();
+                    self.store_from_rax(*dest, 2);
+                }
+
                 TraceOp::Move { dest, src } => {
                     self.compile_move(*dest, *src)?;
                 }
@@ -1662,6 +1693,9 @@ impl JitCompiler {
             TraceOp::GuardLoopContinue {
                 condition_register, ..
             } => *condition_register == register,
+            TraceOp::Select { cond, .. } => *cond == register,
+            TraceOp::SelectBitZero { src, .. } => *src == register,
+            TraceOp::ModImm { src, .. } => *src == register,
             TraceOp::Return { value } => *value == Some(register),
             TraceOp::Unbox { source_reg, .. } => *source_reg == register,
             TraceOp::SpecializedOp { operands, .. } => operands.iter().any(|operand| {
@@ -1733,6 +1767,9 @@ impl JitCompiler {
             | TraceOp::TypeIs { dest, .. }
             | TraceOp::TryCast { dest, .. }
             | TraceOp::GetEnumValue { dest, .. }
+            | TraceOp::Select { dest, .. }
+            | TraceOp::SelectBitZero { dest, .. }
+            | TraceOp::ModImm { dest, .. }
             | TraceOp::BorrowField { dest, .. }
             | TraceOp::BorrowEnumValue { dest, .. } => *dest == register,
             _ => false,
@@ -1920,6 +1957,27 @@ impl JitCompiler {
             TraceOp::CallDirect {
                 dest, result_type, ..
             } => set(&mut self.scalar_registers, *dest, *result_type),
+            TraceOp::Select { dest, on_true, .. } => {
+                let ty = match on_true {
+                    Value::Bool(_) => Some(ValueType::Bool),
+                    Value::Int(_) => Some(ValueType::Int),
+                    Value::Float(_) => Some(ValueType::Float),
+                    _ => None,
+                };
+                set(&mut self.scalar_registers, *dest, ty);
+            }
+            TraceOp::SelectBitZero { dest, on_zero, .. } => {
+                let ty = match on_zero {
+                    Value::Bool(_) => Some(ValueType::Bool),
+                    Value::Int(_) => Some(ValueType::Int),
+                    Value::Float(_) => Some(ValueType::Float),
+                    _ => None,
+                };
+                set(&mut self.scalar_registers, *dest, ty);
+            }
+            TraceOp::ModImm { dest, .. } => {
+                set(&mut self.scalar_registers, *dest, Some(ValueType::Int));
+            }
         }
     }
 

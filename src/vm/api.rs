@@ -1,3 +1,4 @@
+use super::execution::ArgCheck;
 use super::*;
 use crate::ast::Type;
 use crate::bytecode::{LustMap, ValueKey, native_fn};
@@ -93,6 +94,22 @@ pub(crate) fn format_doc_comment(doc: &str, indent: &str) -> String {
     out
 }
 
+#[cfg(feature = "std")]
+#[derive(Clone)]
+struct VmBuiltinsCache {
+    trait_impls: HashMap<(String, String), bool>,
+    struct_metadata: HashMap<String, super::RuntimeStructInfo>,
+    natives: HashMap<String, Value>,
+    globals: HashMap<String, Value>,
+    intrinsics: HashMap<usize, crate::jit::Intrinsic>,
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+    static BUILTINS_CACHE: core::cell::RefCell<HashMap<u64, VmBuiltinsCache>> =
+        core::cell::RefCell::new(HashMap::new());
+}
+
 impl VM {
     pub fn new() -> Self {
         Self::with_config(&LustConfig::default())
@@ -103,6 +120,8 @@ impl VM {
             current_vm_lookup: super::current_vm_ptr,
             jit: JitState::new(),
             budgets: BudgetState::default(),
+            #[cfg(feature = "std")]
+            random_rng: None,
             functions: Vec::new(),
             call_meta: Vec::new(),
             natives: HashMap::new(),
@@ -135,10 +154,37 @@ impl VM {
             export_prefix_stack: Vec::new(),
             #[cfg(feature = "std")]
             exported_type_stubs: Vec::new(),
+            last_dispatched_target: None,
+            root_frame: Some(CallFrame::new(0, None, 255)),
             active_native_depth: 0,
             active_jit_depth: 0,
         };
         vm.jit.enabled = vm.jit.enabled && config.jit_enabled();
+
+        #[cfg(feature = "std")]
+        let cache_key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            config.jit_enabled().hash(&mut hasher);
+            for m in config.enabled_modules() {
+                m.hash(&mut hasher);
+            }
+            hasher.finish()
+        };
+
+        #[cfg(feature = "std")]
+        let cached = BUILTINS_CACHE.with(|c| c.borrow().get(&cache_key).cloned());
+
+        #[cfg(feature = "std")]
+        if let Some(cached) = cached {
+            vm.trait_impls = cached.trait_impls;
+            vm.struct_metadata = cached.struct_metadata;
+            vm.natives = cached.natives;
+            vm.globals = cached.globals;
+            vm.jit.intrinsics = cached.intrinsics;
+            return vm;
+        }
+
         vm.trait_impls
             .insert(("int".to_string(), "ToString".to_string()), true);
         vm.trait_impls
@@ -154,6 +200,20 @@ impl VM {
             vm.register_native(name, func);
         }
         vm.register_jit_intrinsics();
+
+        #[cfg(feature = "std")]
+        BUILTINS_CACHE.with(|c| {
+            c.borrow_mut().insert(
+                cache_key,
+                VmBuiltinsCache {
+                    trait_impls: vm.trait_impls.clone(),
+                    struct_metadata: vm.struct_metadata.clone(),
+                    natives: vm.natives.clone(),
+                    globals: vm.globals.clone(),
+                    intrinsics: vm.jit.intrinsics.clone(),
+                },
+            );
+        });
 
         vm
     }
@@ -645,16 +705,7 @@ impl VM {
         self.maybe_collect_cycles();
     }
 
-    pub fn call(&mut self, function_name: &str, args: Vec<Value>) -> Result<Value> {
-        let func_idx = self
-            .functions
-            .iter()
-            .position(|f| f.name == function_name)
-            .ok_or_else(|| LustError::RuntimeError {
-                message: format!("Function not found: {}", function_name),
-            })?;
-        let frame = self.make_call_frame(func_idx, None, args, Vec::new())?;
-
+    fn execute_call_frame(&mut self, frame: Box<CallFrame>) -> Result<Value> {
         let stack_depth_before = self.call_stack.len();
         let saved_pending_return_value = self.pending_return_value.clone();
         let saved_pending_return_dest = self.pending_return_dest;
@@ -665,7 +716,29 @@ impl VM {
         let saved_call_until_depth = self.call_until_depth;
         self.skip_next_trace_record = false;
         self.call_until_depth = Some(stack_depth_before);
+        let func_idx = frame.function_idx;
         self.call_stack.push(frame);
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let result = if self.jit.enabled && saved_trace_recorder.is_none() {
+            match self.run_compiled_function(func_idx) {
+                Ok(Some(v)) => Ok(v),
+                Ok(None) => {
+                    if let Some(target_depth) = self.call_until_depth
+                        && self.call_stack.len() == target_depth
+                        && let Some(return_value) = self.pending_return_value.take()
+                    {
+                        self.call_until_depth = None;
+                        Ok(return_value)
+                    } else {
+                        self.run()
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            self.run()
+        };
+        #[cfg(not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))))]
         let result = self.run();
         if self.trace_recorder.is_some() {
             self.abandon_trace_recording();
@@ -685,6 +758,172 @@ impl VM {
                 Err(annotated)
             }
         }
+    }
+
+    fn call_function_index(&mut self, func_idx: usize, args: Vec<Value>) -> Result<Value> {
+        let frame = self.make_call_frame(func_idx, None, args, Vec::new())?;
+        self.execute_call_frame(frame)
+    }
+
+    pub fn call(&mut self, function_name: &str, args: Vec<Value>) -> Result<Value> {
+        let func_idx = self
+            .functions
+            .iter()
+            .position(|f| f.name == function_name)
+            .ok_or_else(|| LustError::RuntimeError {
+                message: format!("Function not found: {}", function_name),
+            })?;
+        self.call_function_index(func_idx, args)
+    }
+
+    pub(crate) fn functions(&self) -> &[Function] {
+        &self.functions
+    }
+
+    pub(crate) fn last_dispatched_target(&self) -> Option<(usize, String)> {
+        self.last_dispatched_target.clone()
+    }
+
+    pub(crate) fn current_frame_target(&self) -> Option<(usize, &str)> {
+        self.call_stack.last().and_then(|frame| {
+            let idx = frame.function_idx;
+            self.functions.get(idx).map(|f| (idx, f.name.as_str()))
+        })
+    }
+
+    pub(crate) fn call_function_index_slice(
+        &mut self,
+        func_idx: usize,
+        args: &[Value],
+    ) -> Result<Value> {
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if self.call_stack.is_empty() && self.jit.enabled && self.trace_recorder.is_none() {
+            let entry_addr = self.jit.function_entry(func_idx);
+            if entry_addr != 0 {
+                let (param_count, register_count) = (
+                    self.functions[func_idx].param_count as usize,
+                    self.functions[func_idx].register_count,
+                );
+                if args.len() == param_count {
+                    if let Some(mut root_frame) = self.root_frame.take() {
+                        for (i, arg) in args.iter().enumerate() {
+                            root_frame.registers[i] = arg.fast_clone();
+                        }
+                        let registers_ptr = root_frame.registers.as_mut_ptr();
+                        let vm_ptr = self as *mut VM;
+
+                        let marker = 0u8;
+                        let sp = &marker as *const u8 as usize;
+                        let depth_budget = self.max_stack_depth;
+                        let limit = sp.saturating_sub(crate::jit::NATIVE_STACK_RESERVE).max(
+                            sp.saturating_sub(
+                                depth_budget.saturating_mul(crate::jit::MIN_NATIVE_FRAME),
+                            ),
+                        );
+                        let outer_limit =
+                            core::mem::replace(&mut self.jit_cells.stack_limit, limit);
+
+                        self.jit.record_native_entry();
+                        self.pending_jit_error = None;
+                        self.jit_cells.exit_info = usize::MAX;
+
+                        type NativeEntry = unsafe extern "C" fn(
+                            *mut Value,
+                            *mut VM,
+                            *const Function,
+                            *mut (),
+                        ) -> i32;
+                        let entry_fn: NativeEntry = unsafe { core::mem::transmute(entry_addr) };
+                        let result = unsafe {
+                            entry_fn(
+                                registers_ptr,
+                                vm_ptr,
+                                core::ptr::null(),
+                                core::ptr::null_mut(),
+                            )
+                        };
+
+                        self.jit_cells.stack_limit = outer_limit;
+
+                        if (crate::jit::FUNCTION_RETURN_BASE..crate::jit::NATIVE_RETURNED)
+                            .contains(&result)
+                        {
+                            let reg = (result - crate::jit::FUNCTION_RETURN_BASE) as usize;
+                            let return_value = root_frame.registers[reg].fast_clone();
+                            root_frame.reset(0, None, register_count);
+                            self.root_frame = Some(root_frame);
+                            return Ok(return_value);
+                        }
+                        root_frame.reset(0, None, register_count);
+                        self.root_frame = Some(root_frame);
+                    }
+                }
+            }
+        }
+        let frame = self.make_call_frame_slice(func_idx, None, args, ArgCheck::Shallow)?;
+        self.execute_call_frame(frame)
+    }
+
+    pub(crate) fn call_retained_target(
+        &mut self,
+        func_idx: usize,
+        expected_name: &str,
+        args: Vec<Value>,
+    ) -> Result<Value> {
+        let function = self
+            .functions
+            .get(func_idx)
+            .ok_or_else(|| LustError::RuntimeError {
+                message: format!("Function index out of bounds: {}", func_idx),
+            })?;
+        if function.name != expected_name {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Function table staled or mismatched: index {} has name '{}', expected '{}'",
+                    func_idx, function.name, expected_name
+                ),
+            });
+        }
+        if self
+            .last_dispatched_target
+            .as_ref()
+            .map(|(idx, name)| (*idx, name.as_str()))
+            != Some((func_idx, expected_name))
+        {
+            self.last_dispatched_target = Some((func_idx, expected_name.to_string()));
+        }
+        self.call_function_index(func_idx, args)
+    }
+
+    pub(crate) fn call_retained_target_slice(
+        &mut self,
+        func_idx: usize,
+        expected_name: &str,
+        args: &[Value],
+    ) -> Result<Value> {
+        let function = self
+            .functions
+            .get(func_idx)
+            .ok_or_else(|| LustError::RuntimeError {
+                message: format!("Function index out of bounds: {}", func_idx),
+            })?;
+        if function.name != expected_name {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Function table staled or mismatched: index {} has name '{}', expected '{}'",
+                    func_idx, function.name, expected_name
+                ),
+            });
+        }
+        if self
+            .last_dispatched_target
+            .as_ref()
+            .map(|(idx, name)| (*idx, name.as_str()))
+            != Some((func_idx, expected_name))
+        {
+            self.last_dispatched_target = Some((func_idx, expected_name.to_string()));
+        }
+        self.call_function_index_slice(func_idx, args)
     }
 
     pub fn function_value(&self, function_name: &str) -> Option<Value> {
@@ -1499,6 +1738,124 @@ end
             vm.call("succeeding", Vec::new()),
             Ok(Value::Int(7))
         ));
+    }
+
+    #[test]
+    fn vm_call_positive_and_shared_execution_path_integrity() {
+        let mut add_fn = Function::new("add", 2, false);
+        add_fn.set_register_count(3);
+        add_fn.chunk.emit(Instruction::Add(2, 0, 1), 1);
+        add_fn.chunk.emit(Instruction::Return(2), 1);
+
+        let mut vm = VM::new();
+        vm.load_functions(vec![add_fn]);
+
+        let result = vm
+            .call("add", vec![Value::Int(10), Value::Int(32)])
+            .expect("ordinary VM::call must succeed");
+        assert_eq!(result, Value::Int(42));
+    }
+
+    #[test]
+    fn vm_retained_target_and_call_nested_error_cleanup_and_subsequent_call() {
+        let mut child_ok = Function::new("child_ok", 1, false);
+        child_ok.set_register_count(2);
+        let ten = child_ok.chunk.add_constant(Value::Int(10));
+        child_ok.chunk.emit(Instruction::LoadConst(1, ten), 1);
+        child_ok.chunk.emit(Instruction::Add(0, 0, 1), 1);
+        child_ok.chunk.emit(Instruction::Return(0), 1);
+
+        let mut child_fail = Function::new("child_fail", 1, false);
+        child_fail.set_register_count(2);
+        let zero = child_fail.chunk.add_constant(Value::Int(0));
+        child_fail.chunk.emit(Instruction::LoadConst(1, zero), 1);
+        child_fail.chunk.emit(Instruction::Div(0, 0, 1), 1);
+        child_fail.chunk.emit(Instruction::Return(0), 1);
+
+        let mut parent_caller = Function::new("parent_caller", 1, false);
+        parent_caller.set_register_count(4);
+        let child_ok_val = parent_caller.chunk.add_constant(Value::Function(0));
+        parent_caller
+            .chunk
+            .emit(Instruction::LoadConst(1, child_ok_val), 1);
+        parent_caller.chunk.emit(Instruction::Call(1, 0, 1, 2), 1);
+        parent_caller.chunk.emit(Instruction::Return(2), 1);
+
+        let mut parent_failing = Function::new("parent_failing", 1, false);
+        parent_failing.set_register_count(4);
+        let child_fail_val = parent_failing.chunk.add_constant(Value::Function(1));
+        parent_failing
+            .chunk
+            .emit(Instruction::LoadConst(1, child_fail_val), 1);
+        parent_failing.chunk.emit(Instruction::Call(1, 0, 1, 2), 1);
+        parent_failing.chunk.emit(Instruction::Return(2), 1);
+
+        let mut vm = VM::new();
+        vm.load_functions(vec![child_ok, child_fail, parent_caller, parent_failing]);
+
+        // 1. Nested call via VM::call
+        let res = vm
+            .call("parent_caller", vec![Value::Int(5)])
+            .expect("nested call succeeds");
+        assert_eq!(res, Value::Int(15));
+        assert!(vm.call_stack.is_empty(), "stack restored after success");
+
+        // 2. Nested call via call_retained_target
+        let res2 = vm
+            .call_retained_target(2, "parent_caller", vec![Value::Int(20)])
+            .expect("retained-target nested call succeeds");
+        assert_eq!(res2, Value::Int(30));
+        assert!(vm.call_stack.is_empty(), "stack restored after success");
+        assert_eq!(
+            vm.last_dispatched_target(),
+            Some((2, "parent_caller".to_string()))
+        );
+
+        // 3. Stale / mismatched retained target checks
+        let err_oob = vm
+            .call_retained_target(999, "parent_caller", vec![Value::Int(0)])
+            .expect_err("out of bounds must fail");
+        assert!(err_oob.to_string().contains("out of bounds"));
+
+        let err_name = vm
+            .call_retained_target(2, "wrong_name", vec![Value::Int(0)])
+            .expect_err("mismatched name must fail");
+        assert!(err_name.to_string().contains("mismatched"));
+
+        // 4. Runtime error in nested call via call_retained_target
+        let err = vm
+            .call_retained_target(3, "parent_failing", vec![Value::Int(10)])
+            .expect_err("nested division by zero must error");
+        assert!(
+            err.to_string().to_lowercase().contains("division by zero"),
+            "unexpected error message: {}",
+            err
+        );
+
+        // Verify stack/frame state restoration after error
+        assert!(
+            vm.call_stack.is_empty(),
+            "call stack must be completely restored/unwound after error"
+        );
+        assert!(vm.pending_return_value.is_none());
+        assert!(vm.pending_return_dest.is_none());
+        assert!(vm.pending_task_signal.is_none());
+        assert!(vm.last_task_signal.is_none());
+
+        // 5. Subsequent valid call on the same VM after error
+        let res_subsequent = vm
+            .call_retained_target(0, "child_ok", vec![Value::Int(50)])
+            .expect("subsequent call on same VM after error must succeed");
+        assert_eq!(res_subsequent, Value::Int(60));
+        assert_eq!(
+            vm.last_dispatched_target(),
+            Some((0, "child_ok".to_string()))
+        );
+
+        let res_subsequent_call = vm
+            .call("parent_caller", vec![Value::Int(100)])
+            .expect("subsequent public call on same VM after error must succeed");
+        assert_eq!(res_subsequent_call, Value::Int(110));
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

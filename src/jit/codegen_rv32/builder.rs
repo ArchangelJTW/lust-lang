@@ -706,7 +706,10 @@ impl JitCompiler {
                 | TraceOp::SetIndex { .. }
                 | TraceOp::ArrayPush { .. }
                 | TraceOp::BorrowField { .. }
-                | TraceOp::BorrowEnumValue { .. } => {
+                | TraceOp::BorrowEnumValue { .. }
+                | TraceOp::Select { .. }
+                | TraceOp::SelectBitZero { .. }
+                | TraceOp::ModImm { .. } => {
                     return Err(crate::LustError::RuntimeError {
                         message: format!("{op:?} is not supported on riscv32"),
                     });

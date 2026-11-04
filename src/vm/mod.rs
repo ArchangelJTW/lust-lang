@@ -36,6 +36,8 @@ use foldhash::fast::FixedState as DefaultHashBuilder;
 use hashbrown::HashMap;
 mod api;
 mod execution;
+#[cfg(feature = "std")]
+mod rng;
 mod tasks;
 mod tracing;
 // Used by the std-only extern stub writers (`externs`, `packages`).
@@ -204,6 +206,10 @@ pub struct VM {
     /// the interned names: constructing one is a count bump.
     pub(crate) unit_enums: HashMap<(usize, usize), Rc<crate::bytecode::EnumObject>>,
     pub(super) budgets: BudgetState,
+    /// Per-VM random stream. It is lazily initialized from the host entropy
+    /// source and can be made deterministic through `set_random_seed`.
+    #[cfg(feature = "std")]
+    random_rng: Option<rng::PortableRng>,
     pub(super) functions: Vec<Function>,
     /// Per-function facts the call path needs, indexed like `functions`
     /// (see `CallMeta`).
@@ -251,6 +257,8 @@ pub struct VM {
     pub(super) export_prefix_stack: Vec<String>,
     #[cfg(feature = "std")]
     pub(super) exported_type_stubs: Vec<ModuleStub>,
+    pub(super) last_dispatched_target: Option<(usize, String)>,
+    pub(super) root_frame: Option<Box<CallFrame>>,
     pub(super) active_native_depth: usize,
     pub(super) active_jit_depth: usize,
 }
@@ -451,7 +459,7 @@ impl CallFrame {
             function_idx,
             ip: 0,
             #[cfg(feature = "std")]
-            registers: core::array::from_fn(|_| Value::Nil),
+            registers: [const { Value::Nil }; 256],
             #[cfg(not(feature = "std"))]
             registers: alloc::vec![Value::Nil; register_count as usize],
             base_register: 0,

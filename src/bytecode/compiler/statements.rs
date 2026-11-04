@@ -536,7 +536,22 @@ impl Compiler {
         iterator: &Expr,
         body: &[Stmt],
     ) -> Result<()> {
+        // `array.iter(...)` evaluates to an Iterator, so it must use the
+        // generic `Iterator::next()` loop below rather than the indexed array
+        // fast path. Preserve the existing receiver fast path for method-call
+        // iterators and all other expressions.
+        let is_array_iter_call = matches!(
+            &iterator.kind,
+            crate::ast::ExprKind::Call { callee, .. }
+                if matches!(
+                    &callee.kind,
+                    crate::ast::ExprKind::FieldAccess { object, field }
+                        if field == "iter"
+                            && matches!(&object.kind, crate::ast::ExprKind::Identifier(name) if name == "array")
+                )
+        );
         let array_receiver_expr: Option<&Expr> = match &iterator.kind {
+            _ if is_array_iter_call => None,
             crate::ast::ExprKind::MethodCall {
                 receiver, method, ..
             } if method == "iter" => Some(receiver),

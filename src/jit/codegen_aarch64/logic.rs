@@ -152,4 +152,208 @@ impl JitCompiler {
         self.emit_fail_if_w0_zero();
         Ok(())
     }
+
+    fn emit_eval_truthiness(&mut self, cond: u8) {
+        if let Some(pin) = self.active_pin(cond) {
+            match pin.ty {
+                ValueType::Bool => {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; uxtb w0, W(pin.reg)
+                    );
+                }
+                _ => {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; movz w0, 1
+                    );
+                }
+            }
+            return;
+        }
+        let bool_tag = ValueTag::Bool.as_u8() as u32;
+        let scalar_max_tag = ValueTag::Float.as_u8() as u32;
+        unsafe extern "C" {
+            fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
+        }
+        if self.hot_x0_in == Some(cond)
+            && self.scalar_registers.get(&cond) == Some(&ValueType::Bool)
+        {
+            // Already in w0 as 0 or 1!
+        } else if self.scalar_registers.get(&cond) == Some(&ValueType::Bool) {
+            self.load_bool_payload(0, cond);
+        } else {
+            self.load_tag(0, cond);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #scalar_max_tag
+                ; b.hi >generic_truthiness
+                ; cmp w0, #bool_tag
+                ; b.eq >load_bool
+                ; cmp w0, 0
+                ; cset w0, ne
+                ; b >truthiness_ready
+                ; load_bool:
+            );
+            self.load_bool_payload(0, cond);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; b >truthiness_ready
+                ; generic_truthiness:
+            );
+            self.emit_reg_addr(0, cond);
+            self.emit_call(jit_value_is_truthy as *const ());
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; and w0, w0, 0xff
+                ; truthiness_ready:
+            );
+        }
+    }
+
+    pub(super) fn compile_select(
+        &mut self,
+        dest: u8,
+        cond: u8,
+        on_true: &Value,
+        on_false: &Value,
+    ) -> Result<()> {
+        self.emit_eval_truthiness(cond);
+        match (on_true, on_false) {
+            (Value::Int(t), Value::Int(f)) => {
+                if self.cached_select_imms != Some((*t, *f)) {
+                    self.emit_mov_imm64(14, *t as u64);
+                    self.emit_mov_imm64(15, *f as u64);
+                    self.cached_select_imms = Some((*t, *f));
+                }
+                match self.direct_dest_x(dest) {
+                    Some(d) => {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; cmp w0, #0
+                            ; csel X(d), x14, x15, ne
+                        );
+                    }
+                    None => {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; cmp w0, #0
+                            ; csel x0, x14, x15, ne
+                        );
+                        self.store_from_x0(dest, ValueTag::Int.as_u8());
+                    }
+                }
+            }
+            (Value::Bool(t), Value::Bool(f)) => {
+                let t_val = u32::from(*t);
+                let f_val = u32::from(*f);
+                match self.direct_dest_x(dest) {
+                    Some(d) => {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; movz x9, #t_val
+                            ; movz x10, #f_val
+                            ; cmp w0, #0
+                            ; csel X(d), x9, x10, ne
+                        );
+                    }
+                    None => {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; movz x9, #t_val
+                            ; movz x10, #f_val
+                            ; cmp w0, #0
+                            ; csel x0, x9, x10, ne
+                        );
+                        self.store_from_x0(dest, ValueTag::Bool.as_u8());
+                    }
+                }
+            }
+            (Value::Float(t), Value::Float(f)) => {
+                self.emit_mov_imm64(9, t.to_bits());
+                self.emit_mov_imm64(10, f.to_bits());
+                self.hot_d0_in = None;
+                match self.direct_dest_d(dest) {
+                    Some(d) => {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; fmov d1, x9
+                            ; fmov d2, x10
+                            ; cmp w0, #0
+                            ; fcsel D(d), d1, d2, ne
+                        );
+                    }
+                    None => {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; fmov d1, x9
+                            ; fmov d2, x10
+                            ; cmp w0, #0
+                            ; fcsel d0, d1, d2, ne
+                        );
+                        self.store_d0_as_float(dest);
+                    }
+                }
+            }
+            _ => {
+                return Err(crate::LustError::RuntimeError {
+                    message: "Select with unsupported or mismatched types".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn compile_select_bit_zero(
+        &mut self,
+        dest: u8,
+        src: u8,
+        mask: u64,
+        on_zero: &Value,
+        on_nonzero: &Value,
+    ) -> Result<()> {
+        let src_reg = self.operand_x(src, 11);
+        match (on_zero, on_nonzero) {
+            (Value::Int(t), Value::Int(f)) => {
+                if self.cached_select_imms != Some((*t, *f)) {
+                    self.emit_mov_imm64(14, *t as u64);
+                    self.emit_mov_imm64(15, *f as u64);
+                    self.cached_select_imms = Some((*t, *f));
+                }
+                if mask == 1 {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; ands xzr, X(src_reg), #1
+                    );
+                } else {
+                    self.emit_mov_imm64(12, mask);
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; ands xzr, X(src_reg), x12
+                    );
+                }
+                match self.direct_dest_x(dest) {
+                    Some(d) => {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; csel X(d), x14, x15, eq
+                        );
+                    }
+                    None => {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; csel x0, x14, x15, eq
+                        );
+                        self.store_from_x0(dest, ValueTag::Int.as_u8());
+                    }
+                }
+            }
+            _ => {
+                return Err(crate::LustError::RuntimeError {
+                    message: "SelectBitZero with unsupported types".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
 }

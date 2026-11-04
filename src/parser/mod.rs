@@ -61,9 +61,6 @@ impl Parser {
             );
         }
 
-        // Shrink to actual size to save memory
-        tokens.shrink_to_fit();
-
         Ok(Self {
             tokens,
             current: 0,

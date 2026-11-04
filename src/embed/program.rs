@@ -364,6 +364,15 @@ impl EmbeddedProgram {
         &mut self.vm
     }
 
+    /// Set the script-visible random stream to a deterministic seed.
+    ///
+    /// Programs given the same seed and making the same random calls produce
+    /// the same sequence on supported targets. This is for reproducibility;
+    /// it does not make the stream cryptographically safe.
+    pub fn set_random_seed(&mut self, seed: u64) {
+        self.vm.set_random_seed(seed);
+    }
+
     pub fn jit_stats(&self) -> crate::jit::JitStats {
         self.vm.jit_stats()
     }

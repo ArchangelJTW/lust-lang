@@ -120,6 +120,8 @@ impl VM {
             current_vm_lookup: super::current_vm_ptr,
             jit: JitState::new(),
             budgets: BudgetState::default(),
+            #[cfg(feature = "std")]
+            random_rng: None,
             functions: Vec::new(),
             call_meta: Vec::new(),
             natives: HashMap::new(),

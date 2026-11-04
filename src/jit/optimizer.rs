@@ -1,6 +1,6 @@
 use crate::bytecode::{Register, Value};
 use crate::jit;
-use crate::jit::trace::{Trace, TraceOp};
+use crate::jit::trace::{Trace, TraceOp, ValueType};
 use alloc::{format, string::ToString, vec, vec::Vec};
 use hashbrown::{HashMap, HashSet};
 pub struct TraceOptimizer {
@@ -958,10 +958,44 @@ impl TraceOptimizer {
         {
             return false;
         }
+        let mut struct_objects = alloc::vec::Vec::new();
+        for op in &trace.body {
+            match op {
+                TraceOp::GetField {
+                    object, value_type, ..
+                } => {
+                    if !matches!(
+                        value_type,
+                        Some(ValueType::Int | ValueType::Float | ValueType::Bool)
+                    ) || *object >= trace.arg_count
+                    {
+                        return false;
+                    }
+                    if !struct_objects.contains(object) {
+                        struct_objects.push(*object);
+                    }
+                }
+                TraceOp::SetField {
+                    object, value_type, ..
+                } => {
+                    if !matches!(
+                        value_type,
+                        Some(ValueType::Int | ValueType::Float | ValueType::Bool)
+                    ) || *object >= trace.arg_count
+                    {
+                        return false;
+                    }
+                    if !struct_objects.contains(object) {
+                        struct_objects.push(*object);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         for op in &trace.body {
             match op {
                 TraceOp::LoadConst { .. }
-                | TraceOp::Move { .. }
                 | TraceOp::Add { .. }
                 | TraceOp::Sub { .. }
                 | TraceOp::Mul { .. }
@@ -984,6 +1018,11 @@ impl TraceOptimizer {
                 | TraceOp::SetField { .. }
                 | TraceOp::Guard { .. }
                 | TraceOp::At { .. } => {}
+                TraceOp::Move { src, .. } => {
+                    if struct_objects.contains(src) {
+                        return false;
+                    }
+                }
                 _ => return false,
             }
         }

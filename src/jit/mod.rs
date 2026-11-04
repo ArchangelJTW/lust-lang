@@ -78,7 +78,7 @@ where
 
 pub const HOT_THRESHOLD: u32 = 5;
 /// Calls to a bytecode function before its whole body is compiled.
-pub const FUNCTION_HOT_THRESHOLD: u32 = 30;
+pub const FUNCTION_HOT_THRESHOLD: u32 = 15;
 /// Result of compiled function code entered from the interpreter whose
 /// `Return` reached: `FUNCTION_RETURN_BASE + register` (255 = Nil).
 pub const FUNCTION_RETURN_BASE: i32 = 1 << 20;
@@ -430,6 +430,13 @@ impl JitState {
 
     pub(crate) fn function_entry_table(&self) -> usize {
         self.function_entries.as_ptr() as usize
+    }
+
+    pub(crate) fn function_entry(&self, func_idx: usize) -> usize {
+        self.function_entries
+            .get(func_idx)
+            .map(|e| e.load(core::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Count a call; true when the function should be compiled now.

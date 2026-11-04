@@ -7,17 +7,13 @@ use crate::bytecode::{NativeCallResult, Value, native_fn};
 use crate::config::LustConfig;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::lua_compat::register_lust_function;
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng, make_rng};
 use regex::Regex;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::rc::Rc;
-use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-static RNG: OnceLock<Mutex<StdRng>> = OnceLock::new();
 pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)> {
     let mut stdlib = vec![
         ("print", create_print_fn()),
@@ -120,11 +116,7 @@ fn create_type_fn() -> Value {
             Value::Iterator(_) => "iterator",
             Value::Task(_) => "task",
         };
-        Ok(NativeCallResult::Return(Value::enum_variant(
-            "LuaValue",
-            "String",
-            vec![Value::string(type_name)],
-        )))
+        Ok(NativeCallResult::Return(Value::string(type_name)))
     }))
 }
 
@@ -2295,20 +2287,7 @@ fn create_math_random_fn() -> Value {
             .get(1)
             .map(|v| unwrap_lua_value(v.clone()))
             .filter(|v| !matches!(v, Value::Nil));
-        let value = with_rng_mut(|rng| match (lower.as_ref(), upper.as_ref()) {
-            (None, _) => Value::Float(rng.random::<f64>()),
-            (Some(max), None) => {
-                let hi = coerce_int(max).unwrap_or(1);
-                let upper_bound = if hi < 1 { 1 } else { hi };
-                Value::Int(rng.random_range(1..=upper_bound))
-            }
-            (Some(min), Some(max)) => {
-                let lo = coerce_int(min).unwrap_or(1);
-                let hi = coerce_int(max).unwrap_or(lo);
-                let (start, end) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-                Value::Int(rng.random_range(start..=end))
-            }
-        })?;
+        let value = VM::with_current(|vm| vm.random_value(lower.as_ref(), upper.as_ref()))?;
         Ok(NativeCallResult::Return(value))
     }))
 }
@@ -2320,8 +2299,10 @@ fn create_math_randomseed_fn() -> Value {
             .map(|v| unwrap_lua_value(v.clone()))
             .unwrap_or(Value::Int(0));
         let seed = coerce_int(&seed_val).unwrap_or(0) as u64;
-        let mutex = RNG.get_or_init(|| Mutex::new(make_rng()));
-        *mutex.lock().map_err(|e| e.to_string())? = StdRng::seed_from_u64(seed);
+        VM::with_current(|vm| {
+            vm.set_random_seed(seed);
+            Ok(())
+        })?;
         Ok(NativeCallResult::Return(Value::Nil))
     }))
 }
@@ -2333,17 +2314,6 @@ fn coerce_int(value: &Value) -> Option<LustInt> {
         Value::Bool(b) => Some(if *b { 1 } else { 0 }),
         _ => None,
     }
-}
-
-fn with_rng_mut<F, R>(f: F) -> Result<R, String>
-where
-    F: FnOnce(&mut StdRng) -> R,
-{
-    let mutex = RNG.get_or_init(|| Mutex::new(make_rng()));
-    mutex
-        .lock()
-        .map_err(|e| e.to_string())
-        .map(|mut guard| f(&mut guard))
 }
 
 fn render_format(fmt: &str, args: &[Value]) -> Result<String, String> {

@@ -359,7 +359,7 @@ use lib.math.*
 - `array.remove<T>(arr: Array<T>, index: int): Option<T>`
 - `array.clear<T>(arr: Array<T>): ()`
 - `array.slice<T>(arr: Array<T>, start: int, end: int): Array<T>`
-- `array.concat<T>(arr: Array<T> [, sep: string]): string`
+- `array.concat<T>(arr: Array<T> [, sep: string]): string` — joins the elements' string representations; `sep` defaults to `""`.
 - `array.sort<T>(arr: Array<T> [, comp_fn]): ()`
 - `array.reverse<T>(arr: Array<T>): ()`
 - `array.contains<T>(arr: Array<T>, val: T): bool`

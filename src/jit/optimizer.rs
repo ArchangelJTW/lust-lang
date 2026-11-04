@@ -369,13 +369,19 @@ impl TraceOptimizer {
         use crate::jit::trace::ValueType;
         match op {
             TraceOp::ModImm { .. } => Some(ValueType::Int),
-            TraceOp::Select { on_true, on_false, .. } => match (on_true, on_false) {
+            TraceOp::Select {
+                on_true, on_false, ..
+            } => match (on_true, on_false) {
                 (Value::Int(_), Value::Int(_)) => Some(ValueType::Int),
                 (Value::Float(_), Value::Float(_)) => Some(ValueType::Float),
                 (Value::Bool(_), Value::Bool(_)) => Some(ValueType::Bool),
                 _ => None,
             },
-            TraceOp::SelectBitZero { on_zero, on_nonzero, .. } => match (on_zero, on_nonzero) {
+            TraceOp::SelectBitZero {
+                on_zero,
+                on_nonzero,
+                ..
+            } => match (on_zero, on_nonzero) {
                 (Value::Int(_), Value::Int(_)) => Some(ValueType::Int),
                 (Value::Float(_), Value::Float(_)) => Some(ValueType::Float),
                 (Value::Bool(_), Value::Bool(_)) => Some(ValueType::Bool),
@@ -873,13 +879,19 @@ impl TraceOptimizer {
             TraceOp::GetField { .. } => None,
             TraceOp::NewArray { .. } => Some(ValueType::Array),
             TraceOp::NewStruct { .. } => Some(ValueType::Struct),
-            TraceOp::Select { on_true, on_false, .. } => match (on_true, on_false) {
+            TraceOp::Select {
+                on_true, on_false, ..
+            } => match (on_true, on_false) {
                 (Value::Int(_), Value::Int(_)) => Some(ValueType::Int),
                 (Value::Float(_), Value::Float(_)) => Some(ValueType::Float),
                 (Value::Bool(_), Value::Bool(_)) => Some(ValueType::Bool),
                 _ => None,
             },
-            TraceOp::SelectBitZero { on_zero, on_nonzero, .. } => match (on_zero, on_nonzero) {
+            TraceOp::SelectBitZero {
+                on_zero,
+                on_nonzero,
+                ..
+            } => match (on_zero, on_nonzero) {
                 (Value::Int(_), Value::Int(_)) => Some(ValueType::Int),
                 (Value::Float(_), Value::Float(_)) => Some(ValueType::Float),
                 (Value::Bool(_), Value::Bool(_)) => Some(ValueType::Bool),
@@ -1312,7 +1324,10 @@ impl TraceOptimizer {
                     if matches!(prev, TraceOp::At { .. }) {
                         continue;
                     }
-                    if let TraceOp::LoadConst { dest: load_dest, .. } = prev {
+                    if let TraceOp::LoadConst {
+                        dest: load_dest, ..
+                    } = prev
+                    {
                         if load_dest == dest {
                             to_remove.insert(k);
                             break;
@@ -1342,14 +1357,32 @@ impl TraceOptimizer {
         let mut replacements = hashbrown::HashMap::new();
 
         for (i, op) in trace.ops.iter().enumerate() {
-            if let TraceOp::Select { dest, cond, on_true, on_false } = op {
+            if let TraceOp::Select {
+                dest,
+                cond,
+                on_true,
+                on_false,
+            } = op
+            {
                 // 1. Find the Eq operation defining cond
                 let mut eq_info = None;
                 for k in (0..i).rev() {
                     let prev = &trace.ops[k];
-                    if matches!(prev, TraceOp::At { .. }) { continue; }
-                    if let TraceOp::Eq { dest: eq_d, lhs, rhs, lhs_type, rhs_type } = prev {
-                        if *eq_d == *cond && *lhs_type == ValueType::Int && *rhs_type == ValueType::Int {
+                    if matches!(prev, TraceOp::At { .. }) {
+                        continue;
+                    }
+                    if let TraceOp::Eq {
+                        dest: eq_d,
+                        lhs,
+                        rhs,
+                        lhs_type,
+                        rhs_type,
+                    } = prev
+                    {
+                        if *eq_d == *cond
+                            && *lhs_type == ValueType::Int
+                            && *rhs_type == ValueType::Int
+                        {
                             eq_info = Some((k, *lhs, *rhs));
                             break;
                         }
@@ -1358,20 +1391,33 @@ impl TraceOptimizer {
                         break;
                     }
                 }
-                let Some((eq_idx, eq_lhs, eq_rhs)) = eq_info else { continue };
+                let Some((eq_idx, eq_lhs, eq_rhs)) = eq_info else {
+                    continue;
+                };
 
                 // 2. Check if one of Eq's operands is constant 0, and the other is mod_dest
-                let check_zero = |reg: Register, ops: &[TraceOp], before_idx: usize| -> Option<usize> {
-                    for k in (0..before_idx).rev() {
-                        let prev = &ops[k];
-                        if matches!(prev, TraceOp::At { .. }) { continue; }
-                        if let TraceOp::LoadConst { dest: d, value: Value::Int(0) } = prev {
-                            if *d == reg { return Some(k); }
+                let check_zero =
+                    |reg: Register, ops: &[TraceOp], before_idx: usize| -> Option<usize> {
+                        for k in (0..before_idx).rev() {
+                            let prev = &ops[k];
+                            if matches!(prev, TraceOp::At { .. }) {
+                                continue;
+                            }
+                            if let TraceOp::LoadConst {
+                                dest: d,
+                                value: Value::Int(0),
+                            } = prev
+                            {
+                                if *d == reg {
+                                    return Some(k);
+                                }
+                            }
+                            if Self::dest_of(prev) == Some(reg) {
+                                break;
+                            }
                         }
-                        if Self::dest_of(prev) == Some(reg) { break; }
-                    }
-                    None
-                };
+                        None
+                    };
 
                 let mut zero_reg = None;
                 let mut mod_reg = None;
@@ -1392,33 +1438,59 @@ impl TraceOptimizer {
                 let mut mod_info = None;
                 for k in (0..eq_idx).rev() {
                     let prev = &trace.ops[k];
-                    if matches!(prev, TraceOp::At { .. }) { continue; }
-                    if let TraceOp::Mod { dest: d, lhs: src, rhs: divisor_reg, lhs_type, rhs_type } = prev {
-                        if *d == mod_reg && *lhs_type == ValueType::Int && *rhs_type == ValueType::Int {
+                    if matches!(prev, TraceOp::At { .. }) {
+                        continue;
+                    }
+                    if let TraceOp::Mod {
+                        dest: d,
+                        lhs: src,
+                        rhs: divisor_reg,
+                        lhs_type,
+                        rhs_type,
+                    } = prev
+                    {
+                        if *d == mod_reg
+                            && *lhs_type == ValueType::Int
+                            && *rhs_type == ValueType::Int
+                        {
                             mod_info = Some((k, *src, *divisor_reg));
                             break;
                         }
                     }
-                    if Self::reads_of(prev).contains(&mod_reg) || Self::dest_of(prev) == Some(mod_reg) {
+                    if Self::reads_of(prev).contains(&mod_reg)
+                        || Self::dest_of(prev) == Some(mod_reg)
+                    {
                         break;
                     }
                 }
-                let Some((mod_idx, src, divisor_reg)) = mod_info else { continue };
+                let Some((mod_idx, src, divisor_reg)) = mod_info else {
+                    continue;
+                };
 
                 // 4. Check if divisor_reg is constant 2
                 let mut divisor_idx = None;
                 for k in (0..mod_idx).rev() {
                     let prev = &trace.ops[k];
-                    if matches!(prev, TraceOp::At { .. }) { continue; }
-                    if let TraceOp::LoadConst { dest: d, value: Value::Int(2) } = prev {
+                    if matches!(prev, TraceOp::At { .. }) {
+                        continue;
+                    }
+                    if let TraceOp::LoadConst {
+                        dest: d,
+                        value: Value::Int(2),
+                    } = prev
+                    {
                         if *d == divisor_reg {
                             divisor_idx = Some(k);
                             break;
                         }
                     }
-                    if Self::dest_of(prev) == Some(divisor_reg) { break; }
+                    if Self::dest_of(prev) == Some(divisor_reg) {
+                        break;
+                    }
                 }
-                let Some(divisor_idx) = divisor_idx else { continue };
+                let Some(divisor_idx) = divisor_idx else {
+                    continue;
+                };
 
                 // Check downstream reads of intermediate registers
                 let downstream_reads = |reg: Register, start: usize| -> bool {
@@ -1448,13 +1520,16 @@ impl TraceOptimizer {
                 }
                 to_remove.insert(eq_idx);
 
-                replacements.insert(i, TraceOp::SelectBitZero {
-                    dest: *dest,
-                    src,
-                    mask: 1,
-                    on_zero: on_true.clone(),
-                    on_nonzero: on_false.clone(),
-                });
+                replacements.insert(
+                    i,
+                    TraceOp::SelectBitZero {
+                        dest: *dest,
+                        src,
+                        mask: 1,
+                        on_zero: on_true.clone(),
+                        on_nonzero: on_false.clone(),
+                    },
+                );
             }
         }
 

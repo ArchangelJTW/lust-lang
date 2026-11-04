@@ -61,7 +61,6 @@ impl Parser {
             );
         }
 
-
         Ok(Self {
             tokens,
             current: 0,

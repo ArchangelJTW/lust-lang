@@ -1006,8 +1006,20 @@ impl TraceRecorder {
                     let then_slice = &instructions[this_ip + 1..target_ip.saturating_sub(1)];
                     let else_slice = &instructions[target_ip..else_target];
                     if let (Some(then_eff), Some(else_eff)) = (
-                        try_eval_pure_branch(then_slice, &function.chunk, registers, cond, else_target),
-                        try_eval_pure_branch(else_slice, &function.chunk, registers, cond, else_target),
+                        try_eval_pure_branch(
+                            then_slice,
+                            &function.chunk,
+                            registers,
+                            cond,
+                            else_target,
+                        ),
+                        try_eval_pure_branch(
+                            else_slice,
+                            &function.chunk,
+                            registers,
+                            cond,
+                            else_target,
+                        ),
                     ) {
                         if then_eff.dest == else_eff.dest {
                             let (on_true, on_false) = if jump_if_not {
@@ -1026,7 +1038,8 @@ impl TraceRecorder {
 
         // Pattern 2: if-then (no else block)
         let then_slice = &instructions[this_ip + 1..target_ip];
-        let then_eff = try_eval_pure_branch(then_slice, &function.chunk, registers, cond, target_ip)?;
+        let then_eff =
+            try_eval_pure_branch(then_slice, &function.chunk, registers, cond, target_ip)?;
         let dest = then_eff.dest;
         let prev_val = registers.get(dest as usize)?.clone();
         let (on_true, on_false) = if jump_if_not {
@@ -1070,9 +1083,13 @@ fn try_eval_pure_branch(
     let mut temp_regs: hashbrown::HashMap<Register, Value> = hashbrown::HashMap::new();
     let mut written_regs: Vec<Register> = Vec::new();
 
-    let get_reg_val = |reg: Register, temp_regs: &hashbrown::HashMap<Register, Value>| -> Option<Value> {
-        temp_regs.get(&reg).cloned().or_else(|| registers.get(reg as usize).cloned())
-    };
+    let get_reg_val =
+        |reg: Register, temp_regs: &hashbrown::HashMap<Register, Value>| -> Option<Value> {
+            temp_regs
+                .get(&reg)
+                .cloned()
+                .or_else(|| registers.get(reg as usize).cloned())
+        };
 
     for &inst in body {
         match inst {
@@ -1165,7 +1182,6 @@ fn try_eval_pure_branch(
 }
 
 impl TraceRecorder {
-
     /// The tracked register whose specialized array `register` holds (the
     /// register itself or an alias sharing its `Rc`).
     fn specialized_owner(&self, register: Register, registers: &[Value]) -> Option<Register> {

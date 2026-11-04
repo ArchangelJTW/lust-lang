@@ -543,12 +543,19 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
         }
         TraceOp::Unbox { source_reg, .. } => e.reads.push((*source_reg, None)),
         TraceOp::Rebox { dest_reg, .. } => e.helper_writes.push(*dest_reg),
-        TraceOp::Select { dest, cond, on_true, .. } => {
+        TraceOp::Select {
+            dest,
+            cond,
+            on_true,
+            ..
+        } => {
             let cond_ty = env.get(cond).copied();
             e.reads.push((*cond, cond_ty));
             e.native_writes.push((*dest, const_type(on_true)));
         }
-        TraceOp::SelectBitZero { dest, src, on_zero, .. } => {
+        TraceOp::SelectBitZero {
+            dest, src, on_zero, ..
+        } => {
             let src_ty = env.get(src).copied();
             e.reads.push((*src, src_ty));
             e.native_writes.push((*dest, const_type(on_zero)));

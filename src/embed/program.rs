@@ -1031,7 +1031,10 @@ impl EmbeddedProgram {
         Ok(())
     }
 
-    pub fn get_typed_handle<Args, Ret>(&mut self, function_name: &str) -> Result<TypedHandle<Args, Ret>>
+    pub fn get_typed_handle<Args, Ret>(
+        &mut self,
+        function_name: &str,
+    ) -> Result<TypedHandle<Args, Ret>>
     where
         Args: FunctionArgs,
         Ret: FromLustValue,
@@ -2230,13 +2233,7 @@ fn compile_in_memory(
     config: LustConfig,
     extern_registry: ExternRegistry,
 ) -> Result<EmbeddedProgram> {
-    let bytecode = compile_to_bytecode(
-        base_dir,
-        entry_module,
-        overrides,
-        config,
-        extern_registry,
-    )?;
+    let bytecode = compile_to_bytecode(base_dir, entry_module, overrides, config, extern_registry)?;
     EmbeddedProgram::from_compiled(&bytecode)
 }
 
@@ -2359,7 +2356,9 @@ mod tests {
         let t0 = std::time::Instant::now();
         let mut st = 1i64;
         for i in 0..10_000i64 {
-            st = program.call_typed("main.b11_target", st + i % 10).expect("call_typed");
+            st = program
+                .call_typed("main.b11_target", st + i % 10)
+                .expect("call_typed");
         }
         std::hint::black_box(st);
         let elapsed_typed = t0.elapsed();
@@ -2367,13 +2366,18 @@ mod tests {
         let t1 = std::time::Instant::now();
         let mut st2 = 1i64;
         for i in 0..10_000i64 {
-            st2 = program.call_handle(&handle, st2 + i % 10).expect("call_handle");
+            st2 = program
+                .call_handle(&handle, st2 + i % 10)
+                .expect("call_handle");
         }
         std::hint::black_box(st2);
         let elapsed_handle = t1.elapsed();
 
         println!("call_typed: {} ns/call", elapsed_typed.as_nanos() / 10_000);
-        println!("call_handle: {} ns/call", elapsed_handle.as_nanos() / 10_000);
+        println!(
+            "call_handle: {} ns/call",
+            elapsed_handle.as_nanos() / 10_000
+        );
         println!("JIT stats: {:?}", program.jit_stats());
     }
 

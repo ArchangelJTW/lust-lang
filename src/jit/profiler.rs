@@ -23,7 +23,9 @@ impl Profiler {
     }
 
     pub fn get_cached_loop_hierarchy(&self, func_idx: usize, loop_start_ip: usize) -> Option<bool> {
-        self.loop_hierarchy_cache.get(&(func_idx, loop_start_ip)).copied()
+        self.loop_hierarchy_cache
+            .get(&(func_idx, loop_start_ip))
+            .copied()
     }
 
     pub fn set_cached_loop_hierarchy(

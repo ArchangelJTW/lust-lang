@@ -1,5 +1,5 @@
-use super::*;
 use super::execution::ArgCheck;
+use super::*;
 use crate::ast::Type;
 use crate::bytecode::{LustMap, ValueKey, native_fn};
 use crate::config::LustConfig;
@@ -813,22 +813,39 @@ impl VM {
                         let marker = 0u8;
                         let sp = &marker as *const u8 as usize;
                         let depth_budget = self.max_stack_depth;
-                        let limit = sp
-                            .saturating_sub(crate::jit::NATIVE_STACK_RESERVE)
-                            .max(sp.saturating_sub(depth_budget.saturating_mul(crate::jit::MIN_NATIVE_FRAME)));
-                        let outer_limit = core::mem::replace(&mut self.jit_cells.stack_limit, limit);
+                        let limit = sp.saturating_sub(crate::jit::NATIVE_STACK_RESERVE).max(
+                            sp.saturating_sub(
+                                depth_budget.saturating_mul(crate::jit::MIN_NATIVE_FRAME),
+                            ),
+                        );
+                        let outer_limit =
+                            core::mem::replace(&mut self.jit_cells.stack_limit, limit);
 
                         self.jit.record_native_entry();
                         self.pending_jit_error = None;
                         self.jit_cells.exit_info = usize::MAX;
 
-                        type NativeEntry = unsafe extern "C" fn(*mut Value, *mut VM, *const Function, *mut ()) -> i32;
+                        type NativeEntry = unsafe extern "C" fn(
+                            *mut Value,
+                            *mut VM,
+                            *const Function,
+                            *mut (),
+                        ) -> i32;
                         let entry_fn: NativeEntry = unsafe { core::mem::transmute(entry_addr) };
-                        let result = unsafe { entry_fn(registers_ptr, vm_ptr, core::ptr::null(), core::ptr::null_mut()) };
+                        let result = unsafe {
+                            entry_fn(
+                                registers_ptr,
+                                vm_ptr,
+                                core::ptr::null(),
+                                core::ptr::null_mut(),
+                            )
+                        };
 
                         self.jit_cells.stack_limit = outer_limit;
 
-                        if (crate::jit::FUNCTION_RETURN_BASE..crate::jit::NATIVE_RETURNED).contains(&result) {
+                        if (crate::jit::FUNCTION_RETURN_BASE..crate::jit::NATIVE_RETURNED)
+                            .contains(&result)
+                        {
                             let reg = (result - crate::jit::FUNCTION_RETURN_BASE) as usize;
                             let return_value = root_frame.registers[reg].fast_clone();
                             root_frame.reset(0, None, register_count);
@@ -865,7 +882,10 @@ impl VM {
                 ),
             });
         }
-        if self.last_dispatched_target.as_ref().map(|(idx, name)| (*idx, name.as_str()))
+        if self
+            .last_dispatched_target
+            .as_ref()
+            .map(|(idx, name)| (*idx, name.as_str()))
             != Some((func_idx, expected_name))
         {
             self.last_dispatched_target = Some((func_idx, expected_name.to_string()));
@@ -893,7 +913,10 @@ impl VM {
                 ),
             });
         }
-        if self.last_dispatched_target.as_ref().map(|(idx, name)| (*idx, name.as_str()))
+        if self
+            .last_dispatched_target
+            .as_ref()
+            .map(|(idx, name)| (*idx, name.as_str()))
             != Some((func_idx, expected_name))
         {
             self.last_dispatched_target = Some((func_idx, expected_name.to_string()));

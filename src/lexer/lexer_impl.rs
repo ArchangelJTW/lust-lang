@@ -414,7 +414,12 @@ impl<'a> Lexer<'a> {
         let slice = &self.input[start_pos..self.position];
         let symbol = self.interner.intern(slice);
         let interned = self.interner.get(symbol).to_string();
-        Ok(Token::new(TokenKind::String, interned, start_line, start_column))
+        Ok(Token::new(
+            TokenKind::String,
+            interned,
+            start_line,
+            start_column,
+        ))
     }
 
     fn scan_number(&mut self, start_line: usize, start_column: usize) -> Result<Token> {
@@ -485,7 +490,12 @@ impl<'a> Lexer<'a> {
 
         let symbol = self.interner.intern(slice);
         let interned = self.interner.get(symbol).to_string();
-        Ok(Token::new(TokenKind::Identifier, interned, start_line, start_column))
+        Ok(Token::new(
+            TokenKind::Identifier,
+            interned,
+            start_line,
+            start_column,
+        ))
     }
 
     fn skip_whitespace_and_comments(&mut self) -> Result<()> {

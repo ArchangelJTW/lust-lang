@@ -442,11 +442,8 @@ impl VM {
                         {
                             Some(cached) => cached,
                             None => {
-                                let calculated = self.is_loop_in_hierarchy(
-                                    func_idx,
-                                    loop_start_ip,
-                                    backedge_ip,
-                                );
+                                let calculated =
+                                    self.is_loop_in_hierarchy(func_idx, loop_start_ip, backedge_ip);
                                 self.jit.profiler.set_cached_loop_hierarchy(
                                     func_idx,
                                     loop_start_ip,
@@ -461,29 +458,29 @@ impl VM {
                             count,
                             crate::jit::HOT_THRESHOLD + u32::from(loop_in_hierarchy),
                         ) {
-                        crate::jit::log(|| {
-                            format!(
-                                "🔥 JIT: Hot loop detected at func {} ip {} - starting trace recording!",
-                                func_idx, loop_start_ip
-                            )
-                        });
-                        let mut recorder =
-                            TraceRecorder::new(func_idx, loop_start_ip, MAX_TRACE_LENGTH);
-                        recorder.set_root_frame_index(self.call_stack.len().saturating_sub(1));
-                        recorder.set_intrinsics(&self.jit.intrinsics);
-                        // Specialize loop-invariant values at trace entry
-                        if !self
-                            .jit
-                            .no_specialize_sites
-                            .contains(&(func_idx, loop_start_ip))
-                        {
-                            let frame = self.call_stack.last().unwrap();
-                            let func = &self.functions[func_idx];
-                            recorder.specialize_trace_inputs(&frame.registers, func);
-                        }
-                        self.trace_recorder = Some(recorder);
-                        self.jit.recording_started();
-                        self.skip_next_trace_record = true;
+                            crate::jit::log(|| {
+                                format!(
+                                    "🔥 JIT: Hot loop detected at func {} ip {} - starting trace recording!",
+                                    func_idx, loop_start_ip
+                                )
+                            });
+                            let mut recorder =
+                                TraceRecorder::new(func_idx, loop_start_ip, MAX_TRACE_LENGTH);
+                            recorder.set_root_frame_index(self.call_stack.len().saturating_sub(1));
+                            recorder.set_intrinsics(&self.jit.intrinsics);
+                            // Specialize loop-invariant values at trace entry
+                            if !self
+                                .jit
+                                .no_specialize_sites
+                                .contains(&(func_idx, loop_start_ip))
+                            {
+                                let frame = self.call_stack.last().unwrap();
+                                let func = &self.functions[func_idx];
+                                recorder.specialize_trace_inputs(&frame.registers, func);
+                            }
+                            self.trace_recorder = Some(recorder);
+                            self.jit.recording_started();
+                            self.skip_next_trace_record = true;
                         }
                     }
                 }

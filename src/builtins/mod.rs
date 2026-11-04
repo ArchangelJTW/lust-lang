@@ -600,7 +600,7 @@ fn build_array_functions() -> Vec<BuiltinFunction> {
         ),
         generic_func(
             "array.concat",
-            "Concatenate array elements into a string with an optional separator",
+            "Join array element strings with an optional separator (default empty); returns a string",
             &["T"],
             &["arr", "sep"],
             vec![arr_t.clone(), TypeExpr::Unknown],

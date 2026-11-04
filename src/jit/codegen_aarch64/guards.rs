@@ -395,7 +395,22 @@ impl JitCompiler {
         unsafe extern "C" {
             fn jit_value_is_truthy(value_ptr: *const Value) -> u8;
         }
-        if self.hot_x0_in == Some(condition_register)
+        if let Some(pin) = self.active_pin(condition_register) {
+            match pin.ty {
+                ValueType::Bool => {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; uxtb w0, W(pin.reg)
+                    );
+                }
+                _ => {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; movz w0, 1
+                    );
+                }
+            }
+        } else if self.hot_x0_in == Some(condition_register)
             && self.scalar_registers.get(&condition_register) == Some(&ValueType::Bool)
         {
             // Still in w0 (as 0 or 1) from the store the previous op made.

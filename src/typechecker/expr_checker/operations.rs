@@ -1595,8 +1595,14 @@ impl TypeChecker {
             }) {
                 return Ok(Type::new(TypeKind::Unknown, span));
             }
-        if let TypeKind::Map(_, value_type) = &object_type.kind {
-            return Ok(value_type.as_ref().clone());
+        if let TypeKind::Map(_, _) = &object_type.kind {
+            return Err(self.type_error_at(
+                format!(
+                    "Cannot access Map key '{}' with field syntax; use map.get(map, key) to handle missing keys",
+                    field
+                ),
+                span,
+            ));
         }
         let (type_name, type_bindings) = match &object_type.kind {
             TypeKind::Named(name) => (name.clone(), HashMap::new()),

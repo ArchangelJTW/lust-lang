@@ -15,7 +15,7 @@ pub use native_types::{
     self_param, struct_field_decl, trait_bound, type_named, type_unit, type_unknown,
     weak_struct_field_decl,
 };
-pub use program::{AsyncDriver, EmbeddedBuilder, EmbeddedProgram};
+pub use program::{AsyncDriver, CompiledBytecode, EmbeddedBuilder, EmbeddedProgram, TypedHandle};
 pub use values::{
     ArrayHandle, EnumInstance, FunctionHandle, MapHandle, StringRef, StructField, StructHandle,
     StructInstance, TypedValue, ValueRef, matches_lust_nominal_type, struct_field,

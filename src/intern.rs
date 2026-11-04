@@ -47,8 +47,9 @@ impl Interner {
         }
 
         let idx = self.strings.len();
-        self.strings.push(s.to_string());
-        self.indices.insert(s.to_string(), idx);
+        let owned = s.to_string();
+        self.indices.insert(owned.clone(), idx);
+        self.strings.push(owned);
         Symbol(idx)
     }
 

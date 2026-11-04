@@ -40,6 +40,7 @@ impl JitCompiler {
             current_fail_ip: None,
             fail_sites: Vec::new(),
             next_specialized_id: 0,
+            cached_select_imms: None,
         }
     }
 
@@ -186,6 +187,7 @@ impl JitCompiler {
         self.dirty_pins.clear();
         self.current_fail_ip = None;
         self.fail_sites.clear();
+        self.cached_select_imms = None;
         let stack_size = self.compute_stack_size(trace);
         let mut guards = Vec::new();
         let mut guard_index = 0i32;
@@ -729,12 +731,12 @@ impl JitCompiler {
                     dest: constant_register,
                     ..
                 } = op
-                    && self.scalar_registers.contains_key(constant_register)
                     && Self::register_overwritten_before_read(
                         &ops[next_index + 1..],
                         *constant_register,
                     )
                     && (self.compile_integer_add_immediate(op, next)?
+                        || self.compile_integer_mul_immediate(op, next)?
                         || self.compile_float_op_immediate(op, next)?)
                 {
                     self.update_scalar_registers(next);
@@ -769,6 +771,29 @@ impl JitCompiler {
                 TraceOp::At { .. } => unreachable!("markers are consumed above"),
                 TraceOp::LoadConst { dest, value } => {
                     self.compile_load_const(*dest, value)?;
+                }
+
+                TraceOp::Select {
+                    dest,
+                    cond,
+                    on_true,
+                    on_false,
+                } => {
+                    self.compile_select(*dest, *cond, on_true, on_false)?;
+                }
+
+                TraceOp::SelectBitZero {
+                    dest,
+                    src,
+                    mask,
+                    on_zero,
+                    on_nonzero,
+                } => {
+                    self.compile_select_bit_zero(*dest, *src, *mask, on_zero, on_nonzero)?;
+                }
+
+                TraceOp::ModImm { dest, src, divisor } => {
+                    self.compile_mod_imm(*dest, *src, *divisor)?;
                 }
 
                 TraceOp::Move { dest, src } => {
@@ -1502,6 +1527,73 @@ impl JitCompiler {
         Ok(true)
     }
 
+    fn compile_integer_mul_immediate(
+        &mut self,
+        load: &TraceOp,
+        arithmetic: &TraceOp,
+    ) -> Result<bool> {
+        let TraceOp::LoadConst {
+            dest: constant_register,
+            value: Value::Int(immediate),
+        } = load
+        else {
+            return Ok(false);
+        };
+        let TraceOp::Mul {
+            dest,
+            lhs,
+            rhs,
+            lhs_type: ValueType::Int,
+            rhs_type: ValueType::Int,
+        } = arithmetic
+        else {
+            return Ok(false);
+        };
+        let source = if lhs == constant_register && rhs != constant_register {
+            *rhs
+        } else if rhs == constant_register && lhs != constant_register {
+            *lhs
+        } else {
+            return Ok(false);
+        };
+
+        let a = self.operand_x(source, 0);
+        let d = self.direct_dest_x(*dest).unwrap_or(0);
+        match *immediate {
+            0 => {
+                dynasm!(self.ops ; .arch aarch64 ; mov X(d), xzr);
+            }
+            1 => {
+                if a != d {
+                    dynasm!(self.ops ; .arch aarch64 ; mov X(d), X(a));
+                }
+            }
+            2 => {
+                dynasm!(self.ops ; .arch aarch64 ; lsl X(d), X(a), #1);
+            }
+            3 => {
+                dynasm!(self.ops ; .arch aarch64 ; add X(d), X(a), X(a), lsl #1);
+            }
+            4 => {
+                dynasm!(self.ops ; .arch aarch64 ; lsl X(d), X(a), #2);
+            }
+            5 => {
+                dynasm!(self.ops ; .arch aarch64 ; add X(d), X(a), X(a), lsl #2);
+            }
+            8 => {
+                dynasm!(self.ops ; .arch aarch64 ; lsl X(d), X(a), #3);
+            }
+            9 => {
+                dynasm!(self.ops ; .arch aarch64 ; add X(d), X(a), X(a), lsl #3);
+            }
+            _ => return Ok(false),
+        }
+        if d == 0 {
+            self.store_from_x0(*dest, ValueTag::Int.as_u8());
+        }
+        Ok(true)
+    }
+
     fn compile_numeric_comparison_guard(
         &mut self,
         comparison: &TraceOp,
@@ -1753,6 +1845,9 @@ impl JitCompiler {
             TraceOp::GetEnumValue { enum_reg, .. } => *enum_reg == register,
             TraceOp::BorrowField { object, .. } => *object == register,
             TraceOp::BorrowEnumValue { enum_reg, .. } => *enum_reg == register,
+            TraceOp::Select { cond, .. } => *cond == register,
+            TraceOp::SelectBitZero { src, .. } => *src == register,
+            TraceOp::ModImm { src, .. } => *src == register,
             TraceOp::GuardLoopContinue {
                 condition_register, ..
             } => *condition_register == register,
@@ -1809,6 +1904,9 @@ impl JitCompiler {
             | TraceOp::Or { dest, .. }
             | TraceOp::Not { dest, .. }
             | TraceOp::Concat { dest, .. }
+            | TraceOp::Select { dest, .. }
+            | TraceOp::SelectBitZero { dest, .. }
+            | TraceOp::ModImm { dest, .. }
             | TraceOp::GetIndex { dest, .. }
             | TraceOp::TryGetIndex { dest, .. }
             | TraceOp::ArrayPush { dest, .. }
@@ -2011,6 +2109,27 @@ impl JitCompiler {
             TraceOp::NestedLoopCall { .. } => self.scalar_registers.clear(),
             // Set by the `Label` arm itself.
             TraceOp::Label { .. } | TraceOp::Jump { .. } | TraceOp::BranchIf { .. } => {}
+            TraceOp::Select { dest, on_true, .. } => {
+                let ty = match on_true {
+                    Value::Int(_) => Some(ValueType::Int),
+                    Value::Bool(_) => Some(ValueType::Bool),
+                    Value::Float(_) => Some(ValueType::Float),
+                    _ => None,
+                };
+                set(&mut self.scalar_registers, *dest, ty);
+            }
+            TraceOp::SelectBitZero { dest, on_zero, .. } => {
+                let ty = match on_zero {
+                    Value::Int(_) => Some(ValueType::Int),
+                    Value::Bool(_) => Some(ValueType::Bool),
+                    Value::Float(_) => Some(ValueType::Float),
+                    _ => None,
+                };
+                set(&mut self.scalar_registers, *dest, ty);
+            }
+            TraceOp::ModImm { dest, .. } => {
+                set(&mut self.scalar_registers, *dest, Some(ValueType::Int));
+            }
             TraceOp::CallDirect {
                 dest, result_type, ..
             } => set(&mut self.scalar_registers, *dest, *result_type),

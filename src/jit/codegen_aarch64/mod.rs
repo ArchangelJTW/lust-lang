@@ -100,6 +100,13 @@ pub(super) struct SpecializedValue {
     pub stack_offset: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct HoistedArray {
+    pub array_reg: u8,
+    pub ptr_reg: u8,
+    pub len_reg: Option<u8>,
+}
+
 pub struct JitCompiler {
     pub(super) ops: Assembler,
     pub(super) data: Vec<JitData>,
@@ -209,6 +216,8 @@ pub struct JitCompiler {
     #[allow(dead_code)]
     pub(super) next_specialized_id: usize,
     pub(super) cached_select_imms: Option<(i64, i64)>,
+    pub(super) hoisted_array: Option<HoistedArray>,
+    pub(super) const_registers: hashbrown::HashMap<u8, Value>,
 }
 
 impl Default for JitCompiler {

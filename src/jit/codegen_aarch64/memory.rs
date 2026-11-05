@@ -206,6 +206,99 @@ impl JitCompiler {
         value: u8,
         element_type: Option<ValueType>,
     ) -> Result<()> {
+        let index_is_int = self.scalar_registers.get(&index) == Some(&ValueType::Int)
+            || self.pins.get(&index).is_some_and(|p| p.ty == ValueType::Int);
+
+        if let Some(hoisted) = self.hoisted_array
+            && hoisted.array_reg == array
+            && index_is_int
+        {
+            let idx_reg = self.operand_x(index, 12);
+            if let Some(len_r) = hoisted.len_reg {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp X(idx_reg), X(len_r)
+                    ; b.hs >fail
+                );
+            }
+            let val_ty = self
+                .scalar_registers
+                .get(&value)
+                .copied()
+                .or_else(|| self.pins.get(&value).map(|p| p.ty))
+                .or(element_type);
+            let scalar_slot = val_ty
+                .is_some_and(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool));
+
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; add x10, X(hoisted.ptr_reg), X(idx_reg), lsl #4
+            );
+
+            if !scalar_slot {
+                let scalar_max_tag = ValueTag::Float.as_u8() as u32;
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldrb w9, [x10]
+                    ; cmp w9, #scalar_max_tag
+                    ; b.hi >fail
+                );
+            }
+
+            if let Some(ty) = val_ty {
+                let tag = match ty {
+                    ValueType::Int => ValueTag::Int.as_u8(),
+                    ValueType::Float => ValueTag::Float.as_u8(),
+                    _ => ValueTag::Bool.as_u8(),
+                } as u32;
+                if let Some(const_val) = self.const_registers.get(&value) {
+                    match const_val {
+                        Value::Bool(false) => {
+                            dynasm!(self.ops ; .arch aarch64 ; mov x1, xzr);
+                        }
+                        Value::Bool(true) => {
+                            dynasm!(self.ops ; .arch aarch64 ; movz x1, 1);
+                        }
+                        Value::Int(i) => {
+                            self.emit_mov_imm64(1, *i as u64);
+                        }
+                        Value::Float(f) => {
+                            self.emit_mov_imm64(1, f.to_bits());
+                        }
+                        _ => self.load_payload(1, value),
+                    }
+                } else if let Some(pin) = self.active_pin(value) {
+                    dynasm!(self.ops ; .arch aarch64 ; mov X(1), X(pin.reg));
+                } else if self.hot_x0_in == Some(value) {
+                    dynasm!(self.ops ; .arch aarch64 ; mov x1, x0);
+                } else if ty == ValueType::Bool {
+                    self.load_bool_payload(1, value);
+                } else {
+                    self.load_payload(1, value);
+                }
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; movz x0, #tag
+                    ; stp x0, x1, [x10]
+                );
+            } else {
+                self.load_tag_from_memory(13, value);
+                let scalar_max_tag = ValueTag::Float.as_u8() as u32;
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w13, #scalar_max_tag
+                    ; b.hi >fail
+                );
+                self.emit_reg_addr(11, value);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldp x0, x1, [x11]
+                    ; stp x0, x1, [x10]
+                );
+            }
+            return Ok(());
+        }
+
         unsafe extern "C" {
             fn jit_array_set_index_safe(
                 array_value: *const Value,
@@ -216,7 +309,7 @@ impl JitCompiler {
 
         if let (Some(layout), true) = (
             jit::layout::rc_vec_layout(),
-            self.scalar_registers.get(&index) == Some(&ValueType::Int),
+            index_is_int,
         ) {
             let array_tag = ValueTag::Array.as_u8() as u32;
             let scalar_max_tag = ValueTag::Float.as_u8() as u32;
@@ -316,6 +409,69 @@ impl JitCompiler {
         index: u8,
         value_type: Option<ValueType>,
     ) -> Result<()> {
+        let index_is_int = self.scalar_registers.get(&index) == Some(&ValueType::Int)
+            || self.pins.get(&index).is_some_and(|p| p.ty == ValueType::Int);
+
+        if let Some(hoisted) = self.hoisted_array
+            && hoisted.array_reg == array
+            && index_is_int
+            && let Some(ty) = value_type
+        {
+            let idx_reg = self.operand_x(index, 12);
+            if let Some(len_r) = hoisted.len_reg {
+                let out_of_range = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp X(idx_reg), X(len_r)
+                    ; b.hs => out_of_range
+                    ; add x10, X(hoisted.ptr_reg), X(idx_reg), lsl #4
+                    ; ldrb w9, [x10]
+                );
+                let expected_tag = match ty {
+                    ValueType::Int => ValueTag::Int,
+                    ValueType::Float => ValueTag::Float,
+                    _ => ValueTag::Bool,
+                }
+                .as_u8() as u32;
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w9, #expected_tag
+                    ; b.ne >fail
+                );
+                match ty {
+                    ValueType::Float => {
+                        dynasm!(self.ops ; .arch aarch64 ; ldr d0, [x10, 8]);
+                        self.store_d0_as_float(value_dest);
+                    }
+                    ValueType::Int => {
+                        dynasm!(self.ops ; .arch aarch64 ; ldr x0, [x10, 8]);
+                        self.store_from_x0(value_dest, ValueTag::Int.as_u8());
+                    }
+                    _ => {
+                        dynasm!(self.ops ; .arch aarch64 ; ldrb w0, [x10, 8]);
+                        self.store_from_x0(value_dest, ValueTag::Bool.as_u8());
+                    }
+                }
+                self.pending_scalar = Some((value_dest, ty));
+                dynasm!(self.ops ; .arch aarch64 ; movz x0, 1);
+                self.store_from_x0(condition_dest, ValueTag::Bool.as_u8());
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; b => done
+                    ; => out_of_range
+                );
+                self.compile_load_const(value_dest, &Value::Nil)?;
+                dynasm!(self.ops ; .arch aarch64 ; mov x0, xzr);
+                self.store_from_x0(condition_dest, ValueTag::Bool.as_u8());
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; => done
+                );
+                return Ok(());
+            }
+        }
+
         unsafe extern "C" {
             fn jit_array_index_ok_safe(
                 array_value: *const Value,
@@ -327,7 +483,7 @@ impl JitCompiler {
 
         if let (Some(layout), true) = (
             jit::layout::rc_vec_layout(),
-            self.scalar_registers.get(&index) == Some(&ValueType::Int),
+            index_is_int,
         ) {
             // Inline: bounds from the Vec's length, a scalar element copied
             // as tag + payload. An element that owns something, or a

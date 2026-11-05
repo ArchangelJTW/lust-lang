@@ -163,6 +163,8 @@ impl JitCompiler {
             fail_sites: Vec::new(),
             next_specialized_id: 0,
             cached_select_imms: None,
+            hoisted_array: None,
+            const_registers: HashMap::new(),
         }
     }
 
@@ -383,6 +385,7 @@ impl JitCompiler {
         trace_id: TraceId,
         hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
+        self.const_registers = hoisted_constants.iter().cloned().collect();
         self.scalar_registers = trace.entry_scalars.iter().copied().collect();
         self.trace_start_ip = trace.start_ip;
         self.last_fail_island = self.ops.offset().0;
@@ -607,6 +610,42 @@ impl JitCompiler {
                     .collect();
             }
             self.exit_stack.push(exit_pinned_label);
+        }
+
+        if let Some((arr, ptr_reg, len_reg)) = Self::find_hoistable_array(trace, &self.pins) {
+            if let Some(layout) = jit::layout::rc_vec_layout() {
+                let array_tag = ValueTag::Array.as_u8() as u32;
+                let rc_offset = layout.array_rc_offset as u32;
+                let borrow_offset = layout.borrow_offset as u32;
+                let ptr_offset = layout.ptr_offset as u32;
+                let len_offset = layout.len_offset as u32;
+
+                self.load_tag(0, arr);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w0, #array_tag
+                    ; b.ne >fail
+                );
+                self.emit_reg_addr(11, arr);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr x9, [x11, #rc_offset]
+                    ; ldr x10, [x9, #borrow_offset]
+                    ; cbnz x10, >fail
+                    ; ldr X(ptr_reg), [x9, #ptr_offset]
+                );
+                if let Some(len_r) = len_reg {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; ldr X(len_r), [x9, #len_offset]
+                    );
+                }
+                self.hoisted_array = Some(HoistedArray {
+                    array_reg: arr,
+                    ptr_reg,
+                    len_reg,
+                });
+            }
         }
 
         // Create a loop_start label AFTER preamble, BEFORE loop body
@@ -2863,5 +2902,109 @@ impl JitCompiler {
         })();
         self.inline_depth -= 1;
         result
+    }
+
+    fn op_writes_to_reg(op: &TraceOp, reg: u8) -> bool {
+        match op {
+            TraceOp::LoadConst { dest, .. }
+            | TraceOp::Move { dest, .. }
+            | TraceOp::Neg { dest, .. }
+            | TraceOp::Add { dest, .. }
+            | TraceOp::Sub { dest, .. }
+            | TraceOp::Mul { dest, .. }
+            | TraceOp::Div { dest, .. }
+            | TraceOp::Mod { dest, .. }
+            | TraceOp::ModImm { dest, .. }
+            | TraceOp::Lt { dest, .. }
+            | TraceOp::Le { dest, .. }
+            | TraceOp::Gt { dest, .. }
+            | TraceOp::Ge { dest, .. }
+            | TraceOp::Eq { dest, .. }
+            | TraceOp::Ne { dest, .. }
+            | TraceOp::And { dest, .. }
+            | TraceOp::Or { dest, .. }
+            | TraceOp::Not { dest, .. }
+            | TraceOp::Concat { dest, .. }
+            | TraceOp::GetIndex { dest, .. }
+            | TraceOp::TryGetIndex { dest, .. }
+            | TraceOp::ArrayPush { dest, .. }
+            | TraceOp::ArrayLen { dest, .. }
+            | TraceOp::GetField { dest, .. }
+            | TraceOp::NewArray { dest, .. }
+            | TraceOp::NewStruct { dest, .. }
+            | TraceOp::NewEnumUnit { dest, .. }
+            | TraceOp::NewEnumVariant { dest, .. }
+            | TraceOp::IsEnumVariant { dest, .. }
+            | TraceOp::TypeIs { dest, .. }
+            | TraceOp::TryCast { dest, .. }
+            | TraceOp::GetEnumValue { dest, .. }
+            | TraceOp::CallNative { dest, .. }
+            | TraceOp::CallFunction { dest, .. }
+            | TraceOp::CallMethod { dest, .. }
+            | TraceOp::CallDirect { dest, .. }
+            | TraceOp::InlineCall { dest, .. }
+            | TraceOp::Select { dest, .. }
+            | TraceOp::SelectBitZero { dest, .. } => *dest == reg,
+            TraceOp::ArrayIndexOk {
+                value_dest,
+                condition_dest,
+                ..
+            } => *value_dest == reg || *condition_dest == reg,
+            _ => false,
+        }
+    }
+
+    fn find_hoistable_array(
+        trace: &Trace,
+        pins: &HashMap<u8, pins::Pin>,
+    ) -> Option<(u8, u8, Option<u8>)> {
+        if trace.is_function {
+            return None;
+        }
+        let mut candidate = None;
+        for op in &trace.ops {
+            match op {
+                TraceOp::SetIndex { array, .. }
+                | TraceOp::ArrayIndexOk { array, .. }
+                | TraceOp::GetIndex { array, .. } => {
+                    if let Some(cand) = candidate {
+                        if cand != *array {
+                            return None;
+                        }
+                    } else {
+                        candidate = Some(*array);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let arr = candidate?;
+        for op in &trace.ops {
+            match op {
+                TraceOp::CallDirect { .. }
+                | TraceOp::CallFunction { .. }
+                | TraceOp::CallNative { .. }
+                | TraceOp::CallMethod { .. }
+                | TraceOp::InlineCall { .. }
+                | TraceOp::NestedLoopCall { .. }
+                | TraceOp::NewArray { .. }
+                | TraceOp::ArrayPush { .. } => return None,
+                _ => {
+                    if Self::op_writes_to_reg(op, arr) {
+                        return None;
+                    }
+                }
+            }
+        }
+        let ptr_reg = 22;
+        let used_regs: hashbrown::HashSet<u8> = pins.values().map(|p| p.reg).collect();
+        let mut len_reg = None;
+        for r in (23..=28).rev() {
+            if !used_regs.contains(&r) {
+                len_reg = Some(r);
+                break;
+            }
+        }
+        Some((arr, ptr_reg, len_reg))
     }
 }

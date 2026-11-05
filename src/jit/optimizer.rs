@@ -129,7 +129,50 @@ impl TraceOptimizer {
                     )
                     .then_some(*expected_type);
                 }
+                TraceOp::GuardLoopContinue {
+                    condition_register,
+                    ..
+                } if *condition_register == binding || *condition_register == result => {
+                    return Some(ValueType::Bool);
+                }
+                TraceOp::Add { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Add { rhs, rhs_type, .. } if *rhs == binding || *rhs == result => {
+                    return Some(*rhs_type);
+                }
+                TraceOp::Sub { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Sub { rhs, rhs_type, .. } if *rhs == binding || *rhs == result => {
+                    return Some(*rhs_type);
+                }
+                TraceOp::Mul { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Mul { rhs, rhs_type, .. } if *rhs == binding || *rhs == result => {
+                    return Some(*rhs_type);
+                }
+                TraceOp::Lt { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Le { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Gt { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Ge { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Eq { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Ne { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
                 TraceOp::Guard { .. } => {}
+                TraceOp::GuardLoopContinue { .. } => {}
                 TraceOp::Move { dest, .. } if *dest != binding && *dest != result => {}
                 _ => return None,
             }

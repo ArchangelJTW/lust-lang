@@ -500,6 +500,74 @@ impl JitCompiler {
         }
     }
 
+    /// Direct scalar self-call: arguments in x0.., result payload in x1,
+    /// `NATIVE_RETURNED` in w0. No `Value` frame and no inline record —
+    /// the callee is the payload entry of this function. A stack-limit
+    /// failure returns -1 so the VM adapter hands the original call to
+    /// the interpreter.
+    fn compile_scalar_self_call(
+        &mut self,
+        dest: u8,
+        first_arg: u8,
+        arg_count: u8,
+        result_type: Option<ValueType>,
+    ) -> Result<()> {
+        let entry = self
+            .function_self
+            .map(|(_, entry)| entry)
+            .expect("scalar self-call is compiled inside its function");
+        let epilogue = self
+            .function_epilogue
+            .expect("function code is compiled inside compile_trace");
+        let stack_limit = jit::STACK_LIMIT_OFFSET as u32;
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x9, [x20, #stack_limit]
+            ; mov x10, sp
+            ; cmp x10, x9
+            ; b.hs >scalar_call
+            ; movn w0, 0
+            ; b => epilogue
+            ; scalar_call:
+        );
+        // Move arguments straight into x0.. without using pin registers
+        // (x9..x15 and the callee-saved pins) as scratch.
+        for index in (0..arg_count).rev() {
+            let src = first_arg.wrapping_add(index);
+            if let Some(pin) = self.pins.get(&src).copied() {
+                if pin.reg != index {
+                    dynasm!(self.ops ; .arch aarch64 ; mov X(index), X(pin.reg));
+                }
+            } else {
+                self.load_payload(index, src);
+            }
+        }
+        dynasm!(self.ops ; .arch aarch64 ; bl => entry);
+        let returned_shifted = (jit::NATIVE_RETURNED as u32) >> 12;
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #returned_shifted, lsl #12
+            ; b.ne => epilogue
+        );
+        if let Some(ty) = result_type {
+            match ty {
+                ValueType::Float => {
+                    dynasm!(self.ops ; .arch aarch64 ; fmov d0, x1);
+                    self.store_d0_as_float(dest);
+                }
+                ValueType::Int => {
+                    dynasm!(self.ops ; .arch aarch64 ; mov x0, x1);
+                    self.store_from_x0(dest, ValueTag::Int.as_u8());
+                }
+                _ => {
+                    dynasm!(self.ops ; .arch aarch64 ; mov x0, x1);
+                    self.store_from_x0(dest, ValueTag::Bool.as_u8());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Call another bytecode function's compiled code natively: push an
     /// inline record and a frame for it (exactly as an inlined call does,
     /// so an exit inside the callee materializes every frame), `blr` its
@@ -526,6 +594,14 @@ impl JitCompiler {
     ) -> Result<()> {
         unsafe extern "C" {
             fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Value) -> u8;
+        }
+        if self.payload_slots && self.function_self.is_some_and(|(idx, _)| idx == function_idx) {
+            return self.compile_scalar_self_call(
+                dest,
+                first_arg,
+                arg_count,
+                result_type,
+            );
         }
         let value_size = mem::size_of::<Value>() as i32;
         let frame_value_count = callee_registers as i32;
@@ -798,10 +874,12 @@ impl JitCompiler {
             .expect("function code is compiled inside compile_trace");
         let exit_label = self.current_exit_label();
         let interp_return = self.ops.new_dynamic_label();
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; cbz x22, => interp_return
-        );
+        if !self.payload_slots {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cbz x22, => interp_return
+            );
+        }
         if let (Some(ty), Some(reg)) = (self.function_result, value) {
             // A declared scalar result goes back in x1 (its payload bits;
             // the translator's guard before the `Return` proved the type)

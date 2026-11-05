@@ -1,6 +1,12 @@
 use super::*;
 impl JitCompiler {
     pub(super) fn compile_load_const(&mut self, dest: u8, value: &Value) -> Result<()> {
+        if self.scalar_regfile && matches!(value, Value::Function(_) | Value::Nil) {
+            // The direct-call ABI does not read the callee register, and a
+            // Nil constant owns nothing. Leaving the slot untouched keeps
+            // the regfile from materializing a `Value`.
+            return Ok(());
+        }
         match value {
             Value::Int(i) => {
                 self.emit_mov_imm64(0, *i as u64);
@@ -125,6 +131,11 @@ impl JitCompiler {
                 return Ok(());
             }
             _ => {}
+        }
+        if self.payload_slots {
+            self.load_payload(0, src);
+            self.store_payload(dest, 0);
+            return Ok(());
         }
         self.emit_reg_addr(11, src);
         self.emit_clone_x11_into(dest);

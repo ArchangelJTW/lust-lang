@@ -165,8 +165,22 @@ pub struct JitCompiler {
     /// inside a native callee.
     function_epilogue: Option<dynasmrt::DynamicLabel>,
     /// Function code: the function being compiled and the label at its
-    /// entry, so a call to itself is a direct branch.
+    /// entry, so a call to itself is a direct branch. For a scalar-fast
+    /// function this is the payload entry, not the VM adapter.
     function_self: Option<(usize, dynasmrt::DynamicLabel)>,
+    /// Pure scalar self-recursion: the body addresses an 8-byte payload
+    /// frame and calls itself with arguments in x0.. (see OPT-21).
+    scalar_fast: bool,
+    /// Number of leading scalar parameters the scalar-fast entry receives.
+    scalar_params: u8,
+    /// x19 addresses raw 8-byte payloads rather than `Value`s.
+    payload_slots: bool,
+    /// Scalar-fast body keeps VM registers in machine registers. Spill
+    /// slots, if any, are addressed from x29 (positive distance below it).
+    scalar_regfile: bool,
+    spill_off: HashMap<u8, i32>,
+    /// Callee-saved pairs pushed below x29, outermost first.
+    scalar_saved: Vec<(u8, u8)>,
     /// Branch targets of the function being compiled, by bytecode ip.
     function_labels: HashMap<usize, dynasmrt::DynamicLabel>,
     /// Compiled under a gas budget: loop back-edges charge

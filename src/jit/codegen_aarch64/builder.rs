@@ -1,6 +1,120 @@
 use super::*;
 use crate::VM;
 use hashbrown::HashMap;
+
+/// Leading entry registers whose type is a scalar parameter.
+fn scalar_param_count(trace: &Trace) -> u8 {
+    let mut kinds = [None; 64];
+    for (reg, ty) in &trace.entry_scalars {
+        if *reg < 64 {
+            kinds[*reg as usize] = Some(*ty);
+        }
+    }
+    let mut count = 0u8;
+    while (count as usize) < kinds.len() {
+        match kinds[count as usize] {
+            Some(ValueType::Int | ValueType::Float | ValueType::Bool) => count += 1,
+            _ => break,
+        }
+    }
+    count
+}
+
+/// Match `if p0 < IMM { return p0 }` ignoring `At` markers.
+fn early_int_leaf_immediate(ops: &[TraceOp]) -> Option<i64> {
+    let mut cursor = ops.iter().filter(|op| !matches!(op, TraceOp::At { .. }));
+    let (const_reg, imm) = match cursor.next()? {
+        TraceOp::LoadConst {
+            dest,
+            value: Value::Int(imm),
+        } => (*dest, *imm),
+        _ => return None,
+    };
+    let cond = match cursor.next()? {
+        TraceOp::Lt {
+            dest,
+            lhs: 0,
+            rhs,
+            lhs_type: ValueType::Int,
+            rhs_type: ValueType::Int,
+        } if *rhs == const_reg => *dest,
+        _ => return None,
+    };
+    match cursor.next()? {
+        TraceOp::BranchIf {
+            condition_register,
+            expect_truthy: false,
+            ..
+        } if *condition_register == cond => {}
+        _ => return None,
+    }
+    match cursor.next()? {
+        TraceOp::Return { value: Some(0) } => Some(imm),
+        _ => None,
+    }
+}
+
+fn scalar_type(ty: ValueType) -> bool {
+    matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool)
+}
+
+/// Self-recursive function whose body is pure scalar arithmetic. The
+/// payload ABI is only correct when nothing in the body can bail out or
+/// needs a `Value` (no guards, no owned values, no calls to other
+/// functions).
+fn scalar_fast_eligible(trace: &Trace, result: Option<ValueType>, params: u8) -> bool {
+    if !trace.is_function || trace.frame_may_own || !trace.borrowed_registers.is_empty() {
+        return false;
+    }
+    if params == 0 || params > 8 || !result.is_some_and(scalar_type) {
+        return false;
+    }
+    let mut saw_self = false;
+    for op in &trace.ops {
+        match op {
+            TraceOp::At { .. } | TraceOp::Label { .. } | TraceOp::Jump { .. } | TraceOp::Return { .. } => {}
+            TraceOp::BranchIf { .. } => {}
+            TraceOp::LoadConst { value, .. } => match value {
+                Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Nil | Value::Function(_) => {}
+                _ => return false,
+            },
+            TraceOp::Move { .. } | TraceOp::Neg { .. } => {}
+            TraceOp::Add { lhs_type, rhs_type, .. }
+            | TraceOp::Sub { lhs_type, rhs_type, .. }
+            | TraceOp::Mul { lhs_type, rhs_type, .. }
+            | TraceOp::Div { lhs_type, rhs_type, .. }
+            | TraceOp::Mod { lhs_type, rhs_type, .. }
+            | TraceOp::Lt { lhs_type, rhs_type, .. }
+            | TraceOp::Le { lhs_type, rhs_type, .. }
+            | TraceOp::Gt { lhs_type, rhs_type, .. }
+            | TraceOp::Ge { lhs_type, rhs_type, .. }
+                if matches!(
+                    (*lhs_type, *rhs_type),
+                    (ValueType::Int | ValueType::Float, ValueType::Int | ValueType::Float)
+                ) => {}
+            TraceOp::Eq { lhs_type, rhs_type, .. } | TraceOp::Ne { lhs_type, rhs_type, .. }
+                if scalar_type(*lhs_type) && scalar_type(*rhs_type) => {}
+            TraceOp::CallDirect {
+                function_idx,
+                receiver,
+                arg_count,
+                alias_mask,
+                result_type,
+                ..
+            } if *function_idx == trace.function_idx
+                && receiver.is_none()
+                && *alias_mask == 0
+                && *arg_count == params
+                && result_type.is_some_and(scalar_type) =>
+            {
+                saw_self = true;
+            }
+            _ => return false,
+        }
+    }
+    saw_self
+}
+
 impl JitCompiler {
     pub fn new() -> Self {
         Self {
@@ -32,6 +146,12 @@ impl JitCompiler {
             function_entry_table: 0,
             function_epilogue: None,
             function_self: None,
+            scalar_fast: false,
+            scalar_params: 0,
+            payload_slots: false,
+            scalar_regfile: false,
+            spill_off: HashMap::new(),
+            scalar_saved: Vec::new(),
             function_labels: HashMap::new(),
             gas_checked: false,
             op_counter: 0,
@@ -144,9 +264,107 @@ impl JitCompiler {
         self.function_result = result_type;
         self.function_entry_table = entry_table;
         self.function_labels.clear();
+        self.scalar_params = scalar_param_count(trace);
+        self.scalar_fast = scalar_fast_eligible(trace, result_type, self.scalar_params);
+        self.payload_slots = false;
+        self.scalar_regfile = false;
+        self.spill_off.clear();
+        self.scalar_saved.clear();
         let result = self.compile_trace(trace, trace_id, Vec::new());
         self.function_mode = false;
+        self.scalar_fast = false;
+        self.payload_slots = false;
+        self.scalar_regfile = false;
         result
+    }
+
+    /// `if n < imm { return n }` at the start of a one-argument int
+    /// function, emitted before the frame is built. Leaf calls then
+    /// return in a handful of instructions.
+    fn emit_early_int_leaf(&mut self, trace: &Trace) {
+        let imm = early_int_leaf_immediate(&trace.ops);
+        let Some(imm) = imm else {
+            return;
+        };
+        if imm < 0 || imm > 4095 {
+            return;
+        }
+        let imm = imm as u32;
+        let returned_hi = (jit::NATIVE_RETURNED as u32) >> 16;
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp x0, #imm
+            ; b.ge >leaf_frame
+            ; mov x1, x0
+            ; movz w0, #returned_hi, lsl #16
+            ; ret
+            ; leaf_frame:
+        );
+    }
+
+    /// VM entry in front of a scalar-fast body. The interpreter and every
+    /// non-recursive caller still pass a `Value` frame; this adapter unpacks
+    /// the scalar parameters, calls the payload entry, and repacks the
+    /// result. A failure (native stack exhausted) is returned unchanged so
+    /// the interpreter can run the call.
+    fn emit_scalar_vm_adapter(&mut self, fast: dynasmrt::DynamicLabel) {
+        let interp = self.ops.new_dynamic_label();
+        let value_size = mem::size_of::<Value>() as u32;
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; stp x29, x30, [sp, -16]!
+            ; mov x29, sp
+            ; stp x19, x20, [sp, -16]!
+            ; stp x21, x22, [sp, -16]!
+            ; stp x23, x24, [sp, -16]!
+            ; stp x25, x26, [sp, -16]!
+            ; stp x27, x28, [sp, -16]!
+            ; mov x19, x0
+            ; mov x20, x1
+            ; mov x21, x2
+            ; mov x22, x3
+        );
+        for index in 0..self.scalar_params {
+            let offset = value_size * u32::from(index) + 8;
+            dynasm!(self.ops ; .arch aarch64 ; ldr X(index), [x19, #offset]);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; bl => fast);
+        let leave = self.ops.new_dynamic_label();
+        let returned_shifted = (jit::NATIVE_RETURNED as u32) >> 12;
+        let returned_hi = (jit::NATIVE_RETURNED as u32) >> 16;
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #returned_shifted, lsl #12
+            ; b.ne => leave
+            ; cbz x21, => interp
+            ; movz w0, #returned_hi, lsl #16
+            ; b => leave
+            ; => interp
+        );
+        let tag = match self.function_result {
+            Some(ValueType::Float) => ValueTag::Float.as_u8(),
+            Some(ValueType::Bool) => ValueTag::Bool.as_u8(),
+            _ => ValueTag::Int.as_u8(),
+        } as u32;
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; movz w13, #tag
+            ; strb w13, [x19]
+            ; str x1, [x19, #8]
+        );
+        // Register 0 of the interpreter frame receives the scalar result.
+        self.emit_mov_imm_i32(0, jit::FUNCTION_RETURN_BASE);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; => leave
+            ; ldp x27, x28, [sp], 16
+            ; ldp x25, x26, [sp], 16
+            ; ldp x23, x24, [sp], 16
+            ; ldp x21, x22, [sp], 16
+            ; ldp x19, x20, [sp], 16
+            ; ldp x29, x30, [sp], 16
+            ; ret
+        );
     }
 
     pub(super) fn function_label(&mut self, id: usize) -> dynasmrt::DynamicLabel {
@@ -172,6 +390,16 @@ impl JitCompiler {
         } else {
             pins::plan(&hoisted_constants, &trace.preamble, &trace.ops)
         };
+        if self.scalar_fast {
+            if let Some(plan) = pins::plan_scalar_fast(&trace.ops, &trace.entry_scalars) {
+                self.spill_off = plan.spills;
+                self.scalar_saved = plan.saved;
+                self.pins = plan.pins;
+                self.scalar_regfile = true;
+            } else {
+                self.pins.clear();
+            }
+        }
         crate::jit::log(|| {
             let mut text = format!("📋 JIT(aarch64): trace {:?} preamble:\n", trace_id);
             for op in &trace.preamble {
@@ -211,21 +439,85 @@ impl JitCompiler {
         });
 
         // Entry: x0 = *mut Value (registers), x1 = *mut VM, x2 = *const Function
-        if self.function_mode {
-            let entry = self.ops.new_dynamic_label();
-            dynasm!(self.ops ; .arch aarch64 ; => entry);
-            self.function_self = Some((trace.function_idx, entry));
+        if self.scalar_fast {
+            let fast = self.ops.new_dynamic_label();
+            self.function_self = Some((trace.function_idx, fast));
+            self.emit_scalar_vm_adapter(fast);
+            dynasm!(self.ops ; .arch aarch64 ; => fast);
+            self.emit_early_int_leaf(trace);
+            // Internal ABI: x0.. = scalar params, x20 = VM, x21 = the
+            // caller's record (preserved, so materializing exits stay
+            // honest). A regfile body keeps values in pins; anything that
+            // does not fit is a spill slot below x29.
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; stp x29, x30, [sp, -16]!
+                ; mov x29, sp
+            );
+            if self.scalar_regfile {
+                for (lo, hi) in self.scalar_saved.clone() {
+                    dynasm!(self.ops ; .arch aarch64 ; stp X(lo), X(hi), [sp, -16]!);
+                }
+                let spill_bytes = if self.spill_off.is_empty() {
+                    0
+                } else {
+                    let max_off = self.spill_off.values().copied().max().unwrap_or(0);
+                    (max_off + 15) & !15
+                };
+                // Saved pairs already sit below x29. Spills are below them,
+                // which `spill_off` measures from x29, so the subtraction
+                // includes the saved area.
+                let saved_bytes = self.scalar_saved.len() as i32 * 16;
+                let extra = spill_bytes - saved_bytes;
+                if extra > 0 {
+                    self.emit_sub_sp(extra);
+                }
+                for index in 0..self.scalar_params {
+                    if let Some(pin) = self.pins.get(&index).copied() {
+                        if pin.reg != index {
+                            dynasm!(self.ops ; .arch aarch64 ; mov X(pin.reg), X(index));
+                        }
+                    } else if self.spill_off.contains_key(&index) {
+                        self.store_payload(index, index);
+                    }
+                }
+            } else {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; stp x19, x20, [sp, -16]!
+                );
+                self.emit_sub_sp(stack_size);
+                let payload = (i32::from(self.function_frame.0) * 8 + 15) & !15;
+                self.emit_sub_sp(payload);
+                dynasm!(self.ops ; .arch aarch64 ; mov x19, sp);
+                for index in 0..self.scalar_params {
+                    let offset = u32::from(index) * 8;
+                    if offset == 0 {
+                        dynasm!(self.ops ; .arch aarch64 ; str X(index), [x19]);
+                    } else {
+                        dynasm!(self.ops ; .arch aarch64 ; str X(index), [x19, #offset]);
+                    }
+                }
+            }
+            self.payload_slots = true;
+        } else {
+            if self.function_mode {
+                let entry = self.ops.new_dynamic_label();
+                dynasm!(self.ops ; .arch aarch64 ; => entry);
+                self.function_self = Some((trace.function_idx, entry));
+            }
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; stp x29, x30, [sp, -16]!
+                ; mov x29, sp
+                ; stp x19, x20, [sp, -16]!
+                ; stp x21, x22, [sp, -16]!
+            );
         }
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; stp x29, x30, [sp, -16]!
-            ; mov x29, sp
-            ; stp x19, x20, [sp, -16]!
-            ; stp x21, x22, [sp, -16]!
-        );
         // Function code without pins leaves x23..x28 and d8..d15 untouched
-        // and need not save them.
-        if self.function_mode && self.pins.is_empty() {
+        // and need not save them. The scalar-fast prologue already saved
+        // only x19/x20.
+        if self.scalar_fast || (self.function_mode && self.pins.is_empty()) {
         } else {
             dynasm!(self.ops
                 ; .arch aarch64
@@ -238,21 +530,23 @@ impl JitCompiler {
                 ; stp d14, d15, [sp, -16]!
             );
         }
-        self.emit_sub_sp(stack_size);
-        // Entry: x0 = registers, x1 = VM, x2 = the inline record a native
-        // caller pushed for this frame (function mode; null from the
-        // interpreter). Traces are only ever entered by the interpreter.
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; mov x19, x0
-            ; mov x20, x1
-        );
-        if self.function_mode {
-            // x3 = where a native caller wants the result (null from the
-            // interpreter, which takes it from the return code).
-            dynasm!(self.ops ; .arch aarch64 ; mov x21, x2 ; mov x22, x3);
-        } else {
-            dynasm!(self.ops ; .arch aarch64 ; mov x21, xzr);
+        if !self.scalar_fast {
+            self.emit_sub_sp(stack_size);
+            // Entry: x0 = registers, x1 = VM, x2 = the inline record a native
+            // caller pushed for this frame (function mode; null from the
+            // interpreter). Traces are only ever entered by the interpreter.
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; mov x19, x0
+                ; mov x20, x1
+            );
+            if self.function_mode {
+                // x3 = where a native caller wants the result (null from the
+                // interpreter, which takes it from the return code).
+                dynasm!(self.ops ; .arch aarch64 ; mov x21, x2 ; mov x22, x3);
+            } else {
+                dynasm!(self.ops ; .arch aarch64 ; mov x21, xzr);
+            }
         }
         self.function_epilogue = Some(epilogue_label);
         for slot in 0..Self::count_specialized_slots(trace) as i32 {
@@ -290,6 +584,11 @@ impl JitCompiler {
         let mut pinned: Vec<(u8, pins::Pin)> = self.pins.iter().map(|(r, p)| (*r, *p)).collect();
         pinned.sort_by_key(|(r, _)| *r);
         for (vm_reg, pin) in &pinned {
+            if self.scalar_regfile {
+                // Arguments were moved into pins in the prologue. Other
+                // pins are written before they are read.
+                continue;
+            }
             if pin.class == pins::PinClass::Carried || self.function_mode {
                 self.emit_pin_load(*vm_reg, *pin);
             }
@@ -298,12 +597,14 @@ impl JitCompiler {
         if has_pins {
             self.pin_active = true;
             // Iteration two onwards arrives with every carried pin possibly
-            // newer than memory.
-            self.dirty_pins = pinned
-                .iter()
-                .filter(|(_, p)| p.class == pins::PinClass::Carried)
-                .map(|(r, _)| *r)
-                .collect();
+            // newer than memory. The scalar regfile has no memory image.
+            if !self.scalar_regfile {
+                self.dirty_pins = pinned
+                    .iter()
+                    .filter(|(_, p)| p.class == pins::PinClass::Carried)
+                    .map(|(r, _)| *r)
+                    .collect();
+            }
             self.exit_stack.push(exit_pinned_label);
         }
 
@@ -323,11 +624,21 @@ impl JitCompiler {
         if self.function_mode {
             // Every path through function code ends in a `Return`; falling
             // off the end is a compiler bug, reported as a bare failure.
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; movn w0, 0
-                ; b => exit_label
-            );
+            // Scalar-fast has no VM frame to materialize, so it returns
+            // straight through the epilogue.
+            if self.payload_slots {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; movn w0, 0
+                    ; b => epilogue_label
+                );
+            } else {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; movn w0, 0
+                    ; b => exit_label
+                );
+            }
         } else {
             // At end of loop body, jump back to loop_start to loop
             self.emit_gas_check(trace.ops.len());
@@ -391,7 +702,11 @@ impl JitCompiler {
 
         // Epilogue: sp is recovered from the frame pointer, so the exit path
         // is valid regardless of how deep an inline frame we came from.
-        let saved_below_fp = if self.function_mode && self.pins.is_empty() {
+        let saved_below_fp = if self.scalar_regfile {
+            (self.scalar_saved.len() as u32) * 16
+        } else if self.scalar_fast {
+            16u32
+        } else if self.function_mode && self.pins.is_empty() {
             32u32
         } else {
             SAVED_BELOW_FP as u32
@@ -402,7 +717,7 @@ impl JitCompiler {
             ; => epilogue_label
             ; sub sp, x29, #saved_below_fp
         );
-        if self.function_mode && self.pins.is_empty() {
+        if self.scalar_fast || (self.function_mode && self.pins.is_empty()) {
         } else {
             dynasm!(self.ops
                 ; .arch aarch64
@@ -415,10 +730,24 @@ impl JitCompiler {
                 ; ldp x23, x24, [sp], 16
             );
         }
+        if self.scalar_regfile {
+            for (lo, hi) in self.scalar_saved.iter().rev().copied() {
+                dynasm!(self.ops ; .arch aarch64 ; ldp X(lo), X(hi), [sp], 16);
+            }
+        } else {
+            if !self.scalar_fast {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldp x21, x22, [sp], 16
+                );
+            }
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldp x19, x20, [sp], 16
+            );
+        }
         dynasm!(self.ops
             ; .arch aarch64
-            ; ldp x21, x22, [sp], 16
-            ; ldp x19, x20, [sp], 16
             ; ldp x29, x30, [sp], 16
             ; ret
             // A failing postamble must not run the postamble again: return

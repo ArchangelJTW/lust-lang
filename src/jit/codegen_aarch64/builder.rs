@@ -127,6 +127,7 @@ impl JitCompiler {
             specialization_registry: SpecializationRegistry::new(),
             specialized_values: HashMap::new(),
             scalar_registers: HashMap::new(),
+            array_registers: hashbrown::HashSet::new(),
             pins: HashMap::new(),
             pin_active: false,
             hot_x0: None,
@@ -2349,6 +2350,11 @@ impl JitCompiler {
                     self.scalar_registers.get(src).copied()
                 };
                 set(&mut self.scalar_registers, *dest, ty);
+                if self.array_registers.contains(src) {
+                    self.array_registers.insert(*dest);
+                } else {
+                    self.array_registers.remove(dest);
+                }
             }
             TraceOp::Add {
                 dest,
@@ -2422,6 +2428,9 @@ impl JitCompiler {
                 register,
                 expected_type,
             } => {
+                if *expected_type == ValueType::Array {
+                    self.array_registers.insert(*register);
+                }
                 set(
                     &mut self.scalar_registers,
                     *register,
@@ -2434,8 +2443,13 @@ impl JitCompiler {
                 ..
             } => {
                 self.scalar_registers.remove(value_dest);
+                self.array_registers.remove(value_dest);
                 self.scalar_registers
                     .insert(*condition_dest, ValueType::Bool);
+            }
+            TraceOp::NewArray { dest, .. } => {
+                self.scalar_registers.remove(dest);
+                self.array_registers.insert(*dest);
             }
             TraceOp::Concat { dest, .. }
             | TraceOp::GetIndex { dest, .. }
@@ -2444,13 +2458,13 @@ impl JitCompiler {
             | TraceOp::CallFunction { dest, .. }
             | TraceOp::InlineCall { dest, .. }
             | TraceOp::CallMethod { dest, .. }
-            | TraceOp::NewArray { dest, .. }
             | TraceOp::NewStruct { dest, .. }
             | TraceOp::NewEnumUnit { dest, .. }
             | TraceOp::NewEnumVariant { dest, .. }
             | TraceOp::TryCast { dest, .. }
             | TraceOp::GetEnumValue { dest, .. } => {
                 self.scalar_registers.remove(dest);
+                self.array_registers.remove(dest);
             }
             // A borrow owns nothing; the value is of no particular type.
             TraceOp::BorrowField { dest, .. } | TraceOp::BorrowEnumValue { dest, .. } => {

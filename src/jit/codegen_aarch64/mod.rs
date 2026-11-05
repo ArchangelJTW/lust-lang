@@ -115,6 +115,8 @@ pub struct JitCompiler {
     pub(super) specialized_values: HashMap<usize, SpecializedValue>,
     /// Registers proven to contain non-owning scalar values at this point.
     pub(super) scalar_registers: HashMap<u8, ValueType>,
+    /// Registers proven to contain an Array value at this point.
+    pub(super) array_registers: hashbrown::HashSet<u8>,
     /// VM registers held in machine registers for the loop body.
     pins: HashMap<u8, pins::Pin>,
     /// Pins apply only while compiling the loop body (not the preamble,

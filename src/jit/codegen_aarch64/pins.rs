@@ -473,11 +473,11 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
             array,
             index,
             value,
-            ..
+            element_type,
         } => {
             e.reads.push((*array, None));
-            e.reads.push((*index, None));
-            e.reads.push((*value, None));
+            e.reads.push((*index, Some(ValueType::Int)));
+            e.reads.push((*value, *element_type));
         }
         TraceOp::ArrayPush { dest, array, value } => {
             e.reads.push((*array, None));

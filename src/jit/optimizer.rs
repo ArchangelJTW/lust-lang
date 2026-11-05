@@ -24,6 +24,7 @@ impl TraceOptimizer {
         self.eliminate_dead_stores_before_select(trace);
         self.optimize_modulo_select(trace);
         self.optimize_constant_modulo(trace);
+        self.isolate_conflicting_types(trace);
         self.isolate_loop_constants(trace);
         self.hoist_constants(trace);
         self.unroll_loop(trace, crate::jit::UNROLL_FACTOR);
@@ -427,6 +428,104 @@ impl TraceOptimizer {
                     || Self::other_writes(&trace.ops[j]).contains(&dest)
                 {
                     break;
+                }
+            }
+        }
+    }
+
+    fn isolate_conflicting_types(&mut self, trace: &mut Trace) {
+        if trace.ops.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::NestedLoopCall { .. }
+                    | TraceOp::CallFunction { .. }
+                    | TraceOp::CallMethod { .. }
+            )
+        }) {
+            return;
+        }
+
+        let mut max_reg = 0;
+        for op in trace
+            .preamble
+            .iter()
+            .chain(&trace.ops)
+            .chain(&trace.postamble)
+        {
+            if let Some(d) = Self::dest_of(op) {
+                max_reg = max_reg.max(d);
+            }
+            for r in Self::reads_of(op) {
+                max_reg = max_reg.max(r);
+            }
+            for w in Self::other_writes(op) {
+                max_reg = max_reg.max(w);
+            }
+        }
+
+        fn op_write_type(op: &TraceOp) -> Option<(Register, ValueType)> {
+            match op {
+                TraceOp::Lt { dest, .. }
+                | TraceOp::Le { dest, .. }
+                | TraceOp::Gt { dest, .. }
+                | TraceOp::Ge { dest, .. }
+                | TraceOp::Eq { dest, .. }
+                | TraceOp::Ne { dest, .. } => Some((*dest, ValueType::Bool)),
+                TraceOp::Add { dest, lhs_type, rhs_type, .. }
+                | TraceOp::Sub { dest, lhs_type, rhs_type, .. }
+                | TraceOp::Mul { dest, lhs_type, rhs_type, .. }
+                | TraceOp::Div { dest, lhs_type, rhs_type, .. } => {
+                    let ty = match (*lhs_type, *rhs_type) {
+                        (ValueType::Int, ValueType::Int) => ValueType::Int,
+                        (ValueType::Float, _) | (_, ValueType::Float) => ValueType::Float,
+                        _ => return None,
+                    };
+                    Some((*dest, ty))
+                }
+                _ => None,
+            }
+        }
+
+        for i in 0..trace.ops.len() {
+            let (target_reg, ty) = match op_write_type(&trace.ops[i]) {
+                Some(pair) => pair,
+                None => continue,
+            };
+
+            let has_conflict = trace.ops.iter().enumerate().any(|(idx, other)| {
+                idx != i
+                    && op_write_type(other).is_some_and(|(other_reg, other_ty)| {
+                        other_reg == target_reg && other_ty != ty
+                    })
+            });
+
+            if has_conflict && max_reg < 220 {
+                max_reg = max_reg.saturating_add(1);
+                let fresh = max_reg;
+
+                match &mut trace.ops[i] {
+                    TraceOp::Lt { dest, .. }
+                    | TraceOp::Le { dest, .. }
+                    | TraceOp::Gt { dest, .. }
+                    | TraceOp::Ge { dest, .. }
+                    | TraceOp::Eq { dest, .. }
+                    | TraceOp::Ne { dest, .. }
+                    | TraceOp::Add { dest, .. }
+                    | TraceOp::Sub { dest, .. }
+                    | TraceOp::Mul { dest, .. }
+                    | TraceOp::Div { dest, .. } => {
+                        *dest = fresh;
+                    }
+                    _ => {}
+                }
+
+                for j in (i + 1)..trace.ops.len() {
+                    Self::remap_op_reads(&mut trace.ops[j], target_reg, fresh);
+                    if Self::dest_of(&trace.ops[j]) == Some(target_reg)
+                        || Self::other_writes(&trace.ops[j]).contains(&target_reg)
+                    {
+                        break;
+                    }
                 }
             }
         }

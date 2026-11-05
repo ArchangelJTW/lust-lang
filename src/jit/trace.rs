@@ -3118,11 +3118,21 @@ impl TraceRecorder {
                         });
                         if scalar {
                             let elements = arr.borrow();
-                            if !elements.is_empty()
-                                && elements.iter().all(|element| {
+                            let len = elements.len();
+                            let is_uniform = if len == 0 {
+                                false
+                            } else if len <= 64 {
+                                elements.iter().all(|element| {
                                     Self::get_value_type(element) == ty
                                 })
-                            {
+                            } else {
+                                elements[..32].iter().all(|element| {
+                                    Self::get_value_type(element) == ty
+                                }) && elements[len - 32..].iter().all(|element| {
+                                    Self::get_value_type(element) == ty
+                                })
+                            };
+                            if is_uniform {
                                 ty
                             } else {
                                 None

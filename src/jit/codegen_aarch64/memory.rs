@@ -226,12 +226,14 @@ impl JitCompiler {
             let _value_size = mem::size_of::<Value>() as u32;
             let done = self.ops.new_dynamic_label();
             let slow = self.ops.new_dynamic_label();
-            self.load_tag(0, array);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; cmp w0, #array_tag
-                ; b.ne => slow
-            );
+            if !self.array_registers.contains(&array) {
+                self.load_tag(0, array);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w0, #array_tag
+                    ; b.ne => slow
+                );
+            }
             self.load_payload(12, index);
             self.emit_reg_addr(11, array);
             // A monomorphic scalar array never holds an owned element, so
@@ -339,12 +341,14 @@ impl JitCompiler {
             let done = self.ops.new_dynamic_label();
             let out_of_range = self.ops.new_dynamic_label();
             let slow = self.ops.new_dynamic_label();
-            self.load_tag(0, array);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; cmp w0, #array_tag
-                ; b.ne => slow
-            );
+            if !self.array_registers.contains(&array) {
+                self.load_tag(0, array);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w0, #array_tag
+                    ; b.ne => slow
+                );
+            }
             self.load_payload(12, index);
             self.emit_reg_addr(11, array);
             dynasm!(self.ops
@@ -842,12 +846,14 @@ impl JitCompiler {
             let _value_size = mem::size_of::<Value>() as u32;
             let done = self.ops.new_dynamic_label();
             let slow = self.ops.new_dynamic_label();
-            self.load_tag(0, array);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; cmp w0, #array_tag
-                ; b.ne => slow
-            );
+            if !self.array_registers.contains(&array) {
+                self.load_tag(0, array);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w0, #array_tag
+                    ; b.ne => slow
+                );
+            }
             self.emit_reg_addr(11, array);
             dynasm!(self.ops
                 ; .arch aarch64
@@ -859,26 +865,48 @@ impl JitCompiler {
                 ; cmp x12, x10
                 ; b.hs => slow
             );
-            if !self.scalar_registers.contains_key(&value) {
+            if let Some(ty) = self.scalar_registers.get(&value).copied() {
+                let tag = match ty {
+                    ValueType::Int => ValueTag::Int.as_u8(),
+                    ValueType::Float => ValueTag::Float.as_u8(),
+                    _ => ValueTag::Bool.as_u8(),
+                } as u32;
+                if ty == ValueType::Bool {
+                    self.load_bool_payload(1, value);
+                } else {
+                    self.load_payload(1, value);
+                }
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; movz x0, #tag
+                    ; ldr x10, [x9, #ptr_offset]
+                    ; add x10, x10, x12, lsl #4
+                    ; stp x0, x1, [x10]
+                    ; add x12, x12, #1
+                    ; str x12, [x9, #len_offset]
+                    ; b => done
+                    ; => slow
+                );
+            } else {
                 self.load_tag_from_memory(13, value);
                 dynasm!(self.ops
                     ; .arch aarch64
                     ; cmp w13, #scalar_max_tag
                     ; b.hi => slow
                 );
+                self.emit_reg_addr(11, value);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr x10, [x9, #ptr_offset]
+                    ; add x10, x10, x12, lsl #4
+                    ; ldp x0, x1, [x11]
+                    ; stp x0, x1, [x10]
+                    ; add x12, x12, #1
+                    ; str x12, [x9, #len_offset]
+                    ; b => done
+                    ; => slow
+                );
             }
-            self.emit_reg_addr(11, value);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; ldr x10, [x9, #ptr_offset]
-                ; add x10, x10, x12, lsl #4
-                ; ldp x0, x1, [x11]
-                ; stp x0, x1, [x10]
-                ; add x12, x12, #1
-                ; str x12, [x9, #len_offset]
-                ; b => done
-                ; => slow
-            );
             dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
             self.emit_reg_addr(1, array);
             self.emit_reg_addr(2, value);

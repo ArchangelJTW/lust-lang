@@ -471,6 +471,7 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
             array,
             index,
             value,
+            ..
         } => {
             e.reads.push((*array, None));
             e.reads.push((*index, None));
@@ -613,16 +614,15 @@ pub(super) fn op_touches_register_memory(op: &TraceOp) -> bool {
     )
 }
 
-/// Plan the pins for a trace body. `preamble` establishes the scalar types
-/// known at loop entry.
-/// Plan the pins for function code. Control flow makes the trace rules
-/// (loop-carried state, entry proofs) meaningless, so every pin here is a
-/// write-through `Local` one: a register every write of which is a typed
-/// native op of one scalar type, never a helper. Memory stays current, so
-/// reads may use the machine register only where the static environment
-/// proves the type (see `JitCompiler::active_pin`), and the machine
-/// registers are loaded from the frame at entry. The environment restarts
-/// from each label's known scalars, as the translator computed them.
+/// Plan the pins for function code. A register is pinned when every write
+/// is a typed native op of one scalar type and nothing writes it through a
+/// helper. Inside a loop, a register that is read before it is written
+/// (loop-carried state) is `Carried`: the payload stays in the machine
+/// register and is written back only when memory must observe it.
+/// Everything else is a write-through `Local`. Reads use the machine
+/// register only where the static environment proves the type (see
+/// `JitCompiler::active_pin`). The environment restarts from each label's
+/// known scalars, as the translator computed them.
 pub(super) fn plan_function(body: &[TraceOp]) -> HashMap<u8, Pin> {
     #[cfg(feature = "std")]
     if std::env::var_os("LUST_JIT_NOPIN").is_some() {
@@ -682,6 +682,7 @@ pub(super) fn plan_function(body: &[TraceOp]) -> HashMap<u8, Pin> {
         }
     }
     eligible.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    let live_in = carried_registers(body);
     let mut ints = INT_PIN_REGS.iter();
     let mut floats = FLOAT_PIN_REGS.iter();
     let mut pins = HashMap::new();
@@ -691,17 +692,77 @@ pub(super) fn plan_function(body: &[TraceOp]) -> HashMap<u8, Pin> {
             _ => ints.next(),
         };
         let Some(reg) = reg else { continue };
+        let carried = live_in.contains(&r);
         pins.insert(
             r,
             Pin {
                 ty,
                 reg: *reg,
-                class: PinClass::Local,
-                proven_at_entry: false,
+                class: if carried {
+                    PinClass::Carried
+                } else {
+                    PinClass::Local
+                },
+                proven_at_entry: carried,
             },
         );
     }
     pins
+}
+
+/// VM registers that are loop-carried in `body`: read (or guarded) before
+/// they are written on some path through a back-edge, and written by a
+/// native op inside that loop. Their payload must survive the back-edge in
+/// a machine register; memory is stale until a flush.
+fn carried_registers(body: &[TraceOp]) -> hashbrown::HashSet<u8> {
+    let mut label_at: HashMap<usize, usize> = HashMap::new();
+    for (index, op) in body.iter().enumerate() {
+        if let TraceOp::Label { id, .. } = op {
+            label_at.insert(*id, index);
+        }
+    }
+    let mut carried = hashbrown::HashSet::new();
+    for (index, op) in body.iter().enumerate() {
+        let label = match op {
+            TraceOp::Jump { label } | TraceOp::BranchIf { label, .. } => *label,
+            _ => continue,
+        };
+        let Some(&start) = label_at.get(&label) else {
+            continue;
+        };
+        if start > index {
+            continue;
+        }
+        let mut env = match &body[start] {
+            TraceOp::Label { scalars, .. } => scalars.iter().copied().collect(),
+            _ => HashMap::new(),
+        };
+        let mut first: HashMap<u8, Access> = HashMap::new();
+        let mut wrote = hashbrown::HashSet::new();
+        for op in &body[start..=index] {
+            let effects = effects(op, &env);
+            if let Some((reg, ty)) = effects.guard {
+                first.entry(reg).or_insert(Access::Guard(ty));
+            }
+            for (reg, _) in effects.reads {
+                first.entry(reg).or_insert(Access::Read);
+            }
+            for (reg, _) in effects.native_writes {
+                first.entry(reg).or_insert(Access::Write);
+                wrote.insert(reg);
+            }
+            for reg in effects.helper_writes {
+                first.entry(reg).or_insert(Access::Write);
+            }
+            env_update(&mut env, op);
+        }
+        for (reg, access) in first {
+            if wrote.contains(&reg) && !matches!(access, Access::Write) {
+                carried.insert(reg);
+            }
+        }
+    }
+    carried
 }
 
 pub(super) fn plan(

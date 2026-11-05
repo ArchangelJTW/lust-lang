@@ -748,8 +748,9 @@ impl JitCompiler {
                     array,
                     index,
                     value,
+                    element_type,
                 } => {
-                    self.compile_set_index(*array, *index, *value)?;
+                    self.compile_set_index(*array, *index, *value, *element_type)?;
                 }
 
                 TraceOp::ArrayPush { dest, array, value } => {
@@ -1671,6 +1672,7 @@ impl JitCompiler {
                 array,
                 index,
                 value,
+                ..
             } => *array == register || *index == register || *value == register,
             TraceOp::ArrayPush { array, value, .. } => *array == register || *value == register,
             TraceOp::NewArray {

@@ -905,6 +905,7 @@ impl TraceOptimizer {
                 array,
                 index,
                 value,
+                ..
             } => vec![*array, *index, *value],
             TraceOp::ArrayPush { array, value, .. } => vec![*array, *value],
             TraceOp::GetIndex { array, index, .. }

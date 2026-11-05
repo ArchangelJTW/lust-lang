@@ -22,6 +22,7 @@ impl JitCompiler {
             verified_enum: None,
             verified_enum_in: None,
             dirty_pins: Vec::new(),
+            pin_tag_ready: 0,
             trace_start_ip: 0,
             function_mode: false,
             function_alias_params: 0,
@@ -185,6 +186,7 @@ impl JitCompiler {
         });
         self.pin_active = false;
         self.dirty_pins.clear();
+        self.pin_tag_ready = 0;
         self.current_fail_ip = None;
         self.fail_sites.clear();
         self.cached_select_imms = None;
@@ -482,6 +484,7 @@ impl JitCompiler {
     /// A jump to a label already bound is a loop back-edge: charge the ops
     /// between (before the jump, whether or not a conditional one is
     /// taken).
+
     fn emit_back_edge_gas_check(&mut self, label: usize) {
         if let Some(position) = self.label_positions.get(&label).copied() {
             self.emit_gas_check(self.op_counter.saturating_sub(position));
@@ -942,8 +945,9 @@ impl JitCompiler {
                     array,
                     index,
                     value,
+                    element_type,
                 } => {
-                    self.compile_set_index(*array, *index, *value)?;
+                    self.compile_set_index(*array, *index, *value, *element_type)?;
                 }
 
                 TraceOp::ArrayPush { dest, array, value } => {
@@ -1353,6 +1357,29 @@ impl JitCompiler {
                     let label = self.function_label(*id);
                     dynasm!(self.ops ; .arch aarch64 ; => label);
                     self.label_positions.insert(*id, self.op_counter);
+                    // A carried pin is current only while this label's
+                    // environment still names its type. Otherwise the next
+                    // read comes from memory, which must be flushed first.
+                    if self.pin_active && !self.dirty_pins.is_empty() {
+                        let known: hashbrown::HashMap<u8, ValueType> =
+                            scalars.iter().copied().collect();
+                        let dirty = mem::take(&mut self.dirty_pins);
+                        for vm_reg in dirty {
+                            let Some(pin) = self.pins.get(&vm_reg).copied() else {
+                                continue;
+                            };
+                            if known.get(&vm_reg) == Some(&pin.ty) {
+                                self.dirty_pins.push(vm_reg);
+                            } else if pin.class == pins::PinClass::Carried
+                                && pin.proven_at_entry
+                            {
+                                // Live into this label, but the environment
+                                // no longer treats it as that scalar:
+                                // memory is what the next read uses.
+                                self.emit_pin_writeback(vm_reg, pin);
+                            }
+                        }
+                    }
                     self.scalar_registers = scalars.iter().copied().collect();
                     // Control also arrives here by jump.
                     self.hot_x0_in = None;
@@ -1826,6 +1853,7 @@ impl JitCompiler {
                 array,
                 index,
                 value,
+                ..
             } => *array == register || *index == register || *value == register,
             TraceOp::ArrayPush { array, value, .. } => *array == register || *value == register,
             TraceOp::NewArray {

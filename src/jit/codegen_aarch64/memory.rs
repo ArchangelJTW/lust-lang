@@ -188,7 +188,13 @@ impl JitCompiler {
     /// value owns anything are checked, then the value's two words replace
     /// the element. Anything else goes through the helper, which fails to
     /// the interpreter for an error.
-    pub(super) fn compile_set_index(&mut self, array: u8, index: u8, value: u8) -> Result<()> {
+    pub(super) fn compile_set_index(
+        &mut self,
+        array: u8,
+        index: u8,
+        value: u8,
+        element_type: Option<ValueType>,
+    ) -> Result<()> {
         unsafe extern "C" {
             fn jit_array_set_index_safe(
                 array_value: *const Value,
@@ -217,6 +223,11 @@ impl JitCompiler {
             );
             self.load_payload(12, index);
             self.emit_reg_addr(11, array);
+            // A monomorphic scalar array never holds an owned element, so
+            // the old tag (and its rc_dec) can be skipped.
+            let scalar_slot = element_type
+                .is_some_and(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool))
+                && self.scalar_registers.get(&value) == element_type.as_ref();
             dynasm!(self.ops
                 ; .arch aarch64
                 ; ldr x9, [x11, #rc_offset]
@@ -225,10 +236,15 @@ impl JitCompiler {
                 ; b.hs >fail
                 ; ldr x10, [x9, #ptr_offset]
                 ; add x10, x10, x12, lsl #4
-                ; ldrb w9, [x10]
-                ; cmp w9, #scalar_max_tag
-                ; b.hi => slow
             );
+            if !scalar_slot {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldrb w9, [x10]
+                    ; cmp w9, #scalar_max_tag
+                    ; b.hi => slow
+                );
+            }
             if let Some(ty) = self.scalar_registers.get(&value).copied() {
                 let tag = match ty {
                     ValueType::Int => ValueTag::Int.as_u8(),

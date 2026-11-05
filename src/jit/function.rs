@@ -1141,10 +1141,12 @@ impl<'a> Translator<'a> {
             }
             Instruction::SetIndex(array, index, value) => {
                 self.guard(index, ValueType::Int);
+                let element_type = self.env.elements.get(&array).copied();
                 self.ops.push(TraceOp::SetIndex {
                     array,
                     index,
                     value,
+                    element_type,
                 });
             }
             Instruction::GetIndex(dest, array, index) => {

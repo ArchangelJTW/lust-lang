@@ -212,6 +212,7 @@ impl JitCompiler {
         if pin.ty == ValueType::Float || pin.class != pins::PinClass::Carried {
             return None;
         }
+        self.ensure_pin_tag(vm_reg, pin);
         self.mark_dirty(vm_reg);
         Some(pin.reg)
     }
@@ -223,8 +224,24 @@ impl JitCompiler {
         if pin.ty != ValueType::Float || pin.class != pins::PinClass::Carried {
             return None;
         }
+        self.ensure_pin_tag(vm_reg, pin);
         self.mark_dirty(vm_reg);
         Some(pin.reg)
+    }
+
+    /// Publish the pin's tag the first time this slot is written. Later
+    /// carried writes leave the tag alone. A slot the environment already
+    /// knows to hold the pin's type is already tagged.
+    fn ensure_pin_tag(&mut self, vm_reg: u8, pin: pins::Pin) {
+        let bit = 1u64 << vm_reg;
+        if self.pin_tag_ready & bit != 0 {
+            return;
+        }
+        self.pin_tag_ready |= bit;
+        if self.scalar_registers.get(&vm_reg) == Some(&pin.ty) {
+            return;
+        }
+        self.store_tag_imm(vm_reg, Self::pin_tag(&pin));
     }
 
     // ── Immediates ────────────────────────────────────────────────────────
@@ -539,7 +556,18 @@ impl JitCompiler {
             dynasm!(self.ops ; .arch aarch64 ; mov X(pin.reg), x0);
             if pin.class == pins::PinClass::Carried {
                 self.mark_dirty(vm_reg);
-                return;
+                // The tag is already this scalar: keep the payload in the
+                // pin and skip the frame store. The first store into a slot
+                // that is not yet that type still publishes the tag.
+                if self.scalar_registers.get(&vm_reg) == Some(&stored_type) {
+                    return;
+                }
+                if self.scalar_registers.contains_key(&vm_reg) {
+                    self.store_tag_imm(vm_reg, discriminant);
+                    self.store_payload(vm_reg, 0);
+                    self.hot_x0 = Some(vm_reg);
+                    return;
+                }
             }
             // Local pins write through so memory is always current.
         }
@@ -606,7 +634,16 @@ impl JitCompiler {
             dynasm!(self.ops ; .arch aarch64 ; fmov D(pin.reg), d0);
             if pin.class == pins::PinClass::Carried {
                 self.mark_dirty(vm_reg);
-                return;
+                if self.scalar_registers.get(&vm_reg) == Some(&ValueType::Float) {
+                    return;
+                }
+                if self.scalar_registers.contains_key(&vm_reg) {
+                    self.store_tag_imm(vm_reg, float_tag);
+                    let offset = (reg_offset(vm_reg) + 8) as u32;
+                    dynasm!(self.ops ; .arch aarch64 ; str d0, [x19, #offset]);
+                    self.hot_d0 = Some(vm_reg);
+                    return;
+                }
             }
         }
         if self.scalar_registers.get(&vm_reg) == Some(&ValueType::Float) {

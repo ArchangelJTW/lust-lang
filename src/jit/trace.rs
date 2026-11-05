@@ -230,6 +230,11 @@ pub enum TraceOp {
         array: Register,
         index: Register,
         value: Register,
+        /// Declared element type when the array is monomorphic in a scalar
+        /// (`Array<bool>`, `Array<int>`, `Array<float>`). The old element is
+        /// then a scalar too, so the store need not check its tag or
+        /// decrement a reference count.
+        element_type: Option<ValueType>,
     },
     /// `array.push(array, value)` on a plain (unspecialized) `Array`: a
     /// clone of the value is appended and `dest` becomes Nil, or the op
@@ -3091,10 +3096,37 @@ impl TraceRecorder {
                         self.mark_guarded(reg);
                     }
                 }
+                // A monomorphic scalar array (every element already that
+                // scalar) does not need an old-tag check on the store.
+                // An empty array is not evidence: it may later hold objects.
+                let element_type = match &registers[array as usize] {
+                    Value::Array(arr) => {
+                        let ty = Self::get_value_type(&registers[value as usize]);
+                        let scalar = ty.is_some_and(|ty| {
+                            matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool)
+                        });
+                        if scalar {
+                            let elements = arr.borrow();
+                            if !elements.is_empty()
+                                && elements.iter().all(|element| {
+                                    Self::get_value_type(element) == ty
+                                })
+                            {
+                                ty
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
                 self.push_op(TraceOp::SetIndex {
                     array,
                     index,
                     value,
+                    element_type,
                 });
                 Ok(())
             }

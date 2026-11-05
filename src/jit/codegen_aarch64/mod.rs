@@ -135,6 +135,9 @@ pub struct JitCompiler {
     verified_enum_in: Option<u8>,
     /// Carried pins whose machine value may be newer than memory.
     dirty_pins: Vec<u8>,
+    /// Bit `i` set once registers[i]'s tag is known to match its carried pin.
+    /// Further writes keep the payload in the pin and do not retag the slot.
+    pin_tag_ready: u64,
     /// Loop-header ip of the trace being compiled: where a guard that fails
     /// before any instruction of the body has run resumes.
     pub(super) trace_start_ip: usize,

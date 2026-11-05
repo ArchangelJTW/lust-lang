@@ -193,7 +193,13 @@ impl JitCompiler {
     /// `array[index] = value` (see the aarch64 backend): inline for a
     /// known int index when neither the old element nor the value owns
     /// anything, the helper otherwise.
-    pub(super) fn compile_set_index(&mut self, array: u8, index: u8, value: u8) -> Result<()> {
+    pub(super) fn compile_set_index(
+        &mut self,
+        array: u8,
+        index: u8,
+        value: u8,
+        element_type: Option<ValueType>,
+    ) -> Result<()> {
         let array_offset = (array as i32) * (mem::size_of::<Value>() as i32);
         let index_offset = (index as i32) * (mem::size_of::<Value>() as i32);
         let value_offset = (value as i32) * (mem::size_of::<Value>() as i32);
@@ -228,9 +234,17 @@ impl JitCompiler {
                 ; mov r10, [r9 + ptr_offset]
                 ; imul r8, r8, value_size
                 ; add r10, r8
-                ; cmp BYTE [r10], scalar_max_tag
-                ; ja => slow
             );
+            let scalar_slot = element_type
+                .is_some_and(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool))
+                && self.scalar_registers.get(&value) == element_type.as_ref();
+            if !scalar_slot {
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; cmp BYTE [r10], scalar_max_tag
+                    ; ja => slow
+                );
+            }
             if !self.scalar_registers.contains_key(&value) {
                 dynasm!(self.ops
                     ; .arch x64

@@ -29,9 +29,11 @@ with tempfile.TemporaryDirectory() as td:
             e.update(env)
         start = time.perf_counter_ns()
         try:
-            res = subprocess.run(cmd, cwd=td, env=e, capture_output=True, text=True, timeout=120)
+            res = subprocess.run(cmd, cwd=td, env=e, capture_output=True, text=True, timeout=int(os.environ.get("TIMEOUT", 120)))
             dur_ms = (time.perf_counter_ns() - start) / 1_000_000
             last_line = res.stdout.strip().splitlines()[-1] if res.stdout.strip() else ""
+            if res.returncode != 0:
+                return "crash/error", f"<exit {res.returncode}>"
             return f"{dur_ms:6.1f} ms", last_line
         except subprocess.TimeoutExpired:
             return "timeout", "<timeout>"
@@ -45,10 +47,18 @@ with tempfile.TemporaryDirectory() as td:
         t_lj, o_lj = run_cmd(["luajit", str(suite_dir / f"{prog}.lua")])
         t_lua, o_lua = run_cmd(["lua", str(suite_dir / f"{prog}.lua")])
         
-        same = "same"
-        if o_vm != o_jit:
-            same = "LUST DIFFERS"
-        if o_jit != o_lj:
-            same += f" (luajit prints {o_lj})"
-        print(f"{prog:<10} {t_rust:>9} {t_jit:>10} {t_lj:>9} {t_vm:>10} {t_lua:>9}   {same}")
+        outputs = [("rust", o_rust), ("jit", o_jit), ("luajit", o_lj), ("vm", o_vm), ("lua", o_lua)]
+        reference = outputs[0][1]
+        def match_val(a, b):
+            if a == b:
+                return True
+            try:
+                fa, fb = float(a), float(b)
+                import math
+                return math.isclose(fa, fb, rel_tol=1e-6)
+            except ValueError:
+                return False
+        diff = [name for name, output in outputs[1:] if not match_val(reference, output)]
+        status = "same" if not diff else "DIFF: rust!=" + ",".join(diff)
+        print(f"{prog:<10} {t_rust:>9} {t_jit:>10} {t_lj:>9} {t_vm:>10} {t_lua:>9}   {status}")
 EOF

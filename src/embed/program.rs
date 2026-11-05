@@ -272,7 +272,15 @@ pub struct EmbeddedProgram {
     entry_script: Option<String>,
     entry_module: String,
     async_registry: Rc<RefCell<AsyncRegistry>>,
-    last_typed_target: Option<(String, usize)>,
+    last_typed_target: Option<CachedTypedCall>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedTypedCall {
+    name: String,
+    func_idx: usize,
+    args_type: &'static str,
+    ret_type: &'static str,
 }
 
 /// OPT-06: A pre-resolved typed function handle for zero-overhead host calls.
@@ -649,12 +657,40 @@ impl EmbeddedProgram {
             .ok_or_else(|| LustError::TypeError {
                 message: format!("Unknown struct '{}'", type_name),
             })?;
-        let mut provided: HashMap<String, TypedValue> = fields
+
+        let raw_fields: Vec<StructField> = fields.into_iter().map(Into::into).collect();
+
+        // Fast-path: fields match exact definition order (zero HashMap, zero linear search)
+        if raw_fields.len() == def.fields.len()
+            && raw_fields
+                .iter()
+                .zip(&def.fields)
+                .all(|(rf, df)| rf.name() == df.name)
+        {
+            let mut ordered_values = Vec::with_capacity(raw_fields.len());
+            for (field, def_field) in raw_fields.into_iter().zip(&def.fields) {
+                let (_name, typed_value) = field.into_parts();
+                let matches_ref_inner = matches!(def_field.ownership, FieldOwnership::Weak)
+                    && matches!(typed_value.as_value(), Value::Struct { .. });
+                if !typed_value.matches(&def_field.ty) && !matches_ref_inner {
+                    return Err(LustError::TypeError {
+                        message: format!(
+                            "Struct field '{}' expects Rust value of type '{}' but received '{}'",
+                            def_field.name,
+                            def_field.ty,
+                            typed_value.description()
+                        ),
+                    });
+                }
+                ordered_values.push(typed_value.into_value());
+            }
+            let value = self.vm.instantiate_struct_ordered(&type_name, ordered_values)?;
+            return Ok(StructInstance::new(type_name, value));
+        }
+
+        let mut provided: HashMap<String, TypedValue> = raw_fields
             .into_iter()
-            .map(|field| {
-                let field: StructField = field.into();
-                field.into_parts()
-            })
+            .map(|field| field.into_parts())
             .collect();
         let mut ordered_fields: Vec<(Rc<String>, Value)> = Vec::with_capacity(def.fields.len());
         for field in &def.fields {
@@ -1077,6 +1113,29 @@ impl EmbeddedProgram {
         Args: FunctionArgs,
         Ret: FromLustValue,
     {
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if self.vm.has_native_entry(handle.func_idx) {
+            let mut opt_args = Some(args);
+            if let Some(res) = self.vm.call_direct_fast_with(handle.func_idx, |dst| {
+                opt_args.take().unwrap().write_args(dst)
+            }) {
+                return Ret::from_value(res?);
+            }
+            if let Some(args) = opt_args {
+                let mut stack_args = [const { Value::Nil }; 16];
+                let arg_count = args.write_args(&mut stack_args);
+                let value = self.vm.call_retained_target_slice(
+                    handle.func_idx,
+                    &handle.expected_name,
+                    &stack_args[..arg_count],
+                )?;
+                return Ret::from_value(value);
+            }
+            return Err(LustError::RuntimeError {
+                message: "Internal error in native call".to_string(),
+            });
+        }
+
         let mut stack_args = [const { Value::Nil }; 16];
         let arg_count = args.write_args(&mut stack_args);
         let value = self.vm.call_retained_target_slice(
@@ -1092,23 +1151,28 @@ impl EmbeddedProgram {
         Args: FunctionArgs,
         R: FromLustValue,
     {
-        let signature = self
-            .signatures
-            .get(function_name)
-            .ok_or_else(|| LustError::TypeError {
-                message: format!(
-                    "No type information available for function '{}'; \
-                     use call_raw if the function is dynamically typed",
-                    function_name
-                ),
-            })?;
-        Args::validate_signature(function_name, &signature.params)?;
-        ensure_return_type::<R>(function_name, &signature.return_type)?;
-        let func_idx = if let Some((cached_name, cached_idx)) = &self.last_typed_target
-            && cached_name == function_name
+        let args_type = std::any::type_name::<Args>();
+        let ret_type = std::any::type_name::<R>();
+
+        let func_idx = if let Some(cached) = &self.last_typed_target
+            && cached.name == function_name
+            && cached.args_type == args_type
+            && cached.ret_type == ret_type
         {
-            *cached_idx
+            cached.func_idx
         } else {
+            let signature = self
+                .signatures
+                .get(function_name)
+                .ok_or_else(|| LustError::TypeError {
+                    message: format!(
+                        "No type information available for function '{}'; \
+                         use call_raw if the function is dynamically typed",
+                        function_name
+                    ),
+                })?;
+            Args::validate_signature(function_name, &signature.params)?;
+            ensure_return_type::<R>(function_name, &signature.return_type)?;
             let idx = self
                 .vm
                 .functions()
@@ -1117,9 +1181,37 @@ impl EmbeddedProgram {
                 .ok_or_else(|| LustError::RuntimeError {
                     message: format!("Function not found: {}", function_name),
                 })?;
-            self.last_typed_target = Some((function_name.to_string(), idx));
+            self.last_typed_target = Some(CachedTypedCall {
+                name: function_name.to_string(),
+                func_idx: idx,
+                args_type,
+                ret_type,
+            });
             idx
         };
+
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if self.vm.has_native_entry(func_idx) {
+            let mut opt_args = Some(args);
+            if let Some(res) = self.vm.call_direct_fast_with(func_idx, |dst| {
+                opt_args.take().unwrap().write_args(dst)
+            }) {
+                return R::from_value(res?);
+            }
+            if let Some(args) = opt_args {
+                let mut stack_args = [const { Value::Nil }; 16];
+                let arg_count = args.write_args(&mut stack_args);
+                let value = self.vm.call_retained_target_slice(
+                    func_idx,
+                    function_name,
+                    &stack_args[..arg_count],
+                )?;
+                return R::from_value(value);
+            }
+            return Err(LustError::RuntimeError {
+                message: "Internal error in native call".to_string(),
+            });
+        }
 
         let mut stack_args = [const { Value::Nil }; 16];
         let arg_count = args.write_args(&mut stack_args);

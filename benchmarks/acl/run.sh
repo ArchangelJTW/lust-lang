@@ -2,6 +2,8 @@
 set -eu
 cd "$(dirname "$0")/../.."
 python3 benchmarks/acl/oracle.py
+rustc --edition 2021 --crate-type cdylib -C opt-level=3 -C panic=abort -C link-arg=-lSystem benchmarks/acl/rules/policy_c.rs -o benchmarks/acl/rules/policy.dylib
+rustc --edition 2021 --target wasm32-wasip1 --crate-type cdylib -C opt-level=3 -C panic=abort benchmarks/acl/rules/policy_c.rs -o benchmarks/acl/rules/policy.wasm
 cargo build --release -p bench-host --bin acl --bin acl_comparators
 mkdir -p results/acl/v2
 if cargo build --release --manifest-path crates/bench-host-fork/Cargo.toml --bin acl-fork > results/acl/v2/fork-build.log 2>&1; then

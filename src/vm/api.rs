@@ -372,6 +372,25 @@ impl VM {
         Self::build_struct_value(struct_name, info, fields)
     }
 
+    pub fn instantiate_struct_ordered(
+        &self,
+        struct_name: &str,
+        ordered_values: Vec<Value>,
+    ) -> Result<Value> {
+        let info =
+            self.struct_metadata
+                .get(struct_name)
+                .ok_or_else(|| LustError::RuntimeError {
+                    message: format!("Unknown struct '{}'", struct_name),
+                })?;
+        let layout = info.layout.clone();
+        Ok(Value::Struct(crate::bytecode::StructObject::new(
+            struct_name,
+            layout,
+            ordered_values,
+        )))
+    }
+
     pub(crate) fn array_index_result(&mut self, array: &Value, index: LustInt) -> Result<Value> {
         let values = match array {
             Value::Array(values) => values,
@@ -804,20 +823,13 @@ impl VM {
                 );
                 if args.len() == param_count {
                     if let Some(mut root_frame) = self.root_frame.take() {
-                        for (i, arg) in args.iter().enumerate() {
-                            root_frame.registers[i] = arg.fast_clone();
-                        }
+                        root_frame.registers[..param_count].clone_from_slice(args);
                         let registers_ptr = root_frame.registers.as_mut_ptr();
                         let vm_ptr = self as *mut VM;
 
                         let marker = 0u8;
                         let sp = &marker as *const u8 as usize;
-                        let depth_budget = self.max_stack_depth;
-                        let limit = sp.saturating_sub(crate::jit::NATIVE_STACK_RESERVE).max(
-                            sp.saturating_sub(
-                                depth_budget.saturating_mul(crate::jit::MIN_NATIVE_FRAME),
-                            ),
-                        );
+                        let limit = sp.saturating_sub(crate::jit::NATIVE_STACK_RESERVE);
                         let outer_limit =
                             core::mem::replace(&mut self.jit_cells.stack_limit, limit);
 
@@ -862,6 +874,100 @@ impl VM {
         self.execute_call_frame(frame)
     }
 
+    #[inline]
+    pub(crate) fn has_native_entry(&self, func_idx: usize) -> bool {
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            self.call_stack.is_empty()
+                && self.jit.enabled
+                && self.trace_recorder.is_none()
+                && self.root_frame.is_some()
+                && self.jit.function_entry(func_idx) != 0
+        }
+        #[cfg(not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        {
+            false
+        }
+    }
+
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn call_direct_fast_with<F: FnOnce(&mut [Value]) -> usize>(
+        &mut self,
+        func_idx: usize,
+        write_args: F,
+    ) -> Option<Result<Value>> {
+        if self.call_stack.is_empty() && self.jit.enabled && self.trace_recorder.is_none() {
+            let entry_addr = self.jit.function_entry(func_idx);
+            if entry_addr != 0 {
+                let (param_count, register_count) = (
+                    self.functions[func_idx].param_count as usize,
+                    self.functions[func_idx].register_count,
+                );
+                if let Some(mut root_frame) = self.root_frame.take() {
+                    let arg_count = write_args(&mut root_frame.registers);
+                    if arg_count == param_count {
+                        let registers_ptr = root_frame.registers.as_mut_ptr();
+                        let vm_ptr = self as *mut VM;
+
+                        let marker = 0u8;
+                        let sp = &marker as *const u8 as usize;
+                        let limit = sp.saturating_sub(crate::jit::NATIVE_STACK_RESERVE);
+                        let outer_limit =
+                            core::mem::replace(&mut self.jit_cells.stack_limit, limit);
+
+                        self.jit.record_native_entry();
+                        self.pending_jit_error = None;
+                        self.jit_cells.exit_info = usize::MAX;
+
+                        type NativeEntry = unsafe extern "C" fn(
+                            *mut Value,
+                            *mut VM,
+                            *const Function,
+                            *mut (),
+                        ) -> i32;
+                        let entry_fn: NativeEntry = unsafe { core::mem::transmute(entry_addr) };
+                        let result = unsafe {
+                            entry_fn(
+                                registers_ptr,
+                                vm_ptr,
+                                core::ptr::null(),
+                                core::ptr::null_mut(),
+                            )
+                        };
+
+                        self.jit_cells.stack_limit = outer_limit;
+
+                        if (crate::jit::FUNCTION_RETURN_BASE..crate::jit::NATIVE_RETURNED)
+                            .contains(&result)
+                        {
+                            let reg = (result - crate::jit::FUNCTION_RETURN_BASE) as usize;
+                            let return_value = root_frame.registers[reg].fast_clone();
+                            root_frame.reset(0, None, register_count);
+                            self.root_frame = Some(root_frame);
+                            return Some(Ok(return_value));
+                        }
+
+                        let fallback_res = self
+                            .make_call_frame_slice(
+                                func_idx,
+                                None,
+                                &root_frame.registers[..param_count],
+                                ArgCheck::Shallow,
+                            )
+                            .and_then(|frame| self.execute_call_frame(frame));
+                        root_frame.reset(0, None, register_count);
+                        self.root_frame = Some(root_frame);
+                        return Some(fallback_res);
+                    } else {
+                        self.root_frame = Some(root_frame);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+
     pub(crate) fn call_retained_target(
         &mut self,
         func_idx: usize,
@@ -899,26 +1005,26 @@ impl VM {
         expected_name: &str,
         args: &[Value],
     ) -> Result<Value> {
-        let function = self
-            .functions
-            .get(func_idx)
-            .ok_or_else(|| LustError::RuntimeError {
-                message: format!("Function index out of bounds: {}", func_idx),
-            })?;
-        if function.name != expected_name {
-            return Err(LustError::RuntimeError {
-                message: format!(
-                    "Function table staled or mismatched: index {} has name '{}', expected '{}'",
-                    func_idx, function.name, expected_name
-                ),
-            });
-        }
-        if self
+        let is_cached = self
             .last_dispatched_target
             .as_ref()
-            .map(|(idx, name)| (*idx, name.as_str()))
-            != Some((func_idx, expected_name))
-        {
+            .map(|(idx, name)| *idx == func_idx && name.as_str() == expected_name)
+            .unwrap_or(false);
+        if !is_cached {
+            let function = self
+                .functions
+                .get(func_idx)
+                .ok_or_else(|| LustError::RuntimeError {
+                    message: format!("Function index out of bounds: {}", func_idx),
+                })?;
+            if function.name != expected_name {
+                return Err(LustError::RuntimeError {
+                    message: format!(
+                        "Function table staled or mismatched: index {} has name '{}', expected '{}'",
+                        func_idx, function.name, expected_name
+                    ),
+                });
+            }
             self.last_dispatched_target = Some((func_idx, expected_name.to_string()));
         }
         self.call_function_index_slice(func_idx, args)

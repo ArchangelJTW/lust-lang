@@ -9,3 +9,6 @@ tree-sitter-lust/target
 /scripts
 vsc-extension/package-lock.json
 mine/
+*.dylib
+*.wasm
+

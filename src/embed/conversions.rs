@@ -606,6 +606,20 @@ impl IntoLustValue for StructInstance {
     }
 }
 
+impl IntoLustValue for &StructInstance {
+    fn into_value(self) -> Value {
+        self.as_value().clone()
+    }
+
+    fn matches_lust_type(ty: &Type) -> bool {
+        <StructInstance as IntoLustValue>::matches_lust_type(ty)
+    }
+
+    fn type_description() -> &'static str {
+        "struct"
+    }
+}
+
 impl IntoLustValue for StructHandle {
     fn into_value(self) -> Value {
         <StructInstance as IntoLustValue>::into_value(self.into_instance())

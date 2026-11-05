@@ -103,6 +103,30 @@ impl StructInstance {
         &self.type_name
     }
 
+    #[inline]
+    pub fn update_context_ints(&self, role: i64, tenants: i64, owners: i64, teams: i64, archived: i64) {
+        if let Value::Struct(object) = &self.value {
+            let mut slots = object.fields.borrow_mut();
+            if slots.len() >= 5 {
+                slots[0] = Value::Int(role);
+                slots[1] = Value::Int(tenants);
+                slots[2] = Value::Int(owners);
+                slots[3] = Value::Int(teams);
+                slots[4] = Value::Int(archived);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn set_field_int_unchecked(&self, index: usize, val: i64) {
+        if let Value::Struct(object) = &self.value {
+            let mut slots = object.fields.borrow_mut();
+            if index < slots.len() {
+                slots[index] = Value::Int(val);
+            }
+        }
+    }
+
     pub fn field<T: FromLustValue>(&self, field: &str) -> Result<T> {
         let value_ref = self.borrow_field(field)?;
         T::from_value(value_ref.into_owned())

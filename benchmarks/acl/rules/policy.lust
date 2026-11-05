@@ -1,0 +1,29 @@
+struct Context
+    role: int
+    tenants: int
+    owners: int
+    teams: int
+    archived: int
+end
+function check(role: int, tenants: int, owners: int, teams: int, archived: int): int
+    if role == 0 then
+        if tenants / 100 == tenants % 100 then return 1 end
+    else
+        if role == 1 and archived == 0 then
+            if owners / 100 == owners % 100 then return 1 end
+            if teams / 100 != 0 and teams / 100 == teams % 100 then return 1 end
+        end
+    end
+    return 0
+end
+function check_object(c: Context): int
+    if c.role == 0 then
+        if c.tenants / 100 == c.tenants % 100 then return 1 end
+    else
+        if c.role == 1 and c.archived == 0 then
+            if c.owners / 100 == c.owners % 100 then return 1 end
+            if c.teams / 100 != 0 and c.teams / 100 == c.teams % 100 then return 1 end
+        end
+    end
+    return 0
+end

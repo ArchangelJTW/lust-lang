@@ -607,6 +607,18 @@ impl JitCompiler {
             fn jit_array_len_safe(array_value: *const Value) -> i64;
         }
 
+        if let Some(hoisted) = self.hoisted_array
+            && hoisted.array_reg == array
+            && let Some(len_r) = hoisted.len_reg
+        {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; mov x0, X(len_r)
+            );
+            self.store_from_x0(dest, ValueTag::Int.as_u8());
+            return Ok(());
+        }
+
         self.load_tag(0, array);
         dynasm!(self.ops
             ; .arch aarch64

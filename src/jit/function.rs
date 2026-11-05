@@ -1055,25 +1055,22 @@ impl<'a> Translator<'a> {
             Instruction::GetField(dest, object, name_idx) => {
                 let field_name = self.constant_string(name_idx)?;
                 if let Some(Value::Map(map)) = self.env.constants.get(&object) {
-                    // A module table: the entry read now is what a call
-                    // through the result will guard on.
                     let entry = map
                         .borrow()
                         .get(&crate::bytecode::ValueKey::from(field_name.as_str()))
                         .cloned();
-                    self.ops.push(TraceOp::GetField {
-                        dest,
-                        object,
-                        field_name,
-                        field_index: None,
-                        value_type: None,
-                        is_weak: false,
-                    });
-                    self.write(dest, None);
-                    if let Some(entry @ Value::NativeFunction(_)) = entry {
-                        self.env.constants.insert(dest, entry);
+                    if let Some(entry) = entry {
+                        let ty = scalar_of(&entry);
+                        self.ops.push(TraceOp::LoadConst {
+                            dest,
+                            value: entry.clone(),
+                        });
+                        self.write(dest, ty);
+                        if let Value::NativeFunction(_) = &entry {
+                            self.env.constants.insert(dest, entry);
+                        }
+                        return Some(());
                     }
-                    return Some(());
                 }
                 match self.guarded_layout(object) {
                     Some(layout) => {

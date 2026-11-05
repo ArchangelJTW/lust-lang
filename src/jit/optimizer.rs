@@ -31,6 +31,7 @@ impl TraceOptimizer {
         self.hoist_entry_guards(trace);
         self.eliminate_redundant_type_guards(trace);
         self.coalesce_registers(trace);
+        self.promote_invariant_fields(trace);
         let optimized_ops = trace.ops.len();
         let hoisted = self.hoisted_constants.len();
         jit::log(|| {
@@ -900,7 +901,8 @@ impl TraceOptimizer {
             | TraceOp::BranchIf {
                 condition_register, ..
             } => vec![*condition_register],
-            TraceOp::SetField { object, value, .. } => vec![*object, *value],
+            TraceOp::SetField { object, value, .. }
+            | TraceOp::RestoreField { object, value, .. } => vec![*object, *value],
             TraceOp::SetIndex {
                 array,
                 index,
@@ -1912,6 +1914,207 @@ impl TraceOptimizer {
     }
 
     fn coalesce_registers(&mut self, _trace: &mut Trace) {}
+
+    /// Scalar replacement of a loop-invariant struct field.
+    ///
+    /// When a loop repeatedly loads and stores one scalar field of an object
+    /// that the loop never reassigns, keep the payload in a fresh register:
+    /// one load in the preamble, register moves in the body, one store on
+    /// the way out (`RestoreField`). The register is loop-carried, so the
+    /// backend pins it in a callee-saved machine register.
+    fn promote_invariant_fields(&mut self, trace: &mut Trace) {
+        if trace.is_function || trace.ops.is_empty() {
+            return;
+        }
+        if trace.ops.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::CallNative { .. }
+                    | TraceOp::CallFunction { .. }
+                    | TraceOp::CallMethod { .. }
+                    | TraceOp::CallDirect { .. }
+                    | TraceOp::InlineCall { .. }
+                    | TraceOp::NestedLoopCall { .. }
+                    | TraceOp::SpecializedOp { .. }
+                    | TraceOp::NewStruct { .. }
+                    | TraceOp::SetIndex { .. }
+            )
+        }) {
+            return;
+        }
+
+        #[derive(Clone)]
+        struct Field {
+            name: String,
+            index: usize,
+            ty: ValueType,
+            gets: usize,
+            sets: usize,
+        }
+        let mut fields: HashMap<(Register, usize), Field> = HashMap::new();
+        let mut banned: HashSet<Register> = HashSet::new();
+
+        for op in &trace.ops {
+            if let Some(dest) = Self::dest_of(op) {
+                banned.insert(dest);
+            }
+            for reg in Self::other_writes(op) {
+                banned.insert(reg);
+            }
+            match op {
+                TraceOp::GetField {
+                    object,
+                    field_name,
+                    field_index,
+                    value_type,
+                    is_weak,
+                    ..
+                }
+                | TraceOp::SetField {
+                    object,
+                    field_name,
+                    field_index,
+                    value_type,
+                    is_weak,
+                    ..
+                } => {
+                    let is_get = matches!(op, TraceOp::GetField { .. });
+                    let Some(index) = *field_index else {
+                        banned.insert(*object);
+                        continue;
+                    };
+                    if *is_weak {
+                        banned.insert(*object);
+                        continue;
+                    }
+                    let Some(ty) = value_type.filter(|ty| {
+                        matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool)
+                    }) else {
+                        banned.insert(*object);
+                        continue;
+                    };
+                    let entry = fields.entry((*object, index)).or_insert_with(|| Field {
+                        name: field_name.clone(),
+                        index,
+                        ty,
+                        gets: 0,
+                        sets: 0,
+                    });
+                    if entry.ty != ty || entry.name != *field_name {
+                        banned.insert(*object);
+                        continue;
+                    }
+                    if is_get {
+                        entry.gets += 1;
+                    } else {
+                        entry.sets += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut chosen: Vec<((Register, usize), Field)> = fields
+            .into_iter()
+            .filter(|((object, _), field)| {
+                !banned.contains(object) && field.gets > 0 && field.sets > 0
+            })
+            .collect();
+        if chosen.is_empty() {
+            return;
+        }
+        chosen.sort_by_key(|((object, index), _)| (*object, *index));
+
+        let mut max_reg = 0u8;
+        for op in trace
+            .preamble
+            .iter()
+            .chain(&trace.ops)
+            .chain(&trace.postamble)
+        {
+            if let Some(dest) = Self::dest_of(op) {
+                max_reg = max_reg.max(dest);
+            }
+            for reg in Self::reads_of(op) {
+                max_reg = max_reg.max(reg);
+            }
+            for reg in Self::other_writes(op) {
+                max_reg = max_reg.max(reg);
+            }
+        }
+
+        let mut slots: HashMap<(Register, usize), (Register, Field)> = HashMap::new();
+        for (key, field) in chosen {
+            if max_reg >= 220 {
+                break;
+            }
+            max_reg = max_reg.saturating_add(1);
+            let promoted = max_reg;
+            trace.preamble.push(TraceOp::GetField {
+                dest: promoted,
+                object: key.0,
+                field_name: field.name.clone(),
+                field_index: Some(field.index),
+                value_type: Some(field.ty),
+                is_weak: false,
+            });
+            trace.preamble.push(TraceOp::Guard {
+                register: promoted,
+                expected_type: field.ty,
+            });
+            trace.postamble.insert(
+                0,
+                TraceOp::RestoreField {
+                    object: key.0,
+                    field_name: field.name.clone(),
+                    value: promoted,
+                    field_index: field.index,
+                    value_type: field.ty,
+                },
+            );
+            slots.insert(key, (promoted, field));
+        }
+        if slots.is_empty() {
+            return;
+        }
+
+        for op in &mut trace.ops {
+            match op {
+                TraceOp::GetField {
+                    dest,
+                    object,
+                    field_index: Some(index),
+                    ..
+                } if slots.contains_key(&(*object, *index)) => {
+                    let promoted = slots[&(*object, *index)].0;
+                    *op = TraceOp::Move {
+                        dest: *dest,
+                        src: promoted,
+                    };
+                }
+                TraceOp::SetField {
+                    object,
+                    value,
+                    field_index: Some(index),
+                    ..
+                } if slots.contains_key(&(*object, *index)) => {
+                    let promoted = slots[&(*object, *index)].0;
+                    *op = TraceOp::Move {
+                        dest: promoted,
+                        src: *value,
+                    };
+                }
+                _ => {}
+            }
+        }
+
+        jit::log(|| {
+            format!(
+                "📦 JIT Optimizer: promoted {} invariant struct field(s) into registers",
+                slots.len()
+            )
+        });
+    }
 }
 
 impl Default for TraceOptimizer {

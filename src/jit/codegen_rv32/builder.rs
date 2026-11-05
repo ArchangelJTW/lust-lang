@@ -525,6 +525,21 @@ impl JitCompiler {
                         *is_weak,
                     )?;
                 }
+                TraceOp::RestoreField {
+                    object,
+                    field_name,
+                    value,
+                    field_index,
+                    value_type,
+                } => {
+                    self.compile_restore_field(
+                        *object,
+                        field_name,
+                        *value,
+                        *field_index,
+                        *value_type,
+                    )?;
+                }
                 TraceOp::NewArray {
                     dest,
                     first_element,

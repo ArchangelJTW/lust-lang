@@ -743,6 +743,43 @@ impl JitCompiler {
         Ok(())
     }
 
+    /// Sink a promoted field. Skip when the register is not the scalar the
+    /// entry load would have left there: a preamble failure never wrote it,
+    /// and storing Nil would clobber the field.
+    pub(super) fn compile_restore_field(
+        &mut self,
+        object: u8,
+        field_name: &str,
+        value: u8,
+        field_index: usize,
+        value_type: ValueType,
+    ) -> Result<()> {
+        let expected = match value_type {
+            ValueType::Int => ValueTag::Int,
+            ValueType::Float => ValueTag::Float,
+            ValueType::Bool => ValueTag::Bool,
+            _ => ValueTag::Int,
+        }
+        .as_u8() as u32;
+        let skip = self.ops.new_dynamic_label();
+        self.load_tag(0, value);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #expected
+            ; b.ne => skip
+        );
+        self.compile_set_field(
+            object,
+            field_name,
+            value,
+            Some(field_index),
+            Some(value_type),
+            false,
+        )?;
+        dynasm!(self.ops ; .arch aarch64 ; => skip);
+        Ok(())
+    }
+
     pub(super) fn compile_new_array(
         &mut self,
         dest: u8,

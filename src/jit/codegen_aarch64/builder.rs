@@ -579,6 +579,7 @@ impl JitCompiler {
                 | TraceOp::CallMethod { .. }
                 | TraceOp::GetField { .. }
                 | TraceOp::SetField { .. }
+                | TraceOp::RestoreField { .. }
                 | TraceOp::NewArray { .. }
                 | TraceOp::NewStruct { .. }
                 | TraceOp::NewEnumUnit { .. }
@@ -1181,6 +1182,22 @@ impl JitCompiler {
                     )?;
                 }
 
+                TraceOp::RestoreField {
+                    object,
+                    field_name,
+                    value,
+                    field_index,
+                    value_type,
+                } => {
+                    self.compile_restore_field(
+                        *object,
+                        field_name,
+                        *value,
+                        *field_index,
+                        *value_type,
+                    )?;
+                }
+
                 TraceOp::NewArray {
                     dest,
                     first_element,
@@ -1767,6 +1784,7 @@ impl JitCompiler {
                 | TraceOp::CallMethod { .. }
                 | TraceOp::GetField { .. }
                 | TraceOp::SetField { .. }
+                | TraceOp::RestoreField { .. }
                 | TraceOp::NewArray { .. }
                 | TraceOp::NewStruct { .. }
                 | TraceOp::NewEnumUnit { .. }
@@ -1846,7 +1864,8 @@ impl JitCompiler {
                 ..
             } => *object == register || in_args(*first_arg, *arg_count),
             TraceOp::GetField { object, .. } => *object == register,
-            TraceOp::SetField { object, value, .. } => {
+            TraceOp::SetField { object, value, .. }
+            | TraceOp::RestoreField { object, value, .. } => {
                 *object == register || *value == register
             }
             TraceOp::SetIndex {
@@ -2123,6 +2142,7 @@ impl JitCompiler {
                 self.scalar_registers.insert(*dest, ValueType::Plain);
             }
             TraceOp::SetField { .. }
+            | TraceOp::RestoreField { .. }
             | TraceOp::SetIndex { .. }
             | TraceOp::GuardNativeFunction { .. }
             | TraceOp::GuardGlobals { .. }

@@ -328,6 +328,16 @@ pub enum TraceOp {
         value_type: Option<ValueType>,
         is_weak: bool,
     },
+    /// Write a scalar field that the optimizer kept in `value` for the whole
+    /// loop. A no-op when `value` is not that scalar (the entry load never
+    /// completed, so the preamble failed before the body ran).
+    RestoreField {
+        object: Register,
+        field_name: String,
+        value: Register,
+        field_index: usize,
+        value_type: ValueType,
+    },
     NewArray {
         dest: Register,
         first_element: Register,
@@ -1294,6 +1304,7 @@ impl TraceRecorder {
             | TraceOp::SelectBitZero { dest, .. }
             | TraceOp::ModImm { dest, .. } => Some(*dest),
             TraceOp::SetField { .. }
+            | TraceOp::RestoreField { .. }
             | TraceOp::SetIndex { .. }
             | TraceOp::ArrayIndexOk { .. }
             | TraceOp::Guard { .. }

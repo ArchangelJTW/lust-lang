@@ -189,6 +189,7 @@ fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
         }
         TraceOp::ArrayPush { dest, .. } => set(env, *dest, Some(ValueType::Plain)),
         TraceOp::SetField { .. }
+        | TraceOp::RestoreField { .. }
         | TraceOp::SetIndex { .. }
         | TraceOp::GuardNativeFunction { .. }
         | TraceOp::GuardGlobals { .. }
@@ -463,7 +464,8 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
             e.reads.push((*object, None));
             e.helper_writes.push(*dest);
         }
-        TraceOp::SetField { object, value, .. } => {
+        TraceOp::SetField { object, value, .. }
+        | TraceOp::RestoreField { object, value, .. } => {
             e.reads.push((*object, None));
             e.reads.push((*value, None));
         }

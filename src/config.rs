@@ -96,6 +96,8 @@ pub struct LustConfig {
     /// - Removes register type info from Function objects
     /// - Reduces runtime memory at cost of less type safety/debug info
     minimal_runtime_types: bool,
+    use_mir: bool,
+    strict_mir: bool,
     #[cfg(feature = "std")]
     dependencies: Vec<DependencySpec>,
 }
@@ -107,6 +109,8 @@ impl Default for LustConfig {
             jit_enabled: true,
             low_memory_mode: false,
             minimal_runtime_types: false,
+            use_mir: false,
+            strict_mir: false,
             #[cfg(feature = "std")]
             dependencies: Vec::new(),
         }
@@ -198,6 +202,35 @@ impl LustConfig {
         self
     }
 
+    pub fn use_mir(&self) -> bool {
+        self.use_mir
+    }
+
+    pub fn set_use_mir(&mut self, enabled: bool) {
+        self.use_mir = enabled;
+    }
+
+    pub fn with_use_mir(mut self, enabled: bool) -> Self {
+        self.use_mir = enabled;
+        self
+    }
+
+    pub fn strict_mir(&self) -> bool {
+        self.strict_mir
+    }
+
+    pub fn set_strict_mir(&mut self, enabled: bool) {
+        self.strict_mir = enabled;
+        if enabled {
+            self.use_mir = true;
+        }
+    }
+
+    pub fn with_strict_mir(mut self, enabled: bool) -> Self {
+        self.set_strict_mir(enabled);
+        self
+    }
+
     pub fn with_enabled_modules<I, S>(modules: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -227,6 +260,8 @@ impl LustConfig {
             jit,
             rust_modules,
             dependencies: nested_dependencies,
+            mir,
+            strict_mir,
         } = settings;
 
         let modules = stdlib_modules
@@ -304,11 +339,16 @@ impl LustConfig {
             });
         }
 
+        let strict_mir_val = strict_mir.unwrap_or(false);
+        let use_mir_val = mir.unwrap_or(false) || strict_mir_val;
+
         Ok(Self {
             enabled_modules: modules,
             jit_enabled: jit,
             low_memory_mode: false,
             minimal_runtime_types: false,
+            use_mir: use_mir_val,
+            strict_mir: strict_mir_val,
             dependencies,
         })
     }
@@ -334,6 +374,10 @@ struct Settings {
     rust_modules: Vec<RustModuleEntry>,
     #[serde(default)]
     dependencies: BTreeMap<String, DependencyToml>,
+    #[serde(default)]
+    mir: Option<bool>,
+    #[serde(default)]
+    strict_mir: Option<bool>,
 }
 
 #[cfg(feature = "std")]

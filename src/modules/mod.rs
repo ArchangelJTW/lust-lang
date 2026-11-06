@@ -117,6 +117,8 @@ pub fn compile_program_with_config(program: Program, config: &LustConfig) -> cra
     compiler.set_entry_module(program_entry_module.clone());
     compiler.set_function_signatures(signatures);
     compiler.set_minimal_runtime_types(config.minimal_runtime_types());
+    compiler.set_use_mir(config.use_mir());
+    compiler.set_strict_mir(config.strict_mir());
     let functions = compiler.compile_module(&wrapped_items)?;
     let trait_impls = compiler.get_trait_impls().to_vec();
     // AST no longer needed

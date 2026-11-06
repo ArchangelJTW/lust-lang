@@ -20,6 +20,7 @@ pub mod externs;
 pub mod ffi;
 pub mod intern;
 pub mod jit;
+pub mod mir;
 mod lazy;
 pub mod lexer;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]

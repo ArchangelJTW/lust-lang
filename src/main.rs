@@ -85,6 +85,24 @@ fn main() {
             run_file(&args[2], true);
         }
 
+        "--mir" => {
+            if args.len() < 3 {
+                eprintln!("Error: --mir requires a file argument");
+                process::exit(1);
+            }
+
+            run_file_with_options(&args[2], false, true, false);
+        }
+
+        "--strict-mir" | "--strict" => {
+            if args.len() < 3 {
+                eprintln!("Error: --strict-mir requires a file argument");
+                process::exit(1);
+            }
+
+            run_file_with_options(&args[2], false, true, true);
+        }
+
         "--dump-externs" => {
             if args.len() < 3 {
                 eprintln!("Error: --dump-externs requires a file argument");
@@ -139,6 +157,14 @@ fn print_help(program: &str) {
     );
     println!(
         "    {} --disassemble <script.lust>     Show bytecode disassembly",
+        program
+    );
+    println!(
+        "    {} --mir <script.lust>             Run script using Lust MIR pipeline",
+        program
+    );
+    println!(
+        "    {} --strict-mir <script.lust>      Run with strict MIR (reject fallback/unsupported)",
         program
     );
     println!(
@@ -1538,6 +1564,10 @@ fn bindgen_command(args: &[String]) {
 }
 
 fn run_file(filename: &str, disassemble: bool) {
+    run_file_with_options(filename, disassemble, false, false);
+}
+
+fn run_file_with_options(filename: &str, disassemble: bool, use_mir: bool, strict_mir: bool) {
     let source = match fs::read_to_string(filename) {
         Ok(content) => content,
         Err(e) => {
@@ -1550,13 +1580,19 @@ fn run_file(filename: &str, disassemble: bool) {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    let config = match LustConfig::load_for_entry(filename) {
+    let mut config = match LustConfig::load_for_entry(filename) {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("Error loading configuration: {}", e);
             process::exit(1);
         }
     };
+    if use_mir {
+        config.set_use_mir(true);
+    }
+    if strict_mir {
+        config.set_strict_mir(true);
+    }
     #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
     let dependency_resolution = match resolve_dependencies(&config, &project_dir) {
         Ok(res) => res,
@@ -1829,6 +1865,8 @@ fn compile_program(
     compiler.set_imports_by_module(imports_map);
     compiler.set_entry_module(program.entry_module.clone());
     compiler.set_function_signatures(function_signatures);
+    compiler.set_use_mir(config.use_mir());
+    compiler.set_strict_mir(config.strict_mir());
     let functions = compiler.compile_module(&wrapped_items)?;
     let trait_impls = compiler.get_trait_impls().to_vec();
     let mut init_funcs: Vec<(String, String)> = Vec::new();

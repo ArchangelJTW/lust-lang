@@ -157,7 +157,11 @@ impl VM {
             active_native_depth: 0,
             active_jit_depth: 0,
         };
-        vm.jit.enabled = vm.jit.enabled && config.jit_enabled();
+        if config.use_mir() {
+            vm.jit.enabled = false;
+        } else {
+            vm.jit.enabled = vm.jit.enabled && config.jit_enabled();
+        }
 
         #[cfg(feature = "std")]
         let cache_key = {

@@ -82,6 +82,11 @@ impl CycleCollector {
         Self::default()
     }
 
+    #[inline]
+    pub fn tracked_count(&self) -> usize {
+        self.containers.len()
+    }
+
     /// Called on every register write: the leaf test is inlined so a
     /// scalar costs a tag compare and no call.
     #[inline]

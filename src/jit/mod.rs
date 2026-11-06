@@ -314,6 +314,8 @@ pub struct JitStats {
     pub execution_failures: u64,
     pub function_calls: u64,
     pub recursive_calls: u64,
+    pub struct_fast_path_hits: u64,
+    pub struct_slow_path_fallbacks: u64,
 }
 
 /// A stdlib native the recorder knows the meaning of, so a call to it on a
@@ -628,6 +630,15 @@ impl JitState {
 
     pub(crate) fn record_execution_failure(&mut self) {
         self.stats.execution_failures = self.stats.execution_failures.saturating_add(1);
+    }
+
+    pub(crate) fn record_struct_fast_path(&mut self) {
+        self.stats.struct_fast_path_hits = self.stats.struct_fast_path_hits.saturating_add(1);
+    }
+
+    pub(crate) fn record_struct_slow_path(&mut self) {
+        self.stats.struct_slow_path_fallbacks =
+            self.stats.struct_slow_path_fallbacks.saturating_add(1);
     }
 
     pub(crate) fn invalidate_compiled_code(&mut self) {

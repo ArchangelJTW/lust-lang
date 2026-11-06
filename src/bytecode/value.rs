@@ -353,12 +353,14 @@ pub enum FieldStorage {
 #[derive(Debug)]
 pub struct StructLayout {
     name: String,
+    name_interned: Name,
     field_names: Vec<Rc<String>>,
     field_lookup_ptr: HashMap<usize, usize>,
     field_lookup_str: HashMap<String, usize>,
     field_storage: Vec<FieldStorage>,
     field_types: Vec<Type>,
     weak_targets: Vec<Option<Type>>,
+    has_weak_fields: bool,
 }
 
 impl StructLayout {
@@ -384,6 +386,10 @@ impl StructLayout {
             weak_targets.len(),
             "StructLayout::new expects field names and weak target metadata to align"
         );
+        let name_interned = Name::from(&name);
+        let has_weak_fields = field_storage
+            .iter()
+            .any(|s| matches!(s, FieldStorage::Weak));
         let mut field_lookup_ptr = HashMap::with_capacity(field_names.len());
         let mut field_lookup_str = HashMap::with_capacity(field_names.len());
         for (index, field_name_rc) in field_names.iter().enumerate() {
@@ -394,18 +400,30 @@ impl StructLayout {
 
         Self {
             name,
+            name_interned,
             field_names,
             field_lookup_ptr,
             field_lookup_str,
             field_storage,
             field_types,
             weak_targets,
+            has_weak_fields,
         }
     }
 
     #[inline]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    #[inline]
+    pub fn name_interned(&self) -> &Name {
+        &self.name_interned
+    }
+
+    #[inline]
+    pub fn has_weak_fields(&self) -> bool {
+        self.has_weak_fields
     }
 
     #[inline]
@@ -3427,10 +3445,71 @@ pub unsafe extern "C" fn jit_new_struct_safe(
         }
 
         let struct_name_slice = slice::from_raw_parts(struct_name_ptr, struct_name_len);
-        let struct_name = match str::from_utf8(struct_name_slice) {
-            Ok(s) => s.to_string(),
+        let struct_name_str = match str::from_utf8(struct_name_slice) {
+            Ok(s) => s,
             Err(_) => return 0,
         };
+
+        let vm = &mut *vm_ptr;
+
+        #[cfg(feature = "std")]
+        static DISABLE_FAST_PATH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        #[cfg(feature = "std")]
+        let fast_path_disabled =
+            *DISABLE_FAST_PATH.get_or_init(|| std::env::var_os("LUST_NO_STRUCT_FAST_PATH").is_some());
+        #[cfg(not(feature = "std"))]
+        let fast_path_disabled = false;
+
+        if !fast_path_disabled
+            && let Some(info) = vm.struct_metadata.get(struct_name_str)
+        {
+            let layout_fields = info.layout.field_names();
+            if info.layout.name() == struct_name_str
+                && layout_fields.len() == field_count
+                && !info.layout.has_weak_fields()
+            {
+                let mut matched = true;
+                for i in 0..field_count {
+                    let field_name_ptr = *field_names_ptr.add(i);
+                    let field_name_len = *field_name_lens_ptr.add(i);
+                    if field_name_ptr.is_null() {
+                        matched = false;
+                        break;
+                    }
+                    let field_name_slice = slice::from_raw_parts(field_name_ptr, field_name_len);
+                    if field_name_slice != layout_fields[i].as_bytes() {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    let layout = info.layout.clone();
+                    // Read and clone all argument values before writing `out` to safely handle
+                    // register aliasing where `out` (dest) is one of the argument registers.
+                    let mut ordered = Vec::with_capacity(field_count);
+                    for i in 0..field_count {
+                        let field_value_ptr = field_values_ptr.add(i);
+                        ordered.push((*field_value_ptr).clone());
+                    }
+
+                    let struct_value = Value::Struct(StructObject::new(
+                        layout.name_interned().clone(),
+                        layout,
+                        ordered,
+                    ));
+                    vm.observe_value(&struct_value);
+                    replace_value(out, struct_value);
+                    vm.record_struct_fast_path();
+                    return 1;
+                }
+            }
+        }
+
+        // Fallback path:
+        // Used when field order is altered, layout metadata is missing/different,
+        // or weak field canonicalization is needed.
+        vm.record_struct_slow_path();
+        let struct_name = struct_name_str.to_string();
         let mut fields = Vec::with_capacity(field_count);
         for i in 0..field_count {
             let field_name_ptr = *field_names_ptr.add(i);
@@ -3445,7 +3524,6 @@ pub unsafe extern "C" fn jit_new_struct_safe(
             fields.push((field_name, field_value));
         }
 
-        let vm = &mut *vm_ptr;
         let struct_value = match vm.instantiate_struct(&struct_name, fields) {
             Ok(value) => value,
             Err(err) => {

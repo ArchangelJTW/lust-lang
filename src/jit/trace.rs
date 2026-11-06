@@ -1676,6 +1676,38 @@ impl TraceRecorder {
         true
     }
 
+    /// `array.len(a)` on a plain array, as one op instead of a native call:
+    /// the array's type is guarded. False when the call is not that.
+    fn record_array_len(
+        &mut self,
+        native_ptr: usize,
+        first_arg: Register,
+        arg_count: u8,
+        dest_reg: Register,
+        registers: &[Value],
+    ) -> bool {
+        if self.intrinsics.get(&native_ptr) != Some(&crate::jit::Intrinsic::ArrayLen)
+            || arg_count != 1
+            || !matches!(registers.get(first_arg as usize), Some(Value::Array(_)))
+            || self.specialized_owner(first_arg, registers).is_some()
+        {
+            return false;
+        }
+        self.rebox_specialized_register(first_arg, "array.len");
+        if !self.is_guarded(first_arg) {
+            self.push_op(TraceOp::Guard {
+                register: first_arg,
+                expected_type: ValueType::Array,
+            });
+            self.mark_guarded(first_arg);
+        }
+        self.push_op(TraceOp::ArrayLen {
+            dest: dest_reg,
+            array: first_arg,
+        });
+        true
+    }
+
     /// `array.push(a, v)` / `array.len(a)` on a specialized array, as the
     /// specialized ops (the same ones `a:push(v)` records). `None` when the
     /// call is not one of these; `Some` is the recording's result.
@@ -1912,8 +1944,10 @@ impl TraceRecorder {
         }
 
         if let Some(dest) = instruction.defined_register() {
-            let preserves_inputs = matches!(instruction, Instruction::Concat(..))
-                || instruction
+            let preserves_inputs = matches!(
+                instruction,
+                Instruction::Concat(..) | Instruction::NewStruct(..)
+            ) || instruction
                     .numeric_specialization()
                     .is_some_and(|(generic, _, _, _)| {
                         matches!(
@@ -2592,6 +2626,7 @@ impl TraceRecorder {
                     .as_string()
                     .unwrap_or("unknown")
                     .to_string();
+
                 let (field_index, is_weak_field) = match &registers[obj_reg as usize] {
                     Value::Struct(object) => {
                         let StructObject { layout, .. } = object.as_ref();
@@ -2871,6 +2906,16 @@ impl TraceRecorder {
                         ) {
                             return Ok(());
                         }
+                        if self.record_array_len(
+                            Rc::as_ptr(native_fn) as *const () as usize,
+                            first_arg,
+                            arg_count,
+                            dest_reg,
+                            registers,
+                        ) {
+                            return Ok(());
+                        }
+
                         self.specializations_escape("a native call")?;
 
                         self.push_op(TraceOp::CallNative {

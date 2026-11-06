@@ -2966,7 +2966,8 @@ impl JitCompiler {
             match op {
                 TraceOp::SetIndex { array, .. }
                 | TraceOp::ArrayIndexOk { array, .. }
-                | TraceOp::GetIndex { array, .. } => {
+                | TraceOp::GetIndex { array, .. }
+                | TraceOp::ArrayLen { array, .. } => {
                     if let Some(cand) = candidate {
                         if cand != *array {
                             return None;

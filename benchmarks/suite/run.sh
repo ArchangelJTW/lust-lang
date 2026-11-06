@@ -22,7 +22,7 @@ rust_bin = suite_dir / "rust/target/release/suite-rust"
 
 programs = ["fields", "array", "sieve", "calls", "methods", "strings", "fib", "nested", "floatmath", "tree"]
 
-with tempfile.TemporaryDirectory() as td:
+with tempfile.TemporaryDirectory(dir="/tmp") as td:
     def run_cmd(cmd, env=None):
         e = os.environ.copy()
         if env:
@@ -38,16 +38,32 @@ with tempfile.TemporaryDirectory() as td:
         except subprocess.TimeoutExpired:
             return "timeout", "<timeout>"
 
-    print(f"{'program':<10} {'rust':>9} {'lust-jit':>10} {'luajit':>9} {'lust-vm':>10} {'lua':>9}   outputs")
+    aot_bins = {}
+    print("Building Lust AOT binaries (--release-fast)...", file=sys.stderr)
+    for prog in programs:
+        bin_path = Path(td) / f"{prog}_aot"
+        res = subprocess.run([str(lust_bin), "build", str(suite_dir / f"{prog}.lust"), "-o", str(bin_path), "--release-fast"], capture_output=True, text=True)
+        if res.returncode == 0:
+            aot_bins[prog] = bin_path
+            # One warmup execution to prime dyld / code signing cache
+            subprocess.run([str(bin_path)], capture_output=True)
+        else:
+            print(f"Failed to build AOT for {prog}: {res.stderr}", file=sys.stderr)
+
+    print(f"{'program':<10} {'rust':>9} {'lust-aot':>10} {'luajit':>9} {'lust-jit':>10} {'lust-vm':>10} {'lua':>9}   outputs")
 
     for prog in programs:
         t_rust, o_rust = run_cmd([str(rust_bin), prog])
+        if prog in aot_bins:
+            t_aot, o_aot = run_cmd([str(aot_bins[prog])])
+        else:
+            t_aot, o_aot = "n/a", ""
         t_jit, o_jit = run_cmd([str(lust_bin), str(suite_dir / f"{prog}.lust")], {"LUST_JIT": "1"})
         t_vm, o_vm = run_cmd([str(lust_bin), str(suite_dir / f"{prog}.lust")], {"LUST_JIT": "0"})
         t_lj, o_lj = run_cmd(["luajit", str(suite_dir / f"{prog}.lua")])
         t_lua, o_lua = run_cmd(["lua", str(suite_dir / f"{prog}.lua")])
         
-        outputs = [("rust", o_rust), ("jit", o_jit), ("luajit", o_lj), ("vm", o_vm), ("lua", o_lua)]
+        outputs = [("rust", o_rust), ("aot", o_aot), ("jit", o_jit), ("luajit", o_lj), ("vm", o_vm), ("lua", o_lua)]
         reference = outputs[0][1]
         def match_val(a, b):
             if a == b:
@@ -60,5 +76,5 @@ with tempfile.TemporaryDirectory() as td:
                 return False
         diff = [name for name, output in outputs[1:] if not match_val(reference, output)]
         status = "same" if not diff else "DIFF: rust!=" + ",".join(diff)
-        print(f"{prog:<10} {t_rust:>9} {t_jit:>10} {t_lj:>9} {t_vm:>10} {t_lua:>9}   {status}")
+        print(f"{prog:<10} {t_rust:>9} {t_aot:>10} {t_lj:>9} {t_jit:>10} {t_vm:>10} {t_lua:>9}   {status}")
 EOF

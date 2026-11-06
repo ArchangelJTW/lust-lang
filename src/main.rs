@@ -96,6 +96,8 @@ fn main() {
 
         "bindgen" => bindgen_command(&args[2..]),
 
+        "build" | "--aot" => build_command(&args[2..]),
+
         #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
         "pkg" => {
             if let Err(err) = handle_pkg_command(&args) {
@@ -1226,6 +1228,219 @@ fn dump_externs(filename: &str) {
 fn dump_externs(_: &str) {
     eprintln!("This build of the Lust CLI was compiled without package support.");
     process::exit(1);
+}
+
+fn build_command(args: &[String]) {
+    if args.first().is_some_and(|arg| arg == "--help" || arg == "-h") {
+        eprintln!("Usage: lust build <entry.lust> [options]");
+        eprintln!();
+        eprintln!("OPTIONS:");
+        eprintln!("    -o, --output <path>       Specify output binary or library path");
+        eprintln!("    --cdylib, --dylib         Build dynamic shared library (.dylib, .so, .dll)");
+        eprintln!("    --staticlib               Build static library (.a, .lib)");
+        eprintln!("    --emit-h [path]           Generate C header file (.h)");
+        eprintln!("    --emit-zig                Generate Zig source file without compiling");
+        eprintln!("    --release-fast            Optimize for speed (default)");
+        eprintln!("    --release-safe            Optimize for speed with safety checks");
+        eprintln!("    --release-small           Optimize for binary size");
+        eprintln!("    --debug                   Compile in debug mode");
+        eprintln!("    --strip                   Omit debug symbols");
+        eprintln!("    --max-memory <size>       Limit execution memory (e.g. 64MB, 1GB)");
+        eprintln!("    --tree-shake              Enable dead code elimination (default: true)");
+        eprintln!("    --no-tree-shake           Disable dead code elimination");
+        eprintln!("    --target <triple>         Cross-compile target triple");
+        eprintln!("    --cache-dir <dir>         Zig compilation cache directory");
+        return;
+    }
+    let Some(entry_arg) = args.first() else {
+        eprintln!("Error: lust build requires an entry file");
+        process::exit(1);
+    };
+
+    let entry_path = PathBuf::from(entry_arg);
+    let mut output_bin = None;
+    let mut emit_zig = false;
+    let mut opts = lust::codegen_zig::CompileOptions::default();
+
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-o" | "--output" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: -o requires an output path");
+                    process::exit(1);
+                };
+                output_bin = Some(PathBuf::from(val));
+            }
+            "--cdylib" | "--dylib" => {
+                opts.target_kind = lust::codegen_zig::BuildTargetKind::SharedLibrary;
+            }
+            "--staticlib" => {
+                opts.target_kind = lust::codegen_zig::BuildTargetKind::StaticLibrary;
+            }
+            "--emit-h" => {
+                if let Some(next_arg) = args.get(index + 1) {
+                    if !next_arg.starts_with('-') {
+                        index += 1;
+                        opts.emit_header = Some(PathBuf::from(next_arg));
+                    } else {
+                        opts.emit_header = Some(entry_path.with_extension("h"));
+                    }
+                } else {
+                    opts.emit_header = Some(entry_path.with_extension("h"));
+                }
+            }
+            "--emit-zig" => {
+                emit_zig = true;
+            }
+            "--release-fast" => opts.release_mode = "ReleaseFast".to_string(),
+            "--release-safe" => opts.release_mode = "ReleaseSafe".to_string(),
+            "--release-small" => opts.release_mode = "ReleaseSmall".to_string(),
+            "--debug" => opts.release_mode = "Debug".to_string(),
+            "--strip" => opts.strip = true,
+            "--max-memory" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --max-memory requires a size argument (e.g. 64MB)");
+                    process::exit(1);
+                };
+                opts.max_memory = Some(val.clone());
+                opts.max_memory_bytes = lust::codegen_zig::parse_memory_size(val);
+                if opts.max_memory_bytes.is_none() {
+                    eprintln!("Error: invalid memory size '{}'", val);
+                    process::exit(1);
+                }
+            }
+            "--tree-shake" => opts.tree_shake = true,
+            "--no-tree-shake" => opts.tree_shake = false,
+            "--target" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --target requires a target triple");
+                    process::exit(1);
+                };
+                opts.target_triple = Some(val.clone());
+            }
+            "--cache-dir" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --cache-dir requires a directory path");
+                    process::exit(1);
+                };
+                opts.cache_dir = Some(PathBuf::from(val));
+            }
+            opt => {
+                eprintln!("Error: unknown option '{opt}'");
+                process::exit(1);
+            }
+        }
+        index += 1;
+    }
+
+    let mut loader = ModuleLoader::new(entry_path.parent().unwrap_or_else(|| Path::new(".")));
+    let program = match loader.load_program_from_entry(entry_arg) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error loading program: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let mut all_items = Vec::new();
+    for module in &program.modules {
+        all_items.extend(module.items.clone());
+    }
+
+    let is_library = matches!(
+        opts.target_kind,
+        lust::codegen_zig::BuildTargetKind::SharedLibrary
+            | lust::codegen_zig::BuildTargetKind::StaticLibrary
+    );
+
+    let filtered_items = if opts.tree_shake {
+        lust::codegen_zig::tree_shake_items(&all_items, is_library)
+    } else {
+        all_items
+    };
+
+    let runtime_opts = lust::codegen_zig::analyze_runtime_requirements(
+        &filtered_items,
+        is_library,
+        opts.max_memory_bytes,
+    );
+    let link_libc = runtime_opts.needs_io || runtime_opts.needs_os;
+
+    let mut codegen = lust::codegen_zig::ZigCodegen::with_options(runtime_opts);
+    let zig_source = match codegen.generate_program(&filtered_items) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("AOT Codegen error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let stem = entry_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    let zig_file = entry_path.with_extension("zig");
+    if let Err(e) = fs::write(&zig_file, &zig_source) {
+        eprintln!("Failed to write {}: {}", zig_file.display(), e);
+        process::exit(1);
+    }
+
+    if let Some(header_path) = &opts.emit_header {
+        let header_content = lust::codegen_zig::generate_c_header(&filtered_items);
+        if let Err(e) = fs::write(header_path, header_content) {
+            eprintln!("Failed to write C header {}: {}", header_path.display(), e);
+            process::exit(1);
+        }
+        println!("Generated C header: {}", header_path.display());
+    }
+
+    if emit_zig {
+        println!("Generated Zig source: {}", zig_file.display());
+        return;
+    }
+
+    let default_extension = match opts.target_kind {
+        lust::codegen_zig::BuildTargetKind::Executable => "",
+        lust::codegen_zig::BuildTargetKind::SharedLibrary => {
+            if cfg!(target_os = "macos") {
+                "dylib"
+            } else if cfg!(target_os = "windows") {
+                "dll"
+            } else {
+                "so"
+            }
+        }
+        lust::codegen_zig::BuildTargetKind::StaticLibrary => {
+            if cfg!(target_os = "windows") {
+                "lib"
+            } else {
+                "a"
+            }
+        }
+    };
+    let target_bin = output_bin.unwrap_or_else(|| {
+        let parent = entry_path.parent().unwrap_or_else(|| Path::new("."));
+        if default_extension.is_empty() {
+            parent.join(stem)
+        } else {
+            parent.join(format!("{}.{}", stem, default_extension))
+        }
+    });
+
+    match lust::codegen_zig::compile_zig(&zig_file, &target_bin, &opts, link_libc) {
+        Ok(bin) => {
+            println!("Successfully built AOT artifact: {}", bin.display());
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(1);
+        }
+    }
 }
 
 fn bindgen_command(args: &[String]) {

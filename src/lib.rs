@@ -10,6 +10,8 @@ pub mod builtins;
 pub mod bytecode;
 pub mod config;
 #[cfg(feature = "std")]
+pub mod codegen_zig;
+#[cfg(feature = "std")]
 pub mod embed;
 pub mod error;
 #[cfg(feature = "std")]

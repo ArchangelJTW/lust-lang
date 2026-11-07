@@ -1910,6 +1910,10 @@ pub fn analyze_runtime_requirements(
         }
     }
 
+    if opts.needs_string {
+        opts.needs_array = true;
+    }
+
     opts
 }
 

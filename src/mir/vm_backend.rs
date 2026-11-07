@@ -9,6 +9,7 @@ pub struct MirToBytecodeCompiler<'a> {
     chunk: Chunk,
     scratch_start: usize,
     scratch_count: usize,
+    max_scratch: usize,
     block_pcs: HashMap<BlockId, usize>,
     pending_jumps: Vec<(usize, BlockId)>,
 }
@@ -23,6 +24,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
             chunk: Chunk::new(),
             scratch_start: func.locals.len(),
             scratch_count: 0,
+            max_scratch: 0,
             block_pcs: HashMap::new(),
             pending_jumps: Vec::new(),
         };
@@ -31,13 +33,16 @@ impl<'a> MirToBytecodeCompiler<'a> {
         compiler.patch_all_jumps();
 
         bytecode_fn.chunk = compiler.chunk;
-        bytecode_fn.register_count = (func.locals.len() + compiler.scratch_count) as u8;
+        bytecode_fn.register_count = (func.locals.len() + compiler.max_scratch) as u8;
         bytecode_fn
     }
 
     fn next_scratch(&mut self) -> Register {
         let reg = (self.scratch_start + self.scratch_count) as Register;
         self.scratch_count += 1;
+        if self.scratch_count > self.max_scratch {
+            self.max_scratch = self.scratch_count;
+        }
         reg
     }
 
@@ -230,8 +235,51 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 };
                 self.chunk.emit(Instruction::Return(r_ret), span.start_line);
             }
-            Terminator::Call { callee: _, args: _, destination: _, success, error: _, span } => {
-                let jump_idx = self.chunk.emit(Instruction::Jump(0), span.start_line);
+            Terminator::Call { callee, args, destination, success, error: _, span } => {
+                let line = span.start_line;
+                let arg_count = args.len() as u8;
+                let first_arg_reg = if arg_count > 0 {
+                    let scratch_base = self.next_scratch();
+                    for _ in 1..args.len() {
+                        self.next_scratch();
+                    }
+                    for (i, arg) in args.iter().enumerate() {
+                        let target_reg = scratch_base + i as u8;
+                        match arg {
+                            Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
+                                self.chunk.emit(Instruction::Move(target_reg, loc.0 as Register), line);
+                            }
+                            Operand::Copy(Place::Index(base, idx)) | Operand::Move(Place::Index(base, idx)) => {
+                                let base_reg = self.place_to_reg(base);
+                                let idx_reg = idx.0 as Register;
+                                self.chunk.emit(Instruction::GetIndex(target_reg, base_reg, idx_reg), line);
+                            }
+                            Operand::Constant(c) => {
+                                self.load_constant_into_reg(c, target_reg, line);
+                            }
+                            _ => {}
+                        }
+                    }
+                    scratch_base
+                } else {
+                    0
+                };
+
+                let func_reg = self.next_scratch();
+                if let Some((obj_name, field_name)) = callee.split_once('.') {
+                    let obj_idx = self.chunk.add_constant(Value::string(obj_name.to_string()));
+                    let field_idx = self.chunk.add_constant(Value::string(field_name.to_string()));
+                    self.chunk.emit(Instruction::LoadGlobal(func_reg, obj_idx), line);
+                    self.chunk.emit(Instruction::GetField(func_reg, func_reg, field_idx), line);
+                } else {
+                    let name_idx = self.chunk.add_constant(Value::string(callee.clone()));
+                    self.chunk.emit(Instruction::LoadGlobal(func_reg, name_idx), line);
+                }
+
+                let dest_reg = self.place_to_reg(destination);
+                self.chunk.emit(Instruction::Call(func_reg, first_arg_reg, arg_count, dest_reg), line);
+
+                let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
                 self.pending_jumps.push((jump_idx, *success));
             }
             Terminator::Unreachable(span) => {

@@ -212,7 +212,7 @@ impl<'a> AstLowering<'a> {
                 // Header: evaluate condition
                 self.current_block = header;
                 self.emit_stmt(Statement::ResourceCheck(ResourceKind::Gas, 1, stmt.span));
-                let cond_op = self.lower_expr(condition);
+                let (cond_op, body_bindings) = self.lower_condition_with_bindings(condition, stmt.span);
                 self.terminate_block(Terminator::Cond {
                     cond: cond_op,
                     then_block: body_block,
@@ -224,6 +224,16 @@ impl<'a> AstLowering<'a> {
                 self.current_block = body_block;
                 self.loop_stack.push((header, exit_block));
                 self.push_scope();
+                for (name, ty, place) in body_bindings {
+                    let binding_local = self.current_fn.add_local(Some(name.clone()), ty, false, stmt.span);
+                    self.emit_stmt(Statement::StorageLive(binding_local, stmt.span));
+                    self.emit_stmt(Statement::Assign(
+                        Place::Local(binding_local),
+                        Rvalue::Use(Operand::Copy(place)),
+                        stmt.span,
+                    ));
+                    self.insert_var(name, binding_local);
+                }
                 for s in body {
                     self.lower_statement(s);
                 }
@@ -456,6 +466,160 @@ impl<'a> AstLowering<'a> {
         }
     }
 
+    fn lower_condition_with_bindings(
+        &mut self,
+        condition: &Expr,
+        span: crate::ast::Span,
+    ) -> (Operand, Vec<(String, MirType, Place)>) {
+        match &condition.kind {
+            ExprKind::Paren(inner) => self.lower_condition_with_bindings(inner, span),
+            ExprKind::IsPattern { expr: scrutinee, pattern } => {
+                match pattern {
+                    crate::ast::Pattern::Enum { variant, bindings, .. }
+                        if (variant == "Ok" || variant == "Some") =>
+                    {
+                        if let ExprKind::Index { object, index } = &scrutinee.kind {
+                            let base_place = match self.lower_place(object) {
+                                Some(p) => p,
+                                None => {
+                                    let obj_op = self.lower_expr(object);
+                                    let temp = self.current_fn.add_local(
+                                        None,
+                                        MirType::Array(Box::new(MirType::Int)),
+                                        true,
+                                        span,
+                                    );
+                                    self.emit_stmt(Statement::StorageLive(temp, span));
+                                    self.emit_stmt(Statement::Assign(
+                                        Place::Local(temp),
+                                        Rvalue::Use(obj_op),
+                                        span,
+                                    ));
+                                    Place::Local(temp)
+                                }
+                            };
+
+                            let elem_ty = match &base_place {
+                                Place::Local(loc) => match &self.current_fn.locals[loc.0].ty {
+                                    MirType::Array(inner) => (**inner).clone(),
+                                    _ => MirType::Int,
+                                },
+                                _ => MirType::Int,
+                            };
+
+                            let idx_op = self.lower_expr(index);
+                            let idx_local = match &idx_op {
+                                Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => *loc,
+                                _ => {
+                                    let temp = self.current_fn.add_local(None, MirType::Int, true, span);
+                                    self.emit_stmt(Statement::StorageLive(temp, span));
+                                    self.emit_stmt(Statement::Assign(
+                                        Place::Local(temp),
+                                        Rvalue::Use(idx_op),
+                                        span,
+                                    ));
+                                    temp
+                                }
+                            };
+
+                            let len_temp = self.current_fn.add_local(None, MirType::Int, true, span);
+                            self.emit_stmt(Statement::StorageLive(len_temp, span));
+                            self.emit_stmt(Statement::Assign(
+                                Place::Local(len_temp),
+                                Rvalue::UnaryOp(MirUnaryOp::Len, Operand::Copy(base_place.clone())),
+                                span,
+                            ));
+
+                            let ge_zero_temp = self.current_fn.add_local(None, MirType::Bool, true, span);
+                            self.emit_stmt(Statement::StorageLive(ge_zero_temp, span));
+                            self.emit_stmt(Statement::Assign(
+                                Place::Local(ge_zero_temp),
+                                Rvalue::BinaryOp(
+                                    MirBinaryOp::GtEq,
+                                    Operand::Copy(Place::Local(idx_local)),
+                                    Operand::Constant(MirConstant::Int(0)),
+                                ),
+                                span,
+                            ));
+
+                            let lt_len_temp = self.current_fn.add_local(None, MirType::Bool, true, span);
+                            self.emit_stmt(Statement::StorageLive(lt_len_temp, span));
+                            self.emit_stmt(Statement::Assign(
+                                Place::Local(lt_len_temp),
+                                Rvalue::BinaryOp(
+                                    MirBinaryOp::Lt,
+                                    Operand::Copy(Place::Local(idx_local)),
+                                    Operand::Copy(Place::Local(len_temp)),
+                                ),
+                                span,
+                            ));
+
+                            let in_bounds_temp = self.current_fn.add_local(None, MirType::Bool, true, span);
+                            self.emit_stmt(Statement::StorageLive(in_bounds_temp, span));
+                            self.emit_stmt(Statement::Assign(
+                                Place::Local(in_bounds_temp),
+                                Rvalue::BinaryOp(
+                                    MirBinaryOp::And,
+                                    Operand::Copy(Place::Local(ge_zero_temp)),
+                                    Operand::Copy(Place::Local(lt_len_temp)),
+                                ),
+                                span,
+                            ));
+
+                            let elem_place = Place::Index(Box::new(base_place), idx_local);
+                            let mut out_bindings = Vec::new();
+                            if let Some(crate::ast::Pattern::Identifier(binding_name)) = bindings.first() {
+                                out_bindings.push((binding_name.clone(), elem_ty, elem_place));
+                            }
+
+                            return (Operand::Move(Place::Local(in_bounds_temp)), out_bindings);
+                        }
+
+                        (self.lower_expr(condition), Vec::new())
+                    }
+                    crate::ast::Pattern::Wildcard => {
+                        (Operand::Constant(MirConstant::Bool(true)), Vec::new())
+                    }
+                    crate::ast::Pattern::Identifier(name) => {
+                        let (place, ty) = if let Some(p) = self.lower_place(scrutinee) {
+                            let ty = match &p {
+                                Place::Local(loc) => self.current_fn.locals[loc.0].ty.clone(),
+                                _ => MirType::Int,
+                            };
+                            (p, ty)
+                        } else {
+                            let op = self.lower_expr(scrutinee);
+                            let temp = self.current_fn.add_local(None, MirType::Int, true, span);
+                            self.emit_stmt(Statement::StorageLive(temp, span));
+                            self.emit_stmt(Statement::Assign(Place::Local(temp), Rvalue::Use(op), span));
+                            (Place::Local(temp), MirType::Int)
+                        };
+                        (Operand::Constant(MirConstant::Bool(true)), vec![(name.clone(), ty, place)])
+                    }
+                    crate::ast::Pattern::Literal(lit) => {
+                        let scrutinee_op = self.lower_expr(scrutinee);
+                        let lit_op = match lit {
+                            Literal::Integer(i) => Operand::Constant(MirConstant::Int(*i)),
+                            Literal::Float(f) => Operand::Constant(MirConstant::Float(*f)),
+                            Literal::Bool(b) => Operand::Constant(MirConstant::Bool(*b)),
+                            Literal::String(s) => Operand::Constant(MirConstant::String(s.clone())),
+                        };
+                        let temp = self.current_fn.add_local(None, MirType::Bool, true, span);
+                        self.emit_stmt(Statement::StorageLive(temp, span));
+                        self.emit_stmt(Statement::Assign(
+                            Place::Local(temp),
+                            Rvalue::BinaryOp(MirBinaryOp::Eq, scrutinee_op, lit_op),
+                            span,
+                        ));
+                        (Operand::Move(Place::Local(temp)), Vec::new())
+                    }
+                    _ => (Operand::Constant(MirConstant::Bool(false)), Vec::new()),
+                }
+            }
+            _ => (self.lower_expr(condition), Vec::new()),
+        }
+    }
+
     fn lower_if(
         &mut self,
         condition: &Expr,
@@ -464,7 +628,7 @@ impl<'a> AstLowering<'a> {
         else_block: Option<&[Stmt]>,
         span: crate::ast::Span,
     ) {
-        let cond_op = self.lower_expr(condition);
+        let (cond_op, then_bindings) = self.lower_condition_with_bindings(condition, span);
         let then_bb = self.current_fn.new_block();
         let merge_bb = self.current_fn.new_block();
 
@@ -484,6 +648,16 @@ impl<'a> AstLowering<'a> {
         // Lower Then Block
         self.current_block = then_bb;
         self.push_scope();
+        for (name, ty, place) in then_bindings {
+            let binding_local = self.current_fn.add_local(Some(name.clone()), ty, false, span);
+            self.emit_stmt(Statement::StorageLive(binding_local, span));
+            self.emit_stmt(Statement::Assign(
+                Place::Local(binding_local),
+                Rvalue::Use(Operand::Copy(place)),
+                span,
+            ));
+            self.insert_var(name, binding_local);
+        }
         for s in then_block {
             self.lower_statement(s);
         }
@@ -499,7 +673,7 @@ impl<'a> AstLowering<'a> {
                 break;
             }
             self.current_block = cur_else_bb;
-            let elif_op = self.lower_expr(elif_cond);
+            let (elif_op, elif_bindings) = self.lower_condition_with_bindings(elif_cond, span);
             let elif_then = self.current_fn.new_block();
             let next_elif = if i + 1 < elseif_branches.len() || else_block.is_some() {
                 self.current_fn.new_block()
@@ -516,6 +690,16 @@ impl<'a> AstLowering<'a> {
 
             self.current_block = elif_then;
             self.push_scope();
+            for (name, ty, place) in elif_bindings {
+                let binding_local = self.current_fn.add_local(Some(name.clone()), ty, false, span);
+                self.emit_stmt(Statement::StorageLive(binding_local, span));
+                self.emit_stmt(Statement::Assign(
+                    Place::Local(binding_local),
+                    Rvalue::Use(Operand::Copy(place)),
+                    span,
+                ));
+                self.insert_var(name, binding_local);
+            }
             for s in elif_body {
                 self.lower_statement(s);
             }
@@ -668,10 +852,10 @@ impl<'a> AstLowering<'a> {
                 then_branch,
                 else_branch,
             } => {
+                let (cond_op, bindings) = self.lower_condition_with_bindings(condition, expr.span);
                 let res_local = self.current_fn.add_local(None, MirType::Int, true, expr.span);
                 self.emit_stmt(Statement::StorageLive(res_local, expr.span));
 
-                let cond_op = self.lower_expr(condition);
                 let then_bb = self.current_fn.new_block();
                 let else_bb = self.current_fn.new_block();
                 let merge_bb = self.current_fn.new_block();
@@ -684,12 +868,24 @@ impl<'a> AstLowering<'a> {
                 });
 
                 self.current_block = then_bb;
+                self.push_scope();
+                for (name, ty, place) in bindings {
+                    let binding_local = self.current_fn.add_local(Some(name.clone()), ty, false, expr.span);
+                    self.emit_stmt(Statement::StorageLive(binding_local, expr.span));
+                    self.emit_stmt(Statement::Assign(
+                        Place::Local(binding_local),
+                        Rvalue::Use(Operand::Copy(place)),
+                        expr.span,
+                    ));
+                    self.insert_var(name, binding_local);
+                }
                 let then_op = self.lower_expr(then_branch);
                 self.emit_stmt(Statement::Assign(
                     Place::Local(res_local),
                     Rvalue::Use(then_op),
                     expr.span,
                 ));
+                self.pop_scope();
                 if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
                     self.terminate_block(Terminator::Goto(merge_bb, expr.span));
                 }
@@ -710,30 +906,9 @@ impl<'a> AstLowering<'a> {
                 self.current_block = merge_bb;
                 Operand::Move(Place::Local(res_local))
             }
-            ExprKind::IsPattern { expr: scrutinee, pattern } => {
-                let scrutinee_op = self.lower_expr(scrutinee);
-                match pattern {
-                    crate::ast::Pattern::Wildcard | crate::ast::Pattern::Identifier(_) => {
-                        Operand::Constant(MirConstant::Bool(true))
-                    }
-                    crate::ast::Pattern::Literal(lit) => {
-                        let lit_op = match lit {
-                            Literal::Integer(i) => Operand::Constant(MirConstant::Int(*i)),
-                            Literal::Float(f) => Operand::Constant(MirConstant::Float(*f)),
-                            Literal::Bool(b) => Operand::Constant(MirConstant::Bool(*b)),
-                            Literal::String(s) => Operand::Constant(MirConstant::String(s.clone())),
-                        };
-                        let temp = self.current_fn.add_local(None, MirType::Bool, true, expr.span);
-                        self.emit_stmt(Statement::StorageLive(temp, expr.span));
-                        self.emit_stmt(Statement::Assign(
-                            Place::Local(temp),
-                            Rvalue::BinaryOp(MirBinaryOp::Eq, scrutinee_op, lit_op),
-                            expr.span,
-                        ));
-                        Operand::Move(Place::Local(temp))
-                    }
-                    _ => Operand::Constant(MirConstant::Bool(false)),
-                }
+            ExprKind::IsPattern { .. } => {
+                let (cond_op, _) = self.lower_condition_with_bindings(expr, expr.span);
+                cond_op
             }
             ExprKind::Array(elements) => {
                 let lowered_elems: Vec<Operand> = elements.iter().map(|e| self.lower_expr(e)).collect();
@@ -770,8 +945,15 @@ impl<'a> AstLowering<'a> {
                         temp
                     }
                 };
+                let elem_ty = match &base_place {
+                    Place::Local(loc) => match &self.current_fn.locals[loc.0].ty {
+                        MirType::Array(inner) => (**inner).clone(),
+                        _ => MirType::Int,
+                    },
+                    _ => MirType::Int,
+                };
                 let elem_place = Place::Index(Box::new(base_place), idx_local);
-                let val_temp = self.current_fn.add_local(None, MirType::Int, true, expr.span);
+                let val_temp = self.current_fn.add_local(None, elem_ty, true, expr.span);
                 self.emit_stmt(Statement::StorageLive(val_temp, expr.span));
                 self.emit_stmt(Statement::Assign(
                     Place::Local(val_temp),
@@ -840,6 +1022,13 @@ impl<'a> AstLowering<'a> {
             ExprKind::Call { callee, args, .. } => {
                 let callee_name = match &callee.kind {
                     ExprKind::Identifier(name) => name.clone(),
+                    ExprKind::FieldAccess { object, field } => {
+                        if let ExprKind::Identifier(obj_name) = &object.kind {
+                            format!("{obj_name}.{field}")
+                        } else {
+                            "unknown_callee".into()
+                        }
+                    }
                     _ => "unknown_callee".into(),
                 };
                 let lowered_args: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
@@ -921,6 +1110,8 @@ pub fn mir_type_from_ast(ty: &Type) -> MirType {
         TypeKind::Map(k, v) => {
             MirType::Map(Box::new(mir_type_from_ast(k)), Box::new(mir_type_from_ast(v)))
         }
+        TypeKind::Option(_) => MirType::Enum("Option".to_string()),
+        TypeKind::Result(_, _) => MirType::Enum("Result".to_string()),
         _ => MirType::Int,
     }
 }

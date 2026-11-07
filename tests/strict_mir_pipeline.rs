@@ -74,3 +74,37 @@ fn test_strict_mir_flags_and_configuration() {
     compiler.configure(&config);
     // Verifies that Compiler picks up strict MIR configuration properly
 }
+
+#[test]
+fn test_strict_mir_pattern_matching_array_unwrap() {
+    let source = r#"
+        function sieve_count(n: int): int
+            local flags = [true, true, true, true, true, true, true, true, true, true]
+            local count: int = 0
+            local i: int = 2
+            while i < 10 do
+                if flags[i] is Ok(f) then
+                    if f then
+                        count = count + 1
+                    end
+                end
+                i = i + 1
+            end
+            return count
+        end
+    "#;
+
+    let entries = &[EmbeddedModule {
+        module: "main",
+        parent: None,
+        source: Some(source),
+    }];
+
+    let program = load_program_from_embedded(entries, "main").expect("Failed to load program");
+    let config = LustConfig::default().with_strict_mir(true);
+    let mut vm = compile_program_with_config(program, &config).expect("Strict MIR compilation failed");
+
+    let result = vm.call("sieve_count", vec![Value::Int(10)]).expect("VM call failed");
+    assert_eq!(result, Value::Int(8));
+}
+

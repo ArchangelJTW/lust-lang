@@ -171,6 +171,12 @@ impl TraceOptimizer {
                 TraceOp::Ne { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
                     return Some(*lhs_type);
                 }
+                TraceOp::GuardLoopContinue {
+                    condition_register,
+                    ..
+                } if *condition_register == binding || *condition_register == result => {
+                    return Some(ValueType::Bool);
+                }
                 TraceOp::Guard { .. } => {}
                 TraceOp::GuardLoopContinue { .. } => {}
                 TraceOp::Move { dest, .. } if *dest != binding && *dest != result => {}

@@ -70,37 +70,12 @@ fn main() {
     match args[1].as_str() {
         "--help" | "-h" => {
             print_help(&args[0]);
+            return;
         }
 
         "--version" | "-v" => {
             print_version();
-        }
-
-        "--disassemble" | "-d" => {
-            if args.len() < 3 {
-                eprintln!("Error: --disassemble requires a file argument");
-                process::exit(1);
-            }
-
-            run_file(&args[2], true);
-        }
-
-        "--mir" => {
-            if args.len() < 3 {
-                eprintln!("Error: --mir requires a file argument");
-                process::exit(1);
-            }
-
-            run_file_with_options(&args[2], false, true, false);
-        }
-
-        "--strict-mir" | "--strict" => {
-            if args.len() < 3 {
-                eprintln!("Error: --strict-mir requires a file argument");
-                process::exit(1);
-            }
-
-            run_file_with_options(&args[2], false, true, true);
+            return;
         }
 
         "--dump-externs" => {
@@ -110,11 +85,18 @@ fn main() {
             }
 
             dump_externs(&args[2]);
+            return;
         }
 
-        "bindgen" => bindgen_command(&args[2..]),
+        "bindgen" => {
+            bindgen_command(&args[2..]);
+            return;
+        }
 
-        "build" | "--aot" => build_command(&args[2..]),
+        "build" | "--aot" => {
+            build_command(&args[2..]);
+            return;
+        }
 
         #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
         "pkg" => {
@@ -122,11 +104,45 @@ fn main() {
                 eprintln!("Error: {err}");
                 process::exit(1);
             }
+            return;
         }
 
-        filename => {
-            run_file(filename, false);
+        _ => {}
+    }
+
+    let mut disassemble = false;
+    let mut use_mir = false;
+    let mut strict_mir = false;
+    let mut no_gc = false;
+    let mut script_file: Option<String> = None;
+
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--disassemble" | "-d" => disassemble = true,
+            "--mir" => use_mir = true,
+            "--strict-mir" | "--strict" => {
+                strict_mir = true;
+                use_mir = true;
+            }
+            "--no-gc" => no_gc = true,
+            other if other.starts_with('-') => {
+                eprintln!("Unknown option '{}'", other);
+                print_usage(&args[0]);
+                process::exit(1);
+            }
+            pos => {
+                if script_file.is_none() {
+                    script_file = Some(pos.to_string());
+                }
+            }
         }
+    }
+
+    if let Some(file) = script_file {
+        run_file_with_options(&file, disassemble, use_mir, strict_mir, no_gc);
+    } else {
+        print_usage(&args[0]);
+        process::exit(1);
     }
 }
 
@@ -165,6 +181,10 @@ fn print_help(program: &str) {
     );
     println!(
         "    {} --strict-mir <script.lust>      Run with strict MIR (reject fallback/unsupported)",
+        program
+    );
+    println!(
+        "    {} --no-gc <script.lust>           Run script with cycle collector GC disabled",
         program
     );
     println!(
@@ -1563,11 +1583,14 @@ fn bindgen_command(args: &[String]) {
     }
 }
 
-fn run_file(filename: &str, disassemble: bool) {
-    run_file_with_options(filename, disassemble, false, false);
-}
 
-fn run_file_with_options(filename: &str, disassemble: bool, use_mir: bool, strict_mir: bool) {
+fn run_file_with_options(
+    filename: &str,
+    disassemble: bool,
+    use_mir: bool,
+    strict_mir: bool,
+    no_gc: bool,
+) {
     let source = match fs::read_to_string(filename) {
         Ok(content) => content,
         Err(e) => {
@@ -1592,6 +1615,9 @@ fn run_file_with_options(filename: &str, disassemble: bool, use_mir: bool, stric
     }
     if strict_mir {
         config.set_strict_mir(true);
+    }
+    if no_gc {
+        config.set_gc_enabled(false);
     }
     #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
     let dependency_resolution = match resolve_dependencies(&config, &project_dir) {

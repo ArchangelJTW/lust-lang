@@ -157,6 +157,7 @@ impl VM {
             active_native_depth: 0,
             active_jit_depth: 0,
         };
+        vm.cycle_collector.set_enabled(config.gc_enabled());
         if config.use_mir() {
             vm.jit.enabled = false;
         } else {
@@ -252,7 +253,9 @@ impl VM {
     }
 
     pub(crate) fn observe_value(&mut self, value: &Value) {
-        self.cycle_collector.register_value(value);
+        if self.cycle_collector.is_enabled() {
+            self.cycle_collector.register_value(value);
+        }
     }
 
     pub(crate) fn set_pending_jit_error(&mut self, error: LustError) {
@@ -260,7 +263,9 @@ impl VM {
     }
 
     pub(crate) fn observe_value_graph(&mut self, value: &Value) {
-        self.cycle_collector.register_graph(value);
+        if self.cycle_collector.is_enabled() {
+            self.cycle_collector.register_graph(value);
+        }
     }
 
     #[inline]
@@ -277,7 +282,7 @@ impl VM {
     pub(super) fn maybe_collect_cycles(&mut self) {
         // The trigger check is on every register write; only an actual
         // collection needs the collector taken out to borrow the VM.
-        if self.cycle_collector.should_collect() {
+        if self.cycle_collector.is_enabled() && self.cycle_collector.should_collect() {
             self.collect_cycles();
         }
     }
@@ -287,7 +292,12 @@ impl VM {
     #[cold]
     #[inline(never)]
     fn collect_cycles(&mut self) {
+        if !self.cycle_collector.is_enabled() {
+            return;
+        }
+        let enabled = self.cycle_collector.is_enabled();
         let mut collector = mem::take(&mut self.cycle_collector);
+        collector.set_enabled(enabled);
         collector.collect(self);
         self.cycle_collector = collector;
     }
@@ -299,6 +309,16 @@ impl VM {
 
     pub fn force_collect_cycles(&mut self) {
         self.collect_cycles();
+    }
+
+    #[inline]
+    pub fn is_gc_enabled(&self) -> bool {
+        self.cycle_collector.is_enabled()
+    }
+
+    #[inline]
+    pub fn set_gc_enabled(&mut self, enabled: bool) {
+        self.cycle_collector.set_enabled(enabled);
     }
 
     pub fn with_current<F, R>(f: F) -> CoreResult<R, String>

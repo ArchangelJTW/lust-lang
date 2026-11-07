@@ -85,6 +85,7 @@ impl DependencySpec {
 pub struct LustConfig {
     enabled_modules: HashSet<String>,
     jit_enabled: bool,
+    gc_enabled: bool,
     /// When enabled, minimizes memory usage during compilation by:
     /// - Not storing expression types and variable types
     /// - Not storing short-circuit type flow analysis
@@ -104,9 +105,26 @@ pub struct LustConfig {
 
 impl Default for LustConfig {
     fn default() -> Self {
+        let gc_enabled = {
+            #[cfg(feature = "std")]
+            {
+                if std::env::var_os("LUST_NO_GC").is_some()
+                    || std::env::var("LUST_GC").as_deref() == Ok("0")
+                {
+                    false
+                } else {
+                    true
+                }
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                true
+            }
+        };
         Self {
             enabled_modules: HashSet::new(),
             jit_enabled: true,
+            gc_enabled,
             low_memory_mode: false,
             minimal_runtime_types: false,
             use_mir: false,
@@ -172,6 +190,19 @@ impl LustConfig {
 
     pub fn set_jit_enabled(&mut self, enabled: bool) {
         self.jit_enabled = enabled;
+    }
+
+    pub fn gc_enabled(&self) -> bool {
+        self.gc_enabled
+    }
+
+    pub fn set_gc_enabled(&mut self, enabled: bool) {
+        self.gc_enabled = enabled;
+    }
+
+    pub fn with_gc_enabled(mut self, enabled: bool) -> Self {
+        self.gc_enabled = enabled;
+        self
     }
 
     pub fn low_memory_mode(&self) -> bool {
@@ -258,6 +289,7 @@ impl LustConfig {
         let Settings {
             stdlib_modules,
             jit,
+            gc,
             rust_modules,
             dependencies: nested_dependencies,
             mir,
@@ -342,9 +374,18 @@ impl LustConfig {
         let strict_mir_val = strict_mir.unwrap_or(false);
         let use_mir_val = mir.unwrap_or(false) || strict_mir_val;
 
+        let gc_val = if std::env::var_os("LUST_NO_GC").is_some()
+            || std::env::var("LUST_GC").as_deref() == Ok("0")
+        {
+            false
+        } else {
+            gc
+        };
+
         Ok(Self {
             enabled_modules: modules,
             jit_enabled: jit,
+            gc_enabled: gc_val,
             low_memory_mode: false,
             minimal_runtime_types: false,
             use_mir: use_mir_val,
@@ -370,6 +411,8 @@ struct Settings {
     stdlib_modules: Vec<String>,
     #[serde(default = "default_jit_enabled")]
     jit: bool,
+    #[serde(default = "default_gc_enabled")]
+    gc: bool,
     #[serde(default)]
     rust_modules: Vec<RustModuleEntry>,
     #[serde(default)]
@@ -415,6 +458,11 @@ struct DependencyTomlTable {
 
 #[allow(dead_code)]
 const fn default_jit_enabled() -> bool {
+    true
+}
+
+#[allow(dead_code)]
+const fn default_gc_enabled() -> bool {
     true
 }
 

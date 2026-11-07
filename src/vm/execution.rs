@@ -2744,7 +2744,9 @@ impl VM {
     // without materializing a temporary Value for an out-of-line call.
     #[inline(always)]
     pub(super) fn set_register(&mut self, reg: Register, value: Value) -> Result<()> {
-        self.cycle_collector.register_value(&value);
+        if self.cycle_collector.is_enabled() {
+            self.cycle_collector.register_value(&value);
+        }
         let frame = self
             .call_stack
             .last_mut()
@@ -2758,7 +2760,9 @@ impl VM {
         } else {
             *slot = value;
         }
-        self.maybe_collect_cycles();
+        if self.cycle_collector.is_enabled() {
+            self.maybe_collect_cycles();
+        }
         Ok(())
     }
 

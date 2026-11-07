@@ -110,3 +110,45 @@ fn value_copies_do_not_allocate_cycle_discovery_bookkeeping() -> lust::Result<()
     }
     Ok(())
 }
+
+#[test]
+fn disabled_gc_tracks_zero_containers_and_skips_cycles() -> lust::Result<()> {
+    let source = r#"
+        struct Node
+            value: int
+            next: Option<Node>
+        end
+
+        function create_chain(n: int): int
+            local head = Node { value = 0, next = Option.None }
+            local i = 1
+            while i < n do
+                head = Node { value = i, next = Option.Some(head) }
+                i = i + 1
+            end
+            return head.value
+        end
+    "#;
+
+    let mut config = LustConfig::default();
+    config.set_gc_enabled(false);
+    assert!(!config.gc_enabled());
+
+    let mut program = EmbeddedProgram::builder()
+        .with_config(config)
+        .module("chain", source)
+        .entry_module("chain")
+        .compile()?;
+
+    assert!(!program.vm_mut().is_gc_enabled());
+    let res = program.vm_mut().call("chain.create_chain", vec![Value::Int(1_000)])?;
+    assert_eq!(res, Value::Int(999));
+    assert_eq!(program.vm_mut().cycle_collector_tracked_count(), 0);
+
+    // Forcing collection with disabled GC must be a safe no-op
+    program.vm_mut().force_collect_cycles();
+    assert_eq!(program.vm_mut().cycle_collector_tracked_count(), 0);
+
+    Ok(())
+}
+

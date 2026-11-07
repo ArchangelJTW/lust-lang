@@ -10,6 +10,8 @@ pub mod builtins;
 pub mod bytecode;
 pub mod config;
 #[cfg(feature = "std")]
+pub mod codegen_zig;
+#[cfg(feature = "std")]
 pub mod embed;
 pub mod error;
 #[cfg(feature = "std")]
@@ -18,6 +20,7 @@ pub mod externs;
 pub mod ffi;
 pub mod intern;
 pub mod jit;
+pub mod mir;
 mod lazy;
 pub mod lexer;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
@@ -36,12 +39,13 @@ pub use bytecode::{Chunk, Compiler, Function, Instruction, Value};
 pub use config::{ConfigError, DependencyKind, DependencySpec, LustConfig};
 #[cfg(feature = "std")]
 pub use embed::{
-    ArrayHandle, AsyncDriver, AsyncTaskQueue, EmbeddedBuilder, EmbeddedProgram, EnumInstance,
-    ExternRegistry, FromLustValue, FromStructField, FunctionArgs, FunctionBuilder, FunctionHandle,
-    ImplBuilder, IntoLustValue, MapHandle, ModuleStub, StringRef, StructBuilder, StructField,
-    StructHandle, StructInstance, TraitBuilder, TraitMethodBuilder, ValueRef, enum_variant,
-    enum_variant_with, function_param, private_struct_field_decl, self_param, struct_field,
-    struct_field_decl, trait_bound, type_named, type_unit, type_unknown, weak_struct_field_decl,
+    ArrayHandle, AsyncDriver, AsyncTaskQueue, CompiledBytecode, EmbeddedBuilder, EmbeddedProgram,
+    EnumInstance, ExternRegistry, FromLustValue, FromStructField, FunctionArgs, FunctionBuilder,
+    FunctionHandle, ImplBuilder, IntoLustValue, MapHandle, ModuleStub, StringRef, StructBuilder,
+    StructField, StructHandle, StructInstance, TraitBuilder, TraitMethodBuilder, TypedHandle,
+    ValueRef, enum_variant, enum_variant_with, function_param, private_struct_field_decl,
+    self_param, struct_field, struct_field_decl, trait_bound, type_named, type_unit, type_unknown,
+    weak_struct_field_decl,
 };
 pub use error::{LustError, Result};
 pub use jit::{JitCompiler, JitState, JitStats};

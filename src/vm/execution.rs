@@ -5,7 +5,7 @@ use core::ptr;
 
 /// How thoroughly a call's arguments are checked against the signature.
 #[derive(Clone, Copy)]
-enum ArgCheck {
+pub(super) enum ArgCheck {
     /// Full validation, including container contents (host and dynamic calls).
     Deep,
     /// Kinds only; the typechecker proved the rest (bytecode calls).
@@ -176,8 +176,6 @@ impl VM {
             if should_check_jit && JIT_ENABLED {
                 let count = self.jit.profiler.record_backedge(func_idx, loop_start_ip);
                 let backedge_ip = ip_before_execution.saturating_sub(1);
-                let loop_in_hierarchy =
-                    self.is_loop_in_hierarchy(func_idx, loop_start_ip, backedge_ip);
                 if self
                     .trace_recorder
                     .as_ref()
@@ -436,36 +434,54 @@ impl VM {
                             .jit
                             .root_traces
                             .contains_key(&(func_idx, loop_start_ip))
-                        && self.jit.should_record_root(
+                    {
+                        let loop_in_hierarchy = match self
+                            .jit
+                            .profiler
+                            .get_cached_loop_hierarchy(func_idx, loop_start_ip)
+                        {
+                            Some(cached) => cached,
+                            None => {
+                                let calculated =
+                                    self.is_loop_in_hierarchy(func_idx, loop_start_ip, backedge_ip);
+                                self.jit.profiler.set_cached_loop_hierarchy(
+                                    func_idx,
+                                    loop_start_ip,
+                                    calculated,
+                                );
+                                calculated
+                            }
+                        };
+                        if self.jit.should_record_root(
                             func_idx,
                             loop_start_ip,
                             count,
                             crate::jit::HOT_THRESHOLD + u32::from(loop_in_hierarchy),
-                        )
-                    {
-                        crate::jit::log(|| {
-                            format!(
-                                "🔥 JIT: Hot loop detected at func {} ip {} - starting trace recording!",
-                                func_idx, loop_start_ip
-                            )
-                        });
-                        let mut recorder =
-                            TraceRecorder::new(func_idx, loop_start_ip, MAX_TRACE_LENGTH);
-                        recorder.set_root_frame_index(self.call_stack.len().saturating_sub(1));
-                        recorder.set_intrinsics(&self.jit.intrinsics);
-                        // Specialize loop-invariant values at trace entry
-                        if !self
-                            .jit
-                            .no_specialize_sites
-                            .contains(&(func_idx, loop_start_ip))
-                        {
-                            let frame = self.call_stack.last().unwrap();
-                            let func = &self.functions[func_idx];
-                            recorder.specialize_trace_inputs(&frame.registers, func);
+                        ) {
+                            crate::jit::log(|| {
+                                format!(
+                                    "🔥 JIT: Hot loop detected at func {} ip {} - starting trace recording!",
+                                    func_idx, loop_start_ip
+                                )
+                            });
+                            let mut recorder =
+                                TraceRecorder::new(func_idx, loop_start_ip, MAX_TRACE_LENGTH);
+                            recorder.set_root_frame_index(self.call_stack.len().saturating_sub(1));
+                            recorder.set_intrinsics(&self.jit.intrinsics);
+                            // Specialize loop-invariant values at trace entry
+                            if !self
+                                .jit
+                                .no_specialize_sites
+                                .contains(&(func_idx, loop_start_ip))
+                            {
+                                let frame = self.call_stack.last().unwrap();
+                                let func = &self.functions[func_idx];
+                                recorder.specialize_trace_inputs(&frame.registers, func);
+                            }
+                            self.trace_recorder = Some(recorder);
+                            self.jit.recording_started();
+                            self.skip_next_trace_record = true;
                         }
-                        self.trace_recorder = Some(recorder);
-                        self.jit.recording_started();
-                        self.skip_next_trace_record = true;
                     }
                 }
             }
@@ -1296,26 +1312,51 @@ impl VM {
                 }
 
                 Instruction::Concat(dest, lhs, rhs) => {
-                    let (left, right) = {
-                        let frame =
-                            self.call_stack
-                                .last_mut()
-                                .ok_or_else(|| LustError::RuntimeError {
-                                    message: "Empty call stack".to_string(),
-                                })?;
-                        let left = frame.registers[lhs as usize].clone();
-                        let right = frame.registers[rhs as usize].clone();
-                        (left, right)
-                    };
-                    let left_str = self.value_to_string_for_concat(&left)?;
-                    let right_str = self.value_to_string_for_concat(&right)?;
-                    let cap = left_str.len().saturating_add(right_str.len());
-                    self.budgets.charge_mem_bytes(cap)?;
-                    let mut combined = String::with_capacity(cap);
-                    combined.push_str(left_str.as_ref());
-                    combined.push_str(right_str.as_ref());
-                    let result = Value::string(combined);
-                    self.set_register(dest, result)?;
+                    let mut in_place_done = false;
+                    if dest == lhs {
+                        let right = {
+                            let frame = self.call_stack.last().ok_or_else(|| LustError::RuntimeError {
+                                message: "Empty call stack".to_string(),
+                            })?;
+                            frame.registers[rhs as usize].clone()
+                        };
+                        let right_str = self.value_to_string_for_concat(&right)?;
+                        let right_len = right_str.len();
+
+                        let frame = self.call_stack.last_mut().ok_or_else(|| LustError::RuntimeError {
+                            message: "Empty call stack".to_string(),
+                        })?;
+                        if let Value::String(ref mut rc) = frame.registers[dest as usize] {
+                            if let Some(s_mut) = Rc::get_mut(rc) {
+                                self.budgets.charge_mem_bytes(right_len)?;
+                                s_mut.push_str(right_str.as_ref());
+                                in_place_done = true;
+                            }
+                        }
+                    }
+
+                    if !in_place_done {
+                        let (left, right) = {
+                            let frame =
+                                self.call_stack
+                                    .last_mut()
+                                    .ok_or_else(|| LustError::RuntimeError {
+                                        message: "Empty call stack".to_string(),
+                                    })?;
+                            let left = frame.registers[lhs as usize].clone();
+                            let right = frame.registers[rhs as usize].clone();
+                            (left, right)
+                        };
+                        let left_str = self.value_to_string_for_concat(&left)?;
+                        let right_str = self.value_to_string_for_concat(&right)?;
+                        let cap = left_str.len().saturating_add(right_str.len());
+                        self.budgets.charge_mem_bytes(cap)?;
+                        let mut combined = String::with_capacity(if dest == lhs { cap.max(left_str.len() * 2) } else { cap });
+                        combined.push_str(left_str.as_ref());
+                        combined.push_str(right_str.as_ref());
+                        let result = Value::string(combined);
+                        self.set_register(dest, result)?;
+                    }
                 }
 
                 Instruction::GetIndex(dest, array_reg, index_reg) => {
@@ -2052,7 +2093,7 @@ impl VM {
     /// (x86_64 and aarch64, with `std`) have function code; elsewhere the
     /// interpreter runs every call itself and loops are still traced.
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    fn run_compiled_function(&mut self, func_idx: usize) -> Result<Option<Value>> {
+    pub(super) fn run_compiled_function(&mut self, func_idx: usize) -> Result<Option<Value>> {
         if !self.effective_jit_enabled() {
             return Ok(None);
         }
@@ -2247,7 +2288,7 @@ impl VM {
     /// Targets without a whole-function backend: the call stays
     /// interpreted (see the compiled version above).
     #[cfg(not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))))]
-    fn run_compiled_function(&mut self, _func_idx: usize) -> Result<Option<Value>> {
+    pub(super) fn run_compiled_function(&mut self, _func_idx: usize) -> Result<Option<Value>> {
         Ok(None)
     }
 
@@ -2349,6 +2390,66 @@ impl VM {
         upvalues: Vec<Value>,
     ) -> Result<Box<CallFrame>> {
         self.make_call_frame_with(function_idx, return_dest, args, upvalues, ArgCheck::Deep)
+    }
+
+    pub(super) fn make_call_frame_slice(
+        &mut self,
+        function_idx: usize,
+        return_dest: Option<Register>,
+        args: &[Value],
+        check: ArgCheck,
+    ) -> Result<Box<CallFrame>> {
+        let function = self
+            .functions
+            .get(function_idx)
+            .ok_or_else(|| LustError::RuntimeError {
+                message: format!("Invalid function index {}", function_idx),
+            })?;
+        if args.len() != function.param_count as usize {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Function {} expects {} arguments, got {}",
+                    function.name,
+                    function.param_count,
+                    args.len()
+                ),
+            });
+        }
+        if let Some(signature) = &function.signature
+            && signature.params.len() == args.len()
+        {
+            for (index, (value, ty)) in args.iter().zip(&signature.params).enumerate() {
+                let ok = match check {
+                    ArgCheck::Deep => self.value_matches_type(value, ty),
+                    ArgCheck::Shallow => Self::value_matches_type_shallow(value, ty),
+                };
+                if !ok {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "Function {} argument {} expects {}, got {:?}",
+                            function.name,
+                            index + 1,
+                            ty,
+                            value.type_of()
+                        ),
+                    });
+                }
+            }
+        }
+
+        let register_count = function.register_count;
+        let mut frame = self.take_frame(function_idx, return_dest, register_count)?;
+        let recursive = self
+            .call_stack
+            .iter()
+            .any(|existing| existing.function_idx == function_idx);
+        self.jit.record_function_call(recursive);
+        frame.upvalues.clear();
+        for (index, arg) in args.iter().enumerate() {
+            self.observe_value_graph(arg);
+            frame.registers[index] = arg.fast_clone();
+        }
+        Ok(frame)
     }
 
     fn make_call_frame_with(
@@ -2643,7 +2744,9 @@ impl VM {
     // without materializing a temporary Value for an out-of-line call.
     #[inline(always)]
     pub(super) fn set_register(&mut self, reg: Register, value: Value) -> Result<()> {
-        self.cycle_collector.register_value(&value);
+        if self.cycle_collector.is_enabled() {
+            self.cycle_collector.register_value(&value);
+        }
         let frame = self
             .call_stack
             .last_mut()
@@ -2657,7 +2760,9 @@ impl VM {
         } else {
             *slot = value;
         }
-        self.maybe_collect_cycles();
+        if self.cycle_collector.is_enabled() {
+            self.maybe_collect_cycles();
+        }
         Ok(())
     }
 

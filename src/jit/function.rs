@@ -203,8 +203,9 @@ struct Env {
     layouts: HashMap<Register, (Rc<StructLayout>, bool)>,
     /// Registers holding an array whose elements are of a scalar type.
     elements: HashMap<Register, ValueType>,
-    /// Registers holding a snapshot of a global (a module table, a native)
-    /// taken under the globals guard.
+    /// Registers holding a snapshot of a global native function taken under
+    /// the globals guard. Mutable containers (like Map) are never stored here
+    /// because in-place mutation does not change globals_version.
     constants: HashMap<Register, Value>,
     /// Registers whose native function identity a guard has established.
     natives_guarded: HashSet<Register>,
@@ -214,7 +215,6 @@ struct Env {
 
 fn same_constant(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Map(x), Value::Map(y)) => Rc::ptr_eq(x, y),
         (Value::NativeFunction(x), Value::NativeFunction(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
@@ -424,7 +424,7 @@ fn jump_targets(instructions: &[Instruction]) -> Option<HashSet<usize>> {
             _ => continue,
         };
         let target = jump_target(ip, offset)?;
-        if target >= instructions.len() {
+        if target > instructions.len() {
             return None;
         }
         targets.insert(target);
@@ -831,7 +831,7 @@ impl<'a> Translator<'a> {
                     Value::Function(idx) => {
                         self.env.functions.insert(dest, *idx);
                     }
-                    Value::Map(_) | Value::NativeFunction(_) => {
+                    Value::NativeFunction(_) => {
                         self.env.constants.insert(dest, value);
                     }
                     _ => {}
@@ -1054,27 +1054,6 @@ impl<'a> Translator<'a> {
             }
             Instruction::GetField(dest, object, name_idx) => {
                 let field_name = self.constant_string(name_idx)?;
-                if let Some(Value::Map(map)) = self.env.constants.get(&object) {
-                    // A module table: the entry read now is what a call
-                    // through the result will guard on.
-                    let entry = map
-                        .borrow()
-                        .get(&crate::bytecode::ValueKey::from(field_name.as_str()))
-                        .cloned();
-                    self.ops.push(TraceOp::GetField {
-                        dest,
-                        object,
-                        field_name,
-                        field_index: None,
-                        value_type: None,
-                        is_weak: false,
-                    });
-                    self.write(dest, None);
-                    if let Some(entry @ Value::NativeFunction(_)) = entry {
-                        self.env.constants.insert(dest, entry);
-                    }
-                    return Some(());
-                }
                 match self.guarded_layout(object) {
                     Some(layout) => {
                         let index = layout.index_of_str(&field_name)?;
@@ -1141,10 +1120,12 @@ impl<'a> Translator<'a> {
             }
             Instruction::SetIndex(array, index, value) => {
                 self.guard(index, ValueType::Int);
+                let element_type = self.env.elements.get(&array).copied();
                 self.ops.push(TraceOp::SetIndex {
                     array,
                     index,
                     value,
+                    element_type,
                 });
             }
             Instruction::GetIndex(dest, array, index) => {
@@ -1478,8 +1459,11 @@ fn translate_pass(
                 (Some(incoming), true) => incoming.merge(&t.env),
                 (Some(incoming), false) => incoming,
                 (None, true) => t.env.clone(),
-                // Only reachable through a back edge: not structured code.
-                (None, false) => return None,
+                // Dead code: no forward edges arrive here and straight-line flow terminated.
+                (None, false) => {
+                    ip += 1;
+                    continue;
+                }
             };
             if let Some(loop_env) = t.loop_envs.get(&ip) {
                 env = env.merge(loop_env);
@@ -1967,5 +1951,271 @@ mod compiled_semantics_tests {
                 .call_typed::<_, crate::LustInt>("main.modulo", (1, 0))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn b05_recursion_compiles_and_runs() {
+        let mut program = program(
+            r#"
+            function b05_recursion(depth: int): int
+                if depth <= 0 then
+                    return 0
+                else
+                    return depth + b05_recursion(depth - 1)
+                end
+            end
+            "#,
+        );
+        for _ in 0..40 {
+            let res: crate::LustInt = program
+                .call_typed("main.b05_recursion", 10i64)
+                .expect("call");
+            assert_eq!(res, 55);
+        }
+        assert!(
+            program.jit_stats().functions_compiled >= 1,
+            "functions_compiled: {}",
+            program.jit_stats().functions_compiled
+        );
+    }
+
+    #[test]
+    fn whole_function_map_callable_in_place_mutation_regression() {
+        use crate::bytecode::value::{native_fn, NativeCallResult};
+        use crate::bytecode::{Value, ValueKey};
+        use std::cell::Cell;
+
+        let mut program = program(
+            r#"
+            struct SampleStruct
+                val: int
+            end
+
+            function make_sample_struct(): SampleStruct
+                return SampleStruct { val = 42 }
+            end
+
+            function invoke_dispatch(x: float): float
+                return math.abs(x)
+            end
+            "#,
+        );
+
+        let sample_struct = program
+            .call_raw("main.make_sample_struct", vec![])
+            .expect("make_sample_struct");
+        assert!(matches!(sample_struct, Value::Struct(_)));
+
+        // Call enough times to compile whole-function (threshold is 15)
+        for i in 0..25 {
+            let res = program
+                .call_typed::<_, f64>("main.invoke_dispatch", -(i as f64))
+                .expect("invoke_dispatch");
+            assert_eq!(res, i as f64);
+        }
+
+        // Prove whole-function native entry separately from root traces
+        let stats = program.jit_stats();
+        assert!(stats.functions_compiled >= 1, "must compile whole function");
+        assert_eq!(stats.root_traces_compiled, 0, "must NOT compile root traces (whole-function only)");
+        assert!(stats.native_trace_entries > 0, "must enter native code");
+
+        // 1. Mutate math map in-place via FFI with unchanged globals_version:
+        // verify callable substitution, side-effects, and direct proof of native execution entry
+        let custom_calls = Rc::new(Cell::new(0usize));
+        let custom_calls_clone = custom_calls.clone();
+        let custom_fn = Value::NativeFunction(native_fn(move |args| {
+            custom_calls_clone.set(custom_calls_clone.get() + 1);
+            let x = args.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+            Ok(NativeCallResult::Return(Value::Float(x + 100.0)))
+        }));
+
+        let math_mod = program.vm().get_global("math").expect("math module");
+        let version_before = program.vm().globals_version;
+        if let Value::Map(ref m) = math_mod {
+            m.borrow_mut()
+                .insert(ValueKey::from("abs"), custom_fn);
+        } else {
+            panic!("expected Map for math");
+        }
+        assert_eq!(program.vm().globals_version, version_before, "globals_version unchanged on in-place map mutation");
+
+        // Compare native entry count before/after to prove native entry after in-place mutation
+        let native_entries_before = program.jit_stats().native_trace_entries;
+        let res = program
+            .call_typed::<_, f64>("main.invoke_dispatch", 10.0)
+            .expect("invoke_dispatch after in-place map mutation");
+        let native_entries_after = program.jit_stats().native_trace_entries;
+
+        assert_eq!(
+            native_entries_after,
+            native_entries_before + 1,
+            "native entry MUST be recorded upon executing after in-place mutation"
+        );
+        assert_eq!(custom_calls.get(), 1, "in-place replaced callable MUST be invoked (side effect)");
+        assert_eq!(res, 110.0, "must return result from in-place replaced callable");
+
+        // 2. Mutate map through an alias: verify native entry and side effect
+        let map_alias = math_mod.clone();
+        let alias_calls = Rc::new(Cell::new(0usize));
+        let alias_calls_clone = alias_calls.clone();
+        let alias_fn = Value::NativeFunction(native_fn(move |args| {
+            alias_calls_clone.set(alias_calls_clone.get() + 1);
+            let x = args.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+            Ok(NativeCallResult::Return(Value::Float(x + 500.0)))
+        }));
+
+        if let Value::Map(ref m) = map_alias {
+            m.borrow_mut().insert(ValueKey::from("abs"), alias_fn);
+        }
+        assert_eq!(program.vm().globals_version, version_before, "globals_version unchanged on alias mutation");
+
+        let alias_entries_before = program.jit_stats().native_trace_entries;
+        let res_alias = program
+            .call_typed::<_, f64>("main.invoke_dispatch", 20.0)
+            .expect("invoke_dispatch after alias mutation");
+        let alias_entries_after = program.jit_stats().native_trace_entries;
+
+        assert_eq!(
+            alias_entries_after,
+            alias_entries_before + 1,
+            "native entry MUST be recorded after alias mutation"
+        );
+        assert_eq!(alias_calls.get(), 1, "callable replaced via alias MUST be invoked (side effect)");
+        assert_eq!(res_alias, 520.0, "must return result from alias replaced callable");
+
+        // 3. In-place mutation to Scalar (Value::Int): calling non-function must fail cleanly
+        if let Value::Map(ref m) = math_mod {
+            m.borrow_mut().insert(ValueKey::from("abs"), Value::Int(42));
+        }
+        assert_eq!(program.vm().globals_version, version_before);
+        let scalar_err = program
+            .call_typed::<_, f64>("main.invoke_dispatch", 5.0)
+            .unwrap_err();
+        assert!(
+            format!("{scalar_err}").contains("Cannot call non-function value"),
+            "calling scalar in place of callable must fail cleanly: {scalar_err}"
+        );
+
+        // 4. In-place mutation to Nil (Value::Nil): calling nil must fail cleanly
+        if let Value::Map(ref m) = math_mod {
+            m.borrow_mut().insert(ValueKey::from("abs"), Value::Nil);
+        }
+        assert_eq!(program.vm().globals_version, version_before);
+        let nil_err = program
+            .call_typed::<_, f64>("main.invoke_dispatch", 5.0)
+            .unwrap_err();
+        assert!(
+            format!("{nil_err}").contains("Cannot call non-function value"),
+            "calling nil in place of callable must fail cleanly: {nil_err}"
+        );
+
+        // 5. In-place mutation to Nested Map (Value::Map): calling map must fail cleanly
+        let nested_map = Value::map(hashbrown::HashMap::default());
+        if let Value::Map(ref m) = math_mod {
+            m.borrow_mut().insert(ValueKey::from("abs"), nested_map);
+        }
+        assert_eq!(program.vm().globals_version, version_before);
+        let map_err = program
+            .call_typed::<_, f64>("main.invoke_dispatch", 5.0)
+            .unwrap_err();
+        assert!(
+            format!("{map_err}").contains("Cannot call non-function value"),
+            "calling nested map in place of callable must fail cleanly: {map_err}"
+        );
+
+        // 6. In-place mutation to Struct (Value::Struct): calling struct must fail cleanly
+        if let Value::Map(ref m) = math_mod {
+            m.borrow_mut().insert(ValueKey::from("abs"), sample_struct);
+        }
+        assert_eq!(program.vm().globals_version, version_before);
+        let struct_err = program
+            .call_typed::<_, f64>("main.invoke_dispatch", 5.0)
+            .unwrap_err();
+        assert!(
+            format!("{struct_err}").contains("Cannot call non-function value"),
+            "calling struct in place of callable must fail cleanly: {struct_err}"
+        );
+
+        // 7. In-place mutation to host Error returning callable: error propagation
+        let error_fn = Value::NativeFunction(native_fn(|_args| {
+            Err("math computation host fault".to_string())
+        }));
+        if let Value::Map(ref m) = math_mod {
+            m.borrow_mut().insert(ValueKey::from("abs"), error_fn);
+        }
+        assert_eq!(program.vm().globals_version, version_before);
+        let host_err = program
+            .call_typed::<_, f64>("main.invoke_dispatch", 5.0)
+            .unwrap_err();
+        assert!(
+            format!("{host_err}").contains("math computation host fault"),
+            "host error must propagate cleanly: {host_err}"
+        );
+
+        // 8. In-place mutation with Type Change and Deopt:
+        // Replacing float-returning callable with int-returning callable triggers return type guard exit (deopt)
+        let type_change_fn = Value::NativeFunction(native_fn(|_args| {
+            Ok(NativeCallResult::Return(Value::Int(777)))
+        }));
+        if let Value::Map(ref m) = math_mod {
+            m.borrow_mut().insert(ValueKey::from("abs"), type_change_fn);
+        }
+        assert_eq!(program.vm().globals_version, version_before);
+
+        let guard_exits_before = program.jit_stats().guard_exits;
+        let type_err = program
+            .call_typed::<_, f64>("main.invoke_dispatch", 5.0)
+            .unwrap_err();
+        let guard_exits_after = program.jit_stats().guard_exits;
+
+        assert!(
+            guard_exits_after > guard_exits_before,
+            "type change (Int returned where Float expected by guard) MUST trigger guard exit / deopt"
+        );
+        assert!(
+            format!("{type_err}").to_lowercase().contains("type")
+                || format!("{type_err}").contains("expected")
+                || format!("{type_err}").contains("int")
+                || format!("{type_err}").contains("float"),
+            "unexpected error format for type mismatch: {type_err}"
+        );
+
+        // Crucial verification: guard exit evicted the compiled function from native dispatch table
+        let func_idx = program
+            .vm()
+            .functions
+            .iter()
+            .position(|f| f.name == "main.invoke_dispatch")
+            .expect("invoke_dispatch function exists");
+        assert_eq!(
+            program.vm().jit.function_entry(func_idx),
+            0,
+            "compiled function MUST be evicted following guard exit"
+        );
+
+        // 9. Replace the entire Map in globals: globals_version changes.
+        // Function is executed via interpreter (since compiled entry was evicted on guard exit)
+        let new_map = Value::map(hashbrown::HashMap::default());
+        let replace_calls = Rc::new(Cell::new(0usize));
+        let replace_calls_clone = replace_calls.clone();
+        let replace_fn = Value::NativeFunction(native_fn(move |args| {
+            replace_calls_clone.set(replace_calls_clone.get() + 1);
+            let x = args.first().and_then(|v| v.as_float()).unwrap_or(0.0);
+            Ok(NativeCallResult::Return(Value::Float(x + 1000.0)))
+        }));
+
+        if let Value::Map(ref m) = new_map {
+            m.borrow_mut().insert(ValueKey::from("abs"), replace_fn);
+        }
+        program.vm_mut().set_global("math", new_map);
+        assert_ne!(program.vm().globals_version, version_before, "globals_version MUST change when global map is replaced");
+
+        let res_replace = program
+            .call_typed::<_, f64>("main.invoke_dispatch", 30.0)
+            .expect("invoke_dispatch after map replacement");
+
+        assert_eq!(replace_calls.get(), 1, "callable in replaced global Map MUST be invoked (side effect)");
+        assert_eq!(res_replace, 1030.0, "must return result from replaced global Map");
     }
 }

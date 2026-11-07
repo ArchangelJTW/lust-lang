@@ -8,30 +8,73 @@
 # keeps a stray one from changing a later run.
 D=$(cd "$(dirname "$0")" && pwd)
 LUST=${1:-"$D/../../target/release/lust"}
+RUST_MANIFEST="$D/rust/Cargo.toml"
+RUST_BIN="$D/rust/target/release/suite-rust"
+cargo build --release --manifest-path "$RUST_MANIFEST" >&2
 TIMEOUT=${TIMEOUT:-120}
-ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
-has() { command -v "$1" > /dev/null 2>&1; }
-# Run one engine over one program; sets T (ms, or "timeout") and O (last line).
-timed() {
-  local start
-  start=$(ms)
-  O=$(cd "$WORK" && timeout "$TIMEOUT" "$@" 2>&1 | tail -1)
-  local status=${PIPESTATUS[0]}
-  T=$(( $(ms) - start ))
-  if [ "$status" -eq 124 ]; then
-    T="timeout"
-    O="<timeout after ${TIMEOUT}s>"
-  fi
-}
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
-printf "%-10s %10s %10s %10s %10s   %s\n" program lust-vm lust-jit luajit lua outputs
-for f in fields array sieve calls methods strings fib nested floatmath tree; do
-  timed env LUST_JIT=0 "$LUST" "$D/$f.lust"; t1=$T; o1=$O
-  timed env LUST_JIT=1 "$LUST" "$D/$f.lust"; t2=$T; o2=$O
-  t3=-; t4=-; o3=$o2
-  if has luajit; then timed luajit "$D/$f.lua"; t3=$T; o3=$O; fi
-  if has lua; then timed lua "$D/$f.lua"; t4=$T; fi
-  same="same"; [ "$o1" = "$o2" ] || same="LUST DIFFERS"; [ "$o2" = "$o3" ] || same="$same (lua prints $o3)"
-  printf "%-10s %8s ms %8s ms %8s ms %8s ms   %s\n" "$f" "$t1" "$t2" "$t3" "$t4" "$same"
-done
+exec python3 - << 'EOF'
+import os, sys, time, subprocess, tempfile
+from pathlib import Path
+
+suite_dir = Path(os.environ.get("D", "/Users/vedmalex/work/lust-lang/repos/lust-lang-fork/benchmarks/suite"))
+lust_bin = Path(sys.argv[1]) if len(sys.argv) > 1 else suite_dir.parent.parent / "target/release/lust"
+rust_bin = suite_dir / "rust/target/release/suite-rust"
+
+programs = ["fields", "array", "sieve", "calls", "methods", "strings", "fib", "nested", "floatmath", "tree"]
+
+with tempfile.TemporaryDirectory(dir="/tmp") as td:
+    def run_cmd(cmd, env=None):
+        e = os.environ.copy()
+        if env:
+            e.update(env)
+        start = time.perf_counter_ns()
+        try:
+            res = subprocess.run(cmd, cwd=td, env=e, capture_output=True, text=True, timeout=int(os.environ.get("TIMEOUT", 120)))
+            dur_ms = (time.perf_counter_ns() - start) / 1_000_000
+            last_line = res.stdout.strip().splitlines()[-1] if res.stdout.strip() else ""
+            if res.returncode != 0:
+                return "crash/error", f"<exit {res.returncode}>"
+            return f"{dur_ms:6.1f} ms", last_line
+        except subprocess.TimeoutExpired:
+            return "timeout", "<timeout>"
+
+    aot_bins = {}
+    print("Building Lust AOT binaries (--release-fast)...", file=sys.stderr)
+    for prog in programs:
+        bin_path = Path(td) / f"{prog}_aot"
+        res = subprocess.run([str(lust_bin), "build", str(suite_dir / f"{prog}.lust"), "-o", str(bin_path), "--release-fast"], capture_output=True, text=True)
+        if res.returncode == 0:
+            aot_bins[prog] = bin_path
+            # One warmup execution to prime dyld / code signing cache
+            subprocess.run([str(bin_path)], capture_output=True)
+        else:
+            print(f"Failed to build AOT for {prog}: {res.stderr}", file=sys.stderr)
+
+    print(f"{'program':<10} {'rust':>9} {'lust-aot':>10} {'luajit':>9} {'lust-jit':>10} {'lust-vm':>10} {'lua':>9}   outputs")
+
+    for prog in programs:
+        t_rust, o_rust = run_cmd([str(rust_bin), prog])
+        if prog in aot_bins:
+            t_aot, o_aot = run_cmd([str(aot_bins[prog])])
+        else:
+            t_aot, o_aot = "n/a", ""
+        t_jit, o_jit = run_cmd([str(lust_bin), str(suite_dir / f"{prog}.lust")], {"LUST_JIT": "1"})
+        t_vm, o_vm = run_cmd([str(lust_bin), str(suite_dir / f"{prog}.lust")], {"LUST_JIT": "0"})
+        t_lj, o_lj = run_cmd(["luajit", str(suite_dir / f"{prog}.lua")])
+        t_lua, o_lua = run_cmd(["lua", str(suite_dir / f"{prog}.lua")])
+        
+        outputs = [("rust", o_rust), ("aot", o_aot), ("jit", o_jit), ("luajit", o_lj), ("vm", o_vm), ("lua", o_lua)]
+        reference = outputs[0][1]
+        def match_val(a, b):
+            if a == b:
+                return True
+            try:
+                fa, fb = float(a), float(b)
+                import math
+                return math.isclose(fa, fb, rel_tol=1e-6)
+            except ValueError:
+                return False
+        diff = [name for name, output in outputs[1:] if not match_val(reference, output)]
+        status = "same" if not diff else "DIFF: rust!=" + ",".join(diff)
+        print(f"{prog:<10} {t_rust:>9} {t_aot:>10} {t_lj:>9} {t_jit:>10} {t_vm:>10} {t_lua:>9}   {status}")
+EOF

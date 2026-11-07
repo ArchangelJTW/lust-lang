@@ -525,6 +525,21 @@ impl JitCompiler {
                         *is_weak,
                     )?;
                 }
+                TraceOp::RestoreField {
+                    object,
+                    field_name,
+                    value,
+                    field_index,
+                    value_type,
+                } => {
+                    self.compile_restore_field(
+                        *object,
+                        field_name,
+                        *value,
+                        *field_index,
+                        *value_type,
+                    )?;
+                }
                 TraceOp::NewArray {
                     dest,
                     first_element,
@@ -706,7 +721,10 @@ impl JitCompiler {
                 | TraceOp::SetIndex { .. }
                 | TraceOp::ArrayPush { .. }
                 | TraceOp::BorrowField { .. }
-                | TraceOp::BorrowEnumValue { .. } => {
+                | TraceOp::BorrowEnumValue { .. }
+                | TraceOp::Select { .. }
+                | TraceOp::SelectBitZero { .. }
+                | TraceOp::ModImm { .. } => {
                     return Err(crate::LustError::RuntimeError {
                         message: format!("{op:?} is not supported on riscv32"),
                     });

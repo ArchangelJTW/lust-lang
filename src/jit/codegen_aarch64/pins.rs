@@ -55,7 +55,7 @@ pub(super) struct Pin {
 pub(super) const INT_PIN_REGS: [u8; 6] = [23, 24, 25, 26, 27, 28];
 pub(super) const FLOAT_PIN_REGS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Access {
     Read,
     Write,
@@ -189,6 +189,7 @@ fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
         }
         TraceOp::ArrayPush { dest, .. } => set(env, *dest, Some(ValueType::Plain)),
         TraceOp::SetField { .. }
+        | TraceOp::RestoreField { .. }
         | TraceOp::SetIndex { .. }
         | TraceOp::GuardNativeFunction { .. }
         | TraceOp::GuardGlobals { .. }
@@ -200,6 +201,9 @@ fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
         | TraceOp::Return { .. }
         | TraceOp::Unbox { .. }
         | TraceOp::DropSpecialized { .. } => {}
+        TraceOp::Select { dest, on_true, .. } => set(env, *dest, const_type(on_true)),
+        TraceOp::SelectBitZero { dest, on_zero, .. } => set(env, *dest, const_type(on_zero)),
+        TraceOp::ModImm { dest, .. } => set(env, *dest, Some(ValueType::Int)),
     }
 }
 
@@ -460,7 +464,8 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
             e.reads.push((*object, None));
             e.helper_writes.push(*dest);
         }
-        TraceOp::SetField { object, value, .. } => {
+        TraceOp::SetField { object, value, .. }
+        | TraceOp::RestoreField { object, value, .. } => {
             e.reads.push((*object, None));
             e.reads.push((*value, None));
         }
@@ -468,10 +473,11 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
             array,
             index,
             value,
+            element_type,
         } => {
             e.reads.push((*array, None));
-            e.reads.push((*index, None));
-            e.reads.push((*value, None));
+            e.reads.push((*index, Some(ValueType::Int)));
+            e.reads.push((*value, *element_type));
         }
         TraceOp::ArrayPush { dest, array, value } => {
             e.reads.push((*array, None));
@@ -540,6 +546,28 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
         }
         TraceOp::Unbox { source_reg, .. } => e.reads.push((*source_reg, None)),
         TraceOp::Rebox { dest_reg, .. } => e.helper_writes.push(*dest_reg),
+        TraceOp::Select {
+            dest,
+            cond,
+            on_true,
+            ..
+        } => {
+            let cond_ty = env.get(cond).copied();
+            e.reads.push((*cond, cond_ty));
+            e.native_writes.push((*dest, const_type(on_true)));
+        }
+        TraceOp::SelectBitZero {
+            dest, src, on_zero, ..
+        } => {
+            let src_ty = env.get(src).copied();
+            e.reads.push((*src, src_ty));
+            e.native_writes.push((*dest, const_type(on_zero)));
+        }
+        TraceOp::ModImm { dest, src, .. } => {
+            let src_ty = env.get(src).copied();
+            e.reads.push((*src, src_ty));
+            e.native_writes.push((*dest, Some(ValueType::Int)));
+        }
         TraceOp::SpecializedOp { operands, .. } => {
             for operand in operands {
                 if let Operand::Register(r) = operand {
@@ -563,6 +591,9 @@ pub(super) fn op_touches_register_memory(op: &TraceOp) -> bool {
                 value: Value::Int(_) | Value::Float(_) | Value::Bool(_),
                 ..
             }
+            | TraceOp::Select { .. }
+            | TraceOp::SelectBitZero { .. }
+            | TraceOp::ModImm { .. }
             | TraceOp::Add { .. }
             | TraceOp::Sub { .. }
             | TraceOp::Mul { .. }
@@ -585,16 +616,290 @@ pub(super) fn op_touches_register_memory(op: &TraceOp) -> bool {
     )
 }
 
-/// Plan the pins for a trace body. `preamble` establishes the scalar types
-/// known at loop entry.
-/// Plan the pins for function code. Control flow makes the trace rules
-/// (loop-carried state, entry proofs) meaningless, so every pin here is a
-/// write-through `Local` one: a register every write of which is a typed
-/// native op of one scalar type, never a helper. Memory stays current, so
-/// reads may use the machine register only where the static environment
-/// proves the type (see `JitCompiler::active_pin`), and the machine
-/// registers are loaded from the frame at entry. The environment restarts
-/// from each label's known scalars, as the translator computed them.
+pub(super) struct ScalarRegPlan {
+    pub pins: HashMap<u8, Pin>,
+    pub spills: HashMap<u8, i32>,
+    /// Pairs pushed below the frame pointer, first pair pushed first.
+    /// Always includes x20 (the VM). x21 is intentionally absent: it is
+    /// the caller's inline record and must survive the body untouched.
+    pub saved: Vec<(u8, u8)>,
+}
+
+/// Pin a pure scalar function, including ones with no loop. Registers
+/// live across a self-call take callee-saved pins; the rest take
+/// caller-saved pins. A register whose type changes (the fib comparison
+/// temporary reused as an int) is spilled to a slot under x29.
+pub(super) fn plan_scalar_fast(
+    body: &[TraceOp],
+    entry: &[(u8, ValueType)],
+) -> Option<ScalarRegPlan> {
+    let mut entry_ty = HashMap::<u8, ValueType>::new();
+    for (reg, ty) in entry {
+        if matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool) {
+            if *ty == ValueType::Float {
+                return None;
+            }
+            entry_ty.insert(*reg, *ty);
+        }
+    }
+
+    let mut writes: HashMap<u8, ValueType> = HashMap::new();
+    let mut uses: Vec<Vec<u8>> = Vec::with_capacity(body.len());
+    let mut defs: Vec<Vec<u8>> = Vec::with_capacity(body.len());
+    let mut env = entry_ty.clone();
+    for op in body {
+        let (op_uses, op_defs) = scalar_uses_defs(op, &env);
+        for (reg, ty) in &op_defs {
+            if let Some(ty) = ty {
+                if *ty == ValueType::Float {
+                    return None;
+                }
+                if let Some(prev) = writes.get(reg) {
+                    if prev != ty {
+                        writes.insert(*reg, ValueType::Plain);
+                    }
+                } else if let Some(prev) = entry_ty.get(reg) {
+                    if prev != ty {
+                        writes.insert(*reg, ValueType::Plain);
+                    } else {
+                        writes.insert(*reg, *ty);
+                    }
+                } else {
+                    writes.insert(*reg, *ty);
+                }
+                env.insert(*reg, *ty);
+            }
+        }
+        uses.push(op_uses);
+        defs.push(op_defs.into_iter().map(|(reg, _)| reg).collect());
+    }
+
+    let succ = scalar_successors(body);
+    let mut live_in: Vec<hashbrown::HashSet<u8>> = vec![hashbrown::HashSet::new(); body.len()];
+    let mut live_out: Vec<hashbrown::HashSet<u8>> = vec![hashbrown::HashSet::new(); body.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for index in (0..body.len()).rev() {
+            let mut out = hashbrown::HashSet::new();
+            for &next in &succ[index] {
+                out.extend(live_in[next].iter().copied());
+            }
+            let mut inn = out.clone();
+            for reg in &defs[index] {
+                inn.remove(reg);
+            }
+            inn.extend(uses[index].iter().copied());
+            if out != live_out[index] {
+                live_out[index] = out;
+                changed = true;
+            }
+            if inn != live_in[index] {
+                live_in[index] = inn;
+                changed = true;
+            }
+        }
+    }
+
+    let mut across = hashbrown::HashSet::new();
+    for (index, op) in body.iter().enumerate() {
+        if matches!(op, TraceOp::CallDirect { .. }) {
+            for reg in &live_out[index] {
+                if !defs[index].contains(reg) {
+                    across.insert(*reg);
+                }
+            }
+        }
+    }
+
+    let mut spill_regs = Vec::new();
+    let mut pin_regs: Vec<(u8, ValueType, bool)> = Vec::new();
+    let mut seen = hashbrown::HashSet::new();
+    for (reg, ty) in &entry_ty {
+        seen.insert(*reg);
+        if writes.get(reg) == Some(&ValueType::Plain) {
+            spill_regs.push(*reg);
+        } else {
+            pin_regs.push((*reg, *ty, across.contains(reg)));
+        }
+    }
+    for (reg, ty) in &writes {
+        if !seen.insert(*reg) {
+            continue;
+        }
+        if *ty == ValueType::Plain {
+            spill_regs.push(*reg);
+        } else {
+            pin_regs.push((*reg, *ty, across.contains(reg)));
+        }
+    }
+
+    // Callee-saved only. Caller-saved pins alias the scratch registers
+    // (x9–x12) the arithmetic emitters already use.
+    const CALLEE: [u8; 8] = [19, 22, 23, 24, 25, 26, 27, 28];
+    let mut callee = CALLEE.iter().copied();
+    let mut pins = HashMap::new();
+    pin_regs.sort_by_key(|(reg, _, live)| (!*live, *reg));
+    for (reg, ty, _live) in pin_regs {
+        let Some(machine) = callee.next() else {
+            return None;
+        };
+        pins.insert(
+            reg,
+            Pin {
+                ty,
+                reg: machine,
+                class: PinClass::Carried,
+                proven_at_entry: entry_ty.get(&reg) == Some(&ty),
+            },
+        );
+    }
+
+    // Only values live across a call are saved in every frame. The VM
+    // adapter saves the rest of the callee-saved set once, for the
+    // interpreter. x20 (the VM) and x21 (the caller's record) stay put.
+    let mut saved_regs: Vec<u8> = pins
+        .iter()
+        .filter(|(reg, _)| across.contains(*reg))
+        .map(|(_, pin)| pin.reg)
+        .collect();
+    saved_regs.sort_unstable();
+    saved_regs.dedup();
+    if saved_regs.len() % 2 == 1 {
+        saved_regs.push(20);
+    }
+    let mut saved = Vec::new();
+    for pair in saved_regs.chunks(2) {
+        saved.push((pair[0], pair[1]));
+    }
+    let saved_bytes = saved.len() as i32 * 16;
+    let mut spills = HashMap::new();
+    for (index, reg) in spill_regs.iter().enumerate() {
+        spills.insert(*reg, saved_bytes + (index as i32 + 1) * 8);
+    }
+    Some(ScalarRegPlan {
+        pins,
+        spills,
+        saved,
+    })
+}
+
+fn scalar_successors(body: &[TraceOp]) -> Vec<Vec<usize>> {
+    let mut at = HashMap::<usize, usize>::new();
+    for (index, op) in body.iter().enumerate() {
+        if let TraceOp::Label { id, .. } = op {
+            at.insert(*id, index);
+        }
+    }
+    let mut succ = Vec::with_capacity(body.len());
+    for (index, op) in body.iter().enumerate() {
+        let next = |label: usize| at.get(&label).copied().into_iter().collect();
+        succ.push(match op {
+            TraceOp::Return { .. } => Vec::new(),
+            TraceOp::Jump { label } => next(*label),
+            TraceOp::BranchIf { label, .. } => {
+                let mut edges = next(*label);
+                if index + 1 < body.len() {
+                    edges.push(index + 1);
+                }
+                edges
+            }
+            _ => {
+                if index + 1 < body.len() {
+                    vec![index + 1]
+                } else {
+                    Vec::new()
+                }
+            }
+        });
+    }
+    succ
+}
+
+fn scalar_uses_defs(
+    op: &TraceOp,
+    env: &HashMap<u8, ValueType>,
+) -> (Vec<u8>, Vec<(u8, Option<ValueType>)>) {
+    let mut uses = Vec::new();
+    let mut defs = Vec::new();
+    match op {
+        TraceOp::BranchIf {
+            condition_register, ..
+        } => uses.push(*condition_register),
+        TraceOp::Return { value } => {
+            if let Some(reg) = value {
+                uses.push(*reg);
+            }
+        }
+        TraceOp::LoadConst { dest, value } => match value {
+            Value::Int(_) => defs.push((*dest, Some(ValueType::Int))),
+            Value::Bool(_) => defs.push((*dest, Some(ValueType::Bool))),
+            Value::Float(_) => defs.push((*dest, Some(ValueType::Float))),
+            Value::Function(_) | Value::Nil => {}
+            _ => defs.push((*dest, None)),
+        },
+        TraceOp::Move { dest, src } => {
+            uses.push(*src);
+            defs.push((*dest, env.get(src).copied()));
+        }
+        TraceOp::Add { dest, lhs, rhs, lhs_type, rhs_type, .. }
+        | TraceOp::Sub { dest, lhs, rhs, lhs_type, rhs_type, .. }
+        | TraceOp::Mul { dest, lhs, rhs, lhs_type, rhs_type, .. }
+        | TraceOp::Div { dest, lhs, rhs, lhs_type, rhs_type, .. }
+        | TraceOp::Mod { dest, lhs, rhs, lhs_type, rhs_type, .. } => {
+            uses.push(*lhs);
+            uses.push(*rhs);
+            let ty = match (*lhs_type, *rhs_type) {
+                (ValueType::Int, ValueType::Int) => Some(ValueType::Int),
+                (ValueType::Float, _) | (_, ValueType::Float) => Some(ValueType::Float),
+                _ => None,
+            };
+            defs.push((*dest, ty));
+        }
+        TraceOp::Lt { dest, lhs, rhs, .. }
+        | TraceOp::Le { dest, lhs, rhs, .. }
+        | TraceOp::Gt { dest, lhs, rhs, .. }
+        | TraceOp::Ge { dest, lhs, rhs, .. }
+        | TraceOp::Eq { dest, lhs, rhs, .. }
+        | TraceOp::Ne { dest, lhs, rhs, .. } => {
+            uses.push(*lhs);
+            uses.push(*rhs);
+            defs.push((*dest, Some(ValueType::Bool)));
+        }
+        TraceOp::Neg { dest, src } => {
+            uses.push(*src);
+            defs.push((*dest, env.get(src).copied()));
+        }
+        TraceOp::CallDirect {
+            dest,
+            first_arg,
+            arg_count,
+            result_type,
+            receiver,
+            ..
+        } => {
+            if let Some(reg) = receiver {
+                uses.push(*reg);
+            }
+            for index in 0..*arg_count {
+                uses.push(first_arg.wrapping_add(index));
+            }
+            defs.push((*dest, *result_type));
+        }
+        _ => {}
+    }
+    (uses, defs)
+}
+
+/// Plan the pins for function code. A register is pinned when every write
+/// is a typed native op of one scalar type and nothing writes it through a
+/// helper. Inside a loop, a register that is read before it is written
+/// (loop-carried state) is `Carried`: the payload stays in the machine
+/// register and is written back only when memory must observe it.
+/// Everything else is a write-through `Local`. Reads use the machine
+/// register only where the static environment proves the type (see
+/// `JitCompiler::active_pin`). The environment restarts from each label's
+/// known scalars, as the translator computed them.
 pub(super) fn plan_function(body: &[TraceOp]) -> HashMap<u8, Pin> {
     #[cfg(feature = "std")]
     if std::env::var_os("LUST_JIT_NOPIN").is_some() {
@@ -654,6 +959,7 @@ pub(super) fn plan_function(body: &[TraceOp]) -> HashMap<u8, Pin> {
         }
     }
     eligible.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    let live_in = carried_registers(body);
     let mut ints = INT_PIN_REGS.iter();
     let mut floats = FLOAT_PIN_REGS.iter();
     let mut pins = HashMap::new();
@@ -663,17 +969,77 @@ pub(super) fn plan_function(body: &[TraceOp]) -> HashMap<u8, Pin> {
             _ => ints.next(),
         };
         let Some(reg) = reg else { continue };
+        let carried = live_in.contains(&r);
         pins.insert(
             r,
             Pin {
                 ty,
                 reg: *reg,
-                class: PinClass::Local,
-                proven_at_entry: false,
+                class: if carried {
+                    PinClass::Carried
+                } else {
+                    PinClass::Local
+                },
+                proven_at_entry: carried,
             },
         );
     }
     pins
+}
+
+/// VM registers that are loop-carried in `body`: read (or guarded) before
+/// they are written on some path through a back-edge, and written by a
+/// native op inside that loop. Their payload must survive the back-edge in
+/// a machine register; memory is stale until a flush.
+fn carried_registers(body: &[TraceOp]) -> hashbrown::HashSet<u8> {
+    let mut label_at: HashMap<usize, usize> = HashMap::new();
+    for (index, op) in body.iter().enumerate() {
+        if let TraceOp::Label { id, .. } = op {
+            label_at.insert(*id, index);
+        }
+    }
+    let mut carried = hashbrown::HashSet::new();
+    for (index, op) in body.iter().enumerate() {
+        let label = match op {
+            TraceOp::Jump { label } | TraceOp::BranchIf { label, .. } => *label,
+            _ => continue,
+        };
+        let Some(&start) = label_at.get(&label) else {
+            continue;
+        };
+        if start > index {
+            continue;
+        }
+        let mut env = match &body[start] {
+            TraceOp::Label { scalars, .. } => scalars.iter().copied().collect(),
+            _ => HashMap::new(),
+        };
+        let mut first: HashMap<u8, Access> = HashMap::new();
+        let mut wrote = hashbrown::HashSet::new();
+        for op in &body[start..=index] {
+            let effects = effects(op, &env);
+            if let Some((reg, ty)) = effects.guard {
+                first.entry(reg).or_insert(Access::Guard(ty));
+            }
+            for (reg, _) in effects.reads {
+                first.entry(reg).or_insert(Access::Read);
+            }
+            for (reg, _) in effects.native_writes {
+                first.entry(reg).or_insert(Access::Write);
+                wrote.insert(reg);
+            }
+            for reg in effects.helper_writes {
+                first.entry(reg).or_insert(Access::Write);
+            }
+            env_update(&mut env, op);
+        }
+        for (reg, access) in first {
+            if wrote.contains(&reg) && !matches!(access, Access::Write) {
+                carried.insert(reg);
+            }
+        }
+    }
+    carried
 }
 
 pub(super) fn plan(
@@ -805,8 +1171,17 @@ pub(super) fn plan(
         ));
     }
 
-    // Hottest first; ties by register number for determinism.
-    eligible.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    // Carried pins keep loop state in machine registers across iterations and
+    // avoid memory round-trips; prioritize them over write-through Local pins,
+    // then hottest first; ties by register number for determinism.
+    eligible.sort_by(|a, b| {
+        let a_carried = a.1.class == PinClass::Carried;
+        let b_carried = b.1.class == PinClass::Carried;
+        b_carried
+            .cmp(&a_carried)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     let mut ints = INT_PIN_REGS.iter();
     let mut floats = FLOAT_PIN_REGS.iter();
     let mut pins = HashMap::new();

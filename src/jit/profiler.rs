@@ -3,6 +3,7 @@ use hashbrown::HashMap;
 pub struct Profiler {
     backedges: HashMap<(usize, usize), u32>,
     hot_spots: Vec<HotSpot>,
+    loop_hierarchy_cache: HashMap<(usize, usize), bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -17,7 +18,24 @@ impl Profiler {
         Self {
             backedges: HashMap::new(),
             hot_spots: Vec::new(),
+            loop_hierarchy_cache: HashMap::new(),
         }
+    }
+
+    pub fn get_cached_loop_hierarchy(&self, func_idx: usize, loop_start_ip: usize) -> Option<bool> {
+        self.loop_hierarchy_cache
+            .get(&(func_idx, loop_start_ip))
+            .copied()
+    }
+
+    pub fn set_cached_loop_hierarchy(
+        &mut self,
+        func_idx: usize,
+        loop_start_ip: usize,
+        is_hierarchy: bool,
+    ) {
+        self.loop_hierarchy_cache
+            .insert((func_idx, loop_start_ip), is_hierarchy);
     }
 
     pub fn record_backedge(&mut self, func_idx: usize, ip: usize) -> u32 {
@@ -56,6 +74,7 @@ impl Profiler {
     pub fn reset(&mut self) {
         self.backedges.clear();
         self.hot_spots.clear();
+        self.loop_hierarchy_cache.clear();
     }
 }
 

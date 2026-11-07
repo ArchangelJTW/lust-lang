@@ -46,6 +46,8 @@ pub struct Compiler {
     numeric_types: HashMap<String, HashMap<Span, NumericType>>,
     function_signatures: HashMap<String, FunctionSignature>,
     minimal_runtime_types: bool,
+    pub(super) use_mir: bool,
+    pub(super) strict_mir: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +91,8 @@ impl Compiler {
             numeric_types: HashMap::new(),
             function_signatures: HashMap::new(),
             minimal_runtime_types: false,
+            use_mir: false,
+            strict_mir: false,
         };
         compiler.configure_stdlib(&LustConfig::default());
         compiler
@@ -98,9 +102,22 @@ impl Compiler {
         self.minimal_runtime_types = enabled;
     }
 
+    pub fn set_use_mir(&mut self, enabled: bool) {
+        self.use_mir = enabled;
+    }
+
+    pub fn set_strict_mir(&mut self, enabled: bool) {
+        self.strict_mir = enabled;
+        if enabled {
+            self.use_mir = true;
+        }
+    }
+
     /// Apply all relevant config settings to the compiler
     pub fn configure(&mut self, config: &LustConfig) {
         self.minimal_runtime_types = config.minimal_runtime_types();
+        self.use_mir = config.use_mir();
+        self.strict_mir = config.strict_mir();
         self.configure_stdlib(config);
     }
 

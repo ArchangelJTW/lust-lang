@@ -34,8 +34,8 @@ const NODE_TUPLE_VALUES: u8 = 6;
 const NODE_CLOSURE_UPVALUES: u8 = 7;
 const NODE_UPVALUE_CELL: u8 = 8;
 
-#[derive(Default)]
 pub struct CycleCollector {
+    enabled: bool,
     containers: HashMap<NodeKey, ContainerKind>,
     steps_since_collect: usize,
     pending_registrations: usize,
@@ -44,6 +44,19 @@ pub struct CycleCollector {
     last_collect_work: usize,
     /// Values visited so far by the collection in progress.
     work: usize,
+}
+
+impl Default for CycleCollector {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            containers: HashMap::new(),
+            steps_since_collect: 0,
+            pending_registrations: 0,
+            last_collect_work: 0,
+            work: 0,
+        }
+    }
 }
 
 enum ContainerKind {
@@ -82,10 +95,32 @@ impl CycleCollector {
         Self::default()
     }
 
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.containers.clear();
+            self.steps_since_collect = 0;
+            self.pending_registrations = 0;
+        }
+    }
+
+    #[inline]
+    pub fn tracked_count(&self) -> usize {
+        self.containers.len()
+    }
+
     /// Called on every register write: the leaf test is inlined so a
     /// scalar costs a tag compare and no call.
     #[inline]
     pub fn register_value(&mut self, value: &Value) {
+        if !self.enabled {
+            return;
+        }
         if !Self::is_leaf(value) {
             self.discover_value(value, false);
         }
@@ -93,6 +128,9 @@ impl CycleCollector {
 
     #[inline]
     pub(crate) fn register_graph(&mut self, value: &Value) {
+        if !self.enabled {
+            return;
+        }
         if !Self::is_leaf(value) {
             self.discover_value(value, false);
         }
@@ -103,6 +141,9 @@ impl CycleCollector {
     /// registry here instead of a collection.
     #[inline]
     pub fn should_collect(&mut self) -> bool {
+        if !self.enabled {
+            return false;
+        }
         self.steps_since_collect = self.steps_since_collect.saturating_add(1);
         if self.containers.is_empty() {
             self.steps_since_collect = 0;
@@ -133,6 +174,9 @@ impl CycleCollector {
     }
 
     pub fn collect(&mut self, vm: &VM) {
+        if !self.enabled {
+            return;
+        }
         self.work = 0;
         self.discover_vm_roots(vm);
         self.collect_registered();

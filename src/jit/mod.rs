@@ -78,7 +78,7 @@ where
 
 pub const HOT_THRESHOLD: u32 = 5;
 /// Calls to a bytecode function before its whole body is compiled.
-pub const FUNCTION_HOT_THRESHOLD: u32 = 30;
+pub const FUNCTION_HOT_THRESHOLD: u32 = 15;
 /// Result of compiled function code entered from the interpreter whose
 /// `Return` reached: `FUNCTION_RETURN_BASE + register` (255 = Nil).
 pub const FUNCTION_RETURN_BASE: i32 = 1 << 20;
@@ -314,6 +314,8 @@ pub struct JitStats {
     pub execution_failures: u64,
     pub function_calls: u64,
     pub recursive_calls: u64,
+    pub struct_fast_path_hits: u64,
+    pub struct_slow_path_fallbacks: u64,
 }
 
 /// A stdlib native the recorder knows the meaning of, so a call to it on a
@@ -430,6 +432,13 @@ impl JitState {
 
     pub(crate) fn function_entry_table(&self) -> usize {
         self.function_entries.as_ptr() as usize
+    }
+
+    pub(crate) fn function_entry(&self, func_idx: usize) -> usize {
+        self.function_entries
+            .get(func_idx)
+            .map(|e| e.load(core::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Count a call; true when the function should be compiled now.
@@ -621,6 +630,15 @@ impl JitState {
 
     pub(crate) fn record_execution_failure(&mut self) {
         self.stats.execution_failures = self.stats.execution_failures.saturating_add(1);
+    }
+
+    pub(crate) fn record_struct_fast_path(&mut self) {
+        self.stats.struct_fast_path_hits = self.stats.struct_fast_path_hits.saturating_add(1);
+    }
+
+    pub(crate) fn record_struct_slow_path(&mut self) {
+        self.stats.struct_slow_path_fallbacks =
+            self.stats.struct_slow_path_fallbacks.saturating_add(1);
     }
 
     pub(crate) fn invalidate_compiled_code(&mut self) {

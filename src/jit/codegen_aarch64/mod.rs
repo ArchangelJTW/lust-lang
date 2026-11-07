@@ -100,6 +100,13 @@ pub(super) struct SpecializedValue {
     pub stack_offset: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct HoistedArray {
+    pub array_reg: u8,
+    pub ptr_reg: u8,
+    pub len_reg: Option<u8>,
+}
+
 pub struct JitCompiler {
     pub(super) ops: Assembler,
     pub(super) data: Vec<JitData>,
@@ -115,6 +122,8 @@ pub struct JitCompiler {
     pub(super) specialized_values: HashMap<usize, SpecializedValue>,
     /// Registers proven to contain non-owning scalar values at this point.
     pub(super) scalar_registers: HashMap<u8, ValueType>,
+    /// Registers proven to contain an Array value at this point.
+    pub(super) array_registers: hashbrown::HashSet<u8>,
     /// VM registers held in machine registers for the loop body.
     pins: HashMap<u8, pins::Pin>,
     /// Pins apply only while compiling the loop body (not the preamble,
@@ -135,6 +144,9 @@ pub struct JitCompiler {
     verified_enum_in: Option<u8>,
     /// Carried pins whose machine value may be newer than memory.
     dirty_pins: Vec<u8>,
+    /// Bit `i` set once registers[i]'s tag is known to match its carried pin.
+    /// Further writes keep the payload in the pin and do not retag the slot.
+    pin_tag_ready: u64,
     /// Loop-header ip of the trace being compiled: where a guard that fails
     /// before any instruction of the body has run resumes.
     pub(super) trace_start_ip: usize,
@@ -162,8 +174,22 @@ pub struct JitCompiler {
     /// inside a native callee.
     function_epilogue: Option<dynasmrt::DynamicLabel>,
     /// Function code: the function being compiled and the label at its
-    /// entry, so a call to itself is a direct branch.
+    /// entry, so a call to itself is a direct branch. For a scalar-fast
+    /// function this is the payload entry, not the VM adapter.
     function_self: Option<(usize, dynasmrt::DynamicLabel)>,
+    /// Pure scalar self-recursion: the body addresses an 8-byte payload
+    /// frame and calls itself with arguments in x0.. (see OPT-21).
+    scalar_fast: bool,
+    /// Number of leading scalar parameters the scalar-fast entry receives.
+    scalar_params: u8,
+    /// x19 addresses raw 8-byte payloads rather than `Value`s.
+    payload_slots: bool,
+    /// Scalar-fast body keeps VM registers in machine registers. Spill
+    /// slots, if any, are addressed from x29 (positive distance below it).
+    scalar_regfile: bool,
+    spill_off: HashMap<u8, i32>,
+    /// Callee-saved pairs pushed below x29, outermost first.
+    scalar_saved: Vec<(u8, u8)>,
     /// Branch targets of the function being compiled, by bytecode ip.
     function_labels: HashMap<usize, dynasmrt::DynamicLabel>,
     /// Compiled under a gas budget: loop back-edges charge
@@ -189,6 +215,9 @@ pub struct JitCompiler {
     /// Next ID for specialized values
     #[allow(dead_code)]
     pub(super) next_specialized_id: usize,
+    pub(super) cached_select_imms: Option<(i64, i64)>,
+    pub(super) hoisted_array: Option<HoistedArray>,
+    pub(super) const_registers: hashbrown::HashMap<u8, Value>,
 }
 
 impl Default for JitCompiler {

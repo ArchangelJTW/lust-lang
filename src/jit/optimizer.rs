@@ -1,6 +1,6 @@
 use crate::bytecode::{Register, Value};
 use crate::jit;
-use crate::jit::trace::{Trace, TraceOp};
+use crate::jit::trace::{Trace, TraceOp, ValueType};
 use alloc::{format, string::ToString, vec, vec::Vec};
 use hashbrown::{HashMap, HashSet};
 pub struct TraceOptimizer {
@@ -17,13 +17,22 @@ impl TraceOptimizer {
     pub fn optimize(&mut self, trace: &mut Trace) -> Vec<(Register, Value)> {
         jit::log(|| "🔧 JIT Optimizer: Starting optimization...".to_string());
         let original_ops = trace.ops.len();
+        self.inline_leaf_functions(trace);
+        self.forward_struct_fields(trace);
         self.fuse_try_get_index_patterns(trace);
         self.fuse_try_cast_patterns(trace);
+        self.eliminate_dead_stores_before_select(trace);
+        self.optimize_modulo_select(trace);
+        self.optimize_constant_modulo(trace);
+        self.isolate_conflicting_types(trace);
+        self.isolate_loop_constants(trace);
         self.hoist_constants(trace);
         self.unroll_loop(trace, crate::jit::UNROLL_FACTOR);
+        self.forward_struct_fields(trace);
         self.hoist_entry_guards(trace);
         self.eliminate_redundant_type_guards(trace);
         self.coalesce_registers(trace);
+        self.promote_invariant_fields(trace);
         let optimized_ops = trace.ops.len();
         let hoisted = self.hoisted_constants.len();
         jit::log(|| {
@@ -33,6 +42,52 @@ impl TraceOptimizer {
             )
         });
         self.hoisted_constants.clone()
+    }
+
+    fn forward_struct_fields(&mut self, trace: &mut Trace) {
+        let mut last_stores: HashMap<(Register, String), Register> = HashMap::new();
+        for op in &mut trace.ops {
+            match op {
+                TraceOp::SetField {
+                    object,
+                    field_name,
+                    value,
+                    ..
+                } => {
+                    last_stores.retain(|_, val| *val != *value);
+                    last_stores.insert((*object, field_name.clone()), *value);
+                }
+                TraceOp::GetField {
+                    dest,
+                    object,
+                    field_name,
+                    ..
+                } => {
+                    let d = *dest;
+                    let o = *object;
+                    let fn_name = field_name.clone();
+                    if let Some(&val_reg) = last_stores.get(&(o, fn_name)) {
+                        *op = TraceOp::Move {
+                            dest: d,
+                            src: val_reg,
+                        };
+                    }
+                    last_stores.retain(|(obj, _), val| *obj != d && *val != d);
+                }
+                TraceOp::CallNative { .. }
+                | TraceOp::CallFunction { .. }
+                | TraceOp::CallMethod { .. }
+                | TraceOp::InlineCall { .. }
+                | TraceOp::GuardLoopContinue { .. } => {
+                    last_stores.clear();
+                }
+                _ => {
+                    if let Some(dest) = Self::dest_of(op) {
+                        last_stores.retain(|(obj, _), val| *obj != dest && *val != dest);
+                    }
+                }
+            }
+        }
     }
 
     /// Separate `At` markers from the ops they precede, so a pass can match
@@ -74,7 +129,56 @@ impl TraceOptimizer {
                     )
                     .then_some(*expected_type);
                 }
+                TraceOp::GuardLoopContinue {
+                    condition_register,
+                    ..
+                } if *condition_register == binding || *condition_register == result => {
+                    return Some(ValueType::Bool);
+                }
+                TraceOp::Add { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Add { rhs, rhs_type, .. } if *rhs == binding || *rhs == result => {
+                    return Some(*rhs_type);
+                }
+                TraceOp::Sub { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Sub { rhs, rhs_type, .. } if *rhs == binding || *rhs == result => {
+                    return Some(*rhs_type);
+                }
+                TraceOp::Mul { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Mul { rhs, rhs_type, .. } if *rhs == binding || *rhs == result => {
+                    return Some(*rhs_type);
+                }
+                TraceOp::Lt { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Le { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Gt { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Ge { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Eq { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::Ne { lhs, lhs_type, .. } if *lhs == binding || *lhs == result => {
+                    return Some(*lhs_type);
+                }
+                TraceOp::GuardLoopContinue {
+                    condition_register,
+                    ..
+                } if *condition_register == binding || *condition_register == result => {
+                    return Some(ValueType::Bool);
+                }
                 TraceOp::Guard { .. } => {}
+                TraceOp::GuardLoopContinue { .. } => {}
                 TraceOp::Move { dest, .. } if *dest != binding && *dest != result => {}
                 _ => return None,
             }
@@ -211,6 +315,269 @@ impl TraceOptimizer {
             i += 1;
         }
         trace.ops = ops;
+    }
+
+    fn remap_op_reads(op: &mut TraceOp, from: Register, to: Register) {
+        match op {
+            TraceOp::Move { src, .. }
+            | TraceOp::Neg { src, .. }
+            | TraceOp::Not { src, .. }
+            | TraceOp::ModImm { src, .. }
+            | TraceOp::SelectBitZero { src, .. } => {
+                if *src == from {
+                    *src = to;
+                }
+            }
+            TraceOp::Add { lhs, rhs, .. }
+            | TraceOp::Sub { lhs, rhs, .. }
+            | TraceOp::Mul { lhs, rhs, .. }
+            | TraceOp::Div { lhs, rhs, .. }
+            | TraceOp::Mod { lhs, rhs, .. }
+            | TraceOp::Eq { lhs, rhs, .. }
+            | TraceOp::Ne { lhs, rhs, .. }
+            | TraceOp::Lt { lhs, rhs, .. }
+            | TraceOp::Le { lhs, rhs, .. }
+            | TraceOp::Gt { lhs, rhs, .. }
+            | TraceOp::Ge { lhs, rhs, .. }
+            | TraceOp::And { lhs, rhs, .. }
+            | TraceOp::Or { lhs, rhs, .. } => {
+                if *lhs == from {
+                    *lhs = to;
+                }
+                if *rhs == from {
+                    *rhs = to;
+                }
+            }
+            TraceOp::Guard { register, .. } => {
+                if *register == from {
+                    *register = to;
+                }
+            }
+            TraceOp::Select { cond, .. } => {
+                if *cond == from {
+                    *cond = to;
+                }
+            }
+            TraceOp::GuardLoopContinue {
+                condition_register, ..
+            } => {
+                if *condition_register == from {
+                    *condition_register = to;
+                }
+            }
+            TraceOp::SetField { value, .. } => {
+                if *value == from {
+                    *value = to;
+                }
+            }
+            TraceOp::SetIndex { index, value, .. } => {
+                if *index == from {
+                    *index = to;
+                }
+                if *value == from {
+                    *value = to;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn isolate_loop_constants(&mut self, trace: &mut Trace) {
+        if trace.ops.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::NestedLoopCall { .. }
+                    | TraceOp::CallFunction { .. }
+                    | TraceOp::CallNative { .. }
+                    | TraceOp::CallMethod { .. }
+                    | TraceOp::InlineCall { .. }
+            )
+        }) {
+            return;
+        }
+
+        let mut max_reg = 0u8;
+        for op in trace
+            .preamble
+            .iter()
+            .chain(&trace.ops)
+            .chain(&trace.postamble)
+        {
+            if let Some(d) = Self::dest_of(op) {
+                max_reg = max_reg.max(d);
+            }
+            for r in Self::reads_of(op) {
+                max_reg = max_reg.max(r);
+            }
+            for w in Self::other_writes(op) {
+                max_reg = max_reg.max(w);
+            }
+        }
+
+        let mut clobbered: HashSet<Register> = HashSet::new();
+        let mut const_values: HashMap<Register, Value> = HashMap::new();
+        for op in &trace.ops {
+            match op {
+                TraceOp::LoadConst { dest, value } => match const_values.get(dest) {
+                    Some(seen) if !values_identical(seen, value) => {
+                        clobbered.insert(*dest);
+                    }
+                    None => {
+                        const_values.insert(*dest, value.clone());
+                    }
+                    _ => {}
+                },
+                other => {
+                    for w in Self::other_writes(other).into_iter().chain(Self::dest_of(other)) {
+                        clobbered.insert(w);
+                    }
+                }
+            }
+        }
+
+        let mut constant_to_fresh: Vec<(Value, Register)> = Vec::new();
+
+        for i in 0..trace.ops.len() {
+            let (dest, val) = match &trace.ops[i] {
+                TraceOp::LoadConst { dest, value }
+                    if clobbered.contains(dest)
+                        && matches!(
+                            value,
+                            Value::Int(_) | Value::Float(_) | Value::Bool(_)
+                        ) =>
+                {
+                    (*dest, value.clone())
+                }
+                _ => continue,
+            };
+
+            if max_reg >= 220 {
+                break;
+            }
+
+            let fresh_reg = if let Some((_, reg)) = constant_to_fresh
+                .iter()
+                .find(|(v, _)| values_identical(v, &val))
+            {
+                *reg
+            } else {
+                max_reg = max_reg.saturating_add(1);
+                constant_to_fresh.push((val.clone(), max_reg));
+                max_reg
+            };
+
+            trace.ops[i] = TraceOp::LoadConst {
+                dest: fresh_reg,
+                value: val,
+            };
+
+            for j in (i + 1)..trace.ops.len() {
+                Self::remap_op_reads(&mut trace.ops[j], dest, fresh_reg);
+                if Self::dest_of(&trace.ops[j]) == Some(dest)
+                    || Self::other_writes(&trace.ops[j]).contains(&dest)
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn isolate_conflicting_types(&mut self, trace: &mut Trace) {
+        if trace.ops.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::NestedLoopCall { .. }
+                    | TraceOp::CallFunction { .. }
+                    | TraceOp::CallMethod { .. }
+            )
+        }) {
+            return;
+        }
+
+        let mut max_reg = 0;
+        for op in trace
+            .preamble
+            .iter()
+            .chain(&trace.ops)
+            .chain(&trace.postamble)
+        {
+            if let Some(d) = Self::dest_of(op) {
+                max_reg = max_reg.max(d);
+            }
+            for r in Self::reads_of(op) {
+                max_reg = max_reg.max(r);
+            }
+            for w in Self::other_writes(op) {
+                max_reg = max_reg.max(w);
+            }
+        }
+
+        fn op_write_type(op: &TraceOp) -> Option<(Register, ValueType)> {
+            match op {
+                TraceOp::Lt { dest, .. }
+                | TraceOp::Le { dest, .. }
+                | TraceOp::Gt { dest, .. }
+                | TraceOp::Ge { dest, .. }
+                | TraceOp::Eq { dest, .. }
+                | TraceOp::Ne { dest, .. } => Some((*dest, ValueType::Bool)),
+                TraceOp::Add { dest, lhs_type, rhs_type, .. }
+                | TraceOp::Sub { dest, lhs_type, rhs_type, .. }
+                | TraceOp::Mul { dest, lhs_type, rhs_type, .. }
+                | TraceOp::Div { dest, lhs_type, rhs_type, .. } => {
+                    let ty = match (*lhs_type, *rhs_type) {
+                        (ValueType::Int, ValueType::Int) => ValueType::Int,
+                        (ValueType::Float, _) | (_, ValueType::Float) => ValueType::Float,
+                        _ => return None,
+                    };
+                    Some((*dest, ty))
+                }
+                _ => None,
+            }
+        }
+
+        for i in 0..trace.ops.len() {
+            let (target_reg, ty) = match op_write_type(&trace.ops[i]) {
+                Some(pair) => pair,
+                None => continue,
+            };
+
+            let has_conflict = trace.ops.iter().enumerate().any(|(idx, other)| {
+                idx != i
+                    && op_write_type(other).is_some_and(|(other_reg, other_ty)| {
+                        other_reg == target_reg && other_ty != ty
+                    })
+            });
+
+            if has_conflict && max_reg < 220 {
+                max_reg = max_reg.saturating_add(1);
+                let fresh = max_reg;
+
+                match &mut trace.ops[i] {
+                    TraceOp::Lt { dest, .. }
+                    | TraceOp::Le { dest, .. }
+                    | TraceOp::Gt { dest, .. }
+                    | TraceOp::Ge { dest, .. }
+                    | TraceOp::Eq { dest, .. }
+                    | TraceOp::Ne { dest, .. }
+                    | TraceOp::Add { dest, .. }
+                    | TraceOp::Sub { dest, .. }
+                    | TraceOp::Mul { dest, .. }
+                    | TraceOp::Div { dest, .. } => {
+                        *dest = fresh;
+                    }
+                    _ => {}
+                }
+
+                for j in (i + 1)..trace.ops.len() {
+                    Self::remap_op_reads(&mut trace.ops[j], target_reg, fresh);
+                    if Self::dest_of(&trace.ops[j]) == Some(target_reg)
+                        || Self::other_writes(&trace.ops[j]).contains(&target_reg)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fn hoist_constants(&mut self, trace: &mut Trace) {
@@ -350,6 +717,9 @@ impl TraceOptimizer {
             | TraceOp::GetEnumValue { dest, .. }
             | TraceOp::CallNative { dest, .. }
             | TraceOp::CallFunction { dest, .. }
+            | TraceOp::Select { dest, .. }
+            | TraceOp::SelectBitZero { dest, .. }
+            | TraceOp::ModImm { dest, .. }
             | TraceOp::InlineCall { dest, .. } => Some(*dest),
             TraceOp::ArrayIndexOk { .. } => None,
             _ => None,
@@ -361,6 +731,25 @@ impl TraceOptimizer {
     fn annotated_write_type(op: &TraceOp) -> Option<crate::jit::trace::ValueType> {
         use crate::jit::trace::ValueType;
         match op {
+            TraceOp::ModImm { .. } => Some(ValueType::Int),
+            TraceOp::Select {
+                on_true, on_false, ..
+            } => match (on_true, on_false) {
+                (Value::Int(_), Value::Int(_)) => Some(ValueType::Int),
+                (Value::Float(_), Value::Float(_)) => Some(ValueType::Float),
+                (Value::Bool(_), Value::Bool(_)) => Some(ValueType::Bool),
+                _ => None,
+            },
+            TraceOp::SelectBitZero {
+                on_zero,
+                on_nonzero,
+                ..
+            } => match (on_zero, on_nonzero) {
+                (Value::Int(_), Value::Int(_)) => Some(ValueType::Int),
+                (Value::Float(_), Value::Float(_)) => Some(ValueType::Float),
+                (Value::Bool(_), Value::Bool(_)) => Some(ValueType::Bool),
+                _ => None,
+            },
             TraceOp::LoadConst { value, .. } => match value {
                 Value::Bool(_) => Some(ValueType::Bool),
                 Value::Int(_) => Some(ValueType::Int),
@@ -660,11 +1049,13 @@ impl TraceOptimizer {
             | TraceOp::BranchIf {
                 condition_register, ..
             } => vec![*condition_register],
-            TraceOp::SetField { object, value, .. } => vec![*object, *value],
+            TraceOp::SetField { object, value, .. }
+            | TraceOp::RestoreField { object, value, .. } => vec![*object, *value],
             TraceOp::SetIndex {
                 array,
                 index,
                 value,
+                ..
             } => vec![*array, *index, *value],
             TraceOp::ArrayPush { array, value, .. } => vec![*array, *value],
             TraceOp::GetIndex { array, index, .. }
@@ -725,6 +1116,9 @@ impl TraceOptimizer {
             TraceOp::NewEnumVariant {
                 value_registers, ..
             } => value_registers.clone(),
+            TraceOp::Select { cond, .. } => vec![*cond],
+            TraceOp::SelectBitZero { src, .. } => vec![*src],
+            TraceOp::ModImm { src, .. } => vec![*src],
             TraceOp::NewEnumUnit { .. }
             | TraceOp::LoadConst { .. }
             | TraceOp::GuardGlobals { .. }
@@ -850,7 +1244,464 @@ impl TraceOptimizer {
             TraceOp::GetField { .. } => None,
             TraceOp::NewArray { .. } => Some(ValueType::Array),
             TraceOp::NewStruct { .. } => Some(ValueType::Struct),
+            TraceOp::Select {
+                on_true, on_false, ..
+            } => match (on_true, on_false) {
+                (Value::Int(_), Value::Int(_)) => Some(ValueType::Int),
+                (Value::Float(_), Value::Float(_)) => Some(ValueType::Float),
+                (Value::Bool(_), Value::Bool(_)) => Some(ValueType::Bool),
+                _ => None,
+            },
+            TraceOp::SelectBitZero {
+                on_zero,
+                on_nonzero,
+                ..
+            } => match (on_zero, on_nonzero) {
+                (Value::Int(_), Value::Int(_)) => Some(ValueType::Int),
+                (Value::Float(_), Value::Float(_)) => Some(ValueType::Float),
+                (Value::Bool(_), Value::Bool(_)) => Some(ValueType::Bool),
+                _ => None,
+            },
+            TraceOp::ModImm { .. } => Some(ValueType::Int),
             _ => None,
+        }
+    }
+
+    fn is_leaf_inline_trace(trace: &crate::jit::trace::InlineTrace) -> bool {
+        if trace.is_closure
+            || trace.return_register.is_none()
+            || trace.register_count > 32
+            || trace.body.len() > 64
+        {
+            return false;
+        }
+        let mut struct_objects = alloc::vec::Vec::new();
+        for op in &trace.body {
+            match op {
+                TraceOp::GetField {
+                    object, value_type, ..
+                } => {
+                    if !matches!(
+                        value_type,
+                        Some(ValueType::Int | ValueType::Float | ValueType::Bool)
+                    ) || *object >= trace.arg_count
+                    {
+                        return false;
+                    }
+                    if !struct_objects.contains(object) {
+                        struct_objects.push(*object);
+                    }
+                }
+                TraceOp::SetField {
+                    object, value_type, ..
+                } => {
+                    if !matches!(
+                        value_type,
+                        Some(ValueType::Int | ValueType::Float | ValueType::Bool)
+                    ) || *object >= trace.arg_count
+                    {
+                        return false;
+                    }
+                    if !struct_objects.contains(object) {
+                        struct_objects.push(*object);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for op in &trace.body {
+            match op {
+                TraceOp::LoadConst { .. }
+                | TraceOp::Add { .. }
+                | TraceOp::Sub { .. }
+                | TraceOp::Mul { .. }
+                | TraceOp::Div { .. }
+                | TraceOp::Mod { .. }
+                | TraceOp::ModImm { .. }
+                | TraceOp::Neg { .. }
+                | TraceOp::Eq { .. }
+                | TraceOp::Ne { .. }
+                | TraceOp::Lt { .. }
+                | TraceOp::Le { .. }
+                | TraceOp::Gt { .. }
+                | TraceOp::Ge { .. }
+                | TraceOp::And { .. }
+                | TraceOp::Or { .. }
+                | TraceOp::Not { .. }
+                | TraceOp::Select { .. }
+                | TraceOp::SelectBitZero { .. }
+                | TraceOp::GetField { .. }
+                | TraceOp::SetField { .. }
+                | TraceOp::Guard { .. }
+                | TraceOp::At { .. } => {}
+                TraceOp::Move { src, .. } => {
+                    if struct_objects.contains(src) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    fn remap_leaf_op(op: &TraceOp, map: &HashMap<Register, Register>) -> TraceOp {
+        let r = |reg: &Register| -> Register { *map.get(reg).unwrap_or(reg) };
+        match op {
+            TraceOp::LoadConst { dest, value } => TraceOp::LoadConst {
+                dest: r(dest),
+                value: value.clone(),
+            },
+            TraceOp::Move { dest, src } => TraceOp::Move {
+                dest: r(dest),
+                src: r(src),
+            },
+            TraceOp::Add {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Add {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Sub {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Sub {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Mul {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Mul {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Div {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Div {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Mod {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Mod {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::ModImm { dest, src, divisor } => TraceOp::ModImm {
+                dest: r(dest),
+                src: r(src),
+                divisor: *divisor,
+            },
+            TraceOp::Neg { dest, src } => TraceOp::Neg {
+                dest: r(dest),
+                src: r(src),
+            },
+            TraceOp::Eq {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Eq {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Ne {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Ne {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Lt {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Lt {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Le {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Le {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Gt {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Gt {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Ge {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Ge {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::And { dest, lhs, rhs } => TraceOp::And {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+            },
+            TraceOp::Or { dest, lhs, rhs } => TraceOp::Or {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+            },
+            TraceOp::Not { dest, src } => TraceOp::Not {
+                dest: r(dest),
+                src: r(src),
+            },
+            TraceOp::Select {
+                dest,
+                cond,
+                on_true,
+                on_false,
+            } => TraceOp::Select {
+                dest: r(dest),
+                cond: r(cond),
+                on_true: on_true.clone(),
+                on_false: on_false.clone(),
+            },
+            TraceOp::SelectBitZero {
+                dest,
+                src,
+                mask,
+                on_zero,
+                on_nonzero,
+            } => TraceOp::SelectBitZero {
+                dest: r(dest),
+                src: r(src),
+                mask: *mask,
+                on_zero: on_zero.clone(),
+                on_nonzero: on_nonzero.clone(),
+            },
+            TraceOp::Guard {
+                register,
+                expected_type,
+            } => TraceOp::Guard {
+                register: r(register),
+                expected_type: *expected_type,
+            },
+            TraceOp::GetField {
+                dest,
+                object,
+                field_name,
+                field_index,
+                value_type,
+                is_weak,
+            } => TraceOp::GetField {
+                dest: r(dest),
+                object: r(object),
+                field_name: field_name.clone(),
+                field_index: *field_index,
+                value_type: *value_type,
+                is_weak: *is_weak,
+            },
+            TraceOp::SetField {
+                object,
+                field_name,
+                value,
+                field_index,
+                value_type,
+                is_weak,
+            } => TraceOp::SetField {
+                object: r(object),
+                field_name: field_name.clone(),
+                value: r(value),
+                field_index: *field_index,
+                value_type: *value_type,
+                is_weak: *is_weak,
+            },
+            TraceOp::At { ip } => TraceOp::At { ip: *ip },
+            other => other.clone(),
+        }
+    }
+
+    fn inline_leaf_functions(&mut self, trace: &mut Trace) {
+        if !trace
+            .ops
+            .iter()
+            .any(|op| matches!(op, TraceOp::InlineCall { .. }))
+        {
+            return;
+        }
+
+        let mut max_reg = 0u8;
+        for op in trace
+            .preamble
+            .iter()
+            .chain(&trace.ops)
+            .chain(&trace.postamble)
+        {
+            if let Some(d) = Self::dest_of(op) {
+                max_reg = max_reg.max(d);
+            }
+            for r in Self::reads_of(op) {
+                max_reg = max_reg.max(r);
+            }
+            for w in Self::other_writes(op) {
+                max_reg = max_reg.max(w);
+            }
+        }
+
+        let mut new_ops = Vec::with_capacity(trace.ops.len() * 2);
+        let mut inlined_any = false;
+
+        for op in trace.ops.drain(..) {
+            if let TraceOp::InlineCall {
+                dest: inline_dest,
+                callee,
+                trace: inline_trace,
+            } = op
+            {
+                if Self::is_leaf_inline_trace(&inline_trace)
+                    && (max_reg as usize + inline_trace.register_count as usize) < 240
+                {
+                    inlined_any = true;
+                    let mut reg_map: HashMap<Register, Register> = HashMap::new();
+                    let mut prelude_moves = Vec::new();
+
+                    let num_args = inline_trace.arg_registers.len() as u8;
+                    for i in 0..num_args {
+                        let writes_param = inline_trace.body.iter().any(|callee_op| {
+                            Self::dest_of(callee_op) == Some(i)
+                                || Self::other_writes(callee_op).contains(&i)
+                        });
+                        let caller_arg_reg = inline_trace.arg_registers[i as usize];
+                        if writes_param {
+                            max_reg = max_reg.saturating_add(1);
+                            let fresh_reg = max_reg;
+                            prelude_moves.push(TraceOp::Move {
+                                dest: fresh_reg,
+                                src: caller_arg_reg,
+                            });
+                            reg_map.insert(i, fresh_reg);
+                        } else {
+                            reg_map.insert(i, caller_arg_reg);
+                        }
+                    }
+
+                    let ret_reg = inline_trace.return_register.unwrap();
+                    let can_direct_return = ret_reg >= num_args
+                        && !inline_trace.arg_registers.contains(&inline_dest);
+
+                    for r in num_args..inline_trace.register_count {
+                        if r == ret_reg && can_direct_return {
+                            reg_map.insert(r, inline_dest);
+                        } else {
+                            max_reg = max_reg.saturating_add(1);
+                            reg_map.insert(r, max_reg);
+                        }
+                    }
+
+                    new_ops.extend(prelude_moves);
+
+                    for callee_op in &inline_trace.body {
+                        if matches!(callee_op, TraceOp::At { .. }) {
+                            continue;
+                        }
+                        let remapped = Self::remap_leaf_op(callee_op, &reg_map);
+                        new_ops.push(remapped);
+                    }
+
+                    let mapped_ret = reg_map.get(&ret_reg).copied().unwrap_or(ret_reg);
+                    if mapped_ret != inline_dest {
+                        new_ops.push(TraceOp::Move {
+                            dest: inline_dest,
+                            src: mapped_ret,
+                        });
+                    }
+                    continue;
+                } else {
+                    new_ops.push(TraceOp::InlineCall {
+                        dest: inline_dest,
+                        callee,
+                        trace: inline_trace,
+                    });
+                }
+            } else {
+                new_ops.push(op);
+            }
+        }
+
+        trace.ops = new_ops;
+
+        if inlined_any {
+            crate::jit::log(|| {
+                "🌿 JIT Optimizer: Inlined leaf functions into caller trace".to_string()
+            });
         }
     }
 
@@ -897,7 +1748,521 @@ impl TraceOptimizer {
         trace.ops = new_ops;
     }
 
+    fn eliminate_dead_stores_before_select(&mut self, trace: &mut Trace) {
+        if trace.ops.is_empty() {
+            return;
+        }
+        let mut to_remove = hashbrown::HashSet::new();
+        for (i, op) in trace.ops.iter().enumerate() {
+            if let TraceOp::Select { dest, .. } | TraceOp::SelectBitZero { dest, .. } = op {
+                // Look backward for a LoadConst targeting dest before any read of dest
+                for k in (0..i).rev() {
+                    let prev = &trace.ops[k];
+                    if matches!(prev, TraceOp::At { .. }) {
+                        continue;
+                    }
+                    if let TraceOp::LoadConst {
+                        dest: load_dest, ..
+                    } = prev
+                    {
+                        if load_dest == dest {
+                            to_remove.insert(k);
+                            break;
+                        }
+                    }
+                    if Self::reads_of(prev).contains(dest) || Self::dest_of(prev) == Some(*dest) {
+                        break;
+                    }
+                }
+            }
+        }
+        if !to_remove.is_empty() {
+            let mut new_ops = Vec::with_capacity(trace.ops.len() - to_remove.len());
+            for (i, op) in trace.ops.drain(..).enumerate() {
+                if !to_remove.contains(&i) {
+                    new_ops.push(op);
+                }
+            }
+            trace.ops = new_ops;
+        }
+    }
+
+    fn optimize_modulo_select(&mut self, trace: &mut Trace) {
+        use crate::jit::trace::ValueType;
+
+        let mut to_remove = hashbrown::HashSet::new();
+        let mut replacements = hashbrown::HashMap::new();
+
+        for (i, op) in trace.ops.iter().enumerate() {
+            if let TraceOp::Select {
+                dest,
+                cond,
+                on_true,
+                on_false,
+            } = op
+            {
+                // 1. Find the Eq operation defining cond
+                let mut eq_info = None;
+                for k in (0..i).rev() {
+                    let prev = &trace.ops[k];
+                    if matches!(prev, TraceOp::At { .. }) {
+                        continue;
+                    }
+                    if let TraceOp::Eq {
+                        dest: eq_d,
+                        lhs,
+                        rhs,
+                        lhs_type,
+                        rhs_type,
+                    } = prev
+                    {
+                        if *eq_d == *cond
+                            && *lhs_type == ValueType::Int
+                            && *rhs_type == ValueType::Int
+                        {
+                            eq_info = Some((k, *lhs, *rhs));
+                            break;
+                        }
+                    }
+                    if Self::reads_of(prev).contains(cond) || Self::dest_of(prev) == Some(*cond) {
+                        break;
+                    }
+                }
+                let Some((eq_idx, eq_lhs, eq_rhs)) = eq_info else {
+                    continue;
+                };
+
+                // 2. Check if one of Eq's operands is constant 0, and the other is mod_dest
+                let check_zero =
+                    |reg: Register, ops: &[TraceOp], before_idx: usize| -> Option<usize> {
+                        for k in (0..before_idx).rev() {
+                            let prev = &ops[k];
+                            if matches!(prev, TraceOp::At { .. }) {
+                                continue;
+                            }
+                            if let TraceOp::LoadConst {
+                                dest: d,
+                                value: Value::Int(0),
+                            } = prev
+                            {
+                                if *d == reg {
+                                    return Some(k);
+                                }
+                            }
+                            if Self::dest_of(prev) == Some(reg) {
+                                break;
+                            }
+                        }
+                        None
+                    };
+
+                let mut zero_reg = None;
+                let mut mod_reg = None;
+                let mut zero_idx = None;
+                if let Some(k) = check_zero(eq_rhs, &trace.ops, eq_idx) {
+                    zero_reg = Some(eq_rhs);
+                    mod_reg = Some(eq_lhs);
+                    zero_idx = Some(k);
+                } else if let Some(k) = check_zero(eq_lhs, &trace.ops, eq_idx) {
+                    zero_reg = Some(eq_lhs);
+                    mod_reg = Some(eq_rhs);
+                    zero_idx = Some(k);
+                }
+
+                let Some(mod_reg) = mod_reg else { continue };
+
+                // 3. Find the Mod operation defining mod_reg: mod_reg = src % divisor_reg
+                let mut mod_info = None;
+                for k in (0..eq_idx).rev() {
+                    let prev = &trace.ops[k];
+                    if matches!(prev, TraceOp::At { .. }) {
+                        continue;
+                    }
+                    if let TraceOp::Mod {
+                        dest: d,
+                        lhs: src,
+                        rhs: divisor_reg,
+                        lhs_type,
+                        rhs_type,
+                    } = prev
+                    {
+                        if *d == mod_reg
+                            && *lhs_type == ValueType::Int
+                            && *rhs_type == ValueType::Int
+                        {
+                            mod_info = Some((k, *src, *divisor_reg));
+                            break;
+                        }
+                    }
+                    if Self::reads_of(prev).contains(&mod_reg)
+                        || Self::dest_of(prev) == Some(mod_reg)
+                    {
+                        break;
+                    }
+                }
+                let Some((mod_idx, src, divisor_reg)) = mod_info else {
+                    continue;
+                };
+
+                // 4. Check if divisor_reg is constant 2
+                let mut divisor_idx = None;
+                for k in (0..mod_idx).rev() {
+                    let prev = &trace.ops[k];
+                    if matches!(prev, TraceOp::At { .. }) {
+                        continue;
+                    }
+                    if let TraceOp::LoadConst {
+                        dest: d,
+                        value: Value::Int(2),
+                    } = prev
+                    {
+                        if *d == divisor_reg {
+                            divisor_idx = Some(k);
+                            break;
+                        }
+                    }
+                    if Self::dest_of(prev) == Some(divisor_reg) {
+                        break;
+                    }
+                }
+                let Some(divisor_idx) = divisor_idx else {
+                    continue;
+                };
+
+                // Check downstream reads of intermediate registers
+                let downstream_reads = |reg: Register, start: usize| -> bool {
+                    for op in &trace.ops[start..] {
+                        if Self::reads_of(op).contains(&reg) {
+                            return true;
+                        }
+                        if Self::dest_of(op) == Some(reg) {
+                            break;
+                        }
+                    }
+                    false
+                };
+
+                if downstream_reads(*cond, i + 1) || downstream_reads(mod_reg, eq_idx + 1) {
+                    continue;
+                }
+
+                to_remove.insert(divisor_idx);
+                to_remove.insert(mod_idx);
+                if let Some(z_idx) = zero_idx {
+                    if let Some(zr) = zero_reg {
+                        if !downstream_reads(zr, eq_idx + 1) {
+                            to_remove.insert(z_idx);
+                        }
+                    }
+                }
+                to_remove.insert(eq_idx);
+
+                replacements.insert(
+                    i,
+                    TraceOp::SelectBitZero {
+                        dest: *dest,
+                        src,
+                        mask: 1,
+                        on_zero: on_true.clone(),
+                        on_nonzero: on_false.clone(),
+                    },
+                );
+            }
+        }
+
+        if !to_remove.is_empty() {
+            let mut new_ops = Vec::with_capacity(trace.ops.len());
+            for (idx, op) in trace.ops.drain(..).enumerate() {
+                if let Some(replacement) = replacements.remove(&idx) {
+                    new_ops.push(replacement);
+                } else if !to_remove.contains(&idx) {
+                    new_ops.push(op);
+                }
+            }
+            trace.ops = new_ops;
+        }
+    }
+
+    fn optimize_constant_modulo(&mut self, trace: &mut Trace) {
+        use crate::jit::trace::ValueType;
+
+        let mut to_remove = hashbrown::HashSet::new();
+        let mut replacements = hashbrown::HashMap::new();
+
+        for (i, op) in trace.ops.iter().enumerate() {
+            if let TraceOp::Mod {
+                dest,
+                lhs,
+                rhs,
+                lhs_type: ValueType::Int,
+                rhs_type: ValueType::Int,
+            } = op
+            {
+                let mut const_info = None;
+                for k in (0..i).rev() {
+                    let prev = &trace.ops[k];
+                    if matches!(prev, TraceOp::At { .. }) {
+                        continue;
+                    }
+                    if let TraceOp::LoadConst {
+                        dest: d,
+                        value: Value::Int(c),
+                    } = prev
+                    {
+                        if *d == *rhs && *c > 0 {
+                            const_info = Some((k, *c));
+                            break;
+                        }
+                    }
+                    if Self::dest_of(prev) == Some(*rhs) {
+                        break;
+                    }
+                }
+
+                if let Some((const_idx, divisor)) = const_info {
+                    let downstream_reads = |reg: Register, start: usize| -> bool {
+                        for op in &trace.ops[start..] {
+                            if Self::reads_of(op).contains(&reg) {
+                                return true;
+                            }
+                            if Self::dest_of(op) == Some(reg) {
+                                break;
+                            }
+                        }
+                        false
+                    };
+
+                    if !downstream_reads(*rhs, i + 1) {
+                        to_remove.insert(const_idx);
+                    }
+
+                    replacements.insert(
+                        i,
+                        TraceOp::ModImm {
+                            dest: *dest,
+                            src: *lhs,
+                            divisor,
+                        },
+                    );
+                }
+            }
+        }
+
+        if !replacements.is_empty() {
+            let mut new_ops = Vec::with_capacity(trace.ops.len());
+            for (idx, op) in trace.ops.drain(..).enumerate() {
+                if let Some(replacement) = replacements.remove(&idx) {
+                    new_ops.push(replacement);
+                } else if !to_remove.contains(&idx) {
+                    new_ops.push(op);
+                }
+            }
+            trace.ops = new_ops;
+        }
+    }
+
     fn coalesce_registers(&mut self, _trace: &mut Trace) {}
+
+    /// Scalar replacement of a loop-invariant struct field.
+    ///
+    /// When a loop repeatedly loads and stores one scalar field of an object
+    /// that the loop never reassigns, keep the payload in a fresh register:
+    /// one load in the preamble, register moves in the body, one store on
+    /// the way out (`RestoreField`). The register is loop-carried, so the
+    /// backend pins it in a callee-saved machine register.
+    fn promote_invariant_fields(&mut self, trace: &mut Trace) {
+        if trace.is_function || trace.ops.is_empty() {
+            return;
+        }
+        if trace.ops.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::CallNative { .. }
+                    | TraceOp::CallFunction { .. }
+                    | TraceOp::CallMethod { .. }
+                    | TraceOp::CallDirect { .. }
+                    | TraceOp::InlineCall { .. }
+                    | TraceOp::NestedLoopCall { .. }
+                    | TraceOp::SpecializedOp { .. }
+                    | TraceOp::NewStruct { .. }
+                    | TraceOp::SetIndex { .. }
+            )
+        }) {
+            return;
+        }
+
+        #[derive(Clone)]
+        struct Field {
+            name: String,
+            index: usize,
+            ty: ValueType,
+            gets: usize,
+            sets: usize,
+        }
+        let mut fields: HashMap<(Register, usize), Field> = HashMap::new();
+        let mut banned: HashSet<Register> = HashSet::new();
+
+        for op in &trace.ops {
+            if let Some(dest) = Self::dest_of(op) {
+                banned.insert(dest);
+            }
+            for reg in Self::other_writes(op) {
+                banned.insert(reg);
+            }
+            match op {
+                TraceOp::GetField {
+                    object,
+                    field_name,
+                    field_index,
+                    value_type,
+                    is_weak,
+                    ..
+                }
+                | TraceOp::SetField {
+                    object,
+                    field_name,
+                    field_index,
+                    value_type,
+                    is_weak,
+                    ..
+                } => {
+                    let is_get = matches!(op, TraceOp::GetField { .. });
+                    let Some(index) = *field_index else {
+                        banned.insert(*object);
+                        continue;
+                    };
+                    if *is_weak {
+                        banned.insert(*object);
+                        continue;
+                    }
+                    let Some(ty) = value_type.filter(|ty| {
+                        matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool)
+                    }) else {
+                        banned.insert(*object);
+                        continue;
+                    };
+                    let entry = fields.entry((*object, index)).or_insert_with(|| Field {
+                        name: field_name.clone(),
+                        index,
+                        ty,
+                        gets: 0,
+                        sets: 0,
+                    });
+                    if entry.ty != ty || entry.name != *field_name {
+                        banned.insert(*object);
+                        continue;
+                    }
+                    if is_get {
+                        entry.gets += 1;
+                    } else {
+                        entry.sets += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut chosen: Vec<((Register, usize), Field)> = fields
+            .into_iter()
+            .filter(|((object, _), field)| {
+                !banned.contains(object) && field.gets > 0 && field.sets > 0
+            })
+            .collect();
+        if chosen.is_empty() {
+            return;
+        }
+        chosen.sort_by_key(|((object, index), _)| (*object, *index));
+
+        let mut max_reg = 0u8;
+        for op in trace
+            .preamble
+            .iter()
+            .chain(&trace.ops)
+            .chain(&trace.postamble)
+        {
+            if let Some(dest) = Self::dest_of(op) {
+                max_reg = max_reg.max(dest);
+            }
+            for reg in Self::reads_of(op) {
+                max_reg = max_reg.max(reg);
+            }
+            for reg in Self::other_writes(op) {
+                max_reg = max_reg.max(reg);
+            }
+        }
+
+        let mut slots: HashMap<(Register, usize), (Register, Field)> = HashMap::new();
+        for (key, field) in chosen {
+            if max_reg >= 220 {
+                break;
+            }
+            max_reg = max_reg.saturating_add(1);
+            let promoted = max_reg;
+            trace.preamble.push(TraceOp::GetField {
+                dest: promoted,
+                object: key.0,
+                field_name: field.name.clone(),
+                field_index: Some(field.index),
+                value_type: Some(field.ty),
+                is_weak: false,
+            });
+            trace.preamble.push(TraceOp::Guard {
+                register: promoted,
+                expected_type: field.ty,
+            });
+            trace.postamble.insert(
+                0,
+                TraceOp::RestoreField {
+                    object: key.0,
+                    field_name: field.name.clone(),
+                    value: promoted,
+                    field_index: field.index,
+                    value_type: field.ty,
+                },
+            );
+            slots.insert(key, (promoted, field));
+        }
+        if slots.is_empty() {
+            return;
+        }
+
+        for op in &mut trace.ops {
+            match op {
+                TraceOp::GetField {
+                    dest,
+                    object,
+                    field_index: Some(index),
+                    ..
+                } if slots.contains_key(&(*object, *index)) => {
+                    let promoted = slots[&(*object, *index)].0;
+                    *op = TraceOp::Move {
+                        dest: *dest,
+                        src: promoted,
+                    };
+                }
+                TraceOp::SetField {
+                    object,
+                    value,
+                    field_index: Some(index),
+                    ..
+                } if slots.contains_key(&(*object, *index)) => {
+                    let promoted = slots[&(*object, *index)].0;
+                    *op = TraceOp::Move {
+                        dest: promoted,
+                        src: *value,
+                    };
+                }
+                _ => {}
+            }
+        }
+
+        jit::log(|| {
+            format!(
+                "📦 JIT Optimizer: promoted {} invariant struct field(s) into registers",
+                slots.len()
+            )
+        });
+    }
 }
 
 impl Default for TraceOptimizer {

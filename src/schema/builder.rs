@@ -399,6 +399,28 @@ impl From<ArrayBuilder> for Schema {
     }
 }
 
+fn unpack_optional(ir: SchemaIR) -> (SchemaIR, bool) {
+    match ir {
+        SchemaIR::Optional(inner) => {
+            let (unwrapped, _) = unpack_optional(*inner);
+            (unwrapped, true)
+        }
+        SchemaIR::Nullable(inner) => {
+            let (unwrapped, is_opt) = unpack_optional(*inner);
+            (SchemaIR::Nullable(Box::new(unwrapped)), is_opt)
+        }
+        SchemaIR::Refine { inner, predicate, message } => {
+            let (unwrapped, is_opt) = unpack_optional(*inner);
+            (SchemaIR::Refine { inner: Box::new(unwrapped), predicate, message }, is_opt)
+        }
+        SchemaIR::Transform { inner, transform } => {
+            let (unwrapped, is_opt) = unpack_optional(*inner);
+            (SchemaIR::Transform { inner: Box::new(unwrapped), transform }, is_opt)
+        }
+        other => (other, false),
+    }
+}
+
 pub struct ObjectBuilder {
     fields: Vec<ObjectFieldIR>,
     strict: bool,
@@ -414,10 +436,7 @@ impl ObjectBuilder {
 
     pub fn field(mut self, name: impl Into<String>, schema: impl Into<Schema>) -> Self {
         let sch = schema.into();
-        let (schema_ir, optional) = match sch.ir {
-            SchemaIR::Optional(inner) => (*inner, true),
-            other => (other, false),
-        };
+        let (schema_ir, optional) = unpack_optional(sch.ir);
         self.fields.push(ObjectFieldIR {
             name: name.into(),
             schema: schema_ir,

@@ -137,24 +137,35 @@ pub fn validate_ir(
 
             if let Some(f) = float_val {
                 let mut valid = true;
-                if let Some(min_val) = min {
-                    if f < *min_val {
+                if f.is_nan() {
+                    if min.is_some() || max.is_some() {
                         errors.push(ValidationError::new(
                             path.clone(),
-                            format!("Float must be >= {}", min_val),
-                            "too_small",
-                        ).with_received(f.to_string()));
+                            "Float value must not be NaN when bounds are specified",
+                            "invalid_range",
+                        ).with_received("NaN"));
                         valid = false;
                     }
-                }
-                if let Some(max_val) = max {
-                    if f > *max_val {
-                        errors.push(ValidationError::new(
-                            path.clone(),
-                            format!("Float must be <= {}", max_val),
-                            "too_big",
-                        ).with_received(f.to_string()));
-                        valid = false;
+                } else {
+                    if let Some(min_val) = min {
+                        if f < *min_val {
+                            errors.push(ValidationError::new(
+                                path.clone(),
+                                format!("Float must be >= {}", min_val),
+                                "too_small",
+                            ).with_received(f.to_string()));
+                            valid = false;
+                        }
+                    }
+                    if let Some(max_val) = max {
+                        if f > *max_val {
+                            errors.push(ValidationError::new(
+                                path.clone(),
+                                format!("Float must be <= {}", max_val),
+                                "too_big",
+                            ).with_received(f.to_string()));
+                            valid = false;
+                        }
                     }
                 }
                 if valid {

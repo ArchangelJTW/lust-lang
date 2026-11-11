@@ -45,6 +45,18 @@ impl DataValue {
         matches!(self, DataValue::Document(_))
     }
 
+    pub fn is_binary(&self) -> bool {
+        matches!(self, DataValue::Binary(_))
+    }
+
+    pub fn is_object_id(&self) -> bool {
+        matches!(self, DataValue::ObjectId(_))
+    }
+
+    pub fn is_datetime(&self) -> bool {
+        matches!(self, DataValue::DateTimeUtc(_))
+    }
+
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             DataValue::Bool(b) => Some(*b),
@@ -87,6 +99,13 @@ impl DataValue {
         }
     }
 
+    pub fn as_array_mut(&mut self) -> Option<&mut Vec<DataValue>> {
+        match self {
+            DataValue::Array(arr) => Some(arr),
+            _ => None,
+        }
+    }
+
     pub fn as_document(&self) -> Option<&Document> {
         match self {
             DataValue::Document(doc) => Some(doc),
@@ -104,6 +123,55 @@ impl DataValue {
     pub fn as_binary(&self) -> Option<&[u8]> {
         match self {
             DataValue::Binary(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn as_object_id(&self) -> Option<&ObjectId> {
+        match self {
+            DataValue::ObjectId(oid) => Some(oid),
+            _ => None,
+        }
+    }
+
+    pub fn as_datetime(&self) -> Option<&DateTimeUtc> {
+        match self {
+            DataValue::DateTimeUtc(dt) => Some(dt),
+            _ => None,
+        }
+    }
+
+    pub fn as_decimal128(&self) -> Option<&Decimal128> {
+        match self {
+            DataValue::Number(ExactNumber::Decimal128(dec)) => Some(dec),
+            _ => None,
+        }
+    }
+
+    pub fn len(&self) -> Option<usize> {
+        match self {
+            DataValue::String(s) => Some(s.len()),
+            DataValue::Binary(b) => Some(b.len()),
+            DataValue::Array(arr) => Some(arr.len()),
+            DataValue::Document(doc) => Some(doc.len()),
+            _ => None,
+        }
+    }
+
+    pub fn is_empty(&self) -> Option<bool> {
+        self.len().map(|l| l == 0)
+    }
+
+    pub fn get(&self, key: &str) -> Option<&DataValue> {
+        match self {
+            DataValue::Document(doc) => doc.get(key),
+            _ => None,
+        }
+    }
+
+    pub fn get_index(&self, index: usize) -> Option<&DataValue> {
+        match self {
+            DataValue::Array(arr) => arr.get(index),
             _ => None,
         }
     }

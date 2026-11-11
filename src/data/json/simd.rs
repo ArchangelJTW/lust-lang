@@ -293,7 +293,7 @@ impl<'a> SimdJsonParser<'a> {
     /// Parse a JSON string using SIMD chunk-scanning to fast-forward past clean runs of bytes.
     fn parse_string(&mut self) -> Result<String, JsonError> {
         self.consume_byte(b'"')?;
-        let mut out = String::new();
+        let mut bytes = Vec::new();
 
         while self.pos < self.input.len() {
             // Check if we can run a vector chunk scan
@@ -314,17 +314,7 @@ impl<'a> SimdJsonParser<'a> {
 
             if clean_len > 0 {
                 let slice = &self.input[self.pos..self.pos + clean_len];
-                if slice.iter().all(|&b| b < 0x80) {
-                    // Pure ASCII bytes can be appended as UTF-8 string chunk directly
-                    // Safe because all bytes are strictly ASCII (< 0x80)
-                    unsafe {
-                        out.push_str(std::str::from_utf8_unchecked(slice));
-                    }
-                } else {
-                    for &b in slice {
-                        out.push(b as char);
-                    }
-                }
+                bytes.extend_from_slice(slice);
                 self.pos += clean_len;
             }
 
@@ -336,48 +326,56 @@ impl<'a> SimdJsonParser<'a> {
                 let b = self.input[self.pos];
                 self.pos += 1;
                 match b {
-                    b'"' => return Ok(out),
+                    b'"' => {
+                        return String::from_utf8(bytes).map_err(|_| JsonError::InvalidUnicode(self.pos));
+                    }
                     b'\\' => {
                         let esc = self.next_byte()?;
                         match esc {
-                            b'"' => out.push('"'),
-                            b'\\' => out.push('\\'),
-                            b'/' => out.push('/'),
-                            b'b' => out.push('\x08'),
-                            b'f' => out.push('\x0c'),
-                            b'n' => out.push('\n'),
-                            b'r' => out.push('\r'),
-                            b't' => out.push('\t'),
+                            b'"' => bytes.push(b'"'),
+                            b'\\' => bytes.push(b'\\'),
+                            b'/' => bytes.push(b'/'),
+                            b'b' => bytes.push(b'\x08'),
+                            b'f' => bytes.push(b'\x0c'),
+                            b'n' => bytes.push(b'\n'),
+                            b'r' => bytes.push(b'\r'),
+                            b't' => bytes.push(b'\t'),
                             b'u' => {
                                 let ch = self.parse_unicode_hex()?;
-                                out.push(ch);
+                                let mut buf = [0u8; 4];
+                                let s = ch.encode_utf8(&mut buf);
+                                bytes.extend_from_slice(s.as_bytes());
                             }
                             _ => return Err(JsonError::InvalidEscape(self.pos - 1)),
                         }
                     }
                     0x00..=0x1F => return Err(JsonError::UnexpectedChar(b as char, self.pos - 1)),
-                    _ => out.push(b as char),
+                    _ => bytes.push(b),
                 }
             } else {
                 // A special delimiter or control byte was detected at self.pos
                 let b = self.input[self.pos];
                 self.pos += 1;
                 match b {
-                    b'"' => return Ok(out),
+                    b'"' => {
+                        return String::from_utf8(bytes).map_err(|_| JsonError::InvalidUnicode(self.pos));
+                    }
                     b'\\' => {
                         let esc = self.next_byte()?;
                         match esc {
-                            b'"' => out.push('"'),
-                            b'\\' => out.push('\\'),
-                            b'/' => out.push('/'),
-                            b'b' => out.push('\x08'),
-                            b'f' => out.push('\x0c'),
-                            b'n' => out.push('\n'),
-                            b'r' => out.push('\r'),
-                            b't' => out.push('\t'),
+                            b'"' => bytes.push(b'"'),
+                            b'\\' => bytes.push(b'\\'),
+                            b'/' => bytes.push(b'/'),
+                            b'b' => bytes.push(b'\x08'),
+                            b'f' => bytes.push(b'\x0c'),
+                            b'n' => bytes.push(b'\n'),
+                            b'r' => bytes.push(b'\r'),
+                            b't' => bytes.push(b'\t'),
                             b'u' => {
                                 let ch = self.parse_unicode_hex()?;
-                                out.push(ch);
+                                let mut buf = [0u8; 4];
+                                let s = ch.encode_utf8(&mut buf);
+                                bytes.extend_from_slice(s.as_bytes());
                             }
                             _ => return Err(JsonError::InvalidEscape(self.pos - 1)),
                         }

@@ -22,6 +22,13 @@ impl Schema {
                 return Ok(val);
             }
         }
+        if errors.is_empty() {
+            errors.push(ValidationError::new(
+                path,
+                "Validation failed",
+                "validation_failed",
+            ));
+        }
         Err(ValidationErrors::new(errors))
     }
 
@@ -208,6 +215,14 @@ impl StringBuilder {
     {
         self.build().transform(transform_fn)
     }
+
+    pub fn optional(self) -> Schema {
+        self.build().optional()
+    }
+
+    pub fn nullable(self) -> Schema {
+        self.build().nullable()
+    }
 }
 
 impl From<StringBuilder> for Schema {
@@ -267,6 +282,14 @@ impl IntBuilder {
     {
         self.build().transform(transform_fn)
     }
+
+    pub fn optional(self) -> Schema {
+        self.build().optional()
+    }
+
+    pub fn nullable(self) -> Schema {
+        self.build().nullable()
+    }
 }
 
 impl From<IntBuilder> for Schema {
@@ -325,6 +348,14 @@ impl FloatBuilder {
         F: Fn(DataValue) -> DataValue + Send + Sync + 'static,
     {
         self.build().transform(transform_fn)
+    }
+
+    pub fn optional(self) -> Schema {
+        self.build().optional()
+    }
+
+    pub fn nullable(self) -> Schema {
+        self.build().nullable()
     }
 }
 
@@ -391,6 +422,14 @@ impl ArrayBuilder {
     {
         self.build().transform(transform_fn)
     }
+
+    pub fn optional(self) -> Schema {
+        self.build().optional()
+    }
+
+    pub fn nullable(self) -> Schema {
+        self.build().nullable()
+    }
 }
 
 impl From<ArrayBuilder> for Schema {
@@ -399,7 +438,7 @@ impl From<ArrayBuilder> for Schema {
     }
 }
 
-fn unpack_optional(ir: SchemaIR) -> (SchemaIR, bool) {
+pub fn unpack_optional(ir: SchemaIR) -> (SchemaIR, bool) {
     match ir {
         SchemaIR::Optional(inner) => {
             let (unwrapped, _) = unpack_optional(*inner);
@@ -498,10 +537,88 @@ impl ObjectBuilder {
     {
         self.build().transform(transform_fn)
     }
+
+    pub fn optional(self) -> Schema {
+        self.build().optional()
+    }
+
+    pub fn nullable(self) -> Schema {
+        self.build().nullable()
+    }
 }
 
 impl From<ObjectBuilder> for Schema {
     fn from(b: ObjectBuilder) -> Self {
+        b.build()
+    }
+}
+
+pub struct BinaryBuilder {
+    min_len: Option<usize>,
+    max_len: Option<usize>,
+}
+
+impl BinaryBuilder {
+    pub fn new() -> Self {
+        Self {
+            min_len: None,
+            max_len: None,
+        }
+    }
+
+    pub fn min(mut self, len: usize) -> Self {
+        self.min_len = Some(len);
+        self
+    }
+
+    pub fn max(mut self, len: usize) -> Self {
+        self.max_len = Some(len);
+        self
+    }
+
+    pub fn build(self) -> Schema {
+        Schema::new(SchemaIR::Binary {
+            min_len: self.min_len,
+            max_len: self.max_len,
+        })
+    }
+
+    pub fn compile(self) -> SchemaIR {
+        self.build().ir
+    }
+
+    pub fn refine<F>(self, predicate: F) -> Schema
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        self.build().refine(predicate)
+    }
+
+    pub fn refine_with_message<F>(self, predicate: F, message: impl Into<String>) -> Schema
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        self.build().refine_with_message(predicate, message)
+    }
+
+    pub fn transform<F>(self, transform_fn: F) -> Schema
+    where
+        F: Fn(DataValue) -> DataValue + Send + Sync + 'static,
+    {
+        self.build().transform(transform_fn)
+    }
+
+    pub fn optional(self) -> Schema {
+        self.build().optional()
+    }
+
+    pub fn nullable(self) -> Schema {
+        self.build().nullable()
+    }
+}
+
+impl From<BinaryBuilder> for Schema {
+    fn from(b: BinaryBuilder) -> Self {
         b.build()
     }
 }
@@ -526,6 +643,22 @@ impl SchemaFactory {
 
     pub fn bool(&self) -> Schema {
         Schema::new(SchemaIR::Bool)
+    }
+
+    pub fn binary(&self) -> BinaryBuilder {
+        BinaryBuilder::new()
+    }
+
+    pub fn object_id(&self) -> Schema {
+        Schema::new(SchemaIR::ObjectId)
+    }
+
+    pub fn datetime_utc(&self) -> Schema {
+        Schema::new(SchemaIR::DateTimeUtc)
+    }
+
+    pub fn decimal128(&self) -> Schema {
+        Schema::new(SchemaIR::Decimal128)
     }
 
     pub fn any(&self) -> Schema {

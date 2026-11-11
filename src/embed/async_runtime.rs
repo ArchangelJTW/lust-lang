@@ -226,7 +226,7 @@ pub struct PendingAsyncTask<Args, R> {
 }
 
 impl<Args, R> PendingAsyncTask<Args, R> {
-    pub(crate) fn new(task: TaskHandle, args: Args, completer: AsyncCompleter<R>) -> Self {
+    pub fn new(task: TaskHandle, args: Args, completer: AsyncCompleter<R>) -> Self {
         Self {
             task,
             args,
@@ -256,7 +256,7 @@ struct AsyncSignalState<T> {
     waker: Mutex<Option<Waker>>,
 }
 
-pub(crate) struct AsyncCompleter<T> {
+pub struct AsyncCompleter<T> {
     inner: Arc<AsyncSignalState<T>>,
 }
 
@@ -269,11 +269,11 @@ impl<T> Clone for AsyncCompleter<T> {
 }
 
 impl<T> AsyncCompleter<T> {
-    fn complete_ok(&self, value: T) {
+    pub fn complete_ok(&self, value: T) {
         self.set_result(Ok(value));
     }
 
-    fn complete_err(&self, message: impl Into<String>) {
+    pub fn complete_err(&self, message: impl Into<String>) {
         self.set_result(Err(message.into()));
     }
 
@@ -292,7 +292,7 @@ impl<T> AsyncCompleter<T> {
     }
 }
 
-pub(crate) struct AsyncSignalFuture<T> {
+pub struct AsyncSignalFuture<T> {
     inner: Arc<AsyncSignalState<T>>,
 }
 
@@ -313,7 +313,7 @@ impl<T> Future for AsyncSignalFuture<T> {
     }
 }
 
-pub(crate) fn signal_pair<T>() -> (AsyncCompleter<T>, AsyncSignalFuture<T>) {
+pub fn signal_pair<T>() -> (AsyncCompleter<T>, AsyncSignalFuture<T>) {
     let inner = Arc::new(AsyncSignalState {
         result: Mutex::new(None),
         waker: Mutex::new(None),

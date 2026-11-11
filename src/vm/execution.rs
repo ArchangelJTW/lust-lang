@@ -533,6 +533,13 @@ impl VM {
                 }
             }
 
+            #[cfg(feature = "std")]
+            if crate::vm::tracing::has_trace_hook() {
+                let func = &self.functions[func_idx];
+                let line = func.chunk.lines.get(ip_before_execution).copied().unwrap_or(0);
+                self.dispatch_instruction_hook(&func.name, line, ip_before_execution);
+            }
+
             self.budgets.charge_gas(1)?;
             match instruction {
                 Instruction::LoadNil(dest) => {
@@ -1016,6 +1023,12 @@ impl VM {
                         self.bytecode_call_frame(func_reg, first_arg, arg_count, dest_reg)?;
                     let callee_idx = frame.function_idx;
                     self.call_stack.push(frame);
+                    #[cfg(feature = "std")]
+                    if crate::vm::tracing::has_trace_hook() {
+                        let callee = &self.functions[callee_idx];
+                        let line = callee.chunk.lines.first().copied().unwrap_or(0);
+                        self.dispatch_call_hook(&callee.name, line, self.call_stack.len());
+                    }
                     if JIT_ENABLED
                         && self.trace_recorder.is_none()
                         && let Some(finished) = self.run_compiled_function(callee_idx)?
@@ -2120,7 +2133,7 @@ impl VM {
         self.set_register(dest, Value::Bool(result))
     }
 
-    pub(crate) fn value_is_type(&self, value: &Value, type_name: &str) -> bool {
+    pub fn value_is_type(&self, value: &Value, type_name: &str) -> bool {
         // Lua compatibility intentionally treats LuaValue as a dynamic carrier. Transpiled
         // values may still be represented by their underlying VM value at call boundaries.
         if type_name == "LuaValue" || type_name == "unknown" {
@@ -2308,6 +2321,13 @@ impl VM {
         let frame = self.call_stack.last().unwrap();
         let return_dest = frame.return_dest;
         self.validate_function_return(frame.function_idx, &return_value)?;
+        #[cfg(feature = "std")]
+        if crate::vm::tracing::has_trace_hook() {
+            let func = &self.functions[frame.function_idx];
+            let ip_index = frame.ip.saturating_sub(1);
+            let line = func.chunk.lines.get(ip_index).copied().unwrap_or(0);
+            self.dispatch_return_hook(&func.name, line, self.call_stack.len());
+        }
         if let Some(frame) = self.call_stack.pop() {
             self.recycle_frame(frame);
         }
@@ -2921,7 +2941,7 @@ impl VM {
         })
     }
 
-    pub(super) fn make_hash_key(&mut self, value: &Value) -> Result<ValueKey> {
+    pub fn make_hash_key(&mut self, value: &Value) -> Result<ValueKey> {
         let type_name = self.value_trait_name(value);
         if self.type_has_hashkey(&type_name) {
             let hashed = self.invoke_hashkey(value, &type_name)?;

@@ -1,4 +1,4 @@
-use super::VM;
+use super::{FieldStorage, RuntimeStructInfo, StructLayout, Type, TypeKind, VM};
 use super::task::{TaskInstance, TaskKind, TaskState};
 use crate::LustError;
 use crate::bytecode::value::EnumObject;
@@ -13,8 +13,65 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 pub(super) fn install_core_builtins(vm: &mut VM) {
+    register_builtin_struct_layouts(vm);
     for (name, value) in core_entries(vm) {
         vm.register_native(name, value);
+    }
+}
+
+fn register_builtin_struct_layouts(vm: &mut VM) {
+    if !vm.struct_metadata.contains_key("LuaTable") {
+        let field_names = vec![
+            Rc::new("table".to_string()),
+            Rc::new("metamethods".to_string()),
+        ];
+        let dummy_type = Type::new(TypeKind::Unknown, crate::ast::Span::dummy());
+        let layout = Rc::new(StructLayout::new(
+            "LuaTable".to_string(),
+            field_names,
+            vec![FieldStorage::Strong, FieldStorage::Strong],
+            vec![dummy_type.clone(), dummy_type],
+            vec![None, None],
+        ));
+        vm.struct_metadata.insert(
+            "LuaTable".to_string(),
+            RuntimeStructInfo { layout },
+        );
+    }
+    if !vm.struct_metadata.contains_key("LuaFunction") {
+        let field_names = vec![Rc::new("handle".to_string())];
+        let dummy_type = Type::new(TypeKind::Unknown, crate::ast::Span::dummy());
+        let layout = Rc::new(StructLayout::new(
+            "LuaFunction".to_string(),
+            field_names,
+            vec![FieldStorage::Strong],
+            vec![dummy_type],
+            vec![None],
+        ));
+        vm.struct_metadata.insert(
+            "LuaFunction".to_string(),
+            RuntimeStructInfo { layout },
+        );
+    }
+    if !vm.struct_metadata.contains_key("TaskInfo") {
+        let field_names = vec![
+            Rc::new("state".to_string()),
+            Rc::new("last_yield".to_string()),
+            Rc::new("last_result".to_string()),
+            Rc::new("error".to_string()),
+        ];
+        let dummy_type = Type::new(TypeKind::Unknown, crate::ast::Span::dummy());
+        let layout = Rc::new(StructLayout::new(
+            "TaskInfo".to_string(),
+            field_names,
+            vec![FieldStorage::Strong; 4],
+            vec![dummy_type.clone(), dummy_type.clone(), dummy_type.clone(), dummy_type],
+            vec![None; 4],
+        ));
+        vm.struct_metadata.insert(
+            "TaskInfo".to_string(),
+            RuntimeStructInfo { layout },
+        );
     }
 }
 
@@ -29,6 +86,15 @@ pub(super) fn core_entries(vm: &VM) -> Vec<(&'static str, Value)> {
         ("pairs", create_pairs_fn()),
         ("ipairs", create_ipairs_fn()),
         ("task", create_task_module(vm)),
+        ("task.run", create_task_run_fn()),
+        ("task.create", create_task_create_fn()),
+        ("task.status", create_task_status_fn()),
+        ("task.info", create_task_info_fn()),
+        ("task.resume", create_task_resume_fn()),
+        ("task.yield", create_task_yield_fn()),
+        ("task.stop", create_task_stop_fn()),
+        ("task.restart", create_task_restart_fn()),
+        ("task.current", create_task_current_fn()),
     ];
     #[cfg(feature = "std")]
     {

@@ -442,3 +442,291 @@ fn test_simd_complex_nested_document() {
     let reparsed_simd = json::from_str_simd(&encoded).unwrap();
     assert_eq!(parsed_simd, reparsed_simd);
 }
+
+// ============================================================================
+// 10. Multi-byte UTF-8 Chunk Alignment and Vector Boundary Crossing
+// ============================================================================
+
+#[test]
+fn test_simd_multibyte_utf8_boundaries_and_alignment() {
+    // 10.1 Aligned exactly on and straddling chunk boundaries (8 bytes SWAR, 16 bytes NEON, 32 bytes AVX2, 64 bytes)
+    for &boundary in &[8usize, 16, 32, 64] {
+        // --- Cyrillic (2-byte UTF-8, e.g. 'ж' = 0xD0 0xB6) ---
+        // Aligned at boundary: string starts with '"', (boundary - 1) ASCII chars, then 'ж'
+        let cyr_aligned = format!("\"{}ж\"", "a".repeat(boundary - 1));
+        assert_simd_scalar_parity(&cyr_aligned);
+
+        // Straddling boundary: index boundary - 1 is 0xD0, index boundary is 0xB6
+        if boundary >= 2 {
+            let cyr_straddle = format!("\"{}ж\"", "a".repeat(boundary - 2));
+            assert_simd_scalar_parity(&cyr_straddle);
+        }
+
+        // --- CJK (3-byte UTF-8, e.g. '你' = 0xE4 0xBD 0xA0) ---
+        // Aligned at boundary
+        let cjk_aligned = format!("\"{}你\"", "a".repeat(boundary - 1));
+        assert_simd_scalar_parity(&cjk_aligned);
+
+        // Straddling boundary with 1 byte in chunk N-1 and 2 bytes in chunk N
+        if boundary >= 2 {
+            let cjk_straddle1 = format!("\"{}你\"", "a".repeat(boundary - 2));
+            assert_simd_scalar_parity(&cjk_straddle1);
+        }
+
+        // Straddling boundary with 2 bytes in chunk N-1 and 1 byte in chunk N
+        if boundary >= 3 {
+            let cjk_straddle2 = format!("\"{}你\"", "a".repeat(boundary - 3));
+            assert_simd_scalar_parity(&cjk_straddle2);
+        }
+
+        // --- Emoji (4-byte UTF-8, e.g. '🦀' = 0xF0 0x9F 0xA6 0x80) ---
+        // Aligned at boundary
+        let emoji_aligned = format!("\"{}🦀\"", "a".repeat(boundary - 1));
+        assert_simd_scalar_parity(&emoji_aligned);
+
+        // Straddling boundary with 1 byte in chunk N-1 and 3 bytes in chunk N
+        if boundary >= 2 {
+            let emoji_straddle1 = format!("\"{}🦀\"", "a".repeat(boundary - 2));
+            assert_simd_scalar_parity(&emoji_straddle1);
+        }
+
+        // Straddling boundary with 2 bytes in chunk N-1 and 2 bytes in chunk N
+        if boundary >= 3 {
+            let emoji_straddle2 = format!("\"{}🦀\"", "a".repeat(boundary - 3));
+            assert_simd_scalar_parity(&emoji_straddle2);
+        }
+
+        // Straddling boundary with 3 bytes in chunk N-1 and 1 byte in chunk N
+        if boundary >= 4 {
+            let emoji_straddle3 = format!("\"{}🦀\"", "a".repeat(boundary - 4));
+            assert_simd_scalar_parity(&emoji_straddle3);
+        }
+    }
+
+    // 10.2 Sweeping alignment: test all offsets 0..=48 for Cyrillic, CJK, Emoji, and mixed text
+    for pad in 0..=48 {
+        let p = "x".repeat(pad);
+
+        // Cyrillic pangram with varying alignments
+        let cyrillic_doc = format!("\"{p}Съешь же ещё этих мягких французских булок, да выпей чаю.\"");
+        assert_simd_scalar_parity(&cyrillic_doc);
+
+        // CJK text with varying alignments
+        let cjk_doc = format!("\"{p}天地玄黄，宇宙洪荒。日月盈昃，辰宿列张。\"");
+        assert_simd_scalar_parity(&cjk_doc);
+
+        // Multi-emoji runs with varying alignments
+        let emoji_doc = format!("\"{p}🦀🚀🔥🎉✨📦💡🎯⚡️🦄🌈\"");
+        assert_simd_scalar_parity(&emoji_doc);
+
+        // Mixed multi-byte text interleaved with JSON escapes
+        let mixed_doc = format!("\"{p}Prefix_\\n_Привет_\\t_世界_\\\"_🦀_\\\\_End\"");
+        assert_simd_scalar_parity(&mixed_doc);
+    }
+
+    // 10.3 Exact vector chunk multiples of pure non-ASCII UTF-8
+    // 8 bytes (4 Cyrillic chars)
+    assert_simd_scalar_parity("\"тест\"");
+    // 16 bytes (8 Cyrillic chars)
+    assert_simd_scalar_parity("\"тестиров\"");
+    // 32 bytes (16 Cyrillic chars)
+    assert_simd_scalar_parity("\"тестирование_sim\"");
+    // 64 bytes (32 Cyrillic chars)
+    assert_simd_scalar_parity("\"тестирование_simd_парсер_lust_\"");
+
+    // Pure Emoji: 8 bytes (2 emoji), 16 bytes (4 emoji), 32 bytes (8 emoji)
+    assert_simd_scalar_parity("\"🦀🚀\"");
+    assert_simd_scalar_parity("\"🦀🚀🎉🔥\"");
+    assert_simd_scalar_parity("\"🦀🚀🎉🔥✨📦💡🎯\"");
+
+    // Document structures with multi-byte keys and values
+    let doc = r#"{
+        "ключ_на_русском": "значение_кириллица",
+        "中文键名": "这是中文值",
+        "emoji_key_🦀": ["🚀", "🔥", {"вложенный": "объект"}]
+    }"#;
+    assert_simd_scalar_parity(doc);
+}
+
+// ============================================================================
+// 11. Fail-Closed: Invalid UTF-8 Byte Rejection across All CPU Dispatches
+// ============================================================================
+
+/// Verification helper for invalid UTF-8 bytes: asserts that both scalar and all SIMD dispatches
+/// reject the input with JsonError::InvalidUnicode and have exact parity.
+fn assert_invalid_utf8_rejected(bytes: &[u8]) {
+    let scalar_res = json::from_slice_with_limits(bytes, 256, 1024 * 1024);
+    assert!(
+        matches!(scalar_res, Err(JsonError::InvalidUnicode(_))),
+        "Scalar oracle did not reject invalid UTF-8 with InvalidUnicode on input {:?}: got {:?}",
+        bytes,
+        scalar_res
+    );
+
+    for dispatch in test_dispatches() {
+        let simd_res = json::from_slice_simd_with_limits_and_dispatch(bytes, 256, 1024 * 1024, dispatch);
+        assert_eq!(
+            simd_res, scalar_res,
+            "SIMD dispatch {:?} diverged from scalar oracle on invalid UTF-8 input: {:?}",
+            dispatch, bytes
+        );
+        assert!(
+            matches!(simd_res, Err(JsonError::InvalidUnicode(_))),
+            "SIMD dispatch {:?} did not return InvalidUnicode on input {:?}: got {:?}",
+            dispatch, bytes, simd_res
+        );
+    }
+}
+
+#[test]
+fn test_simd_rejects_invalid_utf8_across_all_dispatches() {
+    // 11.1 Lone invalid bytes (never valid anywhere in UTF-8)
+    let invalid_bytes: &[u8] = &[0xC0, 0xC1, 0xF5, 0xF6, 0xF7, 0xF8, 0xFC, 0xFE, 0xFF];
+    for &bad in invalid_bytes {
+        let input = [b'"', bad, b'"'];
+        assert_invalid_utf8_rejected(&input);
+
+        // Preceded and followed by clean ASCII bytes
+        let with_surrounding = [b'"', b'a', b'b', bad, b'c', b'd', b'"'];
+        assert_invalid_utf8_rejected(&with_surrounding);
+    }
+
+    // 11.2 Lone continuation bytes (0x80..=0xBF without a leading byte)
+    let lone_continuations: &[u8] = &[0x80, 0x85, 0x90, 0x9F, 0xA0, 0xBF];
+    for &cont in lone_continuations {
+        let input = [b'"', cont, b'"'];
+        assert_invalid_utf8_rejected(&input);
+
+        let input_mid = [b'"', b'h', b'e', b'l', b'l', b'o', cont, b'w', b'o', b'r', b'l', b'd', b'"'];
+        assert_invalid_utf8_rejected(&input_mid);
+    }
+
+    // 11.3 Overlong encodings (security vulnerability vector rejected by RFC 3629)
+    let overlong_cases: &[&[u8]] = &[
+        // Overlong 2-byte sequences
+        &[b'"', 0xC0, 0xAF, b'"'], // Overlong '/' (0x2F)
+        &[b'"', 0xC1, 0xBF, b'"'], // Overlong 0x7F
+        // Overlong 3-byte sequences
+        &[b'"', 0xE0, 0x80, 0xAF, b'"'],
+        &[b'"', 0xE0, 0x9F, 0xBF, b'"'],
+        // Overlong 4-byte sequences
+        &[b'"', 0xF0, 0x80, 0x80, 0xAF, b'"'],
+        &[b'"', 0xF0, 0x8F, 0xBF, 0xBF, b'"'],
+    ];
+    for &case in overlong_cases {
+        assert_invalid_utf8_rejected(case);
+    }
+
+    // 11.4 Incomplete / truncated sequences cut off by closing quote
+    let incomplete_cases: &[&[u8]] = &[
+        // Incomplete 2-byte sequence (lead only)
+        &[b'"', 0xD0, b'"'],
+        // Incomplete 3-byte sequence (lead only)
+        &[b'"', 0xE4, b'"'],
+        // Incomplete 3-byte sequence (lead + 1 continuation byte)
+        &[b'"', 0xE4, 0xBD, b'"'],
+        // Incomplete 4-byte sequence (lead only)
+        &[b'"', 0xF0, b'"'],
+        // Incomplete 4-byte sequence (lead + 1 continuation byte)
+        &[b'"', 0xF0, 0x9F, b'"'],
+        // Incomplete 4-byte sequence (lead + 2 continuation bytes)
+        &[b'"', 0xF0, 0x9F, 0xA6, b'"'],
+    ];
+    for &case in incomplete_cases {
+        assert_invalid_utf8_rejected(case);
+    }
+
+    // 11.5 Invalid continuation bytes (expected continuation byte 0x80..0xBF, got something else)
+    let bad_continuation_cases: &[&[u8]] = &[
+        // 2-byte lead followed by ASCII letter
+        &[b'"', 0xD0, b'a', b'"'],
+        // 2-byte lead followed by another lead byte
+        &[b'"', 0xD0, 0xD0, b'"'],
+        // 3-byte lead followed by ASCII space and continuation
+        &[b'"', 0xE4, 0x20, 0xA0, b'"'],
+        // 3-byte lead + valid continuation followed by ASCII letter
+        &[b'"', 0xE4, 0xBD, b'z', b'"'],
+        // 4-byte lead followed by ASCII char
+        &[b'"', 0xF0, b'x', 0x9F, 0xA6, b'"'],
+        // 4-byte lead + valid 2 bytes followed by ASCII char
+        &[b'"', 0xF0, 0x9F, 0xA6, b'!', b'"'],
+    ];
+    for &case in bad_continuation_cases {
+        assert_invalid_utf8_rejected(case);
+    }
+
+    // 11.6 UTF-16 surrogate halves in UTF-8 (U+D800..=U+DFFF strictly forbidden by Unicode standard)
+    let surrogate_cases: &[&[u8]] = &[
+        // U+D800
+        &[b'"', 0xED, 0xA0, 0x80, b'"'],
+        // U+DBFF
+        &[b'"', 0xED, 0xAF, 0xBF, b'"'],
+        // U+DC00
+        &[b'"', 0xED, 0xB0, 0x80, b'"'],
+        // U+DFFF
+        &[b'"', 0xED, 0xBF, 0xBF, b'"'],
+    ];
+    for &case in surrogate_cases {
+        assert_invalid_utf8_rejected(case);
+    }
+
+    // 11.7 Out-of-range codepoints (> U+10FFFF)
+    let out_of_range_cases: &[&[u8]] = &[
+        // U+110000
+        &[b'"', 0xF4, 0x90, 0x80, 0x80, b'"'],
+        // 0xF5.. starts codepoint >= U+140000
+        &[b'"', 0xF5, 0x80, 0x80, 0x80, b'"'],
+    ];
+    for &case in out_of_range_cases {
+        assert_invalid_utf8_rejected(case);
+    }
+
+    // 11.8 Invalid UTF-8 positioned at and crossing vector chunk boundaries (8, 16, 32 bytes)
+    for &boundary in &[8usize, 16, 32] {
+        // 0xFF placed right at chunk boundary
+        let mut buf_at_boundary = vec![b'"'];
+        buf_at_boundary.extend(vec![b'a'; boundary - 1]);
+        buf_at_boundary.push(0xFF);
+        buf_at_boundary.push(b'"');
+        assert_invalid_utf8_rejected(&buf_at_boundary);
+
+        // Incomplete 2-byte sequence straddling chunk boundary
+        if boundary >= 2 {
+            let mut buf_straddle_2 = vec![b'"'];
+            buf_straddle_2.extend(vec![b'a'; boundary - 2]);
+            buf_straddle_2.push(0xD0); // lead byte at end of chunk 0
+            buf_straddle_2.push(b'"'); // closing quote at start of chunk 1
+            assert_invalid_utf8_rejected(&buf_straddle_2);
+
+            // Lead byte at end of chunk 0, invalid continuation byte at start of chunk 1
+            let mut buf_straddle_bad = vec![b'"'];
+            buf_straddle_bad.extend(vec![b'a'; boundary - 2]);
+            buf_straddle_bad.push(0xD0);
+            buf_straddle_bad.push(b'X');
+            buf_straddle_bad.push(b'"');
+            assert_invalid_utf8_rejected(&buf_straddle_bad);
+        }
+
+        // Incomplete 3-byte sequence straddling chunk boundary
+        if boundary >= 3 {
+            let mut buf_straddle_3 = vec![b'"'];
+            buf_straddle_3.extend(vec![b'a'; boundary - 3]);
+            buf_straddle_3.push(0xE4); // byte boundary - 2
+            buf_straddle_3.push(0xBD); // byte boundary - 1
+            buf_straddle_3.push(b'"'); // closing quote at boundary
+            assert_invalid_utf8_rejected(&buf_straddle_3);
+        }
+
+        // Incomplete 4-byte sequence straddling chunk boundary
+        if boundary >= 4 {
+            let mut buf_straddle_4 = vec![b'"'];
+            buf_straddle_4.extend(vec![b'a'; boundary - 4]);
+            buf_straddle_4.push(0xF0); // byte boundary - 3
+            buf_straddle_4.push(0x9F); // byte boundary - 2
+            buf_straddle_4.push(0xA6); // byte boundary - 1
+            buf_straddle_4.push(b'"'); // closing quote at boundary
+            assert_invalid_utf8_rejected(&buf_straddle_4);
+        }
+    }
+}
+

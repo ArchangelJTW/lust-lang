@@ -864,6 +864,17 @@ impl VM {
         self.call_function_index(func_idx, args)
     }
 
+    pub fn call_slice(&mut self, function_name: &str, args: &[Value]) -> Result<Value> {
+        let func_idx = self
+            .functions
+            .iter()
+            .position(|f| f.name == function_name)
+            .ok_or_else(|| LustError::RuntimeError {
+                message: format!("Function not found: {}", function_name),
+            })?;
+        self.call_function_index_slice(func_idx, args)
+    }
+
     pub(crate) fn functions(&self) -> &[Function] {
         &self.functions
     }
@@ -880,7 +891,7 @@ impl VM {
         })
     }
 
-    pub(crate) fn call_function_index_slice(
+    pub fn call_function_index_slice(
         &mut self,
         func_idx: usize,
         args: &[Value],

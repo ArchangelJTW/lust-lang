@@ -346,20 +346,49 @@ pub fn validate_ir(
                 let mut validated_doc = Document::new();
                 let mut valid = true;
 
+                // Check for duplicate keys in input document
+                let mut seen_keys = std::collections::HashSet::new();
+                for (k, _) in doc.iter() {
+                    if !seen_keys.insert(k) {
+                        path.push(k.clone());
+                        errors.push(ValidationError::new(
+                            path.clone(),
+                            format!("Duplicate key '{}' in document", k),
+                            "duplicate_key",
+                        ));
+                        path.pop();
+                        valid = false;
+                    }
+                }
+
                 // Validate defined fields
                 for field in fields {
                     path.push(field.name.clone());
                     match doc.get(&field.name) {
                         Some(val) => {
                             if let Some(v) = validate_ir(&field.schema, val, path, errors) {
-                                let _ = validated_doc.try_insert(field.name.clone(), v);
+                                if validated_doc.try_insert(field.name.clone(), v).is_err() {
+                                    errors.push(ValidationError::new(
+                                        path.clone(),
+                                        format!("Duplicate field '{}' in validated object", field.name),
+                                        "duplicate_key",
+                                    ));
+                                    valid = false;
+                                }
                             } else {
                                 valid = false;
                             }
                         }
                         None => {
                             if let Some(default_val) = &field.default {
-                                let _ = validated_doc.try_insert(field.name.clone(), default_val.clone());
+                                if validated_doc.try_insert(field.name.clone(), default_val.clone()).is_err() {
+                                    errors.push(ValidationError::new(
+                                        path.clone(),
+                                        format!("Duplicate default field '{}' in validated object", field.name),
+                                        "duplicate_key",
+                                    ));
+                                    valid = false;
+                                }
                             } else if field.optional {
                                 // Field is optional and omitted
                             } else {
@@ -393,7 +422,16 @@ pub fn validate_ir(
                     // Copy other fields through
                     for (k, v) in doc.iter() {
                         if !fields.iter().any(|f| &f.name == k) {
-                            let _ = validated_doc.try_insert(k.clone(), v.clone());
+                            if validated_doc.try_insert(k.clone(), v.clone()).is_err() {
+                                path.push(k.clone());
+                                errors.push(ValidationError::new(
+                                    path.clone(),
+                                    format!("Duplicate key '{}' when copying extra fields", k),
+                                    "duplicate_key",
+                                ));
+                                path.pop();
+                                valid = false;
+                            }
                         }
                     }
                 }
@@ -418,6 +456,21 @@ pub fn validate_ir(
                 let mut validated_doc = Document::new();
                 let mut valid = true;
 
+                // Check for duplicate keys in input document
+                let mut seen_keys = std::collections::HashSet::new();
+                for (k, _) in doc.iter() {
+                    if !seen_keys.insert(k) {
+                        path.push(k.clone());
+                        errors.push(ValidationError::new(
+                            path.clone(),
+                            format!("Duplicate key '{}' in document", k),
+                            "duplicate_key",
+                        ));
+                        path.pop();
+                        valid = false;
+                    }
+                }
+
                 for (k, v) in doc.iter() {
                     path.push(k.clone());
                     let key_as_val = DataValue::String(k.clone());
@@ -427,7 +480,14 @@ pub fn validate_ir(
                         valid = false;
                     }
                     if let Some(val) = validate_ir(val_schema, v, path, errors) {
-                        let _ = validated_doc.try_insert(k.clone(), val);
+                        if validated_doc.try_insert(k.clone(), val).is_err() {
+                            errors.push(ValidationError::new(
+                                path.clone(),
+                                format!("Duplicate key '{}' in record", k),
+                                "duplicate_key",
+                            ));
+                            valid = false;
+                        }
                     } else {
                         valid = false;
                     }
@@ -499,7 +559,7 @@ pub fn validate_ir(
                     path.clone(),
                     "Expected object document for discriminated union",
                     "invalid_type",
-                ));
+                ).with_expected("object").with_received(value_type_name(value)));
                 None
             }
         }
@@ -572,5 +632,71 @@ fn value_type_name(value: &DataValue) -> String {
         DataValue::Binary(_) => "binary".to_string(),
         DataValue::ObjectId(_) => "object_id".to_string(),
         DataValue::DateTimeUtc(_) => "datetime_utc".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::{DateTimeUtc, Decimal128, ObjectId};
+    use crate::schema::ir::ObjectFieldIR;
+
+    #[test]
+    fn test_internal_document_duplicate_key_rejection() {
+        let dup_doc = Document {
+            entries: vec![
+                ("key".to_string(), DataValue::Number(ExactNumber::Int(1))),
+                ("key".to_string(), DataValue::Number(ExactNumber::Int(2))),
+            ],
+        };
+        let schema = SchemaIR::Object {
+            fields: vec![ObjectFieldIR {
+                name: "key".to_string(),
+                schema: SchemaIR::Int { min: None, max: None },
+                optional: false,
+                default: None,
+            }],
+            strict: false,
+        };
+        let mut path = Vec::new();
+        let mut errors = Vec::new();
+        let res = validate_ir(&schema, &DataValue::Document(dup_doc), &mut path, &mut errors);
+        assert!(res.is_none());
+        assert!(errors.iter().any(|e| e.code == "duplicate_key" && e.path_string() == "key"));
+    }
+
+    #[test]
+    fn test_internal_record_duplicate_key_rejection() {
+        let dup_doc = Document {
+            entries: vec![
+                ("k".to_string(), DataValue::String("v1".to_string())),
+                ("k".to_string(), DataValue::String("v2".to_string())),
+            ],
+        };
+        let schema = SchemaIR::Record {
+            key: Box::new(SchemaIR::String { min_len: None, max_len: None, regex: None }),
+            value: Box::new(SchemaIR::String { min_len: None, max_len: None, regex: None }),
+        };
+        let mut path = Vec::new();
+        let mut errors = Vec::new();
+        let res = validate_ir(&schema, &DataValue::Document(dup_doc), &mut path, &mut errors);
+        assert!(res.is_none());
+        assert!(errors.iter().any(|e| e.code == "duplicate_key" && e.path_string() == "k"));
+    }
+
+    #[test]
+    fn test_value_type_name_all_variants() {
+        assert_eq!(value_type_name(&DataValue::Null), "null");
+        assert_eq!(value_type_name(&DataValue::Bool(true)), "boolean");
+        assert_eq!(value_type_name(&DataValue::Number(ExactNumber::Int(1))), "integer");
+        assert_eq!(value_type_name(&DataValue::Number(ExactNumber::UInt(1))), "unsigned integer");
+        assert_eq!(value_type_name(&DataValue::Number(ExactNumber::Float(1.0))), "float");
+        assert_eq!(value_type_name(&DataValue::Number(ExactNumber::Decimal128(Decimal128::new([0; 16])))), "decimal128");
+        assert_eq!(value_type_name(&DataValue::String("s".to_string())), "string");
+        assert_eq!(value_type_name(&DataValue::Array(vec![])), "array");
+        assert_eq!(value_type_name(&DataValue::Document(Document::new())), "object");
+        assert_eq!(value_type_name(&DataValue::Binary(vec![])), "binary");
+        assert_eq!(value_type_name(&DataValue::ObjectId(ObjectId::new([0; 12]))), "object_id");
+        assert_eq!(value_type_name(&DataValue::DateTimeUtc(DateTimeUtc::from_millis(0))), "datetime_utc");
     }
 }

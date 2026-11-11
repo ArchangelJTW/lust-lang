@@ -10,11 +10,175 @@ use super::{
 use crate::config::{DependencyKind, LustConfig};
 use object::{File, Object, ObjectSymbol};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
 };
 use thiserror::Error;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Semver {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+}
+
+impl Semver {
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim().trim_start_matches('v');
+        let clean = s.split(['-', '+']).next().unwrap_or(s);
+        let parts: Vec<&str> = clean.split('.').collect();
+        if parts.is_empty() || parts.len() > 3 {
+            return None;
+        }
+        let major = parts[0].parse::<u64>().ok()?;
+        let minor = if parts.len() > 1 {
+            parts[1].parse::<u64>().ok()?
+        } else {
+            0
+        };
+        let patch = if parts.len() > 2 {
+            parts[2].parse::<u64>().ok()?
+        } else {
+            0
+        };
+        Some(Self {
+            major,
+            minor,
+            patch,
+        })
+    }
+
+    pub fn matches_constraint(&self, constraint: &str) -> bool {
+        let constraint = constraint.trim();
+        if constraint == "*" || constraint.is_empty() {
+            return true;
+        }
+        if constraint.contains(',') {
+            return constraint
+                .split(',')
+                .all(|c| self.matches_single_constraint(c.trim()));
+        }
+        self.matches_single_constraint(constraint)
+    }
+
+    fn matches_single_constraint(&self, c: &str) -> bool {
+        let c = c.trim();
+        if c == "*" || c.is_empty() {
+            return true;
+        }
+        if let Some(rest) = c.strip_prefix('^') {
+            let Some(req) = Semver::parse(rest) else {
+                return false;
+            };
+            if *self < req {
+                return false;
+            }
+            if req.major > 0 {
+                self.major == req.major
+            } else if req.minor > 0 {
+                self.major == 0 && self.minor == req.minor
+            } else {
+                self.major == 0 && self.minor == 0 && self.patch == req.patch
+            }
+        } else if let Some(rest) = c.strip_prefix('~') {
+            let Some(req) = Semver::parse(rest) else {
+                return false;
+            };
+            if *self < req {
+                return false;
+            }
+            self.major == req.major && self.minor == req.minor
+        } else if let Some(rest) = c.strip_prefix(">=") {
+            let Some(req) = Semver::parse(rest) else {
+                return false;
+            };
+            *self >= req
+        } else if let Some(rest) = c.strip_prefix("<=") {
+            let Some(req) = Semver::parse(rest) else {
+                return false;
+            };
+            *self <= req
+        } else if let Some(rest) = c.strip_prefix('>') {
+            let Some(req) = Semver::parse(rest) else {
+                return false;
+            };
+            *self > req
+        } else if let Some(rest) = c.strip_prefix('<') {
+            let Some(req) = Semver::parse(rest) else {
+                return false;
+            };
+            *self < req
+        } else if let Some(rest) = c.strip_prefix('=') {
+            let Some(req) = Semver::parse(rest) else {
+                return false;
+            };
+            *self == req
+        } else if let Some(req) = Semver::parse(c) {
+            *self == req
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum DependencyResolutionError {
+    #[error("failed to prepare package cache: {source}")]
+    PackageCache {
+        #[source]
+        source: io::Error,
+    },
+    #[error("dependency '{name}' expected directory at {path}")]
+    MissingPath { name: String, path: PathBuf },
+    #[error("dependency '{name}' package version '{version}' not installed (expected at {path})")]
+    MissingPackage {
+        name: String,
+        version: String,
+        path: PathBuf,
+    },
+    #[error("dependency '{name}' manifest error: {source}")]
+    Manifest {
+        name: String,
+        #[source]
+        source: ManifestError,
+    },
+    #[error("failed to read library '{path}': {source}")]
+    LibraryIo {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to inspect library '{path}': {source}")]
+    LibraryInspect {
+        path: PathBuf,
+        #[source]
+        source: object::read::Error,
+    },
+    #[error("dependency '{name}' at {path} is a shared library but its kind could not be detected")]
+    UnknownLibraryKind { name: String, path: PathBuf },
+    #[error("cyclic dependency detected: {path}")]
+    CyclicDependency { package: String, path: String },
+    #[error("dependency '{name}' version '{found}' does not satisfy constraint '{required}'")]
+    UnmetVersionConstraint {
+        name: String,
+        required: String,
+        found: String,
+    },
+    #[error("version conflict for package '{package}': direct requirement '{direct_requirement}' conflicts with transitive requirement '{transitive_requirement}' requested by '{required_by}'")]
+    VersionConflict {
+        package: String,
+        direct_requirement: String,
+        transitive_requirement: String,
+        required_by: String,
+    },
+    #[error("failed to read dependency directory '{path}': {source}")]
+    DirectoryRead {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct DependencyResolution {
@@ -81,69 +245,177 @@ struct LibrarySignature {
     has_lust_extension: bool,
 }
 
-#[derive(Debug, Error)]
-pub enum DependencyResolutionError {
-    #[error("failed to prepare package cache: {source}")]
-    PackageCache {
-        #[source]
-        source: io::Error,
-    },
-    #[error("dependency '{name}' expected directory at {path}")]
-    MissingPath { name: String, path: PathBuf },
-    #[error("dependency '{name}' package version '{version}' not installed (expected at {path})")]
-    MissingPackage {
-        name: String,
-        version: String,
-        path: PathBuf,
-    },
-    #[error("dependency '{name}' manifest error: {source}")]
-    Manifest {
-        name: String,
-        #[source]
-        source: ManifestError,
-    },
-    #[error("failed to read library '{path}': {source}")]
-    LibraryIo {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to inspect library '{path}': {source}")]
-    LibraryInspect {
-        path: PathBuf,
-        #[source]
-        source: object::read::Error,
-    },
-    #[error("dependency '{name}' at {path} is a shared library but its kind could not be detected")]
-    UnknownLibraryKind { name: String, path: PathBuf },
-}
+
 
 pub fn resolve_dependencies(
     config: &LustConfig,
     project_dir: &Path,
 ) -> Result<DependencyResolution, DependencyResolutionError> {
-    let mut resolution = DependencyResolution::default();
+    resolve_transitive_dependencies(config, project_dir)
+}
+
+pub fn resolve_transitive_dependencies(
+    config: &LustConfig,
+    project_dir: &Path,
+) -> Result<DependencyResolution, DependencyResolutionError> {
     let manager = PackageManager::new(PackageManager::default_root());
+    resolve_dependencies_with_manager(config, project_dir, &manager)
+}
+
+pub fn resolve_dependencies_with_manager(
+    config: &LustConfig,
+    project_dir: &Path,
+    manager: &PackageManager,
+) -> Result<DependencyResolution, DependencyResolutionError> {
+    let mut resolution = DependencyResolution::default();
     manager
         .ensure_layout()
         .map_err(|source| DependencyResolutionError::PackageCache { source })?;
 
+    let mut direct_reqs: HashMap<String, String> = HashMap::new();
+    let mut resolved_versions: HashMap<String, (String, String)> = HashMap::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    for spec in config.dependencies() {
+        if let Some(v) = spec.version() {
+            direct_reqs.insert(spec.name().to_string(), v.to_string());
+        }
+    }
+
+    resolve_transitive_recursive(
+        config,
+        project_dir,
+        manager,
+        &direct_reqs,
+        &mut resolved_versions,
+        &mut stack,
+        &mut visited,
+        &mut resolution,
+        true,
+    )?;
+
+    Ok(resolution)
+}
+
+
+fn resolve_transitive_recursive(
+    config: &LustConfig,
+    project_dir: &Path,
+    manager: &PackageManager,
+    direct_reqs: &HashMap<String, String>,
+    resolved_versions: &mut HashMap<String, (String, String)>,
+    stack: &mut Vec<String>,
+    visited: &mut HashSet<String>,
+    resolution: &mut DependencyResolution,
+    is_direct: bool,
+) -> Result<(), DependencyResolutionError> {
     for spec in config.dependencies() {
         let name = spec.name().to_string();
+
+        if stack.contains(&name) {
+            let cycle_path = format!("{} -> {}", stack.join(" -> "), name);
+            return Err(DependencyResolutionError::CyclicDependency {
+                package: name,
+                path: cycle_path,
+            });
+        }
+
         let (root_dir, version) = if let Some(path) = spec.path() {
             (resolve_dependency_path(project_dir, path), None)
-        } else if let Some(version) = spec.version() {
-            let dir = manager.root().join(spec.name()).join(version);
-            if !dir.exists() {
+        } else if let Some(version_req) = spec.version() {
+            let pkg_dir = manager.root().join(spec.name());
+            if !pkg_dir.exists() {
                 return Err(DependencyResolutionError::MissingPackage {
                     name: spec.name().to_string(),
-                    version: version.to_string(),
-                    path: dir,
+                    version: version_req.to_string(),
+                    path: pkg_dir.join(version_req),
                 });
             }
-            (dir, Some(version.to_string()))
+
+            let mut matched_dir = None;
+            let mut found_ver_str = None;
+            let exact_dir = pkg_dir.join(version_req);
+            if exact_dir.exists() {
+                matched_dir = Some(exact_dir);
+                found_ver_str = Some(version_req.to_string());
+            } else if let Ok(entries) = fs::read_dir(&pkg_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let name_opt = path.file_name().and_then(|n| n.to_str()).map(String::from);
+                        if let Some(ver_str) = name_opt {
+                            if let Some(parsed) = Semver::parse(&ver_str) {
+                                if parsed.matches_constraint(version_req) {
+                                    matched_dir = Some(path);
+                                    found_ver_str = Some(ver_str);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let (dir, found_ver) = match (matched_dir, found_ver_str) {
+                (Some(d), Some(v)) => (d, v),
+                _ => {
+                    if let Ok(mut entries) = fs::read_dir(&pkg_dir) {
+                        if let Some(Ok(first)) = entries.next() {
+                            let found = first.file_name().to_string_lossy().to_string();
+                            return Err(DependencyResolutionError::UnmetVersionConstraint {
+                                name: spec.name().to_string(),
+                                required: version_req.to_string(),
+                                found,
+                            });
+                        }
+                    }
+                    return Err(DependencyResolutionError::MissingPackage {
+                        name: spec.name().to_string(),
+                        version: version_req.to_string(),
+                        path: pkg_dir.join(version_req),
+                    });
+                }
+            };
+
+            if !is_direct {
+                if let Some(direct_req) = direct_reqs.get(&name) {
+                    let direct_conflicts = if let (Some(d_sem), Some(t_sem)) = (Semver::parse(direct_req), Semver::parse(version_req)) {
+                        d_sem.major != t_sem.major
+                    } else if let Some(found_parsed) = Semver::parse(&found_ver) {
+                        !found_parsed.matches_constraint(direct_req)
+                    } else {
+                        false
+                    };
+
+                    if direct_conflicts {
+                        let parent = stack.last().cloned().unwrap_or_else(|| "root".to_string());
+                        return Err(DependencyResolutionError::VersionConflict {
+                            package: name.clone(),
+                            direct_requirement: direct_req.clone(),
+                            transitive_requirement: version_req.to_string(),
+                            required_by: parent,
+                        });
+                    }
+                }
+            }
+
+            if let Some((prev_ver, prev_by)) = resolved_versions.get(&name) {
+                if prev_ver != &found_ver {
+                    return Err(DependencyResolutionError::VersionConflict {
+                        package: name.clone(),
+                        direct_requirement: prev_ver.clone(),
+                        transitive_requirement: found_ver.clone(),
+                        required_by: prev_by.clone(),
+                    });
+                }
+            } else {
+                let required_by = stack.last().cloned().unwrap_or_else(|| "direct".to_string());
+                resolved_versions.insert(name.clone(), (found_ver.clone(), required_by));
+            }
+
+            (dir, Some(found_ver))
         } else {
-            // Parser guarantees either path or version exists.
             unreachable!("dependency spec missing path and version");
         };
 
@@ -152,6 +424,19 @@ pub fn resolve_dependencies(
                 name: spec.name().to_string(),
                 path: root_dir,
             });
+        }
+
+        if root_dir.is_dir() {
+            if let Err(source) = fs::read_dir(&root_dir) {
+                return Err(DependencyResolutionError::DirectoryRead {
+                    path: root_dir.clone(),
+                    source,
+                });
+            }
+        }
+
+        if !visited.insert(name.clone()) {
+            continue;
         }
 
         let detected = match spec.kind() {
@@ -164,7 +449,7 @@ pub fn resolve_dependencies(
             None => detect_kind(spec.name(), &root_dir)?,
         };
 
-        match detected {
+        match &detected {
             DetectedKind::Lust => {
                 let module_root = resolve_module_root(&root_dir);
                 let root_module = detect_root_module(&module_root, spec.name());
@@ -175,7 +460,7 @@ pub fn resolve_dependencies(
                     None
                 };
                 resolution.lust.push(ResolvedLustDependency {
-                    name,
+                    name: name.clone(),
                     sanitized_name,
                     module_root,
                     root_module,
@@ -191,13 +476,13 @@ pub fn resolve_dependencies(
                     Some(root_dir.join("externs"))
                 };
                 resolution.rust.push(ResolvedRustDependency {
-                    name,
-                    crate_dir: root_dir,
+                    name: name.clone(),
+                    crate_dir: root_dir.clone(),
                     features: spec.features().to_vec(),
                     default_features: spec.default_features().unwrap_or(true),
                     externs_override,
                     cache_stub_dir,
-                    version,
+                    version: version.clone(),
                 });
             }
             DetectedKind::Lua {
@@ -205,17 +490,38 @@ pub fn resolve_dependencies(
                 lua_files,
             } => {
                 resolution.lua.push(ResolvedLuaDependency {
-                    name,
-                    library_path: root_dir,
-                    luaopen_symbols,
-                    version,
-                    lua_files,
+                    name: name.clone(),
+                    library_path: root_dir.clone(),
+                    luaopen_symbols: luaopen_symbols.clone(),
+                    version: version.clone(),
+                    lua_files: lua_files.clone(),
                 });
+            }
+        }
+
+        if root_dir.is_dir() {
+            let child_manifest = root_dir.join("lust-config.toml");
+            if child_manifest.exists() {
+                if let Ok(child_cfg) = LustConfig::load_from_path(&child_manifest) {
+                    stack.push(name.clone());
+                    resolve_transitive_recursive(
+                        &child_cfg,
+                        &root_dir,
+                        manager,
+                        direct_reqs,
+                        resolved_versions,
+                        stack,
+                        visited,
+                        resolution,
+                        false,
+                    )?;
+                    stack.pop();
+                }
             }
         }
     }
 
-    Ok(resolution)
+    Ok(())
 }
 
 fn detect_kind(name: &str, root: &Path) -> Result<DetectedKind, DependencyResolutionError> {

@@ -10,8 +10,8 @@ use crate::utils::{
 };
 use hashbrown::HashSet;
 use lust::ast::{
-    ExternItem, FunctionParam, Item, ItemKind, Stmt, StmtKind, TraitBound, Type, TypeKind,
-    Visibility,
+    ExternItem, FunctionParam, Item, ItemKind, Stmt, StmtKind, SuiteDecl, TraitBound, Type,
+    TypeKind, Visibility,
 };
 use lust::builtins::{self, BuiltinFunction, BuiltinMethod, TypeExpr};
 use lust::Span;
@@ -434,7 +434,12 @@ pub(crate) fn identifier_completions(
                 }
             }
 
-            ItemKind::Script(_) | ItemKind::Impl(_) | ItemKind::Use { .. } | ItemKind::Service(_) => {}
+            ItemKind::Script(_)
+            | ItemKind::Impl(_)
+            | ItemKind::Use { .. }
+            | ItemKind::Service(_)
+            | ItemKind::Test(_)
+            | ItemKind::Suite(_) => {}
         }
     }
 
@@ -1513,7 +1518,60 @@ fn find_scope_strict<'a>(items: &'a [Item], position: &Position) -> Option<Scope
                 return Some(ScopeContext::Script { stmts });
             }
 
+            ItemKind::Test(test_decl) => {
+                return Some(ScopeContext::Script {
+                    stmts: &test_decl.body,
+                });
+            }
+
+            ItemKind::Suite(suite_decl) => {
+                if let Some(scope) = find_suite_scope(suite_decl, position) {
+                    return Some(scope);
+                }
+            }
+
             _ => {}
+        }
+    }
+
+    None
+}
+
+fn find_suite_scope<'a>(suite: &'a SuiteDecl, position: &Position) -> Option<ScopeContext<'a>> {
+    for test in &suite.tests {
+        if span_contains_position(test.span, position) || stmts_contain_position(&test.body, position) {
+            return Some(ScopeContext::Script {
+                stmts: &test.body,
+            });
+        }
+    }
+
+    for nested in &suite.nested_suites {
+        if nested.span.start_line == 0 || span_contains_position(nested.span, position) {
+            if let Some(scope) = find_suite_scope(nested, position) {
+                return Some(scope);
+            }
+        }
+    }
+
+    if let Some(ref stmts) = suite.hooks.before_each {
+        if stmts_contain_position(stmts, position) {
+            return Some(ScopeContext::Script { stmts });
+        }
+    }
+    if let Some(ref stmts) = suite.hooks.after_each {
+        if stmts_contain_position(stmts, position) {
+            return Some(ScopeContext::Script { stmts });
+        }
+    }
+    if let Some(ref stmts) = suite.hooks.before_all {
+        if stmts_contain_position(stmts, position) {
+            return Some(ScopeContext::Script { stmts });
+        }
+    }
+    if let Some(ref stmts) = suite.hooks.after_all {
+        if stmts_contain_position(stmts, position) {
+            return Some(ScopeContext::Script { stmts });
         }
     }
 
@@ -2054,3 +2112,259 @@ pub(crate) fn resolve_base_type_name_for_context(
 
     base_name
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hashbrown::HashMap;
+    use lust::intern::Interner;
+    use lust::modules::{LoadedModule, ModuleExports, ModuleImports, Program};
+    use lust::{Lexer, Parser, TypeCollection};
+    use std::path::PathBuf;
+
+    fn parse_items(source: &str) -> Vec<Item> {
+        let mut interner = Interner::new();
+        let mut lexer = Lexer::new(source, &mut interner);
+        let tokens = lexer
+            .tokenize()
+            .expect("lexer should succeed for valid lust source");
+        let mut parser = Parser::new(tokens);
+        parser
+            .parse()
+            .expect("parser should succeed for valid lust source")
+    }
+
+    fn make_test_module_and_snapshot(
+        source: &str,
+        path_str: &str,
+    ) -> (AnalysisSnapshot, ModuleSnapshot, PathBuf) {
+        let items = parse_items(source);
+        let path = PathBuf::from(path_str);
+        let loaded = LoadedModule {
+            path: "test_pkg".to_string(),
+            items,
+            imports: ModuleImports::default(),
+            exports: ModuleExports::default(),
+            init_function: None,
+            source_path: path.clone(),
+        };
+        let program = Program {
+            modules: vec![loaded],
+            entry_module: "test_pkg".to_string(),
+        };
+        let type_info = TypeCollection {
+            expr_types: HashMap::new(),
+            variable_types: HashMap::new(),
+        };
+        let mut source_overrides = HashMap::new();
+        source_overrides.insert(path.clone(), source.to_string());
+        let snapshot = AnalysisSnapshot::new(
+            &program,
+            type_info,
+            &source_overrides,
+            HashMap::new(),
+            HashMap::new(),
+            HashSet::new(),
+        );
+        let module_snapshot = snapshot
+            .module_for_file(&path)
+            .expect("module snapshot for test file must exist")
+            .clone();
+        (snapshot, module_snapshot, path)
+    }
+
+    #[test]
+    fn test_find_scope_strict_test_decl() {
+        let source = "test \"basic_addition\" do\n    local a = 10\n    local b = 20\n    local sum = a + b\nend\n";
+        let items = parse_items(source);
+        assert_eq!(items.len(), 1, "Expected exactly 1 test item parsed from input: {source}");
+
+        // Position inside test body: line 2 (0-indexed: line 1 = '    local a = 10', line 2 = '    local b = 20')
+        let inside_pos = Position::new(2, 8);
+        let scope = find_scope_strict(&items, &inside_pos);
+        assert!(
+            scope.is_some(),
+            "find_scope_strict must return Some for position inside test body in input: {source}"
+        );
+        if let Some(ScopeContext::Script { stmts }) = scope {
+            assert_eq!(
+                stmts.len(),
+                3,
+                "Expected 3 statements in test body for input: {source}"
+            );
+        } else {
+            panic!("Expected ScopeContext::Script for test decl body");
+        }
+
+        // Position strictly after the entire test item:
+        let after_pos = Position::new(10, 0);
+        let outside_scope = find_scope_strict(&items, &after_pos);
+        assert!(
+            outside_scope.is_none(),
+            "find_scope_strict must return None for position outside test body: {after_pos:?}"
+        );
+    }
+
+    #[test]
+    fn test_find_scope_strict_suite_decl() {
+        let source = "suite \"math_tests\" do\n    test \"nested_multiply\" do\n        local factor = 5\n        local result = factor * 2\n    end\nend\n";
+        let items = parse_items(source);
+        assert_eq!(items.len(), 1, "Expected 1 suite item parsed from input: {source}");
+
+        // Inside test "nested_multiply": line 2 (0-indexed: '        local factor = 5')
+        let inside_test_pos = Position::new(2, 12);
+        let scope = find_scope_strict(&items, &inside_test_pos);
+        assert!(
+            scope.is_some(),
+            "find_scope_strict must find test body inside suite for input: {source}"
+        );
+        if let Some(ScopeContext::Script { stmts }) = scope {
+            assert_eq!(
+                stmts.len(),
+                2,
+                "Expected 2 statements in nested test body for input: {source}"
+            );
+        } else {
+            panic!("Expected ScopeContext::Script for nested test body inside suite");
+        }
+
+        // Position outside the entire suite
+        let outside_pos = Position::new(20, 0);
+        assert!(
+            find_scope_strict(&items, &outside_pos).is_none(),
+            "find_scope_strict must return None outside suite"
+        );
+    }
+
+    #[test]
+    fn test_find_scope_strict_nested_suite_deep() {
+        let source = "suite \"l1\" do\n    suite \"l2\" do\n        suite \"l3\" do\n            test \"deep_inner\" do\n                local deep_var = 42\n            end\n        end\n    end\nend\n";
+        let items = parse_items(source);
+        assert_eq!(items.len(), 1, "Expected 1 root suite item from input: {source}");
+
+        // Position inside deep_inner: line 4 (0-indexed: '                local deep_var = 42')
+        let deep_pos = Position::new(4, 20);
+        let scope = find_scope_strict(&items, &deep_pos);
+        assert!(
+            scope.is_some(),
+            "find_scope_strict must resolve recursively through nested suites for input: {source}"
+        );
+        if let Some(ScopeContext::Script { stmts }) = scope {
+            assert_eq!(
+                stmts.len(),
+                1,
+                "Expected 1 statement in deep test body for input: {source}"
+            );
+        } else {
+            panic!("Expected ScopeContext::Script for deep test body");
+        }
+    }
+
+    #[test]
+    fn test_find_scope_strict_suite_hooks() {
+        let source = "suite \"lifecycle\" do\n    before_each do\n        local hook_setup = 99\n    end\n    test \"test_with_hook\" do\n        local test_val = 1\n    end\nend\n";
+        let items = parse_items(source);
+        assert_eq!(items.len(), 1, "Expected 1 suite item from input: {source}");
+
+        // Position inside before_each hook: line 2 (0-indexed: '        local hook_setup = 99')
+        let hook_pos = Position::new(2, 14);
+        let hook_scope = find_scope_strict(&items, &hook_pos);
+        assert!(
+            hook_scope.is_some(),
+            "find_scope_strict must resolve hook body inside suite for input: {source}"
+        );
+        if let Some(ScopeContext::Script { stmts }) = hook_scope {
+            assert_eq!(
+                stmts.len(),
+                1,
+                "Expected 1 statement in before_each hook for input: {source}"
+            );
+        } else {
+            panic!("Expected ScopeContext::Script for before_each hook");
+        }
+
+        // Position inside test "test_with_hook": line 5 (0-indexed: '        local test_val = 1')
+        let test_pos = Position::new(5, 14);
+        let test_scope = find_scope_strict(&items, &test_pos);
+        assert!(
+            test_scope.is_some(),
+            "find_scope_strict must resolve test body inside suite with hooks for input: {source}"
+        );
+        if let Some(ScopeContext::Script { stmts }) = test_scope {
+            assert_eq!(
+                stmts.len(),
+                1,
+                "Expected 1 statement in test_with_hook body for input: {source}"
+            );
+        } else {
+            panic!("Expected ScopeContext::Script for test_with_hook");
+        }
+    }
+
+    #[test]
+    fn test_identifier_completions_ignores_test_and_suite() {
+        let source = "function helper_func(): int\n    return 42\nend\n\ntest \"standalone_test\" do\n    local x = 1\nend\n\nsuite \"suite_group\" do\n    test \"suite_test\" do\n        local y = 2\n    end\nend\n";
+        let (snapshot, module, path) =
+            make_test_module_and_snapshot(source, "/mock/test_ignores.lust");
+
+        let completions = identifier_completions(&module, &snapshot, &path, Position::new(0, 0), "");
+        let labels: Vec<&str> = completions.iter().map(|item| item.label.as_str()).collect();
+
+        // Independent oracle:
+        // regular function defined in the module must be suggested
+        assert!(
+            labels.contains(&"helper_func"),
+            "helper_func must be present in completions, got labels: {labels:?}"
+        );
+        // test and suite names must NOT be suggested as value identifiers
+        assert!(
+            !labels.contains(&"standalone_test"),
+            "standalone_test must NOT be suggested as an identifier completion"
+        );
+        assert!(
+            !labels.contains(&"suite_group"),
+            "suite_group must NOT be suggested as an identifier completion"
+        );
+        assert!(
+            !labels.contains(&"suite_test"),
+            "suite_test must NOT be suggested as an identifier completion"
+        );
+    }
+
+    #[test]
+    fn test_identifier_completions_offers_locals_inside_test_body() {
+        let source = "test \"test_with_locals\" do\n    local my_test_var = 42\n    my_test_var\nend\n";
+        let (snapshot, module, path) =
+            make_test_module_and_snapshot(source, "/mock/test_locals.lust");
+
+        // Cursor at line 2 col 15 (0-indexed: '    my_test_var')
+        let pos = Position::new(2, 15);
+        let completions = identifier_completions(&module, &snapshot, &path, pos, "my_");
+        let found = completions.iter().any(|item| {
+            item.label == "my_test_var" && item.kind == Some(CompletionItemKind::VARIABLE)
+        });
+        assert!(
+            found,
+            "Expected 'my_test_var' with CompletionItemKind::VARIABLE in completions for input: {source}, got: {completions:?}"
+        );
+    }
+
+    #[test]
+    fn test_identifier_completions_offers_locals_inside_suite_test_body() {
+        let source = "suite \"suite_locals\" do\n    test \"inner\" do\n        local suite_test_var = 100\n        suite_test_var\n    end\nend\n";
+        let (snapshot, module, path) =
+            make_test_module_and_snapshot(source, "/mock/suite_locals.lust");
+
+        // Cursor at line 3 col 22 (0-indexed: '        suite_test_var')
+        let pos = Position::new(3, 22);
+        let completions = identifier_completions(&module, &snapshot, &path, pos, "suite_");
+        let found = completions.iter().any(|item| {
+            item.label == "suite_test_var" && item.kind == Some(CompletionItemKind::VARIABLE)
+        });
+        assert!(
+            found,
+            "Expected 'suite_test_var' with CompletionItemKind::VARIABLE in completions for input: {source}, got: {completions:?}"
+        );
+    }
+}
+

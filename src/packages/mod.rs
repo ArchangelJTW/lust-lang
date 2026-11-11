@@ -27,13 +27,43 @@ pub use credentials::{
 };
 pub use dependencies::{
     DependencyResolution, DependencyResolutionError, ResolvedLuaDependency, ResolvedLustDependency,
-    ResolvedRustDependency, resolve_dependencies,
+    ResolvedRustDependency, Semver, resolve_dependencies, resolve_dependencies_with_manager,
+    resolve_transitive_dependencies,
 };
 pub use manifest::{ManifestError, ManifestKind, PackageManifest, PackageSection};
 pub use registry::{
     DEFAULT_BASE_URL, DownloadedArchive, PackageDetails, PackageSearchResponse, PackageSummary,
     PackageVersionInfo, PublishResponse, RegistryClient, RegistryError, SearchParameters,
+    compute_sha256, verify_sha256,
 };
+
+#[derive(Debug, Error)]
+pub enum ArchiveVerificationError {
+    #[error("failed to read archive '{path}': {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("digest mismatch for package '{package}': expected '{expected}', found '{actual}'")]
+    DigestMismatch {
+        package: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("corrupted archive for package '{package}' at '{path}': {message}")]
+    CorruptedArchive {
+        package: String,
+        path: PathBuf,
+        message: String,
+    },
+    #[error("failed to extract package '{package}' to '{destination}': {message}")]
+    ExtractFailed {
+        package: String,
+        destination: PathBuf,
+        message: String,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageKind {
@@ -73,6 +103,9 @@ impl PackageManager {
     }
 
     pub fn default_root() -> PathBuf {
+        if let Ok(dir) = env::var("LUST_PACKAGES_DIR") {
+            return PathBuf::from(dir);
+        }
         let mut base = home_dir().unwrap_or_else(|| PathBuf::from("."));
         base.push(".lust");
         base.push("packages");
@@ -85,6 +118,67 @@ impl PackageManager {
 
     pub fn ensure_layout(&self) -> io::Result<()> {
         fs::create_dir_all(&self.root)
+    }
+
+    pub fn verify_archive_digest(
+        archive_path: &Path,
+        expected_sha256: &str,
+    ) -> Result<bool, ArchiveVerificationError> {
+        let bytes = fs::read(archive_path).map_err(|source| ArchiveVerificationError::Io {
+            path: archive_path.to_path_buf(),
+            source,
+        })?;
+        Ok(registry::verify_sha256(&bytes, expected_sha256))
+    }
+
+    pub fn install_package_archive(
+        &self,
+        package_name: &str,
+        version: &str,
+        archive_path: &Path,
+        expected_sha256: Option<&str>,
+    ) -> Result<PathBuf, ArchiveVerificationError> {
+        let bytes = fs::read(archive_path).map_err(|source| ArchiveVerificationError::Io {
+            path: archive_path.to_path_buf(),
+            source,
+        })?;
+        if let Some(expected) = expected_sha256 {
+            let actual = registry::compute_sha256(&bytes);
+            if !actual.eq_ignore_ascii_case(expected.trim()) {
+                return Err(ArchiveVerificationError::DigestMismatch {
+                    package: package_name.to_string(),
+                    expected: expected.to_string(),
+                    actual,
+                });
+            }
+        }
+        if bytes.len() < 10 || bytes[0] != 0x1f || bytes[1] != 0x8b {
+            return Err(ArchiveVerificationError::CorruptedArchive {
+                package: package_name.to_string(),
+                path: archive_path.to_path_buf(),
+                message: "invalid gzip magic header".to_string(),
+            });
+        }
+        let target_dir = self.root.join(package_name).join(version);
+        fs::create_dir_all(&target_dir).map_err(|source| ArchiveVerificationError::Io {
+            path: target_dir.clone(),
+            source,
+        })?;
+        let mut command = Command::new("tar");
+        command.arg("-xzf").arg(archive_path).arg("-C").arg(&target_dir);
+        let output = command.output().map_err(|source| ArchiveVerificationError::Io {
+            path: archive_path.to_path_buf(),
+            source,
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(ArchiveVerificationError::ExtractFailed {
+                package: package_name.to_string(),
+                destination: target_dir,
+                message: stderr,
+            });
+        }
+        Ok(target_dir)
     }
 }
 
@@ -421,7 +515,7 @@ fn extension_profile() -> String {
     env::var("LUST_EXTENSION_PROFILE").unwrap_or_else(|_| "release".to_string())
 }
 
-fn library_file_name(crate_name: &str) -> String {
+pub fn library_file_name(crate_name: &str) -> String {
     let sanitized = sanitized_crate_name(crate_name);
     #[cfg(target_os = "windows")]
     {
@@ -437,7 +531,7 @@ fn library_file_name(crate_name: &str) -> String {
     }
 }
 
-fn sanitized_crate_name(name: &str) -> String {
+pub fn sanitized_crate_name(name: &str) -> String {
     name.replace('-', "_")
 }
 
@@ -642,7 +736,7 @@ fn format_params(export: &NativeExport) -> String {
         .join(", ")
 }
 
-fn relative_stub_path(module: &str) -> PathBuf {
+pub fn relative_stub_path(module: &str) -> PathBuf {
     let mut segments: Vec<String> = module.split('.').map(|seg| seg.replace('-', "_")).collect();
     if let Some(first) = segments.first()
         && first == "externs"
@@ -659,7 +753,7 @@ fn relative_stub_path(module: &str) -> PathBuf {
     path
 }
 
-fn read_crate_name(module_dir: &Path) -> Result<String, LocalModuleError> {
+pub fn read_crate_name(module_dir: &Path) -> Result<String, LocalModuleError> {
     let manifest_path = module_dir.join("Cargo.toml");
     let manifest_str = fs::read_to_string(&manifest_path)?;
     #[derive(Deserialize)]

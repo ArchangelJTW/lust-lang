@@ -551,6 +551,30 @@ fn finalize_module(
         .remove(module_name)
         .ok_or_else(|| LustError::Unknown(format!("Unknown module '{}'", module_name)))?;
 
+    for item in &module.items {
+        match &item.kind {
+            ItemKind::Function(func) => {
+                if func.visibility == crate::ast::Visibility::Public {
+                    let fq = format!("{}.{}", module_name, func.name);
+                    module.exports.functions.insert(func.name.clone(), fq);
+                }
+            }
+            ItemKind::Struct(s) => {
+                if s.visibility == crate::ast::Visibility::Public {
+                    let fq = format!("{}.{}", module_name, s.name);
+                    module.exports.types.insert(s.name.clone(), fq);
+                }
+            }
+            ItemKind::Enum(e) => {
+                if e.visibility == crate::ast::Visibility::Public {
+                    let fq = format!("{}.{}", module_name, e.name);
+                    module.exports.types.insert(e.name.clone(), fq);
+                }
+            }
+            _ => {}
+        }
+    }
+
     let registry_ref = ModuleRegistryView { modules: registry };
     for item in &module.items {
         if let ItemKind::Use { tree, .. } = &item.kind {

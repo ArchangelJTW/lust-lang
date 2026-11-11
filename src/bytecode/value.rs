@@ -72,7 +72,7 @@ impl ValueKey {
         self.original.clone()
     }
 
-    pub(crate) fn owned_values(&self) -> (&Value, &Value) {
+    pub fn owned_values(&self) -> (&Value, &Value) {
         (&self.original, &self.hashed)
     }
 }
@@ -255,7 +255,8 @@ fn hash_value_for_key<H: Hasher>(value: &Value, state: &mut H) {
             if float_is_nan(*f) {
                 u64::MAX.hash(state);
             } else {
-                float_to_hash_bits(*f).hash(state);
+                let norm = if *f == 0.0 { 0.0 } else { *f };
+                float_to_hash_bits(norm).hash(state);
             }
         }
         String(s) => {
@@ -1370,6 +1371,55 @@ impl Value {
     }
 }
 
+#[cfg(feature = "std")]
+thread_local! {
+    static VISITED_DEBUG: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    static VISITED_DISPLAY: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    static VISITED_EQ_PAIRS: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(feature = "std")]
+struct DebugCycleGuard(usize);
+#[cfg(feature = "std")]
+impl Drop for DebugCycleGuard {
+    fn drop(&mut self) {
+        VISITED_DEBUG.with(|cell| {
+            let mut v = cell.borrow_mut();
+            if let Some(pos) = v.iter().rposition(|p| *p == self.0) {
+                v.remove(pos);
+            }
+        });
+    }
+}
+
+#[cfg(feature = "std")]
+struct DisplayCycleGuard(usize);
+#[cfg(feature = "std")]
+impl Drop for DisplayCycleGuard {
+    fn drop(&mut self) {
+        VISITED_DISPLAY.with(|cell| {
+            let mut v = cell.borrow_mut();
+            if let Some(pos) = v.iter().rposition(|p| *p == self.0) {
+                v.remove(pos);
+            }
+        });
+    }
+}
+
+#[cfg(feature = "std")]
+struct EqCycleGuard((usize, usize));
+#[cfg(feature = "std")]
+impl Drop for EqCycleGuard {
+    fn drop(&mut self) {
+        VISITED_EQ_PAIRS.with(|cell| {
+            let mut v = cell.borrow_mut();
+            if let Some(pos) = v.iter().rposition(|p| *p == self.0) {
+                v.remove(pos);
+            }
+        });
+    }
+}
+
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1381,11 +1431,82 @@ impl fmt::Debug for Value {
             Value::Array(arr) => {
                 #[cfg(feature = "std")]
                 sync_specialized_array(arr);
-                write!(f, "Array({:?})", arr.borrow())
+                let ptr = Rc::as_ptr(arr) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DEBUG.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(f, "Array([...])");
+                }
+                #[cfg(feature = "std")]
+                VISITED_DEBUG.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = DebugCycleGuard(ptr);
+
+                write!(f, "Array([")?;
+                let borrowed = arr.borrow();
+                for (i, val) in borrowed.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}", val)?;
+                }
+                write!(f, "])")
             }
-            Value::Tuple(values) => write!(f, "Tuple({:?})", values),
-            Value::Map(map) => write!(f, "Map({:?})", map.borrow()),
+            Value::Tuple(values) => {
+                let ptr = Rc::as_ptr(values) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DEBUG.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(f, "Tuple([...])");
+                }
+                #[cfg(feature = "std")]
+                VISITED_DEBUG.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = DebugCycleGuard(ptr);
+
+                write!(f, "Tuple([")?;
+                for (i, val) in values.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}", val)?;
+                }
+                write!(f, "])")
+            }
+            Value::Map(map) => {
+                let ptr = Rc::as_ptr(map) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DEBUG.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(f, "Map({{...}})");
+                }
+                #[cfg(feature = "std")]
+                VISITED_DEBUG.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = DebugCycleGuard(ptr);
+
+                write!(f, "Map({{")?;
+                let borrowed = map.borrow();
+                for (i, (k, v)) in borrowed.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}: {:?}", k, v)?;
+                }
+                write!(f, "}})")
+            }
             Value::Struct(object) => {
+                let ptr = Rc::as_ptr(object) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DEBUG.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(
+                        f,
+                        "Struct {{ name: {:?}, fields: [...] }}",
+                        object.name.as_str()
+                    );
+                }
+                #[cfg(feature = "std")]
+                VISITED_DEBUG.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = DebugCycleGuard(ptr);
+
                 let StructObject {
                     name,
                     layout,
@@ -1457,6 +1578,16 @@ impl fmt::Display for Value {
             Value::Array(arr) => {
                 #[cfg(feature = "std")]
                 sync_specialized_array(arr);
+                let ptr = Rc::as_ptr(arr) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DISPLAY.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(f, "[...]");
+                }
+                #[cfg(feature = "std")]
+                VISITED_DISPLAY.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = DisplayCycleGuard(ptr);
+
                 write!(f, "[")?;
                 let borrowed = arr.borrow();
                 for (i, val) in borrowed.iter().enumerate() {
@@ -1471,6 +1602,16 @@ impl fmt::Display for Value {
             }
 
             Value::Tuple(values) => {
+                let ptr = Rc::as_ptr(values) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DISPLAY.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(f, "(...)");
+                }
+                #[cfg(feature = "std")]
+                VISITED_DISPLAY.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = DisplayCycleGuard(ptr);
+
                 write!(f, "(")?;
                 for (i, val) in values.iter().enumerate() {
                     if i > 0 {
@@ -1484,6 +1625,16 @@ impl fmt::Display for Value {
             }
 
             Value::Map(map) => {
+                let ptr = Rc::as_ptr(map) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DISPLAY.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(f, "{{...}}");
+                }
+                #[cfg(feature = "std")]
+                VISITED_DISPLAY.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = DisplayCycleGuard(ptr);
+
                 write!(f, "{{")?;
                 let borrowed = map.borrow();
                 for (i, (k, v)) in borrowed.iter().enumerate() {
@@ -1498,6 +1649,16 @@ impl fmt::Display for Value {
             }
 
             Value::Struct(object) => {
+                let ptr = Rc::as_ptr(object) as usize;
+                #[cfg(feature = "std")]
+                if VISITED_DISPLAY.with(|c| c.borrow().contains(&ptr)) {
+                    return write!(f, "{} {{ ... }}", object.name);
+                }
+                #[cfg(feature = "std")]
+                VISITED_DISPLAY.with(|c| c.borrow_mut().push(ptr));
+                #[cfg(feature = "std")]
+                let _guard = DisplayCycleGuard(ptr);
+
                 let StructObject {
                     name,
                     layout,
@@ -1565,10 +1726,87 @@ impl PartialEq for Value {
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
-            (Value::Array(a), Value::Array(b)) => *a.borrow() == *b.borrow(),
-            (Value::Tuple(a), Value::Tuple(b)) => *a == *b,
-            (Value::Map(a), Value::Map(b)) => *a.borrow() == *b.borrow(),
+            (Value::Array(a), Value::Array(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
+                let pair = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+                #[cfg(feature = "std")]
+                {
+                    if VISITED_EQ_PAIRS.with(|c| c.borrow().contains(&pair)) {
+                        return true;
+                    }
+                    VISITED_EQ_PAIRS.with(|c| c.borrow_mut().push(pair));
+                }
+                #[cfg(feature = "std")]
+                let _guard = EqCycleGuard(pair);
+                let b_a = a.borrow();
+                let b_b = b.borrow();
+                if b_a.len() != b_b.len() {
+                    return false;
+                }
+                b_a.iter().zip(b_b.iter()).all(|(x, y)| x == y)
+            }
+            (Value::Tuple(a), Value::Tuple(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
+                let pair = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+                #[cfg(feature = "std")]
+                {
+                    if VISITED_EQ_PAIRS.with(|c| c.borrow().contains(&pair)) {
+                        return true;
+                    }
+                    VISITED_EQ_PAIRS.with(|c| c.borrow_mut().push(pair));
+                }
+                #[cfg(feature = "std")]
+                let _guard = EqCycleGuard(pair);
+                if a.len() != b.len() {
+                    return false;
+                }
+                a.iter().zip(b.iter()).all(|(x, y)| x == y)
+            }
+            (Value::Map(a), Value::Map(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
+                let pair = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+                #[cfg(feature = "std")]
+                {
+                    if VISITED_EQ_PAIRS.with(|c| c.borrow().contains(&pair)) {
+                        return true;
+                    }
+                    VISITED_EQ_PAIRS.with(|c| c.borrow_mut().push(pair));
+                }
+                #[cfg(feature = "std")]
+                let _guard = EqCycleGuard(pair);
+                let b_a = a.borrow();
+                let b_b = b.borrow();
+                if b_a.len() != b_b.len() {
+                    return false;
+                }
+                for (k, v1) in b_a.iter() {
+                    match b_b.get(k) {
+                        Some(v2) if v1 == v2 => {}
+                        _ => return false,
+                    }
+                }
+                true
+            }
             (Value::Struct(a), Value::Struct(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
+                let pair = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+                #[cfg(feature = "std")]
+                {
+                    if VISITED_EQ_PAIRS.with(|c| c.borrow().contains(&pair)) {
+                        return true;
+                    }
+                    VISITED_EQ_PAIRS.with(|c| c.borrow_mut().push(pair));
+                }
+                #[cfg(feature = "std")]
+                let _guard = EqCycleGuard(pair);
                 let (n1, l1, f1) = (&a.name, &a.layout, &a.fields);
                 let (n2, l2, f2) = (&b.name, &b.layout, &b.fields);
                 if n1 != n2 {
@@ -1628,6 +1866,63 @@ impl PartialEq for Value {
         }
     }
 }
+
+impl From<bool> for Value {
+    #[inline]
+    fn from(b: bool) -> Self {
+        Value::Bool(b)
+    }
+}
+
+impl From<LustInt> for Value {
+    #[inline]
+    fn from(i: LustInt) -> Self {
+        Value::Int(i)
+    }
+}
+
+impl From<LustFloat> for Value {
+    #[inline]
+    fn from(f: LustFloat) -> Self {
+        Value::Float(f)
+    }
+}
+
+impl From<String> for Value {
+    #[inline]
+    fn from(s: String) -> Self {
+        Value::String(Rc::new(s))
+    }
+}
+
+impl From<&str> for Value {
+    #[inline]
+    fn from(s: &str) -> Self {
+        Value::String(Rc::new(s.to_owned()))
+    }
+}
+
+impl From<Rc<String>> for Value {
+    #[inline]
+    fn from(s: Rc<String>) -> Self {
+        Value::String(s)
+    }
+}
+
+impl From<Vec<Value>> for Value {
+    #[inline]
+    fn from(v: Vec<Value>) -> Self {
+        Value::Array(Rc::new(RefCell::new(v)))
+    }
+}
+
+impl From<LustMap> for Value {
+    #[inline]
+    fn from(m: LustMap) -> Self {
+        Value::Map(Rc::new(RefCell::new(m)))
+    }
+}
+
 
 #[inline]
 unsafe fn replace_value(dest: *mut Value, value: Value) {

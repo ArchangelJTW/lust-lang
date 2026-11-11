@@ -173,9 +173,10 @@ impl Compiler {
                 )));
             }
             if let Ok(src_reg) = self.resolve_local(&var_name) {
-                let loc_ty = self.functions[self.current_function]
-                    .register_types
-                    .get(&src_reg);
+                let loc_ty = self
+                    .functions
+                    .get(self.current_function)
+                    .and_then(|f| f.register_types.get(&src_reg));
                 let is_int = match loc_ty {
                     Some(TypeKind::Int) => true,
                     Some(TypeKind::Named(s)) if s == "int" || s == "i64" => true,

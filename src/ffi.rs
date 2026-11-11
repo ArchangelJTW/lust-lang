@@ -289,8 +289,9 @@ pub extern "C" fn lust_builder_set_base_dir(
             return false;
         }
     };
-    let builder_ref = unsafe { &mut *builder };
-    builder_ref.set_entry_module(base_dir_str);
+    let old = unsafe { ptr::read(builder) };
+    let updated = old.set_base_dir(base_dir_str);
+    unsafe { ptr::write(builder, updated) };
     true
 }
 
@@ -384,7 +385,14 @@ pub extern "C" fn lust_program_call(
     }
 
     let program_ref = unsafe { &mut *program };
-    let result = match program_ref.call_raw(&func_name, converted_args) {
+    let mut call_res = program_ref.call_raw(&func_name, converted_args.clone());
+    if call_res.is_err() && !func_name.contains('.') {
+        let qualified = format!("main.{}", func_name);
+        if let Ok(value) = program_ref.call_raw(&qualified, converted_args) {
+            call_res = Ok(value);
+        }
+    }
+    let result = match call_res {
         Ok(value) => value,
         Err(err) => {
             handle_error(err);
@@ -508,6 +516,70 @@ pub extern "C" fn lust_program_set_global(
 
     let program_ref = unsafe { &mut *program };
     program_ref.set_global_value(name_str, converted);
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_last_error() -> *const c_char {
+    lust_last_error_message()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_value_free(value: *mut LustFfiValue) {
+    lust_value_dispose(value);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_program_new(source: *const c_char) -> *mut EmbeddedProgram {
+    clear_last_error();
+    if source.is_null() {
+        set_last_error("Source pointer was null");
+        return ptr::null_mut();
+    }
+
+    let source_cstr = unsafe { CStr::from_ptr(source) };
+    let source_str = match source_cstr.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_last_error("Source code was not valid UTF-8");
+            return ptr::null_mut();
+        }
+    };
+
+    let mut builder = EmbeddedBuilder::new();
+    builder.add_module("main", source_str);
+    builder.set_entry_module("main");
+    match builder.compile() {
+        Ok(prog) => Box::into_raw(Box::new(prog)),
+        Err(err) => {
+            handle_error(err);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_program_eval(
+    program: *mut EmbeddedProgram,
+    out_value: *mut LustFfiValue,
+) -> bool {
+    clear_last_error();
+    if program.is_null() {
+        set_last_error("Program pointer was null");
+        return false;
+    }
+
+    let program_ref = unsafe { &mut *program };
+    if let Err(err) = program_ref.run_entry_script() {
+        handle_error(err);
+        return false;
+    }
+
+    if !out_value.is_null() {
+        unsafe {
+            *out_value = LustFfiValue::default();
+        }
+    }
     true
 }
 // #![cfg(feature = "std")]

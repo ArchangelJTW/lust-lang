@@ -32,6 +32,8 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
         ("map", create_map_module(vm)),
         ("math", create_math_module(vm)),
         ("effect", create_effect_module(vm)),
+        ("bit", create_bit_module(vm)),
+        ("bitwise", create_bit_module(vm)),
 
         // Direct qualified entries for imported symbols
         ("effect.succeed", create_effect_succeed_fn()),
@@ -65,6 +67,21 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
         ("math.mod", create_math_mod_fn()),
         ("math.random", create_math_random_fn()),
         ("math.randomseed", create_math_randomseed_fn()),
+        ("math.pow", create_math_pow_fn()),
+        ("bit.band", create_bit_band_fn()),
+        ("bit.bor", create_bit_bor_fn()),
+        ("bit.bxor", create_bit_bxor_fn()),
+        ("bit.bnot", create_bit_bnot_fn()),
+        ("bit.lshift", create_bit_lshift_fn()),
+        ("bit.rshift", create_bit_rshift_fn()),
+        ("bit.arshift", create_bit_arshift_fn()),
+        ("bitwise.band", create_bit_band_fn()),
+        ("bitwise.bor", create_bit_bor_fn()),
+        ("bitwise.bxor", create_bit_bxor_fn()),
+        ("bitwise.bnot", create_bit_bnot_fn()),
+        ("bitwise.lshift", create_bit_lshift_fn()),
+        ("bitwise.rshift", create_bit_rshift_fn()),
+        ("bitwise.arshift", create_bit_arshift_fn()),
 
         ("table.len", create_array_len_fn()),
         ("table.is_empty", create_array_is_empty_fn()),
@@ -123,6 +140,15 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
         ("string.ends_with", create_string_ends_with_fn()),
         ("string.contains", create_string_contains_fn()),
         ("string.replace", create_string_replace_fn()),
+        ("string.match", create_string_match_fn()),
+        ("string.gsub", create_string_gsub_fn()),
+        ("string.trim_start", create_string_trim_start_fn()),
+        ("string.trim_end", create_string_trim_end_fn()),
+        ("string.is_empty", create_string_is_empty_fn()),
+        ("string.chars", create_string_chars_fn()),
+        ("string.lines", create_string_lines_fn()),
+        ("string.slice", create_string_slice_fn()),
+        ("string.index_of", create_string_index_of_fn()),
 
         ("map.len", create_map_len_fn()),
         ("map.is_empty", create_map_is_empty_fn()),
@@ -2451,6 +2477,7 @@ fn create_math_module(vm: &VM) -> Value {
         (string_key("tointeger"), create_math_tointeger_fn()),
         (string_key("tofloat"), create_math_tofloat_fn()),
         (string_key("mod"), create_math_mod_fn()),
+        (string_key("pow"), create_math_pow_fn()),
     ];
     vm.map_with_entries(entries)
 }
@@ -2762,6 +2789,141 @@ fn create_math_log_fn() -> Value {
         };
         Ok(NativeCallResult::Return(Value::Float(result)))
     }))
+}
+
+fn create_math_pow_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 2 {
+            return Err("math.pow requires base and exponent arguments".to_string());
+        }
+        let base_val = unwrap_lua_value(args[0].clone());
+        let exp_val = unwrap_lua_value(args[1].clone());
+        let base = base_val
+            .as_float()
+            .or_else(|| base_val.as_int().map(|i| i as f64))
+            .ok_or_else(|| "math.pow expects number arguments".to_string())?;
+        let exp = exp_val
+            .as_float()
+            .or_else(|| exp_val.as_int().map(|i| i as f64))
+            .ok_or_else(|| "math.pow expects number arguments".to_string())?;
+        Ok(NativeCallResult::Return(Value::Float(base.powf(exp))))
+    }))
+}
+
+fn create_bit_band_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.is_empty() {
+            return Err("bit.band requires at least one argument".to_string());
+        }
+        let mut acc: LustInt = -1;
+        for (idx, arg) in args.iter().enumerate() {
+            let val = unwrap_lua_value(arg.clone());
+            let n = coerce_int(&val).ok_or_else(|| {
+                format!("bit.band expects integer arguments, got arg {}", idx + 1)
+            })?;
+            acc &= n;
+        }
+        Ok(NativeCallResult::Return(Value::Int(acc)))
+    }))
+}
+
+fn create_bit_bor_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.is_empty() {
+            return Err("bit.bor requires at least one argument".to_string());
+        }
+        let mut acc: LustInt = 0;
+        for (idx, arg) in args.iter().enumerate() {
+            let val = unwrap_lua_value(arg.clone());
+            let n = coerce_int(&val).ok_or_else(|| {
+                format!("bit.bor expects integer arguments, got arg {}", idx + 1)
+            })?;
+            acc |= n;
+        }
+        Ok(NativeCallResult::Return(Value::Int(acc)))
+    }))
+}
+
+fn create_bit_bxor_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.is_empty() {
+            return Err("bit.bxor requires at least one argument".to_string());
+        }
+        let mut acc: LustInt = 0;
+        for (idx, arg) in args.iter().enumerate() {
+            let val = unwrap_lua_value(arg.clone());
+            let n = coerce_int(&val).ok_or_else(|| {
+                format!("bit.bxor expects integer arguments, got arg {}", idx + 1)
+            })?;
+            acc ^= n;
+        }
+        Ok(NativeCallResult::Return(Value::Int(acc)))
+    }))
+}
+
+fn create_bit_bnot_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
+        let n = coerce_int(&val)
+            .ok_or_else(|| "bit.bnot expects an integer argument".to_string())?;
+        Ok(NativeCallResult::Return(Value::Int(!n)))
+    }))
+}
+
+fn create_bit_lshift_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 2 {
+            return Err("bit.lshift requires value and shift count".to_string());
+        }
+        let a = coerce_int(&unwrap_lua_value(args[0].clone()))
+            .ok_or_else(|| "bit.lshift expects integer value".to_string())?;
+        let n = coerce_int(&unwrap_lua_value(args[1].clone()))
+            .ok_or_else(|| "bit.lshift expects integer shift count".to_string())?;
+        let shift = (n & 63) as u32;
+        Ok(NativeCallResult::Return(Value::Int(a.wrapping_shl(shift))))
+    }))
+}
+
+fn create_bit_rshift_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 2 {
+            return Err("bit.rshift requires value and shift count".to_string());
+        }
+        let a = coerce_int(&unwrap_lua_value(args[0].clone()))
+            .ok_or_else(|| "bit.rshift expects integer value".to_string())?;
+        let n = coerce_int(&unwrap_lua_value(args[1].clone()))
+            .ok_or_else(|| "bit.rshift expects integer shift count".to_string())?;
+        let shift = (n & 63) as u32;
+        let unsigned = a as u64;
+        Ok(NativeCallResult::Return(Value::Int((unsigned.wrapping_shr(shift)) as LustInt)))
+    }))
+}
+
+fn create_bit_arshift_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 2 {
+            return Err("bit.arshift requires value and shift count".to_string());
+        }
+        let a = coerce_int(&unwrap_lua_value(args[0].clone()))
+            .ok_or_else(|| "bit.arshift expects integer value".to_string())?;
+        let n = coerce_int(&unwrap_lua_value(args[1].clone()))
+            .ok_or_else(|| "bit.arshift expects integer shift count".to_string())?;
+        let shift = (n & 63) as u32;
+        Ok(NativeCallResult::Return(Value::Int(a.wrapping_shr(shift))))
+    }))
+}
+
+fn create_bit_module(vm: &VM) -> Value {
+    let entries = [
+        (string_key("band"), create_bit_band_fn()),
+        (string_key("bor"), create_bit_bor_fn()),
+        (string_key("bxor"), create_bit_bxor_fn()),
+        (string_key("bnot"), create_bit_bnot_fn()),
+        (string_key("lshift"), create_bit_lshift_fn()),
+        (string_key("rshift"), create_bit_rshift_fn()),
+        (string_key("arshift"), create_bit_arshift_fn()),
+    ];
+    vm.map_with_entries(entries)
 }
 
 fn create_math_tointeger_fn() -> Value {

@@ -1,6 +1,6 @@
 use super::*;
 impl Compiler {
-    pub(super) fn compile_stmt(&mut self, stmt: &Stmt) -> Result<()> {
+    pub fn compile_stmt(&mut self, stmt: &Stmt) -> Result<()> {
         self.current_line = stmt.span.start_line;
         match &stmt.kind {
             StmtKind::Local {
@@ -45,10 +45,10 @@ impl Compiler {
                                 }
                                 ExprKind::Identifier(src_name) => {
                                     if let Ok(src_reg) = self.resolve_local(src_name) {
-                                        if let Some(tk) = self.functions[self.current_function]
-                                            .register_types
-                                            .get(&src_reg)
-                                            .cloned()
+                                        if let Some(tk) = self
+                                            .functions
+                                            .get(self.current_function)
+                                            .and_then(|f| f.register_types.get(&src_reg).cloned())
                                         {
                                             self.register_type(reg, tk);
                                         }
@@ -301,6 +301,12 @@ impl Compiler {
             }
 
             StmtKind::Return(values) => {
+                if self.functions.is_empty() {
+                    return Err(LustError::CompileError(
+                        "'return' outside of function".to_string(),
+                    ));
+                }
+
                 if self.thunk_return_target.is_some() {
                     if values.len() != 1 {
                         return Err(LustError::CompileError(

@@ -1,4 +1,33 @@
 use super::*;
+
+#[cfg(feature = "std")]
+use std::cell::RefCell;
+
+#[cfg(feature = "std")]
+pub struct TraceHooks {
+    pub instruction_hook: Option<Box<dyn FnMut(&str, usize, usize) + 'static>>,
+    pub call_hook: Option<Box<dyn FnMut(&str, usize, usize) + 'static>>,
+    pub return_hook: Option<Box<dyn FnMut(&str, usize, usize) + 'static>>,
+    pub error_hook: Option<Box<dyn FnMut(&str, usize, &str) + 'static>>,
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+    static ACTIVE_TRACE_HOOKS: RefCell<Option<TraceHooks>> = const { RefCell::new(None) };
+}
+
+#[inline]
+pub(crate) fn has_trace_hook() -> bool {
+    #[cfg(feature = "std")]
+    {
+        ACTIVE_TRACE_HOOKS.with(|cell| cell.borrow().is_some())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        false
+    }
+}
+
 impl VM {
     /// A unit enum value (`Option.None`): the one shared object for these
     /// names, so the value is a count bump and compares by pointer.
@@ -61,7 +90,159 @@ impl VM {
         frames
     }
 
+    #[cfg(feature = "std")]
+    pub fn set_instruction_hook(
+        &mut self,
+        hook: Option<Box<dyn FnMut(&str, usize, usize) + 'static>>,
+    ) {
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            if let Some(hooks) = opt.as_mut() {
+                hooks.instruction_hook = hook;
+            } else if hook.is_some() {
+                *opt = Some(TraceHooks {
+                    instruction_hook: hook,
+                    call_hook: None,
+                    return_hook: None,
+                    error_hook: None,
+                });
+            }
+        });
+    }
+
+    #[cfg(feature = "std")]
+    pub fn set_call_hook(
+        &mut self,
+        hook: Option<Box<dyn FnMut(&str, usize, usize) + 'static>>,
+    ) {
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            if let Some(hooks) = opt.as_mut() {
+                hooks.call_hook = hook;
+            } else if hook.is_some() {
+                *opt = Some(TraceHooks {
+                    instruction_hook: None,
+                    call_hook: hook,
+                    return_hook: None,
+                    error_hook: None,
+                });
+            }
+        });
+    }
+
+    #[cfg(feature = "std")]
+    pub fn set_return_hook(
+        &mut self,
+        hook: Option<Box<dyn FnMut(&str, usize, usize) + 'static>>,
+    ) {
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            if let Some(hooks) = opt.as_mut() {
+                hooks.return_hook = hook;
+            } else if hook.is_some() {
+                *opt = Some(TraceHooks {
+                    instruction_hook: None,
+                    call_hook: None,
+                    return_hook: hook,
+                    error_hook: None,
+                });
+            }
+        });
+    }
+
+    #[cfg(feature = "std")]
+    pub fn set_error_hook(
+        &mut self,
+        hook: Option<Box<dyn FnMut(&str, usize, &str) + 'static>>,
+    ) {
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            if let Some(hooks) = opt.as_mut() {
+                hooks.error_hook = hook;
+            } else if hook.is_some() {
+                *opt = Some(TraceHooks {
+                    instruction_hook: None,
+                    call_hook: None,
+                    return_hook: None,
+                    error_hook: hook,
+                });
+            }
+        });
+    }
+
+    #[cfg(feature = "std")]
+    pub fn clear_trace_hooks(&mut self) {
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+
+    pub(crate) fn dispatch_instruction_hook(&self, function: &str, line: usize, ip: usize) {
+        #[cfg(feature = "std")]
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            if let Ok(mut opt) = cell.try_borrow_mut() {
+                if let Some(hooks) = opt.as_mut() {
+                    if let Some(hook) = hooks.instruction_hook.as_mut() {
+                        hook(function, line, ip);
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) fn dispatch_call_hook(&self, function: &str, line: usize, depth: usize) {
+        #[cfg(feature = "std")]
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            if let Ok(mut opt) = cell.try_borrow_mut() {
+                if let Some(hooks) = opt.as_mut() {
+                    if let Some(hook) = hooks.call_hook.as_mut() {
+                        hook(function, line, depth);
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) fn dispatch_return_hook(&self, function: &str, line: usize, depth: usize) {
+        #[cfg(feature = "std")]
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            if let Ok(mut opt) = cell.try_borrow_mut() {
+                if let Some(hooks) = opt.as_mut() {
+                    if let Some(hook) = hooks.return_hook.as_mut() {
+                        hook(function, line, depth);
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) fn dispatch_error_hook(&self, function: &str, line: usize, error: &str) {
+        #[cfg(feature = "std")]
+        ACTIVE_TRACE_HOOKS.with(|cell| {
+            if let Ok(mut opt) = cell.try_borrow_mut() {
+                if let Some(hooks) = opt.as_mut() {
+                    if let Some(hook) = hooks.error_hook.as_mut() {
+                        hook(function, line, error);
+                    }
+                }
+            }
+        });
+    }
+
     pub(super) fn annotate_runtime_error(&self, err: LustError) -> LustError {
+        #[cfg(feature = "std")]
+        if has_trace_hook() {
+            let (func_name, line) = if let Some(frame) = self.call_stack.last() {
+                let function = &self.functions[frame.function_idx];
+                let ip_index = frame.ip.saturating_sub(1);
+                let line = function.chunk.lines.get(ip_index).copied().unwrap_or(0);
+                (function.name.clone(), line)
+            } else {
+                ("<unknown>".to_string(), 0)
+            };
+            self.dispatch_error_hook(&func_name, line, &err.to_string());
+        }
+
         match err {
             LustError::RuntimeError { message } => {
                 if let Some(frame) = self.call_stack.last() {

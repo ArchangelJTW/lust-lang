@@ -643,23 +643,18 @@ fn format_params(export: &NativeExport) -> String {
 }
 
 fn relative_stub_path(module: &str) -> PathBuf {
-    let mut path = PathBuf::new();
     let mut segments: Vec<String> = module.split('.').map(|seg| seg.replace('-', "_")).collect();
     if let Some(first) = segments.first()
         && first == "externs"
     {
         segments.remove(0);
     }
-    if let Some(first) = segments.first() {
-        path.push(first);
+    if segments.len() == 1 {
+        return PathBuf::from(format!("{}.lust", segments[0]));
     }
-    if segments.len() > 1 {
-        for seg in &segments[1..segments.len() - 1] {
-            path.push(seg);
-        }
-        path.push(segments.last().unwrap());
-    } else if let Some(first) = segments.first() {
-        path.push(first);
+    let mut path = PathBuf::new();
+    for seg in &segments {
+        path.push(seg);
     }
     path
 }

@@ -165,6 +165,7 @@ impl VM {
             array_id_map: core::cell::RefCell::new(HashMap::new()),
             lua_context: Rc::new(crate::lua_compat::LuaCompatContext::new()),
             mir_context: alloc::sync::Arc::new(crate::mir::runtime_helpers::MirContext::new()),
+            clock: alloc::sync::Arc::new(crate::sim::clock::LustClock::system()),
         };
         vm.cycle_collector.set_enabled(config.gc_enabled());
         if config.use_mir() {
@@ -237,6 +238,19 @@ impl VM {
         let vm = Self::new();
         vm.set_seed(seed);
         vm
+    }
+
+    pub fn with_sim_clock(seed: u64, epoch_nanos: u64, monotonic_nanos: u64) -> Self {
+        let mut vm = Self::with_seed(seed);
+        vm.clock = alloc::sync::Arc::new(crate::sim::clock::LustClock::simulated(
+            epoch_nanos,
+            monotonic_nanos,
+        ));
+        vm
+    }
+
+    pub fn set_clock(&mut self, clock: alloc::sync::Arc<crate::sim::clock::LustClock>) {
+        self.clock = clock;
     }
 
     pub fn with_config_and_seed(config: &LustConfig, seed: u64) -> Self {

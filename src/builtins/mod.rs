@@ -1448,6 +1448,13 @@ fn build_os_functions() -> Vec<BuiltinFunction> {
             TypeExpr::Float,
         ),
         func(
+            "os.date",
+            "Format date and time or return date components table",
+            &["format", "time"],
+            vec![TypeExpr::Option(Box::new(TypeExpr::String)), TypeExpr::Option(Box::new(TypeExpr::Float))],
+            TypeExpr::Unknown,
+        ),
+        func(
             "os.sleep",
             "Sleep for the given number of seconds",
             &["seconds"],

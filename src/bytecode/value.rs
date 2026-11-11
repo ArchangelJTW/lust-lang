@@ -911,6 +911,7 @@ impl fmt::Debug for Upvalue {
 pub enum NativeCallResult {
     Return(Value),
     Yield(Value),
+    YieldTimer(core::time::Duration, Value),
     Stop(Value),
 }
 
@@ -3679,6 +3680,57 @@ pub unsafe extern "C" fn jit_call_native_safe(
                     value,
                 });
                 2
+            }
+
+            NativeCallResult::YieldTimer(duration, value) => {
+                let vm = &mut *vm_ptr;
+                if vm.clock.is_simulated() && vm.current_task.is_some() {
+                    let dest_reg = vm.call_stack.last().and_then(|frame| {
+                        let base = frame.registers.as_ptr() as usize;
+                        let out_ptr = out as usize;
+                        let value_size = core::mem::size_of::<Value>();
+                        let end = base + value_size * frame.registers.len();
+                        if out_ptr < base || out_ptr >= end {
+                            return None;
+                        }
+                        let offset = out_ptr - base;
+                        if !offset.is_multiple_of(value_size) {
+                            return None;
+                        }
+                        let reg = offset / value_size;
+                        if reg > u8::MAX as usize {
+                            return None;
+                        }
+                        Some(reg as u8)
+                    });
+                    let Some(dest_reg) = dest_reg else {
+                        jit::log(|| {
+                            "jit_call_native_safe: could not compute dest register for yield timer"
+                                .to_string()
+                        });
+                        return 0;
+                    };
+
+                    let duration_nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+                    let now = vm.clock.now_nanos();
+                    let deadline = now.saturating_add(duration_nanos);
+                    let timer_id = vm.clock.schedule_timer(deadline, 0, move || {});
+
+                    replace_value(out, Value::Nil);
+                    vm.observe_value_graph(&value);
+                    vm.pending_task_signal = Some(crate::vm::TaskSignal::YieldTimer {
+                        dest: dest_reg,
+                        value,
+                        timer_id,
+                    });
+                    2
+                } else {
+                    #[cfg(feature = "std")]
+                    std::thread::sleep(duration);
+                    vm.observe_value_graph(&value);
+                    replace_value(out, value);
+                    1
+                }
             }
 
             NativeCallResult::Stop(value) => {

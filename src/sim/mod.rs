@@ -1,18 +1,28 @@
 //! Deterministic Simulation Testing (DST) framework for Lust runtime.
 //! Phase 1: MinimalSimScheduler and state isolation micro-harness.
+//! Phase 2: Clock & Timers separation, deterministic virtual time, nonblocking sleep.
+
+pub mod clock;
+pub use clock::{
+    CivilDateTime, LustClock, MonotonicClock, SimClock, SystemMonotonicClock, SystemWallClock,
+    TimerControl, TimerId, TimerQueue, WallClock,
+};
 
 use crate::bytecode::{TaskHandle, Value};
 use crate::error::{LustError, Result};
 use crate::vm::TaskState;
 use crate::vm::VM;
 use alloc::string::ToString;
+use alloc::vec::Vec;
 use core::result::Result as CoreResult;
+use core::time::Duration;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepOutcome {
     Progress(TaskState),
     Completed(Option<Value>),
     Yielded(Option<Value>),
+    YieldedTimer(TimerId),
     Stopped,
     Failed,
 }
@@ -54,7 +64,7 @@ impl GasProgressOracle {
 }
 
 /// MinimalSimScheduler: minimal cooperative loop with support for TaskState::Yielded,
-/// single-fiber stepping, and micro-oracle integration.
+/// virtual time advancement, single-fiber stepping, and micro-oracle integration.
 pub struct MinimalSimScheduler {
     pub vm: VM,
     pub step_counter: u64,
@@ -74,7 +84,14 @@ impl MinimalSimScheduler {
     }
 
     pub fn with_seed(seed: u64) -> Self {
-        Self::new(VM::with_seed(seed))
+        let mut vm = VM::with_seed(seed);
+        // MinimalSimScheduler defaults to simulated clock for deterministic testing
+        vm.clock = alloc::sync::Arc::new(LustClock::simulated(0, 0));
+        Self::new(vm)
+    }
+
+    pub fn with_sim_clock(seed: u64, epoch_nanos: u64, monotonic_nanos: u64) -> Self {
+        Self::new(VM::with_sim_clock(seed, epoch_nanos, monotonic_nanos))
     }
 
     pub fn with_step_limit(mut self, limit: u64) -> Self {
@@ -105,14 +122,25 @@ impl MinimalSimScheduler {
 
         let res = self.vm.resume_task_handle(handle, resume_val);
 
-        let (state, last_yield, last_result) = {
+        let (state, last_yield, last_result, timer_id) = {
             let task = self.vm.get_task_instance(handle)?;
-            (task.state.clone(), task.last_yield.clone(), task.last_result.clone())
+            (
+                task.state.clone(),
+                task.last_yield.clone(),
+                task.last_result.clone(),
+                task.timer_id,
+            )
         };
 
         match res {
             Ok(()) => match state {
-                TaskState::Yielded => Ok(StepOutcome::Yielded(last_yield)),
+                TaskState::Yielded => {
+                    if let Some(tid) = timer_id {
+                        Ok(StepOutcome::YieldedTimer(tid))
+                    } else {
+                        Ok(StepOutcome::Yielded(last_yield))
+                    }
+                }
                 TaskState::Completed => Ok(StepOutcome::Completed(last_result)),
                 TaskState::Stopped => Ok(StepOutcome::Stopped),
                 TaskState::Failed => Ok(StepOutcome::Failed),
@@ -126,6 +154,74 @@ impl MinimalSimScheduler {
                 }
             }
         }
+    }
+
+    /// Advance simulated virtual time by duration, triggering any expired timers.
+    pub fn advance_time(&mut self, duration: Duration) {
+        self.vm.clock.advance(duration);
+        let now = self.vm.clock.now_nanos();
+        let actions = self.vm.clock.poll_expired_timers(now);
+        for action in actions {
+            action();
+        }
+    }
+
+    /// Return earliest pending timer deadline in nanoseconds.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.vm.clock.next_deadline()
+    }
+
+    /// Advance virtual time to the next pending timer deadline and fire expired timers.
+    pub fn advance_to_next_deadline(&mut self) -> bool {
+        if let Some(next) = self.next_deadline() {
+            let now = self.vm.clock.now_nanos();
+            if next > now {
+                self.advance_time(Duration::from_nanos(next - now));
+            } else {
+                let actions = self.vm.clock.poll_expired_timers(now);
+                for action in actions {
+                    action();
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Runs a fiber with virtual time advancement until it completes or reaches max_steps.
+    pub fn run_task_with_virtual_time(
+        &mut self,
+        handle: TaskHandle,
+        max_steps: u64,
+    ) -> Result<StepOutcome> {
+        let mut steps = 0;
+        while steps < max_steps {
+            if self.step_counter >= self.max_execution_steps {
+                return Err(LustError::RuntimeError {
+                    message: "EXHAUSTION_LIMIT_REACHED: Maximum simulation execution steps exceeded".to_string(),
+                });
+            }
+            let outcome = self.step_fiber(handle, None)?;
+            steps += 1;
+            match outcome {
+                StepOutcome::YieldedTimer(_tid) => {
+                    if self.advance_to_next_deadline() {
+                        if let Ok(task) = self.vm.get_task_instance_mut(handle) {
+                            task.timer_id = None;
+                        }
+                        continue;
+                    }
+                    return Ok(outcome);
+                }
+                StepOutcome::Yielded(_) => {
+                    return Ok(outcome);
+                }
+                terminal => return Ok(terminal),
+            }
+        }
+        Err(LustError::RuntimeError {
+            message: "EXHAUSTION_LIMIT_REACHED: Task did not reach terminal within step limit".to_string(),
+        })
     }
 
     /// Verifies mutant M1: checks step progress against the gas progress oracle

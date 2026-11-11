@@ -3101,6 +3101,26 @@ impl VM {
                 }
             }
 
+            NativeCallResult::YieldTimer(duration, value) => {
+                if self.clock.is_simulated() && self.current_task.is_some() {
+                    let duration_nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+                    let now = self.clock.now_nanos();
+                    let deadline = now.saturating_add(duration_nanos);
+                    let timer_id = self.clock.schedule_timer(deadline, 0, move || {});
+                    self.set_register(dest, Value::Nil)?;
+                    self.pending_task_signal = Some(TaskSignal::YieldTimer {
+                        dest,
+                        value,
+                        timer_id,
+                    });
+                    Ok(())
+                } else {
+                    #[cfg(feature = "std")]
+                    std::thread::sleep(duration);
+                    self.set_register(dest, value)
+                }
+            }
+
             NativeCallResult::Stop(value) => {
                 if self.current_task.is_some() {
                     self.set_register(dest, Value::Nil)?;
@@ -3299,6 +3319,11 @@ impl VM {
                 let outcome = outcome.map_err(|e| LustError::RuntimeError { message: e })?;
                 match outcome {
                     NativeCallResult::Return(value) => Ok(value),
+                    NativeCallResult::YieldTimer(duration, value) => {
+                        #[cfg(feature = "std")]
+                        std::thread::sleep(duration);
+                        Ok(value)
+                    }
                     NativeCallResult::Yield(_) | NativeCallResult::Stop(_) => {
                         Err(LustError::RuntimeError {
                             message: "Yielding or stopping is not allowed from this context"

@@ -100,10 +100,10 @@ impl VM {
             _ => {}
         }
 
-        task.last_yield = None;
+        let last_yield_fallback = task.last_yield.take();
         let mut resume_value_opt = resume_value;
         if let Some(dest) = task.yield_dest.take() {
-            let value = resume_value_opt.take().unwrap_or(Value::Nil);
+            let value = resume_value_opt.take().or(last_yield_fallback).unwrap_or(Value::Nil);
             if let Some(frame) = task.call_stack.last_mut() {
                 frame.registers[dest as usize] = value;
             }
@@ -149,6 +149,18 @@ impl VM {
                             task.last_yield = Some(yielded);
                             task.last_result = None;
                             task.yield_dest = Some(dest);
+                        }
+
+                        TaskSignal::YieldTimer {
+                            dest,
+                            value: yielded,
+                            timer_id,
+                        } => {
+                            task.state = TaskState::Yielded;
+                            task.last_yield = Some(yielded);
+                            task.last_result = None;
+                            task.yield_dest = Some(dest);
+                            task.timer_id = Some(timer_id);
                         }
 
                         TaskSignal::Stop { value: stop_value } => {
@@ -439,6 +451,7 @@ impl VM {
         }
 
         task.state = TaskState::Stopped;
+        task.timer_id = None;
         task.call_stack.clear();
         task.pending_return_value = None;
         task.pending_return_dest = None;
@@ -763,9 +776,11 @@ impl VM {
                             .map_err(|e| LustError::RuntimeError { message: e })?
                         {
                             NativeCallResult::Return(value) => Ok(value),
-                            NativeCallResult::Yield(_) => Err(LustError::RuntimeError {
-                                message: "unpack() unexpectedly yielded".to_string(),
-                            }),
+                            NativeCallResult::Yield(_) | NativeCallResult::YieldTimer(..) => {
+                                Err(LustError::RuntimeError {
+                                    message: "unpack() unexpectedly yielded".to_string(),
+                                })
+                            }
                             NativeCallResult::Stop(_) => Err(LustError::RuntimeError {
                                 message: "unpack() unexpectedly stopped execution".to_string(),
                             }),

@@ -286,7 +286,9 @@ impl CycleCollector {
 
     fn discover_task_signal(&mut self, signal: &TaskSignal) {
         match signal {
-            TaskSignal::Yield { value, .. } | TaskSignal::Stop { value } => {
+            TaskSignal::Yield { value, .. }
+            | TaskSignal::YieldTimer { value, .. }
+            | TaskSignal::Stop { value } => {
                 self.discover_value(value, true)
             }
         }

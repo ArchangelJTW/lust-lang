@@ -144,7 +144,7 @@ pub fn pop_vm_ptr() {
 }
 
 pub fn current_vm_ptr() -> Option<*mut VM> {
-    with_vm_stack_ref(|stack| stack.last().copied())
+    with_vm_stack_ref(|stack| stack.last().copied().filter(|p| !p.is_null()))
 }
 
 pub struct CurrentVmGuard {
@@ -294,6 +294,7 @@ pub struct VM {
     pub array_id_map: core::cell::RefCell<HashMap<usize, crate::bytecode::value::ArraySequenceId>>,
     pub lua_context: Rc<crate::lua_compat::LuaCompatContext>,
     pub mir_context: alloc::sync::Arc<crate::mir::runtime_helpers::MirContext>,
+    pub clock: alloc::sync::Arc<crate::sim::clock::LustClock>,
 }
 
 pub type HostResourceCleanupFn = fn(usize);
@@ -609,6 +610,11 @@ pub(super) struct RuntimeStructInfo {
 #[derive(Debug, Clone)]
 pub(super) enum TaskSignal {
     Yield { dest: Register, value: Value },
+    YieldTimer {
+        dest: Register,
+        value: Value,
+        timer_id: crate::sim::clock::TimerId,
+    },
     Stop { value: Value },
 }
 

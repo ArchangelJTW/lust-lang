@@ -13,7 +13,6 @@ use regex::Regex;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::rc::Rc;
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)> {
@@ -504,6 +503,7 @@ fn create_io_write_stdout_fn() -> Value {
 fn create_os_module(vm: &VM) -> Value {
     let entries = [
         (string_key("time"), create_os_time_fn()),
+        (string_key("date"), create_os_date_fn()),
         (string_key("sleep"), create_os_sleep_fn()),
         (string_key("create_file"), create_os_create_file_fn()),
         (string_key("create_dir"), create_os_create_dir_fn()),
@@ -523,13 +523,89 @@ fn create_os_time_fn() -> Value {
             ))));
         }
 
-        let now = SystemTime::now();
-        let seconds = match now.duration_since(UNIX_EPOCH) {
-            Ok(duration) => duration.as_secs_f64(),
-            Err(err) => -(err.duration().as_secs_f64()),
+        let seconds = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            unsafe {
+                let vm = &*vm_ptr;
+                vm.clock.now_epoch_secs_f64()
+            }
+        } else {
+            let now = SystemTime::now();
+            match now.duration_since(UNIX_EPOCH) {
+                Ok(duration) => duration.as_secs_f64(),
+                Err(err) => -(err.duration().as_secs_f64()),
+            }
         };
 
         Ok(NativeCallResult::Return(Value::Float(seconds)))
+    }))
+}
+
+fn create_os_date_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let format_opt = if !args.is_empty() {
+            match &args[0] {
+                Value::Nil => None,
+                Value::String(s) => Some(s.as_str()),
+                _ => {
+                    return Ok(NativeCallResult::Return(Value::err(Value::string(
+                        "os.date(format, time) expects a string format",
+                    ))));
+                }
+            }
+        } else {
+            None
+        };
+
+        let epoch_seconds = if args.len() >= 2 {
+            match args[1].as_float() {
+                Some(s) => s as i64,
+                None => match args[1].as_int() {
+                    Some(i) => i,
+                    None => {
+                        return Ok(NativeCallResult::Return(Value::err(Value::string(
+                            "os.date(format, time) expects numeric time",
+                        ))));
+                    }
+                },
+            }
+        } else if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            unsafe {
+                let vm = &*vm_ptr;
+                (vm.clock.now_epoch_nanos() / 1_000_000_000) as i64
+            }
+        } else {
+            let now = SystemTime::now();
+            match now.duration_since(UNIX_EPOCH) {
+                Ok(d) => d.as_secs() as i64,
+                Err(e) => -(e.duration().as_secs() as i64),
+            }
+        };
+
+        let civil = crate::sim::clock::epoch_secs_to_civil(epoch_seconds);
+        let fmt_str = format_opt.unwrap_or("%Y-%m-%d %H:%M:%S");
+
+        if fmt_str == "*t" || fmt_str == "!*t" {
+            if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+                let vm = unsafe { &*vm_ptr };
+                let entries = [
+                    (string_key("year"), Value::Int(civil.year as i64)),
+                    (string_key("month"), Value::Int(civil.month as i64)),
+                    (string_key("day"), Value::Int(civil.day as i64)),
+                    (string_key("hour"), Value::Int(civil.hour as i64)),
+                    (string_key("min"), Value::Int(civil.min as i64)),
+                    (string_key("sec"), Value::Int(civil.sec as i64)),
+                    (string_key("wday"), Value::Int(civil.wday as i64)),
+                    (string_key("yday"), Value::Int(civil.yday as i64)),
+                    (string_key("isdst"), Value::Bool(civil.isdst)),
+                ];
+                return Ok(NativeCallResult::Return(vm.map_with_entries(entries)));
+            } else {
+                return Ok(NativeCallResult::Return(Value::string(civil.format_default())));
+            }
+        }
+
+        let formatted = civil.format(fmt_str);
+        Ok(NativeCallResult::Return(Value::string(formatted)))
     }))
 }
 
@@ -562,9 +638,10 @@ fn create_os_sleep_fn() -> Value {
             ))));
         }
 
-        thread::sleep(Duration::from_secs_f64(seconds));
-
-        Ok(NativeCallResult::Return(Value::ok(Value::Nil)))
+        Ok(NativeCallResult::YieldTimer(
+            Duration::from_secs_f64(seconds),
+            Value::ok(Value::Nil),
+        ))
     }))
 }
 

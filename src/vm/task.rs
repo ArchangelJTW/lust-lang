@@ -42,6 +42,7 @@ impl TaskState {
 pub struct TaskInstance {
     pub id: TaskId,
     pub state: TaskState,
+    pub timer_id: Option<crate::sim::clock::TimerId>,
     pub fiber_context: FiberContext,
     pub scope_id: Option<u64>,
     pub(super) call_stack: Vec<Box<CallFrame>>,
@@ -65,6 +66,7 @@ impl TaskInstance {
     pub(super) fn new(id: TaskId, initial_frame: Box<CallFrame>) -> Self {
         Self {
             id,
+            timer_id: None,
             fiber_context: FiberContext::new(id.0, 0),
             scope_id: None,
             state: TaskState::Ready,
@@ -83,6 +85,7 @@ impl TaskInstance {
     pub(super) fn new_native_future(id: TaskId) -> Self {
         Self {
             id,
+            timer_id: None,
             fiber_context: FiberContext::new(id.0, 0),
             scope_id: None,
             state: TaskState::Yielded,
@@ -128,6 +131,7 @@ impl TaskInstance {
 
     pub fn reset(&mut self) {
         self.fiber_context = FiberContext::new(self.id.0, self.scope_id.unwrap_or(0));
+        self.timer_id = None;
         match self.kind {
             TaskKind::Script => {
                 self.state = TaskState::Ready;

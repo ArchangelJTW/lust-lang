@@ -35,14 +35,92 @@ use std::ffi::CStr;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+pub struct LuaCompatContext {
+    pub fn_registry: StdRefCell<HashMap<usize, Value>>,
+    pub next_fn_id: AtomicUsize,
+}
+
+impl Default for LuaCompatContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LuaCompatContext {
+    pub fn new() -> Self {
+        Self {
+            fn_registry: StdRefCell::new(HashMap::new()),
+            next_fn_id: AtomicUsize::new(1),
+        }
+    }
+
+    pub fn next_id(&self) -> usize {
+        self.next_fn_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn register(&self, value: Value) -> usize {
+        let id = self.next_id();
+        self.fn_registry.borrow_mut().insert(id, value);
+        id
+    }
+
+    pub fn lookup(&self, id: usize) -> Option<Value> {
+        self.fn_registry.borrow().get(&id).cloned()
+    }
+
+    pub fn enter(&self) -> LuaCompatContextGuard {
+        enter_lua_compat_context(self)
+    }
+}
+
+pub struct LuaCompatContextGuard(*const LuaCompatContext);
+
+impl Drop for LuaCompatContextGuard {
+    fn drop(&mut self) {
+        CURRENT_LUA_CONTEXT.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if let Some(top) = stack.last() {
+                if *top == self.0 {
+                    stack.pop();
+                    return;
+                }
+            }
+            if let Some(pos) = stack.iter().rposition(|&p| p == self.0) {
+                stack.remove(pos);
+            }
+        });
+    }
+}
+
+pub fn enter_lua_compat_context(ctx: &LuaCompatContext) -> LuaCompatContextGuard {
+    let ptr = ctx as *const LuaCompatContext;
+    CURRENT_LUA_CONTEXT.with(|stack| {
+        stack.borrow_mut().push(ptr);
+    });
+    LuaCompatContextGuard(ptr)
+}
+
 thread_local! {
-    static LUST_FN_REGISTRY: StdRefCell<HashMap<usize, Value>> = StdRefCell::new(HashMap::new());
+    static CURRENT_LUA_CONTEXT: StdRefCell<Vec<*const LuaCompatContext>> = const { StdRefCell::new(Vec::new()) };
+    static DEFAULT_LUA_CONTEXT: LuaCompatContext = LuaCompatContext::new();
+}
+
+pub fn with_current_lua_context<F, R>(f: F) -> R
+where
+    F: FnOnce(&LuaCompatContext) -> R,
+{
+    CURRENT_LUA_CONTEXT.with(|stack| {
+        if let Some(&top) = stack.borrow().last() {
+            let ctx = unsafe { &*top };
+            f(ctx)
+        } else {
+            DEFAULT_LUA_CONTEXT.with(|default_ctx| f(default_ctx))
+        }
+    })
 }
 
 #[cfg(feature = "lua_transpile")]
 pub mod transpile;
-
-static NEXT_LUA_FUNCTION_ID: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Clone, Debug)]
 struct LuaTraceConfig {
@@ -117,20 +195,16 @@ fn format_lua_stack_brief(stack: &[LuaValue]) -> String {
     }
 }
 
-fn next_lua_function_id() -> usize {
-    NEXT_LUA_FUNCTION_ID.fetch_add(1, Ordering::SeqCst)
+pub fn next_lua_function_id() -> usize {
+    with_current_lua_context(|ctx| ctx.next_id())
 }
 
-pub(crate) fn register_lust_function(value: Value) -> usize {
-    let id = next_lua_function_id();
-    LUST_FN_REGISTRY.with(|registry| {
-        registry.borrow_mut().insert(id, value);
-    });
-    id
+pub fn register_lust_function(value: Value) -> usize {
+    with_current_lua_context(|ctx| ctx.register(value))
 }
 
-pub(crate) fn lookup_lust_function(id: usize) -> Option<Value> {
-    LUST_FN_REGISTRY.with(|registry| registry.borrow().get(&id).cloned())
+pub fn lookup_lust_function(id: usize) -> Option<Value> {
+    with_current_lua_context(|ctx| ctx.lookup(id))
 }
 
 /// Lua 5.1 type codes.

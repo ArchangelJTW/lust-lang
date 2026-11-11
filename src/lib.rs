@@ -40,6 +40,7 @@ pub mod parser;
 pub mod test_framework;
 pub mod typechecker;
 pub mod vm;
+pub mod sim;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 pub use ast::{Expr, Item, Span, Stmt, Type};
@@ -95,4 +96,5 @@ pub use packages::{
 pub use parser::Parser;
 pub use typechecker::{FunctionSignature, TypeChecker, TypeCollection};
 pub use vm::{NativeExport, NativeExportParam, VM};
+pub use sim::{GasProgressOracle, MinimalSimScheduler, StepOutcome};
 pub use hashbrown;

@@ -42,6 +42,7 @@ mod tracing;
 #[cfg(feature = "std")]
 pub(crate) use self::api::format_doc_comment;
 pub use self::api::{NativeExport, NativeExportParam};
+pub use self::execution::{MUTATION_M1_EXECUTION_COUNT, MUTATION_M1_SKIP_GAS, MutationM1Guard};
 pub(crate) use self::tracing::JitCallSite;
 #[cfg(feature = "std")]
 thread_local! {
@@ -132,32 +133,61 @@ where
     VM_STACK.with_mut(f)
 }
 
-pub(crate) fn push_vm_ptr(vm: *mut VM) {
+pub fn push_vm_ptr(vm: *mut VM) {
     with_vm_stack_mut(|stack| stack.push(vm));
 }
 
-pub(crate) fn pop_vm_ptr() {
+pub fn pop_vm_ptr() {
     with_vm_stack_mut(|stack| {
         stack.pop();
     });
 }
 
-fn current_vm_ptr() -> Option<*mut VM> {
+pub fn current_vm_ptr() -> Option<*mut VM> {
     with_vm_stack_ref(|stack| stack.last().copied())
 }
 
-struct CurrentVmGuard;
+pub struct CurrentVmGuard {
+    vm: *mut VM,
+    _lua_guard: Option<crate::lua_compat::LuaCompatContextGuard>,
+    _mir_guard: Option<crate::mir::runtime_helpers::MirContextGuard>,
+}
 
 impl CurrentVmGuard {
-    fn new(vm: *mut VM) -> Self {
+    pub fn new(vm: *mut VM) -> Self {
         push_vm_ptr(vm);
-        Self
+        let (lua_guard, mir_guard) = if !vm.is_null() {
+            unsafe {
+                let vm_ref = &*vm;
+                (
+                    Some(vm_ref.lua_context.enter()),
+                    Some(vm_ref.mir_context.enter()),
+                )
+            }
+        } else {
+            (None, None)
+        };
+        Self {
+            vm,
+            _lua_guard: lua_guard,
+            _mir_guard: mir_guard,
+        }
     }
 }
 
 impl Drop for CurrentVmGuard {
     fn drop(&mut self) {
-        pop_vm_ptr();
+        with_vm_stack_mut(|stack| {
+            if let Some(top) = stack.last() {
+                if *top == self.vm {
+                    stack.pop();
+                    return;
+                }
+            }
+            if let Some(pos) = stack.iter().rposition(|&p| p == self.vm) {
+                stack.remove(pos);
+            }
+        });
     }
 }
 
@@ -257,6 +287,13 @@ pub struct VM {
     pub(super) active_native_depth: usize,
     pub(super) active_jit_depth: usize,
     pub host_ledger: TrustedHostResourceLedger,
+    #[cfg(feature = "std")]
+    pub rng: core::cell::RefCell<Box<dyn rand::Rng + Send>>,
+    pub id: crate::bytecode::value::VmId,
+    pub next_array_sequence_id: core::sync::atomic::AtomicU64,
+    pub array_id_map: core::cell::RefCell<HashMap<usize, crate::bytecode::value::ArraySequenceId>>,
+    pub lua_context: Rc<crate::lua_compat::LuaCompatContext>,
+    pub mir_context: alloc::sync::Arc<crate::mir::runtime_helpers::MirContext>,
 }
 
 pub type HostResourceCleanupFn = fn(usize);

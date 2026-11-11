@@ -3,6 +3,24 @@ use crate::bytecode::ValueKey;
 use crate::bytecode::value::{ClosureObject, EnumObject, StructObject};
 use core::ptr;
 
+pub static MUTATION_M1_SKIP_GAS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub static MUTATION_M1_EXECUTION_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub struct MutationM1Guard;
+
+impl MutationM1Guard {
+    pub fn enable() -> Self {
+        MUTATION_M1_SKIP_GAS.store(true, core::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for MutationM1Guard {
+    fn drop(&mut self) {
+        MUTATION_M1_SKIP_GAS.store(false, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// How thoroughly a call's arguments are checked against the signature.
 #[derive(Clone, Copy)]
 pub(super) enum ArgCheck {
@@ -126,16 +144,8 @@ impl VM {
         value.clone()
     }
 
-    pub(super) fn push_current_vm(&mut self) {
-        let ptr = self as *mut VM;
-        crate::vm::push_vm_ptr(ptr);
-    }
-
-    pub(super) fn pop_current_vm(&mut self) {
-        crate::vm::pop_vm_ptr();
-    }
-
     pub(super) fn run(&mut self) -> Result<Value> {
+        let _vm_guard = crate::vm::CurrentVmGuard::new(self as *mut VM);
         // Specialize the dispatch loop once rather than testing it around every
         // instruction; the interpreter-only copy has no trace bookkeeping or JIT backedges.
         // When a memory budget is active, effective execution is the interpreter.
@@ -540,7 +550,11 @@ impl VM {
                 self.dispatch_instruction_hook(&func.name, line, ip_before_execution);
             }
 
-            self.budgets.charge_gas(1)?;
+            if MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed) {
+                MUTATION_M1_EXECUTION_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            } else {
+                self.budgets.charge_gas(1)?;
+            }
             match instruction {
                 Instruction::LoadNil(dest) => {
                     self.set_register(dest, Value::Nil)?;
@@ -1161,9 +1175,9 @@ impl VM {
                             }
 
                             let _native_guard = self.enter_native_scope();
-                            self.push_current_vm();
+                            let _vm_guard = crate::vm::CurrentVmGuard::new(self as *mut VM);
                             let outcome = native_fn(&args);
-                            self.pop_current_vm();
+                            drop(_vm_guard);
                             drop(_native_guard);
                             let outcome =
                                 outcome.map_err(|e| LustError::RuntimeError { message: e })?;
@@ -3118,6 +3132,7 @@ impl VM {
 
     #[inline(never)]
     pub fn call_value(&mut self, func: &Value, args: Vec<Value>) -> Result<Value> {
+        let _vm_guard = crate::vm::CurrentVmGuard::new(self as *mut VM);
         // Lua compatibility: honor __call metamethod on Lua tables/userdata.
         // Lua semantics: if value has metatable.__call, calling it invokes that function with the
         // receiver as the first argument.
@@ -3277,9 +3292,9 @@ impl VM {
 
             Value::NativeFunction(native_fn) => {
                 let _native_guard = self.enter_native_scope();
-                self.push_current_vm();
+                let _vm_guard = crate::vm::CurrentVmGuard::new(self as *mut VM);
                 let outcome = native_fn(&args);
-                self.pop_current_vm();
+                drop(_vm_guard);
                 drop(_native_guard);
                 let outcome = outcome.map_err(|e| LustError::RuntimeError { message: e })?;
                 match outcome {

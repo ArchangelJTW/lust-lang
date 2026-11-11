@@ -1601,8 +1601,8 @@ fn test_tasks_lua_table_unpack_and_sort_lifecycle() {
 
     let mut vm = VM::new();
     vm.load_functions(vec![func, comp_fn]);
-    let err = vm.call("test_unpack", vec![]).unwrap_err();
-    assert!(err.to_string().contains("No active VM context") || err.to_string().contains("unpack"));
+    let res = vm.call("test_unpack", vec![]);
+    assert!(res.is_ok(), "table unpack and sort must succeed with active VM context: {:?}", res);
 }
 
 #[test]

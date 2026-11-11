@@ -232,7 +232,7 @@ impl VM {
         }
     }
 
-    pub(super) fn create_task_value(
+    pub fn create_task_value(
         &mut self,
         func: Value,
         args: Vec<Value>,
@@ -407,6 +407,7 @@ impl VM {
         handle: TaskHandle,
         resume_value: Option<Value>,
     ) -> Result<()> {
+        let _vm_guard = crate::vm::CurrentVmGuard::new(self as *mut VM);
         let task_id = self.task_id_from_handle(handle)?;
         self.run_task_internal(task_id, resume_value)
     }

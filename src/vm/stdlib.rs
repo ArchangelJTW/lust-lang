@@ -13,11 +13,9 @@ use regex::Regex;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::rc::Rc;
-use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-static RNG: OnceLock<Mutex<StdRng>> = OnceLock::new();
 pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)> {
     let mut stdlib = vec![
         ("print", create_print_fn()),
@@ -3103,6 +3101,10 @@ fn create_math_random_fn() -> Value {
     }))
 }
 
+thread_local! {
+    static FALLBACK_RNG: std::cell::RefCell<StdRng> = std::cell::RefCell::new(make_rng());
+}
+
 fn create_math_randomseed_fn() -> Value {
     Value::NativeFunction(native_fn(|args: &[Value]| {
         let seed_val = args
@@ -3110,8 +3112,14 @@ fn create_math_randomseed_fn() -> Value {
             .map(|v| unwrap_lua_value(v.clone()))
             .unwrap_or(Value::Int(0));
         let seed = coerce_int(&seed_val).unwrap_or(0) as u64;
-        let mutex = RNG.get_or_init(|| Mutex::new(make_rng()));
-        *mutex.lock().map_err(|e| e.to_string())? = StdRng::seed_from_u64(seed);
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &*vm_ptr };
+            vm.set_seed(seed);
+        } else {
+            FALLBACK_RNG.with(|rng| {
+                *rng.borrow_mut() = StdRng::seed_from_u64(seed);
+            });
+        }
         Ok(NativeCallResult::Return(Value::Nil))
     }))
 }
@@ -3127,13 +3135,15 @@ fn coerce_int(value: &Value) -> Option<LustInt> {
 
 fn with_rng_mut<F, R>(f: F) -> Result<R, String>
 where
-    F: FnOnce(&mut StdRng) -> R,
+    F: FnOnce(&mut dyn rand::Rng) -> R,
 {
-    let mutex = RNG.get_or_init(|| Mutex::new(make_rng()));
-    mutex
-        .lock()
-        .map_err(|e| e.to_string())
-        .map(|mut guard| f(&mut guard))
+    if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+        let vm = unsafe { &*vm_ptr };
+        let mut rng = vm.rng.borrow_mut();
+        Ok(f(&mut **rng))
+    } else {
+        FALLBACK_RNG.with(|rng| Ok(f(&mut *rng.borrow_mut())))
+    }
 }
 
 fn render_format(fmt: &str, args: &[Value]) -> Result<String, String> {
@@ -3494,14 +3504,7 @@ mod tests {
     #[test]
     fn test_table_insert_push_and_remove_pop() {
         let mut vm = VM::with_config(&LustConfig::default());
-        struct VmGuard;
-        impl Drop for VmGuard {
-            fn drop(&mut self) {
-                crate::vm::pop_vm_ptr();
-            }
-        }
-        crate::vm::push_vm_ptr(&mut vm);
-        let _guard = VmGuard;
+        let _guard = crate::vm::CurrentVmGuard::new(&mut vm);
 
         let stdlib = create_stdlib(&LustConfig::default(), &vm);
         let table_mod = stdlib.iter().find(|(name, _)| *name == "table").unwrap().1.clone();

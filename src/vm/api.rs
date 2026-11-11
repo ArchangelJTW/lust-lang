@@ -158,6 +158,13 @@ impl VM {
             active_native_depth: 0,
             active_jit_depth: 0,
             host_ledger: TrustedHostResourceLedger::new(),
+            #[cfg(feature = "std")]
+            rng: core::cell::RefCell::new(Box::new(rand::make_rng::<rand::rngs::StdRng>())),
+            id: Self::allocate_vm_id(),
+            next_array_sequence_id: core::sync::atomic::AtomicU64::new(0),
+            array_id_map: core::cell::RefCell::new(HashMap::new()),
+            lua_context: Rc::new(crate::lua_compat::LuaCompatContext::new()),
+            mir_context: alloc::sync::Arc::new(crate::mir::runtime_helpers::MirContext::new()),
         };
         vm.cycle_collector.set_enabled(config.gc_enabled());
         if config.use_mir() {
@@ -224,6 +231,59 @@ impl VM {
         });
 
         vm
+    }
+
+    pub fn with_seed(seed: u64) -> Self {
+        let vm = Self::new();
+        vm.set_seed(seed);
+        vm
+    }
+
+    pub fn with_config_and_seed(config: &LustConfig, seed: u64) -> Self {
+        let vm = Self::with_config(config);
+        vm.set_seed(seed);
+        vm
+    }
+
+    pub fn set_seed(&self, seed: u64) {
+        #[cfg(feature = "std")]
+        {
+            use rand::SeedableRng;
+            *self.rng.borrow_mut() = Box::new(rand::rngs::StdRng::seed_from_u64(seed));
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = seed;
+        }
+    }
+
+    pub fn allocate_vm_id() -> crate::bytecode::value::VmId {
+        static NEXT_VM_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+        crate::bytecode::value::VmId(NEXT_VM_ID.fetch_add(1, core::sync::atomic::Ordering::SeqCst))
+    }
+
+    pub fn set_vm_id(&mut self, id: crate::bytecode::value::VmId) {
+        self.id = id;
+    }
+
+    pub fn get_or_register_array_id(
+        &self,
+        arr_ptr: usize,
+    ) -> (crate::bytecode::value::VmId, crate::bytecode::value::ArraySequenceId) {
+        let vm_id = self.id;
+        let mut map = self.array_id_map.borrow_mut();
+        let seq = *map.entry(arr_ptr).or_insert_with(|| {
+            let next = self.next_array_sequence_id.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            crate::bytecode::value::ArraySequenceId(next)
+        });
+        (vm_id, seq)
+    }
+
+    pub fn unregister_array_id(
+        &self,
+        arr_ptr: usize,
+    ) -> Option<(crate::bytecode::value::VmId, crate::bytecode::value::ArraySequenceId)> {
+        self.array_id_map.borrow_mut().remove(&arr_ptr).map(|seq| (self.id, seq))
     }
 
     pub fn acquire_host_resource(
@@ -794,6 +854,7 @@ impl VM {
     }
 
     fn execute_call_frame(&mut self, frame: Box<CallFrame>) -> Result<Value> {
+        let _vm_guard = crate::vm::CurrentVmGuard::new(self as *mut VM);
         let stack_depth_before = self.call_stack.len();
         let saved_pending_return_value = self.pending_return_value.clone();
         let saved_pending_return_dest = self.pending_return_dest;

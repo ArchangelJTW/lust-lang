@@ -154,16 +154,23 @@ pub struct CurrentVmGuard {
 }
 
 impl CurrentVmGuard {
-    pub fn new(vm: *mut VM) -> Self {
+    /// Creates a guard from a mutable reference to VM (safe).
+    pub fn from_vm(vm: &mut VM) -> Self {
+        unsafe { Self::new(vm as *mut VM) }
+    }
+
+    /// Creates a guard from a raw VM pointer.
+    ///
+    /// # Safety
+    /// Caller must ensure that `vm` is either null or points to a valid, live `VM` instance.
+    pub unsafe fn new(vm: *mut VM) -> Self {
         push_vm_ptr(vm);
         let (lua_guard, mir_guard) = if !vm.is_null() {
-            unsafe {
-                let vm_ref = &*vm;
-                (
-                    Some(vm_ref.lua_context.enter()),
-                    Some(vm_ref.mir_context.enter()),
-                )
-            }
+            let vm_ref = unsafe { &*vm };
+            (
+                Some(vm_ref.lua_context.enter()),
+                Some(vm_ref.mir_context.enter()),
+            )
         } else {
             (None, None)
         };
@@ -295,6 +302,12 @@ pub struct VM {
     pub lua_context: Rc<crate::lua_compat::LuaCompatContext>,
     pub mir_context: alloc::sync::Arc<crate::mir::runtime_helpers::MirContext>,
     pub clock: alloc::sync::Arc<crate::sim::clock::LustClock>,
+    #[cfg(feature = "std")]
+    pub vfs: alloc::sync::Arc<dyn crate::vfs::VirtualFileSystem>,
+    #[cfg(feature = "std")]
+    pub env: crate::vfs::VirtualEnv,
+    #[cfg(feature = "std")]
+    pub console: crate::vfs::VirtualConsole,
 }
 
 pub type HostResourceCleanupFn = fn(usize);

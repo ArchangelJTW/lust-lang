@@ -166,6 +166,12 @@ impl VM {
             lua_context: Rc::new(crate::lua_compat::LuaCompatContext::new()),
             mir_context: alloc::sync::Arc::new(crate::mir::runtime_helpers::MirContext::new()),
             clock: alloc::sync::Arc::new(crate::sim::clock::LustClock::system()),
+            #[cfg(feature = "std")]
+            vfs: alloc::sync::Arc::new(crate::vfs::OsFs::new()),
+            #[cfg(feature = "std")]
+            env: crate::vfs::VirtualEnv::new(),
+            #[cfg(feature = "std")]
+            console: crate::vfs::VirtualConsole::new(),
         };
         vm.cycle_collector.set_enabled(config.gc_enabled());
         if config.use_mir() {
@@ -246,6 +252,22 @@ impl VM {
             epoch_nanos,
             monotonic_nanos,
         ));
+        vm
+    }
+
+    #[cfg(feature = "std")]
+    pub fn with_mem_fs() -> Self {
+        let mut vm = Self::new();
+        vm.vfs = alloc::sync::Arc::new(crate::vfs::MemFs::new());
+        vm.env = crate::vfs::VirtualEnv::isolated();
+        vm.console = crate::vfs::VirtualConsole::captured();
+        vm
+    }
+
+    #[cfg(feature = "std")]
+    pub fn with_vfs(vfs: alloc::sync::Arc<dyn crate::vfs::VirtualFileSystem>) -> Self {
+        let mut vm = Self::new();
+        vm.vfs = vfs;
         vm
     }
 
@@ -645,7 +667,7 @@ impl VM {
                     // Resolve the calling VM at invocation time, then expose it to
                     // the extension's VM::with_current for the duration of the call.
                     Value::NativeFunction(native_fn(move |args| {
-                        let _context = host_lookup().map(super::CurrentVmGuard::new);
+                        let _context = host_lookup().map(|ptr| unsafe { super::CurrentVmGuard::new(ptr) });
                         func(args)
                     }))
                 };
@@ -868,7 +890,7 @@ impl VM {
     }
 
     fn execute_call_frame(&mut self, frame: Box<CallFrame>) -> Result<Value> {
-        let _vm_guard = crate::vm::CurrentVmGuard::new(self as *mut VM);
+        let _vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
         let stack_depth_before = self.call_stack.len();
         let saved_pending_return_value = self.pending_return_value.clone();
         let saved_pending_return_dest = self.pending_return_dest;
@@ -1794,7 +1816,7 @@ end
         // The callback must use the invoking VM, not the registration-time VM.
         let mut previous_vm = VM::new();
         let previous_ptr = &mut previous_vm as *mut VM;
-        let _previous_context = crate::vm::CurrentVmGuard::new(previous_ptr);
+        let _previous_context = unsafe { crate::vm::CurrentVmGuard::new(previous_ptr) };
         for marker in [7, 42] {
             let mut host_vm = VM::new();
             host_vm.set_global("marker", Value::Int(marker));

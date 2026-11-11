@@ -1,6 +1,5 @@
-// Dependency resolution fails on a cold path, once per run; boxing the
-// `toml` error inside `ManifestError` to shrink these `Result`s would change
-// public error types for no measurable gain.
+// Host CLI / packaging boundary: package manager operates on the host filesystem directly.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 #![allow(clippy::result_large_err)]
 
 use super::{

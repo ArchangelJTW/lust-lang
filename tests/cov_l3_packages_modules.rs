@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 //! L3 Coverage and Correctness Test Suite: Packages and Embedded Modules
 //!
 //! Independent Oracles:

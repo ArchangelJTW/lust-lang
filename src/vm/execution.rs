@@ -145,7 +145,7 @@ impl VM {
     }
 
     pub(super) fn run(&mut self) -> Result<Value> {
-        let _vm_guard = crate::vm::CurrentVmGuard::new(self as *mut VM);
+        let _vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
         // Specialize the dispatch loop once rather than testing it around every
         // instruction; the interpreter-only copy has no trace bookkeeping or JIT backedges.
         // When a memory budget is active, effective execution is the interpreter.
@@ -1175,7 +1175,7 @@ impl VM {
                             }
 
                             let _native_guard = self.enter_native_scope();
-                            let _vm_guard = crate::vm::CurrentVmGuard::new(self as *mut VM);
+                            let _vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
                             let outcome = native_fn(&args);
                             drop(_vm_guard);
                             drop(_native_guard);
@@ -3152,7 +3152,7 @@ impl VM {
 
     #[inline(never)]
     pub fn call_value(&mut self, func: &Value, args: Vec<Value>) -> Result<Value> {
-        let _vm_guard = crate::vm::CurrentVmGuard::new(self as *mut VM);
+        let _vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
         // Lua compatibility: honor __call metamethod on Lua tables/userdata.
         // Lua semantics: if value has metatable.__call, calling it invokes that function with the
         // receiver as the first argument.
@@ -3312,7 +3312,7 @@ impl VM {
 
             Value::NativeFunction(native_fn) => {
                 let _native_guard = self.enter_native_scope();
-                let _vm_guard = crate::vm::CurrentVmGuard::new(self as *mut VM);
+                let _vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
                 let outcome = native_fn(&args);
                 drop(_vm_guard);
                 drop(_native_guard);

@@ -84,6 +84,7 @@ pub struct RustBindingsBuilder {
     bindings_name: String,
     runtime_crate_path: String,
     extern_registry: ExternRegistry,
+    vfs: Option<std::sync::Arc<dyn crate::vfs::VirtualFileSystem>>,
 }
 
 impl RustBindingsBuilder {
@@ -94,7 +95,14 @@ impl RustBindingsBuilder {
             bindings_name: "Bindings".to_string(),
             runtime_crate_path: "::lust".to_string(),
             extern_registry: ExternRegistry::new(),
+            vfs: None,
         }
+    }
+
+    /// Supply a virtual filesystem for resolving entry files and modules.
+    pub fn with_vfs(mut self, vfs: std::sync::Arc<dyn crate::vfs::VirtualFileSystem>) -> Self {
+        self.vfs = Some(vfs);
+        self
     }
 
     /// Set the generated facade type name (default: `Bindings`).
@@ -119,7 +127,11 @@ impl RustBindingsBuilder {
     /// Typecheck the Lust project and return generated Rust source plus the
     /// source/config files Cargo should watch when used from `build.rs`.
     pub fn generate(&self) -> Result<GeneratedRustBindings> {
-        let entry_file = std::fs::canonicalize(&self.entry_file).map_err(|err| {
+        let vfs = self
+            .vfs
+            .clone()
+            .unwrap_or_else(crate::vfs::current_vfs);
+        let entry_file = vfs.canonicalize(&self.entry_file).map_err(|err| {
             LustError::Unknown(format!(
                 "failed to resolve Lust entry '{}': {err}",
                 self.entry_file.display()
@@ -134,7 +146,8 @@ impl RustBindingsBuilder {
         let config = LustConfig::load_for_entry(&entry_file)
             .map_err(|err| LustError::Unknown(format!("failed to load Lust config: {err}")))?;
 
-        let mut loader = ModuleLoader::new(entry_file.parent().unwrap_or_else(|| Path::new(".")));
+        let mut loader = ModuleLoader::new(entry_file.parent().unwrap_or_else(|| Path::new(".")))
+            .with_vfs(vfs.clone());
         let program = loader.load_program_from_entry(entry_text)?;
 
         let mut imports = HashMap::new();
@@ -191,7 +204,7 @@ impl RustBindingsBuilder {
 
         let mut input_files = vec![entry_file.clone()];
         input_files.extend(program.modules.iter().map(|module| {
-            std::fs::canonicalize(&module.source_path)
+            vfs.canonicalize(&module.source_path)
                 .unwrap_or_else(|_| module.source_path.clone())
         }));
         // Watch the config path even if it doesn't exist yet, so adding one
@@ -228,13 +241,14 @@ impl GeneratedRustBindings {
     }
 
     pub fn write_to(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let vfs = crate::vfs::current_vfs();
         let path = path.as_ref();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent)?;
+            vfs.create_dir_all(parent)?;
         }
-        std::fs::write(path, &self.source)
+        vfs.write(path, self.source.as_bytes())
     }
 }
 
@@ -2621,6 +2635,7 @@ fn bindgen_error(message: impl Into<String>) -> LustError {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use super::*;
     use std::fs;

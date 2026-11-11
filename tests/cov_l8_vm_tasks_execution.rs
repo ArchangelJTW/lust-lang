@@ -1,3 +1,5 @@
+#![allow(clippy::approx_constant)]
+
 use lust::bytecode::compiler::Compiler;
 use lust::bytecode::instruction::Instruction;
 use lust::bytecode::{Function, NativeCallResult, TaskHandle, Value, ValueKey, native_fn};

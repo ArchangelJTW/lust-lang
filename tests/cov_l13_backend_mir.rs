@@ -1,4 +1,5 @@
 #![cfg(feature = "std")]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 //! Stage 4 - L13: MIR Backend Verification & Known-Gap Matrix.
 //! Analyzes all 10 red cases from P0-C baseline against Lust MIR pipeline.
 

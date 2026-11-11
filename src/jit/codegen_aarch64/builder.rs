@@ -1,3 +1,6 @@
+// Host CLI / tooling boundary: JIT disassembly and bytecode dumping writes debug traces to host filesystem.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use super::*;
 use crate::jit::trace::{Operand, SpecializedOpKind};
 use crate::VM;

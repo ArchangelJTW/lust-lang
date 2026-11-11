@@ -92,7 +92,7 @@ fn test_specialized_cache_vmid_qualification_no_collisions() {
     // Test caching operations with active VM context switching on the single thread
     // Activate vm1
     {
-        let _g1 = vm::CurrentVmGuard::new(&mut vm1 as *mut VM);
+        let _g1 = vm::CurrentVmGuard::from_vm(&mut vm1);
         assert_eq!(resolve_array_key_from_ptr(ptr1), key1);
 
         // Populate cache for arr1 in vm1
@@ -102,7 +102,7 @@ fn test_specialized_cache_vmid_qualification_no_collisions() {
 
     // Activate vm2
     {
-        let _g2 = vm::CurrentVmGuard::new(&mut vm2 as *mut VM);
+        let _g2 = vm::CurrentVmGuard::from_vm(&mut vm2);
         assert_eq!(resolve_array_key_from_ptr(ptr2), key2);
 
         // In vm2, ptr1 maps to vm2's key, not vm1's key!

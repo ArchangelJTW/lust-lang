@@ -1,4 +1,5 @@
 #![cfg(feature = "std")]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 //! Stage 4 - L12: Zig Codegen Backend Verification & Known-Gap Matrix.
 //! Analyzes all 13 red cases from P0-C baseline against Zig 0.17.1 compiler.
 

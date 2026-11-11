@@ -1,3 +1,6 @@
+// Host CLI / tooling boundary: program embedding tests use host filesystem fixtures.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use super::async_runtime::{
     AsyncRegistry, AsyncTaskEntry, AsyncTaskQueue, AsyncTaskTarget, AsyncValueFuture,
     PendingAsyncTask, signal_pair,

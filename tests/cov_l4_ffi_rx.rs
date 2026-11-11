@@ -1,3 +1,5 @@
+#![allow(clippy::approx_constant)]
+
 //! Comprehensive coverage and correctness tests for L4: FFI and Rx facade.
 //! Verifies ABI contracts, null safety, UTF-8 safety, error capturing,
 //! RxClock monotonic and virtual behavior, RxError formatting, and RxEnvironment facade.

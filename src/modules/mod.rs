@@ -12,10 +12,7 @@ use alloc::{format, vec};
 use alloc::{string::String, vec::Vec};
 use hashbrown::{HashMap, HashSet};
 #[cfg(feature = "std")]
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default)]
 pub struct ModuleImports {
     pub function_aliases: HashMap<String, String>,
@@ -160,6 +157,7 @@ pub struct ModuleLoader {
     module_roots: HashMap<String, Vec<ModuleRoot>>,
     config: LustConfig,
     data_cache: HashMap<PathBuf, (u64, crate::data::DataValue)>,
+    pub vfs: std::sync::Arc<dyn crate::vfs::VirtualFileSystem>,
 }
 
 #[cfg(feature = "std")]
@@ -180,7 +178,21 @@ impl ModuleLoader {
             module_roots: HashMap::new(),
             config: LustConfig::default(),
             data_cache: HashMap::new(),
+            vfs: crate::vfs::current_vfs(),
         }
+    }
+
+    pub fn with_vfs(mut self, vfs: std::sync::Arc<dyn crate::vfs::VirtualFileSystem>) -> Self {
+        self.vfs = vfs;
+        self
+    }
+
+    pub fn set_vfs(&mut self, vfs: std::sync::Arc<dyn crate::vfs::VirtualFileSystem>) {
+        self.vfs = vfs;
+    }
+
+    pub fn vfs(&self) -> &std::sync::Arc<dyn crate::vfs::VirtualFileSystem> {
+        &self.vfs
     }
 
     pub fn with_config(mut self, config: LustConfig) -> Self {
@@ -296,7 +308,7 @@ impl ModuleLoader {
         let bytes = if let Some(src) = self.source_overrides.get(&resolved) {
             src.as_bytes().to_vec()
         } else {
-            match fs::read(&resolved) {
+            match self.vfs.read(&resolved) {
                 Ok(b) => b,
                 Err(e) => {
                     return Err(LustError::CompileError(format!(
@@ -501,7 +513,7 @@ impl ModuleLoader {
                             p.to_path_buf()
                         } else {
                             let rel = current_file.parent().unwrap_or(Path::new(".")).join(&import_path);
-                            if rel.exists() || self.source_overrides.contains_key(&rel) {
+                            if self.vfs.exists(&rel) || self.source_overrides.contains_key(&rel) {
                                 rel
                             } else {
                                 self.base_dir.join(&import_path)
@@ -525,7 +537,7 @@ impl ModuleLoader {
         let raw_source = if let Some(src) = self.source_overrides.get(&file) {
             src.clone()
         } else {
-            match fs::read_to_string(&file) {
+            match self.vfs.read_to_string(&file) {
                 Ok(src) => src,
                 Err(e) => {
                     // For non-entry modules, allow missing files and create stub
@@ -1669,7 +1681,7 @@ impl ModuleLoader {
     }
 
     fn module_source_known(&self, module_path: &str, file: &Path) -> bool {
-        file.exists()
+        self.vfs.exists(file)
             || self.source_overrides.contains_key(file)
             || self.cache.contains_key(module_path)
     }
@@ -1700,7 +1712,7 @@ impl ModuleLoader {
             let mut fallback: Option<PathBuf> = None;
             for (root, consumed) in candidates.iter().rev() {
                 let candidate = Self::path_from_root(root, &segments, *consumed);
-                if candidate.exists() {
+                if self.vfs.exists(&candidate) {
                     return candidate;
                 }
                 if fallback.is_none() {
@@ -1793,6 +1805,7 @@ impl ModuleLoader {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use super::*;
     use std::fs;

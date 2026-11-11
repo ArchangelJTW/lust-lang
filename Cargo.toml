@@ -1,6 +1,6 @@
 [workspace]
 members = [".", "crates/lust-analyzer", "crates/lust-macros", "crates/lust-fuzz"]
-exclude = ["examples/rust-extension/extensions/**", "tree-sitter-lust"]
+exclude = ["examples/rust-extension/extensions/**", "tree-sitter-lust", "tests/compile_fail/fs_gate"]
 
 [package]
 name = "lust-rs"
@@ -182,4 +182,7 @@ debug = 1
 overflow-checks = false
 panic = "abort"
 codegen-units = 1
+
+[lints.clippy]
+approx_constant = "allow"
 

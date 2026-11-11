@@ -1,3 +1,6 @@
+// Host CLI / tooling boundary: configuration loading operates on host configuration files.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use alloc::{string::String, vec::Vec};
 use hashbrown::HashSet;
 #[cfg(feature = "std")]

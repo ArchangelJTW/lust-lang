@@ -47,7 +47,7 @@ fn test_stdlib_os_time_deterministic_with_sim_clock() {
 
     let os_time_fn = get_os_fn(&vm, "time");
 
-    let _vm_guard = lust::vm::CurrentVmGuard::new(&mut vm as *mut VM);
+    let _vm_guard = lust::vm::CurrentVmGuard::from_vm(&mut vm);
     let mut func = Function::new("test_time".to_string(), 0, false);
     func.register_count = 4;
     let c_fn = func.chunk.add_constant(os_time_fn);
@@ -86,7 +86,7 @@ fn test_stdlib_os_date_formatting_and_table() {
 
     let os_date_fn = get_os_fn(&vm, "date");
 
-    let _vm_guard = lust::vm::CurrentVmGuard::new(&mut vm as *mut VM);
+    let _vm_guard = lust::vm::CurrentVmGuard::from_vm(&mut vm);
 
     // Test 1: os.date() without arguments -> returns "%Y-%m-%d %H:%M:%S"
     let mut func1 = Function::new("test_date_default".to_string(), 0, false);

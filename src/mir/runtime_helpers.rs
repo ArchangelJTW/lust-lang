@@ -1,3 +1,5 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI64, Ordering};

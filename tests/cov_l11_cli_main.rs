@@ -1,4 +1,5 @@
 #![cfg(feature = "std")]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 //! Stage 3 - L11: Process-level testing of the `lust` CLI binary.
 //! Tests execution code and stderr/stdout fragments across 15 CLI scenarios.
 

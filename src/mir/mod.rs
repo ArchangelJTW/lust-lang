@@ -27,6 +27,7 @@ pub use runtime_helpers::*;
 pub use zig_backend::*;
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use super::*;
     use crate::ast::Span;

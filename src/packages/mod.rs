@@ -1,3 +1,6 @@
+// Host CLI / packaging boundary: package manager operates on the host filesystem directly.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use crate::embed::native_types::ModuleStub;
 use crate::{NativeExport, VM};
 use dirs::home_dir;

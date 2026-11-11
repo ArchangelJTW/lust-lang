@@ -1,4 +1,6 @@
 #![cfg(feature = "std")]
+// Host CLI boundary: lust CLI binary runs on host OS and orchestrates process execution.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

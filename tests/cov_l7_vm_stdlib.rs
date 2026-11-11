@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use lust::bytecode::{NativeCallResult, Value, ValueKey, native_fn};
 use lust::config::LustConfig;
 use lust::number::LustInt;

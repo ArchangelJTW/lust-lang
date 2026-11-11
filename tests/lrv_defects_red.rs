@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 //! Desired-behavior regressions: failures are intentional until production fixes land.
 use lust::{DataView, DataValue, OwnerRegistry, NativeExport};
 use lust::data::{Document, jsonl::estimate_data_value_bytes};

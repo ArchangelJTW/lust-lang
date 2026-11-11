@@ -1,3 +1,6 @@
+// Host CLI / tooling boundary: Zig compiler backend invokes external zig compiler and writes to host filesystem.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 #[cfg(feature = "std")]
 pub use zig_engine::{
     MirToZigCompiler, MirZigBackendError, ZigArtifactKind, ZigCompileOptions,

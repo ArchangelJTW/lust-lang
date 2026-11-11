@@ -1,4 +1,5 @@
 #![cfg(feature = "std")]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 //! Master Gate-SCHEMA Integration Suite: Gate-SCHEMA-01 through Gate-SCHEMA-13.
 //!

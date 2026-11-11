@@ -10,8 +10,8 @@ use crate::lua_compat::register_lust_function;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng, make_rng};
 use regex::Regex;
-use std::fs;
 use std::io::{self, Read, Write};
+use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -171,12 +171,21 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
 
 fn create_print_fn() -> Value {
     Value::NativeFunction(native_fn(|args: &[Value]| {
+        let mut text = String::new();
         for (i, arg) in args.iter().enumerate() {
             if i > 0 {
-                print!("\t");
+                text.push('\t');
             }
+            use core::fmt::Write;
+            let _ = write!(text, "{}", arg);
+        }
 
-            print!("{}", arg);
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            unsafe {
+                (*vm_ptr).console.write_stdout(text.as_bytes());
+            }
+        } else {
+            print!("{}", text);
         }
 
         Ok(NativeCallResult::Return(Value::Nil))
@@ -185,15 +194,24 @@ fn create_print_fn() -> Value {
 
 fn create_println_fn() -> Value {
     Value::NativeFunction(native_fn(|args: &[Value]| {
+        let mut text = String::new();
         for (i, arg) in args.iter().enumerate() {
             if i > 0 {
-                print!("\t");
+                text.push('\t');
             }
+            use core::fmt::Write;
+            let _ = write!(text, "{}", arg);
+        }
+        text.push('\n');
 
-            print!("{}", arg);
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            unsafe {
+                (*vm_ptr).console.write_stdout(text.as_bytes());
+            }
+        } else {
+            print!("{}", text);
         }
 
-        println!();
         Ok(NativeCallResult::Return(Value::Nil))
     }))
 }
@@ -335,7 +353,8 @@ fn create_io_read_file_fn() -> Value {
                 ))));
             }
         };
-        match fs::read_to_string(path) {
+        let vfs = crate::vfs::current_vfs();
+        match vfs.read_to_string(Path::new(path)) {
             Ok(contents) => Ok(NativeCallResult::Return(Value::ok(Value::string(contents)))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
@@ -361,7 +380,8 @@ fn create_io_read_file_bytes_fn() -> Value {
             }
         };
 
-        match fs::read(path) {
+        let vfs = crate::vfs::current_vfs();
+        match vfs.read(Path::new(path)) {
             Ok(bytes) => {
                 let values: Vec<Value> = bytes
                     .into_iter()
@@ -394,18 +414,22 @@ fn create_io_read_dir_fn() -> Value {
             }
         };
 
-        let entries = fs::read_dir(path).and_then(|entries| {
-            entries
-                .map(|entry| {
-                    entry.map(|entry| {
-                        Value::string(entry.file_name().to_string_lossy().into_owned())
+        let vfs = crate::vfs::current_vfs();
+        match vfs.read_dir(Path::new(path)) {
+            Ok(entries) => {
+                let names = entries
+                    .into_iter()
+                    .map(|entry| {
+                        Value::string(
+                            entry
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                        )
                     })
-                })
-                .collect::<std::io::Result<Vec<_>>>()
-        });
-
-        match entries {
-            Ok(names) => Ok(NativeCallResult::Return(Value::ok(Value::array(names)))),
+                    .collect::<Vec<_>>();
+                Ok(NativeCallResult::Return(Value::ok(Value::array(names))))
+            }
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
             )))),
@@ -434,7 +458,8 @@ fn create_io_write_file_fn() -> Value {
         } else {
             format!("{}", args[1])
         };
-        match fs::write(path, contents) {
+        let vfs = crate::vfs::current_vfs();
+        match vfs.write(Path::new(path), contents.as_bytes()) {
             Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
@@ -451,12 +476,32 @@ fn create_io_read_stdin_fn() -> Value {
             ))));
         }
 
-        let mut buffer = String::new();
-        match io::stdin().read_to_string(&mut buffer) {
-            Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::string(buffer)))),
-            Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
-                err.to_string(),
-            )))),
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let mut buf = Vec::new();
+            unsafe {
+                let mut temp = [0u8; 1024];
+                loop {
+                    match (*vm_ptr).console.read_stdin(&mut temp) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&temp[..n]),
+                        Err(e) => {
+                            return Ok(NativeCallResult::Return(Value::err(Value::string(
+                                e.to_string(),
+                            ))));
+                        }
+                    }
+                }
+            }
+            let s = String::from_utf8_lossy(&buf).into_owned();
+            Ok(NativeCallResult::Return(Value::ok(Value::string(s))))
+        } else {
+            let mut buffer = String::new();
+            match io::stdin().read_to_string(&mut buffer) {
+                Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::string(buffer)))),
+                Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
+                    err.to_string(),
+                )))),
+            }
         }
     }))
 }
@@ -469,31 +514,49 @@ fn create_io_read_line_fn() -> Value {
             ))));
         }
 
-        let mut line = String::new();
-        match io::stdin().read_line(&mut line) {
-            Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::string(line)))),
-            Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
-                err.to_string(),
-            )))),
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            match unsafe { (*vm_ptr).console.read_line_stdin() } {
+                Ok(line) => Ok(NativeCallResult::Return(Value::ok(Value::string(line)))),
+                Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
+                    err.to_string(),
+                )))),
+            }
+        } else {
+            let mut line = String::new();
+            match io::stdin().read_line(&mut line) {
+                Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::string(line)))),
+                Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
+                    err.to_string(),
+                )))),
+            }
         }
     }))
 }
 
 fn create_io_write_stdout_fn() -> Value {
     Value::NativeFunction(native_fn(|args: &[Value]| {
-        let mut stdout = io::stdout();
-        for arg in args {
-            if let Err(err) = write!(stdout, "{}", arg) {
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            unsafe {
+                for arg in args {
+                    let s = format!("{}", arg);
+                    (*vm_ptr).console.write_stdout(s.as_bytes());
+                }
+            }
+        } else {
+            let mut stdout = io::stdout();
+            for arg in args {
+                if let Err(err) = write!(stdout, "{}", arg) {
+                    return Ok(NativeCallResult::Return(Value::err(Value::string(
+                        err.to_string(),
+                    ))));
+                }
+            }
+
+            if let Err(err) = stdout.flush() {
                 return Ok(NativeCallResult::Return(Value::err(Value::string(
                     err.to_string(),
                 ))));
             }
-        }
-
-        if let Err(err) = stdout.flush() {
-            return Ok(NativeCallResult::Return(Value::err(Value::string(
-                err.to_string(),
-            ))));
         }
 
         Ok(NativeCallResult::Return(Value::ok(Value::Nil)))
@@ -511,6 +574,9 @@ fn create_os_module(vm: &VM) -> Value {
         (string_key("remove_dir"), create_os_remove_dir_fn()),
         (string_key("rename"), create_os_rename_fn()),
         (string_key("get_env"), create_os_get_env_fn()),
+        (string_key("getenv"), create_os_get_env_fn()),
+        (string_key("set_env"), create_os_set_env_fn()),
+        (string_key("setenv"), create_os_set_env_fn()),
     ];
     vm.map_with_entries(entries)
 }
@@ -661,17 +727,17 @@ fn create_os_create_file_fn() -> Value {
                 ))));
             }
         };
-        match fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            // An existing file is opened as is, not emptied.
-            .truncate(false)
-            .open(path)
-        {
-            Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
-            Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
-                err.to_string(),
-            )))),
+        let vfs = crate::vfs::current_vfs();
+        let path_obj = Path::new(path);
+        if !vfs.exists(path_obj) {
+            match vfs.write(path_obj, &[]) {
+                Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
+                Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
+                    err.to_string(),
+                )))),
+            }
+        } else {
+            Ok(NativeCallResult::Return(Value::ok(Value::Nil)))
         }
     }))
 }
@@ -692,7 +758,8 @@ fn create_os_create_dir_fn() -> Value {
                 ))));
             }
         };
-        match fs::create_dir_all(path) {
+        let vfs = crate::vfs::current_vfs();
+        match vfs.create_dir_all(Path::new(path)) {
             Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
@@ -717,7 +784,8 @@ fn create_os_remove_file_fn() -> Value {
                 ))));
             }
         };
-        match fs::remove_file(path) {
+        let vfs = crate::vfs::current_vfs();
+        match vfs.remove_file(Path::new(path)) {
             Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
@@ -742,7 +810,22 @@ fn create_os_remove_dir_fn() -> Value {
                 ))));
             }
         };
-        match fs::remove_dir(path) {
+        let vfs = crate::vfs::current_vfs();
+        let path_obj = Path::new(path);
+        let entries = match vfs.read_dir(path_obj) {
+            Ok(e) => e,
+            Err(err) => {
+                return Ok(NativeCallResult::Return(Value::err(Value::string(
+                    err.to_string(),
+                ))));
+            }
+        };
+        if !entries.is_empty() {
+            return Ok(NativeCallResult::Return(Value::err(Value::string(
+                "Directory not empty",
+            ))));
+        }
+        match vfs.remove_dir_all(path_obj) {
             Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
@@ -775,7 +858,8 @@ fn create_os_rename_fn() -> Value {
                 ))));
             }
         };
-        match fs::rename(from, to) {
+        let vfs = crate::vfs::current_vfs();
+        match vfs.rename(Path::new(from), Path::new(to)) {
             Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),
@@ -786,15 +870,12 @@ fn create_os_rename_fn() -> Value {
 
 fn create_os_get_env_fn() -> Value {
     Value::NativeFunction(native_fn(|args: &[Value]| {
-        // check for one value in args
         if args.len() != 1 {
             return Ok(NativeCallResult::Return(Value::err(Value::string(
                 "os.get_env(name) requires a single string name",
             ))));
         }
 
-        // convert the value with as_string().
-        // return Lust Err if it is not a string
         let name = match args[0].as_string() {
             Some(p) => p,
             None => {
@@ -804,18 +885,53 @@ fn create_os_get_env_fn() -> Value {
             }
         };
 
-        // match on std::env::var(name)
-        match std::env::var(name) {
-            Ok(value) => Ok(NativeCallResult::Return(Value::ok(Value::some(
+        let val_opt = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            unsafe { (*vm_ptr).env.get(name) }
+        } else {
+            std::env::var(name).ok()
+        };
+
+        match val_opt {
+            Some(value) => Ok(NativeCallResult::Return(Value::ok(Value::some(
                 Value::string(value),
             )))),
-            Err(std::env::VarError::NotPresent) => {
-                Ok(NativeCallResult::Return(Value::ok(Value::none())))
-            }
-            Err(std::env::VarError::NotUnicode(_)) => Ok(NativeCallResult::Return(Value::err(
-                Value::string("os.get_env(name) found a value that is not valid Unicode"),
-            ))),
+            None => Ok(NativeCallResult::Return(Value::ok(Value::none()))),
         }
+    }))
+}
+
+fn create_os_set_env_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() != 2 {
+            return Ok(NativeCallResult::Return(Value::err(Value::string(
+                "os.set_env(name, value) requires two string arguments",
+            ))));
+        }
+
+        let name = match args[0].as_string() {
+            Some(p) => p,
+            None => {
+                return Ok(NativeCallResult::Return(Value::err(Value::string(
+                    "os.set_env(name, value) requires a string name",
+                ))));
+            }
+        };
+
+        let val = match args[1].as_string() {
+            Some(v) => v,
+            None => {
+                return Ok(NativeCallResult::Return(Value::err(Value::string(
+                    "os.set_env(name, value) requires a string value",
+                ))));
+            }
+        };
+
+        if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            unsafe {
+                (*vm_ptr).env.set(name, val);
+            }
+        }
+        Ok(NativeCallResult::Return(Value::ok(Value::Nil)))
     }))
 }
 
@@ -3581,7 +3697,7 @@ mod tests {
     #[test]
     fn test_table_insert_push_and_remove_pop() {
         let mut vm = VM::with_config(&LustConfig::default());
-        let _guard = crate::vm::CurrentVmGuard::new(&mut vm);
+        let _guard = crate::vm::CurrentVmGuard::from_vm(&mut vm);
 
         let stdlib = create_stdlib(&LustConfig::default(), &vm);
         let table_mod = stdlib.iter().find(|(name, _)| *name == "table").unwrap().1.clone();

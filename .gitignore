@@ -13,4 +13,5 @@ mine/
 *.wasm
 *.zig
 /results/
+tests/compile_fail/fs_gate/target/
 

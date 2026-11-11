@@ -85,13 +85,26 @@ impl MinimalSimScheduler {
 
     pub fn with_seed(seed: u64) -> Self {
         let mut vm = VM::with_seed(seed);
-        // MinimalSimScheduler defaults to simulated clock for deterministic testing
+        // MinimalSimScheduler defaults to simulated clock, MemFs, isolated env, and captured console
         vm.clock = alloc::sync::Arc::new(LustClock::simulated(0, 0));
+        #[cfg(feature = "std")]
+        {
+            vm.vfs = alloc::sync::Arc::new(crate::vfs::MemFs::new());
+            vm.env = crate::vfs::VirtualEnv::isolated();
+            vm.console = crate::vfs::VirtualConsole::captured();
+        }
         Self::new(vm)
     }
 
     pub fn with_sim_clock(seed: u64, epoch_nanos: u64, monotonic_nanos: u64) -> Self {
-        Self::new(VM::with_sim_clock(seed, epoch_nanos, monotonic_nanos))
+        let mut vm = VM::with_sim_clock(seed, epoch_nanos, monotonic_nanos);
+        #[cfg(feature = "std")]
+        {
+            vm.vfs = alloc::sync::Arc::new(crate::vfs::MemFs::new());
+            vm.env = crate::vfs::VirtualEnv::isolated();
+            vm.console = crate::vfs::VirtualConsole::captured();
+        }
+        Self::new(vm)
     }
 
     pub fn with_step_limit(mut self, limit: u64) -> Self {
@@ -118,7 +131,7 @@ impl MinimalSimScheduler {
         }
         self.step_counter += 1;
 
-        let _vm_guard = crate::vm::CurrentVmGuard::new(&mut self.vm as *mut VM);
+        let _vm_guard = crate::vm::CurrentVmGuard::from_vm(&mut self.vm);
 
         let res = self.vm.resume_task_handle(handle, resume_val);
 
@@ -240,3 +253,35 @@ impl MinimalSimScheduler {
         self.gas_oracle.verify_step_progress(gas_after, 1)
     }
 }
+
+static SIMULATED_MODE_FLAG: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Check if global simulation mode is active.
+pub fn is_simulated_mode() -> bool {
+    SIMULATED_MODE_FLAG.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// Explicitly set global simulation mode.
+pub fn set_simulated_mode(active: bool) {
+    SIMULATED_MODE_FLAG.store(active, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// RAII Guard activating simulation mode for the scope of the guard.
+pub struct SimModeGuard {
+    prev: bool,
+}
+
+impl SimModeGuard {
+    pub fn enter() -> Self {
+        let prev = SIMULATED_MODE_FLAG.swap(true, core::sync::atomic::Ordering::SeqCst);
+        Self { prev }
+    }
+}
+
+impl Drop for SimModeGuard {
+    fn drop(&mut self) {
+        SIMULATED_MODE_FLAG.store(self.prev, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+

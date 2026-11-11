@@ -41,6 +41,8 @@ pub mod test_framework;
 pub mod typechecker;
 pub mod vm;
 pub mod sim;
+#[cfg(feature = "std")]
+pub mod vfs;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 pub use ast::{Expr, Item, Span, Stmt, Type};
@@ -97,4 +99,8 @@ pub use parser::Parser;
 pub use typechecker::{FunctionSignature, TypeChecker, TypeCollection};
 pub use vm::{NativeExport, NativeExportParam, VM};
 pub use sim::{GasProgressOracle, MinimalSimScheduler, StepOutcome};
+#[cfg(feature = "std")]
+pub use vfs::{
+    DirectHostFsBypassPanic, MemFs, OsFs, VfsMetadata, VirtualConsole, VirtualEnv, VirtualFileSystem,
+};
 pub use hashbrown;

@@ -2,272 +2,403 @@
 
 | Метаданные | Значение |
 |---|---|
-| **Статус** | На рассмотрении (Draft / Proposal for Review) |
+| **Версия документа** | 7.1 (DA Remediation — Specification Only) |
+| **Статус** | Исправленная архитектурная спецификация; runtime gates NOT RUN |
 | **Дата** | 2026-11-11 |
 | **Целевой репозиторий** | `repos/lust-lang-fork` (ветка `perf/10x-jit-optimization-suite`) |
 | **Методология** | Спецификация и рубрика `$mb3-dst` (D1–D8), FoundationDB DST Pattern, ZIO TestClock |
-| **Текущий DRS** | **35 / 100 (`DST-HOSTILE`)** (структурный недетерминизм: глобальный RNG, ОС-потоки в таймаутах, прямой `std::fs`) |
-| **Целевой DRS** | **95 / 100 (`DST-READY`)** |
+| **Базовый DRS** | **20 / 100 (`DST-HOSTILE`)** ($100 - 30_{D3} - 15_{D1} - 15_{D2} - 10_{D8} - 5_{D7} - 5_{TP}$) |
+| **Целевой DRS** | **100 / 100 (`DST-READY`)** (расчётная траектория, требующая исполнения gates: 20 → 40 → 55 → 85 → 85 → 100) |
 
 ---
 
-## 0. Введение и Мотивация
+## 0. Область Применимости, Матрица Профилей и Автономный Replay Bundle
 
-Язык **Lust** обладает богатой семантикой среды исполнения:
-1. **Структурированная конкурентность (Fibers & Scopes)**: легкие кооперативные потоки/волокна, области видимости с LIFO-финализацией, маски прерываний (`FiberContext`, `InterruptMask`).
-2. **First-Class Effects (ZIO-Style)**: алгебраические эффекты `Effect<A, E, R>`, комбинаторы `retry`, `repeat`, `acquire_release`, `timeout`.
-3. **Реактивные потоки (Rx)**: `Observable`, `RxScheduler`, `VirtualClock`, `ScopeJoinCoordinator`, управление противодавлением (backpressure).
-4. **Встроенный ввод-вывод и пакетный менеджер**: загрузка модулей, чтение/запись файлов, резолв зависимостей.
+### 0.1. Матрица целевых профилей (Profile Matrix)
+* **Tier-1 DST (Primary Execution & Concurrency Target)**:
+  * *Среда*: `std`, 64-битные платформы (`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`), числовой профиль `std_64` (`LustInt = i64`, `LustFloat = f64`).
+  * *Подсистемы*: Байткод-интерпретатор VM, стек структурированной конкурентности (Fibers, Scopes, Interrupt Masks), First-Class Effects (`effect_abi`), реактивный планировщик `RxScheduler` и координаторы завершения `ScopeJoinCoordinator` / `close_and_wait_quiescent`.
+  * *Гарантия*: **Пошаговый Bit-for-Bit Replay** детерминированной трассы при фиксированном Replay Bundle на совместимой платформе.
+* **Tier-2 DST (JIT & MIR Execution)**:
+  * *Среда*: Cranelift JIT и нативные циклы.
+  * *Требование*: Перенос контекста бюджетов (`GAS_REMAINING`, `MEMORY_USED`, `LAST_STATUS`, `MAX_MEMORY_LIMIT`) из глобальных атомиков в инкапсулированный `MirContext`.
+  * *Гарантия*: Детерминированное чередование на границах вызовов runtime helpers и компилируемых safepoints.
+* **Tier-3 DST (Embedded / no_std)**:
+  * *Среда*: `no_std`, 32-битные платформы (`rv32`, `esp32c6`), числовой профиль `nostd_32` (`LustInt = i32`, `LustFloat = f32`).
+  * *Гарантия*: **Семантическая эквивалентность переходов состояний**. Симулятор запускается на host-машине с типизацией `nostd_32` без привлечения 64-битных атомиков.
 
-### Проблема традиционного тестирования
-Конкурентные ошибки (гонки волокон, утечки финализаторов при гонке с прерыванием, дедлоки на закрытии скоупа) в обычных интеграционных тестах либо:
-- Проявляются спорадически (флакающие тесты);
-- Требуют `sleep(10ms)`, замедляя тестовый сьют;
-- Не дают воспроизводимого сценария падения.
+### 0.2. Автономный Replay Bundle и Execution Snapshot Lock
+Автономность означает наличие всех исходных и входных данных без Git, сети и ранее заполненного Cargo cache. Совместимый toolchain и системный linker/SDK — явно проверяемые prerequisites; их версии и digest образа среды фиксируются в manifest. Сам `Cargo.lock` не содержит исходников зависимостей.
 
-### Цель DST (Deterministic Simulation Testing)
-Превратить выполнение любого сложного конкурентного сценария в **детерминированную функцию**:
-$$\text{Trace} = f(\text{Seed}, \text{VirtualClock}, \text{InterleavingStrategy}, \text{FaultInjectionStream})$$
+1. **Снимок входов сборки**:
+   - Перед кампанией фиксируется весь исходный checkout: tracked-файлы в их текущем состоянии и явно включённые untracked inputs. Учитываются staged, unstaged и бинарные изменения. Hash дерева, а не один git SHA, идентифицирует исполняемые исходники.
+   - Минимально включаются `src/`, `crates/`, `tests/`, `benchmarks/`, `examples/`, `include/`, `Cargo.toml`, `Cargo.lock`, `build.rs`, README и LICENSE-файлы, Cargo/toolchain configuration, fixtures и файлы из `include_str!` / `include_bytes!`. Рекурсивно учитываются manifest каждого workspace member и path dependencies; внешние пути и symlinks не должны уходить за границу снимка.
+   - Перечень выше не является закрытым allowlist. Реальные targets определяются через `cargo metadata` для каждого заявленного профиля, включая автопоиск и `[[test]]` / `[[bench]]`. Build scripts и proc macros требуют учёта собственных входов.
+   - `git status --ignored --porcelain --untracked-files=all` используется как инвентаризация, а не доказательство полноты. Игнорируемые исходные входы должны быть явно включены и хешированы либо отклонены с `UncommittedIgnoredSourceFile`. Сгенерированные выходы создаются в `OUT_DIR` из упакованных входов. `.git/`, build outputs и host credentials не упаковываются.
+2. **Замыкание зависимостей**:
+   - В bundle входят `vendor/` с транзитивными registry/git dependencies и Cargo source-replacement configuration. Path dependencies входят в исходное дерево. Запрещены внешние symlinks и незафиксированные загрузки build scripts.
+   - Версии, features, target triple, numeric profile, rustc/Cargo, build flags и digest toolchain/SDK фиксируются в `manifest.json`. Переменные сборки передаются по явному allowlist; остальные не наследуются.
+3. **Execution Snapshot Lock**:
+   - Снимок формируется и запечатывается до компиляции и запуска кампании. Компиляция и выполнение идут только из его распакованной копии; `target/` и `OUT_DIR` находятся вне неизменяемых исходников. Hash входов проверяется до и после сборки; build script не может незаметно изменить их.
+   - Изменение рабочей копии после фиксации не влияет на кампанию и её replay. Исходный snapshot сохраняется до завершения кампании; bundle не собирается заново из live checkout.
+4. **Состав bundle**:
+   - `manifest.json`, `source_tree.tar`, `vendor/`, source-replacement configuration и hashes каждого артефакта.
+   - `initial_vfs.tar`, `env.json`, исходная программа/сценарий, seed, алгоритм и версия PRNG, параметры quantum, лимиты шагов и fault configuration.
+   - `events.jsonl`: payload внешних ответов, request identity/sequence и точный порядок доставки при совпадающем шаге (`event_id`, `req_seq`, `ready_at_step`, `payload_bytes`).
+   - Failing witness: код нарушенного инварианта, шаг и каноническая трасса либо её hash с описанием сериализации; версия scheduler/oracle и параметры shrinking. Результат shrinking воспроизводится с соответствующими ему входами.
+5. **Приёмка replay (Gate 6)**:
+   - Распаковать bundle в чистую изолированную директорию, проверить hashes и отсутствие выходящих symlinks. Использовать пустой `CARGO_HOME`, отключённую сеть и только объявленный toolchain/SDK.
+   - Выполнить `cargo metadata --offline --locked`, `cargo check --offline --locked` и целевые тесты `cargo test --offline --locked` с точными features/targets кампании. Полнота исходников исключает missing-path ошибки, но не гарантирует успешную компиляцию или прохождение тестов.
+   - Воспроизвести тот же invariant failure и witness trace; отдельно проверить, что правка live checkout после snapshot не меняет результат. Отсутствующая зависимость, вход или несовпадение trace блокируют gate.
 
-**Главный инвариант DST:** Если тест упал на сиде `SEED=0xCAFEBABE`, он обязан гарантированно упасть с идентичным трассировочным логом на любой машине и в любой среде.
+### 0.3. Контракт Внешних Событий и FFI
+В Tier-1 симуляции неконтролируемые фоновые потоки ОС полностью исключены:
+1. Вызовы FFI и хоста разделяются на:
+   - *Детерминированные моки*: немедленный возврат синтетического ответа через `MemFs` или `VirtualConsole`.
+   - *Асинхронные события*: запрос помещается в очередь симулятора, а ответ доставляется строго по расписанию планировщика (из детерминированного PRNG в режиме exploration или из `events.jsonl` в режиме replay).
+2. Любой немоделированный синхронный блокирующий вызов хоста (`BlockingHostCall`) запрещён внутри симуляции и приводит к немедленному fail-stop падению теста.
 
 ---
 
-## 1. Полная Инвентаризация Поверхностей (Surfaces Inventory по D1–D8)
-
-Аудит кодовой базы `repos/lust-lang-fork` выявил следующие поверхности недетерминизма и записи (write-surfaces):
+## 1. Исчерпывающая Инвентаризация Поверхностей (Surfaces Inventory по D1–D8)
 
 ### D1: Время и Таймеры (Clock & Timers)
-| Локация | Обнаруженный паттерн | Влияние на детерминизм | Требуемый шов (Seam) |
-|---|---|---|---|
-| `src/effect_abi.rs:620` | `std::time::Duration`, `recv_timeout` | Блокирует поток ОС, зависит от системного таймера | Использовать таймеры виртуального шедулера без блокировок |
-| `src/vm/stdlib.rs:502` | `SystemTime::now()` в `os.time()` / `os.date()` | Возвращает физическое время хоста | Проброс `Clock::now()` из инстанса `VM` |
-| `src/vm/stdlib.rs:541` | `thread::sleep(Duration)` в `os.sleep()` | Физическая задержка потока ОС | Перевод волокна в состояние `Yielded(TimerId)` в виртуальном времени |
-| `src/rx/scheduler.rs:62,120` | `Instant::now()` + `condvar.wait_timeout` | Гонка по физическому времени в `ScopeJoinCoordinator` | Виртуальная координация завершения скоупов без ОС `Condvar` |
-| `src/model/entity.rs:140` | `SystemTime::now().duration_since(...)` | Таймстемпы сущностей недетерминированы | Инъекция `SimClock` в контекст модели |
-| `src/test_framework/clock.rs` | `TestClockState` | Уже содержит виртуальное время для тестов эффектов | Унифицировать как ядро для всех подсистем |
+1. **`src/effect_abi.rs:614` (`timeout`)**:
+   *Шов*: разделение на чистые волоконные эффекты (управляемые через `TimerQueue` в `LustClock`) и изолированные хостовые вызовы.
+2. **`src/vm/stdlib.rs:502` (`os.time`, `os.date`)**:
+   *Шов*: проброс `WallClock::now_epoch_nanos()` через контекст `VM`.
+3. **`src/vm/stdlib.rs:541` (`os.sleep`)**:
+   *Шов*: перевод текущего волокна в состояние `TaskState::Yielded(TimerId)` в очереди виртуальных таймеров без блокировки потока ОС.
+4. **`src/rx/scheduler.rs:62, 120` & `src/rx/lifecycle.rs:316`**:
+   *Шов*: раздельные детерминированные протоколы ожидания квиесценции для закрытого и открытого скоупа.
+5. **Разделение контрактов времени**:
+   * `WallClock`: календарное время для `os.time()` / `os.date()`.
+   * `MonotonicClock`: строго монотонный счётчик наносекунд для дедлайнов таймеров.
+   * `TimerControl`: интерфейс управления виртуальным временем (доступен исключительно тестовому harness).
 
 ### D2: Энтропия и Генерация Случайных Чисел (PRNG)
-| Локация | Обнаруженный паттерн | Влияние на детерминизм | Требуемый шов (Seam) |
-|---|---|---|---|
-| `src/vm/stdlib.rs:20` | `static RNG: OnceLock<Mutex<StdRng>>` | **Критический DST-блокер**. Глобальный статический RNG для всех VM и тестов | Вынести RNG в поле структуры `VM`. Инициализация от сида симулятора |
-| `src/vm/stdlib.rs:2944` | `math.randomseed(seed)` | Мутирует глобальный статический мьютекс | Мутировать только локальный генератор данной `VM` |
+1. **`src/vm/stdlib.rs:20`**: `static RNG: OnceLock<Mutex<StdRng>>`.
+   *Шов*: локализация генератора внутри инстанса `VM` (`vm.rng: Box<dyn RngCore + Send>`). Конструктор `VM::with_seed(seed: u64)`.
+2. **`src/vm/stdlib.rs:2944` (`math.randomseed`)**: Мутирует локальный RNG конкретной `VM`.
 
 ### D3: Хранилище, VFS и Файловая Система (Storage & I/O)
-| Локация | Обнаруженный паттерн | Влияние на детерминизм | Требуемый шов (Seam) |
-|---|---|---|---|
-| `src/vm/stdlib.rs:315-677` | `fs::read_to_string`, `fs::write`, `fs::create_dir_all`, `fs::rename`, `fs::remove_file` | Прямые системные вызовы к диску хоста | Введение абстракции `VirtualFileSystem (Vfs)`: `OsFs` vs `MemFs` |
-| `src/modules/mod.rs:299` | `fs::read(&resolved)` при импорте модулей | Зависимость от реальной ФС | Чтение модулей через `vm.vfs.read()` |
-| `src/packages/registry.rs` | `fs::write`, `fs::remove_file`, `curl` | Зависимость от сети и реального диска | Mock-хранилище пакетов в памяти |
+1. **Интерфейс `VirtualFileSystem` (ровно 12 методов)**:
+   ```rust
+   pub trait VirtualFileSystem: Send + Sync {
+       fn read(&self, path: &Path) -> Result<Vec<u8>, std::io::Error>;
+       fn read_to_string(&self, path: &Path) -> Result<String, std::io::Error>;
+       fn write(&self, path: &Path, contents: &[u8]) -> Result<(), std::io::Error>;
+       fn append(&self, path: &Path, contents: &[u8]) -> Result<(), std::io::Error>;
+       fn create_dir_all(&self, path: &Path) -> Result<(), std::io::Error>;
+       fn remove_file(&self, path: &Path) -> Result<(), std::io::Error>;
+       fn remove_dir_all(&self, path: &Path) -> Result<(), std::io::Error>;
+       fn rename(&self, from: &Path, to: &Path) -> Result<(), std::io::Error>;
+       fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>, std::io::Error>;
+       fn metadata(&self, path: &Path) -> Result<VfsMetadata, std::io::Error>;
+       fn canonicalize(&self, path: &Path) -> Result<PathBuf, std::io::Error>;
+       fn exists(&self, path: &Path) -> bool;
+   }
+   ```
+2. **Семантика VFS и нормализация**:
+   * Все пути приводятся к каноническому POSIX-виду относительно `/workspace`.
+   * `read_dir` гарантирует детерминированную лексикографическую сортировку возвращаемых путей.
+   * `canonicalize` резолвит сегменты `.` и `..` внутри виртуального корня.
+3. **Ликвидация обходов**: Прямые системные вызовы `std::fs::canonicalize` в `src/bindgen.rs:122` и `Path::exists()` в `src/modules/mod.rs:504` перенаправляются в `vm.vfs`.
+4. **Контроль хостового I/O: lint, facade guard и изоляция процесса**:
+   * **Уровень компиляции (Compile-Time Blacklist Gate)**:
+     Следующий явный baseline запрещает известные файловые входы через `clippy.toml`. Это не перехват системных вызовов и не исчерпывающее доказательство отсутствия I/O:
+     ```toml
+     disallowed-methods = [
+         "std::fs::read",
+         "std::fs::read_to_string",
+         "std::fs::write",
+         "std::fs::read_dir",
+         "std::fs::create_dir",
+         "std::fs::create_dir_all",
+         "std::fs::remove_file",
+         "std::fs::remove_dir",
+         "std::fs::remove_dir_all",
+         "std::fs::rename",
+         "std::fs::copy",
+         "std::fs::hard_link",
+         "std::fs::soft_link",
+         "std::fs::metadata",
+         "std::fs::symlink_metadata",
+         "std::fs::canonicalize",
+         "std::fs::set_permissions",
+         "std::path::Path::exists",
+         "std::path::Path::try_exists",
+         "std::path::Path::is_file",
+         "std::path::Path::is_dir",
+         "std::path::Path::is_symlink",
+         "std::path::Path::metadata",
+         "std::path::Path::symlink_metadata",
+         "std::path::Path::canonicalize",
+         "std::path::Path::read_dir",
+         "std::path::Path::read_link",
+         "std::fs::read_link",
+         "std::fs::exists",
+         "std::fs::DirBuilder::new",
+         "std::fs::DirBuilder::create",
+         "std::fs::File::open",
+         "std::fs::File::create",
+         "std::fs::File::create_new",
+         "std::fs::File::options",
+         "std::fs::OpenOptions::new",
+         "std::fs::OpenOptions::open"
+     ]
+     disallowed-types = [
+         "std::fs::File",
+         "std::fs::OpenOptions",
+         "std::fs::DirEntry",
+         "std::fs::ReadDir",
+         "std::fs::Metadata",
+         "std::fs::Permissions",
+         "std::fs::DirBuilder"
+     ]
+     ```
+     Команда проверки production workspace: `cargo clippy --all-targets -- -D clippy::disallowed_methods -D clippy::disallowed_types`, отдельно для каждого поддержанного набора features/target. Toolchain закреплён; неизвестный или неразрешившийся lint path считается ошибкой конфигурации, а не успешным запретом.
+     Единственное локальное разрешение host filesystem lint: `src/vfs/os_fs.rs`. Новые `allow`/`expect`, платформенные API (`std::os::*::fs`), raw descriptors, FFI и зависимости с I/O проверяются аудитом доступных из SUT путей; транзитивный код не покрывается этим Clippy gate автоматически.
+   * **Runtime facade guard**:
+     Каждая операция `OsFs` проверяет режим исполнения до host I/O, включая сохранённые ранее handles; попытка в симуляции даёт `DirectHostFsBypassPanic`. Проверки только при создании VM недостаточно. Guard не перехватывает прямой `std::fs`, libc или стороннюю библиотеку.
+   * **Изоляция процесса**:
+     Gate 3 запускает реальный SUT в дочернем процессе под внешним watchdog с проверенным для данной платформы запретом host filesystem I/O вне минимального bootstrap allowlist. После bootstrap доступы SUT идут через MemFs. Матрица Linux/macOS фиксирует конкретный backend и границы разрешений. Если backend отсутствует или bypass canary проходит, профиль получает `UNVERIFIED` и gate не закрывается; обычные chmod и переменная окружения sandbox не заменяют.
+   * **Отрицательные тесты без конфликта с `--all-targets`**:
+     - Отдельный fixture crate `tests/compile_fail/fs_gate/` исключён из production workspace и содержит явный `[[test]] name = "direct_std_fs", path = "direct_std_fs.rs"`. В нём используется тот же `clippy.toml`, совпадение проверяется по hash.
+     - Из cwd fixture выполняется `cargo clippy --test direct_std_fs -- -D clippy::disallowed_methods -D clippy::disallowed_types`. Каждый canary проверяется отдельным прогоном: `fs::read`, конструкторы File/OpenOptions/DirBuilder, запрещённый тип, методы Path и платформенные входы. Требуются ненулевой exit и соответствующий lint code/span именно canary; `no test target`, ошибки конфигурации и посторонние ошибки не засчитываются. Разрешённый контрольный пример обязан собираться.
+     - `tests/dst_vfs_bypass_negative.rs` отдельно проверяет facade panic и отклонение raw host I/O из SUT. Canary обращается к существующему host-only файлу, отсутствующему в MemFs; вне изоляции контроль подтверждает, что файл читается. Обход blacklist должен обнаруживаться независимо от OsFs.
 
-### D4: Конкурентность и Порядок Исполнения (Scheduling & Concurrency)
-| Локация | Обнаруженный паттерн | Влияние на детерминизм | Требуемый шов (Seam) |
-|---|---|---|---|
-| `src/effect_abi.rs:626` | `std::thread::spawn` в `timeout()` | Порождает реальный поток ОС; планировщик ОС недетерминирован | Реализация комбинатора `timeout` через виртуальный планировщик волокон |
-| `src/vm/tasks.rs` | `TaskManager`, очередь исполнения задач | Порядок исполнения задач детерминирован, но не исследует перестановки | Добавление режима псевдослучайного чередования шагов волокон (Fiber Interleaving) |
-| `src/embed/async_runtime.rs` | `AsyncTaskQueue` на `Mutex` и `Condvar` | Порядок пробуждения потоков зависит от ОС | Детерминированный `SimAsyncRuntime` |
+### D4: Конкурентность, Шедулинг и Изоляция Процессного Состояния (Scheduling & State)
+1. **Изоляция 4 глобальных атомиков MIR (`src/mir/runtime_helpers.rs:5`)**:
+   * `GAS_REMAINING`, `MEMORY_USED`, `LAST_STATUS`, `MAX_MEMORY_LIMIT` переносятся в структуру `MirContext`.
+   * Активный контекст хранится в потоковом RAII-стеке `CURRENT_MIR_STACK` для безопасной реентрантности FFI.
+2. **Изоляция Lua Registry (`src/lua_compat/mod.rs:38`)**:
+   * TLS-хранилище реестра и монотонный счётчик `NEXT_LUA_FUNCTION_ID` привязываются к инстансу `LuaCompatContext`.
+3. **Полный контракт возобновляемого продолжения (FiberContinuation)**:
+   Сохраняются все компоненты контекста:
+   ```rust
+   pub struct FiberContinuation {
+       pub call_stack: Vec<Box<CallFrame>>, // стек вызовов с регистрами фреймов
+       pub ip: usize,                       // точный instruction pointer
+       pub pending_return_value: Option<Value>,
+       pub pending_return_dest: Option<Register>,
+       pub yield_dest: Option<Register>,
+       pub fiber_context: FiberContext,     // маски прерываний, pending_interrupt, scope_id
+       pub upvalues: Vec<Rc<RefCell<Upvalue>>>,
+   }
+   ```
+4. **Раздельные Протоколы Квиесценции для Двух Entrypoint (Закрытый vs Открытый Скоуп)**:
+   * **Случай А: `close_and_wait_quiescent` (Закрытый Скоуп — Permanent Quiescence)**:
+     1. Под замком `registry.lock()`:
+        - Атомарно устанавливается `reg.closed_scopes.insert(scope_id)` — регистрация новых участников для данной идентичности scope блокируется до конца её жизненного цикла (см. правило retirement ниже).
+        - Проверка: если `active_participants == 0` — немедленный возврат `true`.
+        - Иначе: регистрируется `WaiterEntry` в состоянии `Registered`. Если задан `timeout`, в таймерах регистрируется дедлайн.
+     2. Освобождение мьютекса (`Mutex::unlock()`).
+     3. Уступка управления: `Scheduler::yield_until_woken(waiter_id)`.
+     4. При выходе последнего участника (`active == 0`) под замком `registry.lock()`: waiter переводится в `Woken`, таймер отменяется, волокно переводится в готовую очередь.
+     5. При тайм-ауте под замком `registry.lock()`: если waiter ещё `Registered`, переводится в `TimedOut`. Если уже `Woken`, тайм-аут игнорируется.
+     6. При пробуждении под замком `registry.lock()`: если `Woken` — возврат `true` (admission для данной идентичности остаётся закрытым); если `TimedOut` — финальная проверка `active == 0` и возврат результата.
+   * **Случай Б: `wait_for_quiescence` (Открытый Скоуп — Transient Quiescence)**:
+     1. Выполняет шаги 1–4 регистрации и ожидания под замком `registry.lock()`, но **без закрытия admission**.
+     2. При пробуждении по `Woken` под замком `registry.lock()`: **обязательная повторная проверка `active_participants == 0`**:
+        - Если `active == 0` — квиесценция подтверждена, возврат `true`.
+        - Если до возобновления waiter зарегистрировался новый участник (`active > 0`): **немедленный возврат `true` запрещён!** Если дедлайн не истёк — под тем же замком waiter переводится обратно в `Registered`, восстанавливается таймер на **исходный абсолютный дедлайн** (шаг А.4 отменил предыдущий таймер), затем выполняется атомарная парковка по контракту ниже. Продлевать дедлайн на исходную duration запрещено. При истечении дедлайна возвращается `false`.
+     3. `TimedOut` обрабатывается как в А.6: финальная проверка `active == 0` под замком. При `timeout = None` таймер не создаётся. После терминального результата waiter удаляется, оставшиеся timer/ready entries инвалидируются.
+   * **Retirement и идентичность scope**: в текущем `src/rx/scheduler.rs::retire_scope` удаляется `closed_scopes`, а `lifecycle.rs::join` вызывает retirement. Поэтому нынешний код не обеспечивает постоянного запрета повторной регистрации. Внедрение обязано сохранить закрытый tombstone для той же идентичности либо использовать generation-qualified capability, отклоняющую устаревшие handles. Очистка памяти допустима только при невозможности обращения через старую идентичность; отсутствие записи не означает разрешение регистрации. Gate 2 проверяет `close → retire → register(old_scope)` и retirement до возобновления waiter. Это требование изменения реализации, а не утверждение о текущем runtime.
+   * **Retained wake / атомарная парковка**: `yield_until_woken` сначала проверяет состояние waiter; `Woken`/`TimedOut` не паркуются. Проверка и установка parked-состояния атомарны относительно notify и timeout, с явно закреплённым порядком registry/scheduler locks. Запрещено удерживать registry lock при фактической уступке. Каждый цикл повторной регистрации имеет generation token; устаревшие timer/ready события игнорируются, enqueue выполняется не более одного раза на generation.
+   * **Обязательный контрпример Gate 2**: deadline=10, notify при t=2 отменяет таймер; re-admission при t=3; resume при t=4 повторно паркует waiter; новый участник не выходит до t=10. Результат обязан быть `false` при deadline, без внешнего watchdog. Тест убивает мутант «не восстановить таймер»; отдельный мутант «вернуть true по Woken без recheck» выявляется тем же re-admission порядком. Это проверяется на реальном coordinator и scheduler, а не только на модели протокола.
 
 ### D5: Адресная память и Порядок Итерации (Memory Address Nondeterminism)
-| Локация | Обнаруженный паттерн | Влияние на детерминизм | Требуемый шов (Seam) |
-|---|---|---|---|
-| `src/bytecode/value.rs:2169` | `SPECIALIZED_*_CACHE` с ключом `arr_ptr: usize` | **Высокий риск**. Указатели в куче зависят от ASLR и порядка аллокаций | Использование стабильных монотонных `ObjectId` или изоляция кэша внутри инстанса `VM` |
-| `src/vm/mod.rs` | `foldhash::fast::FixedState` | **PASS**. Уже защищено фиксированным сидом для стабильности хэширования | Сохранить и расширить на все мапы рантайма |
+1. **Квалификация идентификаторов кэшей специализаций (`src/bytecode/value.rs:2169`)**:
+   * Замена сырых указателей памяти `arr_ptr: usize` на композитный детерминированный ключ `(VmId, ArraySequenceId)`.
+   * `VmId` выделяется монотонно планировщиком; `ArraySequenceId` выделяется монотонно внутри конкретной `VM`. Это гарантирует отсутствие коллизий в общем TLS-кэше при работе нескольких VM на одном потоке.
 
-### D6: Инкапсуляция Состояния и Изоляция (State Encapsulation)
-| Локация | Обнаруженный паттерн | Влияние на детерминизм | Требуемый шов (Seam) |
-|---|---|---|---|
-| `src/bytecode/value.rs:593` | `thread_local! { NAMES }` | Интернер строк общий для потока | Очистка при сбросе/пересоздании симулятора |
-| `src/vm/mod.rs:47` | `thread_local! { CURRENT_VM_STACK }` | Стек активных VM для FFI | Гарантировать корректную очистку через RAII guard |
-
-### D7: Проверяемые Инварианты Рантайма (Runtime Invariants)
-В рантайме должны быть формализованы и проверяться fail-stop инварианты:
-1. **INV-FIBER-01 (Scope Finalizer LIFO)**: Финализаторы скоупа обязаны выполняться строго в порядке, обратном регистрации, даже при принудительной отмене (`InterruptReason::Cancelled`).
-2. **INV-FIBER-02 (Interrupt Mask Inviolability)**: Волокно, находящееся внутри маски прерывания (`is_masked() == true`), ни при каких условиях не может быть остановлено внешним сигналом до выхода из маски.
-3. **INV-FIBER-03 (No Orphaned Tasks in Scope)**: Скоуп не может перейти в состояние `ScopeTeardown::Done`, пока хотя бы одна дочерняя задача находится в состоянии `Ready` или `Running`.
-4. **INV-RX-01 (Quiescent Participant Drain)**: При закрытии подписки число активных участников (`active_participants`) обязано стать строго равным 0.
-5. **INV-BUDGET-01 (Gas Monotonicity)**: Расход газа (`BudgetState`) обязан быть монотонно невозрастающим при шагах вычислений.
-
-### D8: Инъекция Сбоев (Fault Injection)
-Необходимы управляемые точки генерации сбоев по заданному профилю вероятностей:
-- `Fault::VfsError(std::io::ErrorKind)` — ошибки диска (диск полон, нет прав, разорван пайп);
-- `Fault::Interrupt(InterruptReason)` — спонтанная доставка отмены или таймаута в случайный момент кооперативного `yield`;
-- `Fault::OutOfMemory` — имитация сбоя аллокации при росте структур данных.
+### D6: Окружение и Ввод-Вывод (Environment & Console)
+1. **Виртуализация окружения (`src/vm/stdlib.rs:733`)**: Таблица `VirtualEnv` изолирует переменные процесса.
+2. **Виртуализация консоли (`src/vm/stdlib.rs:449`)**: `VirtualConsole` перехватывает stdin/stdout/stderr в буферы симуляции.
 
 ---
 
-## 2. Архитектура Механизма DST (`SimulatorEnv`)
+## 2. Формальные Инварианты с «Зубами» (High-Teeth Invariants)
 
-```mermaid
-flowchart TD
-    subgraph TestHarness["DST Test Runner (iterations: 1..N)"]
-        Seed["Current Seed: u64"] --> SimEnv["SimulatorEnv"]
-    end
+Каждый инвариант снабжён независимым предикатом завершимости (liveness) и проверяется fail-stop:
 
-    subgraph SimEnv["Simulator Environment"]
-        SimClock["SimClock (Virtual Time)"]
-        SimRng["SimRng (Deterministic ChaCha8/Xoshiro)"]
-        SimVfs["SimVfs (In-Memory File System)"]
-        FaultInjector["Fault Injector (Configurable Failure Rate)"]
-    end
-
-    subgraph Engine["Lust Runtime Core (Unmodified Bytecode)"]
-        DES["Discrete Event Scheduler (DES)"]
-        VM["Lust VM Instance"]
-        Fibers["Fiber Task Manager"]
-        RxEngine["Rx Scheduler & Observables"]
-    end
-
-    subgraph Monitor["Runtime Invariant Monitor"]
-        InvChecker["Fail-Stop Invariant Asserts"]
-        TraceLogger["Deterministic Replay Trace"]
-    end
-
-    SimEnv --> Engine
-    SimClock --> DES
-    SimRng --> DES
-    SimRng --> VM
-    SimVfs --> VM
-    FaultInjector --> SimVfs
-    FaultInjector --> Fibers
-
-    DES --> Fibers
-    DES --> RxEngine
-    Fibers --> InvChecker
-    RxEngine --> InvChecker
-    InvChecker -->|Violation detected| TraceLogger
+```
++-----------------------------------------------------------------------------------------------------+
+|                                      FAIL-STOP INVARIANTS                                           |
++--------------------------+------------------------------------+-------------------------------------+
+| Идентификатор            | Формулировка Safety                | Формулировка Liveness (Защита завис)|
++--------------------------+------------------------------------+-------------------------------------+
+| INV-FIBER-01 (LIFO)      | Exactly-Once: каждый               | Completion Guarantee: к моменту     |
+|                          | зарегистрированный ресурс          | закрытия скоупа счётчик выполненных |
+|                          | финализируется строго 1 раз        | финализаторов обязан быть равен     |
+|                          | в точном порядке LIFO.             | общему числу зарегистрированных (>0)|
++--------------------------+------------------------------------+-------------------------------------+
+| INV-FIBER-02 (Masking)   | Preserved Delivery: отложенная     | Bound Safe Point: доставка отмены   |
+|                          | отмена не теряется и сохраняется   | обязана произойти ровно на N=1      |
+|                          | внутри маски любого уровня.        | инструкции после выхода из внешней  |
+|                          |                                    | маски.                              |
++--------------------------+------------------------------------+-------------------------------------+
+| INV-FIBER-03 (Teardown)  | Full Quiescence: Scope не может    | Termination Bound: все дочерние     |
+|                          | стать Done, пока дочерние задачи   | задачи обязаны достичь терминала    |
+|                          | не перейдут в Completed, Failed    | за ограниченный квант шагов         |
+|                          | или Stopped (включая Yielded!).    | max_execution_steps (fail-stop).    |
++--------------------------+------------------------------------+-------------------------------------+
+| INV-RX-01 (Quiescence)   | Zero-Leak: после завершения        | Active Rejection: сценарий          |
+|                          | join() ни один callback не         | производит попытку записи после     |
+|                          | выполняет запись в sink.           | join, проверяя отказ/дроп.          |
++--------------------------+------------------------------------+-------------------------------------+
+| INV-BUDGET-01 (Gas)      | Progress Accounting: при каждом    | Non-Stall Invariant: суммарный газ  |
+|                          | шаге вычислений gas_used строго    | растёт пропорционально числу        |
+|                          | монотонно возрастает на вес опкода.| выполненных инструкций.             |
++--------------------------+------------------------------------+-------------------------------------+
 ```
 
-### 2.1. Контракты интерфейсов (Seams)
-
-#### Унифицированный трейт времени (`src/test_framework/clock.rs` / `src/rx/clock.rs`):
-```rust
-pub trait LustClock: Send + Sync {
-    fn now_nanos(&self) -> u64;
-    fn now_ms(&self) -> u64 { self.now_nanos() / 1_000_000 }
-    fn advance(&self, duration: core::time::Duration);
-    fn is_virtual(&self) -> bool;
-}
-```
-
-#### Виртуальная файловая система (`src/vm/vfs.rs`):
-```rust
-pub trait VirtualFileSystem: Send + Sync {
-    fn read_to_string(&self, path: &Path) -> Result<String, std::io::Error>;
-    fn write(&self, path: &Path, contents: &[u8]) -> Result<(), std::io::Error>;
-    fn create_dir_all(&self, path: &Path) -> Result<(), std::io::Error>;
-    fn remove_file(&self, path: &Path) -> Result<(), std::io::Error>;
-    fn exists(&self, path: &Path) -> bool;
-}
-```
-
-#### Детерминированный планировщик чередования (DES):
-Вектор готовых задач `VecDeque<TaskId>` переупорядочивается с использованием `SimRng`:
-```rust
-pub struct DeterministicScheduler {
-    clock: Arc<dyn LustClock>,
-    rng: SimRng,
-    ready_fibers: Vec<TaskId>,
-}
-
-impl DeterministicScheduler {
-    pub fn step_next_fiber(&mut self, vm: &mut VM) -> StepResult {
-        if self.ready_fibers.is_empty() {
-            return StepResult::Idle;
-        }
-        // Детерминированный псевдослучайный выбор следующего волокна для кванта исполнения
-        let idx = self.rng.gen_range(0..self.ready_fibers.len());
-        let task_id = self.ready_fibers.swap_remove_back(idx);
-        vm.run_fiber_quantum(task_id, 100 /* instruction fuel */)
-    }
-}
-```
+### Независимый Лимит Шагов и Внешний Watchdog
+Для гарантированной защиты от бесконечных циклов в симуляции:
+1. **Счётчик шагов симулятора (`sim_step_counter`)**: Физический счётчик циклов шедулера в тестовом harness, полностью независимый от гостевого `gas_used` (который может быть сломан мутантом). При достижении `max_execution_steps` тест аварийно останавливается с вердиктом `EXHAUSTION_LIMIT_REACHED`.
+2. **Внешний Watchdog Процесса**: Тестовый процесс оборачивается в системный watchdog с тайм-аутом 5 секунд. Срабатывание watchdog считается аварийным исходом (`FAIL: WATCHDOG_TIMEOUT`) и категорически не засчитывается как успешное обнаружение дефекта.
 
 ---
 
-## 3. Пошаговый План Реализации (Roadmap)
+## 3. Точный Мутационный Контроль Приёмки (Mutation Acceptance Gate)
 
-### Фаза 1: Устранение глобального недетерминизма (Quick Wins)
-- [ ] **1.1. Инкапсуляция RNG в инстансе `VM`**:
-  - Файлы: `src/vm/stdlib.rs`, `src/vm/mod.rs`, `src/vm/api.rs`.
-  - Действие: Удалить `static RNG: OnceLock<Mutex<StdRng>>`. Добавить поле `pub rng: Box<dyn RngCore + Send>` в `VM` / `LustConfig`.
-  - Добавить метод конструктора `VM::with_seed(seed: u64)`.
-  - Связать `math.random` и `math.randomseed` напрямую с `vm.rng`.
-- [ ] **1.2. Стабилизация кэшей специализаций**:
-  - Файлы: `src/bytecode/value.rs`.
-  - Действие: Заменить использование адресов сырых указателей памяти `arr_ptr: usize` на независимые от ASLR идентификаторы.
+DST-тест считается валидным тогда и только тогда, когда строго доказана его чувствительность к целевым дефектам по следующей цепочке:
 
-### Фаза 2: Унификация виртуального времени (D1)
-- [ ] **2.1. Единый трейт времени `LustClock`**:
-  - Объединить `src/test_framework/clock.rs` и `src/rx/clock.rs`.
-  - Обеспечить совместимость с `TestClockState` и `VirtualClock`.
-- [ ] **2.2. Устранение спавна ОС-потоков в `effect_abi::timeout`**:
-  - Файлы: `src/effect_abi.rs`.
-  - Действие: Предоставить виртуализированную реализацию `timeout_with_clock()`, регистрирующую прерывание волокна в таймерном дереве без вызова `std::thread::spawn` и блокировок `recv_timeout`.
-- [ ] **2.3. Виртуализация `os.sleep` и `os.time`**:
-  - Файлы: `src/vm/stdlib.rs`.
-  - При наличии виртуального таймера `os.sleep(secs)` приостанавливает текущее волокно через кооперативный `yield` до наступления виртуального времени.
+$$\text{Baseline GREEN} \longrightarrow \text{Инъекция мутанта} \longrightarrow \text{Подтверждение выполнения мутированной ветви} \longrightarrow \text{Падение конкретного оракула (RED)}$$
 
-### Фаза 3: Виртуализация I/O и VFS (D3)
-- [ ] **3.1. Трейт `VirtualFileSystem`**:
-  - Файлы: новый `src/vm/vfs.rs`, интеграция в `src/vm/stdlib.rs`.
-  - Реализации: `OsFileSystem` (по умолчанию для CLI) и `MemFileSystem` (в памяти для тестов).
-- [ ] **3.2. Изоляция загрузчика модулей**:
-  - Файлы: `src/modules/mod.rs`.
-  - Перевод резолвера импортов на чтение через `vfs`.
+### Обязательные мутанты:
+1. **Мутант M1 (Списание газа)**:
+   - *Точка инъекции*: `src/vm/execution.rs` (закомментировано списание газа в цикле инструкций).
+   - *Execution Witness*: подтверждение `MUTATION_M1_EXECUTION_COUNT > 0` в логе.
+   - *Ожидаемый RED*: падение оракула `INV-BUDGET-01` (зафиксирован шаг прогресса без изменения газа).
+2. **Мутант M2 (Пропуск финализатора при панике)**:
+   - *Точка инъекции*: `src/vm/tasks.rs` (пропуск LIFO-финализации в ветке `TaskState::Failed`).
+   - *Execution Witness*: подтверждение `MUTATION_M2_EXECUTION_COUNT > 0` в логе.
+   - *Ожидаемый RED*: падение оракула `INV-FIBER-01-EXACTLY-ONCE` (число выполненных финализаторов меньше зарегистрированных).
+3. **Мутант M3 (Гонка в Rx Admission)**:
+   - *Точка инъекции*: `src/rx/scheduler.rs` (удалена проверка `reg.closed_scopes.contains(&scope_id)`).
+   - *Execution Witness*: подтверждение вызова `register_participant` на закрытом скоупе.
+   - *Ожидаемый RED*: падение оракула `INV-RX-01` (зафиксирован запуск callback после завершения join).
 
-### Фаза 4: Детерминированный шедулер волокон и исследование перестановок (D4)
-- [ ] **4.1. Кооперативный квантовый шаг (Fiber Quantum Stepping)**:
-  - Файлы: `src/vm/tasks.rs`, `src/vm/execution.rs`.
-  - Добавить возможность выполнять задачу порциями по $K$ инструкций (fuel-based quantum) с возвратом управления в шедулер.
-- [ ] **4.2. Алгоритм чередования (Interleaving Exploration)**:
-  - Файлы: `src/test_framework/sim_scheduler.rs`.
-  - Планировщик случайным образом переставляет порядок исполнения готовых волокон, симулируя различные профили гонок.
-
-### Фаза 5: Мониторинг инвариантов и инъекция сбоев (D7, D8)
-- [ ] **5.1. Реализация чекера инвариантов**:
-  - Автоматическая проверка `INV-FIBER-01` (Scope LIFO), `INV-FIBER-02` (Masking), `INV-RX-01` после каждого такта симуляции.
-- [ ] **5.2. Модуль инъекции сбоев (`FaultConfiguration`)**:
-  - Настраиваемая вероятность прерываний, ошибок VFS, нехватки газа.
-
-### Фаза 6: DST Тестовый сьют и регрессионный раннер
-- [ ] **6.1. Тестовый макрос `dst_test!`**:
-  - Прогон 1 000 итераций со случайными сидами за сотни миллисекунд.
-  - Логирование минимального падающего сида при ошибке.
-- [ ] **6.2. Интеграционные DST-тесты**:
-  - `tests/dst_fiber_scope_lifecycle.rs` — стресс-тестирование закрытия скоупов с замаскированными детьми.
-  - `tests/dst_rx_backpressure_races.rs` — гонки в Rx операторах при отмене подписки.
-  - `tests/dst_effects_retry_faults.rs` — тестирование ретраев при нестабильной сети/диске.
+**Правило приёмки**: Падение из-за ошибки компиляции, общего тайм-аута процесса или паники инициализации **не засчитывается** как убийство мутанта.
 
 ---
 
-## 4. Оценка DRS (DST-Readiness Score)
+## 4. Поэтапный План Внедрения и Устранение Зависимостей (Phased Implementation Roadmap)
 
-Согласно формуле рубрики `$mb3-dst`:
-$$\text{DRS} = 100 - (D3_{FAIL} \times 30) - (D1_{FAIL} \times 15) - (D2_{FAIL} \times 15) - (D8_{VACUOUS} \times 10) - (D7_{UNINSTR} \times 5) - (D5/D6 \times 5)$$
+Планировщик разделён на два этапа для исключения взаимных зависимостей:
+* **Фаза 1–2: `MinimalSimScheduler`** — минимальный кооперативный цикл: поддержка парковки/пробуждения (`TaskState::Yielded(TimerId)`), очередь таймеров и шаг виртуального времени.
+* **Фаза 4: `PreemptiveExplorationScheduler`** — полномасштабный планировщик вытеснения с quantum-шагами инструкций и псевдослучайным перемешиванием очередей.
 
-### Текущий расчет (Baseline):
-- $D3_{FAIL}$ (файловая система не виртуализирована): $-30$
-- $D1_{FAIL}$ (блокирующие `std::thread::spawn` и `recv_timeout` в таймаутах): $-15$
-- $D2_{FAIL}$ (глобальный `static RNG` в `stdlib.rs`): $-15$
-- $D7_{UNINSTR}$ (инварианты скоупов и волокон не проверяются на каждом шаге): $-5$
-- **Итоговый Baseline DRS:** **35 / 100 (`DST-HOSTILE`)**.
+```
++----------------------------------------------------------------------------------------------------+
+|                                МАТРИЦА ЗАКРЫТИЯ ПОВЕРХНОСТЕЙ                                       |
++--------------------------------------+---------------------+---------------------------------------+
+| Подсистема / Поверхность             | Закреплённая Фаза   | Проверяющий тест и Gate               |
++--------------------------------------+---------------------+---------------------------------------+
+| VM RNG (static RNG)                  | Фаза 1              | `tests/dst_state_isolation.rs`        |
+| MIR Atomics (GAS, MEM, STATUS, LIMIT)| Фаза 1              | `tests/dst_mir_isolation.rs`          |
+| Lua Registry & ArrayId Namespacing   | Фаза 1              | `tests/dst_tls_reentrancy.rs`         |
+| MinimalSimScheduler (Cooperative)    | Фаза 1              | `tests/dst_micro_step.rs`             |
+| LustClock (Wall/Monotonic/TimerQueue)| Фаза 2              | `tests/dst_clock_determinism.rs`      |
+| stdlib os.sleep & os.time            | Фаза 2              | `tests/dst_stdlib_time.rs`            |
+| ScopeJoinCoordinator Quiescence      | Фаза 2              | `tests/dst_rx_quiescence.rs`          |
+| VirtualFileSystem (все 12 методов)   | Фаза 3              | `tests/dst_vfs_contract.rs`           |
+| Module Loader & Path Normalization   | Фаза 3              | `tests/dst_module_isolation.rs`       |
+| VirtualEnv & VirtualConsole          | Фаза 3              | `tests/dst_env_console.rs`            |
+| Clippy & Runtime Fail-Closed VFS Gate| Фаза 3              | `tests/dst_vfs_bypass_negative.rs`    |
+| Fuel-based Fiber Preemption (DES)    | Фаза 4              | `tests/dst_fiber_quantum.rs`          |
+| PreemptiveExplorationScheduler       | Фаза 4              | `tests/dst_fiber_interleaving.rs`     |
+| BlockingHostCall Contract            | Фаза 4              | `tests/dst_host_call_isolation.rs`    |
+| Invariant Engine (INV 01-03, RX, GAS)| Фаза 5              | `tests/dst_invariants_teeth.rs`       |
+| FaultInjector (VFS, Interrupt, OOM)  | Фаза 5              | `tests/dst_fault_injection.rs`        |
+| 100% Mutation Acceptance (M1-M3)     | Фаза 5              | `scripts/run_dst_mutation_gate.sh`    |
+| CI Campaign (100k seeds + Shrinking) | Фаза 6              | `.github/workflows/dst_nightly.yml`  |
+| Zero-Cost Verification (TOST B01-B15)| Фаза 6              | `benchmarks/effects_bench.rs`            |
++--------------------------------------+---------------------+---------------------------------------+
+```
 
-### Целевой расчет (После реализации Фаз 1–4):
-- $D3$ PASS (абстракция `MemFs` внедрена): $0$
-- $D1$ PASS (виртуальное время через `LustClock`): $0$
-- $D2$ PASS (`VM::with_seed` и локальный PRNG): $0$
-- $D4/D8$ PASS (детерминированное чередование и инъекция сбоев): $0$
-- $D7$ PASS (fail-stop чекер инвариантов): $0$
-- **Итоговый Целевой DRS:** **95–100 / 100 (`DST-READY`)**.
+### Подробный регламент фаз:
+
+#### Фаза 1: Изоляция Состояния и Микро-Харнесс (State Isolation & Minimal Loop)
+* **Задачи**:
+  1. Вынести `static RNG` в поле `VM.rng` с конструктором `VM::with_seed(u64)`.
+  2. Перенести все 4 статических атомика MIR (`GAS_REMAINING`, `MEMORY_USED`, `LAST_STATUS`, `MAX_MEMORY_LIMIT`) в структуру `MirContext` с поддержкой реентрантного стека `CURRENT_MIR_STACK`.
+  3. Добавить квалификацию `(VmId, ArraySequenceId)` в кэши специализаций `value.rs`.
+  4. Привязать Lua Registry к `LuaCompatContext`.
+  5. Реализовать `MinimalSimScheduler`: поддержка `TaskState::Yielded`, одноволоконный шаг и микро-оракул для проверки мутанта M1.
+* **Критерий приёмки (Gate 1)**:
+  - 4 параллельных VM на одном потоке с разными сидами работают на 100% изолированно.
+  - Мутант M1 успешно убивается микро-оракулом при подтверждённом выполнении мутированной ветви.
+
+#### Фаза 2: Разделение Времени и Таймеров
+* **Задачи**:
+  1. Внедрить разделение трейтов времени: `WallClock` (эпоха) и `MonotonicClock` (таймеры).
+  2. Заменить вызов `std::thread::sleep` в `os.sleep` на приостановку волокна в очереди виртуальных таймеров через `MinimalSimScheduler`.
+  3. Перевести `ScopeJoinCoordinator` и `close_and_wait_quiescent` на раздельные протоколы квиесценции (закрытый vs открытый скоуп) под единым замком.
+* **Критерий приёмки (Gate 2)**:
+  - Сценарий с задержкой 24 часа виртуального времени выполняется детерминированно за фиксированное число шагов планировщика (< 100 шагов для фиксированного сценария; wall-clock измеряется отдельно и не является детерминированным критерием).
+  - Принудительно заданные порядки `notify-before-park`, `notify-after-park`, `timeout-before-notify`, `timeout-after-notify`, а также повторная регистрация в `wait_for_quiescence`, восстановление отменённого таймера на исходный deadline, stale-event rejection и `close → retire → register(old_scope)` подтверждают отсутствие зависаний и ложных квиесценций.
+
+#### Фаза 3: Полное Замыкание VFS и Окружения
+* **Задачи**:
+  1. Реализовать `VirtualFileSystem` со всеми 12 методами (включая `canonicalize`, `append`, `rename`, `remove_dir_all`).
+  2. Внедрить `MemFs` с детерминированной нормализацией путей и сортировкой директорий.
+  3. Перенаправить все обращения `Path::exists()` и `canonicalize()` из `src/modules/` и `src/bindgen.rs` в VFS. Включить Clippy-правила `disallowed-methods` и `disallowed-types` на запрет `std::fs`.
+  4. Внедрить `VirtualEnv` и `VirtualConsole`.
+* **Критерий приёмки (Gate 3)**:
+  - Каждый перечисленный direct-I/O canary отклоняется Clippy при проверке в изолированном fixture crate (`tests/compile_fail/fs_gate/`), а вызов `OsFs` в режиме симуляции вызывает панику `DirectHostFsBypassPanic` (проверено негативным тестом `dst_vfs_bypass_negative`).
+  - Компиляция и запуск модульного проекта происходят в чистой `MemFs` под проверенной process isolation с host-only canary; bootstrap allowlist фиксируется в отчёте.
+
+#### Фаза 4: Квантование и Чередование Волокон (DES)
+* **Задачи**:
+  1. Реализовать fuel-based квантование байткода с сохранением полного continuation (`FiberContinuation`).
+  2. Добавить `PreemptiveExplorationScheduler`, перемешивающий порядок исполнения готовых волокон на основе `SimRng`.
+  3. Зафиксировать контракт `BlockingHostCall`: внешние хостовые вызовы изолируются и не вносят недетерминизм в Tier-1.
+* **Критерий приёмки (Gate 4)**:
+  - Обнаружение искусственной гонки волокон на разделяемой таблице гарантируется в пределах 500 итераций сида с фиксацией точного падающего сида.
+
+#### Фаза 5: Полнозубые Инварианты и Генерация Сбоев (Fault Injection)
+* **Задачи**:
+  1. Внедрить мониторинг инвариантов `INV-FIBER-01..03`, `INV-RX-01`, `INV-BUDGET-01` с обязательными предикатами завершимости (liveness bounds) и защитой от зависания через независимый `sim_step_counter`.
+  2. Разработать инъектор сбоев `FaultConfiguration` (ошибки VFS, спонтанные отмены, отказы памяти).
+  3. Провести полное мутационное тестирование: подтвердить убийство мутантов M1, M2, M3 конкретными оракулами при обязательном наличии execution witness.
+* **Критерий приёмки (Gate 5)**:
+  - 100% мутантов убиты соответствующими инвариантами; подтверждено выполнение мутированных ветвей.
+
+#### Фаза 6: Масштабирование, CI и Статистическая Zero-Cost Верификация
+* **Задачи**:
+  1. Внедрить генерацию автономного `Replay Bundle` (`source_tree.tar` со всеми targets + `manifest.json` + `events.jsonl`) с автоматическим поиском минимального воспроизводящего примера (shrinking).
+  2. Настроить ночные прогоны на 100 000 сидов в CI.
+  3. Провести валидацию производительности production-сборки:
+     * *Структурный критерий*: Мономономорфизация и нулевой оверхед — все трейты абстракций времени и VFS параметризуются статически (zero-sized marker types). В production (`cfg(not(feature = "sim"))`) все методы инлайнятся без `Box<dyn ...>` на hot-path.
+     * *Статистический критерий (TOST Equivalence)*: Проверка эквивалентности двух односторонних t-тестов (Two One-Sided T-tests) на бенчмарках Criterion B01–B15. 95% доверительный интервал относительного изменения $[\Delta_{lower}, \Delta_{upper}]$ обязан целиком лежать внутри границы $[-1.5\%, +1.5\%]$. Если интервал пересекает границу допуска, результат `INCONCLUSIVE`; если целиком лежит вне допуска — `FAIL` эквивалентности. Оба результата блокируют performance gate. Baseline/candidate собираются одним toolchain с одинаковыми flags, входами и проверкой результатов; число независимых повторов и правило остановки фиксируются до измерений. Повторять тест до случайного PASS запрещено.
+* **Критерий приёмки (Gate 6)**:
+  - Официальное присвоение статуса **`DST-READY`**.
 
 ---
 
-## 5. Рекомендованный регламент рассмотрения и приёмки
+## 5. Корректный Расчёт DRS (DST-Readiness Score)
 
-1. **Adversarial Review (Critic / DA Pass)**:
-   - Проверка: нет ли избыточного усложнения JIT/MIR-пайплайна от введения интерфейсов VFS/Clock.
-   - Подтверждение: сохраняются ли характеристики производительности release-сборок (zero-cost абстракции для `OsFs` и реального времени).
-2. **Архитектурный гейт**:
-   - Утверждение размещения кода: расширение `src/test_framework/` vs выделение `crates/lust-sim`.
-3. **Пилотная реализация Фазы 1**:
-   - Пуллреквест на локализацию `RNG` и `VM::with_seed` как первый осязаемый шаг к детерминизму.
+Расчёт ведётся строго по канонической формуле SoT рубрики `$mb3-dst`:
+$$\text{DRS} = 100 - (D3_{FAIL} \times 30) - (D1_{FAIL} \times 15) - (D2_{FAIL} \times 15) - (D8_{VACUOUS} \times 10) - (D7_{UNINSTR} \times 5) - (TP_{hazards} \times 5)$$
+
+Штрафы снимаются строго по мере завершения соответствующих фаз:
+
+| Этап | $D1$ (Время) | $D2$ (PRNG) | $D3$ (VFS) | $D4$ (DES) | $TP$ (Изоляция/MIR) | $D7$ (Инварианты) | $D8$ (Сбои/Мутанты) | **Итоговый DRS** | Статус |
+|---|---|---|---|---|---|---|---|---|---|
+| **Текущее состояние** | FAIL (-15) | FAIL (-15) | FAIL (-30) | 0 | FAIL (-5) | UNINSTR (-5) | VACUOUS (-10) | **20** | `DST-HOSTILE` |
+| **После Фазы 1** | FAIL (-15) | **PASS (0)** | FAIL (-30) | 0 | **PASS (0)** | UNINSTR (-5) | VACUOUS (-10) | **40** | `DST-BLOCKED` |
+| **После Фазы 2** | **PASS (0)** | **PASS (0)** | FAIL (-30) | 0 | **PASS (0)** | UNINSTR (-5) | VACUOUS (-10) | **55** | `DST-BLOCKED` |
+| **После Фазы 3** | **PASS (0)** | **PASS (0)** | **PASS (0)** | 0 | **PASS (0)** | UNINSTR (-5) | VACUOUS (-10) | **85** | `Core seams implemented; gates pending`|
+| **После Фазы 4** | **PASS (0)** | **PASS (0)** | **PASS (0)** | 0 | **PASS (0)** | UNINSTR (-5) | VACUOUS (-10) | **85** | `Core seams implemented; gates pending`|
+| **После Фаз 5–6**| **PASS (0)** | **PASS (0)** | **PASS (0)** | 0 | **PASS (0)** | **PASS (0)** | **PASS (0)** | **100**| `DST-READY (Full)`|
+
+*Пояснения к расчёту*:
+- $D4$ (DES) имеет вес 0 в формуле вычета DRS, но является функциональным предусловием для перехода от базового Core к полномасштабной симуляции.
+- $D7$ и $D8$ окончательно переходят в `PASS` в Фазе 5 после завершения полного инвариантного мониторинга и 100% покрытия мутационного гейта, что доводит DRS с 85 до 100.
+
+### 5.1. Граница принятия спецификации
+
+DRS — расчётная оценка по перечисленным поверхностям, не доказательство детерминизма или безопасности. Статус DST-READY присваивается только после всех обязательных gates для конкретного профиля и воспроизводимых артефактов. На момент редакции 7.1 runtime gates, автономный replay, мутационные кампании и performance equivalence **NOT RUN** в рамках этого DA. Отсутствие реализации запланированного механизма само по себе не дефект спецификации; закрытие замечания на уровне контракта не закрывает runtime gate.

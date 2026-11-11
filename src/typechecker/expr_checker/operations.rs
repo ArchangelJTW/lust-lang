@@ -468,11 +468,13 @@ impl TypeChecker {
         expected_type: Option<&Type>,
     ) -> Result<Type> {
         if let ExprKind::FieldAccess { object, field } = &callee.kind {
-            if matches!(field.as_str(), "provide" | "run_sync") {
-                if let Ok(ty) = self.check_expr(object) {
-                    if matches!(ty.kind, TypeKind::Effect { .. }) {
-                        return self.check_method_call(object, field, explicit_type_args, args);
-                    }
+            if let Ok(ty) = self.check_expr(object) {
+                if matches!(
+                    ty.kind,
+                    TypeKind::Option(_) | TypeKind::Result(_, _) | TypeKind::Effect { .. }
+                ) || matches!(&ty.kind, TypeKind::Named(name) if name == "Option" || name == "Result")
+                {
+                    return self.check_method_call(object, field, explicit_type_args, args);
                 }
             }
         }

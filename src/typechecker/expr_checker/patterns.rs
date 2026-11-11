@@ -115,10 +115,20 @@ impl TypeChecker {
                         )));
                     }
 
-                    for (binding, field_type) in bindings.iter().zip(variant_fields.iter()) {
+                    for (i, (binding, field_type)) in
+                        bindings.iter().zip(variant_fields.iter()).enumerate()
+                    {
                         let bind_type = if let Some(ref types) = variant_types {
                             if let TypeKind::Generic(_) = &field_type.kind {
-                                types.first().cloned().unwrap_or_else(|| field_type.clone())
+                                match type_name.as_str() {
+                                    "Result" => match variant.as_str() {
+                                        "Ok" => types.first().cloned(),
+                                        "Err" => types.get(1).cloned(),
+                                        _ => types.get(i).cloned(),
+                                    },
+                                    _ => types.get(i).cloned(),
+                                }
+                                .unwrap_or_else(|| field_type.clone())
                             } else {
                                 self.substitute_type(field_type, &type_bindings)
                             }

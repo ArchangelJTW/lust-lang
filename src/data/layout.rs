@@ -143,7 +143,16 @@ impl LogicalLayoutV1 {
         let mut is_c_flat = true;
 
         for field in &mut fields {
-            let align = field.tag.alignment();
+            let mut align = field.tag.alignment();
+            if matches!(field.tag, CanonicalTypeTag::StringSlice | CanonicalTypeTag::BinarySlice) {
+                if target_abi.pointer_width == 4 {
+                    field.byte_size = target_abi.pointer_width * 2 + 8;
+                    align = 4;
+                }
+            }
+            if target_abi.max_alignment > 0 && align > target_abi.max_alignment {
+                align = target_abi.max_alignment;
+            }
             if align > max_align {
                 max_align = align;
             }
@@ -158,6 +167,10 @@ impl LogicalLayoutV1 {
             if field.tag.is_managed_slice() || matches!(field.tag, CanonicalTypeTag::NestedStruct(_)) {
                 is_c_flat = false;
             }
+        }
+
+        if target_abi.max_alignment > 0 && max_align > target_abi.max_alignment {
+            max_align = target_abi.max_alignment;
         }
 
         // Tail padding to round up to max_align

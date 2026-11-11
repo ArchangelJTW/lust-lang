@@ -46,7 +46,7 @@ impl<'s> DataView<'s> {
     pub fn slice(&self, start: usize, end: usize) -> Result<DataView<'s>, DataError> {
         match self {
             DataView::Str(s, owner) => {
-                if start <= end && end <= s.len() {
+                if start <= end && end <= s.len() && s.is_char_boundary(start) && s.is_char_boundary(end) {
                     Ok(DataView::Str(&s[start..end], *owner))
                 } else {
                     Err(DataError::new("Slice index out of bounds"))

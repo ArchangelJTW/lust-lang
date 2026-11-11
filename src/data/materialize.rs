@@ -206,6 +206,16 @@ pub fn materialize_from_document(
         }
     }
 
+    // Check for extra fields in strict layout
+    for (key, _) in doc.entries() {
+        if key == "_type" || key == "__type" || key == "$type" {
+            continue;
+        }
+        if !layout.fields.iter().any(|f| &f.name == key) {
+            return Err(MaterializeError::ExtraFieldInStrictLayout(key.clone()));
+        }
+    }
+
     let max_ordinal = layout
         .fields
         .iter()

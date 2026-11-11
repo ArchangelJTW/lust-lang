@@ -84,10 +84,14 @@ impl<'a> BsonDecoder<'a> {
                 }
                 0x02 => {
                     // UTF-8 string: int32 length + bytes + 0x00
-                    let str_len = self.read_i32()? as usize;
+                    let str_len = self.read_i32()?;
+                    if str_len < 0 {
+                        return Err(BsonError::InvalidDocumentLength(str_len));
+                    }
                     if str_len == 0 {
                         return Err(BsonError::UnexpectedEof);
                     }
+                    let str_len = str_len as usize;
                     let s_bytes = self.read_slice(str_len - 1)?;
                     self.consume_byte(0x00)?;
                     let s = std::str::from_utf8(s_bytes).map_err(|_| BsonError::InvalidUtf8)?;
@@ -109,7 +113,11 @@ impl<'a> BsonDecoder<'a> {
                 }
                 0x05 => {
                     // Binary: int32 len + subtype (1 byte) + data
-                    let bin_len = self.read_i32()? as usize;
+                    let bin_len = self.read_i32()?;
+                    if bin_len < 0 {
+                        return Err(BsonError::InvalidDocumentLength(bin_len));
+                    }
+                    let bin_len = bin_len as usize;
                     let _subtype = self.read_u8()?;
                     let bin_bytes = self.read_slice(bin_len)?;
                     DataValue::Binary(bin_bytes.to_vec())
@@ -139,6 +147,11 @@ impl<'a> BsonDecoder<'a> {
                     // 32-bit integer
                     let i = self.read_i32()?;
                     DataValue::Number(ExactNumber::Int(i as i64))
+                }
+                0x11 => {
+                    // 64-bit unsigned integer (timestamp / uint64)
+                    let u = self.read_u64()?;
+                    DataValue::Number(ExactNumber::UInt(u))
                 }
                 0x12 => {
                     // 64-bit integer
@@ -203,6 +216,11 @@ impl<'a> BsonDecoder<'a> {
     fn read_i64(&mut self) -> Result<i64, BsonError> {
         let slice = self.read_slice(8)?;
         Ok(i64::from_le_bytes(slice.try_into().unwrap()))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, BsonError> {
+        let slice = self.read_slice(8)?;
+        Ok(u64::from_le_bytes(slice.try_into().unwrap()))
     }
 
     fn read_f64(&mut self) -> Result<f64, BsonError> {
@@ -275,9 +293,15 @@ impl BsonEncoder {
                 }
             }
             DataValue::Number(ExactNumber::UInt(u)) => {
-                self.buf.push(0x12);
-                self.write_cstring(key);
-                self.buf.extend_from_slice(&(*u as i64).to_le_bytes());
+                if *u > i64::MAX as u64 {
+                    self.buf.push(0x11);
+                    self.write_cstring(key);
+                    self.buf.extend_from_slice(&u.to_le_bytes());
+                } else {
+                    self.buf.push(0x12);
+                    self.write_cstring(key);
+                    self.buf.extend_from_slice(&(*u as i64).to_le_bytes());
+                }
             }
             DataValue::Number(ExactNumber::Float(f)) => {
                 self.buf.push(0x01);
@@ -377,6 +401,7 @@ pub enum BsonValueView<'a> {
     Null,
     Int32(i32),
     Int64(i64),
+    UInt64(u64),
     Decimal128(Decimal128),
 }
 
@@ -560,6 +585,7 @@ impl<'a> BsonValueView<'a> {
             BsonValueView::Null => Ok(DataValue::Null),
             BsonValueView::Int32(i) => Ok(DataValue::Number(ExactNumber::Int(*i as i64))),
             BsonValueView::Int64(i) => Ok(DataValue::Number(ExactNumber::Int(*i))),
+            BsonValueView::UInt64(u) => Ok(DataValue::Number(ExactNumber::UInt(*u))),
             BsonValueView::Decimal128(d) => Ok(DataValue::Number(ExactNumber::Decimal128(*d))),
         }
     }
@@ -701,6 +727,11 @@ impl<'a> Iterator for BsonElementIter<'a> {
                 let i = i32::from_le_bytes(self.data[self.pos..self.pos + 4].try_into().ok()?);
                 self.pos += 4;
                 BsonValueView::Int32(i)
+            }
+            0x11 => {
+                let bytes: [u8; 8] = self.data[self.pos..self.pos + 8].try_into().ok()?;
+                self.pos += 8;
+                BsonValueView::UInt64(u64::from_le_bytes(bytes))
             }
             0x12 => {
                 let i = i64::from_le_bytes(self.data[self.pos..self.pos + 8].try_into().ok()?);
@@ -845,6 +876,12 @@ fn validate_document_slice(bytes: &[u8], is_root: bool) -> Result<(), BsonError>
                     return Err(BsonError::UnexpectedEof);
                 }
                 pos += 4;
+            }
+            0x11 => {
+                if pos + 8 > limit {
+                    return Err(BsonError::UnexpectedEof);
+                }
+                pos += 8;
             }
             0x12 => {
                 if pos + 8 > limit {

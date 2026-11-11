@@ -408,6 +408,7 @@ impl Compiler {
         self.current_function_name = Some(func_def.name.clone());
         let mut scope = Scope {
             locals: HashMap::new(),
+            upvalues: HashMap::new(),
             effect_thunks: HashMap::new(),
             depth: 0,
             cleanups: Vec::new(),

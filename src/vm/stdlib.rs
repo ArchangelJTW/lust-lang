@@ -641,7 +641,7 @@ fn create_os_remove_dir_fn() -> Value {
                 ))));
             }
         };
-        match fs::remove_dir_all(path) {
+        match fs::remove_dir(path) {
             Ok(_) => Ok(NativeCallResult::Return(Value::ok(Value::Nil))),
             Err(err) => Ok(NativeCallResult::Return(Value::err(Value::string(
                 err.to_string(),

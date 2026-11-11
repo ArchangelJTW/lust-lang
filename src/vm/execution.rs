@@ -1131,12 +1131,13 @@ impl VM {
 
                             let upvalue_values: Vec<Value> =
                                 upvalues.iter().map(|uv| uv.get()).collect();
-                            let frame = self.make_checked_call_frame(
+                            let mut frame = self.make_checked_call_frame(
                                 func_idx,
                                 Some(dest_reg),
                                 args,
                                 upvalue_values,
                             )?;
+                            frame.shared_upvalues = upvalues.clone();
                             self.call_stack.push(frame);
                         }
 
@@ -1874,8 +1875,12 @@ impl VM {
                             .ok_or_else(|| LustError::RuntimeError {
                                 message: "Empty call stack".to_string(),
                             })?;
-                    if (upvalue_idx as usize) < frame.upvalues.len() {
-                        frame.upvalues[upvalue_idx as usize] = value;
+                    let idx = upvalue_idx as usize;
+                    if idx < frame.upvalues.len() {
+                        frame.upvalues[idx] = value.clone();
+                        if idx < frame.shared_upvalues.len() {
+                            frame.shared_upvalues[idx].set(value);
+                        }
                     } else {
                         return Err(LustError::RuntimeError {
                             message: format!(
@@ -2692,6 +2697,7 @@ impl VM {
             .any(|existing| existing.function_idx == function_idx);
         self.jit.record_function_call(recursive);
         frame.upvalues.clear();
+        frame.shared_upvalues.clear();
         for (index, arg) in args.iter().enumerate() {
             self.observe_value(arg);
             frame.registers[index] = arg.fast_clone();
@@ -2769,6 +2775,7 @@ impl VM {
             .any(|existing| existing.function_idx == function_idx);
         self.jit.record_function_call(recursive);
         frame.upvalues = upvalues;
+        frame.shared_upvalues.clear();
         for (index, arg) in args.drain(..).enumerate() {
             self.observe_value(&arg);
             frame.registers[index] = arg;
@@ -3221,7 +3228,8 @@ impl VM {
                 let saved_last_task_signal = self.last_task_signal.clone();
 
                 let upvalue_values: Vec<Value> = upvalues.iter().map(|uv| uv.get()).collect();
-                let frame = self.make_checked_call_frame(*func_idx, None, args, upvalue_values)?;
+                let mut frame = self.make_checked_call_frame(*func_idx, None, args, upvalue_values)?;
+                frame.shared_upvalues = upvalues.clone();
 
                 let stack_depth_before = self.call_stack.len();
                 self.call_stack.push(frame);

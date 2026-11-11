@@ -155,9 +155,11 @@ impl VM {
                             task.state = TaskState::Stopped;
                             task.last_result = Some(stop_value);
                             task.last_yield = None;
-                            task.call_stack.clear();
-                            task.pending_return_value = None;
-                            task.pending_return_dest = None;
+                            while let Some(frame) = self.call_stack.pop() {
+                                self.recycle_frame(frame);
+                            }
+                            self.pending_return_value = None;
+                            self.pending_return_dest = None;
                         }
                     }
                 } else {
@@ -219,7 +221,9 @@ impl VM {
 
             Value::Closure(closure) => {
                 let captured: Vec<Value> = closure.upvalues.iter().map(|uv| uv.get()).collect();
-                self.make_call_frame(closure.function_idx, None, args, captured)
+                let mut frame = self.make_call_frame(closure.function_idx, None, args, captured)?;
+                frame.shared_upvalues = closure.upvalues.clone();
+                Ok(frame)
             }
 
             other => Err(LustError::RuntimeError {

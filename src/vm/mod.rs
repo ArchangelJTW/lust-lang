@@ -9,7 +9,7 @@ pub use self::task::{TaskId, TaskInstance, TaskManager, TaskState};
 pub(super) use crate::ast::{FieldOwnership, StructDef, Type, TypeKind};
 pub(super) use crate::bytecode::{
     FieldStorage, Function, Instruction, NativeCallResult, Register, StructLayout, TaskHandle,
-    Value,
+    Upvalue, Value,
 };
 #[cfg(feature = "std")]
 pub(super) use crate::embed::native_types::ModuleStub;
@@ -395,6 +395,7 @@ pub(super) struct CallFrame {
     pub(super) base_register: usize,
     pub(super) return_dest: Option<Register>,
     pub(super) upvalues: Vec<Value>,
+    pub(super) shared_upvalues: Vec<Upvalue>,
 }
 
 /// What a bytecode-to-bytecode call checks about its callee, computed
@@ -534,6 +535,7 @@ impl CallFrame {
             base_register: 0,
             return_dest,
             upvalues: Vec::new(),
+            shared_upvalues: Vec::new(),
         })
     }
 
@@ -558,6 +560,7 @@ impl CallFrame {
         self.base_register = 0;
         self.return_dest = return_dest;
         self.upvalues.clear();
+        self.shared_upvalues.clear();
     }
 }
 

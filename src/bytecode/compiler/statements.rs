@@ -147,6 +147,9 @@ impl Compiler {
                     {
                         let rhs_reg = self.compile_expr(right)?;
                         self.emit(Instruction::Concat(target_reg, target_reg, rhs_reg), 0);
+                        if let Some(upvalue_idx) = self.lookup_upvalue(target_name) {
+                            self.emit(Instruction::StoreUpvalue(upvalue_idx, target_reg), 0);
+                        }
                         if self.should_sync_module_local(target_name) {
                             self.emit_store_module_global(target_name, target_reg);
                         }
@@ -209,6 +212,10 @@ impl Compiler {
                             if result_reg != target_reg {
                                 self.move_result(target_reg, result_reg, expression_start);
                                 self.free_register(result_reg);
+                            }
+
+                            if let Some(upvalue_idx) = self.lookup_upvalue(&target_name) {
+                                self.emit(Instruction::StoreUpvalue(upvalue_idx, target_reg), 0);
                             }
 
                             if self.should_sync_module_local(&target_name) {
@@ -321,6 +328,24 @@ impl Compiler {
                     }
                 }
 
+                let is_static_err = values.len() == 1 && match &values[0].kind {
+                    ExprKind::EnumConstructor { variant, .. } => variant == "Err",
+                    ExprKind::Call { callee, .. } => {
+                        if let ExprKind::FieldAccess { object, field } = &callee.kind {
+                            if let ExprKind::Identifier(type_name) = &object.kind {
+                                type_name == "Result" && field == "Err"
+                            } else {
+                                false
+                            }
+                        } else if let ExprKind::Identifier(fn_name) = &callee.kind {
+                            fn_name == "Err"
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+
                 let ret_reg = if values.is_empty() {
                     255
                 } else if values.len() == 1 {
@@ -343,7 +368,7 @@ impl Compiler {
                     dedicated_reg
                 };
 
-                self.emit_all_defers()?;
+                self.emit_defers_for_return(ret_reg, is_static_err)?;
                 self.emit(Instruction::Return(ret_reg), 0);
             }
 

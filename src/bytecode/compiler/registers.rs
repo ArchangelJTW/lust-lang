@@ -57,6 +57,7 @@ impl Compiler {
         let depth = self.scopes.last().map(|s| s.depth + 1).unwrap_or(0);
         self.scopes.push(Scope {
             locals: HashMap::new(),
+            upvalues: HashMap::new(),
             effect_thunks: HashMap::new(),
             depth,
             cleanups: Vec::new(),
@@ -72,6 +73,7 @@ impl Compiler {
         }
         self.scopes.push(Scope {
             locals,
+            upvalues: HashMap::new(),
             effect_thunks: HashMap::new(),
             depth,
             cleanups: Vec::new(),
@@ -115,6 +117,70 @@ impl Compiler {
             self.compile_stmt(&stmt)?;
         }
         Ok(())
+    }
+
+    pub(super) fn emit_defers_for_return(&mut self, ret_reg: Register, is_static_err: bool) -> Result<()> {
+        let mut cleanups = Vec::new();
+        for scope in self.scopes.iter().rev() {
+            for cleanup in scope.cleanups.iter().rev() {
+                cleanups.push(cleanup.clone());
+            }
+        }
+
+        if is_static_err {
+            for cleanup in cleanups {
+                self.compile_stmt(&cleanup.stmt)?;
+            }
+            return Ok(());
+        }
+
+        let has_errdefer = cleanups.iter().any(|c| c.kind == CleanupKind::ErrDefer);
+        if !has_errdefer || ret_reg == 255 {
+            for cleanup in cleanups {
+                if cleanup.kind == CleanupKind::Defer {
+                    self.compile_stmt(&cleanup.stmt)?;
+                }
+            }
+            return Ok(());
+        }
+
+        let is_err_reg = self.next_local_slot();
+        if let Some(scope) = self.scopes.first_mut() {
+            scope.locals.insert(format!("(is_err_{})", is_err_reg), (is_err_reg, false));
+        }
+        let enum_name_idx = self.add_string_constant("Result");
+        let variant_idx = self.add_string_constant("Err");
+        self.emit(
+            Instruction::IsEnumVariant(is_err_reg, ret_reg, enum_name_idx, variant_idx),
+            0,
+        );
+
+        for cleanup in cleanups {
+            match cleanup.kind {
+                CleanupKind::Defer => {
+                    self.compile_stmt(&cleanup.stmt)?;
+                }
+                CleanupKind::ErrDefer => {
+                    let jump_skip = self.emit(Instruction::JumpIfNot(is_err_reg, 0), 0);
+                    self.compile_stmt(&cleanup.stmt)?;
+                    let end_pos = self.current_chunk().instructions.len();
+                    self.current_chunk_mut().patch_jump(jump_skip, end_pos);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn lookup_upvalue(&self, name: &str) -> Option<u8> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(&idx) = scope.upvalues.get(name) {
+                return Some(idx);
+            }
+            if scope.is_thunk_boundary {
+                break;
+            }
+        }
+        None
     }
 
     pub(super) fn resolve_local(&self, name: &str) -> Result<Register> {

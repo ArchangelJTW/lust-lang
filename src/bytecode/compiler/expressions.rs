@@ -159,7 +159,11 @@ impl Compiler {
                 Ok(result_reg)
             }
 
-            ExprKind::Call { callee, args, .. } => {
+            ExprKind::Call {
+                callee,
+                args,
+                type_args,
+            } => {
                 if let ExprKind::Identifier(fn_name) = &callee.kind {
                     if fn_name == "Ok" || fn_name == "Err" {
                         let enum_name_idx = self.add_string_constant("Result");
@@ -203,6 +207,46 @@ impl Compiler {
                         let result_reg = self.allocate_register();
                         self.emit(Instruction::NewEnumUnit(result_reg, enum_name_idx, variant_idx), 0);
                         return Ok(result_reg);
+                    }
+                }
+
+                if let ExprKind::FieldAccess { object, field } = &callee.kind {
+                    let is_static = if let ExprKind::Identifier(type_name) = &object.kind {
+                        let is_module_alias = self
+                            .current_module
+                            .as_ref()
+                            .and_then(|module| self.imports_by_module.get(module))
+                            .is_some_and(|imports| {
+                                imports.module_aliases.contains_key(type_name)
+                                    && !self.is_module_level_identifier(type_name)
+                            });
+                        let is_local = self.resolve_local(type_name).is_ok();
+                        !is_local && (Self::looks_like_type_name(type_name) || is_module_alias)
+                    } else {
+                        false
+                    };
+                    if !is_static
+                        && matches!(
+                            field.as_str(),
+                            "unwrap"
+                                | "try_unwrap"
+                                | "unwrap_or"
+                                | "is_some"
+                                | "is_none"
+                                | "is_ok"
+                                | "is_err"
+                        )
+                    {
+                        let method_call = Expr::new(
+                            ExprKind::MethodCall {
+                                receiver: object.clone(),
+                                method: field.clone(),
+                                type_args: type_args.clone(),
+                                args: args.clone(),
+                            },
+                            callee.span,
+                        );
+                        return self.compile_expr(&method_call);
                     }
                 }
 
@@ -615,6 +659,7 @@ impl Compiler {
                 self.scopes.clear();
                 let mut lambda_scope = Scope {
                     locals: HashMap::new(),
+                    upvalues: HashMap::new(),
                     effect_thunks: HashMap::new(),
                     depth: 0,
                     cleanups: Vec::new(),
@@ -627,9 +672,11 @@ impl Compiler {
 
                 self.scopes.push(lambda_scope);
                 let mut upvalue_map = HashMap::new();
+                let mut upvalue_indices = HashMap::new();
                 for (upvalue_idx, var_name) in captured_vars.iter().enumerate() {
                     let upvalue_reg = self.allocate_register();
                     upvalue_map.insert(var_name.clone(), upvalue_reg);
+                    upvalue_indices.insert(var_name.clone(), upvalue_idx as u8);
                     self.emit(Instruction::LoadUpvalue(upvalue_reg, upvalue_idx as u8), 0);
                 }
 
@@ -637,6 +684,7 @@ impl Compiler {
                     for (var_name, reg) in &upvalue_map {
                         scope.locals.insert(var_name.clone(), (*reg, false));
                     }
+                    scope.upvalues = upvalue_indices;
                 }
 
                 let body_reg = self.compile_expr(body)?;
@@ -1029,6 +1077,10 @@ impl Compiler {
             ExprKind::Identifier(name) => {
                 if let Ok(target_reg) = self.resolve_local(name) {
                     self.move_result(target_reg, value_reg, expression_start);
+
+                    if let Some(upvalue_idx) = self.lookup_upvalue(name) {
+                        self.emit(Instruction::StoreUpvalue(upvalue_idx, target_reg), 0);
+                    }
 
                     if self.should_sync_module_local(name) {
                         self.emit_store_module_global(name, target_reg);

@@ -453,6 +453,7 @@ pub unsafe extern "C" fn jit_materialize_inline_frames(
         }
         if let Value::Closure(closure) = unsafe { &*r.caller_regs.add(site.callee_reg) } {
             frame.upvalues = closure.upvalues.iter().map(|uv| uv.get()).collect();
+            frame.shared_upvalues = closure.upvalues.clone();
         }
         if let Some(caller) = vm.call_stack.last_mut() {
             caller.ip = site.caller_resume_ip;

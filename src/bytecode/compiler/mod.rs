@@ -72,6 +72,7 @@ pub(super) struct BytecodeEffectThunk {
 #[derive(Debug, Clone)]
 pub(super) struct Scope {
     pub(super) locals: HashMap<String, (Register, bool)>,
+    pub(super) upvalues: HashMap<String, u8>,
     pub(super) effect_thunks: HashMap<String, BytecodeEffectThunk>,
     pub(super) depth: usize,
     pub(super) cleanups: Vec<ScopeCleanup>,

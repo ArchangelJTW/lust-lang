@@ -69,6 +69,26 @@ impl Default for ScopeJoinCoordinator {
     }
 }
 
+pub static MUTATION_M3_SKIP_CLOSED_CHECK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub static MUTATION_M3_EXECUTION_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub struct MutationM3Guard;
+
+impl MutationM3Guard {
+    pub fn enable() -> Self {
+        MUTATION_M3_SKIP_CLOSED_CHECK.store(true, core::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for MutationM3Guard {
+    fn drop(&mut self) {
+        MUTATION_M3_SKIP_CLOSED_CHECK.store(false, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl ScopeJoinCoordinator {
     pub fn new() -> Self {
         let clock: SharedClock = Arc::new(PhysicalClock::new());
@@ -91,8 +111,13 @@ impl ScopeJoinCoordinator {
     /// Fails closed atomically if admission has already been closed or retired (tombstone) for this scope.
     pub fn register_participant(&self, scope_id: u64) -> Result<ParticipantId, RxError> {
         let mut reg = self.registry.lock().unwrap();
-        if reg.closed_scopes.contains(&scope_id) || reg.tombstones.contains(&scope_id) {
-            return Err(RxError::Cancelled);
+        let is_closed = reg.closed_scopes.contains(&scope_id) || reg.tombstones.contains(&scope_id);
+        if is_closed {
+            if MUTATION_M3_SKIP_CLOSED_CHECK.load(core::sync::atomic::Ordering::Relaxed) {
+                MUTATION_M3_EXECUTION_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            } else {
+                return Err(RxError::Cancelled);
+            }
         }
         let id = ParticipantId(self.next_id.fetch_add(1, Ordering::SeqCst));
         reg.participants.entry(scope_id).or_default().push(id);

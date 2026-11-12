@@ -3,15 +3,25 @@
 //! Phase 2: Clock & Timers separation, deterministic virtual time, nonblocking sleep.
 
 pub mod clock;
+pub mod fault;
 pub mod host_call;
+pub mod invariants;
 pub mod scheduler;
 
 pub use clock::{
     CivilDateTime, LustClock, MonotonicClock, SimClock, SystemMonotonicClock, SystemWallClock,
     TimerControl, TimerId, TimerQueue, WallClock,
 };
+pub use fault::{
+    FaultConfiguration, FaultInjectedVfs, FaultKind, InterruptSchedule, MemoryFaultPolicy,
+    VfsFaultRule, VfsOp,
+};
 pub use host_call::{
     BlockingHostCallContract, assert_non_blocking_host_call, fail_stop_blocking_host_call,
+};
+pub use invariants::{
+    GasMonotonicityOracle, GasProgressOracle, InvariantViolation, InvBudget01Oracle,
+    InvFiber01Oracle, InvFiber02Oracle, InvFiber03Oracle, InvRx01Oracle, StepCounterWatchdog,
 };
 pub use scheduler::PreemptiveExplorationScheduler;
 
@@ -32,42 +42,6 @@ pub enum StepOutcome {
     YieldedTimer(TimerId),
     Stopped,
     Failed,
-}
-
-/// Invariant INV-BUDGET-01 Gas Progress Oracle
-///
-/// Safety: gas_used strictly monotonically increases on every execution step by opcode weight.
-/// Liveness: total gas grows proportionally to executed instructions.
-#[derive(Debug, Clone)]
-pub struct GasProgressOracle {
-    pub last_gas: u64,
-    pub progress_count: u64,
-}
-
-impl GasProgressOracle {
-    pub fn new(initial_gas: u64) -> Self {
-        Self {
-            last_gas: initial_gas,
-            progress_count: 0,
-        }
-    }
-
-    /// Verifies that if execution progress was made (instructions_stepped > 0),
-    /// gas consumption strictly increased.
-    pub fn verify_step_progress(
-        &mut self,
-        current_gas: u64,
-        instructions_stepped: u64,
-    ) -> CoreResult<(), &'static str> {
-        if instructions_stepped > 0 {
-            if current_gas <= self.last_gas {
-                return Err("INV-BUDGET-01-FAIL: Progress made without gas consumption");
-            }
-            self.progress_count += instructions_stepped;
-        }
-        self.last_gas = current_gas;
-        Ok(())
-    }
 }
 
 /// MinimalSimScheduler: minimal cooperative loop with support for TaskState::Yielded,

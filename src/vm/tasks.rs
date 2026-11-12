@@ -5,6 +5,27 @@ use crate::bytecode::{LustMap, ValueKey};
 use crate::vm::task::TaskKind;
 use alloc::{format, string::ToString};
 use core::{cell::RefCell, mem};
+
+pub static MUTATION_M2_SKIP_PANIC_FINALIZER: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub static MUTATION_M2_EXECUTION_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub struct MutationM2Guard;
+
+impl MutationM2Guard {
+    pub fn enable() -> Self {
+        MUTATION_M2_SKIP_PANIC_FINALIZER.store(true, core::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for MutationM2Guard {
+    fn drop(&mut self) {
+        MUTATION_M2_SKIP_PANIC_FINALIZER.store(false, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl VM {
     /// Associates a task with an open scope before it can execute.
     pub fn register_scope_task(
@@ -53,7 +74,16 @@ impl VM {
         }) {
             return false;
         }
-        scope.finalize_resources();
+        let has_failed = children.iter().any(|id| {
+            self.task_manager
+                .get(TaskId(*id))
+                .map_or(false, |task| task.state == TaskState::Failed)
+        });
+        if has_failed && MUTATION_M2_SKIP_PANIC_FINALIZER.load(core::sync::atomic::Ordering::Relaxed) {
+            MUTATION_M2_EXECUTION_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        } else {
+            scope.finalize_resources();
+        }
         true
     }
 

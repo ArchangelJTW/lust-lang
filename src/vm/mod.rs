@@ -43,6 +43,9 @@ mod tracing;
 pub(crate) use self::api::format_doc_comment;
 pub use self::api::{NativeExport, NativeExportParam};
 pub use self::execution::{MUTATION_M1_EXECUTION_COUNT, MUTATION_M1_SKIP_GAS, MutationM1Guard};
+pub use self::tasks::{
+    MUTATION_M2_EXECUTION_COUNT, MUTATION_M2_SKIP_PANIC_FINALIZER, MutationM2Guard,
+};
 pub(crate) use self::tracing::JitCallSite;
 #[cfg(feature = "std")]
 thread_local! {

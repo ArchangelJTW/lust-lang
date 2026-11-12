@@ -6,7 +6,8 @@ vsc-extension/lust-analyzer-*
 examples/rust-extension/extensions/double/target
 examples/rust-extension/extensions/triple/target
 tree-sitter-lust/target
-/scripts
+/scripts/*
+!/scripts/run_dst_mutation_gate.sh
 vsc-extension/package-lock.json
 mine/
 *.dylib

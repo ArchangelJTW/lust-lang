@@ -97,8 +97,17 @@ pub use packages::{
 };
 pub use parser::Parser;
 pub use typechecker::{FunctionSignature, TypeChecker, TypeCollection};
-pub use vm::{NativeExport, NativeExportParam, VM};
-pub use sim::{GasProgressOracle, MinimalSimScheduler, StepOutcome};
+pub use vm::{
+    NativeExport, NativeExportParam, VM,
+    MUTATION_M1_EXECUTION_COUNT, MUTATION_M1_SKIP_GAS, MutationM1Guard,
+    MUTATION_M2_EXECUTION_COUNT, MUTATION_M2_SKIP_PANIC_FINALIZER, MutationM2Guard,
+};
+pub use sim::{
+    FaultConfiguration, FaultInjectedVfs, FaultKind, GasMonotonicityOracle, GasProgressOracle,
+    InterruptSchedule, InvariantViolation, InvBudget01Oracle, InvFiber01Oracle, InvFiber02Oracle,
+    InvFiber03Oracle, InvRx01Oracle, MemoryFaultPolicy, MinimalSimScheduler,
+    PreemptiveExplorationScheduler, StepCounterWatchdog, StepOutcome, VfsFaultRule, VfsOp,
+};
 #[cfg(feature = "std")]
 pub use vfs::{
     DirectHostFsBypassPanic, MemFs, OsFs, VfsMetadata, VirtualConsole, VirtualEnv, VirtualFileSystem,

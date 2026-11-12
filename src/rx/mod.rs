@@ -14,7 +14,10 @@ pub use lifecycle::{
     Completion, ExitStatus, Observer, Subscription, SubscriptionControl, SubscriptionState,
 };
 pub use observable::{interval, Observable, ProducerFn};
-pub use scheduler::{ParticipantId, ReadyTask, RxScheduler, ScopeJoinCoordinator};
+pub use scheduler::{
+    ParticipantId, ReadyTask, RxScheduler, ScopeJoinCoordinator,
+    MUTATION_M3_EXECUTION_COUNT, MUTATION_M3_SKIP_CLOSED_CHECK, MutationM3Guard,
+};
 pub use timer::{RxTimerService, TimerId};
 
 /// Core error types for the Reactive Streams subsystem.

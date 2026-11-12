@@ -72,7 +72,7 @@ fn test_minimal_sim_scheduler_cooperative_yield_and_resume() {
 
     // Verify task state in VM
     let task = scheduler.vm.get_task_instance(handle).expect("task must exist");
-    assert_eq!(task.state, TaskState::Yielded);
+    assert_eq!(task.state, TaskState::Yielded(lust::vm::YieldReason::Explicit));
 
     // Second step: resume fiber with value 123 -> returns 123
     let outcome2 = scheduler

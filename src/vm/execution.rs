@@ -187,6 +187,16 @@ impl VM {
                 return Ok(Value::Nil);
             }
 
+            if self.current_task.is_some() {
+                if let Some(fuel) = self.quantum_fuel.as_mut() {
+                    if *fuel == 0 {
+                        self.last_task_signal = Some(TaskSignal::QuantumExhausted);
+                        return Ok(Value::Nil);
+                    }
+                    *fuel -= 1;
+                }
+            }
+
             let executing_frame_index =
                 self.call_stack
                     .len()
@@ -230,7 +240,7 @@ impl VM {
             } else {
                 (false, 0)
             };
-            if should_check_jit && JIT_ENABLED {
+            if should_check_jit && JIT_ENABLED && self.quantum_fuel.is_none() {
                 let count = self.jit.profiler.record_backedge(func_idx, loop_start_ip);
                 let backedge_ip = ip_before_execution.saturating_sub(1);
                 if self

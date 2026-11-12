@@ -172,6 +172,7 @@ impl VM {
             env: crate::vfs::VirtualEnv::new(),
             #[cfg(feature = "std")]
             console: crate::vfs::VirtualConsole::new(),
+            quantum_fuel: None,
         };
         vm.cycle_collector.set_enabled(config.gc_enabled());
         if config.use_mir() {

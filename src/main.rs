@@ -2286,6 +2286,10 @@ fn print_error_with_context(source: &str, filename: &str, error: &lust::LustErro
         lust::LustError::Unknown(msg) => {
             eprintln!("{RED}{BOLD}error{RESET}: {msg}");
         }
+
+        lust::LustError::BlockingHostCallViolation(msg) => {
+            eprintln!("{RED}{BOLD}blocking host call violation{RESET}: {msg}");
+        }
     }
 }
 

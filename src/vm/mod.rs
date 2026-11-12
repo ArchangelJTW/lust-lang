@@ -5,7 +5,7 @@ pub(crate) mod cycle;
 pub mod stdlib;
 mod task;
 use self::budget::BudgetState;
-pub use self::task::{TaskId, TaskInstance, TaskManager, TaskState};
+pub use self::task::{FiberContinuation, TaskId, TaskInstance, TaskManager, TaskState, YieldReason};
 pub(super) use crate::ast::{FieldOwnership, StructDef, Type, TypeKind};
 pub(super) use crate::bytecode::{
     FieldStorage, Function, Instruction, NativeCallResult, Register, StructLayout, TaskHandle,
@@ -308,6 +308,7 @@ pub struct VM {
     pub env: crate::vfs::VirtualEnv,
     #[cfg(feature = "std")]
     pub console: crate::vfs::VirtualConsole,
+    pub quantum_fuel: Option<u64>,
 }
 
 pub type HostResourceCleanupFn = fn(usize);
@@ -404,7 +405,7 @@ impl VM {
     /// other allocation classes and complete process containment are out of scope.
     #[inline]
     pub fn effective_jit_enabled(&self) -> bool {
-        self.jit.enabled && !self.budgets.mem_budget_enabled()
+        self.jit.enabled && !self.budgets.mem_budget_enabled() && self.quantum_fuel.is_none()
     }
 
     #[inline]
@@ -431,22 +432,22 @@ impl VM {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct CallFrame {
-    pub(super) function_idx: usize,
-    pub(super) ip: usize,
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallFrame {
+    pub function_idx: usize,
+    pub ip: usize,
     /// In std mode this is a fixed [Value; 256] stored inline in the frame (no extra
     /// indirection, JIT-compatible raw pointer layout). In no_std mode (no JIT) it is a
     /// Vec sized to the function's actual register_count, saving the unused slots.
     #[cfg(feature = "std")]
-    pub(super) registers: [Value; 256],
+    pub registers: [Value; 256],
     #[cfg(not(feature = "std"))]
-    pub(super) registers: Vec<Value>,
+    pub registers: Vec<Value>,
     #[allow(dead_code)]
-    pub(super) base_register: usize,
-    pub(super) return_dest: Option<Register>,
-    pub(super) upvalues: Vec<Value>,
-    pub(super) shared_upvalues: Vec<Upvalue>,
+    pub base_register: usize,
+    pub return_dest: Option<Register>,
+    pub upvalues: Vec<Value>,
+    pub shared_upvalues: Vec<Upvalue>,
 }
 
 /// What a bytecode-to-bytecode call checks about its callee, computed
@@ -628,6 +629,7 @@ pub(super) enum TaskSignal {
         value: Value,
         timer_id: crate::sim::clock::TimerId,
     },
+    QuantumExhausted,
     Stop { value: Value },
 }
 

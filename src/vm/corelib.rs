@@ -1512,7 +1512,7 @@ fn task_state_to_status_value(state: &TaskState) -> Value {
     match state {
         TaskState::Ready => Value::enum_unit("TaskStatus", "Ready"),
         TaskState::Running => Value::enum_unit("TaskStatus", "Running"),
-        TaskState::Yielded => Value::enum_unit("TaskStatus", "Yielded"),
+        TaskState::Yielded(_) => Value::enum_unit("TaskStatus", "Yielded"),
         TaskState::Completed => Value::enum_unit("TaskStatus", "Completed"),
         TaskState::Failed => Value::enum_unit("TaskStatus", "Failed"),
         TaskState::Stopped => Value::enum_unit("TaskStatus", "Stopped"),

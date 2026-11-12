@@ -286,6 +286,21 @@ impl TimerQueue {
         }
     }
 
+    /// Check if a timer ID is still pending (present and not cancelled).
+    pub fn is_pending(&self, id: TimerId) -> bool {
+        #[cfg(feature = "std")]
+        {
+            let heap = self.heap.lock().unwrap();
+            heap.iter()
+                .any(|entry| entry.id == id && !entry.cancelled.load(AtomicOrdering::SeqCst))
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = id;
+            false
+        }
+    }
+
     /// Poll all expired, uncancelled actions whose deadline <= now_nanos.
     pub fn poll_expired(&self, now_nanos: u64) -> Vec<Box<dyn FnOnce() + Send + 'static>> {
         #[cfg(feature = "std")]
@@ -447,6 +462,11 @@ impl LustClock {
     /// Cancel a scheduled timer.
     pub fn cancel_timer(&self, timer_id: TimerId, generation: u32) -> bool {
         self.timers.cancel(timer_id, generation)
+    }
+
+    /// Check if a timer ID is still pending.
+    pub fn is_timer_pending(&self, timer_id: TimerId) -> bool {
+        self.timers.is_pending(timer_id)
     }
 
     /// Poll expired timers up to `now_nanos`.

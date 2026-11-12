@@ -9,7 +9,7 @@
 use core::time::Duration;
 use lust::bytecode::{Function, Instruction, Value, ValueKey};
 use lust::sim::{MinimalSimScheduler, StepOutcome};
-use lust::vm::{TaskState, VM};
+use lust::vm::VM;
 
 fn get_os_fn(vm: &VM, name: &str) -> Value {
     match vm.get_global("os").expect("os module must exist") {
@@ -192,7 +192,7 @@ fn test_stdlib_os_sleep_nonblocking_under_sim_clock() {
 
     // Verify task state in VM
     let task = scheduler.vm.get_task_instance(handle).unwrap();
-    assert_eq!(task.state, TaskState::Yielded);
+    assert!(task.state.is_yielded());
     assert!(task.timer_id.is_some());
 
     // Host OS thread must NOT have been blocked!

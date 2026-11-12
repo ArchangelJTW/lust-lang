@@ -291,6 +291,7 @@ impl CycleCollector {
             | TaskSignal::Stop { value } => {
                 self.discover_value(value, true)
             }
+            TaskSignal::QuantumExhausted => {}
         }
     }
 

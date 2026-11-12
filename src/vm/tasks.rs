@@ -145,7 +145,7 @@ impl VM {
                             dest,
                             value: yielded,
                         } => {
-                            task.state = TaskState::Yielded;
+                            task.state = TaskState::Yielded(YieldReason::Explicit);
                             task.last_yield = Some(yielded);
                             task.last_result = None;
                             task.yield_dest = Some(dest);
@@ -156,11 +156,18 @@ impl VM {
                             value: yielded,
                             timer_id,
                         } => {
-                            task.state = TaskState::Yielded;
+                            task.state = TaskState::Yielded(YieldReason::Timer(timer_id));
                             task.last_yield = Some(yielded);
                             task.last_result = None;
                             task.yield_dest = Some(dest);
                             task.timer_id = Some(timer_id);
+                        }
+
+                        TaskSignal::QuantumExhausted => {
+                            task.state = TaskState::Yielded(YieldReason::QuantumExhausted);
+                            task.last_yield = None;
+                            task.last_result = None;
+                            task.yield_dest = None;
                         }
 
                         TaskSignal::Stop { value: stop_value } => {
@@ -204,6 +211,9 @@ impl VM {
             TaskState::Stopped => crate::effect_abi::FiberExecutionState::Interrupted,
             _ => crate::effect_abi::FiberExecutionState::Suspended,
         };
+        if matches!(task.state, TaskState::Yielded(_)) {
+            task.capture_continuation();
+        }
         self.task_manager.attach(task);
         if let Some(err) = error_result {
             Err(err)
@@ -398,7 +408,7 @@ impl VM {
         self.resume_task_handle(handle, Some(resume_value))?;
         let task = self.get_task_instance(handle)?;
         match task.state {
-            TaskState::Yielded => Ok(task.last_yield.clone().unwrap_or(Value::Nil)),
+            TaskState::Yielded(_) => Ok(task.last_yield.clone().unwrap_or(Value::Nil)),
             TaskState::Completed | TaskState::Stopped => {
                 Ok(task.last_result.clone().unwrap_or(Value::Nil))
             }
@@ -422,6 +432,67 @@ impl VM {
         let _vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
         let task_id = self.task_id_from_handle(handle)?;
         self.run_task_internal(task_id, resume_value)
+    }
+
+    /// Resumes a fiber with an exact instruction quantum.
+    /// If quantum fuel is exhausted, the fiber is preempted with TaskState::Yielded(YieldReason::QuantumExhausted)
+    /// and its full FiberContinuation is preserved.
+    pub fn resume_task_handle_with_quantum(
+        &mut self,
+        handle: TaskHandle,
+        quantum: u64,
+        resume_value: Option<Value>,
+    ) -> Result<TaskState> {
+        let _vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
+        let task_id = self.task_id_from_handle(handle)?;
+        self.quantum_fuel = Some(quantum);
+        let res = self.run_task_internal(task_id, resume_value);
+        self.quantum_fuel = None;
+        match res {
+            Ok(()) => {
+                let task = self.get_task_instance(handle)?;
+                Ok(task.state.clone())
+            }
+            Err(e) => {
+                if let Ok(task) = self.get_task_instance(handle) {
+                    if task.state == TaskState::Failed {
+                        return Ok(TaskState::Failed);
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Restores a fiber's execution context from a FiberContinuation and resumes it.
+    pub fn resume_from_continuation(
+        &mut self,
+        handle: TaskHandle,
+        continuation: FiberContinuation,
+        resume_value: Option<Value>,
+    ) -> Result<()> {
+        let task_id = self.task_id_from_handle(handle)?;
+        if let Some(task) = self.task_manager.get_mut(task_id) {
+            task.restore_continuation(continuation);
+            task.state = TaskState::Ready;
+        }
+        self.resume_task_handle(handle, resume_value)
+    }
+
+    /// Restores a fiber's execution context from a FiberContinuation and executes it with an instruction quantum.
+    pub fn resume_from_continuation_with_quantum(
+        &mut self,
+        handle: TaskHandle,
+        continuation: FiberContinuation,
+        quantum: u64,
+        resume_value: Option<Value>,
+    ) -> Result<TaskState> {
+        let task_id = self.task_id_from_handle(handle)?;
+        if let Some(task) = self.task_manager.get_mut(task_id) {
+            task.restore_continuation(continuation);
+            task.state = TaskState::Ready;
+        }
+        self.resume_task_handle_with_quantum(handle, quantum, resume_value)
     }
 
     pub(super) fn stop_task_handle(&mut self, handle: TaskHandle) -> Result<()> {

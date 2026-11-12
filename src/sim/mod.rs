@@ -3,10 +3,17 @@
 //! Phase 2: Clock & Timers separation, deterministic virtual time, nonblocking sleep.
 
 pub mod clock;
+pub mod host_call;
+pub mod scheduler;
+
 pub use clock::{
     CivilDateTime, LustClock, MonotonicClock, SimClock, SystemMonotonicClock, SystemWallClock,
     TimerControl, TimerId, TimerQueue, WallClock,
 };
+pub use host_call::{
+    BlockingHostCallContract, assert_non_blocking_host_call, fail_stop_blocking_host_call,
+};
+pub use scheduler::PreemptiveExplorationScheduler;
 
 use crate::bytecode::{TaskHandle, Value};
 use crate::error::{LustError, Result};
@@ -147,13 +154,17 @@ impl MinimalSimScheduler {
 
         match res {
             Ok(()) => match state {
-                TaskState::Yielded => {
-                    if let Some(tid) = timer_id {
-                        Ok(StepOutcome::YieldedTimer(tid))
-                    } else {
-                        Ok(StepOutcome::Yielded(last_yield))
+                TaskState::Yielded(reason) => match reason {
+                    crate::vm::YieldReason::Timer(tid) => Ok(StepOutcome::YieldedTimer(tid)),
+                    crate::vm::YieldReason::QuantumExhausted => Ok(StepOutcome::Yielded(None)),
+                    crate::vm::YieldReason::Explicit => {
+                        if let Some(tid) = timer_id {
+                            Ok(StepOutcome::YieldedTimer(tid))
+                        } else {
+                            Ok(StepOutcome::Yielded(last_yield))
+                        }
                     }
-                }
+                },
                 TaskState::Completed => Ok(StepOutcome::Completed(last_result)),
                 TaskState::Stopped => Ok(StepOutcome::Stopped),
                 TaskState::Failed => Ok(StepOutcome::Failed),
@@ -254,17 +265,37 @@ impl MinimalSimScheduler {
     }
 }
 
+#[cfg(feature = "std")]
+std::thread_local! {
+    static SIMULATED_MODE_FLAG: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+#[cfg(not(feature = "std"))]
 static SIMULATED_MODE_FLAG: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Check if global simulation mode is active.
 pub fn is_simulated_mode() -> bool {
-    SIMULATED_MODE_FLAG.load(core::sync::atomic::Ordering::SeqCst)
+    #[cfg(feature = "std")]
+    {
+        SIMULATED_MODE_FLAG.with(|flag| flag.get())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        SIMULATED_MODE_FLAG.load(core::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Explicitly set global simulation mode.
 pub fn set_simulated_mode(active: bool) {
-    SIMULATED_MODE_FLAG.store(active, core::sync::atomic::Ordering::SeqCst);
+    #[cfg(feature = "std")]
+    {
+        SIMULATED_MODE_FLAG.with(|flag| flag.set(active));
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        SIMULATED_MODE_FLAG.store(active, core::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// RAII Guard activating simulation mode for the scope of the guard.
@@ -274,14 +305,15 @@ pub struct SimModeGuard {
 
 impl SimModeGuard {
     pub fn enter() -> Self {
-        let prev = SIMULATED_MODE_FLAG.swap(true, core::sync::atomic::Ordering::SeqCst);
+        let prev = is_simulated_mode();
+        set_simulated_mode(true);
         Self { prev }
     }
 }
 
 impl Drop for SimModeGuard {
     fn drop(&mut self) {
-        SIMULATED_MODE_FLAG.store(self.prev, core::sync::atomic::Ordering::SeqCst);
+        set_simulated_mode(self.prev);
     }
 }
 

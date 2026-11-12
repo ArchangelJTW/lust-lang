@@ -932,7 +932,7 @@ fn test_task_native_yield_and_stop_lifecycle() {
 
     // Task must be in Yielded state
     let task = vm.get_task_instance(handle).unwrap();
-    assert_eq!(task.state, TaskState::Yielded);
+    assert!(task.state.is_yielded());
     assert_eq!(task.last_yield, Some(Value::Int(10)));
 
     // Resume task with value
@@ -1200,7 +1200,7 @@ fn test_tasks_deep_lifecycle_and_builtin_error_matrix() {
 
     vm.load_functions(vec![worker]);
     let handle = vm.spawn_task_value(Value::Function(0), vec![]).expect("spawn worker");
-    assert_eq!(vm.get_task_instance(handle).unwrap().state, TaskState::Yielded);
+    assert!(vm.get_task_instance(handle).unwrap().state.is_yielded());
 
     // Stop yielded task
     let _task_id = TaskId(handle.id());

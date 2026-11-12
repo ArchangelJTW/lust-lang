@@ -907,6 +907,14 @@ impl fmt::Debug for Upvalue {
     }
 }
 
+impl PartialEq for Upvalue {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.value, &other.value) || *self.value.borrow() == *other.value.borrow()
+    }
+}
+
+impl Eq for Upvalue {}
+
 #[derive(Debug, Clone)]
 pub enum NativeCallResult {
     Return(Value),

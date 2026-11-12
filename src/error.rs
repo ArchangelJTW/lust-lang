@@ -65,6 +65,8 @@ pub enum LustError {
     },
     #[error("Unknown error: {0}")]
     Unknown(String),
+    #[error("BlockingHostCallViolation: {0}")]
+    BlockingHostCallViolation(String),
 }
 
 fn format_stack_trace(frames: &[StackFrame]) -> String {

@@ -352,6 +352,7 @@ pub enum FiberExecutionState {
 }
 
 /// Context for an active Fiber with interruption masking for acquire_release.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FiberContext {
     pub id: u64,
     pub scope_id: u64,

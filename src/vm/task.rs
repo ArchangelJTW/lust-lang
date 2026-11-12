@@ -1,9 +1,11 @@
 use super::CallFrame;
-use crate::bytecode::{Register, TaskHandle, Value};
+use crate::bytecode::{Register, TaskHandle, Upvalue, Value};
 use crate::effect_abi::{FiberContext, FiberExecutionState, InterruptReason};
 use crate::error::LustError;
-use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, vec, vec::Vec};
+use core::cell::RefCell;
 use hashbrown::HashMap;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TaskId(pub u64);
 impl TaskId {
@@ -16,11 +18,38 @@ impl TaskId {
     }
 }
 
+/// Reason for a fiber yielding execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum YieldReason {
+    /// Explicit cooperative yield via task.yield().
+    Explicit,
+    /// Yield waiting on virtual monotonic clock timer.
+    Timer(crate::sim::clock::TimerId),
+    /// Preempted by quantum instruction fuel exhaustion (DES).
+    QuantumExhausted,
+}
+
+impl YieldReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            YieldReason::Explicit => "explicit",
+            YieldReason::Timer(_) => "timer",
+            YieldReason::QuantumExhausted => "quantum_exhausted",
+        }
+    }
+}
+
+impl From<crate::sim::clock::TimerId> for YieldReason {
+    fn from(id: crate::sim::clock::TimerId) -> Self {
+        YieldReason::Timer(id)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskState {
     Ready,
     Running,
-    Yielded,
+    Yielded(YieldReason),
     Completed,
     Failed,
     Stopped,
@@ -31,12 +60,35 @@ impl TaskState {
         match self {
             TaskState::Ready => "ready",
             TaskState::Running => "running",
-            TaskState::Yielded => "yielded",
+            TaskState::Yielded(_) => "yielded",
             TaskState::Completed => "completed",
             TaskState::Failed => "failed",
             TaskState::Stopped => "stopped",
         }
     }
+
+    pub fn is_yielded(&self) -> bool {
+        matches!(self, TaskState::Yielded(_))
+    }
+
+    pub fn yield_reason(&self) -> Option<&YieldReason> {
+        match self {
+            TaskState::Yielded(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
+/// Full resumable fiber continuation holding complete VM execution context.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FiberContinuation {
+    pub call_stack: Vec<Box<CallFrame>>,
+    pub ip: usize,
+    pub pending_return_value: Option<Value>,
+    pub pending_return_dest: Option<Register>,
+    pub yield_dest: Option<Register>,
+    pub fiber_context: FiberContext,
+    pub upvalues: Vec<Rc<RefCell<Upvalue>>>,
 }
 
 pub struct TaskInstance {
@@ -45,13 +97,14 @@ pub struct TaskInstance {
     pub timer_id: Option<crate::sim::clock::TimerId>,
     pub fiber_context: FiberContext,
     pub scope_id: Option<u64>,
-    pub(super) call_stack: Vec<Box<CallFrame>>,
+    pub call_stack: Vec<Box<CallFrame>>,
     pub pending_return_value: Option<Value>,
     pub pending_return_dest: Option<Register>,
     pub yield_dest: Option<Register>,
     pub last_yield: Option<Value>,
     pub last_result: Option<Value>,
     pub error: Option<LustError>,
+    pub continuation: Option<FiberContinuation>,
     kind: TaskKind,
     initial_frame: Option<Box<CallFrame>>,
 }
@@ -77,6 +130,7 @@ impl TaskInstance {
             last_yield: None,
             last_result: None,
             error: None,
+            continuation: None,
             kind: TaskKind::Script,
             initial_frame: Some(initial_frame),
         }
@@ -88,7 +142,7 @@ impl TaskInstance {
             timer_id: None,
             fiber_context: FiberContext::new(id.0, 0),
             scope_id: None,
-            state: TaskState::Yielded,
+            state: TaskState::Yielded(YieldReason::Explicit),
             call_stack: Vec::new(),
             pending_return_value: None,
             pending_return_dest: None,
@@ -96,6 +150,7 @@ impl TaskInstance {
             last_yield: None,
             last_result: None,
             error: None,
+            continuation: None,
             kind: TaskKind::NativeFuture { future_id: None },
             initial_frame: None,
         }
@@ -144,9 +199,10 @@ impl TaskInstance {
                 self.last_yield = None;
                 self.last_result = None;
                 self.error = None;
+                self.continuation = None;
             }
             TaskKind::NativeFuture { .. } => {
-                self.state = TaskState::Yielded;
+                self.state = TaskState::Yielded(YieldReason::Explicit);
                 self.call_stack.clear();
                 self.pending_return_value = None;
                 self.pending_return_dest = None;
@@ -154,8 +210,64 @@ impl TaskInstance {
                 self.last_yield = None;
                 self.last_result = None;
                 self.error = None;
+                self.continuation = None;
             }
         }
+    }
+
+    pub fn continuation(&self) -> Option<&FiberContinuation> {
+        self.continuation.as_ref()
+    }
+
+    pub fn take_continuation(&mut self) -> Option<FiberContinuation> {
+        self.continuation.take()
+    }
+
+    pub fn capture_continuation(&mut self) -> FiberContinuation {
+        let ip = self.call_stack.last().map(|f| f.ip).unwrap_or(0);
+        let upvalues = self
+            .call_stack
+            .last()
+            .map(|f| {
+                f.shared_upvalues
+                    .iter()
+                    .cloned()
+                    .map(|u| Rc::new(RefCell::new(u)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let cont = FiberContinuation {
+            call_stack: self.call_stack.clone(),
+            ip,
+            pending_return_value: self.pending_return_value.clone(),
+            pending_return_dest: self.pending_return_dest,
+            yield_dest: self.yield_dest,
+            fiber_context: self.fiber_context.clone(),
+            upvalues,
+        };
+        self.continuation = Some(cont.clone());
+        cont
+    }
+
+    pub fn restore_continuation(&mut self, continuation: FiberContinuation) {
+        self.call_stack = continuation.call_stack;
+        if let Some(top) = self.call_stack.last_mut() {
+            top.ip = continuation.ip;
+            if !continuation.upvalues.is_empty() {
+                top.shared_upvalues = continuation
+                    .upvalues
+                    .into_iter()
+                    .map(|u| u.borrow().clone())
+                    .collect();
+                top.upvalues = top.shared_upvalues.iter().map(|u| u.get()).collect();
+            }
+        }
+        self.pending_return_value = continuation.pending_return_value;
+        self.pending_return_dest = continuation.pending_return_dest;
+        self.yield_dest = continuation.yield_dest;
+        self.fiber_context = continuation.fiber_context;
+        self.continuation = None;
     }
 
     pub fn handle(&self) -> TaskHandle {
@@ -218,7 +330,7 @@ impl TaskManager {
         self.tasks.contains_key(&id)
     }
 
-    pub(super) fn iter(&self) -> impl Iterator<Item = &TaskInstance> {
+    pub fn iter(&self) -> impl Iterator<Item = &TaskInstance> {
         self.tasks.values()
     }
 }

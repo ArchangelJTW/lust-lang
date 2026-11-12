@@ -92,6 +92,11 @@ name = "test_framework_bench"
 path = "benchmarks/test_framework_bench.rs"
 required-features = ["std"]
 
+[[bin]]
+name = "tost_equivalence"
+path = "benchmarks/tost_equivalence.rs"
+required-features = ["std"]
+
 [[example]]
 name = "effects_basic"
 path = "examples/effects/01_basic_effects.rs"

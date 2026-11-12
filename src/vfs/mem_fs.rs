@@ -117,6 +117,50 @@ impl MemFs {
         list.sort();
         list
     }
+
+    /// Snapshot all files in MemFs as a sorted list of (path, content) pairs.
+    pub fn snapshot(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        let guard = self.nodes.read().unwrap();
+        let mut files = Vec::new();
+        for (path, node) in guard.iter() {
+            if let MemNode::File { content, .. } = node {
+                files.push((path.clone(), content.clone()));
+            }
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
+    }
+
+    /// Restore MemFs state from a snapshot of (path, content) pairs.
+    pub fn restore_snapshot(&self, files: &[(PathBuf, Vec<u8>)]) {
+        let mut guard = self.nodes.write().unwrap();
+        guard.clear();
+        guard.insert(
+            PathBuf::from("/workspace"),
+            MemNode::Dir {
+                modified: current_epoch_secs(),
+            },
+        );
+        for (path, content) in files {
+            let norm = normalize_virtual_path(path);
+            if let Some(parent) = norm.parent() {
+                let mut curr = PathBuf::from("/");
+                for comp in parent.components() {
+                    curr.push(comp);
+                    guard.entry(curr.clone()).or_insert_with(|| MemNode::Dir {
+                        modified: current_epoch_secs(),
+                    });
+                }
+            }
+            guard.insert(
+                norm,
+                MemNode::File {
+                    content: content.clone(),
+                    modified: current_epoch_secs(),
+                },
+            );
+        }
+    }
 }
 
 impl VirtualFileSystem for MemFs {

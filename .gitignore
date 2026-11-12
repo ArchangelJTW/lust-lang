@@ -8,6 +8,8 @@ examples/rust-extension/extensions/triple/target
 tree-sitter-lust/target
 /scripts/*
 !/scripts/run_dst_mutation_gate.sh
+!/scripts/run_dst_campaign.sh
+!/scripts/run_dst_tost_equivalence.sh
 vsc-extension/package-lock.json
 mine/
 *.dylib

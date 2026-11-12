@@ -6,6 +6,7 @@ pub mod clock;
 pub mod fault;
 pub mod host_call;
 pub mod invariants;
+pub mod replay;
 pub mod scheduler;
 
 pub use clock::{
@@ -22,6 +23,10 @@ pub use host_call::{
 pub use invariants::{
     GasMonotonicityOracle, GasProgressOracle, InvariantViolation, InvBudget01Oracle,
     InvFiber01Oracle, InvFiber02Oracle, InvFiber03Oracle, InvRx01Oracle, StepCounterWatchdog,
+};
+pub use replay::{
+    EventLog, ReplayBundle, ReplayEngine, ReplayError, ReplayEvent, ReplayEventKind,
+    ReplayManifest, ReplayResult, Shrinker, ShrunkReplay,
 };
 pub use scheduler::PreemptiveExplorationScheduler;
 

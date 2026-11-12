@@ -25,6 +25,7 @@ pub struct PreemptiveExplorationScheduler {
     pub max_execution_steps: usize,
     pub gas_oracle: GasProgressOracle,
     pub execution_log: Vec<(TaskHandle, u64, TaskState)>,
+    pub event_log: Option<crate::sim::replay::EventLog>,
 }
 
 impl PreemptiveExplorationScheduler {
@@ -40,6 +41,7 @@ impl PreemptiveExplorationScheduler {
             max_execution_steps: 100_000,
             gas_oracle: GasProgressOracle::new(initial_gas),
             execution_log: Vec::new(),
+            event_log: None,
         }
     }
 
@@ -63,6 +65,24 @@ impl PreemptiveExplorationScheduler {
     pub fn with_step_limit(mut self, limit: usize) -> Self {
         self.max_execution_steps = limit;
         self
+    }
+
+    /// Enables event logging for this scheduler.
+    pub fn with_event_log(mut self) -> Self {
+        self.event_log = Some(crate::sim::replay::EventLog::new());
+        self
+    }
+
+    /// Enables event logging in-place.
+    pub fn enable_event_log(&mut self) {
+        if self.event_log.is_none() {
+            self.event_log = Some(crate::sim::replay::EventLog::new());
+        }
+    }
+
+    /// Takes the recorded event log, replacing it with None.
+    pub fn take_event_log(&mut self) -> Option<crate::sim::replay::EventLog> {
+        self.event_log.take()
     }
 
     /// Spawns a fiber and places it in the ready queue.
@@ -107,6 +127,16 @@ impl PreemptiveExplorationScheduler {
     pub fn advance_time(&mut self, duration: Duration) {
         self.vm.clock.advance(duration);
         let now = self.vm.clock.now_nanos();
+        if let Some(ref mut log) = self.event_log {
+            log.record(
+                self.step_counter as u64,
+                now,
+                crate::sim::replay::ReplayEventKind::TimeAdvanced {
+                    delta_nanos: duration.as_nanos() as u64,
+                    now_nanos: now,
+                },
+            );
+        }
         let actions = self.vm.clock.poll_expired_timers(now);
         for action in actions {
             action();
@@ -173,6 +203,38 @@ impl PreemptiveExplorationScheduler {
         let gas_after = self.vm.gas_used();
         if gas_after > gas_before {
             let _ = self.gas_oracle.verify_step_progress(gas_after, 1);
+        }
+
+        if let Some(ref mut log) = self.event_log {
+            let now = self.vm.clock.now_nanos();
+            log.record(
+                self.step_counter as u64,
+                now,
+                crate::sim::replay::ReplayEventKind::TaskScheduled {
+                    task_id: handle.0,
+                    quantum,
+                },
+            );
+            if gas_after > gas_before {
+                log.record(
+                    self.step_counter as u64,
+                    now,
+                    crate::sim::replay::ReplayEventKind::GasBurned {
+                        task_id: handle.0,
+                        gas_delta: gas_after - gas_before,
+                        total_gas: gas_after,
+                    },
+                );
+            }
+            log.record(
+                self.step_counter as u64,
+                now,
+                crate::sim::replay::ReplayEventKind::StateChanged {
+                    task_id: handle.0,
+                    from_state: "Ready".to_string(),
+                    to_state: alloc::format!("{:?}", state),
+                },
+            );
         }
 
         self.execution_log.push((handle, quantum, state.clone()));

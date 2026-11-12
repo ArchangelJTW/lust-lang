@@ -18,4 +18,5 @@ mine/
 /results/
 tests/compile_fail/fs_gate/target/
 examples/tokio-concurrency/target/
-
+examples/c-ffi/lust_ffi_example
+examples/c-ffi/*.o

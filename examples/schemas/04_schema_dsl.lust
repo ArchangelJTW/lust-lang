@@ -1,0 +1,118 @@
+-- Schema DSL & Structured Data Validation Showcase
+-- Demonstrates schema constraints, field validation rules, and fail-closed assertion checks.
+
+struct UserPayload
+    id: int
+    username: string
+    email: string
+    age: int
+    active: bool
+end
+
+struct UserValidator
+    min_id: int
+    max_id: int
+    min_username_len: int
+    max_username_len: int
+    min_age: int
+    max_age: int
+end
+
+impl UserValidator
+    function default(): UserValidator
+        return UserValidator {
+            min_id = 1,
+            max_id = 1_000_000,
+            min_username_len = 3,
+            max_username_len = 32,
+            min_age = 0,
+            max_age = 150
+        }
+    end
+
+    function validate(self, user: UserPayload): Result<bool, string>
+        -- 1. Integer range constraint (Gate-SCHEMA-01)
+        if user.id < self.min_id or user.id > self.max_id then
+            return Result.Err("Validation error: user id out of allowed range [1, 1000000]")
+        end
+
+        -- 2. String length constraint
+        local ulen = string.len(user.username)
+        if ulen < self.min_username_len or ulen > self.max_username_len then
+            return Result.Err("Validation error: username length must be between 3 and 32 characters")
+        end
+
+        -- 3. String format constraint (regex/pattern simulation)
+        if not string.contains(user.email, "@") or not string.contains(user.email, ".") then
+            return Result.Err("Validation error: email does not conform to valid address format")
+        end
+
+        -- 4. Age bounds check
+        if user.age < self.min_age or user.age > self.max_age then
+            return Result.Err("Validation error: age out of bounds [0, 150]")
+        end
+
+        return Result.Ok(true)
+    end
+end
+
+-- Setup validator
+local validator = UserValidator.default()
+
+-- Case 1: Valid user payload passes validation
+local valid_user = UserPayload {
+    id = 1042,
+    username = "alex_dev",
+    email = "alex@lust-lang.org",
+    age = 28,
+    active = true
+}
+local res1 = validator:validate(valid_user)
+assert(res1:is_ok())
+assert(res1:unwrap() == true)
+
+-- Case 2: Out of bounds ID fails closed
+local invalid_id_user = UserPayload {
+    id = 0,
+    username = "alex_dev",
+    email = "alex@lust-lang.org",
+    age = 28,
+    active = true
+}
+local res2 = validator:validate(invalid_id_user)
+assert(res2:is_err())
+
+-- Case 3: Username too short fails
+local invalid_name_user = UserPayload {
+    id = 100,
+    username = "al",
+    email = "alex@lust-lang.org",
+    age = 28,
+    active = true
+}
+local res3 = validator:validate(invalid_name_user)
+assert(res3:is_err())
+
+-- Case 4: Malformed email fails
+local invalid_email_user = UserPayload {
+    id = 100,
+    username = "alex_dev",
+    email = "plainaddress",
+    age = 28,
+    active = true
+}
+local res4 = validator:validate(invalid_email_user)
+assert(res4:is_err())
+
+-- Case 5: Out of bounds age fails
+local invalid_age_user = UserPayload {
+    id = 100,
+    username = "alex_dev",
+    email = "alex@lust-lang.org",
+    age = 200,
+    active = true
+}
+local res5 = validator:validate(invalid_age_user)
+assert(res5:is_err())
+
+println("All schema DSL assertions passed!")

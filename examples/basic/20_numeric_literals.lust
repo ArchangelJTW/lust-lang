@@ -1,0 +1,90 @@
+-- Lust Programming Language - Numeric Literals & Bitwise Operations Showcase
+-- Matches specification in src/language-tour/basics.md and tests/fixtures/bitwise_golden.lust
+
+-- 1. Decimal Integers with digit separators and boundary constants
+local dec = 1_000_000
+local dec_min = -9_223_372_036_854_775_808
+local dec_max = 9_223_372_036_854_775_807
+
+assert(dec == 1000000)
+assert(dec_min == -9223372036854775808)
+assert(dec_max == 9223372036854775807)
+
+-- 2. Hexadecimal literals (0x and 0X) with two's complement MSB reinterpretation
+local hex_val = 0xDEAD_BEEF
+local hex_upper = 0x7FFF_FFFF_FFFF_FFFF
+local hex_min = 0x8000_0000_0000_0000
+local hex_all_ones = 0xFFFF_FFFF_FFFF_FFFF
+local hex_lower_prefix = 0xcafe
+local hex_upper_prefix = 0XCAFE
+
+assert(hex_val == 3735928559)
+assert(hex_upper == 9223372036854775807)
+assert(hex_min == -9223372036854775808)
+assert(hex_all_ones == -1)
+assert(hex_lower_prefix == hex_upper_prefix)
+
+-- 3. Binary literals (0b and 0B)
+local bin_byte = 0b1010_0101
+local bin_nibble = 0B1111_0000
+local bin_mask = 0b1111_1111
+local bin_all_ones = 0b11111111_11111111_11111111_11111111_11111111_11111111_11111111_11111111
+
+assert(bin_byte == 165)
+assert(bin_nibble == 240)
+assert(bin_mask == 255)
+assert(bin_all_ones == -1)
+
+-- 4. Octal literals (0o and 0O)
+local oct_mode = 0o755
+local oct_rw = 0O644
+local oct_max16 = 0o177777
+local oct_all_ones = 0o1777777777777777777777
+
+assert(oct_mode == 493)
+assert(oct_rw == 420)
+assert(oct_max16 == 65535)
+assert(oct_all_ones == -1)
+
+-- 5. Floating point with separators and scientific notation
+local pi_approx = 3.1415_9265
+local exp_small = 1e-3
+local exp_large = 1.0e+6
+local exp_sep = 1e1_0
+local float_sep = 1_000.5_0
+
+assert(pi_approx == 3.14159265)
+assert(exp_small == 0.001)
+assert(exp_large == 1000000.0)
+assert(exp_sep == 10000000000.0)
+assert(float_sep == 1000.5)
+
+-- 6. Bitwise operations and shifts (&, |, ^^, ~, <<, >>)
+local shifted = 0xFFFF_FFFF_FFFF_FFFF >> 4
+assert(shifted == -1) -- Arithmetic shift on all-ones preserves sign (-1 >> 4 == -1)
+
+local left_shifted = (0x0F << 4) | 0x05
+assert(left_shifted == 245)
+
+assert(1 << 64 == 1)
+assert(16 >> 64 == 16)
+assert(-16 >> 2 == -4)
+assert(~0 == -1)
+
+local masked = 0xDEAD_BEEF & 0xFFFF
+assert(masked == 0xBEEF)
+assert(masked == 48879)
+
+local ored = 0b1010_1010 | 0b0101_0101
+assert(ored == 0b1111_1111)
+assert(ored == 255)
+
+local xored = 0x5555_5555_5555_5555 ^^ 0xAAAA_AAAA_AAAA_AAAA
+assert(xored == -1)
+assert(xored == 0xFFFF_FFFF_FFFF_FFFF)
+
+local oct_masked = 0o755 & 0o777
+assert(oct_masked == 0o755)
+assert(oct_masked == 493)
+
+println("All numeric literal assertions passed!")

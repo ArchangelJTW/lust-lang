@@ -99,6 +99,51 @@ path = "benchmarks/tost_equivalence.rs"
 required-features = ["std"]
 
 [[example]]
+name = "schema_validation"
+path = "examples/schemas/01_schema_validation.rs"
+required-features = ["std"]
+
+[[example]]
+name = "schema_json"
+path = "examples/schemas/02_json_deserialization.rs"
+required-features = ["std"]
+
+[[example]]
+name = "schema_msgpack"
+path = "examples/schemas/03_messagepack_binary.rs"
+required-features = ["std"]
+
+[[example]]
+name = "rx_observables"
+path = "examples/rx/01_observables_basics.rs"
+required-features = ["std"]
+
+[[example]]
+name = "rx_operators"
+path = "examples/rx/02_operators_filter_map.rs"
+required-features = ["std"]
+
+[[example]]
+name = "rx_backpressure"
+path = "examples/rx/03_backpressure_buffers.rs"
+required-features = ["std"]
+
+[[example]]
+name = "sim_scheduler"
+path = "examples/simulation/01_deterministic_scheduler.rs"
+required-features = ["std"]
+
+[[example]]
+name = "sim_fault_injection"
+path = "examples/simulation/02_fault_injection_vfs.rs"
+required-features = ["std"]
+
+[[example]]
+name = "sim_replay_bundle"
+path = "examples/simulation/03_replay_bundle_export.rs"
+required-features = ["std"]
+
+[[example]]
 name = "effects_basic"
 path = "examples/effects/01_basic_effects.rs"
 required-features = ["std"]
@@ -114,18 +159,18 @@ path = "examples/effects/03_acquire_release_and_scopes.rs"
 required-features = ["std"]
 
 [[example]]
-name = "04_testing_with_virtual_clock"
-path = "examples/effects/04_testing_with_virtual_clock.rs"
-required-features = ["std"]
-
-[[example]]
-name = "05_dependency_injection_mocking"
+name = "effects_di_mocking"
 path = "examples/effects/05_dependency_injection_mocking.rs"
 required-features = ["std"]
 
 [[example]]
-name = "06_concurrency_and_supervision"
+name = "effects_supervision"
 path = "examples/effects/06_concurrency_and_supervision.rs"
+required-features = ["std"]
+
+[[example]]
+name = "embed_standalone_vm"
+path = "examples/embedding/standalone_vm.rs"
 required-features = ["std"]
 
 [dependencies]

@@ -1,0 +1,24 @@
+-- Lust Test Framework - Basic Assertions & Modifiers
+-- Demonstrates root-level tests, skip modifiers, timeout modifiers, and assertions.
+
+test "basic assertions" do
+    local x = 40 + 2
+    assert(x == 42)
+    assert(x != 0)
+    assert(true, "condition must be true")
+end
+
+test.skip("skip reason: integration service offline") "remote service ping" do
+    local connected = false
+    assert(connected)
+end
+
+test.timeout(2000) "computation within deadline" do
+    local sum = 0
+    for i = 1, 100 do
+        sum = sum + i
+    end
+    assert(sum == 5050)
+end
+
+println("All basic test declarations verified!")

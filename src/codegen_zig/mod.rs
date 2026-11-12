@@ -647,8 +647,8 @@ impl ZigCodegen {
                         BinaryOp::BitAnd => self.emit_line(&format!("{}.set({}, {} & {});", raw_obj, idx_temp, cur_str, val_str)),
                         BinaryOp::BitOr => self.emit_line(&format!("{}.set({}, {} | {});", raw_obj, idx_temp, cur_str, val_str)),
                         BinaryOp::BitXor => self.emit_line(&format!("{}.set({}, {} ^ {});", raw_obj, idx_temp, cur_str, val_str)),
-                        BinaryOp::Shl => self.emit_line(&format!("{}.set({}, {} << @as(u6, @intCast({} & 63)));", raw_obj, idx_temp, cur_str, val_str)),
-                        BinaryOp::Shr => self.emit_line(&format!("{}.set({}, {} >> @as(u6, @intCast({} & 63)));", raw_obj, idx_temp, cur_str, val_str)),
+                        BinaryOp::Shl => self.emit_line(&format!("{}.set({}, (@as(i64, {}) << @as(u6, @intCast({} & 63))));", raw_obj, idx_temp, cur_str, val_str)),
+                        BinaryOp::Shr => self.emit_line(&format!("{}.set({}, (@as(i64, {}) >> @as(u6, @intCast({} & 63))));", raw_obj, idx_temp, cur_str, val_str)),
                         BinaryOp::Concat => self.emit_line(&format!("{}.set({}, try __lust_str_concat({}, {}));", raw_obj, idx_temp, cur_str, val_str)),
                         _ => self.emit_line(&format!("{}.set({}, {});", raw_obj, idx_temp, val_str)),
                     }
@@ -665,8 +665,8 @@ impl ZigCodegen {
                         BinaryOp::BitAnd => self.emit_line(&format!("{} = {} & {};", target_str, target_str, val_str)),
                         BinaryOp::BitOr => self.emit_line(&format!("{} = {} | {};", target_str, target_str, val_str)),
                         BinaryOp::BitXor => self.emit_line(&format!("{} = {} ^ {};", target_str, target_str, val_str)),
-                        BinaryOp::Shl => self.emit_line(&format!("{} = {} << @as(u6, @intCast({} & 63));", target_str, target_str, val_str)),
-                        BinaryOp::Shr => self.emit_line(&format!("{} = {} >> @as(u6, @intCast({} & 63));", target_str, target_str, val_str)),
+                        BinaryOp::Shl => self.emit_line(&format!("{} = (@as(i64, {}) << @as(u6, @intCast({} & 63)));", target_str, target_str, val_str)),
+                        BinaryOp::Shr => self.emit_line(&format!("{} = (@as(i64, {}) >> @as(u6, @intCast({} & 63)));", target_str, target_str, val_str)),
                         BinaryOp::Concat => self.emit_line(&format!("{} = try __lust_str_concat({}, {});", target_str, target_str, val_str)),
                         _ => self.emit_line(&format!("{} = {};", target_str, val_str)),
                     }
@@ -1081,6 +1081,44 @@ impl ZigCodegen {
         Ok(Some(call_str))
     }
 
+    fn emit_print_call(&mut self, args: &[Expr], is_println: bool) -> Result<String> {
+        if args.is_empty() {
+            return if is_println {
+                Ok("__lust_println(\"\")".to_string())
+            } else {
+                Ok("__lust_print(\"\")".to_string())
+            };
+        }
+        if args.len() == 1 {
+            let arg_str = self.emit_expr_to_string(&args[0])?;
+            return if is_println {
+                Ok(format!("__lust_println({})", arg_str))
+            } else {
+                Ok(format!("__lust_print({})", arg_str))
+            };
+        }
+        let label = self.next_temp_var();
+        let mut parts = Vec::new();
+        let mut tmp_vars = Vec::new();
+        for arg in args {
+            let tmp = self.next_temp_var();
+            let arg_str = self.emit_expr_to_string(arg)?;
+            parts.push(format!("const {tmp} = {arg_str}"));
+            tmp_vars.push(tmp);
+        }
+        for (i, tmp) in tmp_vars.iter().enumerate() {
+            if i > 0 {
+                parts.push("__lust_print(\"\\t\")".to_string());
+            }
+            parts.push(format!("__lust_print({tmp})"));
+        }
+        if is_println {
+            parts.push("__lust_print(\"\\n\")".to_string());
+        }
+        parts.push(format!("break :{label}"));
+        Ok(format!("{label}: {{ {}; }}", parts.join("; ")))
+    }
+
     fn emit_expr_to_string(&mut self, expr: &Expr) -> Result<String> {
         match &expr.kind {
             ExprKind::Literal(lit) => match lit {
@@ -1104,8 +1142,8 @@ impl ZigCodegen {
                     BinaryOp::BitAnd => Ok(format!("({} & {})", l_str, r_str)),
                     BinaryOp::BitOr => Ok(format!("({} | {})", l_str, r_str)),
                     BinaryOp::BitXor => Ok(format!("({} ^ {})", l_str, r_str)),
-                    BinaryOp::Shl => Ok(format!("({} << @as(u6, @intCast({} & 63)))", l_str, r_str)),
-                    BinaryOp::Shr => Ok(format!("({} >> @as(u6, @intCast({} & 63)))", l_str, r_str)),
+                    BinaryOp::Shl => Ok(format!("(@as(i64, {}) << @as(u6, @intCast({} & 63)))", l_str, r_str)),
+                    BinaryOp::Shr => Ok(format!("(@as(i64, {}) >> @as(u6, @intCast({} & 63)))", l_str, r_str)),
                     BinaryOp::Eq => Ok(format!("({} == {})", l_str, r_str)),
                     BinaryOp::Ne => Ok(format!("({} != {})", l_str, r_str)),
                     BinaryOp::Lt => Ok(format!("({} < {})", l_str, r_str)),
@@ -1239,16 +1277,10 @@ impl ZigCodegen {
                             }
                         }
                         "println" => {
-                            if let Some(arg) = args.first() {
-                                let arg_str = self.emit_expr_to_string(arg)?;
-                                return Ok(format!("__lust_println({})", arg_str));
-                            }
+                            return self.emit_print_call(args, true);
                         }
                         "print" => {
-                            if let Some(arg) = args.first() {
-                                let arg_str = self.emit_expr_to_string(arg)?;
-                                return Ok(format!("__lust_print({})", arg_str));
-                            }
+                            return self.emit_print_call(args, false);
                         }
                         "tostring" => {
                             if let Some(arg) = args.first() {
@@ -1273,15 +1305,9 @@ impl ZigCodegen {
                     let imported = self.imports.get(fn_name.as_str()).cloned();
                     if let Some(imported) = imported {
                         if imported == "std.io.print" || imported == "io.print" {
-                            if let Some(arg) = args.first() {
-                                let arg_str = self.emit_expr_to_string(arg)?;
-                                return Ok(format!("__lust_print({})", arg_str));
-                            }
+                            return self.emit_print_call(args, false);
                         } else if imported == "std.io.println" || imported == "io.println" {
-                            if let Some(arg) = args.first() {
-                                let arg_str = self.emit_expr_to_string(arg)?;
-                                return Ok(format!("__lust_println({})", arg_str));
-                            }
+                            return self.emit_print_call(args, true);
                         } else if imported.starts_with("std.math.") || imported.starts_with("math.") {
                             let math_fn = imported.rsplit('.').next().unwrap_or(fn_name.as_str());
                             if let Some(m_call) = self.emit_math_call(math_fn, args)? {
@@ -1477,13 +1503,11 @@ impl ZigCodegen {
                                 _ => {}
                             },
                             "io" => match field.as_str() {
-                                "print" if args.len() == 1 => {
-                                    let arg_str = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_print({})", arg_str));
+                                "print" => {
+                                    return self.emit_print_call(args, false);
                                 }
-                                "println" if args.len() == 1 => {
-                                    let arg_str = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_println({})", arg_str));
+                                "println" => {
+                                    return self.emit_print_call(args, true);
                                 }
                                 "read_file" if args.len() == 1 => {
                                     let path_str = self.emit_expr_to_string(&args[0])?;
@@ -1864,6 +1888,14 @@ impl ZigCodegen {
                             Ok(format!("({} == .{})", expr_str, variant))
                         } else {
                             Ok(format!("({} == .{})", expr_str, variant))
+                        }
+                    }
+                    Pattern::Literal(lit) => {
+                        match lit {
+                            Literal::String(s) => Ok(format!("std.mem.eql(u8, {}, \"{}\")", expr_str, s)),
+                            Literal::Integer(i) => Ok(format!("({} == {})", expr_str, i)),
+                            Literal::Float(f) => Ok(format!("({} == {})", expr_str, f)),
+                            Literal::Bool(b) => Ok(format!("({} == {})", expr_str, b)),
                         }
                     }
                     _ => Ok("true".to_string()),

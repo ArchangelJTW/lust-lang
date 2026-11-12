@@ -40,6 +40,11 @@ fn test_numeric_literals_contract_parsing() {
     assert_eq!(parse_integer_literal("0o7").unwrap(), 7);
     assert_eq!(parse_integer_literal("0O755").unwrap(), 493);
     assert_eq!(parse_integer_literal("0o644").unwrap(), 420);
+    assert_eq!(parse_integer_literal("0o177777").unwrap(), 65535);
+    assert_eq!(parse_integer_literal("0o0123_4567").unwrap(), 342391);
+    assert_eq!(parse_integer_literal("0o0777_7777_7777_7777_7777_77").unwrap(), i64::MAX);
+    assert_eq!(parse_integer_literal("0o1000_0000_0000_0000_0000_00").unwrap(), i64::MIN);
+    assert_eq!(parse_integer_literal("0o1777_7777_7777_7777_7777_77").unwrap(), -1);
 
     // 4. Decimal with '_'
     assert_eq!(parse_integer_literal("1_000_000").unwrap(), 1000000);
@@ -71,11 +76,14 @@ fn test_numeric_literals_contract_parsing() {
         NumberParseError::MalformedLiteral("Expected octal digits after prefix")
     );
 
-    // 7. Float with '_'
+    // 7. Float with '_' and exponents
     assert_eq!(parse_float_literal("3.1415_9265").unwrap(), 3.14159265);
     assert_eq!(parse_float_literal("1_000.5_0").unwrap(), 1000.5);
     assert_eq!(parse_float_literal("1_0.5").unwrap(), 10.5);
     assert_eq!(parse_float_literal("1e1_0").unwrap(), 1e10);
+    assert_eq!(parse_float_literal("1e3").unwrap(), 1000.0);
+    assert_eq!(parse_float_literal("1e-3").unwrap(), 0.001);
+    assert_eq!(parse_float_literal("1.0e+6").unwrap(), 1000000.0);
 }
 
 #[test]
@@ -90,7 +98,54 @@ fn test_numeric_literals_bytecode_identity_and_dst_pipeline() {
     assert_eq!(f_radix[0].chunk.instructions, f_dec[0].chunk.instructions, "Instructions must be bit-identical");
     assert_eq!(f_radix[0].chunk.constants, f_dec[0].chunk.constants, "Constants must be bit-identical");
 
-    // 2. Verify MinimalSimScheduler execution via spawn_fiber / step_fiber
+    // 2. Octal Bytecode Identity: 0o755 vs 493
+    let src_oct = "function worker(): int\nlocal mode = 0o755\nreturn mode\nend";
+    let src_oct_dec = "function worker(): int\nlocal mode = 493\nreturn mode\nend";
+    let f_oct = compile_source(src_oct).expect("compile octal");
+    let f_oct_dec = compile_source(src_oct_dec).expect("compile octal decimal");
+    assert_eq!(f_oct[0].chunk.instructions, f_oct_dec[0].chunk.instructions, "Octal instructions must be bit-identical");
+    assert_eq!(f_oct[0].chunk.constants, f_oct_dec[0].chunk.constants, "Octal constants must be bit-identical");
+
+    // 3. Float with '_' Bytecode Identity: 3.1415_9265 vs 3.14159265
+    let src_flt = "function worker(): float\nlocal pi = 3.1415_9265\nreturn pi\nend";
+    let src_flt_clean = "function worker(): float\nlocal pi = 3.14159265\nreturn pi\nend";
+    let f_flt = compile_source(src_flt).expect("compile float with _");
+    let f_flt_clean = compile_source(src_flt_clean).expect("compile float without _");
+    assert_eq!(f_flt[0].chunk.instructions, f_flt_clean[0].chunk.instructions, "Float instructions must be bit-identical");
+    assert_eq!(f_flt[0].chunk.constants, f_flt_clean[0].chunk.constants, "Float constants must be bit-identical");
+
+    // 4. MSB Boundary Bytecode Identity: 0x7FFF_FFFF_FFFF_FFFF vs 9223372036854775807 (i64::MAX)
+    let src_max_radix = "function worker(): int\nlocal val = 0x7FFF_FFFF_FFFF_FFFF\nreturn val\nend";
+    let src_max_dec = "function worker(): int\nlocal val = 9223372036854775807\nreturn val\nend";
+    let f_max_radix = compile_source(src_max_radix).expect("compile max radix");
+    let f_max_dec = compile_source(src_max_dec).expect("compile max decimal");
+    assert_eq!(f_max_radix[0].chunk.instructions, f_max_dec[0].chunk.instructions);
+    assert_eq!(f_max_radix[0].chunk.constants, f_max_dec[0].chunk.constants);
+
+    // 5. MSB Boundary Bytecode Identity: 0x8000_0000_0000_0000 vs -9223372036854775808 (i64::MIN)
+    let src_min_radix = "function worker(): int\nlocal val = 0x8000_0000_0000_0000\nreturn val\nend";
+    let src_min_dec = "function worker(): int\nlocal val = -9223372036854775808\nreturn val\nend";
+    let f_min_radix = compile_source(src_min_radix).expect("compile min radix");
+    let f_min_dec = compile_source(src_min_dec).expect("compile min decimal");
+    assert_eq!(f_min_radix[0].chunk.instructions, f_min_dec[0].chunk.instructions);
+    assert_eq!(f_min_radix[0].chunk.constants, f_min_dec[0].chunk.constants);
+
+    // 6. MSB Boundary Bytecode Identity: 0xFFFF_FFFF_FFFF_FFFF (hex -1), binary -1, octal -1
+    let src_neg1_hex = "function worker(): int\nlocal val = 0xFFFF_FFFF_FFFF_FFFF\nreturn val\nend";
+    let src_neg1_bin = "function worker(): int\nlocal val = 0b1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111\nreturn val\nend";
+    let src_neg1_oct = "function worker(): int\nlocal val = 0o1777_7777_7777_7777_7777_77\nreturn val\nend";
+
+    let f_neg1_hex = compile_source(src_neg1_hex).expect("compile -1 hex");
+    let f_neg1_bin = compile_source(src_neg1_bin).expect("compile -1 bin");
+    let f_neg1_oct = compile_source(src_neg1_oct).expect("compile -1 oct");
+
+    assert_eq!(f_neg1_hex[0].chunk.instructions, f_neg1_bin[0].chunk.instructions, "Hex and Bin -1 instructions must match");
+    assert_eq!(f_neg1_hex[0].chunk.constants, f_neg1_bin[0].chunk.constants, "Hex and Bin -1 constants must match");
+    assert_eq!(f_neg1_hex[0].chunk.instructions, f_neg1_oct[0].chunk.instructions, "Hex and Oct -1 instructions must match");
+    assert_eq!(f_neg1_hex[0].chunk.constants, f_neg1_oct[0].chunk.constants, "Hex and Oct -1 constants must match");
+    assert_eq!(f_neg1_hex[0].chunk.constants[0], Value::Int(-1));
+
+    // 7. Verify MinimalSimScheduler execution via spawn_fiber / step_fiber
     let mut vm = VM::with_seed(100);
     vm.load_functions(f_radix);
     let mut sched = MinimalSimScheduler::new(vm);
@@ -99,6 +154,14 @@ fn test_numeric_literals_bytecode_identity_and_dst_pipeline() {
 
     assert_eq!(outcome, StepOutcome::Completed(Some(Value::Int(165))));
     assert!(sched.vm.gas_used() > 0);
+
+    // 10. Verify MinimalSimScheduler execution for octal function
+    let mut vm_oct = VM::with_seed(100);
+    vm_oct.load_functions(f_oct);
+    let mut sched_oct = MinimalSimScheduler::new(vm_oct);
+    let handle_oct = sched_oct.spawn_fiber(Value::Function(0), vec![]).expect("spawn oct fiber");
+    let outcome_oct = sched_oct.step_fiber(handle_oct, None).expect("step oct fiber");
+    assert_eq!(outcome_oct, StepOutcome::Completed(Some(Value::Int(493))));
 }
 
 #[test]

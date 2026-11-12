@@ -441,3 +441,185 @@ pub fn parse_float_literal(input: &str) -> Result<LustFloat, NumberParseError> {
     clean.parse::<LustFloat>()
         .map_err(|_| NumberParseError::MalformedLiteral("Invalid floating point format"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_all_radix_bases_and_prefixes() {
+        // Decimal
+        assert_eq!(parse_integer_literal("0").unwrap(), 0);
+        assert_eq!(parse_integer_literal("42").unwrap(), 42);
+        assert_eq!(parse_integer_literal("-42").unwrap(), -42);
+        assert_eq!(parse_integer_literal("1234567890").unwrap(), 1234567890);
+
+        // Hexadecimal (lower and upper prefix)
+        assert_eq!(parse_integer_literal("0x0").unwrap(), 0);
+        assert_eq!(parse_integer_literal("0x0F").unwrap(), 15);
+        assert_eq!(parse_integer_literal("0Xff").unwrap(), 255);
+        assert_eq!(parse_integer_literal("0xDead_Beef").unwrap(), 3735928559);
+        assert_eq!(
+            parse_integer_literal("0x1234_5678_9ABC_DEF0").unwrap(),
+            0x1234_5678_9ABC_DEF0u64 as i64
+        );
+
+        // Binary (lower and upper prefix)
+        assert_eq!(parse_integer_literal("0b0").unwrap(), 0);
+        assert_eq!(parse_integer_literal("0b1").unwrap(), 1);
+        assert_eq!(parse_integer_literal("0B1010").unwrap(), 10);
+        assert_eq!(parse_integer_literal("0b1111_0000").unwrap(), 240);
+
+        // Octal (lower and upper prefix)
+        assert_eq!(parse_integer_literal("0o0").unwrap(), 0);
+        assert_eq!(parse_integer_literal("0o7").unwrap(), 7);
+        assert_eq!(parse_integer_literal("0O755").unwrap(), 493);
+        assert_eq!(parse_integer_literal("0o644").unwrap(), 420);
+        assert_eq!(parse_integer_literal("0o177777").unwrap(), 65535);
+        assert_eq!(parse_integer_literal("0o0123_4567").unwrap(), 342391);
+    }
+
+    #[test]
+    fn test_msb_boundary_vectors() {
+        // Hexadecimal boundary bit patterns
+        assert_eq!(parse_integer_literal("0x7FFF_FFFF_FFFF_FFFF").unwrap(), i64::MAX);
+        assert_eq!(parse_integer_literal("0x8000_0000_0000_0000").unwrap(), i64::MIN);
+        assert_eq!(parse_integer_literal("0xFFFF_FFFF_FFFF_FFFF").unwrap(), -1);
+
+        // Binary boundary bit patterns
+        // i64::MAX = 63 ones (0 followed by 63 ones)
+        assert_eq!(
+            parse_integer_literal("0b0111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111").unwrap(),
+            i64::MAX
+        );
+        // i64::MIN = 1 followed by 63 zeros
+        assert_eq!(
+            parse_integer_literal("0b1000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000_0000").unwrap(),
+            i64::MIN
+        );
+        // -1 = 64 ones
+        assert_eq!(
+            parse_integer_literal("0b1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111_1111").unwrap(),
+            -1
+        );
+
+        // Octal boundary bit patterns
+        // 0o0777_7777_7777_7777_7777_77 (21 sevens preceded by 0) = 63 ones = i64::MAX
+        assert_eq!(
+            parse_integer_literal("0o0777_7777_7777_7777_7777_77").unwrap(),
+            i64::MAX
+        );
+        // 0o1000_0000_0000_0000_0000_00 (1 followed by 21 zeros) = 1 << 63 = i64::MIN
+        assert_eq!(
+            parse_integer_literal("0o1000_0000_0000_0000_0000_00").unwrap(),
+            i64::MIN
+        );
+        // 0o1777_7777_7777_7777_7777_77 (1 followed by 21 sevens) = 64 ones = -1
+        assert_eq!(
+            parse_integer_literal("0o1777_7777_7777_7777_7777_77").unwrap(),
+            -1
+        );
+    }
+
+    #[test]
+    fn test_underscore_cleaning() {
+        // Decimal integers
+        assert_eq!(parse_integer_literal("1_000_000").unwrap(), 1_000_000);
+        assert_eq!(parse_integer_literal("42_133_7").unwrap(), 421_337);
+        assert_eq!(parse_integer_literal("1_0").unwrap(), 10);
+        assert_eq!(parse_integer_literal("9_223_372_036_854_775_807").unwrap(), i64::MAX);
+
+        // Radix integers
+        assert_eq!(parse_integer_literal("0xDE_AD_BE_EF").unwrap(), 0xDEAD_BEEFu64 as i64);
+        assert_eq!(parse_integer_literal("0b10_10_10_10").unwrap(), 170);
+        assert_eq!(parse_integer_literal("0o7_5_5").unwrap(), 493);
+
+        // Floats
+        assert_eq!(parse_float_literal("3.1415_9265").unwrap(), 3.14159265);
+        assert_eq!(parse_float_literal("1_000.5_0").unwrap(), 1000.5);
+        assert_eq!(parse_float_literal("1_0.5").unwrap(), 10.5);
+        assert_eq!(parse_float_literal("1e1_0").unwrap(), 1e10);
+        assert_eq!(parse_float_literal("1_000.0e+0_2").unwrap(), 100000.0);
+    }
+
+    #[test]
+    fn test_overflow_teeth() {
+        // Radix overflow > u64::MAX
+        assert_eq!(
+            parse_integer_literal("0x1_0000_0000_0000_0000").unwrap_err(),
+            NumberParseError::Overflow("exceeds u64::MAX")
+        );
+        assert_eq!(
+            parse_integer_literal("0b1_00000000_00000000_00000000_00000000_00000000_00000000_00000000_00000000").unwrap_err(),
+            NumberParseError::Overflow("exceeds u64::MAX")
+        );
+        assert_eq!(
+            parse_integer_literal("0o2000_0000_0000_0000_0000_00").unwrap_err(),
+            NumberParseError::Overflow("exceeds u64::MAX")
+        );
+
+        // Decimal overflow > i64::MAX
+        assert_eq!(
+            parse_integer_literal("9223372036854775808").unwrap_err(),
+            NumberParseError::Overflow("exceeds i64::MAX")
+        );
+        assert_eq!(
+            parse_integer_literal("99999999999999999999").unwrap_err(),
+            NumberParseError::Overflow("exceeds i64::MAX")
+        );
+    }
+
+    #[test]
+    fn test_malformed_literals_teeth() {
+        // Empty / only underscores
+        assert_eq!(
+            parse_integer_literal("").unwrap_err(),
+            NumberParseError::MalformedLiteral("Empty literal")
+        );
+        assert_eq!(
+            parse_integer_literal("___").unwrap_err(),
+            NumberParseError::MalformedLiteral("Empty literal")
+        );
+
+        // Prefixes without digits
+        assert_eq!(
+            parse_integer_literal("0x").unwrap_err(),
+            NumberParseError::MalformedLiteral("Expected hex digits after prefix")
+        );
+        assert_eq!(
+            parse_integer_literal("0X").unwrap_err(),
+            NumberParseError::MalformedLiteral("Expected hex digits after prefix")
+        );
+        assert_eq!(
+            parse_integer_literal("0b").unwrap_err(),
+            NumberParseError::MalformedLiteral("Expected binary digits after prefix")
+        );
+        assert_eq!(
+            parse_integer_literal("0B").unwrap_err(),
+            NumberParseError::MalformedLiteral("Expected binary digits after prefix")
+        );
+        assert_eq!(
+            parse_integer_literal("0o").unwrap_err(),
+            NumberParseError::MalformedLiteral("Expected octal digits after prefix")
+        );
+        assert_eq!(
+            parse_integer_literal("0O").unwrap_err(),
+            NumberParseError::MalformedLiteral("Expected octal digits after prefix")
+        );
+
+        // Malformed float
+        assert_eq!(
+            parse_float_literal("").unwrap_err(),
+            NumberParseError::MalformedLiteral("Invalid floating point format")
+        );
+        assert_eq!(
+            parse_float_literal("abc").unwrap_err(),
+            NumberParseError::MalformedLiteral("Invalid floating point format")
+        );
+        assert_eq!(
+            parse_float_literal("1.2.3").unwrap_err(),
+            NumberParseError::MalformedLiteral("Invalid floating point format")
+        );
+    }
+}
+

@@ -580,7 +580,7 @@ impl<'a> Lexer<'a> {
         while !self.is_at_end() {
             let c = self.current_char();
             if c == '_' {
-                if last_char == '_' {
+                if last_char == '_' || self.peek(1) == Some('_') {
                     return Err(LustError::LexerError {
                         line: start_line,
                         column: start_column,
@@ -657,7 +657,7 @@ impl<'a> Lexer<'a> {
                 last_char = b as char;
                 self.advance();
             } else if b == b'_' {
-                if last_char == '_' {
+                if last_char == '_' || self.peek(1) == Some('_') {
                     return Err(LustError::LexerError {
                         line: start_line,
                         column: start_column,
@@ -721,7 +721,7 @@ impl<'a> Lexer<'a> {
                         last_char = b as char;
                         self.advance();
                     } else if b == b'_' {
-                        if last_char == '_' {
+                        if last_char == '_' || self.peek(1) == Some('_') {
                             return Err(LustError::LexerError {
                                 line: start_line,
                                 column: start_column,
@@ -801,7 +801,7 @@ impl<'a> Lexer<'a> {
                     last_char = b as char;
                     self.advance();
                 } else if b == b'_' {
-                    if last_char == '_' {
+                    if last_char == '_' || self.peek(1) == Some('_') {
                         return Err(LustError::LexerError {
                             line: start_line,
                             column: start_column,

@@ -125,7 +125,7 @@ impl Compiler {
             Pattern::Enum {
                 enum_name,
                 variant,
-                bindings: _,
+                bindings,
             } => {
                 let actual_enum_name = if enum_name.is_empty() {
                     match variant.as_str() {
@@ -153,6 +153,29 @@ impl Compiler {
                     ),
                     0,
                 );
+
+                let has_subpatterns = bindings
+                    .iter()
+                    .any(|b| !matches!(b, Pattern::Wildcard | Pattern::Identifier(_)));
+                if has_subpatterns {
+                    let jump_skip = self.emit(Instruction::JumpIfNot(result_reg, 0), 0);
+                    for (index, binding) in bindings.iter().enumerate() {
+                        if !matches!(binding, Pattern::Wildcard | Pattern::Identifier(_)) {
+                            let temp_val_reg = self.allocate_register();
+                            self.emit(
+                                Instruction::GetEnumValue(temp_val_reg, scrutinee_reg, index as u8),
+                                0,
+                            );
+                            let sub_res_reg = self.compile_is_pattern(temp_val_reg, binding)?;
+                            self.free_register(temp_val_reg);
+                            self.emit(Instruction::And(result_reg, result_reg, sub_res_reg), 0);
+                            self.free_register(sub_res_reg);
+                        }
+                    }
+                    let after_check = self.current_chunk().instructions.len();
+                    self.current_chunk_mut().patch_jump(jump_skip, after_check);
+                }
+
                 Ok(result_reg)
             }
 
@@ -258,7 +281,7 @@ impl Compiler {
                             }
                         }
 
-                        Pattern::Wildcard => {
+                        Pattern::Wildcard | Pattern::Literal(_) | Pattern::TypeCheck(_) => {
                             continue;
                         }
 

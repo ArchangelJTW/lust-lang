@@ -1,0 +1,64 @@
+==================
+Numeric Literals
+==================
+
+local a = 0xDEAD_BEEF
+local b = 0b1010_0101
+local c = 0o755
+local d = 1_000_000
+local e = 3.1415_9265
+local f = 1e3
+local g = 1.0e+6
+
+---
+
+(source_file
+  (local_declaration
+    bindings: (binding_list
+      (binding
+        name: (identifier)))
+    values: (expression_list
+      (literal
+        (number))))
+  (local_declaration
+    bindings: (binding_list
+      (binding
+        name: (identifier)))
+    values: (expression_list
+      (literal
+        (number))))
+  (local_declaration
+    bindings: (binding_list
+      (binding
+        name: (identifier)))
+    values: (expression_list
+      (literal
+        (number))))
+  (local_declaration
+    bindings: (binding_list
+      (binding
+        name: (identifier)))
+    values: (expression_list
+      (literal
+        (number))))
+  (local_declaration
+    bindings: (binding_list
+      (binding
+        name: (identifier)))
+    values: (expression_list
+      (literal
+        (number))))
+  (local_declaration
+    bindings: (binding_list
+      (binding
+        name: (identifier)))
+    values: (expression_list
+      (literal
+        (number))))
+  (local_declaration
+    bindings: (binding_list
+      (binding
+        name: (identifier)))
+    values: (expression_list
+      (literal
+        (number)))))

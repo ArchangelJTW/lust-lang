@@ -601,6 +601,16 @@ impl Parser {
                         self.peek_ahead(1)
                             .map(|t| t.kind == TokenKind::LeftParen)
                             .unwrap_or(false)
+                    } else if matches!(
+                        self.peek_kind(),
+                        TokenKind::Integer
+                            | TokenKind::Float
+                            | TokenKind::String
+                            | TokenKind::True
+                            | TokenKind::False
+                            | TokenKind::Minus
+                    ) {
+                        true
                     } else {
                         false
                     };
@@ -832,8 +842,9 @@ impl Parser {
                 self.consume(TokenKind::RightParen, "Expected ')' after expression")?;
                 if expressions.len() == 1 {
                     let span = self.make_span(&start_token, &end_token);
+                    let inner = expressions.pop().expect("one expression present");
                     return Ok(Expr::new(
-                        ExprKind::Paren(Box::new(expressions.into_iter().next().unwrap())),
+                        ExprKind::Paren(Box::new(inner)),
                         span,
                     ));
                 } else {
@@ -1076,6 +1087,44 @@ impl Parser {
                     } else {
                         Ok(Pattern::Identifier(name))
                     }
+                }
+            }
+
+            TokenKind::Minus => {
+                self.advance();
+                match self.peek_kind() {
+                    TokenKind::Integer => {
+                        let token = self.advance().clone();
+                        let clean: String = token.lexeme.chars().filter(|&c| c != '_').collect();
+                        #[cfg(feature = "std")]
+                        let is_min = clean == "9223372036854775808";
+                        #[cfg(not(feature = "std"))]
+                        let is_min = clean == "2147483648";
+
+                        let lit = if is_min {
+                            #[cfg(feature = "std")]
+                            let min_val: i64 = i64::MIN;
+                            #[cfg(not(feature = "std"))]
+                            let min_val: i32 = i32::MIN;
+                            Literal::Integer(min_val)
+                        } else {
+                            let value = parse_integer_literal(&token.lexeme)
+                                .map_err(|e| self.error(&format!("{}", e)))?;
+                            Literal::Integer(
+                                value.checked_neg().ok_or_else(|| {
+                                    self.error("Integer overflow in pattern negation")
+                                })?,
+                            )
+                        };
+                        Ok(Pattern::Literal(lit))
+                    }
+                    TokenKind::Float => {
+                        let token = self.advance().clone();
+                        let value = parse_float_literal(&token.lexeme)
+                            .map_err(|e| self.error(&format!("{}", e)))?;
+                        Ok(Pattern::Literal(Literal::Float(-value)))
+                    }
+                    _ => Err(self.error("Expected integer or float literal after '-' in pattern")),
                 }
             }
 

@@ -515,35 +515,328 @@ impl<'a> Lexer<'a> {
         ))
     }
 
+    fn scan_radix_number(
+        &mut self,
+        prefix: char,
+        start_pos: usize,
+        start_line: usize,
+        start_column: usize,
+    ) -> Result<Token> {
+        let radix = match prefix {
+            'x' | 'X' => 16,
+            'b' | 'B' => 2,
+            'o' | 'O' => 8,
+            _ => unreachable!(),
+        };
+
+        // Advance past '0' and prefix
+        self.advance();
+        self.advance();
+
+        if self.is_at_end() {
+            return Err(LustError::LexerError {
+                line: start_line,
+                column: start_column,
+                message: "Expected at least one valid digit after radix prefix".to_string(),
+                module: None,
+            });
+        }
+
+        let first = self.current_char();
+        if first == '_' {
+            return Err(LustError::LexerError {
+                line: start_line,
+                column: start_column,
+                message: "Radix prefix cannot be immediately followed by an underscore".to_string(),
+                module: None,
+            });
+        }
+
+        if !first.is_ascii_alphanumeric() {
+            return Err(LustError::LexerError {
+                line: start_line,
+                column: start_column,
+                message: "Expected at least one valid digit after radix prefix".to_string(),
+                module: None,
+            });
+        }
+
+        if !first.is_digit(radix) {
+            // Consume invalid alphanumeric run to prevent token splitting
+            while !self.is_at_end() && self.current_char().is_ascii_alphanumeric() {
+                self.advance();
+            }
+            return Err(LustError::LexerError {
+                line: start_line,
+                column: start_column,
+                message: "Invalid digit for radix literal".to_string(),
+                module: None,
+            });
+        }
+
+        let mut last_char = first;
+        self.advance();
+
+        while !self.is_at_end() {
+            let c = self.current_char();
+            if c == '_' {
+                if last_char == '_' {
+                    return Err(LustError::LexerError {
+                        line: start_line,
+                        column: start_column,
+                        message: "Consecutive underscores in number literal are not allowed".to_string(),
+                        module: None,
+                    });
+                }
+                match self.peek(1) {
+                    Some(next) if next.is_ascii_alphanumeric() => {
+                        if !next.is_digit(radix) {
+                            self.advance(); // consume '_'
+                            while !self.is_at_end() && self.current_char().is_ascii_alphanumeric() {
+                                self.advance();
+                            }
+                            return Err(LustError::LexerError {
+                                line: start_line,
+                                column: start_column,
+                                message: "Invalid digit for radix literal".to_string(),
+                                module: None,
+                            });
+                        }
+                    }
+                    _ => {
+                        return Err(LustError::LexerError {
+                            line: start_line,
+                            column: start_column,
+                            message: "Trailing underscore in number literal is not allowed".to_string(),
+                            module: None,
+                        });
+                    }
+                }
+                last_char = '_';
+                self.advance();
+            } else if c.is_digit(radix) {
+                last_char = c;
+                self.advance();
+            } else if c.is_ascii_alphanumeric() {
+                while !self.is_at_end() && self.current_char().is_ascii_alphanumeric() {
+                    self.advance();
+                }
+                return Err(LustError::LexerError {
+                    line: start_line,
+                    column: start_column,
+                    message: "Invalid digit for radix literal".to_string(),
+                    module: None,
+                });
+            } else {
+                break;
+            }
+        }
+
+        let slice = &self.input[start_pos..self.position];
+        let symbol = self.interner.intern(slice);
+        let interned = self.interner.get(symbol).to_string();
+        Ok(Token::new(TokenKind::Integer, interned, start_line, start_column))
+    }
+
     fn scan_number(&mut self, start_line: usize, start_column: usize) -> Result<Token> {
         let start_pos = self.position;
-        let mut is_float = false;
-        while !self.is_at_end() && self.input.as_bytes()[self.position].is_ascii_digit() {
-            self.advance();
-        }
-
-        if !self.is_at_end()
-            && self.current_char() == '.'
-            && self.peek(1) != Some('.')
-            && self.peek(1).is_some_and(|c| c.is_ascii_digit())
-        {
-            is_float = true;
-            self.advance();
-            while !self.is_at_end() && self.input.as_bytes()[self.position].is_ascii_digit() {
-                self.advance();
+        // Check for radix prefix (0x, 0b, 0o)
+        if self.current_char() == '0' {
+            if let Some(prefix) = self.peek(1) {
+                if matches!(prefix, 'x' | 'X' | 'b' | 'B' | 'o' | 'O') {
+                    return self.scan_radix_number(prefix, start_pos, start_line, start_column);
+                }
             }
         }
 
+        let mut is_float = false;
+        let mut last_char = '0';
+        while !self.is_at_end() {
+            let b = self.input.as_bytes()[self.position];
+            if b.is_ascii_digit() {
+                last_char = b as char;
+                self.advance();
+            } else if b == b'_' {
+                if last_char == '_' {
+                    return Err(LustError::LexerError {
+                        line: start_line,
+                        column: start_column,
+                        message: "Consecutive underscores in number literal are not allowed".to_string(),
+                        module: None,
+                    });
+                }
+                match self.peek(1) {
+                    Some('.') => {
+                        return Err(LustError::LexerError {
+                            line: start_line,
+                            column: start_column,
+                            message: "Underscore immediately preceding decimal point is not allowed".to_string(),
+                            module: None,
+                        });
+                    }
+                    Some('e' | 'E') => {
+                        return Err(LustError::LexerError {
+                            line: start_line,
+                            column: start_column,
+                            message: "Underscore immediately preceding exponent is not allowed".to_string(),
+                            module: None,
+                        });
+                    }
+                    Some(c) if c.is_ascii_digit() => {
+                        last_char = '_';
+                        self.advance();
+                    }
+                    _ => {
+                        return Err(LustError::LexerError {
+                            line: start_line,
+                            column: start_column,
+                            message: "Trailing underscore in number literal is not allowed".to_string(),
+                            module: None,
+                        });
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Float / range disambiguation
+        if !self.is_at_end() && self.current_char() == '.' {
+            if self.peek(1) == Some('.') {
+                // Range operator (.. or ..=): do NOT consume dot, stop here!
+            } else if self.peek(1) == Some('_') {
+                return Err(LustError::LexerError {
+                    line: start_line,
+                    column: start_column,
+                    message: "Underscore immediately following decimal point is not allowed".to_string(),
+                    module: None,
+                });
+            } else if self.peek(1).is_some_and(|c| c.is_ascii_digit()) {
+                is_float = true;
+                self.advance(); // consume '.'
+                last_char = '.';
+                while !self.is_at_end() {
+                    let b = self.input.as_bytes()[self.position];
+                    if b.is_ascii_digit() {
+                        last_char = b as char;
+                        self.advance();
+                    } else if b == b'_' {
+                        if last_char == '_' {
+                            return Err(LustError::LexerError {
+                                line: start_line,
+                                column: start_column,
+                                message: "Consecutive underscores in number literal are not allowed".to_string(),
+                                module: None,
+                            });
+                        }
+                        match self.peek(1) {
+                            Some('e' | 'E') => {
+                                return Err(LustError::LexerError {
+                                    line: start_line,
+                                    column: start_column,
+                                    message: "Underscore immediately preceding exponent is not allowed".to_string(),
+                                    module: None,
+                                });
+                            }
+                            Some(c) if c.is_ascii_digit() => {
+                                last_char = '_';
+                                self.advance();
+                            }
+                            _ => {
+                                return Err(LustError::LexerError {
+                                    line: start_line,
+                                    column: start_column,
+                                    message: "Trailing underscore in float literal is not allowed".to_string(),
+                                    module: None,
+                                });
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            // else: single dot followed by non-digit (e.g. 1.method or 1. ): do NOT consume dot!
+        }
+
+        // Exponent check (e / E)
         if !self.is_at_end() && (self.current_char() == 'e' || self.current_char() == 'E') {
             is_float = true;
-            self.advance();
+            self.advance(); // consume e/E
             if !self.is_at_end() && (self.current_char() == '+' || self.current_char() == '-') {
                 self.advance();
+                if !self.is_at_end() && self.current_char() == '_' {
+                    return Err(LustError::LexerError {
+                        line: start_line,
+                        column: start_column,
+                        message: "Underscore immediately following exponent indicator or sign is not allowed".to_string(),
+                        module: None,
+                    });
+                }
+            } else if !self.is_at_end() && self.current_char() == '_' {
+                return Err(LustError::LexerError {
+                    line: start_line,
+                    column: start_column,
+                    message: "Underscore immediately following exponent indicator or sign is not allowed".to_string(),
+                    module: None,
+                });
             }
 
-            while !self.is_at_end() && self.input.as_bytes()[self.position].is_ascii_digit() {
+            if self.is_at_end() || !self.input.as_bytes()[self.position].is_ascii_digit() {
+                while !self.is_at_end() && self.current_char().is_ascii_alphanumeric() {
+                    self.advance();
+                }
+                return Err(LustError::LexerError {
+                    line: start_line,
+                    column: start_column,
+                    message: "Exponent indicator must be followed by digits".to_string(),
+                    module: None,
+                });
+            }
+
+            last_char = '0';
+            while !self.is_at_end() {
+                let b = self.input.as_bytes()[self.position];
+                if b.is_ascii_digit() {
+                    last_char = b as char;
+                    self.advance();
+                } else if b == b'_' {
+                    if last_char == '_' {
+                        return Err(LustError::LexerError {
+                            line: start_line,
+                            column: start_column,
+                            message: "Consecutive underscores in number literal are not allowed".to_string(),
+                            module: None,
+                        });
+                    }
+                    if self.peek(1).is_some_and(|c| c.is_ascii_digit()) {
+                        last_char = '_';
+                        self.advance();
+                    } else {
+                        return Err(LustError::LexerError {
+                            line: start_line,
+                            column: start_column,
+                            message: "Trailing underscore in number literal is not allowed".to_string(),
+                            module: None,
+                        });
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Check for trailing invalid alphanumeric suffix (e.g. 100abc)
+        if !self.is_at_end() && (self.current_char().is_ascii_alphabetic() || self.current_char() == '_') {
+            while !self.is_at_end() && (self.current_char().is_ascii_alphanumeric() || self.current_char() == '_') {
                 self.advance();
             }
+            return Err(LustError::LexerError {
+                line: start_line,
+                column: start_column,
+                message: "Invalid trailing characters in number literal".to_string(),
+                module: None,
+            });
         }
 
         let kind = if is_float {

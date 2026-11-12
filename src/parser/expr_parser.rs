@@ -6,7 +6,7 @@ use crate::{
     },
     error::{LustError, Result},
     lexer::{Token, TokenKind},
-    number::{LustInt, parse_float},
+    number::{parse_float_literal, parse_integer_literal},
 };
 use alloc::{
     boxed::Box,
@@ -366,6 +366,29 @@ impl Parser {
                 TokenKind::Tilde => UnaryOp::BitNot,
                 _ => unreachable!(),
             };
+
+            if op == UnaryOp::Neg && self.check(TokenKind::Integer) {
+                let next_token = self.current_token();
+                let clean: String = next_token.lexeme.chars().filter(|&c| c != '_').collect();
+                #[cfg(feature = "std")]
+                let is_min = clean == "9223372036854775808";
+                #[cfg(not(feature = "std"))]
+                let is_min = clean == "2147483648";
+
+                if is_min {
+                    let end_token = self.advance().clone();
+                    let span = self.make_span(&start_token, &end_token);
+                    #[cfg(feature = "std")]
+                    let min_val: i64 = i64::MIN;
+                    #[cfg(not(feature = "std"))]
+                    let min_val: i32 = i32::MIN;
+                    return Ok(Expr::new(
+                        ExprKind::Literal(Literal::Integer(min_val)),
+                        span,
+                    ));
+                }
+            }
+
             let operand = self.parse_unary()?;
             let end_token = self.tokens[self.current - 1].clone();
             return Ok(Expr::new(
@@ -707,17 +730,15 @@ impl Parser {
         let kind = match self.peek_kind() {
             TokenKind::Integer => {
                 let token = self.advance();
-                let value = token
-                    .lexeme
-                    .parse::<LustInt>()
-                    .map_err(|_| self.error("Invalid integer literal"))?;
+                let value = parse_integer_literal(&token.lexeme)
+                    .map_err(|e| self.error(&format!("{}", e)))?;
                 ExprKind::Literal(Literal::Integer(value))
             }
 
             TokenKind::Float => {
                 let token = self.advance();
-                let value =
-                    parse_float(&token.lexeme).map_err(|_| self.error("Invalid float literal"))?;
+                let value = parse_float_literal(&token.lexeme)
+                    .map_err(|e| self.error(&format!("{}", e)))?;
                 ExprKind::Literal(Literal::Float(value))
             }
 
@@ -1065,8 +1086,16 @@ impl Parser {
             | TokenKind::False => {
                 let token = self.advance().clone();
                 let lit = match token.kind {
-                    TokenKind::Integer => Literal::Integer(token.lexeme.parse().unwrap()),
-                    TokenKind::Float => Literal::Float(token.lexeme.parse().unwrap()),
+                    TokenKind::Integer => {
+                        let value = parse_integer_literal(&token.lexeme)
+                            .map_err(|e| self.error(&format!("{}", e)))?;
+                        Literal::Integer(value)
+                    }
+                    TokenKind::Float => {
+                        let value = parse_float_literal(&token.lexeme)
+                            .map_err(|e| self.error(&format!("{}", e)))?;
+                        Literal::Float(value)
+                    }
                     TokenKind::String => {
                         let s = self.unescape_string_literal(&token)?;
                         Literal::String(s)

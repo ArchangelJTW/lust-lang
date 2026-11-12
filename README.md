@@ -5,11 +5,18 @@
 Lust is a strongly typed, Lua-inspired scripting language implemented in Rust. It targets embedding scenarios while staying fast with a hybrid collector and a trace-based JIT.
 
 ## Features
-- Strong static type system with ergonomic enum pattern matching via the `is` operator.
+- Strong static type system with ergonomic enum pattern matching (`is`), precise `Result::Err` binding, and method calls on sum types.
+- Pure Core & Typed Algebraic Effects with static tracking (`T ! Error ~ Requirements`), capability-based sandboxing, and zero-allocation context projection.
+- First-Class Data Formats & Schemas: Strict RFC 8259 JSON, memory-bounded streaming JSONL, BSON, safe YAML, and TOON with fluent validation (`@std/schema`) and ordinal materialization.
+- ReDoS-Immune Bounded Regex: One-pass DFA execution guaranteeing strictly linear $O(n)$ search time with compile-time rejection of backtracking patterns.
+- Native Testing Framework: Fiber-isolated test runner (`lust test`), virtual time (`TestClock`), zero production overhead via AST pruning & DCE, and TAP/JSON reporters.
+- Deterministic Simulation Testing (DST): FoundationDB-grade discrete-event simulator with virtual time, in-memory POSIX VFS, fuel-based fiber preemption, high-teeth invariant oracles (DRS 100/100), and autonomous Replay Bundles with shrinking.
+- Zero-Cost Functional Pipelines: Ergonomic pipeline operator `|>` with compiler loop fusion and SROA, plus scoped `errdefer` for guaranteed error cleanup.
+- Reactive Streams (Rx) with push-pull Observables, backpressure watermarks, deterministic virtual time, and zero lingering callbacks.
 - High-performance runtime that pairs reference counting with a fallback mark-and-sweep pass for long-lived cycles.
 - Trace-based JIT powered by `dynasm-rs`, emitting x64 machine code similar in function to LuaJIT.
 - Friendly embedding surface for Rust and C, including typed value conversions and module loaders.
-- Batteries-included tooling: bytecode compiler, VM, CLI runner, and optional WebAssembly build.
+- Batteries-included tooling: bytecode compiler, VM, CLI runner, test runner, and optional WebAssembly build.
 
 ## Quick Start
 
@@ -396,6 +403,183 @@ println!("recursive calls: {}", stats.recursive_calls);
 `VM::jit_stats()` exposes the same `JitStats` value. Loading a replacement
 function table invalidates compiled traces, profiles, retries, and counters so
 machine code cannot retain stale function indexes.
+
+## Pure Core & Algebraic Effects
+
+Lust incorporates a typed algebraic effect system designed for zero-overhead native execution, deterministic resource safety, and capability-based security:
+
+```lust
+-- Function declaring a return type, error type, and contextual requirements
+function load_profile(user_id: string): string ! IoError ~ (FileSystem + Console)
+    local console = service<Console>()
+    console.log("Loading profile: " .. user_id)
+
+    local fs = service<FileSystem>()
+    return fs.read_file("/var/data/" .. user_id .. ".json")?
+end
+```
+
+Key architectural properties:
+- **Eager Execution & Lazy Blueprints:** Function calls with `?` execute immediately in the active context. Constructing `effect do ... end` returns a cold, replayable `Effect<A, E, R>` blueprint that performs zero side effects until evaluated with `effect.run_sync` or `effect.run_fork`.
+- **Compile-Time Thunk Inlining:** In the MIR and Bytecode compiler, `run_sync` on effect thunks is devirtualized and inlined at compile time. Read-only free variables are captured as snapshot integers, achieving **0 heap allocations** and native parity on Bytecode VM, Cranelift JIT, and Zig AOT.
+- **Capability-Based Authority:** Host applications can run untrusted code with `CapabilityMask::none()`. Forbidden imports (`import io from "@std/io"`) are denied at compile time with zero ambient authority.
+- **Resource Guarantees:** Deterministic cleanup via `scoped do ... end`, `defer`, and `errdefer` executed in strict LIFO order. Terminal interrupts (such as `OutOfGas` or `Timeout`) are fail-closed and cannot be suppressed.
+
+## Reactive Programming (Rx & Observables)
+
+Lust includes a production-grade Reactive Streams subsystem with push-pull semantics, deterministic backpressure, and zero lingering callbacks:
+
+```rust
+use std::sync::Arc;
+use lust::rx::{Observable, Observer, BufferOptions, RxScheduler, ExitStatus};
+
+let scheduler = Arc::new(RxScheduler::new_virtual());
+let stream = Observable::from_iter(0..100)
+    .map(|x| x * 2)
+    .filter(|x| x >= 10)
+    .take(5);
+
+let sub = stream.subscribe(
+    Observer::from_next(|val| {
+        println!("Received: {}", val);
+        Ok(())
+    }),
+    1, // scope_id
+    BufferOptions::default_bounded(),
+    scheduler.clone(),
+).unwrap();
+
+scheduler.run_until_quiescent(100);
+let completion = sub.join(None).unwrap();
+assert_eq!(completion.exit, ExitStatus::Completed);
+assert_eq!(completion.items_delivered, 5);
+```
+
+Subsystem highlights:
+- **Zero Lingering Callbacks:** Subscription cancellation transitions state atomically to `Stopping`, bumps the generation tag, and detaches handlers. No callback will ever execute after cancellation commits.
+- **Upstream Cancellation:** The `take(N)` operator immediately cancels upstream producers upon receiving the $N$-th item, eliminating wasted compute cycles.
+- **Dual-Limit Backpressure Queues:** `BoundedQueue` enforces simultaneous limits on item count and byte memory footprint with configurable overflow strategies (`Fail`, `Suspend`, `DropNewest`, `DropOldest`).
+- **Deterministic Virtual Time:** Clocks can run on real-time (`PhysicalClock`) or discrete virtual time (`VirtualClock`), enabling deterministic simulation and instant testing of time-dependent streams.
+- **Re-entrancy Safety:** The re-entrant `AdmissionGate` supports self-cancellation from within observer callbacks while detecting and preventing recursive self-join deadlocks (`RxError::SelfJoin`).
+
+## First-Class Data Formats & Schemas
+
+Lust provides a high-performance, memory-safe data processing and schema validation subsystem:
+
+```rust
+use lust::schema::s;
+use lust::data::{DataValue, Document, ExactNumber};
+
+// 1. Define schema with strict bounds and NaN protection
+let user_schema = s.object()
+    .field("id", s.int().min(1).max(1_000_000).build())
+    .field("username", s.string().min(3).max(32).build())
+    .field("email", s.string().regex(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$").build())
+    .field("score", s.float().min(0.0).max(100.0).build())
+    .strict()
+    .build();
+
+// 2. Validate structured Document
+let mut doc = Document::new();
+doc.try_insert("id", DataValue::Number(ExactNumber::Int(1042))).unwrap();
+doc.try_insert("username", DataValue::String("alex".to_string())).unwrap();
+doc.try_insert("email", DataValue::String("alex@lust.dev".to_string())).unwrap();
+doc.try_insert("score", DataValue::Number(ExactNumber::Float(95.5))).unwrap();
+
+assert!(user_schema.parse(&DataValue::Document(doc)).is_ok());
+```
+
+Subsystem highlights:
+- **Strict Semantic Rejection (Gate-SCHEMA-01):** Duplicate keys in JSON and YAML, duplicate columns in TOON, non-finite numbers (`NaN`, `Infinity`), and integer overflows fail closed immediately.
+- **Memory-Bounded Streaming JSONL (Gate-SCHEMA-06):** Stream massive datasets with bounded buffer limits, $O(1)$ memory usage, and cooperative `CancellationToken`.
+- **Billion-Laughs Defense (Gate-SCHEMA-02):** YAML aliases are capped at $10\times$ source size expansion, preventing memory exhaustion attacks.
+- **Direct Ordinal Materialization (Gate-SCHEMA-09):** Decodes validated documents directly into fixed struct slots without hash table lookups.
+
+## Bounded Regex (`@std/regex`)
+
+Lust eliminates Regular Expression Denial of Service (ReDoS) with guaranteed linear execution time:
+
+```rust
+use lust::regex::{BoundedRegex, compile_bounded, RegexError};
+
+// Strictly linear O(n) execution powered by one-pass DFA
+let re = BoundedRegex::new(r"^[a-z]+@[a-z]+\.[a-z]+$").unwrap();
+assert!(re.is_match("user@example.com").unwrap());
+
+// ReDoS patterns (lookahead, lookbehind, backreferences) fail at compile time!
+assert!(matches!(compile_bounded(r"(?=abc)abc"), Err(RegexError::UnsupportedPattern(_))));
+assert!(matches!(compile_bounded(r"([a-z])\1"), Err(RegexError::UnsupportedPattern(_))));
+```
+
+- **Zero Backtracking:** Forward and reverse one-pass DFAs process input in constant time per byte.
+- **Fail-Closed Compilation:** Patterns requiring exponential or quadratic backtracking are rejected at compile time with zero fallback to unsafe NFA/backtracking engines.
+
+## Native Test Framework (`lust test`)
+
+Built-in, fiber-isolated testing with zero production overhead:
+
+```lust
+use std.test.{suite, test, before_each, assert_eq, assert_almost_eq}
+
+suite "Cart Calculations" do
+    before_each do
+        -- Scoped setup executed per test
+    end
+
+    test "calculates subtotal with tax" do
+        local price = 100.0
+        local tax = price * 0.20
+        assert_eq(price + tax, 120.0)
+    end
+
+    test.timeout(1000) "network heartbeat with deadline" do
+        assert_eq(ping(), "PONG")
+    end
+end
+```
+
+Run tests with `lust test`:
+```bash
+lust test --filter "Cart" --format console
+lust test --backend vm --format tap > test_results.tap
+```
+
+Highlights:
+- **Zero Production Overhead:** Test blocks and suites are pruned during `lust build`; symbols are removed via DCE.
+- **Virtual Time (`TestClock`):** Simulates seconds or hours of timers, retries, and exponential backoffs in microseconds of CPU time.
+- **Fiber Panic Containment:** Panics and interruptions (`OutOfGas`) are caught at the fiber boundary without crashing the runner process.
+
+## Deterministic Simulation Testing (DST)
+
+Lust incorporates an aerospace-grade **Deterministic Simulation Testing (DST)** subsystem modeled after the testing patterns of FoundationDB and TigerBeetle. DST eliminates Heisenbugs by running entire concurrent, multi-fiber workflows inside a seed-driven discrete-event simulator with virtual time, in-memory POSIX VFS, and fault injection:
+
+```rust
+use lust::sim::PreemptiveExplorationScheduler;
+use lust::bytecode::Value;
+
+// 1. Initialize simulation with a 64-bit seed (100% bit-for-bit reproducible)
+let mut scheduler = PreemptiveExplorationScheduler::with_seed(42)
+    .with_max_quantum(4)
+    .with_step_limit(10_000)
+    .with_event_log();
+
+// 2. Spawn concurrent fibers and execute discrete quantum steps
+let h1 = scheduler.spawn_fiber(worker_func, vec![]).unwrap();
+let h2 = scheduler.spawn_fiber(worker_func, vec![]).unwrap();
+
+// 3. Drive simulation to quiescence or step exhaustion
+scheduler.run_until_quiescent_or_limit(10_000).unwrap();
+```
+
+Subsystem highlights:
+- **DRS 100/100 Benchmark:** Full compliance across all 8 simulation dimensions ($D1$–$D8$, $TP$), verified through 18 formal oracles and 20 dedicated integration test suites.
+- **Pure Virtual Clock & Timers ($D1$):** Complete decoupling of calendar time (`WallClock`) and monotonic deadlines (`MonotonicClock`). `os.sleep` yields non-blocking virtual timer registrations (`NativeCallResult::YieldTimer`); a 24-hour virtual delay completes in $<15\text{ ms}$ wall-clock time.
+- **In-Memory POSIX VFS ($D3$):** 12-method `VirtualFileSystem` sandbox rooted at `/workspace` with path normalization, traversal escape guards, and deterministic lexicographically sorted `read_dir`. Host filesystem access is denied at compile time via Clippy rules and at runtime via `DirectHostFsBypassPanic`.
+- **Fuel-Based DES Preemption ($D4$):** Bytecode instruction-level fuel countdown with full continuation serialization (`FiberContinuation`). Automatically shuffles ready queues to discover data races within 500 seeds.
+- **High-Teeth Invariants & Fault Injection ($D7$, $D8$):** Dual-clause safety and liveness oracles (`INV-FIBER-01..03`, `INV-RX-01`, `INV-BUDGET-01`) with proven teeth, 100% mutation kill across M1–M3 with execution witnesses, and seed-driven VFS/memory/interrupt fault injection (`FaultConfiguration`).
+- **Autonomous Replay Bundles & Shrinker:** Packaged `.tar` archives (`manifest.json`, `events.jsonl`, `initial_vfs/`) reproducing failures offline bit-for-bit, with automated binary-search shrinking to minimal bug-report step prefixes.
+- **Zero-Cost Production Hot-Paths:** Two One-Sided T-tests (TOST) statistical equivalence verification across Criterion benchmarks B01–B15 confirms $95\%$ CI strictly within $[-1.5\%, +1.5\%]$ with zero dynamic dispatch (`dyn`) on production execution paths.
+- **Full Documentation:** See the [Simulation Testing Chapter](https://lust-lang.dev/docs/simulation-testing.html) in The Lust Book for comprehensive architecture guides and embedding tutorials.
 
 ## Embedding in C (WIP)
 

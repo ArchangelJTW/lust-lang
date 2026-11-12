@@ -341,3 +341,103 @@ pub fn int_clamp(value: LustInt, min: LustInt, max: LustInt) -> LustInt {
 pub fn int_abs(value: LustInt) -> Option<LustInt> {
     value.checked_abs()
 }
+
+use alloc::string::String;
+use core::fmt;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NumberParseError {
+    InvalidDigit { char: char, radix: u32 },
+    Overflow(&'static str),
+    MalformedLiteral(&'static str),
+}
+
+impl fmt::Display for NumberParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDigit { char, radix } => write!(f, "Invalid digit '{}' for base {}", char, radix),
+            Self::Overflow(msg) => write!(f, "Integer overflow: {}", msg),
+            Self::MalformedLiteral(msg) => write!(f, "Malformed numeric literal: {}", msg),
+        }
+    }
+}
+
+impl core::error::Error for NumberParseError {}
+
+/// Parse integer literal (decimal, 0x, 0b, 0o) with digit separators '_'
+pub fn parse_integer_literal(input: &str) -> Result<LustInt, NumberParseError> {
+    let clean: String = input.chars().filter(|&c| c != '_').collect();
+    if clean.is_empty() {
+        return Err(NumberParseError::MalformedLiteral("Empty literal"));
+    }
+
+    #[cfg(feature = "std")]
+    {
+        if clean.starts_with("0x") || clean.starts_with("0X") {
+            let digits = &clean[2..];
+            if digits.is_empty() {
+                return Err(NumberParseError::MalformedLiteral("Expected hex digits after prefix"));
+            }
+            u64::from_str_radix(digits, 16)
+                .map(|v| v as i64)
+                .map_err(|_| NumberParseError::Overflow("exceeds u64::MAX"))
+        } else if clean.starts_with("0b") || clean.starts_with("0B") {
+            let digits = &clean[2..];
+            if digits.is_empty() {
+                return Err(NumberParseError::MalformedLiteral("Expected binary digits after prefix"));
+            }
+            u64::from_str_radix(digits, 2)
+                .map(|v| v as i64)
+                .map_err(|_| NumberParseError::Overflow("exceeds u64::MAX"))
+        } else if clean.starts_with("0o") || clean.starts_with("0O") {
+            let digits = &clean[2..];
+            if digits.is_empty() {
+                return Err(NumberParseError::MalformedLiteral("Expected octal digits after prefix"));
+            }
+            u64::from_str_radix(digits, 8)
+                .map(|v| v as i64)
+                .map_err(|_| NumberParseError::Overflow("exceeds u64::MAX"))
+        } else {
+            clean.parse::<i64>()
+                .map_err(|_| NumberParseError::Overflow("exceeds i64::MAX"))
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        if clean.starts_with("0x") || clean.starts_with("0X") {
+            let digits = &clean[2..];
+            if digits.is_empty() {
+                return Err(NumberParseError::MalformedLiteral("Expected hex digits after prefix"));
+            }
+            u32::from_str_radix(digits, 16)
+                .map(|v| v as i32)
+                .map_err(|_| NumberParseError::Overflow("exceeds u32::MAX"))
+        } else if clean.starts_with("0b") || clean.starts_with("0B") {
+            let digits = &clean[2..];
+            if digits.is_empty() {
+                return Err(NumberParseError::MalformedLiteral("Expected binary digits after prefix"));
+            }
+            u32::from_str_radix(digits, 2)
+                .map(|v| v as i32)
+                .map_err(|_| NumberParseError::Overflow("exceeds u32::MAX"))
+        } else if clean.starts_with("0o") || clean.starts_with("0O") {
+            let digits = &clean[2..];
+            if digits.is_empty() {
+                return Err(NumberParseError::MalformedLiteral("Expected octal digits after prefix"));
+            }
+            u32::from_str_radix(digits, 8)
+                .map(|v| v as i32)
+                .map_err(|_| NumberParseError::Overflow("exceeds u32::MAX"))
+        } else {
+            clean.parse::<i32>()
+                .map_err(|_| NumberParseError::Overflow("exceeds i32::MAX"))
+        }
+    }
+}
+
+/// Parse floating point literal with digit separators '_'
+pub fn parse_float_literal(input: &str) -> Result<LustFloat, NumberParseError> {
+    let clean: String = input.chars().filter(|&c| c != '_').collect();
+    clean.parse::<LustFloat>()
+        .map_err(|_| NumberParseError::MalformedLiteral("Invalid floating point format"))
+}

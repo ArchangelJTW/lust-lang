@@ -623,6 +623,9 @@ impl TypeChecker {
                         error.as_ref(),
                         callee.span,
                     )?;
+                    if self.is_in_main() {
+                        return Ok(success);
+                    }
                     return Ok(if let Some(err) = error {
                         Type::new(TypeKind::Result(Box::new(success), Box::new(err)), span)
                     } else {
@@ -1042,6 +1045,9 @@ impl TypeChecker {
                     error.as_ref(),
                     callee.span,
                 )?;
+                if self.is_in_main() {
+                    return Ok(success);
+                }
                 return Ok(if let Some(err) = error {
                     Type::new(TypeKind::Result(Box::new(success), Box::new(err)), span)
                 } else {

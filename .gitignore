@@ -17,4 +17,5 @@ mine/
 *.zig
 /results/
 tests/compile_fail/fs_gate/target/
+examples/tokio-concurrency/target/
 

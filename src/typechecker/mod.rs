@@ -43,6 +43,7 @@ pub struct TypeChecker {
     loop_depth_in_defer: usize,
     current_function_return_spec: Option<crate::ast::ReturnSpec>,
     effect_block_stack: Vec<EffectBlockContext>,
+    pub(crate) current_function_name: Option<String>,
 }
 
 pub fn normalize_requirements(reqs: &[Type]) -> Vec<Type> {
@@ -109,6 +110,7 @@ impl TypeChecker {
             loop_depth_in_defer: 0,
             current_function_return_spec: None,
             effect_block_stack: Vec::new(),
+            current_function_name: None,
         }
     }
 
@@ -1009,12 +1011,22 @@ impl TypeChecker {
         }
     }
 
+    pub(crate) fn is_in_main(&self) -> bool {
+        self.current_function_name
+            .as_deref()
+            .map_or(false, |n| n == "main" || n.ends_with(".main"))
+    }
+
     pub fn record_effect_call(
         &mut self,
         requirements: &[Type],
         error_type: Option<&Type>,
         span: Span,
     ) -> Result<()> {
+        if self.is_in_main() {
+            return Ok(());
+        }
+
         if let Some(ctx_idx) = self.effect_block_stack.len().checked_sub(1) {
             for req in requirements {
                 if self.scoped_depth > 0 && req.to_string() == "Scope" { continue; }
@@ -1215,6 +1227,21 @@ impl TypeChecker {
                         .map(|name| self.resolve_type_key(name))
                         .collect(),
                 ),
+                ty.span,
+            ),
+            TK::Effect {
+                success,
+                error,
+                requirements,
+            } => Type::new(
+                TK::Effect {
+                    success: Box::new(self.canonicalize_type(success)),
+                    error: Box::new(self.canonicalize_type(error)),
+                    requirements: requirements
+                        .iter()
+                        .map(|req| self.canonicalize_type(req))
+                        .collect(),
+                },
                 ty.span,
             ),
             _ => ty.clone(),

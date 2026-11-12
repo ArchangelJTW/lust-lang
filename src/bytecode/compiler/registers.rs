@@ -94,14 +94,23 @@ impl Compiler {
     }
 
     pub(super) fn end_scope(&mut self) -> Result<()> {
-        if let Some(scope) = self.scopes.pop() {
-            for cleanup in scope.cleanups.into_iter().rev() {
+        let cleanups_res = if let Some(scope) = self.scopes.last() {
+            let cleanups = scope.cleanups.clone();
+            let mut res = Ok(());
+            for cleanup in cleanups.into_iter().rev() {
                 if cleanup.kind == CleanupKind::Defer {
-                    self.compile_stmt(&cleanup.stmt)?;
+                    if let Err(e) = self.compile_stmt(&cleanup.stmt) {
+                        res = Err(e);
+                        break;
+                    }
                 }
             }
-        }
-        Ok(())
+            res
+        } else {
+            Ok(())
+        };
+        self.scopes.pop();
+        cleanups_res
     }
 
     pub(super) fn emit_all_defers(&mut self) -> Result<()> {

@@ -58,6 +58,7 @@ std = [
   "dep:cranelift-jit",
   "dep:cranelift-module",
   "dep:cranelift-native",
+  "dep:serde_json",
 ]
 # JIT for riscv32 targets. Enables `std` because dynasmrt requires it
 # (memmap2, std::sync). Requires a std-capable runtime (e.g. Linux/RISC-V).
@@ -65,7 +66,7 @@ std = [
 rv32 = ["std", "dep:dynasmrt"]
 libloading = ["std", "dep:libloading"]
 dirs = ["std", "dep:dirs"]
-packages = ["std", "libloading", "dirs", "dep:serde_json", "dep:object"]
+packages = ["std", "libloading", "dirs", "dep:object"]
 lua_transpile = ["std", "dep:full_moon"]
 # ESP32 debugging support - adds logging via esp-println
 esp32c6-logging = ["dep:esp-println", "dep:log"]

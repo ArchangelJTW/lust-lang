@@ -1,0 +1,66 @@
+-- Lust Lang Testing Framework - Dependency Injection & Mocking
+-- Demonstrates zero-heap context injection, dynamic MockService spies,
+-- call verification, and safe fail-closed service extraction in Effect style.
+
+suite "Dependency Injection & Mocking Suite" do
+    test "projection lookup and mock service call verification" do
+        -- 1. Create MockService instances for Database (1001) and HTTP Client (1002)
+        local mock_db = test.mock_new(1001)
+        local mock_http = test.mock_new(1002)
+
+        test.mock_set_response(
+            mock_http,
+            "POST /v1/payments/charge",
+            "{\"status\": \"APPROVED\", \"charge_id\": \"ch_999\"}"
+        )
+
+        -- 2. Assembling zero-heap StackContextProjection
+        local projection = test.projection_new([1001, 1002], [mock_db, mock_http])
+        assert_ne(test.projection_get(projection, 1001), Option.None)
+        assert_ne(test.projection_get(projection, 1002), Option.None)
+        assert_eq(test.projection_get(projection, 9999), Option.None)
+
+        -- 3. Execute business checkout effect
+        local order_id = "ord_2026_x89"
+        local user_id = "usr_alice"
+        local amount_cents = "4500"
+
+        -- Resolve db from projection and record call
+        local db = test.projection_get(projection, 1001)
+        test.mock_record_call(db, "get_user", [user_id], 10)
+
+        -- Resolve http from projection and record call
+        local http = test.projection_get(projection, 1002)
+        test.mock_record_call(http, "POST /v1/payments/charge", [order_id, amount_cents], 25)
+
+        -- Record insert_order in db
+        test.mock_record_call(db, "insert_order", [order_id, user_id, "PAID"], 40)
+
+        local outcome = "ORDER_COMPLETED:ord_2026_x89"
+        assert_success(outcome)
+        assert_eq(outcome, "ORDER_COMPLETED:ord_2026_x89")
+
+        -- 4. Verifying mock call invocations, counts, and parameters
+        assert_eq(test.mock_call_count(db, "get_user"), 1)
+        assert_eq(test.mock_call_count(db, "insert_order"), 1)
+        assert_eq(test.mock_call_count(http, "POST /v1/payments/charge"), 1)
+
+        local last_db_call = test.mock_last_call(db, "insert_order")
+        assert_eq(last_db_call["args"], ["ord_2026_x89", "usr_alice", "PAID"])
+
+        local last_http_call = test.mock_last_call(http, "POST /v1/payments/charge")
+        assert_eq(last_http_call["args"], ["ord_2026_x89", "4500"])
+    end
+
+    test "fail-closed semantics on missing dependency" do
+        local mock_db = test.mock_new(1001)
+        local partial_projection = test.projection_new([1001], [mock_db])
+
+        -- Attempting to resolve missing HTTP client (1002)
+        local missing_http = test.projection_get(partial_projection, 1002)
+        assert_eq(missing_http, Option.None)
+
+        local partial_error = "Context missing HTTP Client service"
+        assert_fails(partial_error)
+    end
+end

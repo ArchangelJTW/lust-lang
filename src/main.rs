@@ -19,6 +19,7 @@ use lust::packages::{
     load_prepared_rust_dependencies, prepare_rust_dependencies, resolve_dependencies,
     save_credentials, write_stub_files,
 };
+use lust::error::IntoDiagnostic;
 use lust::{Compiler, Item, LustConfig, ModuleLoader, Span, TypeChecker, VM};
 use std::{
     env, fs,
@@ -29,6 +30,13 @@ use std::{
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 use toml::{self, Value, map::Map};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+mod cli {
+    #[path = "diag.rs"]
+    pub mod diag;
+    #[path = "test.rs"]
+    pub mod test;
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -99,6 +107,11 @@ fn main() {
             return;
         }
 
+        "test" => {
+            cli::test::test_command(&args[2..]);
+            return;
+        }
+
         "build" | "--aot" => {
             build_command(&args[2..]);
             return;
@@ -125,10 +138,18 @@ fn main() {
     let mut disassemble = false;
     let mut use_mir = false;
     let mut strict_mir = false;
+    let mut cranelift_jit = false;
     let mut no_gc = false;
     let mut pure_core = false;
     let mut backend_mode: Option<String> = None;
+    let mut jit_mode: Option<String> = None;
     let mut script_file: Option<String> = None;
+    let mut json_diag = env::var("LUST_ERROR_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+        || env::var("LUST_DIAG_FORMAT")
+            .map(|v| v.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
 
     let mut i = 0;
     while i < run_args.len() {
@@ -137,6 +158,34 @@ fn main() {
             "--help" | "-h" => {
                 print_help(&args[0]);
                 return;
+            }
+            "--error-format" | "--diag-format" | "--format" => {
+                i += 1;
+                let Some(val) = run_args.get(i) else {
+                    eprintln!("Error: flag requires a format argument (human, json)");
+                    process::exit(1);
+                };
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
+            }
+            opt if opt.starts_with("--error-format=") => {
+                let val = opt.strip_prefix("--error-format=").unwrap();
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
+            }
+            opt if opt.starts_with("--diag-format=") => {
+                let val = opt.strip_prefix("--diag-format=").unwrap();
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
+            }
+            opt if opt.starts_with("--format=") => {
+                let val = opt.strip_prefix("--format=").unwrap();
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
             }
             "--disassemble" | "-d" => disassemble = true,
             "--mir" => use_mir = true,
@@ -161,6 +210,18 @@ fn main() {
             opt if opt.starts_with("--backend=") => {
                 let val = opt.strip_prefix("--backend=").unwrap();
                 backend_mode = Some(val.to_string());
+            }
+            "--jit" => {
+                i += 1;
+                let Some(val) = run_args.get(i) else {
+                    eprintln!("Error: --jit requires a mode argument (cranelift, auto, off)");
+                    process::exit(1);
+                };
+                jit_mode = Some(val.clone());
+            }
+            opt if opt.starts_with("--jit=") => {
+                let val = opt.strip_prefix("--jit=").unwrap();
+                jit_mode = Some(val.to_string());
             }
             other if other.starts_with('-') => {
                 eprintln!("Unknown option '{}'", other);
@@ -187,6 +248,7 @@ fn main() {
             }
             "cranelift" | "jit" => {
                 use_mir = true;
+                cranelift_jit = true;
             }
             "zig" | "aot" => {
                 is_zig_aot = true;
@@ -203,12 +265,39 @@ fn main() {
             }
         }
     }
+    if let Some(mode) = jit_mode {
+        match mode.to_ascii_lowercase().as_str() {
+            "cranelift" => {
+                use_mir = true;
+                cranelift_jit = true;
+            }
+            "auto" | "default" | "vm" | "bytecode" | "off" | "none" => {
+                cranelift_jit = false;
+            }
+            other => {
+                eprintln!(
+                    "Error: unknown --jit mode '{}'. Supported modes: cranelift, auto, off",
+                    other
+                );
+                process::exit(1);
+            }
+        }
+    }
 
     if let Some(file) = script_file {
         if is_zig_aot {
             run_file_zig_aot(&file);
         } else {
-            run_file_with_options(&file, disassemble, use_mir, strict_mir, no_gc, pure_core);
+            run_file_with_options(
+                &file,
+                disassemble,
+                use_mir,
+                strict_mir,
+                cranelift_jit,
+                no_gc,
+                pure_core,
+                json_diag,
+            );
         }
     } else {
         print_usage(&args[0]);
@@ -1423,10 +1512,44 @@ fn build_command(args: &[String]) {
     let mut emit_zig = false;
     let mut emit_header_requested = false;
     let mut opts = lust::codegen_zig::CompileOptions::default();
+    let mut json_diag = env::var("LUST_ERROR_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+        || env::var("LUST_DIAG_FORMAT")
+            .map(|v| v.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
 
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--error-format" | "--diag-format" | "--format" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: flag requires a format argument (human, json)");
+                    process::exit(1);
+                };
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
+            }
+            opt if opt.starts_with("--error-format=") => {
+                let val = opt.strip_prefix("--error-format=").unwrap();
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
+            }
+            opt if opt.starts_with("--diag-format=") => {
+                let val = opt.strip_prefix("--diag-format=").unwrap();
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
+            }
+            opt if opt.starts_with("--format=") => {
+                let val = opt.strip_prefix("--format=").unwrap();
+                if val.eq_ignore_ascii_case("json") {
+                    json_diag = true;
+                }
+            }
             "--backend" => {
                 index += 1;
                 let Some(val) = args.get(index) else {
@@ -1543,7 +1666,11 @@ fn build_command(args: &[String]) {
     let program = match loader.load_program_from_entry(&entry_arg) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Error loading program: {}", e);
+            if json_diag {
+                eprint!("{}", cli::diag::json(format!("Error loading program: {e}"), "error", None, None));
+            } else {
+                eprintln!("Error loading program: {}", e);
+            }
             process::exit(1);
         }
     };
@@ -1744,13 +1871,19 @@ fn run_file_with_options(
     disassemble: bool,
     use_mir: bool,
     strict_mir: bool,
+    cranelift_jit: bool,
     no_gc: bool,
     pure_core: bool,
+    json_diag: bool,
 ) {
     let source = match fs::read_to_string(filename) {
         Ok(content) => content,
         Err(e) => {
-            eprintln!("Error reading file '{}': {}", filename, e);
+            if json_diag {
+                eprint!("{}", cli::diag::json(format!("Error reading file '{filename}': {e}"), "error", None, None));
+            } else {
+                eprintln!("Error reading file '{}': {}", filename, e);
+            }
             process::exit(1);
         }
     };
@@ -1762,7 +1895,11 @@ fn run_file_with_options(
     let mut config = match LustConfig::load_for_entry(filename) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("Error loading configuration: {}", e);
+            if json_diag {
+                eprint!("{}", cli::diag::json(format!("Error loading configuration: {e}"), "error", None, None));
+            } else {
+                eprintln!("Error loading configuration: {}", e);
+            }
             process::exit(1);
         }
     };
@@ -1774,6 +1911,9 @@ fn run_file_with_options(
     }
     if strict_mir {
         config.set_strict_mir(true);
+    }
+    if cranelift_jit {
+        config.set_cranelift_jit(true);
     }
     if no_gc {
         config.set_gc_enabled(false);
@@ -1794,7 +1934,7 @@ fn run_file_with_options(
             process::exit(1);
         }
     };
-    let (functions, trait_impls, init_funcs, struct_defs) = match compile_program(
+    let (functions, mir_functions, trait_impls, init_funcs, struct_defs) = match compile_program(
         filename,
         &config,
         #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
@@ -1804,7 +1944,7 @@ fn run_file_with_options(
     ) {
         Ok(result) => result,
         Err(e) => {
-            print_error_with_context(&source, filename, &e);
+            print_error_with_context(&source, filename, &e, json_diag);
             process::exit(1);
         }
     };
@@ -1821,6 +1961,12 @@ fn run_file_with_options(
 
     let mut vm = VM::with_config(&config);
     vm.load_functions(functions);
+    for mir_fn in mir_functions {
+        if let Err(e) = vm.load_mir_function(mir_fn) {
+            print_error_with_context(&source, filename, &e, json_diag);
+            process::exit(1);
+        }
+    }
     vm.register_structs(&struct_defs);
     for (type_name, trait_name) in trait_impls {
         vm.register_trait_impl(type_name, trait_name);
@@ -1896,19 +2042,23 @@ fn run_file_with_options(
                 vm.set_global(module_path, module_value);
             }
             Err(e) => {
-                print_error_with_context(&source, filename, &e);
+                print_error_with_context(&source, filename, &e, json_diag);
                 process::exit(1);
             }
         }
     }
 
     if let Err(e) = vm.call("__script", vec![]) {
-        print_error_with_context(&source, filename, &e);
+        print_error_with_context(&source, filename, &e, json_diag);
         process::exit(1);
     }
 
     if std::env::var_os("LUST_JIT_STATS").is_some() {
         eprintln!("JIT stats: {:?}", vm.jit_stats());
+        eprintln!(
+            "Cranelift stats: entries={} compilations={}",
+            vm.cranelift_entry_count, vm.cranelift_compilation_count
+        );
     }
 }
 
@@ -2028,6 +2178,7 @@ fn run_file_zig_aot(filename: &str) {
 /// definitions.
 type CompiledProgram = (
     Vec<lust::bytecode::Function>,
+    Vec<lust::mir::ir::MirFunction>,
     Vec<(String, String)>,
     Vec<(String, String)>,
     lust::hashbrown::HashMap<String, lust::ast::StructDef>,
@@ -2169,6 +2320,7 @@ fn compile_program(
     compiler.set_use_mir(config.use_mir());
     compiler.set_strict_mir(config.strict_mir());
     let functions = compiler.compile_module(&wrapped_items)?;
+    let mir_functions = compiler.take_mir_functions();
     let trait_impls = compiler.get_trait_impls().to_vec();
     let mut init_funcs: Vec<(String, String)> = Vec::new();
     for m in &program.modules {
@@ -2185,10 +2337,16 @@ fn compile_program(
         }
     }
 
-    Ok((functions, trait_impls, init_funcs, struct_defs))
+    Ok((functions, mir_functions, trait_impls, init_funcs, struct_defs))
 }
 
-fn print_error_with_context(source: &str, filename: &str, error: &lust::LustError) {
+fn print_error_with_context(source: &str, filename: &str, error: &lust::LustError, json_diag: bool) {
+    if json_diag {
+        let mut bag = cli::diag::DiagnosticBag::new();
+        bag.add(error.clone().into_diagnostic(Some(filename), Some(source)));
+        cli::diag::emit_diagnostics(&bag);
+        return;
+    }
     const RED: &str = "\x1b[31m";
     const BOLD: &str = "\x1b[1m";
     const DIM: &str = "\x1b[90m";

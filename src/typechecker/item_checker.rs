@@ -69,6 +69,33 @@ impl TypeChecker {
                 }
                 Ok(())
             }
+            ItemKind::Schema(schema_def) => {
+                for field in &schema_def.fields {
+                    let canon_ty = self.canonicalize_type(&field.ty);
+                    self.validate_type(&canon_ty)?;
+                    for constraint in &field.constraints {
+                        if constraint.name == "regex" {
+                            if let Some(arg) = constraint.args.first() {
+                                if let ExprKind::Literal(Literal::String(pattern)) = &arg.kind {
+                                    #[cfg(feature = "std")]
+                                    if let Err(err) = crate::regex::compile_bounded(pattern) {
+                                        return Err(self.type_error_at(
+                                            format!("Invalid regex pattern '{}' in schema constraint: {}", pattern, err),
+                                            constraint.span,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            ItemKind::TypeAlias { ty, .. } => {
+                let canon_ty = self.canonicalize_type(ty);
+                self.validate_type(&canon_ty)?;
+                Ok(())
+            }
         }
     }
 

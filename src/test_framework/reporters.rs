@@ -8,6 +8,7 @@ pub enum ReporterKind {
     Pretty,
     Tap,
     Json,
+    Junit,
 }
 
 impl Default for ReporterKind {
@@ -25,6 +26,7 @@ impl Reporter {
             ReporterKind::Pretty => Self::format_pretty(suites, summary),
             ReporterKind::Tap => Self::format_tap(suites),
             ReporterKind::Json => Self::format_json(suites, summary),
+            ReporterKind::Junit => super::junit::format(suites, summary),
         }
     }
 
@@ -34,6 +36,13 @@ impl Reporter {
 
         for suite in suites {
             Self::format_suite_pretty(suite, 0, &mut out);
+        }
+
+        if !summary.benchmarks.is_empty() {
+            out.push_str("\n--- [Benchmarks] ---\n");
+            for bench in &summary.benchmarks {
+                out.push_str(&format!("  {}\n", bench.report_line()));
+            }
         }
 
         out.push_str("\n--------------------------------------------------\n");
@@ -129,7 +138,23 @@ impl Reporter {
             out.push('\n');
         }
 
-        out.push_str("  ]\n");
+        out.push_str("  ]");
+        if !summary.benchmarks.is_empty() {
+            out.push_str(",\n  \"benchmarks\": [\n");
+            for (b_idx, b) in summary.benchmarks.iter().enumerate() {
+                out.push_str(&format!(
+                    "    {{\"name\": \"{}\", \"samples\": {}, \"median_ns\": {}, \"p95_ns\": {}, \"mad_ns\": {}}}",
+                    b.name, b.samples, b.median_ns, b.p95_ns, b.mad_ns
+                ));
+                if b_idx + 1 < summary.benchmarks.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str("  ]\n");
+        } else {
+            out.push('\n');
+        }
         out.push_str("}\n");
         out
     }

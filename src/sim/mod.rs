@@ -136,6 +136,7 @@ impl MinimalSimScheduler {
                 TaskState::Yielded(reason) => match reason {
                     crate::vm::YieldReason::Timer(tid) => Ok(StepOutcome::YieldedTimer(tid)),
                     crate::vm::YieldReason::QuantumExhausted => Ok(StepOutcome::Yielded(None)),
+                    crate::vm::YieldReason::Parked(_) => Ok(StepOutcome::Yielded(None)),
                     crate::vm::YieldReason::Explicit => {
                         if let Some(tid) = timer_id {
                             Ok(StepOutcome::YieldedTimer(tid))

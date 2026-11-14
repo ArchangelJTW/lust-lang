@@ -1,0 +1,56 @@
+-- Lust Rx Stream Operators (filter, map, take)
+-- Demonstrates composable stream transformations where operators chain
+-- lazily and preserve backpressure invariants across asynchronous stages.
+
+suite "Rx Operators (Filter & Map) Suite" do
+    test "filter even numbers and map multiplied by 10" do
+        local received = []
+        local completed = []
+
+        -- 1. Source stream emitting numbers 1..10
+        local source = rx.from_iter([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+
+        -- 2. Chain filter (keep even numbers) and map (multiply by 10)
+        local evens = rx.filter(source, function(x: int): bool return x % 2 == 0 end)
+        local transformed = rx.map(evens, function(x: int): int return x * 10 end)
+
+        -- 3. Subscribe and join
+        local sub = rx.subscribe_with(
+            transformed,
+            function(item)
+                table.push(received, item)
+            end,
+            function(err)
+            end,
+            function()
+                table.push(completed, true)
+            end
+        )
+
+        local completion = rx.join(sub)
+        assert_eq(completion["exit"], "Completed")
+        -- Even numbers: 2, 4, 6, 8, 10 -> multiplied by 10: 20, 40, 60, 80, 100
+        assert_eq(received, [20, 40, 60, 80, 100])
+        assert(table.len(completed) > 0, "Transformed stream must report completed")
+    end
+
+    test "chained take operator limits element count" do
+        local received = []
+        local source = rx.from_iter([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        local evens = rx.filter(source, function(x: int): bool return x % 2 == 0 end)
+        local transformed = rx.map(evens, function(x: int): int return x * 10 end)
+        local limited = rx.take(transformed, 3)
+
+        local sub = rx.subscribe(
+            limited,
+            function(item)
+                table.push(received, item)
+            end
+        )
+
+        local completion = rx.join(sub)
+        assert_eq(completion["exit"], "Completed")
+        assert_eq(table.len(received), 3)
+        assert_eq(received, [20, 40, 60])
+    end
+end

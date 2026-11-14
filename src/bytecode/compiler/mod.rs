@@ -48,6 +48,7 @@ pub struct Compiler {
     minimal_runtime_types: bool,
     pub(super) use_mir: bool,
     pub(super) strict_mir: bool,
+    pub(super) mir_functions: Vec<crate::mir::ir::MirFunction>,
     pub(super) thunk_return_target: Option<(Register, Vec<usize>)>,
 }
 
@@ -116,10 +117,15 @@ impl Compiler {
             minimal_runtime_types: false,
             use_mir: false,
             strict_mir: false,
+            mir_functions: Vec::new(),
             thunk_return_target: None,
         };
         compiler.configure_stdlib(&LustConfig::default());
         compiler
+    }
+
+    pub fn take_mir_functions(&mut self) -> Vec<crate::mir::ir::MirFunction> {
+        core::mem::take(&mut self.mir_functions)
     }
 
     pub fn set_minimal_runtime_types(&mut self, enabled: bool) {
@@ -364,6 +370,7 @@ impl Compiler {
             ExprKind::Return(_) => "return expression",
             ExprKind::Range { .. } => "range expression",
             ExprKind::EffectBlock(_) => "effect expression",
+            ExprKind::RegexLiteral { .. } => "regex literal",
         }
     }
 
@@ -460,6 +467,19 @@ impl Compiler {
                     format!("Effect<{}, {}, {}>", s, e, req_strs.join(" + "))
                 }
             }
+            TypeKind::Typeof(name) => format!("typeof {name}"),
+            TypeKind::InferType(inner) => format!("Infer<{}>", Self::type_to_string(&inner.kind)),
+            TypeKind::InferInput(inner) => {
+                format!("InferInput<{}>", Self::type_to_string(&inner.kind))
+            }
+            TypeKind::InferOutput(inner) => {
+                format!("InferOutput<{}>", Self::type_to_string(&inner.kind))
+            }
+            TypeKind::Schema { input, output, .. } => format!(
+                "Schema<{}, {}>",
+                Self::type_to_string(&input.kind),
+                Self::type_to_string(&output.kind)
+            ),
         }
     }
 

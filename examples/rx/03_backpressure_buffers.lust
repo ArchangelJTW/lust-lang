@@ -1,0 +1,73 @@
+-- Lust Backpressure & Bounded Buffers in Rx
+-- Demonstrates configuring dual-limit bounded queues (max items, max bytes,
+-- low watermarks) and overflow strategies (Fail, DropOldest) under RxScheduler.
+
+suite "Rx Backpressure & Bounded Buffers Suite" do
+    test "buffer options configuration and defaults" do
+        -- 1. Create a custom bounded BufferOptions configuration
+        local custom_options = rx.BufferOptions(16, 1024, 4, 256, "Fail")
+        assert_eq(custom_options["max_items"], 16)
+        assert_eq(custom_options["max_bytes"], 1024)
+        assert_eq(custom_options["overflow"], "Fail")
+
+        -- 2. Default bounded options verification (64 items / 64KB)
+        local default_options = rx.default_buffer_options()
+        assert_eq(default_options["max_items"], 64)
+        assert_eq(default_options["max_bytes"], 65536)
+    end
+
+    test "overflow strategy Fail rejects items with OverflowError" do
+        -- 3a. OverflowStrategy::Fail: push 10 items into capacity-5 queue
+        local fail_queue = rx.BoundedQueue(5, 1024, "Fail")
+
+        for i = 0, 4 do
+            assert_eq(rx.push(fail_queue, i), "Enqueued")
+        end
+        assert_eq(rx.len(fail_queue), 5)
+
+        -- Items 5..9 must fail with OverflowError
+        for i = 5, 9 do
+            assert_eq(rx.push(fail_queue, i), "OverflowError")
+        end
+        assert_eq(rx.len(fail_queue), 5)
+    end
+
+    test "overflow strategy DropOldest drops oldest and retains newest" do
+        -- 3b. OverflowStrategy::DropOldest: push 10 items to replace oldest items
+        local drop_queue = rx.BoundedQueue(5, 1024, "DropOldest")
+
+        for i = 0, 4 do
+            assert_eq(rx.push(drop_queue, i), "Enqueued")
+        end
+        for i = 5, 9 do
+            assert_eq(rx.push(drop_queue, i), "ReplacedOldest")
+        end
+
+        assert_eq(rx.len(drop_queue), 5)
+        assert_eq(rx.dropped_count(drop_queue), 5)
+
+        -- Queue should now contain 5, 6, 7, 8, 9
+        for expected = 5, 9 do
+            assert_eq(rx.pop(drop_queue), expected)
+        end
+        assert_eq(rx.pop(drop_queue), Option.None)
+    end
+
+    test "bounded stream subscription completes successfully" do
+        local received = []
+        local stream = rx.from_iter([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+        local custom_options = rx.BufferOptions(16, 1024, 4, 256, "Fail")
+
+        local sub = rx.subscribe(
+            stream,
+            function(item)
+                table.push(received, item)
+            end,
+            custom_options
+        )
+
+        local completion = rx.join(sub)
+        assert_eq(completion["exit"], "Completed")
+        assert_eq(table.len(received), 10)
+    end
+end

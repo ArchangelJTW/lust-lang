@@ -78,6 +78,42 @@ impl MeasurableItem for i64 {
     }
 }
 
+impl MeasurableItem for i32 {
+    fn charged_bytes(&self) -> usize {
+        4
+    }
+}
+
+impl MeasurableItem for u64 {
+    fn charged_bytes(&self) -> usize {
+        8
+    }
+}
+
+impl MeasurableItem for usize {
+    fn charged_bytes(&self) -> usize {
+        std::mem::size_of::<usize>()
+    }
+}
+
+impl MeasurableItem for f64 {
+    fn charged_bytes(&self) -> usize {
+        8
+    }
+}
+
+impl MeasurableItem for bool {
+    fn charged_bytes(&self) -> usize {
+        1
+    }
+}
+
+impl MeasurableItem for &'static str {
+    fn charged_bytes(&self) -> usize {
+        self.len()
+    }
+}
+
 impl MeasurableItem for String {
     fn charged_bytes(&self) -> usize {
         std::mem::size_of::<String>() + self.len()

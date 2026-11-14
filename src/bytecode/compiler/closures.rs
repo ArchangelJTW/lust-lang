@@ -156,7 +156,7 @@ impl Compiler {
                 self.find_free_vars_in_expr(inner, free_vars, bound_vars);
             }
 
-            ExprKind::Literal(_) => {}
+            ExprKind::Literal(_) | ExprKind::RegexLiteral { .. } => {}
 
             ExprKind::EffectBlock(stmts) => {
                 let mut scope_bound = bound_vars.clone();

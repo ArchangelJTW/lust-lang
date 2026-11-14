@@ -30,6 +30,13 @@ impl Compiler {
                 Ok(reg)
             }
 
+            ExprKind::RegexLiteral { pattern, .. } => {
+                let reg = self.allocate_register();
+                let const_idx = self.add_constant(Value::string(pattern.clone()));
+                self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                Ok(reg)
+            }
+
             ExprKind::Identifier(name) => {
                 if self.lookup_effect_thunk(name).is_some() {
                     return Err(LustError::CompileError(format!(

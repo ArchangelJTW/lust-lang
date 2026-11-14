@@ -8,6 +8,21 @@ use hashbrown::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TaskId(pub u64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WaitKey(pub u64);
+
+impl WaitKey {
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for WaitKey {
+    fn from(val: u64) -> Self {
+        WaitKey(val)
+    }
+}
+
 impl TaskId {
     pub fn as_u64(self) -> u64 {
         self.0
@@ -27,6 +42,7 @@ pub enum YieldReason {
     Timer(crate::sim::clock::TimerId),
     /// Preempted by quantum instruction fuel exhaustion (DES).
     QuantumExhausted,
+    Parked(WaitKey),
 }
 
 impl YieldReason {
@@ -35,6 +51,7 @@ impl YieldReason {
             YieldReason::Explicit => "explicit",
             YieldReason::Timer(_) => "timer",
             YieldReason::QuantumExhausted => "quantum_exhausted",
+            YieldReason::Parked(_) => "parked",
         }
     }
 }
@@ -136,7 +153,7 @@ impl TaskInstance {
         }
     }
 
-    pub(super) fn new_native_future(id: TaskId) -> Self {
+    pub fn new_native_future(id: TaskId) -> Self {
         Self {
             id,
             timer_id: None,
@@ -156,7 +173,7 @@ impl TaskInstance {
         }
     }
 
-    /// First interrupt wins; the context owns the pending reason, including while masked.
+    /// Signals an interrupt to the task; non-maskable (OutOfGas/OutOfMemory) preempts immediately.
     pub fn request_interrupt(&mut self, reason: InterruptReason) {
         if matches!(
             self.state,
@@ -164,7 +181,12 @@ impl TaskInstance {
         ) {
             return;
         }
-        self.fiber_context.pending_interrupt.get_or_insert(reason);
+        self.fiber_context.request_interrupt(reason);
+        if self.fiber_context.pending_interrupt.is_none()
+            || matches!(reason, InterruptReason::OutOfGas | InterruptReason::OutOfMemory)
+        {
+            self.fiber_context.pending_interrupt = Some(reason);
+        }
         // Running tasks must unwind through the dispatch safe point before being joined.
         if self.state != TaskState::Running {
             self.poll_interrupt();
@@ -173,6 +195,18 @@ impl TaskInstance {
 
     pub fn poll_interrupt(&mut self) -> Option<InterruptReason> {
         if self.fiber_context.is_masked() {
+            // INV-MASK-02: OutOfGas and OutOfMemory are non-maskable budget interrupts.
+            if let Some(reason) = self.fiber_context.pending_interrupt {
+                if matches!(reason, InterruptReason::OutOfGas | InterruptReason::OutOfMemory) {
+                    self.fiber_context.pending_interrupt = None;
+                    self.state = TaskState::Stopped;
+                    self.fiber_context.state = FiberExecutionState::Interrupted;
+                    self.error = Some(LustError::RuntimeError {
+                        message: alloc::format!("Task interrupted: {:?}", reason),
+                    });
+                    return Some(reason);
+                }
+            }
             return None;
         }
         let reason = self.fiber_context.pending_interrupt.take()?;
@@ -182,6 +216,24 @@ impl TaskInstance {
             message: alloc::format!("Task interrupted: {:?}", reason),
         });
         Some(reason)
+    }
+
+    pub fn enter_mask(&mut self) {
+        self.fiber_context.enter_mask();
+    }
+
+    pub fn exit_mask(&mut self) -> Option<InterruptReason> {
+        if self.fiber_context.interrupt_mask_depth == 0 {
+            return None;
+        }
+        let reason = self.fiber_context.exit_mask();
+        if let Some(r) = reason {
+            self.fiber_context.pending_interrupt = Some(r);
+            if self.state != TaskState::Running {
+                self.poll_interrupt();
+            }
+        }
+        reason
     }
 
     pub fn reset(&mut self) {
@@ -289,14 +341,18 @@ impl TaskInstance {
 
 pub struct TaskManager {
     tasks: HashMap<TaskId, TaskInstance>,
+    waiters: HashMap<WaitKey, Vec<TaskId>>,
     next_id: u64,
+    next_wait_key: u64,
 }
 
 impl TaskManager {
     pub fn new() -> Self {
         Self {
             tasks: HashMap::new(),
+            waiters: HashMap::new(),
             next_id: 1,
+            next_wait_key: 1,
         }
     }
 
@@ -326,11 +382,106 @@ impl TaskManager {
         id
     }
 
+    pub fn next_wait_key(&mut self) -> WaitKey {
+        let key = WaitKey(self.next_wait_key);
+        self.next_wait_key += 1;
+        key
+    }
+
     pub fn contains(&self, id: TaskId) -> bool {
         self.tasks.contains_key(&id)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &TaskInstance> {
         self.tasks.values()
+    }
+
+    pub fn park(&mut self, id: TaskId, key: WaitKey) -> bool {
+        let Some(task) = self.tasks.get_mut(&id) else {
+            return false;
+        };
+        if matches!(
+            task.state,
+            TaskState::Stopped | TaskState::Completed | TaskState::Failed
+        ) {
+            return false;
+        }
+        if task.fiber_context.state == FiberExecutionState::Interrupted {
+            task.state = TaskState::Stopped;
+            return false;
+        }
+        if !task.fiber_context.is_masked() && task.fiber_context.pending_interrupt.is_some() {
+            task.poll_interrupt();
+            return false;
+        }
+        if let Some(reason) = task.fiber_context.pending_interrupt {
+            if matches!(reason, InterruptReason::OutOfGas | InterruptReason::OutOfMemory) {
+                task.poll_interrupt();
+                return false;
+            }
+        }
+        task.continuation = Some(task.capture_continuation());
+        task.state = TaskState::Yielded(YieldReason::Parked(key));
+        let q = self.waiters.entry(key).or_default();
+        if !q.contains(&id) {
+            q.push(id);
+        }
+        true
+    }
+
+    pub fn wake(&mut self, key: WaitKey, all: bool) -> Vec<TaskId> {
+        let mut woken = Vec::new();
+        while let Some(id) = self.waiters.get_mut(&key).and_then(|q| {
+            if q.is_empty() {
+                None
+            } else {
+                Some(q.remove(0))
+            }
+        }) {
+            let valid = self.tasks.get_mut(&id).is_some_and(|t| {
+                if matches!(t.state, TaskState::Yielded(YieldReason::Parked(k)) if k == key)
+                    && t.fiber_context.state != FiberExecutionState::Interrupted
+                {
+                    t.state = TaskState::Ready;
+                    true
+                } else {
+                    false
+                }
+            });
+            if valid {
+                woken.push(id);
+                if !all {
+                    break;
+                }
+            }
+        }
+        if self.waiters.get(&key).is_some_and(Vec::is_empty) {
+            self.waiters.remove(&key);
+        }
+        woken
+    }
+
+    pub fn unregister_task_from_waiters(&mut self, id: TaskId) {
+        for q in self.waiters.values_mut() {
+            q.retain(|waiter_id| *waiter_id != id);
+        }
+        self.waiters.retain(|_, q| !q.is_empty());
+    }
+
+    pub fn is_task_waiting(&self, id: TaskId) -> bool {
+        self.waiters.values().any(|q| q.contains(&id))
+    }
+
+    pub fn cancel_task(&mut self, id: TaskId, reason: InterruptReason) {
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.request_interrupt(reason);
+        }
+        self.unregister_task_from_waiters(id);
+    }
+}
+
+impl Default for TaskManager {
+    fn default() -> Self {
+        Self::new()
     }
 }

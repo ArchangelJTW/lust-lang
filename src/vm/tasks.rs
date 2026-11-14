@@ -27,6 +27,46 @@ impl Drop for MutationM2Guard {
 }
 
 impl VM {
+    pub fn park_task(&mut self, task_id: TaskId, key: crate::vm::task::WaitKey) -> bool {
+        self.task_manager.park(task_id, key)
+    }
+
+    pub fn park_current_task(&mut self, key: crate::vm::task::WaitKey) -> bool {
+        self.current_task.is_some_and(|id| self.task_manager.park(id, key))
+    }
+
+    pub fn wake_one(&mut self, key: crate::vm::task::WaitKey) -> Option<TaskId> {
+        self.task_manager.wake(key, false).into_iter().next()
+    }
+
+    pub fn wake_all(&mut self, key: crate::vm::task::WaitKey) -> Vec<TaskId> {
+        self.task_manager.wake(key, true)
+    }
+
+    pub fn next_wait_key(&mut self) -> crate::vm::task::WaitKey {
+        self.task_manager.next_wait_key()
+    }
+
+    pub fn is_task_waiting(&self, task_id: TaskId) -> bool {
+        self.task_manager.is_task_waiting(task_id)
+    }
+
+    pub fn cancel_task(&mut self, task_id: TaskId, reason: crate::effect_abi::InterruptReason) {
+        self.task_manager.cancel_task(task_id, reason);
+    }
+
+    pub fn set_current_task_id(&mut self, id: Option<TaskId>) {
+        self.current_task = id;
+    }
+
+    pub fn task_manager(&self) -> &crate::vm::task::TaskManager {
+        &self.task_manager
+    }
+
+    pub fn task_manager_mut(&mut self) -> &mut crate::vm::task::TaskManager {
+        &mut self.task_manager
+    }
+
     /// Associates a task with an open scope before it can execute.
     pub fn register_scope_task(
         &mut self,
@@ -59,8 +99,17 @@ impl VM {
         }
         let children = scope.begin_teardown();
         for id in &children {
-            if let Some(task) = self.task_manager.get_mut(TaskId(*id)) {
+            let task_id = TaskId(*id);
+            if let Some(task) = self.task_manager.get_mut(task_id) {
                 task.request_interrupt(InterruptReason::Cancelled);
+            }
+            if self.task_manager.get(task_id).is_some_and(|t| {
+                matches!(
+                    t.state,
+                    TaskState::Completed | TaskState::Failed | TaskState::Stopped
+                )
+            }) {
+                self.task_manager.unregister_task_from_waiters(task_id);
             }
         }
         scope.mark_joining();
@@ -220,7 +269,23 @@ impl VM {
 
             Err(err) => {
                 let annotated = self.annotate_runtime_error(err);
-                if task.fiber_context.state != crate::effect_abi::FiberExecutionState::Interrupted {
+                let is_gas = match &annotated {
+                    LustError::RuntimeError { message } => message.starts_with("Out of gas"),
+                    _ => false,
+                };
+                let is_mem = match &annotated {
+                    LustError::RuntimeError { message } => message.starts_with("Out of memory"),
+                    _ => false,
+                };
+                if is_gas {
+                    task.state = TaskState::Stopped;
+                    task.fiber_context.state = crate::effect_abi::FiberExecutionState::Interrupted;
+                    task.fiber_context.pending_interrupt = Some(crate::effect_abi::InterruptReason::OutOfGas);
+                } else if is_mem {
+                    task.state = TaskState::Stopped;
+                    task.fiber_context.state = crate::effect_abi::FiberExecutionState::Interrupted;
+                    task.fiber_context.pending_interrupt = Some(crate::effect_abi::InterruptReason::OutOfMemory);
+                } else if task.fiber_context.state != crate::effect_abi::FiberExecutionState::Interrupted {
                     task.state = TaskState::Failed;
                 }
                 task.error = Some(annotated.clone());
@@ -245,6 +310,11 @@ impl VM {
             task.capture_continuation();
         }
         self.task_manager.attach(task);
+        if self.task_manager.get(task_id).is_some_and(|t| {
+            matches!(t.state, TaskState::Completed | TaskState::Failed | TaskState::Stopped)
+        }) {
+            self.task_manager.unregister_task_from_waiters(task_id);
+        }
         if let Some(err) = error_result {
             Err(err)
         } else {
@@ -559,6 +629,7 @@ impl VM {
         task.yield_dest = None;
         task.last_yield = None;
         self.task_manager.attach(task);
+        self.task_manager.unregister_task_from_waiters(task_id);
         Ok(())
     }
 
@@ -653,6 +724,11 @@ impl VM {
                 task.pending_return_dest = None;
                 task.yield_dest = None;
                 self.task_manager.attach(task);
+                if self.task_manager.get(task_id).is_some_and(|t| {
+                    matches!(t.state, TaskState::Completed | TaskState::Failed | TaskState::Stopped)
+                }) {
+                    self.task_manager.unregister_task_from_waiters(task_id);
+                }
                 Ok(())
             }
 

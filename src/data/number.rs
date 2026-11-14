@@ -55,6 +55,10 @@ impl ObjectId {
     pub fn timestamp(&self) -> u32 {
         u32::from_be_bytes([self.0[0], self.0[1], self.0[2], self.0[3]])
     }
+
+    pub const fn bytes(&self) -> &[u8; 12] {
+        &self.0
+    }
 }
 
 impl fmt::Display for ObjectId {

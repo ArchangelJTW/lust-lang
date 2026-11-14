@@ -1,0 +1,74 @@
+-- Lust Rx Hot Multicast Subject
+-- Demonstrates hot multicast broadcasting, zero replay for late subscribers,
+-- and isolated slow-subscriber backpressure overflow failure.
+
+suite "Rx Hot Multicast Subject Suite" do
+    test "hot multicast, late join without replay, and slow subscriber isolation" do
+        local subject = rx.Subject()
+
+        local fast_received = []
+        local late_received = []
+        local slow_received = []
+        local slow_failed = []
+
+        -- 1. Fast subscriber joins before any emissions
+        local fast_sub = rx.subject_subscribe(
+            subject,
+            function(item)
+                table.push(fast_received, item)
+            end
+        )
+
+        -- 2. Slow subscriber joins with tiny capacity (max_items: 2, Fail on overflow)
+        local tiny_options = rx.BufferOptions(2, 1024, 1, 512, "Fail")
+        local slow_sub = rx.subject_subscribe_with(
+            subject,
+            function(item)
+                table.push(slow_received, item)
+            end,
+            function(err)
+                table.push(slow_failed, true)
+            end,
+            function()
+            end,
+            tiny_options
+        )
+
+        -- Emit event 10
+        rx.next(subject, 10)
+
+        -- 3. Late subscriber joins AFTER item 10 has been emitted
+        local late_sub = rx.subject_subscribe(
+            subject,
+            function(item)
+                table.push(late_received, item)
+            end
+        )
+
+        -- Emit items 20 and 30 (slow subscriber overflows capacity 2 and fails)
+        rx.next(subject, 20)
+        rx.next(subject, 30)
+
+        -- Complete subject
+        rx.complete(subject)
+
+        -- Verify items received
+        -- Fast subscriber received all items: 10, 20, 30
+        assert_eq(fast_received, [10, 20, 30])
+
+        -- Late subscriber joined after 10, received only post-join items: 20, 30 (ZERO replay!)
+        assert_eq(late_received, [20, 30])
+
+        -- Slow subscriber failed on overflow
+        assert(table.len(slow_failed) > 0, "Slow subscriber must fail on backpressure overflow")
+
+        -- Verify join status
+        local fast_comp = rx.join(fast_sub)
+        local late_comp = rx.join(late_sub)
+        local slow_comp = rx.join(slow_sub)
+
+        assert_eq(fast_comp["exit"], "Completed")
+        assert_eq(late_comp["exit"], "Completed")
+        assert_eq(slow_comp["exit"], "Failed(BackpressureOverflow)")
+    end
+end

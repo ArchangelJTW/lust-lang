@@ -251,6 +251,9 @@ impl PreemptiveExplorationScheduler {
             TaskState::Yielded(YieldReason::Timer(_)) => {
                 // Fiber is waiting on a timer; will be added to ready_queue when timer fires
             }
+            TaskState::Yielded(YieldReason::Parked(_)) => {
+                // Explicit wake operation owns re-enqueueing parked fibers.
+            }
             TaskState::Ready => {
                 self.ready_queue.push(handle);
             }

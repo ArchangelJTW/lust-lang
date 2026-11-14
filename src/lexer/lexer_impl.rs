@@ -379,6 +379,10 @@ impl<'a> Lexer<'a> {
                     return Ok(Token::simple(TokenKind::Bang, start_line, start_column));
                 }
             }
+            '@' => {
+                self.advance();
+                return Ok(Token::simple(TokenKind::At, start_line, start_column));
+            }
             '<' => {
                 self.advance();
                 if self.current_char() == '<' {

@@ -515,7 +515,9 @@ fn collect_nominal_names_in_items(
             | ItemKind::Use { .. }
             | ItemKind::Service(_)
             | ItemKind::Test(_)
-            | ItemKind::Suite(_) => {}
+            | ItemKind::Suite(_)
+            | ItemKind::Schema(_)
+            | ItemKind::TypeAlias { .. } => {}
         }
     }
 }
@@ -764,7 +766,9 @@ fn collect_items(
             | ItemKind::Use { .. }
             | ItemKind::Service(_)
             | ItemKind::Test(_)
-            | ItemKind::Suite(_) => {}
+            | ItemKind::Suite(_)
+            | ItemKind::Schema(_)
+            | ItemKind::TypeAlias { .. } => {}
         }
     }
 

@@ -39,6 +39,7 @@ pub struct TestSummary {
     pub failed: usize,
     pub skipped: usize,
     pub duration: Duration,
+    pub benchmarks: Vec<super::bench::BenchResult>,
 }
 
 impl TestSummary {
@@ -226,6 +227,7 @@ impl TestRunner {
             failed,
             skipped,
             duration,
+            benchmarks: Vec::new(),
         }
     }
 }

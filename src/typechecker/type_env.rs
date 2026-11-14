@@ -25,6 +25,7 @@ pub struct TypeEnv {
     builtin_types: HashSet<String>,
     constants: HashMap<String, Type>,
     services: HashMap<String, Option<Type>>,
+    type_aliases: HashMap<String, Type>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +111,7 @@ impl TypeEnv {
             builtin_types: HashSet::new(),
             constants: HashMap::new(),
             services: HashMap::new(),
+            type_aliases: HashMap::new(),
         };
         env.register_builtins(config);
         env
@@ -130,6 +132,8 @@ impl TypeEnv {
         self.register_builtin_type("Array");
         self.register_builtin_type("Map");
         self.register_builtin_type("Table");
+        self.register_builtin_type("Regex");
+        self.register_builtin_type("Schema");
         let task_status_type = Type::new(TypeKind::Named("TaskStatus".to_string()), dummy_span);
         let unknown_type = Type::new(TypeKind::Unknown, dummy_span);
         let option_unknown_type =
@@ -329,7 +333,7 @@ impl TypeEnv {
                     }
                 }
                 if let Some(global_scope) = self.scopes.first_mut() {
-                    for mod_name in ["array", "table", "map", "math", "string", "task", "lua"] {
+                    for mod_name in ["array", "table", "map", "math", "string", "task", "lua", "rx"] {
                         if auto_globals.contains(mod_name) {
                             global_scope.insert(mod_name.to_string(), Type::new(TypeKind::Unknown, dummy_span));
                         }
@@ -355,6 +359,7 @@ impl TypeEnv {
                     );
                     global_scope.insert("task".to_string(), Type::new(TypeKind::Unknown, dummy_span));
                     global_scope.insert("lua".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+                    global_scope.insert("rx".to_string(), Type::new(TypeKind::Unknown, dummy_span));
                 }
             }
         }
@@ -365,6 +370,8 @@ impl TypeEnv {
         self.register_builtin_function_slice(builtins::string_functions(), dummy_span);
         self.register_builtin_function_slice(builtins::task_functions(), dummy_span);
         self.register_builtin_function_slice(builtins::lua_functions(), dummy_span);
+        self.register_builtin_function_slice(builtins::rx_functions(), dummy_span);
+        self.register_builtin_function_slice(builtins::test_functions(), dummy_span);
 
         let task_status_enum = EnumDef {
             name: "TaskStatus".to_string(),
@@ -861,6 +868,14 @@ impl TypeEnv {
 
     pub fn lookup_struct(&self, name: &str) -> Option<&StructDef> {
         self.structs.get(name)
+    }
+
+    pub fn register_type_alias(&mut self, name: String, ty: Type) {
+        self.type_aliases.insert(name, ty);
+    }
+
+    pub fn lookup_type_alias(&self, name: &str) -> Option<&Type> {
+        self.type_aliases.get(name)
     }
 
     pub fn register_service(&mut self, name: String, target_type: Option<Type>) -> Result<()> {

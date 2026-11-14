@@ -42,6 +42,8 @@ pub mod typechecker;
 pub mod vm;
 pub mod sim;
 #[cfg(feature = "std")]
+pub mod stdlib;
+#[cfg(feature = "std")]
 pub mod vfs;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
@@ -98,9 +100,14 @@ pub use packages::{
 pub use parser::Parser;
 pub use typechecker::{FunctionSignature, TypeChecker, TypeCollection};
 pub use vm::{
-    NativeExport, NativeExportParam, VM,
+    NativeEffectSpec, NativeExport, NativeExportParam, NativeGasPolicy, NativeMemoryPolicy,
+    NativePurity, VM,
     MUTATION_M1_EXECUTION_COUNT, MUTATION_M1_SKIP_GAS, MutationM1Guard,
     MUTATION_M2_EXECUTION_COUNT, MUTATION_M2_SKIP_PANIC_FINALIZER, MutationM2Guard,
+};
+#[cfg(feature = "std")]
+pub use stdlib::effects::{
+    EnvError, EnvService, FileHandle, FileSystemService, IoError, RandomService,
 };
 pub use sim::{
     FaultConfiguration, FaultInjectedVfs, FaultKind, GasMonotonicityOracle, GasProgressOracle,

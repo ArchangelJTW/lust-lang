@@ -521,6 +521,9 @@ impl AstCoverageVisitor {
                 self.visit_expr(start);
                 self.visit_expr(end);
             }
+            ExprKind::RegexLiteral { .. } => {
+                self.visited_kinds.insert("RegexLiteral");
+            }
         }
     }
 }
@@ -671,6 +674,13 @@ fn test_l9_ast_visitor_covers_every_expr_variant() {
             },
             span,
         ),
+        Expr::new(
+            ExprKind::RegexLiteral {
+                pattern: "^[a-z]+$".to_string(),
+                span,
+            },
+            span,
+        ),
     ];
 
     let mut visitor = AstCoverageVisitor::new();
@@ -702,6 +712,7 @@ fn test_l9_ast_visitor_covers_every_expr_variant() {
         "EffectBlock",
         "Return",
         "Range",
+        "RegexLiteral",
     ];
 
     for var in expected_variants {

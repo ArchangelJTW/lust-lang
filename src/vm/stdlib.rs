@@ -29,10 +29,90 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
         ("map", create_map_module(vm)),
         ("math", create_math_module(vm)),
         ("effect", create_effect_module(vm)),
+        ("rx", create_rx_module(vm)),
+        ("test", crate::stdlib::rx_test_bridge::create_test_module(vm)),
+        ("random", create_random_module(vm)),
         ("bit", create_bit_module(vm)),
         ("bitwise", create_bit_module(vm)),
 
         // Direct qualified entries for imported symbols
+        ("random.int_effect", create_random_int_effect_fn()),
+        ("random.float_effect", create_random_float_effect_fn()),
+        ("random.bool_effect", create_random_bool_effect_fn()),
+        ("random.bytes_effect", create_random_bytes_effect_fn()),
+        ("io.read_file_effect", create_io_read_file_effect_fn()),
+        ("io.write_file_effect", create_io_write_file_effect_fn()),
+        ("io.exists_effect", create_io_exists_effect_fn()),
+        ("io.remove_file_effect", create_io_remove_file_effect_fn()),
+        ("io.create_dir_all_effect", create_io_create_dir_all_effect_fn()),
+        ("io.read_dir_effect", create_io_read_dir_effect_fn()),
+        ("io.open_scoped", create_io_open_scoped_fn()),
+        ("io.read_handle", create_io_read_handle_fn()),
+        ("io.write_handle", create_io_write_handle_fn()),
+        ("io.close_handle", create_io_close_handle_fn()),
+        ("os.getenv_effect", create_os_getenv_effect_fn()),
+        ("os.setenv_effect", create_os_setenv_effect_fn()),
+        ("os.now_ms_effect", create_os_now_ms_effect_fn()),
+        ("os.args_effect", create_os_args_effect_fn()),
+        ("rx.Subject", create_rx_subject_fn()),
+        ("rx.Observable", create_rx_observable_fn()),
+        ("rx.from_iter", crate::stdlib::rx_test_bridge::create_rx_observable_fn()),
+        ("rx.interval", create_rx_interval_fn()),
+        ("rx.Scheduler", crate::stdlib::rx_test_bridge::create_rx_scheduler_fn()),
+        ("rx.advance_by", crate::stdlib::rx_test_bridge::create_rx_advance_by_fn()),
+        ("rx.unsubscribe", crate::stdlib::rx_test_bridge::create_rx_unsubscribe_fn()),
+        ("rx.join", crate::stdlib::rx_test_bridge::create_rx_join_fn()),
+        ("rx.BoundedQueue", crate::stdlib::rx_test_bridge::create_rx_bounded_queue_fn()),
+        ("rx.BufferOptions", crate::stdlib::rx_test_bridge::create_rx_buffer_options_fn()),
+        ("rx.default_buffer_options", crate::stdlib::rx_test_bridge::create_rx_default_buffer_options_fn()),
+        ("rx.push", crate::stdlib::rx_test_bridge::create_rx_push_fn()),
+        ("rx.pop", crate::stdlib::rx_test_bridge::create_rx_pop_fn()),
+        ("rx.dequeue", crate::stdlib::rx_test_bridge::create_rx_pop_fn()),
+        ("rx.dropped_count", crate::stdlib::rx_test_bridge::create_rx_dropped_count_fn()),
+        ("rx.len", crate::stdlib::rx_test_bridge::create_rx_len_fn()),
+        ("rx.used_bytes", crate::stdlib::rx_test_bridge::create_rx_used_bytes_fn()),
+        ("rx.subject_subscribe", crate::stdlib::rx_test_bridge::create_rx_subject_subscribe_fn()),
+        ("rx.subject_subscribe_with", crate::stdlib::rx_test_bridge::create_rx_subject_subscribe_with_fn()),
+        ("rx.next", crate::stdlib::rx_test_bridge::create_rx_next_fn()),
+        ("rx.complete", crate::stdlib::rx_test_bridge::create_rx_complete_fn()),
+        ("rx.filter", crate::stdlib::rx_test_bridge::create_rx_filter_fn()),
+        ("rx.map", crate::stdlib::rx_test_bridge::create_rx_map_fn()),
+        ("rx.take", crate::stdlib::rx_test_bridge::create_rx_take_fn()),
+        ("rx.subscribe", crate::stdlib::rx_test_bridge::create_rx_subscribe_fn()),
+        ("rx.subscribe_with", crate::stdlib::rx_test_bridge::create_rx_subscribe_with_fn()),
+        ("test.clock_new", crate::stdlib::rx_test_bridge::create_test_clock_new_fn()),
+        ("test.clock_now_ms", crate::stdlib::rx_test_bridge::create_test_clock_now_ms_fn()),
+        ("test.clock_schedule", crate::stdlib::rx_test_bridge::create_test_clock_schedule_fn()),
+        ("test.clock_adjust", crate::stdlib::rx_test_bridge::create_test_clock_adjust_fn()),
+        ("test.clock_pending_count", crate::stdlib::rx_test_bridge::create_test_clock_pending_count_fn()),
+        ("test.schedule_exponential", crate::stdlib::rx_test_bridge::create_test_schedule_exponential_fn()),
+        ("test.schedule_step", crate::stdlib::rx_test_bridge::create_test_schedule_step_fn()),
+        ("test.mock_new", crate::stdlib::rx_test_bridge::create_test_mock_new_fn()),
+        ("test.mock_set_response", crate::stdlib::rx_test_bridge::create_test_mock_set_response_fn()),
+        ("test.mock_record_call", crate::stdlib::rx_test_bridge::create_test_mock_record_call_fn()),
+        ("test.mock_call_count", crate::stdlib::rx_test_bridge::create_test_mock_call_count_fn()),
+        ("test.mock_last_call", crate::stdlib::rx_test_bridge::create_test_mock_last_call_fn()),
+        ("test.projection_new", crate::stdlib::rx_test_bridge::create_test_projection_new_fn()),
+        ("test.projection_get", crate::stdlib::rx_test_bridge::create_test_projection_get_fn()),
+        ("test.resource_new", crate::stdlib::rx_test_bridge::create_test_resource_new_fn()),
+        ("test.resource_is_active", crate::stdlib::rx_test_bridge::create_test_resource_is_active_fn()),
+        ("test.scope_new", crate::stdlib::rx_test_bridge::create_test_scope_new_fn()),
+        ("test.scope_is_open", crate::stdlib::rx_test_bridge::create_test_scope_is_open_fn()),
+        ("test.scope_teardown_state", crate::stdlib::rx_test_bridge::create_test_scope_teardown_state_fn()),
+        ("test.scope_admission_state", crate::stdlib::rx_test_bridge::create_test_scope_admission_state_fn()),
+        ("test.scope_register_finalizer", crate::stdlib::rx_test_bridge::create_test_scope_register_finalizer_fn()),
+        ("test.scope_register_child", crate::stdlib::rx_test_bridge::create_test_scope_register_child_fn()),
+        ("test.scope_begin_teardown", crate::stdlib::rx_test_bridge::create_test_scope_begin_teardown_fn()),
+        ("test.scope_mark_joining", crate::stdlib::rx_test_bridge::create_test_scope_mark_joining_fn()),
+        ("test.scope_current_releases", crate::stdlib::rx_test_bridge::create_test_scope_current_releases_fn()),
+        ("test.scope_finalize", crate::stdlib::rx_test_bridge::create_test_scope_finalize_fn()),
+        ("test.fiber_new", crate::stdlib::rx_test_bridge::create_test_fiber_new_fn()),
+        ("test.fiber_set_state", crate::stdlib::rx_test_bridge::create_test_fiber_set_state_fn()),
+        ("test.fiber_enter_mask", crate::stdlib::rx_test_bridge::create_test_fiber_enter_mask_fn()),
+        ("test.fiber_exit_mask", crate::stdlib::rx_test_bridge::create_test_fiber_exit_mask_fn()),
+        ("test.fiber_is_masked", crate::stdlib::rx_test_bridge::create_test_fiber_is_masked_fn()),
+        ("test.fiber_request_interrupt", crate::stdlib::rx_test_bridge::create_test_fiber_request_interrupt_fn()),
+        ("test.fiber_state", crate::stdlib::rx_test_bridge::create_test_fiber_state_fn()),
         ("effect.succeed", create_effect_succeed_fn()),
         ("effect.fail", create_effect_fail_fn()),
         ("effect.die", create_effect_die_fn()),
@@ -333,6 +413,16 @@ fn create_io_module(vm: &VM) -> Value {
         (string_key("read_stdin"), create_io_read_stdin_fn()),
         (string_key("read_line"), create_io_read_line_fn()),
         (string_key("write_stdout"), create_io_write_stdout_fn()),
+        (string_key("read_file_effect"), create_io_read_file_effect_fn()),
+        (string_key("write_file_effect"), create_io_write_file_effect_fn()),
+        (string_key("exists_effect"), create_io_exists_effect_fn()),
+        (string_key("remove_file_effect"), create_io_remove_file_effect_fn()),
+        (string_key("create_dir_all_effect"), create_io_create_dir_all_effect_fn()),
+        (string_key("read_dir_effect"), create_io_read_dir_effect_fn()),
+        (string_key("open_scoped"), create_io_open_scoped_fn()),
+        (string_key("read_handle"), create_io_read_handle_fn()),
+        (string_key("write_handle"), create_io_write_handle_fn()),
+        (string_key("close_handle"), create_io_close_handle_fn()),
     ];
     vm.map_with_entries(entries)
 }
@@ -577,6 +667,10 @@ fn create_os_module(vm: &VM) -> Value {
         (string_key("getenv"), create_os_get_env_fn()),
         (string_key("set_env"), create_os_set_env_fn()),
         (string_key("setenv"), create_os_set_env_fn()),
+        (string_key("getenv_effect"), create_os_getenv_effect_fn()),
+        (string_key("setenv_effect"), create_os_setenv_effect_fn()),
+        (string_key("now_ms_effect"), create_os_now_ms_effect_fn()),
+        (string_key("args_effect"), create_os_args_effect_fn()),
     ];
     vm.map_with_entries(entries)
 }
@@ -2207,6 +2301,22 @@ fn create_table_module(vm: &VM) -> Value {
     vm.map_with_entries(entries)
 }
 
+fn create_rx_module(vm: &VM) -> Value {
+    crate::stdlib::rx_test_bridge::create_rx_module(vm)
+}
+
+fn create_rx_subject_fn() -> Value {
+    crate::stdlib::rx_test_bridge::create_rx_subject_fn()
+}
+
+fn create_rx_observable_fn() -> Value {
+    crate::stdlib::rx_test_bridge::create_rx_observable_fn()
+}
+
+fn create_rx_interval_fn() -> Value {
+    crate::stdlib::rx_test_bridge::create_rx_interval_fn()
+}
+
 fn create_effect_module(vm: &VM) -> Value {
     let entries = [
         (string_key("succeed"), create_effect_succeed_fn()),
@@ -2444,6 +2554,539 @@ fn create_effect_run_sync_fn() -> Value {
             }
         }
     }))
+}
+
+fn extract_file_handle(val: &Value) -> Option<crate::stdlib::effects::fs::FileHandle> {
+    if let Value::Map(m) = val {
+        let b = m.borrow();
+        let handle_id = match b.get(&string_key("handle_id")) {
+            Some(Value::Int(n)) => *n as usize,
+            _ => return None,
+        };
+        let slot_id = match b.get(&string_key("slot_id")) {
+            Some(Value::Int(n)) => *n as usize,
+            _ => return None,
+        };
+        let path = match b.get(&string_key("path")).and_then(|v| v.as_string()) {
+            Some(p) => p.to_string(),
+            _ => String::new(),
+        };
+        let mode = match b.get(&string_key("mode")).and_then(|v| v.as_string()) {
+            Some(m) => m.to_string(),
+            _ => String::new(),
+        };
+        Some(crate::stdlib::effects::fs::FileHandle {
+            handle_id,
+            slot_id,
+            path,
+            mode,
+        })
+    } else {
+        None
+    }
+}
+
+fn create_io_read_file_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let path = match args.first().and_then(|v| v.as_string()) {
+            Some(p) => p,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("path must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::read_to_string(vm, path)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(s) => crate::effect_abi::Exit::Success(Value::string(s)),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_write_file_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let path = match args.first().and_then(|v| v.as_string()) {
+            Some(p) => p,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("path must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let content = match args.get(1) {
+            Some(Value::String(s)) => s.as_str(),
+            Some(_v) => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("content must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+            None => "",
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::write_string(vm, path, content)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(()) => crate::effect_abi::Exit::Success(Value::Nil),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_exists_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let path = match args.first().and_then(|v| v.as_string()) {
+            Some(p) => p,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("path must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::exists(vm, path)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(b) => crate::effect_abi::Exit::Success(Value::Bool(b)),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_remove_file_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let path = match args.first().and_then(|v| v.as_string()) {
+            Some(p) => p,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("path must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::remove_file(vm, path)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(()) => crate::effect_abi::Exit::Success(Value::Nil),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_create_dir_all_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let path = match args.first().and_then(|v| v.as_string()) {
+            Some(p) => p,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("path must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::create_dir_all(vm, path)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(()) => crate::effect_abi::Exit::Success(Value::Nil),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_read_dir_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let path = match args.first().and_then(|v| v.as_string()) {
+            Some(p) => p,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("path must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::read_dir(vm, path)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(items) => {
+                let arr: Vec<Value> = items.into_iter().map(Value::string).collect();
+                crate::effect_abi::Exit::Success(Value::array(arr))
+            }
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_open_scoped_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let path = match args.first().and_then(|v| v.as_string()) {
+            Some(p) => p,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("path must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let mode = match args.get(1).and_then(|v| v.as_string()) {
+            Some(m) => m,
+            None => "r",
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::open_scoped(vm, path, mode)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(handle) => {
+                let handle_map = alloc::vec![
+                    (string_key("__type"), Value::string("FileHandle")),
+                    (string_key("handle_id"), Value::Int(handle.handle_id as i64)),
+                    (string_key("slot_id"), Value::Int(handle.slot_id as i64)),
+                    (string_key("path"), Value::string(&handle.path)),
+                    (string_key("mode"), Value::string(&handle.mode)),
+                ];
+                crate::effect_abi::Exit::Success(Value::map(handle_map.into_iter().collect()))
+            }
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_read_handle_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let handle = match args.first().and_then(extract_file_handle) {
+            Some(h) => h,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("Invalid file handle".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let max_bytes = match args.get(1) {
+            Some(Value::Int(n)) if *n > 0 => *n as usize,
+            _ => 4096,
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::read_handle(vm, &handle, max_bytes)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(bytes) => {
+                let arr: Vec<Value> = bytes.into_iter().map(|b| Value::Int(b as i64)).collect();
+                crate::effect_abi::Exit::Success(Value::array(arr))
+            }
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_write_handle_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let handle = match args.first().and_then(extract_file_handle) {
+            Some(h) => h,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("Invalid file handle".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let bytes: Vec<u8> = match args.get(1) {
+            Some(Value::String(s)) => s.as_bytes().to_vec(),
+            Some(Value::Array(arr)) => arr.borrow().iter().filter_map(|v| match v {
+                Value::Int(i) => Some(*i as u8),
+                _ => None,
+            }).collect(),
+            _ => Vec::new(),
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::write_handle(vm, &handle, &bytes)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(()) => crate::effect_abi::Exit::Success(Value::Nil),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_io_close_handle_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let handle = match args.first().and_then(extract_file_handle) {
+            Some(h) => h,
+            None => {
+                let err = crate::stdlib::effects::fs::IoError::InvalidInput("Invalid file handle".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::fs::FileSystemService::close_handle(vm, &handle)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::fs::IoError::IoFailure("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(()) => crate::effect_abi::Exit::Success(Value::Nil),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_os_getenv_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let key = match args.first().and_then(|v| v.as_string()) {
+            Some(k) => k,
+            None => {
+                let err = crate::stdlib::effects::env::EnvError::NotFound("Key must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::env::EnvService::var(vm, key)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::env::EnvError::NotFound("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(s) => crate::effect_abi::Exit::Success(Value::string(s)),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_os_setenv_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let key = match args.first().and_then(|v| v.as_string()) {
+            Some(k) => k,
+            None => {
+                let err = crate::stdlib::effects::env::EnvError::NotFound("Key must be a string".to_string());
+                return Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(
+                    crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+                )));
+            }
+        };
+        let val = match args.get(1).and_then(|v| v.as_string()) {
+            Some(v) => v,
+            None => "",
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::env::EnvService::set_var(vm, key, val)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::env::EnvError::NotFound("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(()) => crate::effect_abi::Exit::Success(Value::Nil),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_os_now_ms_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|_args: &[Value]| {
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::env::EnvService::now_millis(vm)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::env::EnvError::NotFound("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(n) => crate::effect_abi::Exit::Success(Value::Int(n as i64)),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_os_args_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|_args: &[Value]| {
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::env::EnvService::args(vm)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(
+                crate::stdlib::effects::env::EnvError::NotFound("No active VM context".to_string()),
+            ))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(args_list) => {
+                let arr: Vec<Value> = args_list.into_iter().map(Value::string).collect();
+                crate::effect_abi::Exit::Success(Value::array(arr))
+            }
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_random_int_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let min = match args.first() {
+            Some(Value::Int(n)) => *n,
+            _ => 0,
+        };
+        let max = match args.get(1) {
+            Some(Value::Int(n)) => *n,
+            _ => 100,
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::random::RandomService::next_int(vm, min, max)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail("No active VM context".to_string()))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(n) => crate::effect_abi::Exit::Success(Value::Int(n)),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_random_float_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|_args: &[Value]| {
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::random::RandomService::next_float(vm)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail("No active VM context".to_string()))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(f) => crate::effect_abi::Exit::Success(Value::Float(f)),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_random_bool_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|_args: &[Value]| {
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::random::RandomService::next_bool(vm)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail("No active VM context".to_string()))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(b) => crate::effect_abi::Exit::Success(Value::Bool(b)),
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_random_bytes_effect_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let len = match args.first() {
+            Some(Value::Int(n)) if *n >= 0 => *n as usize,
+            _ => 16,
+        };
+        let exit = if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+            let vm = unsafe { &mut *vm_ptr };
+            crate::stdlib::effects::random::RandomService::fill_bytes(vm, len)
+        } else {
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail("No active VM context".to_string()))
+        };
+        let val_exit = match exit {
+            crate::effect_abi::Exit::Success(bytes) => {
+                let items: Vec<Value> = bytes.into_iter().map(|b| Value::Int(b as i64)).collect();
+                crate::effect_abi::Exit::Success(Value::array(items))
+            }
+            crate::effect_abi::Exit::Failure(cause) => crate::effect_abi::Exit::Failure(cause),
+        };
+        Ok(NativeCallResult::Return(crate::stdlib::effects::exit_to_value(val_exit)))
+    }))
+}
+
+fn create_random_module(vm: &VM) -> Value {
+    let entries = [
+        (string_key("int_effect"), create_random_int_effect_fn()),
+        (string_key("float_effect"), create_random_float_effect_fn()),
+        (string_key("bool_effect"), create_random_bool_effect_fn()),
+        (string_key("bytes_effect"), create_random_bytes_effect_fn()),
+        (string_key("int"), create_random_int_effect_fn()),
+        (string_key("float"), create_random_float_effect_fn()),
+        (string_key("bool"), create_random_bool_effect_fn()),
+        (string_key("bytes"), create_random_bytes_effect_fn()),
+        (string_key("random"), create_math_random_fn()),
+        (string_key("randomseed"), create_math_randomseed_fn()),
+    ];
+    vm.map_with_entries(entries)
 }
 
 fn create_map_module(vm: &VM) -> Value {

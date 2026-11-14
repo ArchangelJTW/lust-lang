@@ -19,6 +19,7 @@ pub struct Parser {
     /// Doc comments collected from the current position, waiting to be
     /// attached to the next declaration.
     pending_docs: Vec<String>,
+    pub regex_aliases: Vec<String>,
 }
 
 impl Parser {
@@ -27,6 +28,7 @@ impl Parser {
             tokens,
             current: 0,
             pending_docs: Vec::new(),
+            regex_aliases: Vec::new(),
         }
     }
 
@@ -65,6 +67,7 @@ impl Parser {
             tokens,
             current: 0,
             pending_docs: Vec::new(),
+            regex_aliases: Vec::new(),
         })
     }
 
@@ -139,6 +142,11 @@ impl Parser {
             | TokenKind::Extern => true,
             TokenKind::Identifier
                 if self.current_token().lexeme == "service"
+                    || (self.current_token().lexeme == "schema"
+                        && self.peek_ahead(1).is_some_and(|t| t.kind == TokenKind::Identifier))
+                    || (self.current_token().lexeme == "type"
+                        && self.peek_ahead(1).is_some_and(|t| t.kind == TokenKind::Identifier)
+                        && self.peek_ahead(2).is_some_and(|t| t.kind == TokenKind::Equal))
                     || (self.current_token().lexeme == "export"
                         && self.peek_ahead(1).is_some_and(|t| matches!(t.kind, TokenKind::Use | TokenKind::Function | TokenKind::Struct | TokenKind::Enum)))
                     || self.is_test_or_suite_start() =>
@@ -149,7 +157,10 @@ impl Parser {
                 matches!(
                     t.kind,
                     TokenKind::Function | TokenKind::Struct | TokenKind::Enum | TokenKind::Trait
-                ) || (t.kind == TokenKind::Identifier && t.lexeme == "service")
+                ) || (t.kind == TokenKind::Identifier
+                    && (t.lexeme == "service"
+                        || (t.lexeme == "schema"
+                            && self.peek_ahead(2).is_some_and(|t2| t2.kind == TokenKind::Identifier))))
             }),
             _ => false,
         }

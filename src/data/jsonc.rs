@@ -104,6 +104,7 @@ pub enum JsoncError {
     MaxBytesExceeded(usize),
     Json(JsonError),
     UnsupportedFeature(&'static str),
+    Budget(crate::data::BudgetError),
 }
 
 impl fmt::Display for JsoncError {
@@ -151,11 +152,18 @@ impl fmt::Display for JsoncError {
             JsoncError::UnsupportedFeature(feat) => {
                 write!(f, "Unsupported JSONC feature: {}", feat)
             }
+            JsoncError::Budget(err) => write!(f, "{}", err),
         }
     }
 }
 
 impl std::error::Error for JsoncError {}
+
+impl From<crate::data::BudgetError> for JsoncError {
+    fn from(err: crate::data::BudgetError) -> Self {
+        JsoncError::Budget(err)
+    }
+}
 
 impl From<JsonError> for JsoncError {
     fn from(err: JsonError) -> Self {
@@ -957,14 +965,438 @@ pub fn from_slice_with_limits(
 }
 
 // ---------------------------------------------------------------------------
-// Optional CST support (feature = "jsonc_cst", off by default)
+// CST Trivia and Concrete Syntax Tree (D-CST, RFC §2, WBS 12C-02)
 // ---------------------------------------------------------------------------
+
+/// Kinds of trivia spans recognized in the CST representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriviaKind {
+    Whitespace,
+    LineComment,
+    BlockComment,
+    TrailingComma,
+}
+
+/// A trivia span preserving whitespace, comments, or trailing commas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TriviaSpan {
+    pub kind: TriviaKind,
+    pub span: Span,
+}
+
+impl TriviaSpan {
+    pub fn new(kind: TriviaKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+}
+
+/// An entry within a CST object node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CstObjectEntry {
+    pub leading_trivia: Vec<TriviaSpan>,
+    pub key: JsoncToken,
+    pub colon_trivia: Vec<TriviaSpan>,
+    pub colon: Span,
+    pub value: CstNode,
+    pub comma: Option<Span>,
+    pub trailing_trivia: Vec<TriviaSpan>,
+}
+
+/// An element within a CST array node.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CstElement {
+    pub leading_trivia: Vec<TriviaSpan>,
+    pub value: CstNode,
+    pub comma: Option<Span>,
+    pub trailing_trivia: Vec<TriviaSpan>,
+}
+
+/// A node in the JSONC Concrete Syntax Tree.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CstNode {
+    Object {
+        open_brace: Span,
+        entries: Vec<CstObjectEntry>,
+        close_brace: Span,
+        leading_trivia: Vec<TriviaSpan>,
+        trailing_trivia: Vec<TriviaSpan>,
+    },
+    Array {
+        open_bracket: Span,
+        elements: Vec<CstElement>,
+        close_bracket: Span,
+        leading_trivia: Vec<TriviaSpan>,
+        trailing_trivia: Vec<TriviaSpan>,
+    },
+    Scalar {
+        token: JsoncToken,
+        leading_trivia: Vec<TriviaSpan>,
+        trailing_trivia: Vec<TriviaSpan>,
+    },
+}
+
+/// Concrete Syntax Tree document with full trivia preservation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsoncCstDocument {
+    pub source: std::sync::Arc<[u8]>,
+    pub root: CstNode,
+    pub eof_trivia: Vec<TriviaSpan>,
+}
+
+impl JsoncCstDocument {
+    pub fn emit_preserving(&self) -> Result<Vec<u8>, JsoncError> {
+        let mut out = Vec::with_capacity(self.source.len());
+        Self::emit_node(&self.root, &self.source, &mut out);
+        for t in &self.eof_trivia {
+            out.extend_from_slice(&self.source[t.span.start..t.span.end]);
+        }
+        if out.len() != self.source.len() || out[..] != self.source[..] {
+            return Err(JsoncError::Json(crate::data::json::JsonError::Io(
+                format!("CST byte mismatch: emitted {} bytes, expected {}", out.len(), self.source.len()),
+            )));
+        }
+        Ok(out)
+    }
+
+    fn emit_node(node: &CstNode, source: &[u8], out: &mut Vec<u8>) {
+        match node {
+            CstNode::Object {
+                open_brace,
+                entries,
+                close_brace,
+                leading_trivia,
+                trailing_trivia,
+            } => {
+                for t in leading_trivia {
+                    out.extend_from_slice(&source[t.span.start..t.span.end]);
+                }
+                out.extend_from_slice(&source[open_brace.start..open_brace.end]);
+                if entries.is_empty() {
+                    for t in trailing_trivia {
+                        out.extend_from_slice(&source[t.span.start..t.span.end]);
+                    }
+                    out.extend_from_slice(&source[close_brace.start..close_brace.end]);
+                } else {
+                    for entry in entries {
+                        for t in &entry.leading_trivia {
+                            out.extend_from_slice(&source[t.span.start..t.span.end]);
+                        }
+                        out.extend_from_slice(&source[entry.key.span.start..entry.key.span.end]);
+                        for t in &entry.colon_trivia {
+                            out.extend_from_slice(&source[t.span.start..t.span.end]);
+                        }
+                        out.extend_from_slice(&source[entry.colon.start..entry.colon.end]);
+                        Self::emit_node(&entry.value, source, out);
+                        if let Some(comma) = entry.comma {
+                            out.extend_from_slice(&source[comma.start..comma.end]);
+                        }
+                        for t in &entry.trailing_trivia {
+                            out.extend_from_slice(&source[t.span.start..t.span.end]);
+                        }
+                    }
+                    out.extend_from_slice(&source[close_brace.start..close_brace.end]);
+                    for t in trailing_trivia {
+                        out.extend_from_slice(&source[t.span.start..t.span.end]);
+                    }
+                }
+            }
+            CstNode::Array {
+                open_bracket,
+                elements,
+                close_bracket,
+                leading_trivia,
+                trailing_trivia,
+            } => {
+                for t in leading_trivia {
+                    out.extend_from_slice(&source[t.span.start..t.span.end]);
+                }
+                out.extend_from_slice(&source[open_bracket.start..open_bracket.end]);
+                if elements.is_empty() {
+                    for t in trailing_trivia {
+                        out.extend_from_slice(&source[t.span.start..t.span.end]);
+                    }
+                    out.extend_from_slice(&source[close_bracket.start..close_bracket.end]);
+                } else {
+                    for elem in elements {
+                        for t in &elem.leading_trivia {
+                            out.extend_from_slice(&source[t.span.start..t.span.end]);
+                        }
+                        Self::emit_node(&elem.value, source, out);
+                        if let Some(comma) = elem.comma {
+                            out.extend_from_slice(&source[comma.start..comma.end]);
+                        }
+                        for t in &elem.trailing_trivia {
+                            out.extend_from_slice(&source[t.span.start..t.span.end]);
+                        }
+                    }
+                    out.extend_from_slice(&source[close_bracket.start..close_bracket.end]);
+                    for t in trailing_trivia {
+                        out.extend_from_slice(&source[t.span.start..t.span.end]);
+                    }
+                }
+            }
+            CstNode::Scalar {
+                token,
+                leading_trivia,
+                trailing_trivia,
+            } => {
+                for t in leading_trivia {
+                    out.extend_from_slice(&source[t.span.start..t.span.end]);
+                }
+                out.extend_from_slice(&source[token.span.start..token.span.end]);
+                for t in trailing_trivia {
+                    out.extend_from_slice(&source[t.span.start..t.span.end]);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "jsonc_cst")]
+struct CstParser<'a> {
+    tokens: Vec<JsoncToken>,
+    pos: usize,
+    budget: &'a mut crate::data::BudgetTracker,
+}
+
+#[cfg(feature = "jsonc_cst")]
+impl<'a> CstParser<'a> {
+    fn is_trivia(kind: TokenKind) -> bool {
+        matches!(
+            kind,
+            TokenKind::Whitespace | TokenKind::LineComment | TokenKind::BlockComment
+        )
+    }
+
+    fn to_trivia_kind(kind: TokenKind) -> TriviaKind {
+        match kind {
+            TokenKind::Whitespace => TriviaKind::Whitespace,
+            TokenKind::LineComment => TriviaKind::LineComment,
+            TokenKind::BlockComment => TriviaKind::BlockComment,
+            _ => TriviaKind::Whitespace,
+        }
+    }
+
+    fn take_trivia(&mut self) -> Result<Vec<TriviaSpan>, JsoncError> {
+        let mut trivia = Vec::new();
+        while self.pos < self.tokens.len() && Self::is_trivia(self.tokens[self.pos].kind) {
+            let tok = self.tokens[self.pos];
+            self.budget.charge_bytes(std::mem::size_of::<TriviaSpan>())?;
+            trivia.push(TriviaSpan::new(Self::to_trivia_kind(tok.kind), tok.span));
+            self.pos += 1;
+        }
+        Ok(trivia)
+    }
+
+    fn peek_non_trivia(&self) -> Option<TokenKind> {
+        let mut idx = self.pos;
+        while idx < self.tokens.len() {
+            if !Self::is_trivia(self.tokens[idx].kind) {
+                return Some(self.tokens[idx].kind);
+            }
+            idx += 1;
+        }
+        None
+    }
+
+    fn parse_node(&mut self) -> Result<CstNode, JsoncError> {
+        let leading_trivia = self.take_trivia()?;
+        if self.pos >= self.tokens.len() {
+            return Err(JsoncError::UnexpectedEof);
+        }
+
+        let tok = self.tokens[self.pos];
+        match tok.kind {
+            TokenKind::LeftBrace => {
+                let open_brace = tok.span;
+                self.pos += 1;
+                let mut entries: Vec<CstObjectEntry> = Vec::new();
+                let mut trailing_trivia = Vec::new();
+
+                loop {
+                    let before_item = self.take_trivia()?;
+                    if self.pos >= self.tokens.len() {
+                        return Err(JsoncError::UnexpectedEof);
+                    }
+                    if self.tokens[self.pos].kind == TokenKind::RightBrace {
+                        if entries.is_empty() {
+                            trailing_trivia.extend(before_item);
+                        } else {
+                            entries.last_mut().unwrap().trailing_trivia.extend(before_item);
+                        }
+                        break;
+                    }
+
+                    // Key must be string
+                    let key = self.tokens[self.pos];
+                    self.pos += 1;
+
+                    // Trivia before colon
+                    let colon_trivia = self.take_trivia()?;
+                    if self.pos >= self.tokens.len() || self.tokens[self.pos].kind != TokenKind::Colon {
+                        return Err(JsoncError::UnexpectedToken(self.pos));
+                    }
+                    let colon = self.tokens[self.pos].span;
+                    self.pos += 1;
+
+                    // Parse value
+                    let val_node = self.parse_node()?;
+
+                    // Trivia between value and comma/close
+                    let mut entry_trailing = self.take_trivia()?;
+
+                    let mut comma = None;
+                    if self.pos < self.tokens.len() && self.tokens[self.pos].kind == TokenKind::Comma {
+                        let comma_tok = self.tokens[self.pos];
+                        self.pos += 1;
+
+                        // Check if this comma is a trailing comma (next non-trivia is RightBrace)
+                        if self.peek_non_trivia() == Some(TokenKind::RightBrace) {
+                            self.budget.charge_bytes(std::mem::size_of::<TriviaSpan>())?;
+                            entry_trailing.push(TriviaSpan::new(TriviaKind::TrailingComma, comma_tok.span));
+                        } else {
+                            comma = Some(comma_tok.span);
+                        }
+
+                        let post_comma_trivia = self.take_trivia()?;
+                        entry_trailing.extend(post_comma_trivia);
+                    }
+
+                    self.budget.charge_bytes(std::mem::size_of::<CstObjectEntry>())?;
+                    entries.push(CstObjectEntry {
+                        leading_trivia: before_item,
+                        key,
+                        colon_trivia,
+                        colon,
+                        value: val_node,
+                        comma,
+                        trailing_trivia: entry_trailing,
+                    });
+                }
+
+                let close_brace = self.tokens[self.pos].span;
+                self.pos += 1;
+
+                self.budget.charge_bytes(std::mem::size_of::<CstNode>())?;
+                Ok(CstNode::Object {
+                    open_brace,
+                    entries,
+                    close_brace,
+                    leading_trivia,
+                    trailing_trivia,
+                })
+            }
+            TokenKind::LeftBracket => {
+                let open_bracket = tok.span;
+                self.pos += 1;
+                let mut elements: Vec<CstElement> = Vec::new();
+                let mut trailing_trivia = Vec::new();
+
+                loop {
+                    let before_item = self.take_trivia()?;
+                    if self.pos >= self.tokens.len() {
+                        return Err(JsoncError::UnexpectedEof);
+                    }
+                    if self.tokens[self.pos].kind == TokenKind::RightBracket {
+                        if elements.is_empty() {
+                            trailing_trivia.extend(before_item);
+                        } else {
+                            elements.last_mut().unwrap().trailing_trivia.extend(before_item);
+                        }
+                        break;
+                    }
+
+                    let val_node = self.parse_node_with_leading(before_item)?;
+
+                    let mut elem_trailing = self.take_trivia()?;
+
+                    let mut comma = None;
+                    if self.pos < self.tokens.len() && self.tokens[self.pos].kind == TokenKind::Comma {
+                        let comma_tok = self.tokens[self.pos];
+                        self.pos += 1;
+
+                        if self.peek_non_trivia() == Some(TokenKind::RightBracket) {
+                            self.budget.charge_bytes(std::mem::size_of::<TriviaSpan>())?;
+                            elem_trailing.push(TriviaSpan::new(TriviaKind::TrailingComma, comma_tok.span));
+                        } else {
+                            comma = Some(comma_tok.span);
+                        }
+
+                        let post_comma_trivia = self.take_trivia()?;
+                        elem_trailing.extend(post_comma_trivia);
+                    }
+
+                    self.budget.charge_bytes(std::mem::size_of::<CstElement>())?;
+                    elements.push(CstElement {
+                        leading_trivia: Vec::new(),
+                        value: val_node,
+                        comma,
+                        trailing_trivia: elem_trailing,
+                    });
+                }
+
+                let close_bracket = self.tokens[self.pos].span;
+                self.pos += 1;
+
+                self.budget.charge_bytes(std::mem::size_of::<CstNode>())?;
+                Ok(CstNode::Array {
+                    open_bracket,
+                    elements,
+                    close_bracket,
+                    leading_trivia,
+                    trailing_trivia,
+                })
+            }
+            _ => {
+                self.pos += 1;
+                self.budget.charge_bytes(std::mem::size_of::<CstNode>())?;
+                Ok(CstNode::Scalar {
+                    token: tok,
+                    leading_trivia,
+                    trailing_trivia: Vec::new(),
+                })
+            }
+        }
+    }
+
+    fn parse_node_with_leading(&mut self, leading: Vec<TriviaSpan>) -> Result<CstNode, JsoncError> {
+        if self.pos >= self.tokens.len() {
+            return Err(JsoncError::UnexpectedEof);
+        }
+        let tok = self.tokens[self.pos];
+        match tok.kind {
+            TokenKind::LeftBrace | TokenKind::LeftBracket => {
+                let mut node = self.parse_node()?;
+                match &mut node {
+                    CstNode::Object { leading_trivia, .. }
+                    | CstNode::Array { leading_trivia, .. }
+                    | CstNode::Scalar { leading_trivia, .. } => {
+                        let mut combined = leading;
+                        combined.append(leading_trivia);
+                        *leading_trivia = combined;
+                    }
+                }
+                Ok(node)
+            }
+            _ => {
+                self.pos += 1;
+                self.budget.charge_bytes(std::mem::size_of::<CstNode>())?;
+                Ok(CstNode::Scalar {
+                    token: tok,
+                    leading_trivia: leading,
+                    trailing_trivia: Vec::new(),
+                })
+            }
+        }
+    }
+}
 
 #[cfg(feature = "jsonc_cst")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct JsoncDocument {
     pub raw: Vec<u8>,
     pub tokens: Vec<JsoncToken>,
+    pub cst: JsoncCstDocument,
 }
 
 #[cfg(not(feature = "jsonc_cst"))]
@@ -978,9 +1410,9 @@ pub struct JsoncDocument {
 /// Feature-gated via `jsonc_cst`. When the feature is disabled, returns `UnsupportedFeature`.
 #[cfg(feature = "jsonc_cst")]
 pub fn parse_preserving(bytes: &[u8]) -> Result<JsoncDocument, JsoncError> {
-    // Validate JSONC semantics first
-    let _ = from_slice(bytes)?;
-
+    let arc: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
+    let mut budget = crate::data::BudgetTracker::new(67_108_864, 1_000_000, 256);
+    let cst = parse_cst_with_budget(arc, &mut budget)?;
     let mut scanner = JsoncScanner::new(bytes);
     let mut tokens = Vec::new();
     while let Some(tok) = scanner.next_token()? {
@@ -989,6 +1421,7 @@ pub fn parse_preserving(bytes: &[u8]) -> Result<JsoncDocument, JsoncError> {
     Ok(JsoncDocument {
         raw: bytes.to_vec(),
         tokens,
+        cst,
     })
 }
 
@@ -1004,11 +1437,56 @@ pub fn parse_preserving(_bytes: &[u8]) -> Result<JsoncDocument, JsoncError> {
 /// Feature-gated via `jsonc_cst`. When the feature is disabled, returns `UnsupportedFeature`.
 #[cfg(feature = "jsonc_cst")]
 pub fn emit_preserving(doc: &JsoncDocument) -> Result<Vec<u8>, JsoncError> {
-    Ok(doc.raw.clone())
+    doc.cst.emit_preserving()
 }
 
 #[cfg(not(feature = "jsonc_cst"))]
 pub fn emit_preserving(_doc: &JsoncDocument) -> Result<Vec<u8>, JsoncError> {
+    Err(JsoncError::UnsupportedFeature(
+        "Optional CST feature 'jsonc_cst' is disabled",
+    ))
+}
+
+/// Parse CST document with deterministic resource budget charging (Gate-SCHEMA-07, DS-39).
+///
+/// Charges `BudgetTracker::alloc_bytes` for every `TriviaSpan`, `CstObjectEntry`, `CstElement`, and `CstNode`.
+#[cfg(feature = "jsonc_cst")]
+pub fn parse_cst_with_budget(
+    input: std::sync::Arc<[u8]>,
+    budget: &mut crate::data::BudgetTracker,
+) -> Result<JsoncCstDocument, JsoncError> {
+    // 1. Validate JSONC semantics first (reject duplicate keys, invalid syntax, etc.)
+    let _ = from_slice(&input)?;
+
+    // 2. Scan all tokens
+    let mut scanner = JsoncScanner::new(&input);
+    let mut tokens = Vec::new();
+    while let Some(tok) = scanner.next_token()? {
+        tokens.push(tok);
+    }
+
+    // 3. Parse into CST charging budget
+    let mut parser = CstParser {
+        tokens,
+        pos: 0,
+        budget,
+    };
+
+    let root = parser.parse_node()?;
+    let eof_trivia = parser.take_trivia()?;
+
+    Ok(JsoncCstDocument {
+        source: input,
+        root,
+        eof_trivia,
+    })
+}
+
+#[cfg(not(feature = "jsonc_cst"))]
+pub fn parse_cst_with_budget(
+    _input: std::sync::Arc<[u8]>,
+    _budget: &mut crate::data::BudgetTracker,
+) -> Result<JsoncCstDocument, JsoncError> {
     Err(JsoncError::UnsupportedFeature(
         "Optional CST feature 'jsonc_cst' is disabled",
     ))
@@ -1028,5 +1506,10 @@ impl JsoncDocument {
     #[cfg(feature = "jsonc_cst")]
     pub fn tokens(&self) -> &[JsoncToken] {
         &self.tokens
+    }
+
+    #[cfg(feature = "jsonc_cst")]
+    pub fn cst(&self) -> &JsoncCstDocument {
+        &self.cst
     }
 }

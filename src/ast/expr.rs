@@ -126,6 +126,10 @@ pub enum ExprKind {
         end: Box<Expr>,
         inclusive: bool,
     },
+    RegexLiteral {
+        pattern: String,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

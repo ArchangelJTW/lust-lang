@@ -21,7 +21,10 @@
 pub mod binding;
 pub mod builder;
 pub mod error;
+pub mod interop;
 pub mod ir;
+pub mod pattern;
+pub mod pipeline;
 pub mod validate;
 
 pub use binding::{
@@ -29,8 +32,14 @@ pub use binding::{
     derive_schema_from_struct_def, DeriveSchemaTarget, StructSchemaBinding, StructSchemaBuilder,
 };
 pub use builder::{s, ArrayBuilder, BinaryBuilder, FloatBuilder, IntBuilder, ObjectBuilder, Schema, StringBuilder};
-pub use error::{ValidationError, ValidationErrors};
+pub use error::{ValidationError, ValidationErrorKind, ValidationErrors};
+pub use interop::{
+    as_json_schema_portable, export_json_schema_projection, schema_from_json_schema, to_json_schema,
+    ExportOptions, ImportOptions, JsonSchemaDialect, JsonSchemaPortable, OmittedConstraint,
+    ProjectionMode, SchemaExportError, SchemaImportError, SchemaProjection,
+};
 pub use ir::{ObjectFieldIR, RefinePredicate, SchemaIR, TransformFn};
+pub use pattern::{export_regex_pattern, import_regex_pattern, matches_full, matches_pattern, matches_search, PatternMode};
 pub use crate::effect_abi::{Cause, Exit};
 
 /// Effect representation for schema validation returning Exit<T, E> with requirements R

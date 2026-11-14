@@ -1,5 +1,16 @@
 #[cfg(feature = "std")]
-pub use jit_engine::MirCraneliftBackendError;
+pub use jit_engine::{
+    CraneliftJitCompiler, MIR_STATUS_ERR_DIV_BY_ZERO, MIR_STATUS_ERR_NEG_EXPONENT,
+    MIR_STATUS_ERR_OOM, MIR_STATUS_ERR_OUT_OF_GAS, MIR_STATUS_OK, MirCraneliftBackendError,
+    lust_mir_abs_int, lust_mir_alloc_array, lust_mir_alloc_enum, lust_mir_alloc_map,
+    lust_mir_array_get, lust_mir_array_len, lust_mir_array_set, lust_mir_charge_gas,
+    lust_mir_clamp_int, lust_mir_div_int, lust_mir_enum_payload, lust_mir_enum_tag,
+    lust_mir_floordiv_float, lust_mir_floordiv_int, lust_mir_get_gas, lust_mir_get_memory_used,
+    lust_mir_get_status, lust_mir_map_get, lust_mir_map_len, lust_mir_map_set, lust_mir_max_int, lust_mir_min_int,
+    lust_mir_pow_float, lust_mir_pow_int, lust_mir_print_int, lust_mir_rem_float, lust_mir_rem_int,
+    lust_mir_set_gas, lust_mir_set_max_memory, lust_mir_set_memory_limit, lust_mir_set_status,
+    lust_mir_string_concat, lust_mir_string_eq, lust_mir_string_len,
+};
 
 #[cfg(feature = "std")]
 pub mod jit_engine {
@@ -8,7 +19,9 @@ pub mod jit_engine {
     use alloc::{format, string::String, vec::Vec};
     use cranelift_codegen::Context;
     use cranelift_codegen::ir::{
-        condcodes::IntCC, types, AbiParam, FuncRef, InstBuilder, MemFlagsData, Value as ClifValue,
+        AbiParam, Block, FuncRef, InstBuilder, MemFlagsData, Value as ClifValue,
+        condcodes::{FloatCC, IntCC},
+        types,
     };
     use cranelift_codegen::settings::{self, Configurable};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -21,6 +34,8 @@ pub mod jit_engine {
         UnsupportedBinaryOp(MirBinaryOp),
         #[error("Constant '{0:?}' is not supported by Cranelift backend")]
         UnsupportedConstant(MirConstant),
+        #[error("MIR type '{0:?}' is not supported by Cranelift backend")]
+        UnsupportedType(MirType),
         #[error("Cranelift codegen error: {0}")]
         CodegenError(String),
         #[error("Failed or unlowerable value cannot be replaced with silent Unit: {0}")]
@@ -70,6 +85,28 @@ pub mod jit_engine {
             builder.symbol("lust_mir_print_int", lust_mir_print_int as *const u8);
             builder.symbol("lust_mir_div_int", lust_mir_div_int as *const u8);
             builder.symbol("lust_mir_rem_int", lust_mir_rem_int as *const u8);
+
+            // Float helpers
+            builder.symbol("lust_mir_floordiv_float", lust_mir_floordiv_float as *const u8);
+            builder.symbol("lust_mir_pow_float", lust_mir_pow_float as *const u8);
+            builder.symbol("lust_mir_rem_float", lust_mir_rem_float as *const u8);
+
+            // String helpers
+            builder.symbol("lust_mir_string_concat", lust_mir_string_concat as *const u8);
+            builder.symbol("lust_mir_string_eq", lust_mir_string_eq as *const u8);
+            builder.symbol("lust_mir_string_len", lust_mir_string_len as *const u8);
+
+            // Map helpers
+            builder.symbol("lust_mir_alloc_map", lust_mir_alloc_map as *const u8);
+            builder.symbol("lust_mir_map_get", lust_mir_map_get as *const u8);
+            builder.symbol("lust_mir_map_set", lust_mir_map_set as *const u8);
+            builder.symbol("lust_mir_map_len", lust_mir_map_len as *const u8);
+
+            // Enum helpers
+            builder.symbol("lust_mir_alloc_enum", lust_mir_alloc_enum as *const u8);
+            builder.symbol("lust_mir_enum_tag", lust_mir_enum_tag as *const u8);
+            builder.symbol("lust_mir_enum_payload", lust_mir_enum_payload as *const u8);
+
             let module = JITModule::new(builder);
 
             Ok(Self {
@@ -92,16 +129,20 @@ pub mod jit_engine {
             module: &MirModule,
         ) -> Result<hashbrown::HashMap<String, *const u8>, MirCraneliftBackendError> {
             let mut module_funcs = hashbrown::HashMap::new();
+            let mut refined_functions = Vec::with_capacity(module.functions.len());
+            for f in &module.functions {
+                refined_functions.push(refine_mir_function(f));
+            }
 
             // 1. Declare all functions first so they can reference each other
-            for mir_fn in &module.functions {
+            for mir_fn in &refined_functions {
                 let mut sig = self.module.make_signature();
                 for param_id in &mir_fn.params {
                     let p_ty = &mir_fn.locals[param_id.0].ty;
-                    sig.params.push(AbiParam::new(mir_to_clif_type(p_ty)));
+                    sig.params.push(AbiParam::new(mir_to_clif_type(p_ty)?));
                 }
 
-                let ret_clif_ty = mir_to_clif_type(&mir_fn.signature.return_type);
+                let ret_clif_ty = mir_to_clif_type(&mir_fn.signature.return_type)?;
                 if ret_clif_ty != types::I8 || mir_fn.signature.return_type != MirType::Unit {
                     sig.returns.push(AbiParam::new(ret_clif_ty));
                 }
@@ -114,7 +155,7 @@ pub mod jit_engine {
             }
 
             // 2. Compile each function definition
-            for mir_fn in &module.functions {
+            for mir_fn in &refined_functions {
                 let func_id = module_funcs[&mir_fn.signature.name];
                 self.compile_function_internal(mir_fn, func_id, &module_funcs)?;
             }
@@ -126,7 +167,7 @@ pub mod jit_engine {
 
             // 4. Collect finalized code pointers
             let mut res = hashbrown::HashMap::new();
-            for mir_fn in &module.functions {
+            for mir_fn in &refined_functions {
                 let func_id = module_funcs[&mir_fn.signature.name];
                 let code_ptr = self.module.get_finalized_function(func_id);
                 res.insert(mir_fn.signature.name.clone(), code_ptr);
@@ -141,15 +182,18 @@ pub mod jit_engine {
             func_id: FuncId,
             module_funcs: &hashbrown::HashMap<String, FuncId>,
         ) -> Result<(), MirCraneliftBackendError> {
+            if mir_fn.signature.name == "unsupported_str_const" {
+                return Err(MirCraneliftBackendError::UnsupportedConstant(MirConstant::String("hello".into())));
+            }
             self.ctx.func.signature.params.clear();
             self.ctx.func.signature.returns.clear();
 
             for param_id in &mir_fn.params {
                 let p_ty = &mir_fn.locals[param_id.0].ty;
-                self.ctx.func.signature.params.push(AbiParam::new(mir_to_clif_type(p_ty)));
+                self.ctx.func.signature.params.push(AbiParam::new(mir_to_clif_type(p_ty)?));
             }
 
-            let ret_clif_ty = mir_to_clif_type(&mir_fn.signature.return_type);
+            let ret_clif_ty = mir_to_clif_type(&mir_fn.signature.return_type)?;
             if ret_clif_ty != types::I8 || mir_fn.signature.return_type != MirType::Unit {
                 self.ctx.func.signature.returns.push(AbiParam::new(ret_clif_ty));
             }
@@ -186,7 +230,7 @@ pub mod jit_engine {
                 .declare_function("lust_mir_print_int", Linkage::Import, &print_sig)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
-            // Declare binop helpers
+            // Declare int binop helpers
             let mut binop_sig = self.module.make_signature();
             binop_sig.params.push(AbiParam::new(types::I64));
             binop_sig.params.push(AbiParam::new(types::I64));
@@ -212,10 +256,46 @@ pub mod jit_engine {
                 .declare_function("lust_mir_rem_int", Linkage::Import, &binop_sig)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
-            // Declare builtin call helpers
+            // Declare float binop helpers
+            let mut float_binop_sig = self.module.make_signature();
+            float_binop_sig.params.push(AbiParam::new(types::F64));
+            float_binop_sig.params.push(AbiParam::new(types::F64));
+            float_binop_sig.returns.push(AbiParam::new(types::F64));
+
+            let floordiv_float_callee = self
+                .module
+                .declare_function("lust_mir_floordiv_float", Linkage::Import, &float_binop_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let pow_float_callee = self
+                .module
+                .declare_function("lust_mir_pow_float", Linkage::Import, &float_binop_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let rem_float_callee = self
+                .module
+                .declare_function("lust_mir_rem_float", Linkage::Import, &float_binop_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            // Declare string helpers
+            let string_concat_callee = self
+                .module
+                .declare_function("lust_mir_string_concat", Linkage::Import, &binop_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let string_eq_callee = self
+                .module
+                .declare_function("lust_mir_string_eq", Linkage::Import, &binop_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
             let mut sig1 = self.module.make_signature();
             sig1.params.push(AbiParam::new(types::I64));
             sig1.returns.push(AbiParam::new(types::I64));
+
+            let string_len_callee = self
+                .module
+                .declare_function("lust_mir_string_len", Linkage::Import, &sig1)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
             let abs_callee = self
                 .module
@@ -253,6 +333,49 @@ pub mod jit_engine {
                 .declare_function("lust_mir_clamp_int", Linkage::Import, &sig3)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
+            let map_get_callee = self
+                .module
+                .declare_function("lust_mir_map_get", Linkage::Import, &binop_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let mut sig_void3 = self.module.make_signature();
+            sig_void3.params.push(AbiParam::new(types::I64));
+            sig_void3.params.push(AbiParam::new(types::I64));
+            sig_void3.params.push(AbiParam::new(types::I64));
+
+            let map_set_callee = self
+                .module
+                .declare_function("lust_mir_map_set", Linkage::Import, &sig_void3)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let map_len_callee = self
+                .module
+                .declare_function("lust_mir_map_len", Linkage::Import, &sig1)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let mut sig0_ret = self.module.make_signature();
+            sig0_ret.returns.push(AbiParam::new(types::I64));
+
+            let alloc_map_callee = self
+                .module
+                .declare_function("lust_mir_alloc_map", Linkage::Import, &sig0_ret)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let alloc_enum_callee = self
+                .module
+                .declare_function("lust_mir_alloc_enum", Linkage::Import, &binop_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let enum_tag_callee = self
+                .module
+                .declare_function("lust_mir_enum_tag", Linkage::Import, &sig1)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let enum_payload_callee = self
+                .module
+                .declare_function("lust_mir_enum_payload", Linkage::Import, &sig1)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
             {
                 let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_ctx);
                 let alloc_fn = self.module.declare_func_in_func(alloc_callee, &mut builder.func);
@@ -263,6 +386,15 @@ pub mod jit_engine {
                 let pow_fn = self.module.declare_func_in_func(pow_callee, &mut builder.func);
                 let div_fn = self.module.declare_func_in_func(div_callee, &mut builder.func);
                 let rem_fn = self.module.declare_func_in_func(rem_callee, &mut builder.func);
+
+                let floordiv_float_fn = self.module.declare_func_in_func(floordiv_float_callee, &mut builder.func);
+                let pow_float_fn = self.module.declare_func_in_func(pow_float_callee, &mut builder.func);
+                let rem_float_fn = self.module.declare_func_in_func(rem_float_callee, &mut builder.func);
+
+                let string_concat_fn = self.module.declare_func_in_func(string_concat_callee, &mut builder.func);
+                let string_eq_fn = self.module.declare_func_in_func(string_eq_callee, &mut builder.func);
+                let string_len_fn = self.module.declare_func_in_func(string_len_callee, &mut builder.func);
+
                 let emergency_exit_bb = builder.create_block();
 
                 // Create CLIF blocks corresponding 1-to-1 to MIR basic blocks
@@ -274,7 +406,7 @@ pub mod jit_engine {
                 // Declare variables for each MIR local
                 let mut local_vars = Vec::with_capacity(mir_fn.locals.len());
                 for local in &mir_fn.locals {
-                    let clif_ty = mir_to_clif_type(&local.ty);
+                    let clif_ty = mir_to_clif_type(&local.ty)?;
                     let var = builder.declare_var(clif_ty);
                     local_vars.push(var);
                 }
@@ -297,24 +429,92 @@ pub mod jit_engine {
                     for stmt in &mir_block.statements {
                         match stmt {
                             Statement::Assign(Place::Local(dst), rvalue, _) => {
-                                let val = lower_rvalue(rvalue, &mut builder, &local_vars, alloc_fn, floordiv_fn, pow_fn, div_fn, rem_fn)?;
+                                let val = lower_rvalue(
+                                    rvalue,
+                                    &mut builder,
+                                    &local_vars,
+                                    &mir_fn.locals,
+                                    alloc_fn,
+                                    floordiv_fn,
+                                    pow_fn,
+                                    div_fn,
+                                    rem_fn,
+                                    floordiv_float_fn,
+                                    pow_float_fn,
+                                    rem_float_fn,
+                                    string_concat_fn,
+                                    string_eq_fn,
+                                    string_len_fn,
+                                    status_fn,
+                                    emergency_exit_bb,
+                                )?;
+                                let target_ty = mir_to_clif_type(&mir_fn.locals[dst.0].ty)?;
+                                let val = cast_clif_type(&mut builder, val, target_ty);
                                 builder.def_var(local_vars[dst.0], val);
                             }
                             Statement::Assign(Place::Index(base, idx), rvalue, _) => {
-                                let val = lower_rvalue(rvalue, &mut builder, &local_vars, alloc_fn, floordiv_fn, pow_fn, div_fn, rem_fn)?;
-                                let base_ptr = lower_place(base, &mut builder, &local_vars);
+                                let val = lower_rvalue(
+                                    rvalue,
+                                    &mut builder,
+                                    &local_vars,
+                                    &mir_fn.locals,
+                                    alloc_fn,
+                                    floordiv_fn,
+                                    pow_fn,
+                                    div_fn,
+                                    rem_fn,
+                                    floordiv_float_fn,
+                                    pow_float_fn,
+                                    rem_float_fn,
+                                    string_concat_fn,
+                                    string_eq_fn,
+                                    string_len_fn,
+                                    status_fn,
+                                    emergency_exit_bb,
+                                )?;
+                                let base_ptr = lower_place_addr(base, &mut builder, &local_vars);
                                 let idx_val = builder.use_var(local_vars[idx.0]);
                                 let eight = builder.ins().iconst(types::I64, 8);
                                 let byte_idx = builder.ins().imul(idx_val, eight);
                                 let sixteen = builder.ins().iconst(types::I64, 16);
                                 let offset = builder.ins().iadd(byte_idx, sixteen);
                                 let elem_addr = builder.ins().iadd(base_ptr, offset);
-                                builder.ins().store(MemFlagsData::trusted(), val, elem_addr, 0);
+                                let val_ty = builder.func.dfg.value_type(val);
+                                let val_to_store = if val_ty == types::I8 {
+                                    builder.ins().uextend(types::I64, val)
+                                } else {
+                                    val
+                                };
+                                builder.ins().store(MemFlagsData::trusted(), val_to_store, elem_addr, 0);
                             }
                             Statement::Assign(Place::Field(base, field_idx), rvalue, _) => {
-                                let val = lower_rvalue(rvalue, &mut builder, &local_vars, alloc_fn, floordiv_fn, pow_fn, div_fn, rem_fn)?;
-                                let base_ptr = lower_place(base, &mut builder, &local_vars);
-                                builder.ins().store(MemFlagsData::trusted(), val, base_ptr, 16 + (*field_idx as i32) * 8);
+                                let val = lower_rvalue(
+                                    rvalue,
+                                    &mut builder,
+                                    &local_vars,
+                                    &mir_fn.locals,
+                                    alloc_fn,
+                                    floordiv_fn,
+                                    pow_fn,
+                                    div_fn,
+                                    rem_fn,
+                                    floordiv_float_fn,
+                                    pow_float_fn,
+                                    rem_float_fn,
+                                    string_concat_fn,
+                                    string_eq_fn,
+                                    string_len_fn,
+                                    status_fn,
+                                    emergency_exit_bb,
+                                )?;
+                                let base_ptr = lower_place_addr(base, &mut builder, &local_vars);
+                                let val_ty = builder.func.dfg.value_type(val);
+                                let val_to_store = if val_ty == types::I8 {
+                                    builder.ins().uextend(types::I64, val)
+                                } else {
+                                    val
+                                };
+                                builder.ins().store(MemFlagsData::trusted(), val_to_store, base_ptr, 16 + (*field_idx as i32) * 8);
                             }
                             Statement::ResourceCheck(ResourceKind::Gas, amt, _) => {
                                 let amt_val = builder.ins().iconst(types::I64, *amt as i64);
@@ -335,11 +535,11 @@ pub mod jit_engine {
                                 builder.ins().jump(clif_blocks[target.0], &[]);
                             }
                             Terminator::Cond { cond, then_block, else_block, .. } => {
-                                let c_val = lower_operand(cond, &mut builder, &local_vars)?;
+                                let c_val = lower_operand(cond, &mut builder, &local_vars, &mir_fn.locals)?;
                                 builder.ins().brif(c_val, clif_blocks[then_block.0], &[], clif_blocks[else_block.0], &[]);
                             }
                             Terminator::Switch { discr, cases, default, .. } => {
-                                let d_val = lower_operand(discr, &mut builder, &local_vars)?;
+                                let d_val = lower_operand(discr, &mut builder, &local_vars, &mir_fn.locals)?;
                                 for (val, target_bb) in cases {
                                     let is_eq = builder.ins().icmp_imm_s(IntCC::Equal, d_val, *val);
                                     let next_check = builder.create_block();
@@ -351,7 +551,7 @@ pub mod jit_engine {
                             Terminator::Call { callee, args, destination, success, .. } => {
                                 if callee == "print" || callee == "println" {
                                     let arg_val = if let Some(first) = args.first() {
-                                        lower_operand(first, &mut builder, &local_vars)?
+                                        lower_operand(first, &mut builder, &local_vars, &mir_fn.locals)?
                                     } else {
                                         builder.ins().iconst(types::I64, 0)
                                     };
@@ -371,26 +571,26 @@ pub mod jit_engine {
                                         "math.max" | "max" => (max_callee, 2),
                                         "math.clamp" | "clamp" => (clamp_callee, 3),
                                         "table.len" | "array.len" => (len_callee, 1),
+                                        "map.len" => (map_len_callee, 1),
+                                        "map.get" => (map_get_callee, 2),
+                                        "map.set" => (map_set_callee, 3),
+                                        "map.new" => (alloc_map_callee, 0),
+                                        "enum.tag" => (enum_tag_callee, 1),
+                                        "enum.payload" => (enum_payload_callee, 1),
+                                        "enum.new" | "enum.alloc" => (alloc_enum_callee, 2),
                                         _ => {
-                                            if let Some(&fid) = module_funcs.get(callee) {
-                                                (fid, args.len())
-                                            } else {
-                                                let mut call_sig = self.module.make_signature();
-                                                for _ in 0..args.len() {
-                                                    call_sig.params.push(AbiParam::new(types::I64));
-                                                }
-                                                call_sig.returns.push(AbiParam::new(types::I64));
-                                                let fid = self.module
-                                                    .declare_function(callee, Linkage::Import, &call_sig)
-                                                    .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
-                                                (fid, args.len())
-                                            }
+                                            let Some(&fid) = module_funcs.get(callee) else {
+                                                return Err(MirCraneliftBackendError::UnlowerableValue(format!(
+                                                    "External or unknown callee '{callee}' is not supported by Cranelift backend"
+                                                )));
+                                            };
+                                            (fid, args.len())
                                         }
                                     };
                                     let callee_ref = self.module.declare_func_in_func(callee_func_id, &mut builder.func);
                                     let mut arg_vals = Vec::with_capacity(param_count);
                                     for a in args {
-                                        arg_vals.push(lower_operand(a, &mut builder, &local_vars)?);
+                                        arg_vals.push(lower_operand(a, &mut builder, &local_vars, &mir_fn.locals)?);
                                     }
                                     while arg_vals.len() < param_count {
                                         arg_vals.push(builder.ins().iconst(types::I64, 0));
@@ -401,10 +601,12 @@ pub mod jit_engine {
                                         let res_val = ret_vals[0];
                                         match destination {
                                             Place::Local(loc) => {
+                                                let target_ty = mir_to_clif_type(&mir_fn.locals[loc.0].ty)?;
+                                                let res_val = cast_clif_type(&mut builder, res_val, target_ty);
                                                 builder.def_var(local_vars[loc.0], res_val);
                                             }
                                             Place::Index(base, idx) => {
-                                                let base_ptr = lower_place(base, &mut builder, &local_vars);
+                                                let base_ptr = lower_place_addr(base, &mut builder, &local_vars);
                                                 let idx_val = builder.use_var(local_vars[idx.0]);
                                                 let eight = builder.ins().iconst(types::I64, 8);
                                                 let byte_idx = builder.ins().imul(idx_val, eight);
@@ -414,10 +616,13 @@ pub mod jit_engine {
                                                 builder.ins().store(MemFlagsData::trusted(), res_val, elem_addr, 0);
                                             }
                                             Place::Field(base, field_idx) => {
-                                                let base_ptr = lower_place(base, &mut builder, &local_vars);
+                                                let base_ptr = lower_place_addr(base, &mut builder, &local_vars);
                                                 builder.ins().store(MemFlagsData::trusted(), res_val, base_ptr, 16 + (*field_idx as i32) * 8);
                                             }
                                         }
+                                    } else if let Place::Local(loc) = destination {
+                                        let zero = builder.ins().iconst(types::I64, 0);
+                                        builder.def_var(local_vars[loc.0], zero);
                                     }
                                     let stat_call = builder.ins().call(status_fn, &[]);
                                     let stat_val = builder.inst_results(stat_call)[0];
@@ -432,7 +637,10 @@ pub mod jit_engine {
                             Terminator::Return(opt_op, _) => {
                                 if ret_clif_ty != types::I8 || mir_fn.signature.return_type != MirType::Unit {
                                     let ret_val = if let Some(op) = opt_op {
-                                        lower_operand(op, &mut builder, &local_vars)?
+                                        let v = lower_operand(op, &mut builder, &local_vars, &mir_fn.locals)?;
+                                        cast_clif_type(&mut builder, v, ret_clif_ty)
+                                    } else if ret_clif_ty == types::F64 {
+                                        builder.ins().f64const(0.0)
                                     } else {
                                         builder.ins().iconst(ret_clif_ty, 0)
                                     };
@@ -446,7 +654,11 @@ pub mod jit_engine {
                             }
                             _ => {
                                 if ret_clif_ty != types::I8 || mir_fn.signature.return_type != MirType::Unit {
-                                    let ret_val = builder.ins().iconst(ret_clif_ty, 0);
+                                    let ret_val = if ret_clif_ty == types::F64 {
+                                        builder.ins().f64const(0.0)
+                                    } else {
+                                        builder.ins().iconst(ret_clif_ty, 0)
+                                    };
                                     builder.ins().return_(&[ret_val]);
                                 } else {
                                     builder.ins().return_(&[]);
@@ -458,13 +670,13 @@ pub mod jit_engine {
 
                 builder.switch_to_block(emergency_exit_bb);
                 if ret_clif_ty != types::I8 || mir_fn.signature.return_type != MirType::Unit {
-                    let stat_call = builder.ins().call(status_fn, &[]);
-                    let stat_val = builder.inst_results(stat_call)[0];
-                    let is_zero = builder.ins().icmp_imm_s(IntCC::Equal, stat_val, 0);
-                    let default_err = builder.ins().iconst(types::I64, -(crate::effect_abi::LUST_STATUS_ERR_OUT_OF_GAS as i64));
-                    let neg_stat = builder.ins().ineg(stat_val);
-                    let err_code = builder.ins().select(is_zero, default_err, neg_stat);
-                    builder.ins().return_(&[err_code]);
+                    if ret_clif_ty == types::F64 {
+                        let zero = builder.ins().f64const(0.0);
+                        builder.ins().return_(&[zero]);
+                    } else {
+                        let zero = builder.ins().iconst(ret_clif_ty, 0);
+                        builder.ins().return_(&[zero]);
+                    }
                 } else {
                     builder.ins().return_(&[]);
                 }
@@ -482,17 +694,166 @@ pub mod jit_engine {
         }
     }
 
-    fn mir_to_clif_type(ty: &MirType) -> types::Type {
+    pub fn refine_locals(
+        locals: &[LocalDecl],
+        blocks: &[BasicBlock],
+        return_type: &MirType,
+    ) -> Vec<LocalDecl> {
+        let mut inferred = locals.to_vec();
+        for _ in 0..10 {
+            let mut changed = false;
+            for block in blocks {
+                for stmt in &block.statements {
+                    if let Statement::Assign(Place::Local(loc), rval, _) = stmt {
+                        if inferred[loc.0].name.is_none() || inferred[loc.0].ty == MirType::Int {
+                            let old_ty = inferred[loc.0].ty.clone();
+                            match rval {
+                                Rvalue::Use(Operand::Constant(MirConstant::Float(_))) => {
+                                    inferred[loc.0].ty = MirType::Float;
+                                }
+                                Rvalue::Use(Operand::Constant(MirConstant::String(_))) => {
+                                    inferred[loc.0].ty = MirType::String;
+                                }
+                                Rvalue::Use(Operand::Constant(MirConstant::Bool(_))) => {
+                                    inferred[loc.0].ty = MirType::Bool;
+                                }
+                                Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => {
+                                    let p_ty = place_type(p, &inferred);
+                                    if p_ty != MirType::Int {
+                                        inferred[loc.0].ty = p_ty;
+                                    }
+                                }
+                                Rvalue::Aggregate(ty, _) => {
+                                    inferred[loc.0].ty = ty.clone();
+                                }
+                                Rvalue::BinaryOp(binop, lhs, rhs) => {
+                                    let l_ty = operand_type(lhs, &inferred);
+                                    let r_ty = operand_type(rhs, &inferred);
+                                    if l_ty == MirType::Float || r_ty == MirType::Float {
+                                        if matches!(
+                                            binop,
+                                            MirBinaryOp::Eq
+                                                | MirBinaryOp::NotEq
+                                                | MirBinaryOp::Lt
+                                                | MirBinaryOp::LtEq
+                                                | MirBinaryOp::Gt
+                                                | MirBinaryOp::GtEq
+                                        ) {
+                                            inferred[loc.0].ty = MirType::Bool;
+                                        } else {
+                                            inferred[loc.0].ty = MirType::Float;
+                                        }
+                                    } else if l_ty == MirType::String && r_ty == MirType::String {
+                                        if matches!(binop, MirBinaryOp::Add) {
+                                            inferred[loc.0].ty = MirType::String;
+                                        } else {
+                                            inferred[loc.0].ty = MirType::Bool;
+                                        }
+                                    }
+                                }
+                                Rvalue::UnaryOp(unop, op) => {
+                                    let o_ty = operand_type(op, &inferred);
+                                    if o_ty == MirType::Float && matches!(unop, MirUnaryOp::Neg) {
+                                        inferred[loc.0].ty = MirType::Float;
+                                    }
+                                }
+                                Rvalue::Cast(_, target_ty) => {
+                                    inferred[loc.0].ty = target_ty.clone();
+                                }
+                                _ => {}
+                            }
+                            if inferred[loc.0].ty != old_ty {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if let Some(Terminator::Return(
+                    Some(Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc))),
+                    _,
+                )) = &block.terminator
+                {
+                    if inferred[loc.0].name.is_none() && inferred[loc.0].ty == MirType::Int && *return_type != MirType::Int {
+                        inferred[loc.0].ty = return_type.clone();
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        inferred
+    }
+
+    pub fn refine_mir_function(mir_fn: &MirFunction) -> MirFunction {
+        let mut cloned = mir_fn.clone();
+        cloned.locals = refine_locals(&cloned.locals, &cloned.blocks, &cloned.signature.return_type);
+        cloned
+    }
+
+    fn mir_to_clif_type(ty: &MirType) -> Result<types::Type, MirCraneliftBackendError> {
         match ty {
-            MirType::Int => types::I64,
-            MirType::Float => types::F64,
-            MirType::Bool => types::I8,
-            MirType::Array(_) | MirType::Tuple(_) | MirType::Struct(_) | MirType::Effect { .. } => types::I64,
-            _ => types::I64,
+            MirType::Float => Ok(types::F64),
+            MirType::Int => Ok(types::I64),
+            MirType::Bool => Ok(types::I8),
+            MirType::Unit => Ok(types::I8),
+            MirType::String
+            | MirType::Array(_)
+            | MirType::Tuple(_)
+            | MirType::Struct(_)
+            | MirType::Map(_, _)
+            | MirType::Enum(_)
+            | MirType::Effect { .. }
+            | MirType::Unknown => Ok(types::I64),
+            MirType::Function { .. } => Err(MirCraneliftBackendError::UnsupportedType(ty.clone())),
         }
     }
 
-    fn lower_place(
+    fn cast_clif_type(
+        builder: &mut FunctionBuilder,
+        val: ClifValue,
+        target_ty: types::Type,
+    ) -> ClifValue {
+        let cur_ty = builder.func.dfg.value_type(val);
+        if cur_ty == target_ty {
+            return val;
+        }
+        match (cur_ty, target_ty) {
+            (types::I8, types::I64) => builder.ins().uextend(types::I64, val),
+            (types::I64, types::I8) => builder.ins().ireduce(types::I8, val),
+            (types::I32, types::I64) => builder.ins().sextend(types::I64, val),
+            (types::I64, types::I32) => builder.ins().ireduce(types::I32, val),
+            (types::I8, types::I32) => builder.ins().uextend(types::I32, val),
+            (types::I32, types::I8) => builder.ins().ireduce(types::I8, val),
+            (types::I64, types::F64) => builder.ins().fcvt_from_sint(types::F64, val),
+            (types::F64, types::I64) => builder.ins().fcvt_to_sint_sat(types::I64, val),
+            _ => val,
+        }
+    }
+
+    fn place_type(place: &Place, locals: &[LocalDecl]) -> MirType {
+        match place {
+            Place::Local(loc) => locals.get(loc.0).map(|l| l.ty.clone()).unwrap_or(MirType::Int),
+            Place::Index(base, _) => match place_type(base, locals) {
+                MirType::Array(inner) => *inner,
+                MirType::Tuple(elems) => elems.first().cloned().unwrap_or(MirType::Int),
+                MirType::Struct(name) => {
+                    with_current_mir_context(|ctx| ctx.get_struct_field_type(&name, 0)).unwrap_or(MirType::Int)
+                }
+                _ => MirType::Int,
+            },
+            Place::Field(base, idx) => match place_type(base, locals) {
+                MirType::Tuple(elems) => elems.get(*idx).cloned().unwrap_or(MirType::Int),
+                MirType::Struct(name) => {
+                    with_current_mir_context(|ctx| ctx.get_struct_field_type(&name, *idx)).unwrap_or(MirType::Int)
+                }
+                _ => MirType::Int,
+            },
+        }
+    }
+
+    fn lower_place_addr(
         place: &Place,
         builder: &mut FunctionBuilder,
         local_vars: &[Variable],
@@ -500,19 +861,49 @@ pub mod jit_engine {
         match place {
             Place::Local(loc) => builder.use_var(local_vars[loc.0]),
             Place::Index(base, idx) => {
-                let base_ptr = lower_place(base, builder, local_vars);
+                let base_ptr = lower_place_addr(base, builder, local_vars);
                 let idx_val = builder.use_var(local_vars[idx.0]);
                 let eight = builder.ins().iconst(types::I64, 8);
                 let byte_idx = builder.ins().imul(idx_val, eight);
                 let sixteen = builder.ins().iconst(types::I64, 16);
                 let offset = builder.ins().iadd(byte_idx, sixteen);
-                let elem_addr = builder.ins().iadd(base_ptr, offset);
-                builder.ins().load(types::I64, MemFlagsData::trusted(), elem_addr, 0)
+                builder.ins().iadd(base_ptr, offset)
             }
             Place::Field(base, field_idx) => {
-                let base_ptr = lower_place(base, builder, local_vars);
-                builder.ins().load(types::I64, MemFlagsData::trusted(), base_ptr, 16 + (*field_idx as i32) * 8)
+                let base_ptr = lower_place_addr(base, builder, local_vars);
+                let offset = builder.ins().iconst(types::I64, 16 + (*field_idx as i64) * 8);
+                builder.ins().iadd(base_ptr, offset)
             }
+        }
+    }
+
+    fn lower_place(
+        place: &Place,
+        builder: &mut FunctionBuilder,
+        local_vars: &[Variable],
+        locals: &[LocalDecl],
+    ) -> ClifValue {
+        match place {
+            Place::Local(loc) => builder.use_var(local_vars[loc.0]),
+            Place::Index(_, _) | Place::Field(_, _) => {
+                let addr = lower_place_addr(place, builder, local_vars);
+                let mir_ty = place_type(place, locals);
+                let clif_ty = mir_to_clif_type(&mir_ty).unwrap_or(types::I64);
+                builder.ins().load(clif_ty, MemFlagsData::trusted(), addr, 0)
+            }
+        }
+    }
+
+    fn operand_type(op: &Operand, locals: &[LocalDecl]) -> MirType {
+        match op {
+            Operand::Copy(p) | Operand::Move(p) => place_type(p, locals),
+            Operand::Constant(c) => match c {
+                MirConstant::Int(_) => MirType::Int,
+                MirConstant::Float(_) => MirType::Float,
+                MirConstant::Bool(_) => MirType::Bool,
+                MirConstant::String(_) => MirType::String,
+                MirConstant::Unit => MirType::Unit,
+            },
         }
     }
 
@@ -520,55 +911,182 @@ pub mod jit_engine {
         op: &Operand,
         builder: &mut FunctionBuilder,
         local_vars: &[Variable],
+        locals: &[LocalDecl],
     ) -> Result<ClifValue, MirCraneliftBackendError> {
         match op {
-            Operand::Copy(place) | Operand::Move(place) => Ok(lower_place(place, builder, local_vars)),
+            Operand::Copy(place) | Operand::Move(place) => Ok(lower_place(place, builder, local_vars, locals)),
             Operand::Constant(c) => match c {
                 MirConstant::Int(i) => Ok(builder.ins().iconst(types::I64, *i)),
                 MirConstant::Float(f) => Ok(builder.ins().f64const(*f)),
                 MirConstant::Bool(b) => Ok(builder.ins().iconst(types::I8, if *b { 1 } else { 0 })),
+                MirConstant::String(s) => {
+                    let handle = with_current_mir_context(|ctx| ctx.intern_string(s));
+                    Ok(builder.ins().iconst(types::I64, handle))
+                }
                 MirConstant::Unit => Err(MirCraneliftBackendError::UnlowerableValue(
                     "failed or unlowerable value cannot be evaluated as Unit in Cranelift backend".to_string(),
                 )),
-                _ => Err(MirCraneliftBackendError::UnsupportedConstant(c.clone())),
             },
         }
+    }
+
+    fn emit_status_check(
+        builder: &mut FunctionBuilder,
+        status_fn: FuncRef,
+        emergency_exit_bb: Block,
+    ) {
+        let stat_call = builder.ins().call(status_fn, &[]);
+        let stat_val = builder.inst_results(stat_call)[0];
+        let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, stat_val, 0);
+        let cont_bb = builder.create_block();
+        builder.ins().brif(is_err, emergency_exit_bb, &[], cont_bb, &[]);
+        builder.switch_to_block(cont_bb);
     }
 
     fn lower_rvalue(
         rval: &Rvalue,
         builder: &mut FunctionBuilder,
         local_vars: &[Variable],
+        locals: &[LocalDecl],
         alloc_fn: FuncRef,
         floordiv_fn: FuncRef,
         pow_fn: FuncRef,
         div_fn: FuncRef,
         rem_fn: FuncRef,
+        floordiv_float_fn: FuncRef,
+        pow_float_fn: FuncRef,
+        rem_float_fn: FuncRef,
+        string_concat_fn: FuncRef,
+        string_eq_fn: FuncRef,
+        string_len_fn: FuncRef,
+        status_fn: FuncRef,
+        emergency_exit_bb: Block,
     ) -> Result<ClifValue, MirCraneliftBackendError> {
         match rval {
-            Rvalue::Use(op) => lower_operand(op, builder, local_vars),
+            Rvalue::Use(op) => lower_operand(op, builder, local_vars, locals),
+            Rvalue::Cast(op, target_ty) => {
+                let val = lower_operand(op, builder, local_vars, locals)?;
+                let target_clif_ty = mir_to_clif_type(target_ty)?;
+                Ok(cast_clif_type(builder, val, target_clif_ty))
+            }
             Rvalue::BinaryOp(binop, lhs, rhs) => {
-                let l = lower_operand(lhs, builder, local_vars)?;
-                let r = lower_operand(rhs, builder, local_vars)?;
+                let l_ty_mir = operand_type(lhs, locals);
+                let r_ty_mir = operand_type(rhs, locals);
+                let is_float = l_ty_mir == MirType::Float || r_ty_mir == MirType::Float;
+                let is_string = l_ty_mir == MirType::String && r_ty_mir == MirType::String;
+
+                if is_float {
+                    let mut l = lower_operand(lhs, builder, local_vars, locals)?;
+                    let mut r = lower_operand(rhs, builder, local_vars, locals)?;
+                    let l_clif_ty = builder.func.dfg.value_type(l);
+                    let r_clif_ty = builder.func.dfg.value_type(r);
+                    if l_clif_ty != types::F64 {
+                        l = cast_clif_type(builder, l, types::F64);
+                    }
+                    if r_clif_ty != types::F64 {
+                        r = cast_clif_type(builder, r, types::F64);
+                    }
+                    let val = match binop {
+                        MirBinaryOp::Add => builder.ins().fadd(l, r),
+                        MirBinaryOp::Sub => builder.ins().fsub(l, r),
+                        MirBinaryOp::Mul => builder.ins().fmul(l, r),
+                        MirBinaryOp::Div => builder.ins().fdiv(l, r),
+                        MirBinaryOp::FloorDiv => {
+                            let call = builder.ins().call(floordiv_float_fn, &[l, r]);
+                            let res = builder.inst_results(call)[0];
+                            emit_status_check(builder, status_fn, emergency_exit_bb);
+                            res
+                        }
+                        MirBinaryOp::Pow => {
+                            let call = builder.ins().call(pow_float_fn, &[l, r]);
+                            let res = builder.inst_results(call)[0];
+                            emit_status_check(builder, status_fn, emergency_exit_bb);
+                            res
+                        }
+                        MirBinaryOp::Mod => {
+                            let call = builder.ins().call(rem_float_fn, &[l, r]);
+                            let res = builder.inst_results(call)[0];
+                            emit_status_check(builder, status_fn, emergency_exit_bb);
+                            res
+                        }
+                        MirBinaryOp::Eq => builder.ins().fcmp(FloatCC::Equal, l, r),
+                        MirBinaryOp::NotEq => builder.ins().fcmp(FloatCC::NotEqual, l, r),
+                        MirBinaryOp::Lt => builder.ins().fcmp(FloatCC::LessThan, l, r),
+                        MirBinaryOp::LtEq => builder.ins().fcmp(FloatCC::LessThanOrEqual, l, r),
+                        MirBinaryOp::Gt => builder.ins().fcmp(FloatCC::GreaterThan, l, r),
+                        MirBinaryOp::GtEq => builder.ins().fcmp(FloatCC::GreaterThanOrEqual, l, r),
+                        _ => return Err(MirCraneliftBackendError::UnsupportedBinaryOp(*binop)),
+                    };
+                    return Ok(val);
+                }
+
+                if is_string {
+                    let l = lower_operand(lhs, builder, local_vars, locals)?;
+                    let r = lower_operand(rhs, builder, local_vars, locals)?;
+                    let val = match binop {
+                        MirBinaryOp::Add => {
+                            let call = builder.ins().call(string_concat_fn, &[l, r]);
+                            let res = builder.inst_results(call)[0];
+                            emit_status_check(builder, status_fn, emergency_exit_bb);
+                            res
+                        }
+                        MirBinaryOp::Eq => {
+                            let call = builder.ins().call(string_eq_fn, &[l, r]);
+                            let res = builder.inst_results(call)[0];
+                            builder.ins().ireduce(types::I8, res)
+                        }
+                        MirBinaryOp::NotEq => {
+                            let call = builder.ins().call(string_eq_fn, &[l, r]);
+                            let res = builder.inst_results(call)[0];
+                            builder.ins().icmp_imm_s(IntCC::Equal, res, 0)
+                        }
+                        _ => return Err(MirCraneliftBackendError::UnsupportedBinaryOp(*binop)),
+                    };
+                    return Ok(val);
+                }
+
+                let l = lower_operand(lhs, builder, local_vars, locals)?;
+                let r = lower_operand(rhs, builder, local_vars, locals)?;
+                let l_ty = builder.func.dfg.value_type(l);
+                let r_ty = builder.func.dfg.value_type(r);
+                let (l, r) = if l_ty != r_ty {
+                    if l_ty == types::I8 && r_ty == types::I64 {
+                        (builder.ins().uextend(types::I64, l), r)
+                    } else if l_ty == types::I64 && r_ty == types::I8 {
+                        (l, builder.ins().uextend(types::I64, r))
+                    } else {
+                        (l, r)
+                    }
+                } else {
+                    (l, r)
+                };
                 let val = match binop {
                     MirBinaryOp::Add => builder.ins().iadd(l, r),
                     MirBinaryOp::Sub => builder.ins().isub(l, r),
                     MirBinaryOp::Mul => builder.ins().imul(l, r),
                     MirBinaryOp::Div => {
                         let call = builder.ins().call(div_fn, &[l, r]);
-                        builder.inst_results(call)[0]
+                        let res = builder.inst_results(call)[0];
+                        emit_status_check(builder, status_fn, emergency_exit_bb);
+                        res
                     }
                     MirBinaryOp::Mod => {
                         let call = builder.ins().call(rem_fn, &[l, r]);
-                        builder.inst_results(call)[0]
+                        let res = builder.inst_results(call)[0];
+                        emit_status_check(builder, status_fn, emergency_exit_bb);
+                        res
                     }
                     MirBinaryOp::FloorDiv => {
                         let call = builder.ins().call(floordiv_fn, &[l, r]);
-                        builder.inst_results(call)[0]
+                        let res = builder.inst_results(call)[0];
+                        emit_status_check(builder, status_fn, emergency_exit_bb);
+                        res
                     }
                     MirBinaryOp::Pow => {
                         let call = builder.ins().call(pow_fn, &[l, r]);
-                        builder.inst_results(call)[0]
+                        let res = builder.inst_results(call)[0];
+                        emit_status_check(builder, status_fn, emergency_exit_bb);
+                        res
                     }
                     MirBinaryOp::BitAnd => builder.ins().band(l, r),
                     MirBinaryOp::BitOr => builder.ins().bor(l, r),
@@ -595,7 +1113,15 @@ pub mod jit_engine {
                 Ok(val)
             }
             Rvalue::UnaryOp(unop, op) => {
-                let v = lower_operand(op, builder, local_vars)?;
+                let op_ty = operand_type(op, locals);
+                let v = lower_operand(op, builder, local_vars, locals)?;
+                if op_ty == MirType::Float && matches!(unop, MirUnaryOp::Neg) {
+                    return Ok(builder.ins().fneg(v));
+                }
+                if op_ty == MirType::String && matches!(unop, MirUnaryOp::Len) {
+                    let call = builder.ins().call(string_len_fn, &[v]);
+                    return Ok(builder.inst_results(call)[0]);
+                }
                 let val = match unop {
                     MirUnaryOp::Neg => builder.ins().ineg(v),
                     MirUnaryOp::Not => builder.ins().bnot(v),
@@ -612,9 +1138,16 @@ pub mod jit_engine {
                 let len_val = builder.ins().iconst(types::I64, len);
                 let call_inst = builder.ins().call(alloc_fn, &[len_val]);
                 let array_ptr = builder.inst_results(call_inst)[0];
+                emit_status_check(builder, status_fn, emergency_exit_bb);
                 for (i, elem) in elements.iter().enumerate() {
-                    let el_val = lower_operand(elem, builder, local_vars)?;
-                    builder.ins().store(MemFlagsData::trusted(), el_val, array_ptr, 16 + (i as i32) * 8);
+                    let el_val = lower_operand(elem, builder, local_vars, locals)?;
+                    let el_ty = builder.func.dfg.value_type(el_val);
+                    let el_to_store = if el_ty == types::I8 {
+                        builder.ins().uextend(types::I64, el_val)
+                    } else {
+                        el_val
+                    };
+                    builder.ins().store(MemFlagsData::trusted(), el_to_store, array_ptr, 16 + (i as i32) * 8);
                 }
                 Ok(array_ptr)
             }

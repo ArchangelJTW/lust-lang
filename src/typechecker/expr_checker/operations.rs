@@ -471,10 +471,92 @@ impl TypeChecker {
             if let Ok(ty) = self.check_expr(object) {
                 if matches!(
                     ty.kind,
-                    TypeKind::Option(_) | TypeKind::Result(_, _) | TypeKind::Effect { .. }
+                    TypeKind::Option(_) | TypeKind::Result(_, _) | TypeKind::Effect { .. } | TypeKind::Schema { .. }
                 ) || matches!(&ty.kind, TypeKind::Named(name) if name == "Option" || name == "Result")
                 {
                     return self.check_method_call(object, field, explicit_type_args, args);
+                }
+            }
+        }
+        if let ExprKind::FieldAccess { object, field } = &callee.kind
+            && let ExprKind::Identifier(obj_name) = &object.kind
+            && (obj_name == "s" || obj_name == "schema")
+        {
+            for arg in args {
+                self.check_expr(arg)?;
+            }
+            let span = Self::dummy_span();
+            let explicit_args = explicit_type_args.unwrap_or(&[]);
+            match field.as_str() {
+                "string" => {
+                    return Ok(Type::new(
+                        TypeKind::Schema {
+                            input: Box::new(Type::new(TypeKind::String, span)),
+                            output: Box::new(Type::new(TypeKind::String, span)),
+                            fields: None,
+                        },
+                        span,
+                    ));
+                }
+                "int" | "i64" | "i32" => {
+                    return Ok(Type::new(
+                        TypeKind::Schema {
+                            input: Box::new(Type::new(TypeKind::Int, span)),
+                            output: Box::new(Type::new(TypeKind::Int, span)),
+                            fields: None,
+                        },
+                        span,
+                    ));
+                }
+                "float" => {
+                    return Ok(Type::new(
+                        TypeKind::Schema {
+                            input: Box::new(Type::new(TypeKind::Float, span)),
+                            output: Box::new(Type::new(TypeKind::Float, span)),
+                            fields: None,
+                        },
+                        span,
+                    ));
+                }
+                "bool" => {
+                    return Ok(Type::new(
+                        TypeKind::Schema {
+                            input: Box::new(Type::new(TypeKind::Bool, span)),
+                            output: Box::new(Type::new(TypeKind::Bool, span)),
+                            fields: None,
+                        },
+                        span,
+                    ));
+                }
+                "struct" | "derive_schema" => {
+                    if let Some(first_type_arg) = explicit_args.first() {
+                        return Ok(Type::new(
+                            TypeKind::Schema {
+                                input: Box::new(first_type_arg.clone()),
+                                output: Box::new(first_type_arg.clone()),
+                                fields: None,
+                            },
+                            span,
+                        ));
+                    }
+                    return Ok(Type::new(
+                        TypeKind::Schema {
+                            input: Box::new(Type::new(TypeKind::Unknown, span)),
+                            output: Box::new(Type::new(TypeKind::Unknown, span)),
+                            fields: None,
+                        },
+                        span,
+                    ));
+                }
+                _ => {
+                    return Ok(Type::new(
+                        TypeKind::Schema {
+                            input: Box::new(Type::new(TypeKind::Unknown, span)),
+                            output: Box::new(Type::new(TypeKind::Unknown, span)),
+                            fields: None,
+                        },
+                        span,
+                    ));
                 }
             }
         }
@@ -1357,6 +1439,36 @@ impl TypeChecker {
                 }
                 _ => {}
             },
+            TypeKind::Schema { input, output, .. } => {
+                for arg in args {
+                    self.check_expr(arg)?;
+                }
+                match method {
+                    "validate" | "validate_json" | "validate_jsonc" | "validate_yaml"
+                    | "validate_bson" | "decode_json" => {
+                        return Ok((**output).clone());
+                    }
+                    "transform" => {
+                        if let Some(arg) = args.first() {
+                            let arg_ty = self.check_expr(arg)?;
+                            if let TypeKind::Function { return_type, .. } = arg_ty.kind {
+                                return Ok(Type::new(
+                                    TypeKind::Schema {
+                                        input: input.clone(),
+                                        output: return_type,
+                                        fields: None,
+                                    },
+                                    span,
+                                ));
+                            }
+                        }
+                        return Ok(receiver_type.clone());
+                    }
+                    _ => {
+                        return Ok(receiver_type.clone());
+                    }
+                }
+            },
             TypeKind::Named(type_name) if type_name == "Option" || type_name == "Result" => {
                 match method {
                     "is_some" | "is_none" | "is_ok" | "is_err" => {
@@ -1749,6 +1861,12 @@ impl TypeChecker {
             }
 
             if !enum_def.type_params.is_empty() {
+                if enum_def.name == "Option" {
+                    return Ok(Type::new(
+                        TypeKind::Option(Box::new(Type::new(TypeKind::Unknown, span))),
+                        span,
+                    ));
+                }
                 return Err(self.type_error_at(
                     format!(
                         "Cannot infer type parameters for unit variant '{}.{}'",

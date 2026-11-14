@@ -144,8 +144,12 @@ impl VM {
         value.clone()
     }
 
-    pub(super) fn run(&mut self) -> Result<Value> {
+    pub fn run(&mut self) -> Result<Value> {
         let _vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
+        #[cfg(feature = "std")]
+        if self.backend == crate::vm::VmBackend::Cranelift {
+            return self.run_cranelift();
+        }
         // Specialize the dispatch loop once rather than testing it around every
         // instruction; the interpreter-only copy has no trace bookkeeping or JIT backedges.
         // When a memory budget is active, effective execution is the interpreter.
@@ -158,7 +162,7 @@ impl VM {
         result
     }
 
-    fn run_inner<const JIT_ENABLED: bool>(&mut self) -> Result<Value> {
+    pub(super) fn run_inner<const JIT_ENABLED: bool>(&mut self) -> Result<Value> {
         'dispatch: loop {
             if let Some(task) = self.current_task.and_then(|id| self.task_manager.get_mut(id)) {
                 if task.poll_interrupt().is_some() {
@@ -562,8 +566,14 @@ impl VM {
 
             if MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed) {
                 MUTATION_M1_EXECUTION_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            } else {
-                self.budgets.charge_gas(1)?;
+            } else if let Err(e) = self.budgets.charge_gas(1) {
+                if let Some(task) = self.current_task.and_then(|id| self.task_manager.get_mut(id)) {
+                    task.request_interrupt(crate::effect_abi::InterruptReason::OutOfGas);
+                    if let Some(err) = task.error.clone() {
+                        return Err(err);
+                    }
+                }
+                return Err(e);
             }
             match instruction {
                 Instruction::LoadNil(dest) => {
@@ -602,6 +612,10 @@ impl VM {
                             self.natives.iter().find(|(key, _)| key.as_str() == name)
                         {
                             self.set_register(dest, value.clone())?;
+                        } else if name.contains('.')
+                            && let Some(pos) = self.functions.iter().position(|f| f.name == name)
+                        {
+                            self.set_register(dest, Value::Function(pos))?;
                         } else {
                             return Err(LustError::RuntimeError {
                                 message: format!("Undefined global: {}", name),
@@ -753,6 +767,9 @@ impl VM {
                         }
                         (Value::Float(a), Value::Int(b)) => {
                             Ok(Value::Float(*a + float_from_int(*b)))
+                        }
+                        (Value::String(a), Value::String(b)) => {
+                            Ok(Value::string(format!("{}{}", a, b)))
                         }
                         _ => Err(LustError::RuntimeError {
                             message: format!("Cannot add {:?} and {:?}", l, r),
@@ -1052,6 +1069,16 @@ impl VM {
                         let callee = &self.functions[callee_idx];
                         let line = callee.chunk.lines.first().copied().unwrap_or(0);
                         self.dispatch_call_hook(&callee.name, line, self.call_stack.len());
+                    }
+                    #[cfg(feature = "std")]
+                    if self.backend == crate::vm::VmBackend::Cranelift
+                        && self.trace_recorder.is_none()
+                        && let Some(finished) = self.try_run_cranelift_top_frame()?
+                    {
+                        if let Some(val) = finished {
+                            return Ok(val);
+                        }
+                        continue 'dispatch;
                     }
                     if JIT_ENABLED
                         && self.trace_recorder.is_none()
@@ -2333,7 +2360,12 @@ impl VM {
             TypeKind::Ref(inner) | TypeKind::MutRef(inner) => self.value_matches_type(value, inner),
             TypeKind::Pointer { .. } => true,
             TypeKind::Never => false,
-            TypeKind::Effect { .. } => true,
+            TypeKind::Effect { .. }
+            | TypeKind::Typeof(_)
+            | TypeKind::InferType(_)
+            | TypeKind::InferInput(_)
+            | TypeKind::InferOutput(_)
+            | TypeKind::Schema { .. } => true,
         }
     }
 
@@ -2341,7 +2373,7 @@ impl VM {
     /// it against the signature, pop the frame and deliver the value to
     /// the caller. Returns the value itself when the call stack is now
     /// empty and `run` should hand it back.
-    fn finish_return(&mut self, return_value: Value) -> Result<Option<Value>> {
+    pub(super) fn finish_return(&mut self, return_value: Value) -> Result<Option<Value>> {
         let frame = self.call_stack.last().unwrap();
         let return_dest = frame.return_dest;
         self.validate_function_return(frame.function_idx, &return_value)?;

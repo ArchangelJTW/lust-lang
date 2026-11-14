@@ -2,7 +2,7 @@ use crate::bytecode::{Chunk, Function, Instruction, Register, Value};
 use crate::mir::ir::*;
 use crate::number::{LustFloat, LustInt};
 use alloc::vec::Vec;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MirVmBackendError {
@@ -18,10 +18,25 @@ pub struct MirToBytecodeCompiler<'a> {
     max_scratch: usize,
     block_pcs: HashMap<BlockId, usize>,
     pending_jumps: Vec<(usize, BlockId)>,
+    direct_callees: Option<&'a HashSet<String>>,
 }
 
 impl<'a> MirToBytecodeCompiler<'a> {
     pub fn compile(func: &'a MirFunction) -> Result<Function, MirVmBackendError> {
+        Self::compile_inner(func, None)
+    }
+
+    pub fn compile_with_direct_callees(
+        func: &'a MirFunction,
+        direct_callees: &'a HashSet<String>,
+    ) -> Result<Function, MirVmBackendError> {
+        Self::compile_inner(func, Some(direct_callees))
+    }
+
+    fn compile_inner(
+        func: &'a MirFunction,
+        direct_callees: Option<&'a HashSet<String>>,
+    ) -> Result<Function, MirVmBackendError> {
         let param_count = func.params.len() as u8;
         let mut bytecode_fn = Function::new(func.signature.name.clone(), param_count, false);
 
@@ -33,6 +48,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
             max_scratch: 0,
             block_pcs: HashMap::new(),
             pending_jumps: Vec::new(),
+            direct_callees,
         };
 
         compiler.compile_blocks()?;
@@ -156,16 +172,51 @@ impl<'a> MirToBytecodeCompiler<'a> {
                     }
                 }
             }
+            Rvalue::Cast(op, target_ty) => {
+                let r_op = self.operand_to_reg(op, line);
+                match target_ty {
+                    MirType::Float => {
+                        let zero_f_reg = self.next_scratch();
+                        self.load_constant_into_reg(&MirConstant::Float(0.0), zero_f_reg, line);
+                        self.chunk.emit(Instruction::Add(dst_reg, r_op, zero_f_reg), line);
+                    }
+                    MirType::Int => {
+                        let obj_idx = self.chunk.add_constant(Value::string("math".to_string()));
+                        let field_idx = self.chunk.add_constant(Value::string("floor".to_string()));
+                        let func_reg = self.next_scratch();
+                        self.chunk.emit(Instruction::LoadGlobal(func_reg, obj_idx), line);
+                        self.chunk.emit(Instruction::GetField(func_reg, func_reg, field_idx), line);
+                        let arg_reg = self.next_scratch();
+                        self.chunk.emit(Instruction::Move(arg_reg, r_op), line);
+                        self.chunk.emit(Instruction::Call(func_reg, arg_reg, 1, dst_reg), line);
+                    }
+                    _ => {
+                        if dst_reg != r_op {
+                            self.chunk.emit(Instruction::Move(dst_reg, r_op), line);
+                        }
+                    }
+                }
+            }
             Rvalue::BinaryOp(binop, lhs, rhs) => {
+                let is_string = match (lhs, rhs) {
+                    (Operand::Constant(MirConstant::String(_)), _) | (_, Operand::Constant(MirConstant::String(_))) => true,
+                    (Operand::Copy(Place::Local(l)) | Operand::Move(Place::Local(l)), _) if self.func.locals[l.0].ty == MirType::String => true,
+                    (_, Operand::Copy(Place::Local(r)) | Operand::Move(Place::Local(r))) if self.func.locals[r.0].ty == MirType::String => true,
+                    _ => false,
+                };
                 let r_lhs = self.operand_to_reg(lhs, line);
                 let r_rhs = self.operand_to_reg(rhs, line);
-                self.compile_binop(*binop, dst_reg, r_lhs, r_rhs, line)?;
+                if is_string && *binop == MirBinaryOp::Add {
+                    self.chunk.emit(Instruction::Concat(dst_reg, r_lhs, r_rhs), line);
+                } else {
+                    self.compile_binop(*binop, dst_reg, r_lhs, r_rhs, line)?;
+                }
             }
             Rvalue::UnaryOp(unop, op) => {
                 let r_op = self.operand_to_reg(op, line);
                 match unop {
                     MirUnaryOp::Neg => {
-                        self.chunk.emit(Instruction::NegInt(dst_reg, r_op), line);
+                        self.chunk.emit(Instruction::Neg(dst_reg, r_op), line);
                     }
                     MirUnaryOp::Not => {
                         self.chunk.emit(Instruction::Not(dst_reg, r_op), line);
@@ -178,18 +229,18 @@ impl<'a> MirToBytecodeCompiler<'a> {
                     }
                 }
             }
-            Rvalue::Aggregate(MirType::Array(_) | MirType::Tuple(_) | MirType::Struct(_), elements) => {
+            Rvalue::Aggregate(agg_ty, elements) => {
                 let count = elements.len() as u8;
-                if count == 0 {
-                    self.chunk.emit(Instruction::NewArray(dst_reg, 0, 0), line);
+                let scratch_base = if count == 0 {
+                    0
                 } else {
-                    let scratch_base = (self.scratch_start + self.scratch_count) as Register;
+                    let s_base = (self.scratch_start + self.scratch_count) as Register;
                     self.scratch_count += elements.len();
                     if self.scratch_count > self.max_scratch {
                         self.max_scratch = self.scratch_count;
                     }
                     for (i, elem) in elements.iter().enumerate() {
-                        let target_reg = scratch_base + i as u8;
+                        let target_reg = s_base + i as u8;
                         match elem {
                             Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
                                 self.chunk.emit(Instruction::Move(target_reg, loc.0 as Register), line);
@@ -210,10 +261,17 @@ impl<'a> MirToBytecodeCompiler<'a> {
                             }
                         }
                     }
-                    self.chunk.emit(Instruction::NewArray(dst_reg, scratch_base, count), line);
+                    s_base
+                };
+                match agg_ty {
+                    MirType::Tuple(_) => {
+                        self.chunk.emit(Instruction::TupleNew(dst_reg, scratch_base, count), line);
+                    }
+                    _ => {
+                        self.chunk.emit(Instruction::NewArray(dst_reg, scratch_base, count), line);
+                    }
                 }
             }
-            _ => {}
         }
         Ok(())
     }
@@ -265,24 +323,24 @@ impl<'a> MirToBytecodeCompiler<'a> {
 
     fn compile_binop(&mut self, op: MirBinaryOp, dst: Register, lhs: Register, rhs: Register, line: usize) -> Result<(), MirVmBackendError> {
         let instr = match op {
-            MirBinaryOp::Add => Instruction::AddInt(dst, lhs, rhs),
-            MirBinaryOp::Sub => Instruction::SubInt(dst, lhs, rhs),
-            MirBinaryOp::Mul => Instruction::MulInt(dst, lhs, rhs),
-            MirBinaryOp::Div => Instruction::DivInt(dst, lhs, rhs),
-            MirBinaryOp::Mod => Instruction::ModInt(dst, lhs, rhs),
-            MirBinaryOp::FloorDiv => Instruction::FloorDivInt(dst, lhs, rhs),
-            MirBinaryOp::Pow => Instruction::PowInt(dst, lhs, rhs),
+            MirBinaryOp::Add => Instruction::Add(dst, lhs, rhs),
+            MirBinaryOp::Sub => Instruction::Sub(dst, lhs, rhs),
+            MirBinaryOp::Mul => Instruction::Mul(dst, lhs, rhs),
+            MirBinaryOp::Div => Instruction::Div(dst, lhs, rhs),
+            MirBinaryOp::Mod => Instruction::Mod(dst, lhs, rhs),
+            MirBinaryOp::FloorDiv => Instruction::FloorDiv(dst, lhs, rhs),
+            MirBinaryOp::Pow => Instruction::Pow(dst, lhs, rhs),
             MirBinaryOp::BitAnd => Instruction::BitAnd(dst, lhs, rhs),
             MirBinaryOp::BitOr => Instruction::BitOr(dst, lhs, rhs),
             MirBinaryOp::BitXor => Instruction::BitXor(dst, lhs, rhs),
             MirBinaryOp::Shl => Instruction::Shl(dst, lhs, rhs),
             MirBinaryOp::Shr => Instruction::Shr(dst, lhs, rhs),
-            MirBinaryOp::Eq => Instruction::EqInt(dst, lhs, rhs),
-            MirBinaryOp::NotEq => Instruction::NeInt(dst, lhs, rhs),
-            MirBinaryOp::Lt => Instruction::LtInt(dst, lhs, rhs),
-            MirBinaryOp::LtEq => Instruction::LeInt(dst, lhs, rhs),
-            MirBinaryOp::Gt => Instruction::GtInt(dst, lhs, rhs),
-            MirBinaryOp::GtEq => Instruction::GeInt(dst, lhs, rhs),
+            MirBinaryOp::Eq => Instruction::Eq(dst, lhs, rhs),
+            MirBinaryOp::NotEq => Instruction::Ne(dst, lhs, rhs),
+            MirBinaryOp::Lt => Instruction::Lt(dst, lhs, rhs),
+            MirBinaryOp::LtEq => Instruction::Le(dst, lhs, rhs),
+            MirBinaryOp::Gt => Instruction::Gt(dst, lhs, rhs),
+            MirBinaryOp::GtEq => Instruction::Ge(dst, lhs, rhs),
             MirBinaryOp::And => Instruction::And(dst, lhs, rhs),
             MirBinaryOp::Or => Instruction::Or(dst, lhs, rhs),
         };
@@ -365,7 +423,12 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 };
 
                 let func_reg = self.next_scratch();
-                if let Some((obj_name, field_name)) = callee.split_once('.') {
+                let is_direct = self
+                    .direct_callees
+                    .is_some_and(|set| set.contains(callee.as_str()));
+                if !is_direct
+                    && let Some((obj_name, field_name)) = callee.split_once('.')
+                {
                     let obj_idx = self.chunk.add_constant(Value::string(obj_name.to_string()));
                     let field_idx = self.chunk.add_constant(Value::string(field_name.to_string()));
                     self.chunk.emit(Instruction::LoadGlobal(func_reg, obj_idx), line);

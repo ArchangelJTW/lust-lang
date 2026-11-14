@@ -92,6 +92,31 @@ impl Schema {
         })
     }
 
+    pub fn to_json_schema(&self) -> Result<crate::data::Document, crate::schema::interop::SchemaExportError> {
+        crate::schema::interop::to_json_schema(self, None)
+    }
+
+    pub fn to_json_schema_with_options(
+        &self,
+        options: &crate::schema::interop::ExportOptions,
+    ) -> Result<crate::data::Document, crate::schema::interop::SchemaExportError> {
+        crate::schema::interop::to_json_schema(self, Some(options))
+    }
+
+    pub fn as_json_schema_portable(
+        &self,
+        options: Option<&crate::schema::interop::ExportOptions>,
+    ) -> Result<crate::schema::interop::JsonSchemaPortable, crate::schema::interop::SchemaExportError> {
+        crate::schema::interop::as_json_schema_portable(self, options)
+    }
+
+    pub fn export_json_schema_projection(
+        &self,
+        projection: crate::schema::interop::ProjectionMode,
+    ) -> Result<crate::schema::interop::SchemaProjection, crate::schema::interop::SchemaExportError> {
+        crate::schema::interop::export_json_schema_projection(self, projection)
+    }
+
     pub fn min(mut self, min: usize) -> Self {
         match &mut self.ir {
             SchemaIR::String { min_len, .. } => {
@@ -452,6 +477,10 @@ pub fn unpack_optional(ir: SchemaIR) -> (SchemaIR, bool) {
             let (unwrapped, is_opt) = unpack_optional(*inner);
             (SchemaIR::Refine { inner: Box::new(unwrapped), predicate, message }, is_opt)
         }
+        SchemaIR::Pattern { inner, pattern, mode } => {
+            let (unwrapped, is_opt) = unpack_optional(*inner);
+            (SchemaIR::Pattern { inner: Box::new(unwrapped), pattern, mode }, is_opt)
+        }
         SchemaIR::Transform { inner, transform } => {
             let (unwrapped, is_opt) = unpack_optional(*inner);
             (SchemaIR::Transform { inner: Box::new(unwrapped), transform }, is_opt)
@@ -701,5 +730,13 @@ impl SchemaFactory {
 
     pub fn derive_schema<T: crate::schema::binding::DeriveSchemaTarget>(&self, target: T) -> Schema {
         target.derive_schema()
+    }
+
+    pub fn schema_from_json_schema(
+        &self,
+        doc: &crate::data::Document,
+        options: Option<&crate::schema::interop::ImportOptions>,
+    ) -> Result<Schema, crate::schema::interop::SchemaImportError> {
+        crate::schema::interop::schema_from_json_schema(doc, options)
     }
 }

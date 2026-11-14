@@ -1,6 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 use crate::data::DataValue;
+use crate::schema::pattern::PatternMode;
 
 #[derive(Clone)]
 pub struct RefinePredicate {
@@ -89,6 +90,11 @@ pub enum SchemaIR {
     },
     Optional(Box<SchemaIR>),
     Nullable(Box<SchemaIR>),
+    Pattern {
+        inner: Box<SchemaIR>,
+        pattern: String,
+        mode: PatternMode,
+    },
     Refine {
         inner: Box<SchemaIR>,
         predicate: RefinePredicate,

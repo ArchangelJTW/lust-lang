@@ -38,6 +38,7 @@ pub struct EmbeddedBuilder {
     entry_module: Option<String>,
     config: LustConfig,
     extern_registry: ExternRegistry,
+    extern_exports: Vec<NativeExport>,
 }
 
 impl Default for EmbeddedBuilder {
@@ -49,6 +50,7 @@ impl Default for EmbeddedBuilder {
             entry_module: None,
             config: LustConfig::default(),
             extern_registry: ExternRegistry::new(),
+            extern_exports: Vec::new(),
         }
     }
 }
@@ -153,6 +155,11 @@ impl EmbeddedBuilder {
         self
     }
 
+    pub fn declare_exported_native(mut self, export: NativeExport) -> Self {
+        self.extern_exports.push(export);
+        self
+    }
+
     pub fn with_extern_registry(mut self, registry: ExternRegistry) -> Self {
         self.extern_registry = registry;
         self
@@ -232,6 +239,7 @@ impl EmbeddedBuilder {
             overrides,
             self.config,
             self.extern_registry,
+            self.extern_exports,
         )
     }
 
@@ -261,6 +269,7 @@ impl EmbeddedBuilder {
             overrides,
             self.config,
             self.extern_registry,
+            self.extern_exports,
         )
     }
 }
@@ -278,6 +287,7 @@ pub struct CompiledBytecode {
     pub(crate) init_funcs: Vec<(String, String)>,
     pub(crate) config: LustConfig,
     pub(crate) extern_registry: ExternRegistry,
+    pub(crate) extern_exports: Vec<NativeExport>,
 }
 
 impl CompiledBytecode {
@@ -364,6 +374,9 @@ impl EmbeddedProgram {
             vm.register_trait_impl(type_name.clone(), trait_name.clone());
         }
         bytecode.extern_registry.register_trait_impls(&mut vm);
+        for export in &bytecode.extern_exports {
+            vm.record_exported_native(export.clone());
+        }
 
         for (module_path, init) in &bytecode.init_funcs {
             let value = vm.call(init, Vec::new())?;
@@ -1578,8 +1591,14 @@ impl EmbeddedProgram {
             TypeKind::Union(_) => Err(PreflightError::type_error(
                 "Union schema is strictly rejected",
             )),
-            TypeKind::Never | TypeKind::Effect { .. } => Err(PreflightError::type_error(
-                "Effect/Never schema is not supported in embed parameters",
+            TypeKind::Never
+            | TypeKind::Effect { .. }
+            | TypeKind::Typeof(_)
+            | TypeKind::InferType(_)
+            | TypeKind::InferInput(_)
+            | TypeKind::InferOutput(_)
+            | TypeKind::Schema { .. } => Err(PreflightError::type_error(
+                "Effect/Never/Schema/Infer/Typeof schema is not supported in embed parameters",
             )),
         }
     }
@@ -2220,9 +2239,45 @@ pub(crate) fn compile_to_bytecode(
     overrides: HashMap<PathBuf, String>,
     config: LustConfig,
     extern_registry: ExternRegistry,
+    extern_exports: Vec<NativeExport>,
 ) -> Result<CompiledBytecode> {
+    for export in &extern_exports {
+        if config.prelude_mode() == &crate::config::PreludeMode::Pure {
+            if let Some(spec) = &export.effects {
+                if spec.purity == crate::vm::NativePurity::Effectful {
+                    return Err(LustError::CompileError(format!(
+                        "PurityViolation: effectful native function '{}' not allowed in PreludeMode::Pure",
+                        export.name()
+                    )));
+                }
+            }
+        }
+        if let Some(spec) = &export.effects {
+            if let Some(req_cap) = &spec.required_capability {
+                let caps = config.capability_mask();
+                let allowed = match req_cap.as_str() {
+                    "net" => caps.allow_net,
+                    "fs" => caps.allow_fs,
+                    "io" => caps.allow_io || caps.allow_fs,
+                    "os" => caps.allow_os,
+                    "task" => caps.allow_task,
+                    "test" => caps.allow_test,
+                    "ffi" => caps.allow_ffi,
+                    other => caps.custom_capabilities.contains(other) || config.is_std_module_allowed(other),
+                };
+                if !allowed {
+                    return Err(LustError::CompileError(format!(
+                        "CapabilityDenied: native function '{}' requires capability '{}'",
+                        export.name(),
+                        req_cap
+                    )));
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "std")]
-    let cache_key = if extern_registry.is_empty() {
+    let cache_key = if extern_registry.is_empty() && extern_exports.is_empty() {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         base_dir.hash(&mut hasher);
@@ -2261,6 +2316,28 @@ pub(crate) fn compile_to_bytecode(
         .ok_or_else(|| LustError::Unknown("Entry path contained invalid UTF-8".into()))?
         .to_string();
     let program = loader.load_program_from_entry(&entry_path_str)?;
+
+    let mut config = loader.config().clone();
+    for module in &program.modules {
+        for target in module.imports.module_aliases.values() {
+            if crate::builtins::is_virtual_std_module(target) {
+                let canon = crate::builtins::canonical_std_module_name(target);
+                if config.is_std_module_allowed(canon) {
+                    config.enable_module(canon);
+                }
+            }
+        }
+        for target in module.imports.function_aliases.values() {
+            if let Some((mod_part, _)) = target.split_once('.') {
+                if crate::builtins::is_virtual_std_module(mod_part) {
+                    let canon = crate::builtins::canonical_std_module_name(mod_part);
+                    if config.is_std_module_allowed(canon) {
+                        config.enable_module(canon);
+                    }
+                }
+            }
+        }
+    }
 
     // Build imports map (small: just alias/path strings, not AST)
     let mut imports_map: HashMap<String, ModuleImports> = HashMap::new();
@@ -2361,6 +2438,7 @@ pub(crate) fn compile_to_bytecode(
         init_funcs,
         config,
         extern_registry,
+        extern_exports,
     };
 
     #[cfg(feature = "std")]
@@ -2379,8 +2457,9 @@ fn compile_in_memory(
     overrides: HashMap<PathBuf, String>,
     config: LustConfig,
     extern_registry: ExternRegistry,
+    extern_exports: Vec<NativeExport>,
 ) -> Result<EmbeddedProgram> {
-    let bytecode = compile_to_bytecode(base_dir, entry_module, overrides, config, extern_registry)?;
+    let bytecode = compile_to_bytecode(base_dir, entry_module, overrides, config, extern_registry, extern_exports)?;
     EmbeddedProgram::from_compiled(&bytecode)
 }
 

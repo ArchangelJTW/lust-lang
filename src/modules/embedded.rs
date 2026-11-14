@@ -407,7 +407,10 @@ fn collect_deps_from_lua_require_expr(expr: &crate::ast::Expr, deps: &mut HashSe
             collect_deps_from_lua_require_expr(start, deps);
             collect_deps_from_lua_require_expr(end, deps);
         }
-        ExprKind::Literal(Literal::String(_)) | ExprKind::Literal(_) | ExprKind::Identifier(_) => {}
+        ExprKind::Literal(Literal::String(_))
+        | ExprKind::Literal(_)
+        | ExprKind::Identifier(_)
+        | ExprKind::RegexLiteral { .. } => {}
         ExprKind::EffectBlock(stmts) => {
             for stmt in stmts {
                 collect_deps_from_lua_require_stmt(stmt, deps);
@@ -934,7 +937,7 @@ fn validate_dynamic_imports_in_expr(expr: &crate::ast::Expr, config: &crate::con
             validate_dynamic_imports_in_expr(start, config)?;
             validate_dynamic_imports_in_expr(end, config)?;
         }
-        ExprKind::Literal(_) | ExprKind::Identifier(_) => {}
+        ExprKind::Literal(_) | ExprKind::Identifier(_) | ExprKind::RegexLiteral { .. } => {}
         ExprKind::EffectBlock(stmts) => {
             for s in stmts {
                 validate_dynamic_imports_in_stmt(s, config)?;

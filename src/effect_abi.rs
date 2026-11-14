@@ -2,6 +2,9 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+#[path = "stdlib/sync.rs"]
+pub mod sync;
+
 /// Stable C-ABI version tag for first-class Lust effects (0x0001_0000 = v1.0).
 pub const LUST_EFFECT_ABI_V1: u32 = 0x0001_0000;
 
@@ -397,7 +400,12 @@ impl FiberContext {
     /// Returns true if delivered immediately, false if masked/deferred.
     pub fn request_interrupt(&mut self, reason: InterruptReason) -> bool {
         if self.is_masked() {
-            if self.pending_interrupt.is_none() {
+            if matches!(reason, InterruptReason::OutOfGas | InterruptReason::OutOfMemory) {
+                self.pending_interrupt = Some(reason);
+                self.state = FiberExecutionState::Interrupted;
+                return true;
+            }
+            if self.pending_interrupt.is_none_or(|old| interrupt_priority(reason) > interrupt_priority(old)) {
                 self.pending_interrupt = Some(reason);
             }
             false
@@ -406,6 +414,10 @@ impl FiberContext {
             true
         }
     }
+}
+
+fn interrupt_priority(reason: InterruptReason) -> u8 {
+    match reason { InterruptReason::Cancelled => 1, InterruptReason::Timeout => 2, InterruptReason::OutOfGas => 4, InterruptReason::OutOfMemory => 5 }
 }
 
 /// Schedule policy definition (immutable blueprint).

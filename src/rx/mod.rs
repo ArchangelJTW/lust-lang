@@ -6,6 +6,7 @@ pub mod clock;
 pub mod lifecycle;
 pub mod observable;
 pub mod scheduler;
+pub mod subject;
 pub mod timer;
 
 pub use buffer::{BoundedQueue, BufferOptions, EnqueueResult, MeasurableItem, OverflowStrategy};
@@ -18,6 +19,7 @@ pub use scheduler::{
     ParticipantId, ReadyTask, RxScheduler, ScopeJoinCoordinator,
     MUTATION_M3_EXECUTION_COUNT, MUTATION_M3_SKIP_CLOSED_CHECK, MutationM3Guard,
 };
+pub use subject::{Subject, SubjectOptions};
 pub use timer::{RxTimerService, TimerId};
 
 /// Core error types for the Reactive Streams subsystem.
@@ -193,9 +195,47 @@ impl RxEnvironment {
         self.scheduler.run_until_quiescent(max_steps)
     }
 
+    /// Create a hot multicast Subject in this environment.
+    pub fn subject<T, E>(&self) -> Subject<T, E>
+    where
+        T: MeasurableItem + Clone + Send + Sync + 'static,
+        E: Clone + Send + 'static,
+    {
+        Subject::new(self.scheduler.clone())
+    }
+
+    /// Create a hot multicast Subject with custom options in this environment.
+    pub fn subject_with_options<T, E>(&self, options: SubjectOptions) -> Subject<T, E>
+    where
+        T: MeasurableItem + Clone + Send + Sync + 'static,
+        E: Clone + Send + 'static,
+    {
+        Subject::with_options(self.scheduler.clone(), options)
+    }
+
     /// Shut down the scheduler.
     pub fn shutdown(&self) {
         self.scheduler.shutdown();
     }
 }
+
+/// Standard library symbol resolver for `@std/rx` / `std.rx`.
+pub fn resolve_rx_function(item_name: &str) -> Option<&'static str> {
+    match item_name {
+        "Subject" => Some("rx.Subject"),
+        "Observable" => Some("rx.Observable"),
+        "interval" => Some("rx.interval"),
+        _ => None,
+    }
+}
+
+/// Virtual standard module functions exposed by `@std/rx` / `std.rx`.
+pub fn virtual_rx_functions() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("Subject", "rx.Subject"),
+        ("Observable", "rx.Observable"),
+        ("interval", "rx.interval"),
+    ]
+}
+
 

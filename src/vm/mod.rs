@@ -4,8 +4,9 @@ pub(crate) mod cycle;
 #[cfg(feature = "std")]
 pub mod stdlib;
 mod task;
+pub mod cranelift_dispatch;
 use self::budget::BudgetState;
-pub use self::task::{FiberContinuation, TaskId, TaskInstance, TaskManager, TaskState, YieldReason};
+pub use self::task::{FiberContinuation, TaskId, TaskInstance, TaskManager, TaskState, WaitKey, YieldReason};
 pub(super) use crate::ast::{FieldOwnership, StructDef, Type, TypeKind};
 pub(super) use crate::bytecode::{
     FieldStorage, Function, Instruction, NativeCallResult, Register, StructLayout, TaskHandle,
@@ -41,7 +42,10 @@ mod tracing;
 // Used by the std-only extern stub writers (`externs`, `packages`).
 #[cfg(feature = "std")]
 pub(crate) use self::api::format_doc_comment;
-pub use self::api::{NativeExport, NativeExportParam};
+pub use self::api::{
+    NativeEffectSpec, NativeExport, NativeExportParam, NativeGasPolicy, NativeMemoryPolicy,
+    NativePurity,
+};
 pub use self::execution::{MUTATION_M1_EXECUTION_COUNT, MUTATION_M1_SKIP_GAS, MutationM1Guard};
 pub use self::tasks::{
     MUTATION_M2_EXECUTION_COUNT, MUTATION_M2_SKIP_PANIC_FINALIZER, MutationM2Guard,
@@ -233,10 +237,28 @@ pub(super) const TO_STRING_TRAIT: &str = "ToString";
 pub(super) const TO_STRING_METHOD: &str = "to_string";
 pub(super) const HASH_KEY_TRAIT: &str = "HashKey";
 pub(super) const HASH_KEY_METHOD: &str = "to_hashkey";
+
+/// Execution backend selection for VM runtime dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VmBackend {
+    /// Baseline Bytecode VM interpreter (with Dynasm trace JIT where supported).
+    #[default]
+    Bytecode,
+    /// Native Cranelift JIT compilation backend via Lust MIR.
+    Cranelift,
+}
+
 pub struct VM {
     // Retain the host runtime's lookup function across dynamic-library boundaries.
     // Each extension can have its own copy of CURRENT_VM_STACK.
     current_vm_lookup: fn() -> Option<*mut VM>,
+    pub backend: VmBackend,
+    pub cranelift_entry_count: u64,
+    pub cranelift_compilation_count: u64,
+    #[cfg(feature = "std")]
+    pub(crate) cranelift_jit: Option<crate::mir::cranelift_backend::jit_engine::CraneliftJitCompiler>,
+    pub mir_functions: HashMap<String, crate::mir::ir::MirFunction>,
+    pub cranelift_compiled: HashMap<String, *const u8>,
     pub(super) jit: JitState,
     /// Cells compiled code reads and writes through the VM pointer.
     pub(crate) jit_cells: crate::jit::JitCells,
@@ -312,6 +334,7 @@ pub struct VM {
     #[cfg(feature = "std")]
     pub console: crate::vfs::VirtualConsole,
     pub quantum_fuel: Option<u64>,
+    pub config: crate::config::LustConfig,
 }
 
 pub type HostResourceCleanupFn = fn(usize);
@@ -320,12 +343,15 @@ pub type HostResourceCleanupFn = fn(usize);
 pub struct HostResourceSlot {
     pub handle: usize,
     pub cleanup: HostResourceCleanupFn,
+    pub generation: u32,
+    pub scope_id: u64,
     pub active: bool,
 }
 
 pub struct TrustedHostResourceLedger {
     pub slots: [HostResourceSlot; 256],
     pub count: usize,
+    pub next_generation: u32,
 }
 
 impl Default for TrustedHostResourceLedger {
@@ -340,9 +366,12 @@ impl TrustedHostResourceLedger {
             slots: [HostResourceSlot {
                 handle: 0,
                 cleanup: |_| {},
+                generation: 1,
+                scope_id: 0,
                 active: false,
             }; 256],
             count: 0,
+            next_generation: 1,
         }
     }
 
@@ -351,10 +380,25 @@ impl TrustedHostResourceLedger {
         handle: usize,
         cleanup: HostResourceCleanupFn,
     ) -> crate::error::Result<usize> {
+        self.acquire_scoped(handle, cleanup, 0)
+    }
+
+    pub fn acquire_scoped(
+        &mut self,
+        handle: usize,
+        cleanup: HostResourceCleanupFn,
+        scope_id: u64,
+    ) -> crate::error::Result<usize> {
         for (idx, slot) in self.slots.iter_mut().enumerate() {
             if !slot.active {
                 slot.handle = handle;
                 slot.cleanup = cleanup;
+                slot.generation = self.next_generation;
+                self.next_generation = self.next_generation.wrapping_add(1);
+                if self.next_generation == 0 {
+                    self.next_generation = 1;
+                }
+                slot.scope_id = scope_id;
                 slot.active = true;
                 self.count += 1;
                 return Ok(idx);
@@ -376,6 +420,18 @@ impl TrustedHostResourceLedger {
         }
     }
 
+    pub fn cleanup_scope(&mut self, scope_id: u64) {
+        for slot in self.slots.iter_mut().rev() {
+            if slot.active && slot.scope_id == scope_id {
+                slot.active = false;
+                (slot.cleanup)(slot.handle);
+                if self.count > 0 {
+                    self.count -= 1;
+                }
+            }
+        }
+    }
+
     pub fn cleanup_all(&mut self) {
         for slot in self.slots.iter_mut() {
             if slot.active {
@@ -388,6 +444,16 @@ impl TrustedHostResourceLedger {
 }
 
 impl VM {
+    #[inline]
+    pub fn config(&self) -> &crate::config::LustConfig {
+        &self.config
+    }
+
+    #[inline]
+    pub fn charge_gas(&mut self, amount: u64) -> crate::error::Result<()> {
+        self.budgets.charge_gas(amount)
+    }
+
     /// Whether the VM is currently idle (no executing call frame, native callback, or JIT code).
     #[inline]
     pub fn is_idle(&self) -> bool {
@@ -402,14 +468,108 @@ impl VM {
 
     /// Whether JIT execution is effectively active.
     ///
-    /// When a memory budget is active, the effective execution policy switches to
-    /// the interpreter (Stage A) so existing logical array and growth checks apply.
-    /// This does not charge all allocations or guarantee RSS/physical memory containment;
-    /// other allocation classes and complete process containment are out of scope.
+    /// When a memory budget is active or Cranelift backend is selected, effective
+    /// Dynasm JIT execution is bypassed.
     #[inline]
     pub fn effective_jit_enabled(&self) -> bool {
-        self.jit.enabled && !self.budgets.mem_budget_enabled() && self.quantum_fuel.is_none()
+        self.jit.enabled
+            && self.backend != VmBackend::Cranelift
+            && !self.budgets.mem_budget_enabled()
+            && self.quantum_fuel.is_none()
     }
+
+    /// Sets the execution backend for VM runtime dispatch.
+    #[inline]
+    pub fn set_backend(&mut self, backend: VmBackend) {
+        self.backend = backend;
+    }
+
+    /// Returns the current execution backend.
+    #[inline]
+    pub fn backend(&self) -> VmBackend {
+        self.backend
+    }
+
+    /// Sets JIT backend (alias for `set_backend`).
+    #[inline]
+    pub fn set_jit_backend(&mut self, backend: VmBackend) {
+        self.backend = backend;
+    }
+
+    /// Builder-style backend configuration.
+    #[inline]
+    pub fn with_backend(mut self, backend: VmBackend) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    /// Loads a MIR function into the VM, automatically generating its bytecode representation
+    /// for interpreter oracle parity while registering it for native Cranelift JIT compilation.
+    pub fn load_mir_function(&mut self, mir_fn: crate::mir::ir::MirFunction) -> Result<()> {
+        let mut direct_callees: hashbrown::HashSet<String> =
+            self.functions.iter().map(|f| f.name.clone()).collect();
+        direct_callees.extend(self.mir_functions.keys().cloned());
+        direct_callees.insert(mir_fn.signature.name.clone());
+        self.load_mir_function_with_callees(mir_fn, &direct_callees)
+    }
+
+    fn load_mir_function_with_callees(
+        &mut self,
+        mir_fn: crate::mir::ir::MirFunction,
+        direct_callees: &hashbrown::HashSet<String>,
+    ) -> Result<()> {
+        let name = mir_fn.signature.name.clone();
+        let bytecode_fn = crate::mir::vm_backend::MirToBytecodeCompiler::compile_with_direct_callees(
+            &mir_fn,
+            direct_callees,
+        )
+        .map_err(|e| LustError::RuntimeError {
+            message: format!("Failed to lower MIR function '{}' to bytecode: {:?}", name, e),
+        })?;
+        let meta = CallMeta::of(&bytecode_fn);
+        let func_idx = if let Some(pos) = self.functions.iter().position(|f| f.name == name) {
+            let mut bytecode_fn = bytecode_fn;
+            bytecode_fn.is_method = self.functions[pos].is_method;
+            self.functions[pos] = bytecode_fn;
+            if pos < self.call_meta.len() {
+                self.call_meta[pos] = meta;
+            } else {
+                self.call_meta.push(meta);
+            }
+            pos
+        } else {
+            let idx = self.functions.len();
+            self.functions.push(bytecode_fn);
+            self.call_meta.push(meta);
+            idx
+        };
+        self.globals.insert(name.clone(), Value::Function(func_idx));
+        self.globals_version = self.globals_version.wrapping_add(1);
+        self.jit.reset_function_tables(self.functions.len());
+        self.jit_cells.entry_table = self.jit.function_entry_table();
+        self.mir_functions.insert(name, mir_fn);
+        #[cfg(feature = "std")]
+        {
+            self.cranelift_jit = None;
+            self.cranelift_compiled.clear();
+        }
+        Ok(())
+    }
+
+    /// Loads all functions from a MIR module into the VM.
+    pub fn load_mir_module(&mut self, module: &crate::mir::ir::MirModule) -> Result<()> {
+        let mut direct_callees: hashbrown::HashSet<String> =
+            self.functions.iter().map(|f| f.name.clone()).collect();
+        direct_callees.extend(self.mir_functions.keys().cloned());
+        for mir_fn in &module.functions {
+            direct_callees.insert(mir_fn.signature.name.clone());
+        }
+        for mir_fn in &module.functions {
+            self.load_mir_function_with_callees(mir_fn.clone(), &direct_callees)?;
+        }
+        Ok(())
+    }
+
 
     #[inline]
     pub(crate) fn enter_native_scope(&mut self) -> ActiveNativeGuard {

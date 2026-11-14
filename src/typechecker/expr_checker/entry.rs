@@ -87,6 +87,10 @@ impl TypeChecker {
                     return Ok(const_type);
                 }
 
+                if name == "s" || name == "schema" {
+                    return Ok(Type::new(TypeKind::Named("SchemaBuilder".to_string()), expr.span));
+                }
+
                 if self.prelude_mode == crate::config::PreludeMode::Pure
                     && self.env.lookup_variable(name).is_none()
                     && self.env.lookup_function(&self.resolve_function_key(name)).is_none()
@@ -398,6 +402,17 @@ impl TypeChecker {
                     },
                     expr.span,
                 ))
+            }
+
+            ExprKind::RegexLiteral { pattern, span } => {
+                #[cfg(feature = "std")]
+                if let Err(err) = crate::regex::compile_bounded(pattern) {
+                    return Err(self.type_error_at(
+                        format!("Invalid regex pattern '{}': {}", pattern, err),
+                        *span,
+                    ));
+                }
+                Ok(Type::new(TypeKind::Named("Regex".to_string()), *span))
             }
         }
     }

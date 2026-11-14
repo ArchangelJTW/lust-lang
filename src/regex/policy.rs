@@ -9,7 +9,9 @@ pub const POLL_INTERVAL_WORK_UNITS: u64 = 4096;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegexError {
     UnsupportedPattern(String),
+    UnsupportedBackendFeature(String),
     PatternTooLarge(usize),
+    NestingTooDeep(usize),
     TooManyCaptureGroups(usize),
     BudgetExceeded { limit: u64, consumed: u64 },
     SyntaxError(String),
@@ -22,8 +24,14 @@ impl std::fmt::Display for RegexError {
             RegexError::UnsupportedPattern(p) => {
                 write!(f, "Unsupported regex pattern (requires backtracking/NFA fallback): {}", p)
             }
+            RegexError::UnsupportedBackendFeature(msg) => {
+                write!(f, "Unsupported regex backend feature: {}", msg)
+            }
             RegexError::PatternTooLarge(size) => {
                 write!(f, "Pattern size {} bytes exceeds limit of {} bytes", size, MAX_PATTERN_BYTES)
+            }
+            RegexError::NestingTooDeep(depth) => {
+                write!(f, "Pattern nesting depth {} exceeds maximum {}", depth, MAX_NESTING_DEPTH)
             }
             RegexError::TooManyCaptureGroups(g) => {
                 write!(f, "Capture groups {} exceeds maximum {}", g, MAX_CAPTURE_GROUPS)
@@ -47,6 +55,8 @@ pub struct RegexWorkTracker {
     pub bytes_copied: u64,
     pub max_budget: u64,
     pub units_since_poll: u64,
+    pub poll_count: u64,
+    pub cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl RegexWorkTracker {
@@ -74,7 +84,14 @@ impl RegexWorkTracker {
             bytes_copied: 0,
             max_budget: work,
             units_since_poll: 0,
+            poll_count: 0,
+            cancellation: None,
         })
+    }
+
+    pub fn with_cancellation(mut self, token: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cancellation = Some(token);
+        self
     }
 
     pub fn total_work(&self) -> u64 {
@@ -104,6 +121,17 @@ impl RegexWorkTracker {
         self.on_work_charged(count)
     }
 
+    pub fn poll(&mut self) -> Result<(), RegexError> {
+        self.poll_count = self.poll_count.saturating_add(1);
+        self.units_since_poll = 0;
+        if let Some(token) = &self.cancellation {
+            if token.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(RegexError::Interrupted);
+            }
+        }
+        Ok(())
+    }
+
     fn on_work_charged(&mut self, count: u64) -> Result<(), RegexError> {
         let total = self.total_work();
         if total > self.max_budget {
@@ -114,8 +142,14 @@ impl RegexWorkTracker {
         }
         self.units_since_poll = self.units_since_poll.saturating_add(count);
         if self.units_since_poll >= POLL_INTERVAL_WORK_UNITS {
+            self.poll_count = self.poll_count.saturating_add(self.units_since_poll / POLL_INTERVAL_WORK_UNITS);
             self.units_since_poll %= POLL_INTERVAL_WORK_UNITS;
-            // Interruption hook point
+            // Interruption hook point every <= 4096 work units
+            if let Some(token) = &self.cancellation {
+                if token.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(RegexError::Interrupted);
+                }
+            }
         }
         Ok(())
     }

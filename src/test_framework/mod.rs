@@ -10,6 +10,9 @@ pub mod diff;
 pub mod mock;
 pub mod reporters;
 pub mod runner;
+pub mod bench;
+pub mod snap;
+pub mod junit;
 
 pub use asserts::{
     assert, assert_almost_eq, assert_dies, assert_eq, assert_fails, assert_interrupted,

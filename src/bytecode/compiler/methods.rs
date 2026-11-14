@@ -248,7 +248,7 @@ fn validate_and_find_captures_in_expr(
     free_vars: &mut HashSet<String>,
 ) -> Result<()> {
     match &expr.kind {
-        ExprKind::Literal(_) => Ok(()),
+        ExprKind::Literal(_) | ExprKind::RegexLiteral { .. } => Ok(()),
         ExprKind::Identifier(name) => {
             if !locally_bound.contains(name) {
                 free_vars.insert(name.clone());

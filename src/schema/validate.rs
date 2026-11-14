@@ -35,34 +35,24 @@ pub fn validate_ir(
                     }
                 }
                 if let Some(pattern) = regex {
-                    match crate::regex::BoundedRegex::new(pattern) {
-                        Ok(re) => match re.is_match(s) {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                errors.push(
-                                    ValidationError::new(
-                                        path.clone(),
-                                        format!("String does not match pattern '{}'", pattern),
-                                        "regex_mismatch",
-                                    )
-                                    .with_received(s.clone()),
-                                );
-                                valid = false;
-                            }
-                            Err(e) => {
-                                errors.push(ValidationError::new(
+                    match crate::schema::pattern::matches_pattern(pattern, crate::schema::pattern::PatternMode::FullMatch, s) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            errors.push(
+                                ValidationError::new(
                                     path.clone(),
-                                    format!("Regex execution error: {}", e),
-                                    "regex_error",
-                                ));
-                                valid = false;
-                            }
-                        },
+                                    format!("String does not match pattern '{}'", pattern),
+                                    "regex_mismatch",
+                                )
+                                .with_received(s.clone()),
+                            );
+                            valid = false;
+                        }
                         Err(e) => {
                             errors.push(ValidationError::new(
                                 path.clone(),
-                                format!("Invalid regex pattern '{}': {}", pattern, e),
-                                "invalid_regex",
+                                format!("Regex execution error: {}", e),
+                                "regex_error",
                             ));
                             valid = false;
                         }
@@ -592,6 +582,39 @@ pub fn validate_ir(
                             .with_received(format!("{:?}", inner_val)),
                     );
                     None
+                }
+            } else {
+                None
+            }
+        }
+
+        SchemaIR::Pattern { inner, pattern, mode } => {
+            if let Some(inner_val) = validate_ir(inner, value, path, errors) {
+                if let DataValue::String(s) = &inner_val {
+                    match crate::schema::pattern::matches_pattern(pattern, *mode, s) {
+                        Ok(true) => Some(inner_val),
+                        Ok(false) => {
+                            errors.push(
+                                ValidationError::new(
+                                    path.clone(),
+                                    format!("String does not match pattern '{}'", pattern),
+                                    "regex_mismatch",
+                                )
+                                .with_received(s.clone()),
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            errors.push(ValidationError::new(
+                                path.clone(),
+                                format!("Regex execution error: {}", e),
+                                "regex_error",
+                            ));
+                            None
+                        }
+                    }
+                } else {
+                    Some(inner_val)
                 }
             } else {
                 None

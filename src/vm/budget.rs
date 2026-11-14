@@ -265,8 +265,20 @@ impl VM {
             .map(|limit| limit.saturating_sub(self.budgets.memory.used_bytes))
     }
 
-    pub(crate) fn try_charge_memory_bytes(&mut self, bytes: usize) -> bool {
+    pub fn memory_budget_bytes(&self) -> Option<usize> {
+        self.budgets.memory.limit_bytes
+    }
+
+    pub fn memory_used(&self) -> usize {
+        self.budgets.memory.used_bytes
+    }
+
+    pub fn try_charge_memory_bytes(&mut self, bytes: usize) -> bool {
         self.budgets.try_charge_mem_bytes(bytes)
+    }
+
+    pub fn refund_memory_bytes(&mut self, bytes: usize) {
+        self.budgets.memory.used_bytes = self.budgets.memory.used_bytes.saturating_sub(bytes);
     }
 
     pub(crate) fn try_charge_memory_value_vec(&mut self, element_count: usize) -> bool {

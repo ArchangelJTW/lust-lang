@@ -1322,6 +1322,9 @@ impl<'a> AstLowering<'a> {
                 Literal::Bool(b) => Operand::Constant(MirConstant::Bool(*b)),
                 Literal::String(s) => Operand::Constant(MirConstant::String(s.clone())),
             }),
+            ExprKind::RegexLiteral { pattern, .. } => {
+                Ok(Operand::Constant(MirConstant::String(pattern.clone())))
+            }
             ExprKind::Identifier(name) => {
                 if let Some(loc_id) = self.lookup_var(name) {
                     Ok(Operand::Copy(Place::Local(loc_id)))
@@ -1856,6 +1859,18 @@ impl<'a> AstLowering<'a> {
                 self.current_block = succ_bb;
                 Ok(Operand::Move(Place::Local(temp)))
             }
+            ExprKind::Cast { expr: inner, target_type } => {
+                let inner_op = self.lower_expr(inner)?;
+                let mir_target_ty = mir_type_from_ast(target_type);
+                let temp = self.current_fn.add_local(None, mir_target_ty.clone(), true, expr.span);
+                self.emit_stmt(Statement::StorageLive(temp, expr.span));
+                self.emit_stmt(Statement::Assign(
+                    Place::Local(temp),
+                    Rvalue::Cast(inner_op, mir_target_ty),
+                    expr.span,
+                ));
+                Ok(Operand::Move(Place::Local(temp)))
+            }
             _ => Err(MirLowerError::UnlowerableExpression(format!("{:?}", expr.kind))),
         }
     }
@@ -2027,7 +2042,7 @@ fn validate_and_find_captures_in_expr(
     free_vars: &mut HashSet<String>,
 ) -> Result<(), MirLowerError> {
     match &expr.kind {
-        ExprKind::Literal(_) => Ok(()),
+        ExprKind::Literal(_) | ExprKind::RegexLiteral { .. } => Ok(()),
         ExprKind::Identifier(name) => {
             if !locally_bound.contains(name) {
                 free_vars.insert(name.clone());
@@ -2292,6 +2307,11 @@ pub fn mir_type_from_ast(ty: &Type) -> MirType {
             return_type: Box::new(mir_type_from_ast(success)),
             error_type: Box::new(mir_type_from_ast(error)),
         },
+        TypeKind::Typeof(s) => MirType::Struct(s.clone()),
+        TypeKind::InferType(inner) | TypeKind::InferInput(inner) | TypeKind::InferOutput(inner) => {
+            mir_type_from_ast(inner)
+        }
+        TypeKind::Schema { output, .. } => mir_type_from_ast(output),
         _ => MirType::Int,
     }
 }

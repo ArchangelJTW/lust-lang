@@ -114,21 +114,6 @@ path = "examples/schemas/03_messagepack_binary.rs"
 required-features = ["std"]
 
 [[example]]
-name = "rx_observables"
-path = "examples/rx/01_observables_basics.rs"
-required-features = ["std"]
-
-[[example]]
-name = "rx_operators"
-path = "examples/rx/02_operators_filter_map.rs"
-required-features = ["std"]
-
-[[example]]
-name = "rx_backpressure"
-path = "examples/rx/03_backpressure_buffers.rs"
-required-features = ["std"]
-
-[[example]]
 name = "sim_scheduler"
 path = "examples/simulation/01_deterministic_scheduler.rs"
 required-features = ["std"]

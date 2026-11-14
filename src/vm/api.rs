@@ -33,12 +33,69 @@ impl NativeExportParam {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativePurity {
+    Pure,
+    Effectful,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeEffectSpec {
+    pub purity: NativePurity,
+    pub error_type: Option<String>,
+    pub requirements: Vec<String>,
+    pub required_capability: Option<String>,
+    pub deterministic: bool,
+}
+
+impl NativeEffectSpec {
+    pub fn pure() -> Self {
+        Self {
+            purity: NativePurity::Pure,
+            error_type: None,
+            requirements: Vec::new(),
+            required_capability: None,
+            deterministic: true,
+        }
+    }
+
+    pub fn effectful(error_type: Option<impl Into<String>>, requirements: Vec<String>) -> Self {
+        Self {
+            purity: NativePurity::Effectful,
+            error_type: error_type.map(Into::into),
+            requirements,
+            required_capability: None,
+            deterministic: false,
+        }
+    }
+
+    pub fn with_capability(mut self, cap: impl Into<String>) -> Self {
+        self.required_capability = Some(cap.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeGasPolicy {
+    None,
+    Fixed(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeMemoryPolicy {
+    None,
+    MaxAllocBytes(usize),
+}
+
 #[derive(Debug, Clone)]
 pub struct NativeExport {
     name: String,
     params: Vec<NativeExportParam>,
     return_type: String,
     doc: Option<String>,
+    pub effects: Option<NativeEffectSpec>,
+    pub gas_policy: Option<NativeGasPolicy>,
+    pub memory_policy: Option<NativeMemoryPolicy>,
 }
 
 impl NativeExport {
@@ -52,11 +109,29 @@ impl NativeExport {
             params,
             return_type: return_type.into(),
             doc: None,
+            effects: None,
+            gas_policy: None,
+            memory_policy: None,
         }
     }
 
     pub fn with_doc(mut self, doc: impl Into<String>) -> Self {
         self.doc = Some(doc.into());
+        self
+    }
+
+    pub fn with_effects(mut self, effects: NativeEffectSpec) -> Self {
+        self.effects = Some(effects);
+        self
+    }
+
+    pub fn with_gas_policy(mut self, policy: NativeGasPolicy) -> Self {
+        self.gas_policy = Some(policy);
+        self
+    }
+
+    pub fn with_memory_policy(mut self, policy: NativeMemoryPolicy) -> Self {
+        self.memory_policy = Some(policy);
         self
     }
 
@@ -74,6 +149,18 @@ impl NativeExport {
 
     pub fn doc(&self) -> Option<&str> {
         self.doc.as_deref()
+    }
+
+    pub fn effects(&self) -> Option<&NativeEffectSpec> {
+        self.effects.as_ref()
+    }
+
+    pub fn gas_policy(&self) -> Option<&NativeGasPolicy> {
+        self.gas_policy.as_ref()
+    }
+
+    pub fn memory_policy(&self) -> Option<&NativeMemoryPolicy> {
+        self.memory_policy.as_ref()
     }
 }
 
@@ -118,6 +205,29 @@ impl VM {
     pub fn with_config(config: &LustConfig) -> Self {
         let mut vm = Self {
             current_vm_lookup: super::current_vm_ptr,
+            backend: {
+                #[cfg(feature = "std")]
+                {
+                    if std::env::var("LUST_JIT_BACKEND").as_deref() == Ok("cranelift")
+                        || std::env::var("LUST_BACKEND").as_deref() == Ok("cranelift")
+                        || config.cranelift_jit()
+                    {
+                        super::VmBackend::Cranelift
+                    } else {
+                        super::VmBackend::Bytecode
+                    }
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    super::VmBackend::Bytecode
+                }
+            },
+            cranelift_entry_count: 0,
+            cranelift_compilation_count: 0,
+            #[cfg(feature = "std")]
+            cranelift_jit: None,
+            mir_functions: HashMap::new(),
+            cranelift_compiled: HashMap::new(),
             jit: JitState::new(),
             budgets: BudgetState::default(),
             functions: Vec::new(),
@@ -173,6 +283,7 @@ impl VM {
             #[cfg(feature = "std")]
             console: crate::vfs::VirtualConsole::new(),
             quantum_fuel: None,
+            config: config.clone(),
         };
         vm.cycle_collector.set_enabled(config.gc_enabled());
         if config.use_mir() {
@@ -751,6 +862,10 @@ impl VM {
         let params = export.params.clone();
         let return_type = export.return_type.clone();
         let type_module = self.export_prefix();
+        let effects = export.effects.clone();
+        let gas_policy = export.gas_policy.clone();
+        let memory_policy = export.memory_policy.clone();
+        let fn_name = name.clone();
         self.push_export_metadata(export);
         let native = Value::NativeFunction(native_fn(move |args| {
             if args.len() != params.len() {
@@ -761,6 +876,58 @@ impl VM {
                 ));
             }
             VM::with_current(|vm| {
+                if let Some(spec) = &effects {
+                    if vm.config().prelude_mode() == &crate::config::PreludeMode::Pure
+                        && spec.purity == NativePurity::Effectful
+                    {
+                        return Err(format!(
+                            "PurityViolation: effectful native function '{}' not allowed in PreludeMode::Pure",
+                            fn_name
+                        ));
+                    }
+                    if let Some(req_cap) = &spec.required_capability {
+                        let caps = vm.config().capability_mask();
+                        let allowed = match req_cap.as_str() {
+                            "net" => caps.allow_net,
+                            "fs" => caps.allow_fs,
+                            "io" => caps.allow_io || caps.allow_fs,
+                            "os" => caps.allow_os,
+                            "task" => caps.allow_task,
+                            "test" => caps.allow_test,
+                            "ffi" => caps.allow_ffi,
+                            other => caps.custom_capabilities.contains(other) || vm.config().is_std_module_allowed(other),
+                        };
+                        if !allowed {
+                            return Err(format!(
+                                "CapabilityDenied: native function '{}' requires capability '{}'",
+                                fn_name, req_cap
+                            ));
+                        }
+                    }
+                }
+
+                if let Some(policy) = &gas_policy {
+                    match policy {
+                        NativeGasPolicy::Fixed(gas) => {
+                            if vm.charge_gas(*gas).is_err() {
+                                return Err("Out of gas".to_string());
+                            }
+                        }
+                        NativeGasPolicy::None => {}
+                    }
+                }
+
+                if let Some(policy) = &memory_policy {
+                    match policy {
+                        NativeMemoryPolicy::MaxAllocBytes(max_bytes) => {
+                            if vm.memory_budget_bytes().is_some() && !vm.try_charge_memory_bytes(*max_bytes) {
+                                return Err("Out of memory budget".to_string());
+                            }
+                        }
+                        NativeMemoryPolicy::None => {}
+                    }
+                }
+
                 for (index, (value, param)) in args.iter().zip(&params).enumerate() {
                     if !vm.value_is_export_type(value, param.ty(), type_module.as_deref()) {
                         return Err(format!(
@@ -774,6 +941,41 @@ impl VM {
 
                 let outcome = func(args)?;
                 if let NativeCallResult::Return(value) = &outcome {
+                    if let Value::Map(m) = value {
+                        let borrowed = m.borrow();
+                        let key_effect = ValueKey::from(String::from("__effect"));
+                        let key_kind = ValueKey::from(String::from("__kind"));
+                        let is_effect = matches!(borrowed.get(&key_effect), Some(Value::Bool(true)));
+                        if is_effect {
+                            let is_fail = match borrowed.get(&key_kind) {
+                                Some(Value::String(s)) => s.as_str() == "fail",
+                                _ => false,
+                            };
+                            match &effects {
+                                None => {
+                                    return Err(format!(
+                                        "UndeclaredEffect: native function '{}' produced an effect but has no declared effect signature",
+                                        fn_name
+                                    ));
+                                }
+                                Some(spec) => {
+                                    if spec.purity == NativePurity::Pure {
+                                        return Err(format!(
+                                            "UndeclaredEffect: native function '{}' produced an effect but was declared Pure",
+                                            fn_name
+                                        ));
+                                    }
+                                    if is_fail && spec.error_type.is_none() {
+                                        return Err(format!(
+                                            "UndeclaredEffectError: native function '{}' produced an effect error, but declared no error type",
+                                            fn_name
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let expected = if return_type.trim().is_empty() {
                         "()"
                     } else {
@@ -952,25 +1154,27 @@ impl VM {
     }
 
     pub fn call(&mut self, function_name: &str, args: Vec<Value>) -> Result<Value> {
-        let func_idx = self
-            .functions
-            .iter()
-            .position(|f| f.name == function_name)
-            .ok_or_else(|| LustError::RuntimeError {
-                message: format!("Function not found: {}", function_name),
-            })?;
-        self.call_function_index(func_idx, args)
+        if let Some(func_idx) = self.functions.iter().position(|f| f.name == function_name) {
+            return self.call_function_index(func_idx, args);
+        }
+        if let Some(val) = self.natives.get(function_name).cloned().or_else(|| self.globals.get(function_name).cloned()) {
+            return self.call_value(&val, args);
+        }
+        Err(LustError::RuntimeError {
+            message: format!("Function not found: {}", function_name),
+        })
     }
 
     pub fn call_slice(&mut self, function_name: &str, args: &[Value]) -> Result<Value> {
-        let func_idx = self
-            .functions
-            .iter()
-            .position(|f| f.name == function_name)
-            .ok_or_else(|| LustError::RuntimeError {
-                message: format!("Function not found: {}", function_name),
-            })?;
-        self.call_function_index_slice(func_idx, args)
+        if let Some(func_idx) = self.functions.iter().position(|f| f.name == function_name) {
+            return self.call_function_index_slice(func_idx, args);
+        }
+        if let Some(val) = self.natives.get(function_name).cloned().or_else(|| self.globals.get(function_name).cloned()) {
+            return self.call_value(&val, args.to_vec());
+        }
+        Err(LustError::RuntimeError {
+            message: format!("Function not found: {}", function_name),
+        })
     }
 
     pub(crate) fn functions(&self) -> &[Function] {

@@ -134,6 +134,7 @@ pub struct CapabilityMask {
     pub allow_net: bool,
     pub allow_task: bool,
     pub allow_test: bool,
+    pub allow_ffi: bool,
     pub custom_capabilities: HashSet<String>,
 }
 
@@ -146,6 +147,7 @@ impl Default for CapabilityMask {
             allow_net: true,
             allow_task: true,
             allow_test: true,
+            allow_ffi: true,
             custom_capabilities: HashSet::new(),
         }
     }
@@ -159,6 +161,7 @@ impl std::hash::Hash for CapabilityMask {
         self.allow_net.hash(state);
         self.allow_task.hash(state);
         self.allow_test.hash(state);
+        self.allow_ffi.hash(state);
         let mut customs: Vec<&String> = self.custom_capabilities.iter().collect();
         customs.sort();
         customs.hash(state);
@@ -174,6 +177,7 @@ impl CapabilityMask {
             allow_net: false,
             allow_task: false,
             allow_test: false,
+            allow_ffi: false,
             custom_capabilities: HashSet::new(),
         }
     }
@@ -200,6 +204,7 @@ pub struct LustConfig {
     minimal_runtime_types: bool,
     use_mir: bool,
     strict_mir: bool,
+    cranelift_jit: bool,
     #[cfg(feature = "std")]
     dependencies: Vec<DependencySpec>,
 }
@@ -233,6 +238,7 @@ impl Default for LustConfig {
             minimal_runtime_types: false,
             use_mir: false,
             strict_mir: false,
+            cranelift_jit: false,
             #[cfg(feature = "std")]
             dependencies: Vec::new(),
         }
@@ -297,6 +303,10 @@ impl LustConfig {
         &self.capability_mask
     }
 
+    pub fn capabilities(&self) -> &CapabilityMask {
+        &self.capability_mask
+    }
+
     pub fn capability_mask_mut(&mut self) -> &mut CapabilityMask {
         &mut self.capability_mask
     }
@@ -352,6 +362,12 @@ impl LustConfig {
             "test" => {
                 self.capability_mask.allow_test = true;
             }
+            "ffi" => {
+                self.capability_mask.allow_ffi = true;
+            }
+            "random" => {
+                self.capability_mask.custom_capabilities.insert("random".to_string());
+            }
             other => {
                 self.capability_mask.custom_capabilities.insert(other.to_string());
             }
@@ -385,10 +401,12 @@ impl LustConfig {
         if self.strict_capabilities {
             return self.is_module_enabled(&key)
                 || self.capability_mask.custom_capabilities.contains(&key)
-                || (key == "io" && self.capability_mask.allow_io)
+                || (key == "io" && (self.capability_mask.allow_io || self.capability_mask.allow_fs))
                 || (key == "os" && self.capability_mask.allow_os)
                 || (key == "task" && self.capability_mask.allow_task)
-                || (key == "test" && self.capability_mask.allow_test);
+                || (key == "test" && self.capability_mask.allow_test)
+                || (key == "ffi" && self.capability_mask.allow_ffi)
+                || (key == "random" && self.capability_mask.custom_capabilities.contains("random"));
         }
 
         match &self.prelude_mode {
@@ -526,6 +544,22 @@ impl LustConfig {
         self
     }
 
+    pub fn cranelift_jit(&self) -> bool {
+        self.cranelift_jit
+    }
+
+    pub fn set_cranelift_jit(&mut self, enabled: bool) {
+        self.cranelift_jit = enabled;
+        if enabled {
+            self.use_mir = true;
+        }
+    }
+
+    pub fn with_cranelift_jit(mut self, enabled: bool) -> Self {
+        self.set_cranelift_jit(enabled);
+        self
+    }
+
     pub fn with_enabled_modules<I, S>(modules: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -657,6 +691,7 @@ impl LustConfig {
             minimal_runtime_types: false,
             use_mir: use_mir_val,
             strict_mir: strict_mir_val,
+            cranelift_jit: false,
             dependencies,
         })
     }

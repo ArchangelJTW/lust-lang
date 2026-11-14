@@ -101,6 +101,7 @@ impl Compiler {
                             ItemKind::Module { .. } => {}
                             ItemKind::Service(_) => {}
                             ItemKind::Test(_) | ItemKind::Suite(_) => {}
+                            ItemKind::Schema(_) | ItemKind::TypeAlias { .. } => {}
                         }
                     }
 
@@ -192,6 +193,7 @@ impl Compiler {
                 ItemKind::Use { .. } => {}
                 ItemKind::Service(_) => {}
                 ItemKind::Test(_) | ItemKind::Suite(_) => {}
+                ItemKind::Schema(_) | ItemKind::TypeAlias { .. } => {}
             }
         }
 
@@ -351,6 +353,43 @@ impl Compiler {
         }
     }
 
+    fn resolve_mir_callees(&self, mir_fn: &mut crate::mir::ir::MirFunction) {
+        let module_name = self.module_scope_name();
+        let imports = module_name.and_then(|m| self.imports_by_module.get(m));
+
+        for block in &mut mir_fn.blocks {
+            let Some(crate::mir::ir::Terminator::Call { callee, .. }) = &mut block.terminator
+            else {
+                continue;
+            };
+
+            if !callee.contains('.') {
+                if let Some(fq) = imports
+                    .and_then(|imp| imp.function_aliases.get(callee.as_str()))
+                    && self.function_table.contains_key(fq)
+                {
+                    *callee = fq.clone();
+                    continue;
+                }
+                if let Some(m) = module_name {
+                    let cand = format!("{m}.{callee}");
+                    if self.function_table.contains_key(&cand) {
+                        *callee = cand;
+                    }
+                }
+            } else if !self.function_table.contains_key(callee.as_str())
+                && let Some((mod_alias, fn_name)) = callee.split_once('.')
+                && let Some(real_mod) =
+                    imports.and_then(|imp| imp.module_aliases.get(mod_alias))
+            {
+                let cand = format!("{real_mod}.{fn_name}");
+                if self.function_table.contains_key(&cand) {
+                    *callee = cand;
+                }
+            }
+        }
+    }
+
     pub(super) fn compile_function(
         &mut self,
         func_idx: usize,
@@ -360,13 +399,20 @@ impl Compiler {
             match crate::mir::AstLowering::lower_function(func_def) {
                 Ok(mut mir_fn) => {
                     mir_fn.signature.name = self.functions[func_idx].name.clone();
+                    self.resolve_mir_callees(&mut mir_fn);
                     match crate::mir::MirVerifier::verify_fn(&mir_fn) {
                         Ok(_) => {
                             crate::mir::MirOptimizer::optimize_function(&mut mir_fn);
-                            match crate::mir::MirToBytecodeCompiler::compile(&mir_fn) {
+                            let direct_callees: hashbrown::HashSet<String> =
+                                self.function_table.keys().cloned().collect();
+                            match crate::mir::MirToBytecodeCompiler::compile_with_direct_callees(
+                                &mir_fn,
+                                &direct_callees,
+                            ) {
                                 Ok(mut bytecode_fn) => {
                                     bytecode_fn.is_method = self.functions[func_idx].is_method;
                                     self.functions[func_idx] = bytecode_fn;
+                                    self.mir_functions.push(mir_fn);
                                     return Ok(());
                                 }
                                 Err(err) => {

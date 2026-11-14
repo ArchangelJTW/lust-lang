@@ -16,6 +16,15 @@ use alloc::{
     vec::Vec,
 };
 use core::{matches, unreachable};
+
+fn is_placeholder(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Identifier(name) => name == "_",
+        ExprKind::Paren(inner) => is_placeholder(inner),
+        _ => false,
+    }
+}
+
 impl Parser {
     fn span_through_previous(&self, start: Span) -> Span {
         let end = &self.tokens[self.current - 1];
@@ -44,54 +53,526 @@ impl Parser {
         let mut expr = self.parse_logical_or()?;
         while self.match_token(&[TokenKind::PipeGreater]) {
             let right = self.parse_logical_or()?;
-            let span = self.span_through_previous(expr.span);
-            match right.kind {
-                ExprKind::Call {
-                    callee,
-                    type_args,
-                    mut args,
-                } => {
+            expr = self.desugar_pipe_step(expr, right)?;
+        }
+
+        self.desugar_currying(expr)
+    }
+
+    fn desugar_pipe_step(&mut self, expr: Expr, right: Expr) -> Result<Expr> {
+        let span = self.span_through_previous(expr.span);
+        if is_placeholder(&expr) {
+            return Err(self.error("Placeholder '_' cannot be used as pipe source expression"));
+        }
+        if is_placeholder(&right) {
+            return Err(self.error("Placeholder '_' cannot be used as pipe target without a call"));
+        }
+
+        let expr = self.desugar_currying(expr)?;
+
+        let is_unwrap = matches!(
+            &right.kind,
+            ExprKind::MethodCall {
+                method,
+                args,
+                ..
+            } if method == "try_unwrap" && args.is_empty()
+        );
+
+        if is_unwrap {
+            let ExprKind::MethodCall { receiver, .. } = right.kind else {
+                unreachable!()
+            };
+            let inner_target = *receiver;
+            let piped_inner = self.pipe_into_target(expr, inner_target, span)?;
+            Ok(Expr::new(
+                ExprKind::MethodCall {
+                    receiver: Box::new(piped_inner),
+                    method: "try_unwrap".to_string(),
+                    type_args: None,
+                    args: vec![],
+                },
+                span,
+            ))
+        } else if let ExprKind::Paren(inner) = right.kind {
+            let piped_inner = self.desugar_pipe_step(expr, *inner)?;
+            Ok(Expr::new(ExprKind::Paren(Box::new(piped_inner)), span))
+        } else {
+            self.pipe_into_target(expr, right, span)
+        }
+    }
+
+    fn pipe_into_target(&mut self, expr: Expr, target: Expr, span: Span) -> Result<Expr> {
+        if is_placeholder(&target) {
+            return Err(self.error("Placeholder '_' cannot be used as pipe target without a call"));
+        }
+
+        if matches!(
+            &target.kind,
+            ExprKind::MethodCall {
+                method,
+                args,
+                ..
+            } if method == "try_unwrap" && args.is_empty()
+        ) {
+            let ExprKind::MethodCall { receiver, .. } = target.kind else {
+                unreachable!()
+            };
+            let piped_inner = self.pipe_into_target(expr, *receiver, span)?;
+            return Ok(Expr::new(
+                ExprKind::MethodCall {
+                    receiver: Box::new(piped_inner),
+                    method: "try_unwrap".to_string(),
+                    type_args: None,
+                    args: vec![],
+                },
+                span,
+            ));
+        }
+
+        if let ExprKind::Paren(inner) = target.kind {
+            let piped_inner = self.pipe_into_target(expr, *inner, span)?;
+            return Ok(Expr::new(ExprKind::Paren(Box::new(piped_inner)), span));
+        }
+
+        match target.kind {
+            ExprKind::Call {
+                callee,
+                type_args,
+                mut args,
+            } => {
+                let placeholder_indices: Vec<usize> = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| is_placeholder(a))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if placeholder_indices.is_empty() {
                     args.insert(0, expr);
-                    expr = Expr::new(
+                } else if placeholder_indices.len() == 1 {
+                    args[placeholder_indices[0]] = expr;
+                } else {
+                    return Err(self.error("Multiple placeholders '_' not allowed in a single pipe expression"));
+                }
+
+                Ok(Expr::new(
+                    ExprKind::Call {
+                        callee,
+                        type_args,
+                        args,
+                    },
+                    span,
+                ))
+            }
+
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                type_args,
+                mut args,
+            } => {
+                let placeholder_indices: Vec<usize> = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| is_placeholder(a))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if placeholder_indices.is_empty() {
+                    args.insert(0, expr);
+                } else if placeholder_indices.len() == 1 {
+                    args[placeholder_indices[0]] = expr;
+                } else {
+                    return Err(self.error("Multiple placeholders '_' not allowed in a single pipe expression"));
+                }
+
+                Ok(Expr::new(
+                    ExprKind::MethodCall {
+                        receiver,
+                        method,
+                        type_args,
+                        args,
+                    },
+                    span,
+                ))
+            }
+
+            _ => Ok(Expr::new(
+                ExprKind::Call {
+                    callee: Box::new(target),
+                    type_args: None,
+                    args: vec![expr],
+                },
+                span,
+            )),
+        }
+    }
+
+    fn desugar_currying(&self, expr: Expr) -> Result<Expr> {
+        let span = expr.span;
+        match expr.kind {
+            ExprKind::Identifier(ref name) if name == "_" => {
+                Err(self.error("Placeholder '_' is only valid in call argument positions"))
+            }
+
+            ExprKind::Call {
+                callee,
+                type_args,
+                args,
+            } => {
+                let callee = Box::new(self.desugar_currying(*callee)?);
+                let desugared_args: Vec<Expr> = args
+                    .into_iter()
+                    .map(|a| self.desugar_currying_arg(a))
+                    .collect::<Result<Vec<Expr>>>()?;
+
+                let placeholder_indices: Vec<usize> = desugared_args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| is_placeholder(a))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if placeholder_indices.is_empty() {
+                    Ok(Expr::new(
                         ExprKind::Call {
                             callee,
                             type_args,
-                            args,
+                            args: desugared_args,
+                        },
+                        span,
+                    ))
+                } else {
+                    let mut params = Vec::new();
+                    let mut final_args = desugared_args;
+                    for (param_idx, &arg_idx) in placeholder_indices.iter().enumerate() {
+                        let param_name = format!("__curry_{}", param_idx);
+                        let param_expr = Expr::new(
+                            ExprKind::Identifier(param_name.clone()),
+                            final_args[arg_idx].span,
+                        );
+                        final_args[arg_idx] = param_expr;
+                        params.push((param_name, None));
+                    }
+
+                    let call_expr = Expr::new(
+                        ExprKind::Call {
+                            callee,
+                            type_args,
+                            args: final_args,
                         },
                         span,
                     );
+
+                    Ok(Expr::new(
+                        ExprKind::Lambda {
+                            params,
+                            return_type: None,
+                            body: Box::new(call_expr),
+                        },
+                        span,
+                    ))
                 }
-                ExprKind::MethodCall {
-                    receiver,
-                    method,
-                    type_args,
-                    mut args,
-                } => {
-                    args.insert(0, expr);
-                    expr = Expr::new(
+            }
+
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                type_args,
+                args,
+            } => {
+                let receiver = Box::new(self.desugar_currying(*receiver)?);
+                let desugared_args: Vec<Expr> = args
+                    .into_iter()
+                    .map(|a| self.desugar_currying_arg(a))
+                    .collect::<Result<Vec<Expr>>>()?;
+
+                let placeholder_indices: Vec<usize> = desugared_args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| is_placeholder(a))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if placeholder_indices.is_empty() {
+                    Ok(Expr::new(
                         ExprKind::MethodCall {
                             receiver,
                             method,
                             type_args,
-                            args,
+                            args: desugared_args,
+                        },
+                        span,
+                    ))
+                } else {
+                    let mut params = Vec::new();
+                    let mut final_args = desugared_args;
+                    for (param_idx, &arg_idx) in placeholder_indices.iter().enumerate() {
+                        let param_name = format!("__curry_{}", param_idx);
+                        let param_expr = Expr::new(
+                            ExprKind::Identifier(param_name.clone()),
+                            final_args[arg_idx].span,
+                        );
+                        final_args[arg_idx] = param_expr;
+                        params.push((param_name, None));
+                    }
+
+                    let method_expr = Expr::new(
+                        ExprKind::MethodCall {
+                            receiver,
+                            method,
+                            type_args,
+                            args: final_args,
                         },
                         span,
                     );
-                }
-                _ => {
-                    expr = Expr::new(
-                        ExprKind::Call {
-                            callee: Box::new(right),
-                            type_args: None,
-                            args: vec![expr],
+
+                    Ok(Expr::new(
+                        ExprKind::Lambda {
+                            params,
+                            return_type: None,
+                            body: Box::new(method_expr),
                         },
                         span,
-                    );
+                    ))
                 }
             }
-        }
 
-        Ok(expr)
+            ExprKind::Binary { left, op, right } => Ok(Expr::new(
+                ExprKind::Binary {
+                    left: Box::new(self.desugar_currying(*left)?),
+                    op,
+                    right: Box::new(self.desugar_currying(*right)?),
+                },
+                span,
+            )),
+
+            ExprKind::Unary { op, operand } => Ok(Expr::new(
+                ExprKind::Unary {
+                    op,
+                    operand: Box::new(self.desugar_currying(*operand)?),
+                },
+                span,
+            )),
+
+            ExprKind::FieldAccess { object, field } => Ok(Expr::new(
+                ExprKind::FieldAccess {
+                    object: Box::new(self.desugar_currying(*object)?),
+                    field,
+                },
+                span,
+            )),
+
+            ExprKind::Index { object, index } => Ok(Expr::new(
+                ExprKind::Index {
+                    object: Box::new(self.desugar_currying(*object)?),
+                    index: Box::new(self.desugar_currying(*index)?),
+                },
+                span,
+            )),
+
+            ExprKind::Array(elements) => {
+                let elements = elements
+                    .into_iter()
+                    .map(|e| self.desugar_currying(e))
+                    .collect::<Result<Vec<Expr>>>()?;
+                Ok(Expr::new(ExprKind::Array(elements), span))
+            }
+
+            ExprKind::Map(pairs) => {
+                let mut desugared_pairs = Vec::new();
+                for (k, v) in pairs {
+                    let k = self.desugar_currying(k)?;
+                    let v = self.desugar_currying(v)?;
+                    desugared_pairs.push((k, v));
+                }
+                Ok(Expr::new(ExprKind::Map(desugared_pairs), span))
+            }
+
+            ExprKind::Tuple(elements) => {
+                let elements = elements
+                    .into_iter()
+                    .map(|e| self.desugar_currying(e))
+                    .collect::<Result<Vec<Expr>>>()?;
+                Ok(Expr::new(ExprKind::Tuple(elements), span))
+            }
+
+            ExprKind::StructLiteral { name, fields } => {
+                let mut desugared_fields = Vec::new();
+                for mut f in fields {
+                    f.value = self.desugar_currying(f.value)?;
+                    desugared_fields.push(f);
+                }
+                Ok(Expr::new(
+                    ExprKind::StructLiteral {
+                        name,
+                        fields: desugared_fields,
+                    },
+                    span,
+                ))
+            }
+
+            ExprKind::EnumConstructor {
+                enum_name,
+                variant,
+                args,
+            } => {
+                let desugared_args: Vec<Expr> = args
+                    .into_iter()
+                    .map(|a| self.desugar_currying_arg(a))
+                    .collect::<Result<Vec<Expr>>>()?;
+
+                let placeholder_indices: Vec<usize> = desugared_args
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| is_placeholder(a))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if placeholder_indices.is_empty() {
+                    Ok(Expr::new(
+                        ExprKind::EnumConstructor {
+                            enum_name,
+                            variant,
+                            args: desugared_args,
+                        },
+                        span,
+                    ))
+                } else {
+                    let mut params = Vec::new();
+                    let mut final_args = desugared_args;
+                    for (param_idx, &arg_idx) in placeholder_indices.iter().enumerate() {
+                        let param_name = format!("__curry_{}", param_idx);
+                        let param_expr = Expr::new(
+                            ExprKind::Identifier(param_name.clone()),
+                            final_args[arg_idx].span,
+                        );
+                        final_args[arg_idx] = param_expr;
+                        params.push((param_name, None));
+                    }
+
+                    let enum_expr = Expr::new(
+                        ExprKind::EnumConstructor {
+                            enum_name,
+                            variant,
+                            args: final_args,
+                        },
+                        span,
+                    );
+
+                    Ok(Expr::new(
+                        ExprKind::Lambda {
+                            params,
+                            return_type: None,
+                            body: Box::new(enum_expr),
+                        },
+                        span,
+                    ))
+                }
+            }
+
+            ExprKind::Lambda {
+                params,
+                return_type,
+                body,
+            } => Ok(Expr::new(
+                ExprKind::Lambda {
+                    params,
+                    return_type,
+                    body: Box::new(self.desugar_currying(*body)?),
+                },
+                span,
+            )),
+
+            ExprKind::Paren(inner) => {
+                let inner = self.desugar_currying(*inner)?;
+                Ok(Expr::new(ExprKind::Paren(Box::new(inner)), span))
+            }
+
+            ExprKind::Cast { expr, target_type } => Ok(Expr::new(
+                ExprKind::Cast {
+                    expr: Box::new(self.desugar_currying(*expr)?),
+                    target_type,
+                },
+                span,
+            )),
+
+            ExprKind::TypeCheck { expr, check_type } => Ok(Expr::new(
+                ExprKind::TypeCheck {
+                    expr: Box::new(self.desugar_currying(*expr)?),
+                    check_type,
+                },
+                span,
+            )),
+
+            ExprKind::IsPattern { expr, pattern } => Ok(Expr::new(
+                ExprKind::IsPattern {
+                    expr: Box::new(self.desugar_currying(*expr)?),
+                    pattern,
+                },
+                span,
+            )),
+
+            ExprKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let condition = Box::new(self.desugar_currying(*condition)?);
+                let then_branch = Box::new(self.desugar_currying(*then_branch)?);
+                let else_branch = if let Some(e) = else_branch {
+                    Some(Box::new(self.desugar_currying(*e)?))
+                } else {
+                    None
+                };
+                Ok(Expr::new(
+                    ExprKind::If {
+                        condition,
+                        then_branch,
+                        else_branch,
+                    },
+                    span,
+                ))
+            }
+
+            ExprKind::Block(stmts) => Ok(Expr::new(ExprKind::Block(stmts), span)),
+
+            ExprKind::EffectBlock(stmts) => Ok(Expr::new(ExprKind::EffectBlock(stmts), span)),
+
+            ExprKind::Return(exprs) => {
+                let exprs = exprs
+                    .into_iter()
+                    .map(|e| self.desugar_currying(e))
+                    .collect::<Result<Vec<Expr>>>()?;
+                Ok(Expr::new(ExprKind::Return(exprs), span))
+            }
+
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+            } => Ok(Expr::new(
+                ExprKind::Range {
+                    start: Box::new(self.desugar_currying(*start)?),
+                    end: Box::new(self.desugar_currying(*end)?),
+                    inclusive,
+                },
+                span,
+            )),
+
+            ExprKind::Literal(_) | ExprKind::Identifier(_) | ExprKind::RegexLiteral { .. } => {
+                Ok(Expr::new(expr.kind, span))
+            }
+        }
+    }
+
+    fn desugar_currying_arg(&self, arg: Expr) -> Result<Expr> {
+        if is_placeholder(&arg) {
+            Ok(arg)
+        } else {
+            self.desugar_currying(arg)
+        }
     }
 
     #[inline(never)]
@@ -421,6 +902,59 @@ impl Parser {
         Ok(expr)
     }
 
+    fn parse_call_arg(&mut self) -> Result<Expr> {
+        let mut lookahead = self.current;
+        let mut paren_count = 0;
+        while self.tokens.get(lookahead).is_some_and(|t| t.kind == TokenKind::LeftParen) {
+            paren_count += 1;
+            lookahead += 1;
+        }
+        if self
+            .tokens
+            .get(lookahead)
+            .is_some_and(|t| t.kind == TokenKind::Identifier && t.lexeme == "_")
+        {
+            let mut close_lookahead = lookahead + 1;
+            let mut close_count = 0;
+            while self
+                .tokens
+                .get(close_lookahead)
+                .is_some_and(|t| t.kind == TokenKind::RightParen)
+                && close_count < paren_count
+            {
+                close_count += 1;
+                close_lookahead += 1;
+            }
+            if close_count == paren_count {
+                let mut lparens = Vec::with_capacity(paren_count);
+                for _ in 0..paren_count {
+                    lparens.push(self.advance().clone());
+                }
+                let token = self.advance().clone();
+                let inner_span = Span::new(
+                    token.line,
+                    token.column,
+                    token.line,
+                    token.column.saturating_add(token.lexeme.chars().count()),
+                );
+                let mut expr = Expr::new(ExprKind::Identifier(token.lexeme), inner_span);
+                for i in (0..paren_count).rev() {
+                    let lp = &lparens[i];
+                    let rp = self.advance().clone();
+                    let span = Span::new(
+                        lp.line,
+                        lp.column,
+                        rp.line,
+                        rp.column.saturating_add(rp.lexeme.chars().count()),
+                    );
+                    expr = Expr::new(ExprKind::Paren(Box::new(expr)), span);
+                }
+                return Ok(expr);
+            }
+        }
+        self.parse_expr()
+    }
+
     #[inline(never)]
     fn parse_postfix(&mut self) -> Result<Expr> {
         let mut expr = self.parse_primary()?;
@@ -430,9 +964,9 @@ impl Parser {
                     self.advance();
                     let mut args = Vec::new();
                     if !self.check(TokenKind::RightParen) {
-                        args.push(self.parse_expr()?);
+                        args.push(self.parse_call_arg()?);
                         while self.match_token(&[TokenKind::Comma]) {
-                            args.push(self.parse_expr()?);
+                            args.push(self.parse_call_arg()?);
                         }
                     }
 
@@ -453,9 +987,9 @@ impl Parser {
                     self.consume(TokenKind::LeftParen, "Expected '(' after type arguments")?;
                     let mut args = Vec::new();
                     if !self.check(TokenKind::RightParen) {
-                        args.push(self.parse_expr()?);
+                        args.push(self.parse_call_arg()?);
                         while self.match_token(&[TokenKind::Comma]) {
-                            args.push(self.parse_expr()?);
+                            args.push(self.parse_call_arg()?);
                         }
                     }
                     self.consume(TokenKind::RightParen, "Expected ')' after arguments")?;
@@ -495,9 +1029,9 @@ impl Parser {
                     self.consume(TokenKind::LeftParen, "Expected '(' after method name")?;
                     let mut args = Vec::new();
                     if !self.check(TokenKind::RightParen) {
-                        args.push(self.parse_expr()?);
+                        args.push(self.parse_call_arg()?);
                         while self.match_token(&[TokenKind::Comma]) {
-                            args.push(self.parse_expr()?);
+                            args.push(self.parse_call_arg()?);
                         }
                     }
 
@@ -792,6 +1326,20 @@ impl Parser {
             }
 
             TokenKind::Identifier => {
+                if (self.current_token().lexeme == "regex"
+                    || self.regex_aliases.contains(&self.current_token().lexeme))
+                    && self.peek_ahead(1).is_some_and(|t| t.kind == TokenKind::Bang)
+                    && self.peek_ahead(2).is_some_and(|t| t.kind == TokenKind::String)
+                {
+                    self.advance();
+                    self.advance();
+                    let str_token = self.advance().clone();
+                    let pattern = self.unescape_string_literal(&str_token)?;
+                    let end_token = self.tokens[self.current - 1].clone();
+                    let span = self.make_span(&start_token, &end_token);
+                    return Ok(Expr::new(ExprKind::RegexLiteral { pattern, span }, span));
+                }
+
                 if self.current_token().lexeme == "effect"
                     && (self.peek_ahead(1).is_some_and(|t| t.kind == TokenKind::Do || t.kind == TokenKind::LeftBrace))
                 {
@@ -984,7 +1532,9 @@ impl Parser {
                 } else if self.check(TokenKind::Identifier) {
                     let key_token = self.advance().clone();
                     let span = self.make_span(&key_token, &key_token);
-                    self.consume(TokenKind::Equal, "Expected '=' after map key")?;
+                    if !self.match_token(&[TokenKind::Equal, TokenKind::Colon]) {
+                        return Err(self.error("Expected '=' or ':' after map key"));
+                    }
                     let key_expr = Expr::new(
                         ExprKind::Literal(Literal::String(key_token.lexeme.clone())),
                         span,

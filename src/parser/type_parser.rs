@@ -47,6 +47,16 @@ impl Parser {
                         "bool" => TypeKind::Bool,
                         "unknown" => TypeKind::Unknown,
                         "never" => TypeKind::Never,
+                        "typeof" => {
+                            let first_seg = self.expect_identifier()?;
+                            let mut path = first_seg;
+                            while self.match_token(&[TokenKind::Dot]) {
+                                let seg = self.expect_identifier()?;
+                                path.push('.');
+                                path.push_str(&seg);
+                            }
+                            TypeKind::Typeof(path)
+                        }
                         "Effect" if self.check(TokenKind::Less) => {
                             return self.parse_effect_type_args(&start_token);
                         }
@@ -75,6 +85,16 @@ impl Parser {
                                             Box::new(iter.next().unwrap()),
                                         )
                                     }
+
+                                    "Infer" if type_args.len() == 1 => TypeKind::InferType(Box::new(
+                                        type_args.into_iter().next().unwrap(),
+                                    )),
+                                    "InferInput" if type_args.len() == 1 => TypeKind::InferInput(Box::new(
+                                        type_args.into_iter().next().unwrap(),
+                                    )),
+                                    "InferOutput" if type_args.len() == 1 => TypeKind::InferOutput(Box::new(
+                                        type_args.into_iter().next().unwrap(),
+                                    )),
 
                                     _ => TypeKind::GenericInstance {
                                         name: qualified_name,
@@ -168,7 +188,13 @@ impl Parser {
                 let end_token = self.current_token().clone();
                 self.consume(TokenKind::RightParen, "Expected ')' after type")?;
                 if types.len() == 1 {
-                    return Ok(types.into_iter().next().unwrap());
+                    let mut result_type = types.into_iter().next().unwrap();
+                    while self.match_token(&[TokenKind::Question]) {
+                        let q_end = self.tokens[self.current - 1].clone();
+                        let span = self.make_span(&start_token, &q_end);
+                        result_type = Type::new(TypeKind::Option(Box::new(result_type)), span);
+                    }
+                    return Ok(result_type);
                 }
 
                 return Ok(Type::new(
@@ -182,7 +208,13 @@ impl Parser {
             }
         };
         let end_token = self.tokens[self.current - 1].clone();
-        Ok(Type::new(kind, self.make_span(&start_token, &end_token)))
+        let mut result_type = Type::new(kind, self.make_span(&start_token, &end_token));
+        while self.match_token(&[TokenKind::Question]) {
+            let q_end = self.tokens[self.current - 1].clone();
+            let span = self.make_span(&start_token, &q_end);
+            result_type = Type::new(TypeKind::Option(Box::new(result_type)), span);
+        }
+        Ok(result_type)
     }
 
     pub(super) fn parse_type_arguments(&mut self) -> Result<Vec<Type>> {

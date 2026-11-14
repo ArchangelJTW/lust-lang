@@ -70,6 +70,28 @@ use crate::vm::VM;
 /// vm.call_function("__script", &[])?;
 /// ```
 pub fn compile_program_with_config(program: Program, config: &LustConfig) -> crate::Result<VM> {
+    let mut config = config.clone();
+    for module in &program.modules {
+        for target in module.imports.module_aliases.values() {
+            if crate::builtins::is_virtual_std_module(target) {
+                let canon = crate::builtins::canonical_std_module_name(target);
+                if config.is_std_module_allowed(canon) {
+                    config.enable_module(canon);
+                }
+            }
+        }
+        for target in module.imports.function_aliases.values() {
+            if let Some((mod_part, _)) = target.split_once('.') {
+                if crate::builtins::is_virtual_std_module(mod_part) {
+                    let canon = crate::builtins::canonical_std_module_name(mod_part);
+                    if config.is_std_module_allowed(canon) {
+                        config.enable_module(canon);
+                    }
+                }
+            }
+        }
+    }
+
     // Build imports map
     let mut imports_map: HashMap<String, ModuleImports> = HashMap::new();
     for module in &program.modules {
@@ -77,7 +99,7 @@ pub fn compile_program_with_config(program: Program, config: &LustConfig) -> cra
     }
 
     // Phase 1: Type check
-    let mut typechecker = TypeChecker::with_config(config);
+    let mut typechecker = TypeChecker::with_config(&config);
     typechecker.set_imports_by_module(imports_map.clone());
     typechecker.check_program(&program.modules)?;
     let option_coercions = typechecker.take_option_coercions();
@@ -109,7 +131,7 @@ pub fn compile_program_with_config(program: Program, config: &LustConfig) -> cra
     compiler.set_checked_array_indices(checked_array_indices);
     compiler.set_lambda_return_types(lambda_return_types);
     compiler.set_numeric_types(numeric_types);
-    compiler.configure_stdlib(config);
+    compiler.configure_stdlib(&config);
     compiler.set_imports_by_module(imports_map);
     compiler.set_entry_module(program_entry_module.clone());
     compiler.set_function_signatures(signatures);
@@ -117,13 +139,17 @@ pub fn compile_program_with_config(program: Program, config: &LustConfig) -> cra
     compiler.set_use_mir(config.use_mir());
     compiler.set_strict_mir(config.strict_mir());
     let functions = compiler.compile_module(&wrapped_items)?;
+    let mir_functions = compiler.take_mir_functions();
     let trait_impls = compiler.get_trait_impls().to_vec();
     // AST no longer needed
     drop(wrapped_items);
 
     // Phase 4: Create VM
-    let mut vm = VM::with_config(config);
+    let mut vm = VM::with_config(&config);
     vm.load_functions(functions);
+    for mir_fn in mir_functions {
+        vm.load_mir_function(mir_fn)?;
+    }
     vm.register_structs(&struct_defs);
     for (type_name, trait_name) in trait_impls {
         vm.register_trait_impl(type_name, trait_name);
@@ -1015,7 +1041,8 @@ impl ModuleLoader {
             }
             ExprKind::Literal(Literal::String(_))
             | ExprKind::Literal(_)
-            | ExprKind::Identifier(_) => {}
+            | ExprKind::Identifier(_)
+            | ExprKind::RegexLiteral { .. } => {}
             ExprKind::EffectBlock(stmts) => {
                 for stmt in stmts {
                     self.collect_deps_from_lua_require_stmt(stmt, deps);
@@ -1314,7 +1341,7 @@ impl ModuleLoader {
                 self.validate_dynamic_imports_in_expr(start)?;
                 self.validate_dynamic_imports_in_expr(end)?;
             }
-            ExprKind::Literal(_) | ExprKind::Identifier(_) => {}
+            ExprKind::Literal(_) | ExprKind::Identifier(_) | ExprKind::RegexLiteral { .. } => {}
             ExprKind::EffectBlock(stmts) => {
                 for s in stmts {
                     self.validate_dynamic_imports_in_stmt(s)?;
@@ -1378,7 +1405,7 @@ impl ModuleLoader {
         }
     }
 
-    fn process_use_tree(&self, tree: &UseTree, imports: &mut ModuleImports) -> Result<()> {
+    fn process_use_tree(&mut self, tree: &UseTree, imports: &mut ModuleImports) -> Result<()> {
         match tree {
             UseTree::Path { path, alias, .. } => {
                 let full = path.join(".");
@@ -1396,6 +1423,7 @@ impl ModuleLoader {
                         )));
                     }
                     let canon = crate::builtins::canonical_std_module_name(&full);
+                    self.config.enable_module(canon);
                     let alias_name = alias.clone().unwrap_or_else(|| canon.to_string());
                     imports
                         .module_aliases
@@ -1411,6 +1439,8 @@ impl ModuleLoader {
                                 module
                             )));
                         }
+                        let canon = crate::builtins::canonical_std_module_name(&module);
+                        self.config.enable_module(canon);
                         let fq = crate::builtins::resolve_std_function(&module, &item)
                             .map(String::from)
                             .unwrap_or_else(|| {
@@ -1447,6 +1477,8 @@ impl ModuleLoader {
                             module
                         )));
                     }
+                    let canon = crate::builtins::canonical_std_module_name(&module);
+                    self.config.enable_module(canon);
                     for item in items {
                         if item.path.is_empty() {
                             continue;
@@ -1515,6 +1547,7 @@ impl ModuleLoader {
                         )));
                     }
                     let canon = crate::builtins::canonical_std_module_name(&module);
+                    self.config.enable_module(canon);
                     for (fn_name, fq) in crate::builtins::virtual_std_module_functions(&module) {
                         imports.function_aliases.insert(fn_name.to_string(), fq.to_string());
                     }

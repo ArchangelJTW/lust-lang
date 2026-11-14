@@ -76,6 +76,15 @@ pub enum TypeKind {
         error: Box<Type>,
         requirements: Vec<Type>,
     },
+    Typeof(String),
+    InferType(Box<Type>),
+    InferInput(Box<Type>),
+    InferOutput(Box<Type>),
+    Schema {
+        input: Box<Type>,
+        output: Box<Type>,
+        fields: Option<Vec<(String, Box<Type>, Box<Type>)>>,
+    },
 }
 
 impl TypeKind {
@@ -175,6 +184,11 @@ impl fmt::Display for TypeKind {
                     write!(f, "Effect<{}, {}, {}>", success, error, reqs)
                 }
             }
+            TypeKind::Typeof(name) => write!(f, "typeof {name}"),
+            TypeKind::InferType(inner) => write!(f, "Infer<{inner}>"),
+            TypeKind::InferInput(inner) => write!(f, "InferInput<{inner}>"),
+            TypeKind::InferOutput(inner) => write!(f, "InferOutput<{inner}>"),
+            TypeKind::Schema { input, output, .. } => write!(f, "Schema<{input}, {output}>"),
         }
     }
 }

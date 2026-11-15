@@ -17,6 +17,10 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[path = "capture.rs"]
+pub mod capture;
+pub use capture::*;
+
 /// Error types occurring during Replay Bundle operations.
 #[derive(Debug)]
 pub enum ReplayError {
@@ -252,12 +256,20 @@ impl EventLog {
 }
 
 /// A self-contained simulation archive bundle.
-/// Contains `manifest.json`, `events.jsonl`, and virtual filesystem snapshot.
+/// Contains `manifest.json`, `events.jsonl`, virtual filesystem snapshot,
+/// and optional execution snapshot lock artifacts (`script.lust`, `args.json`, `env.json`,
+/// `source_tree.tar`, `vendor.tar`, `initial_vfs.tar`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayBundle {
     pub manifest: ReplayManifest,
     pub events: EventLog,
     pub vfs_files: Vec<(PathBuf, Vec<u8>)>,
+    pub source_tree_tar: Option<Vec<u8>>,
+    pub vendor_tar: Option<Vec<u8>>,
+    pub script_lust: Option<String>,
+    pub args_json: Option<String>,
+    pub env_json: Option<String>,
+    pub initial_vfs_tar: Option<Vec<u8>>,
 }
 
 impl ReplayBundle {
@@ -270,16 +282,48 @@ impl ReplayBundle {
             manifest,
             events,
             vfs_files,
+            source_tree_tar: None,
+            vendor_tar: None,
+            script_lust: None,
+            args_json: None,
+            env_json: None,
+            initial_vfs_tar: None,
         }
+    }
+
+    pub fn with_source_tree(mut self, tar_bytes: Vec<u8>) -> Self {
+        self.source_tree_tar = Some(tar_bytes);
+        self
+    }
+
+    pub fn with_vendor(mut self, tar_bytes: Vec<u8>) -> Self {
+        self.vendor_tar = Some(tar_bytes);
+        self
+    }
+
+    pub fn with_script(mut self, script: impl Into<String>) -> Self {
+        self.script_lust = Some(script.into());
+        self
+    }
+
+    pub fn with_args(mut self, args: impl Into<String>) -> Self {
+        self.args_json = Some(args.into());
+        self
+    }
+
+    pub fn with_env(mut self, env: impl Into<String>) -> Self {
+        self.env_json = Some(env.into());
+        self
+    }
+
+    pub fn with_initial_vfs(mut self, tar_bytes: Vec<u8>) -> Self {
+        self.initial_vfs_tar = Some(tar_bytes);
+        self
     }
 
     /// Creates a ReplayBundle from current MemFs and event log.
     pub fn from_simulation(manifest: ReplayManifest, events: EventLog, mem_fs: &MemFs) -> Self {
-        Self {
-            manifest,
-            events,
-            vfs_files: mem_fs.snapshot(),
-        }
+        Self::new(manifest, events, mem_fs.snapshot())
     }
 
     /// Restores the virtual filesystem into a target MemFs instance.
@@ -299,7 +343,45 @@ impl ReplayBundle {
         let events_bytes = self.events.to_jsonl()?.into_bytes();
         archive.add_file("events.jsonl", &events_bytes)?;
 
-        // 3. vfs files
+        // 3. script.lust
+        if let Some(script) = &self.script_lust {
+            archive.add_file("script.lust", script.as_bytes())?;
+        }
+
+        // 4. args.json
+        if let Some(args) = &self.args_json {
+            archive.add_file("args.json", args.as_bytes())?;
+        }
+
+        // 5. env.json
+        if let Some(env) = &self.env_json {
+            archive.add_file("env.json", env.as_bytes())?;
+        }
+
+        // 6. source_tree.tar
+        if let Some(src_tar) = &self.source_tree_tar {
+            archive.add_file("source_tree.tar", src_tar)?;
+        }
+
+        // 7. vendor.tar
+        if let Some(vendor_tar) = &self.vendor_tar {
+            archive.add_file("vendor.tar", vendor_tar)?;
+        }
+
+        // 8. initial_vfs.tar
+        if let Some(initial_vfs) = &self.initial_vfs_tar {
+            archive.add_file("initial_vfs.tar", initial_vfs)?;
+        } else if !self.vfs_files.is_empty() {
+            let mut vfs_tar = UstarArchive::new();
+            for (path, content) in &self.vfs_files {
+                let relative = path.strip_prefix("/").unwrap_or(path).to_string_lossy();
+                vfs_tar.add_file(&relative, content)?;
+            }
+            let vfs_tar_bytes = vfs_tar.finish();
+            archive.add_file("initial_vfs.tar", &vfs_tar_bytes)?;
+        }
+
+        // 9. vfs files
         for (path, content) in &self.vfs_files {
             let relative_path = path
                 .strip_prefix("/")
@@ -319,6 +401,12 @@ impl ReplayBundle {
 
         let mut manifest_opt = None;
         let mut events_opt = None;
+        let mut script_lust = None;
+        let mut args_json = None;
+        let mut env_json = None;
+        let mut source_tree_tar = None;
+        let mut vendor_tar = None;
+        let mut initial_vfs_tar = None;
         let mut vfs_files = Vec::new();
 
         for (name, data) in entries {
@@ -330,6 +418,24 @@ impl ReplayBundle {
                 let jsonl = std::str::from_utf8(&data)
                     .map_err(|e| ReplayError::Deserialization(e.to_string()))?;
                 events_opt = Some(EventLog::from_jsonl(jsonl)?);
+            } else if name == "script.lust" {
+                let s = std::str::from_utf8(&data)
+                    .map_err(|e| ReplayError::Deserialization(e.to_string()))?;
+                script_lust = Some(s.to_string());
+            } else if name == "args.json" {
+                let s = std::str::from_utf8(&data)
+                    .map_err(|e| ReplayError::Deserialization(e.to_string()))?;
+                args_json = Some(s.to_string());
+            } else if name == "env.json" {
+                let s = std::str::from_utf8(&data)
+                    .map_err(|e| ReplayError::Deserialization(e.to_string()))?;
+                env_json = Some(s.to_string());
+            } else if name == "source_tree.tar" {
+                source_tree_tar = Some(data);
+            } else if name == "vendor.tar" {
+                vendor_tar = Some(data);
+            } else if name == "initial_vfs.tar" {
+                initial_vfs_tar = Some(data);
             } else if let Some(vfs_path) = name.strip_prefix("vfs/") {
                 let full_path = if vfs_path.starts_with('/') {
                     PathBuf::from(vfs_path)
@@ -345,12 +451,33 @@ impl ReplayBundle {
         let events =
             events_opt.ok_or_else(|| ReplayError::MissingEntry("events.jsonl".to_string()))?;
 
+        if vfs_files.is_empty() {
+            if let Some(vfs_tar_bytes) = &initial_vfs_tar {
+                if let Ok(vfs_entries) = UstarArchive::parse(vfs_tar_bytes) {
+                    for (entry_path, entry_data) in vfs_entries {
+                        let full_path = if entry_path.starts_with('/') {
+                            PathBuf::from(entry_path)
+                        } else {
+                            PathBuf::from(format!("/{}", entry_path))
+                        };
+                        vfs_files.push((full_path, entry_data));
+                    }
+                }
+            }
+        }
+
         vfs_files.sort_by(|a, b| a.0.cmp(&b.0));
 
         Ok(Self {
             manifest,
             events,
             vfs_files,
+            source_tree_tar,
+            vendor_tar,
+            script_lust,
+            args_json,
+            env_json,
+            initial_vfs_tar,
         })
     }
 
@@ -370,7 +497,27 @@ impl ReplayBundle {
         let events_path = dir.join("events.jsonl");
         vfs.write(&events_path, self.events.to_jsonl()?.as_bytes())?;
 
-        // 3. vfs files
+        // 3. Optional metadata files
+        if let Some(script) = &self.script_lust {
+            vfs.write(&dir.join("script.lust"), script.as_bytes())?;
+        }
+        if let Some(args) = &self.args_json {
+            vfs.write(&dir.join("args.json"), args.as_bytes())?;
+        }
+        if let Some(env) = &self.env_json {
+            vfs.write(&dir.join("env.json"), env.as_bytes())?;
+        }
+        if let Some(src_tar) = &self.source_tree_tar {
+            vfs.write(&dir.join("source_tree.tar"), src_tar)?;
+        }
+        if let Some(vendor_tar) = &self.vendor_tar {
+            vfs.write(&dir.join("vendor.tar"), vendor_tar)?;
+        }
+        if let Some(initial_vfs) = &self.initial_vfs_tar {
+            vfs.write(&dir.join("initial_vfs.tar"), initial_vfs)?;
+        }
+
+        // 4. vfs files
         let vfs_root = dir.join("vfs");
         vfs.create_dir_all(&vfs_root)?;
 
@@ -401,7 +548,50 @@ impl ReplayBundle {
         let events_str = vfs.read_to_string(&events_path)?;
         let events = EventLog::from_jsonl(&events_str)?;
 
-        // 3. vfs files
+        // 3. Optional metadata
+        let script_path = dir.join("script.lust");
+        let script_lust = if vfs.exists(&script_path) {
+            Some(vfs.read_to_string(&script_path)?)
+        } else {
+            None
+        };
+
+        let args_path = dir.join("args.json");
+        let args_json = if vfs.exists(&args_path) {
+            Some(vfs.read_to_string(&args_path)?)
+        } else {
+            None
+        };
+
+        let env_path = dir.join("env.json");
+        let env_json = if vfs.exists(&env_path) {
+            Some(vfs.read_to_string(&env_path)?)
+        } else {
+            None
+        };
+
+        let src_path = dir.join("source_tree.tar");
+        let source_tree_tar = if vfs.exists(&src_path) {
+            Some(vfs.read(&src_path)?)
+        } else {
+            None
+        };
+
+        let vendor_path = dir.join("vendor.tar");
+        let vendor_tar = if vfs.exists(&vendor_path) {
+            Some(vfs.read(&vendor_path)?)
+        } else {
+            None
+        };
+
+        let vfs_tar_path = dir.join("initial_vfs.tar");
+        let initial_vfs_tar = if vfs.exists(&vfs_tar_path) {
+            Some(vfs.read(&vfs_tar_path)?)
+        } else {
+            None
+        };
+
+        // 4. vfs files
         let mut vfs_files = Vec::new();
         let vfs_root = dir.join("vfs");
         if vfs.exists(&vfs_root) {
@@ -413,6 +603,12 @@ impl ReplayBundle {
             manifest,
             events,
             vfs_files,
+            source_tree_tar,
+            vendor_tar,
+            script_lust,
+            args_json,
+            env_json,
+            initial_vfs_tar,
         })
     }
 
@@ -649,31 +845,65 @@ impl Shrinker {
 }
 
 // =============================================================================
-// Standalone POSIX USTAR Implementation
+// Standalone POSIX USTAR Implementation with Prefix (up to 256 bytes) Support
 // =============================================================================
 
-struct UstarArchive {
+pub struct UstarArchive {
     buffer: Vec<u8>,
 }
 
+impl Default for UstarArchive {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UstarArchive {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self { buffer: Vec::new() }
     }
 
-    fn add_file(&mut self, name: &str, content: &[u8]) -> Result<(), ReplayError> {
-        if name.len() > 99 {
+    pub fn add_file(&mut self, name: &str, content: &[u8]) -> Result<(), ReplayError> {
+        let mut header = [0u8; 512];
+
+        // 1. File name and prefix (POSIX USTAR header)
+        if name.len() <= 100 {
+            let name_bytes = name.as_bytes();
+            header[..name_bytes.len()].copy_from_slice(name_bytes);
+        } else if name.len() <= 256 {
+            let name_bytes = name.as_bytes();
+            let mut split_pos = None;
+            let max_prefix = 155.min(name.len());
+            for pos in (1..=max_prefix).rev() {
+                if name_bytes[pos - 1] == b'/' {
+                    let suffix_len = name.len() - pos;
+                    if suffix_len <= 100 && suffix_len > 0 {
+                        split_pos = Some(pos - 1);
+                        break;
+                    }
+                }
+            }
+
+            match split_pos {
+                Some(pos) => {
+                    let prefix = &name_bytes[..pos];
+                    let suffix = &name_bytes[pos + 1..];
+                    header[345..345 + prefix.len()].copy_from_slice(prefix);
+                    header[..suffix.len()].copy_from_slice(suffix);
+                }
+                None => {
+                    return Err(ReplayError::TarFormat(format!(
+                        "Filename cannot be split into USTAR prefix (<=155) and name (<=100): {}",
+                        name
+                    )));
+                }
+            }
+        } else {
             return Err(ReplayError::TarFormat(format!(
-                "Filename too long for USTAR header: {}",
+                "Filename too long for USTAR header (max 256 bytes): {}",
                 name
             )));
         }
-
-        let mut header = [0u8; 512];
-
-        // 1. File name: 0..100
-        let name_bytes = name.as_bytes();
-        header[..name_bytes.len()].copy_from_slice(name_bytes);
 
         // 2. Mode: 100..108 (0o644)
         write_octal(&mut header[100..108], 0o644);
@@ -727,13 +957,13 @@ impl UstarArchive {
         Ok(())
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    pub fn finish(mut self) -> Vec<u8> {
         // Two 512-byte zero blocks mark end of TAR archive
         self.buffer.extend(core::iter::repeat_n(0u8, 1024));
         self.buffer
     }
 
-    fn parse(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, ReplayError> {
+    pub fn parse(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, ReplayError> {
         let mut entries = Vec::new();
         let mut offset = 0;
 
@@ -749,14 +979,27 @@ impl UstarArchive {
                 return Err(ReplayError::TarFormat("Missing USTAR magic".to_string()));
             }
 
-            // Extract file name
+            // Extract file name suffix (0..100)
             let name_end = block[0..100]
                 .iter()
                 .position(|&b| b == 0)
                 .unwrap_or(100);
-            let name = std::str::from_utf8(&block[0..name_end])
-                .map_err(|e| ReplayError::TarFormat(e.to_string()))?
-                .to_string();
+            let suffix = std::str::from_utf8(&block[0..name_end])
+                .map_err(|e| ReplayError::TarFormat(e.to_string()))?;
+
+            // Extract prefix (345..500)
+            let prefix_end = block[345..500]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(155);
+            let prefix = std::str::from_utf8(&block[345..345 + prefix_end])
+                .map_err(|e| ReplayError::TarFormat(e.to_string()))?;
+
+            let name = if prefix.is_empty() {
+                suffix.to_string()
+            } else {
+                format!("{}/{}", prefix, suffix)
+            };
 
             // Extract size
             let size = parse_octal(&block[124..136])?;

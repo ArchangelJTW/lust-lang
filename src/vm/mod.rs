@@ -1,11 +1,16 @@
-mod budget;
+pub mod budget;
+pub mod channel;
 mod corelib;
 pub(crate) mod cycle;
+#[cfg(feature = "std")]
+pub mod osr;
 #[cfg(feature = "std")]
 pub mod stdlib;
 mod task;
 pub mod cranelift_dispatch;
-use self::budget::BudgetState;
+#[path = "../telemetry/mod.rs"]
+pub mod telemetry;
+pub use self::budget::BudgetState;
 pub use self::task::{FiberContinuation, TaskId, TaskInstance, TaskManager, TaskState, WaitKey, YieldReason};
 pub(super) use crate::ast::{FieldOwnership, StructDef, Type, TypeKind};
 pub(super) use crate::bytecode::{
@@ -451,7 +456,426 @@ impl VM {
 
     #[inline]
     pub fn charge_gas(&mut self, amount: u64) -> crate::error::Result<()> {
-        self.budgets.charge_gas(amount)
+        let res = self.budgets.charge_gas(amount);
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if res.is_ok() {
+                self.flush_gas_telemetry();
+            } else {
+                self.flush_gas_telemetry();
+                self.record_gas_exhausted("vm");
+            }
+        }
+        res
+    }
+
+    #[cfg(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    ))]
+    pub fn set_telemetry_sink(
+        &mut self,
+        sink: alloc::sync::Arc<dyn crate::vm::telemetry::TelemetrySink>,
+        mask: crate::vm::telemetry::TelemetrySignalMask,
+    ) {
+        self.budgets.telemetry_sink = Some(sink);
+        self.budgets.telemetry_mask = mask;
+    }
+
+    #[cfg(not(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    )))]
+    #[inline(always)]
+    pub fn set_telemetry_sink(
+        &mut self,
+        _sink: alloc::sync::Arc<dyn crate::vm::telemetry::TelemetrySink>,
+        _mask: crate::vm::telemetry::TelemetrySignalMask,
+    ) {
+    }
+
+    #[cfg(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    ))]
+    pub fn clear_telemetry_sink(&mut self) {
+        self.budgets.telemetry_sink = None;
+        self.budgets.telemetry_mask = crate::vm::telemetry::TelemetrySignalMask::NONE;
+    }
+
+    #[cfg(not(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    )))]
+    #[inline(always)]
+    pub fn clear_telemetry_sink(&mut self) {}
+
+    #[cfg(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    ))]
+    pub fn telemetry_sink(&self) -> Option<&alloc::sync::Arc<dyn crate::vm::telemetry::TelemetrySink>> {
+        self.budgets.telemetry_sink.as_ref()
+    }
+
+    #[cfg(not(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    )))]
+    #[inline(always)]
+    pub fn telemetry_sink(&self) -> Option<&alloc::sync::Arc<dyn crate::vm::telemetry::TelemetrySink>> {
+        None
+    }
+
+    #[cfg(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    ))]
+    pub fn telemetry_mask(&self) -> crate::vm::telemetry::TelemetrySignalMask {
+        self.budgets.telemetry_mask
+    }
+
+    #[cfg(not(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    )))]
+    #[inline(always)]
+    pub fn telemetry_mask(&self) -> crate::vm::telemetry::TelemetrySignalMask {
+        crate::vm::telemetry::TelemetrySignalMask::NONE
+    }
+
+    pub fn telemetry_snapshot(&self) -> crate::vm::telemetry::RuntimeTelemetrySnapshot {
+        let stats = self.jit_stats();
+        crate::vm::telemetry::RuntimeTelemetrySnapshot {
+            gas_used: self.gas_used(),
+            gas_remaining: self.gas_remaining(),
+            memory_used_bytes: self.memory_used(),
+            active_host_slots: self.host_ledger.count as u16,
+            jit_traces_compiled: stats.root_traces_compiled + stats.functions_compiled,
+            jit_guard_exits: stats.guard_exits,
+        }
+    }
+
+    #[inline]
+    pub fn flush_gas_telemetry(&mut self) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::GAS) {
+                    let current = self.budgets.gas.used;
+                    if current > self.budgets.last_gas_consumed_flushed {
+                        let delta = current - self.budgets.last_gas_consumed_flushed;
+                        self.budgets.last_gas_consumed_flushed = current;
+                        sink.counter_add("lust.vm.gas.consumed_total", delta, &[]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn record_gas_exhausted(&self, source: &str) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::GAS) {
+                    sink.counter_add("lust.vm.gas.exhausted_total", 1, &[("source", source)]);
+                }
+            }
+        }
+        let _ = source;
+    }
+
+    #[inline]
+    pub fn record_memory_used(&self, bytes: usize) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::MEMORY) {
+                    sink.gauge_set("lust.vm.memory.bytes_used", bytes as f64, &[]);
+                }
+            }
+        }
+        let _ = bytes;
+    }
+
+    #[inline]
+    pub fn record_memory_limit_rejection(&self) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::MEMORY) {
+                    sink.counter_add("lust.vm.memory.limit_rejections_total", 1, &[]);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn record_host_ledger_active(&self, count: u16) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::HOST_LEDGER) {
+                    sink.gauge_set("lust.vm.host_ledger.active_slots", count as f64, &[]);
+                }
+            }
+        }
+        let _ = count;
+    }
+
+    #[inline]
+    pub fn record_host_ledger_overflow(&self) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::HOST_LEDGER) {
+                    sink.counter_add("lust.vm.host_ledger.overflow_total", 1, &[]);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn notify_host_resource_acquired(&self) {
+        self.record_host_ledger_active(self.host_ledger.count as u16);
+    }
+
+    #[inline]
+    pub fn notify_host_resource_released(&self) {
+        self.record_host_ledger_active(self.host_ledger.count as u16);
+    }
+
+    #[inline]
+    pub fn record_jit_trace_compiled(&self, count: u64) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-jit"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::JIT) {
+                    sink.counter_add("lust.jit.traces_compiled_total", count, &[]);
+                }
+            }
+        }
+        let _ = count;
+    }
+
+    #[inline]
+    pub fn record_jit_bailout(&self, guard_kind: &str) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-jit"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::JIT) {
+                    sink.counter_add("lust.jit.bailouts_total", 1, &[("guard_kind", guard_kind)]);
+                }
+            }
+        }
+        let _ = guard_kind;
+    }
+
+    #[inline]
+    pub fn record_fiber_lifecycle(&self, event: &str) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-effects"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::EFFECTS) {
+                    sink.counter_add("lust.fiber.lifecycle_total", 1, &[("event", event)]);
+                }
+            }
+        }
+        let _ = event;
+    }
+
+    #[inline]
+    pub fn span_enter_effect(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-effects"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::EFFECTS) {
+                    return sink.span_enter(name, labels);
+                }
+            }
+        }
+        let _ = (name, labels);
+        0
+    }
+
+    #[inline]
+    pub fn span_exit_effect(&self, span_id: u64, status: crate::vm::telemetry::SpanStatus) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-effects"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::EFFECTS) {
+                    sink.span_exit(span_id, status);
+                }
+            }
+        }
+        let _ = (span_id, status);
+    }
+
+    #[inline]
+    pub fn record_telemetry_counter(&self, name: &str, delta: u64, labels: &[(&str, &str)]) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-user"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::USER) {
+                    sink.counter_add(name, delta, labels);
+                }
+            }
+        }
+        let _ = (name, delta, labels);
+    }
+
+    #[inline]
+    pub fn record_telemetry_gauge(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-user"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::USER) {
+                    sink.gauge_set(name, value, labels);
+                }
+            }
+        }
+        let _ = (name, value, labels);
+    }
+
+    #[inline]
+    pub fn record_telemetry_histogram(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-user"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::USER) {
+                    sink.histogram_record(name, value, labels);
+                }
+            }
+        }
+        let _ = (name, value, labels);
+    }
+
+    #[inline]
+    pub fn telemetry_span_enter(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-user"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::USER) {
+                    return sink.span_enter(name, labels);
+                }
+            }
+        }
+        let _ = (name, labels);
+        0
+    }
+
+    #[inline]
+    pub fn telemetry_span_exit(&self, span_id: u64, status: crate::vm::telemetry::SpanStatus) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-user"
+        ))]
+        {
+            if let Some(ref sink) = self.budgets.telemetry_sink {
+                if self.budgets.telemetry_mask.contains(crate::vm::telemetry::TelemetrySignalMask::USER) {
+                    sink.span_exit(span_id, status);
+                }
+            }
+        }
+        let _ = (span_id, status);
     }
 
     /// Whether the VM is currently idle (no executing call frame, native callback, or JIT code).

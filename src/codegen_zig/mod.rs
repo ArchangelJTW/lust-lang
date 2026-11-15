@@ -1,4 +1,7 @@
 pub mod runtime;
+#[path = "../aot/mod.rs"]
+pub mod aot;
+pub use aot::AotCompiler;
 
 use crate::ast::{
     BinaryOp, EnumDef, Expr, ExprKind, FunctionDef, Item, ItemKind, Literal, Pattern, Stmt,
@@ -2637,13 +2640,37 @@ fn c_type_from_lust(ty: &Type) -> String {
     }
 }
 
+/// Checks whether the system `zig` compiler is installed and available in PATH.
+/// Can be explicitly disabled via `LUST_NO_ZIG=1` or `LUST_FORCE_AOT_NATIVE=1`.
+pub fn is_zig_available() -> bool {
+    let disabled = std::env::var("LUST_NO_ZIG")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+        || std::env::var("LUST_FORCE_AOT_NATIVE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    if disabled {
+        return false;
+    }
+    Command::new("zig")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Compiles a Zig source file to a native executable or library with full configuration.
+/// If system `zig` is unavailable or disabled, seamlessly falls back to autonomous AOT compilation.
 pub fn compile_zig(
     zig_path: &Path,
     output_bin: &Path,
     opts: &CompileOptions,
     link_libc: bool,
 ) -> Result<PathBuf> {
+    if !is_zig_available() {
+        return aot::AotCompiler::compile_zig_fallback(zig_path, output_bin, opts, link_libc);
+    }
+
     let mut cmd = Command::new("zig");
     match opts.target_kind {
         BuildTargetKind::Executable => {

@@ -1,6 +1,9 @@
 use crate::ast::{
-    BinaryOp, Expr, ExprKind, FunctionDef, Literal, Stmt, StmtKind, Type, TypeKind, UnaryOp,
+    BinaryOp, Expr, ExprKind, FunctionDef, Item, ItemKind, Literal, Stmt, StmtKind, StructDef,
+    Type, TypeKind, UnaryOp,
 };
+use crate::data::layout::{CanonicalTypeTag, LogicalLayoutV1};
+use crate::data::materialize::struct_def_to_layout;
 use crate::mir::ir::*;
 use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use hashbrown::{HashMap, HashSet};
@@ -52,6 +55,8 @@ pub struct AstLowering<'a> {
     loop_stack: Vec<(BlockId, BlockId)>, // (header/continue_block, exit_block)
     struct_fields: HashMap<String, Vec<String>>,
     struct_field_substructs: HashMap<String, Vec<Option<String>>>,
+    struct_layouts: HashMap<String, LogicalLayoutV1>,
+    struct_ops: Vec<MirStructOp>,
     local_field_names: HashMap<LocalId, Vec<String>>,
     thunk_return_target: Option<(LocalId, BlockId)>,
 }
@@ -77,9 +82,159 @@ impl<'a> AstLowering<'a> {
             loop_stack: Vec::new(),
             struct_fields: HashMap::new(),
             struct_field_substructs: HashMap::new(),
+            struct_layouts: HashMap::new(),
+            struct_ops: Vec::new(),
             local_field_names: HashMap::new(),
             thunk_return_target: None,
         }
+    }
+
+    pub fn register_struct_def(&mut self, def: &StructDef) {
+        let layout = struct_def_to_layout(def);
+        let substructs = def
+            .fields
+            .iter()
+            .map(|f| match &f.ty.kind {
+                TypeKind::Named(sub)
+                    if !matches!(
+                        sub.as_str(),
+                        "ObjectId" | "DateTimeUtc" | "Decimal128" | "Binary" | "Bytes"
+                    ) =>
+                {
+                    Some(sub.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        self.struct_field_substructs
+            .insert(def.name.clone(), substructs);
+        self.register_struct_layout(layout);
+    }
+
+    pub fn register_struct_layout(&mut self, layout: LogicalLayoutV1) {
+        let names = layout.fields.iter().map(|f| f.name.clone()).collect();
+        self.struct_fields.insert(layout.type_name.clone(), names);
+        self.struct_layouts.insert(layout.type_name.clone(), layout);
+    }
+
+    pub fn struct_ops(&self) -> &[MirStructOp] {
+        &self.struct_ops
+    }
+
+    pub fn lower_struct_decode_into(
+        &mut self,
+        struct_name: &str,
+        src_bytes: Operand,
+        span: crate::ast::Span,
+    ) -> Result<LocalId, MirLowerError> {
+        let layout = self.struct_layouts.get(struct_name).cloned().ok_or_else(|| {
+            MirLowerError::UnlowerableExpression(format!(
+                "Unknown struct layout '{}' for StructDecodeInto",
+                struct_name
+            ))
+        })?;
+        let dst = self
+            .current_fn
+            .add_local(None, MirType::Struct(struct_name.to_string()), true, span);
+        let succ_bb = self.current_fn.new_block();
+        self.emit_stmt(Statement::StorageLive(dst, span));
+        self.struct_ops.push(MirStructOp::StructDecodeInto {
+            struct_name: struct_name.to_string(),
+            layout: MirStructLayout::from(&layout),
+            dst,
+            src_bytes: src_bytes.clone(),
+        });
+        self.terminate_block(Terminator::Call {
+            callee: mir_struct_decode_callee(struct_name),
+            args: vec![src_bytes],
+            destination: Place::Local(dst),
+            success: succ_bb,
+            error: None,
+            span,
+        });
+        self.current_block = succ_bb;
+        Ok(dst)
+    }
+
+    pub fn lower_module_items(
+        module_name: impl Into<String>,
+        items: &[Item],
+    ) -> Result<MirModule, MirLowerError> {
+        let mut module = MirModule::new(module_name.into());
+        let mut defs = Vec::new();
+        for item in items {
+            if let ItemKind::Struct(def) = &item.kind {
+                let layout = struct_def_to_layout(def);
+                module.register_struct_layout(MirStructLayout::from(&layout));
+                defs.push(def);
+            }
+        }
+        for item in items {
+            if let ItemKind::Function(func_def) = &item.kind {
+                let (mir_fn, ops) = Self::lower_function_with_structs(func_def, &defs)?;
+                module.add_function(mir_fn);
+                for op in ops {
+                    module.record_struct_op(op);
+                }
+            }
+        }
+        Ok(module)
+    }
+
+    pub fn lower_function_with_structs(
+        func_def: &FunctionDef,
+        struct_defs: &[&StructDef],
+    ) -> Result<(MirFunction, Vec<MirStructOp>), MirLowerError> {
+        let sig = FunctionSignature {
+            name: func_def.name.clone(),
+            param_types: func_def
+                .params
+                .iter()
+                .map(|p| mir_type_from_ast(&p.ty))
+                .collect(),
+            return_type: func_def
+                .return_type
+                .as_ref()
+                .map(mir_type_from_ast)
+                .unwrap_or(MirType::Unit),
+            is_public: true,
+            effects: func_def.effects.clone(),
+        };
+
+        let mut mir_fn = MirFunction::new(sig, crate::ast::Span::dummy());
+        for (i, p) in func_def.params.iter().enumerate() {
+            let p_id = mir_fn.params[i];
+            mir_fn.locals[p_id.0].name = Some(p.name.clone());
+        }
+
+        let ops = {
+            let mut lowering = AstLowering::new(&mut mir_fn);
+            for def in struct_defs {
+                lowering.register_struct_def(def);
+            }
+            for stmt in &func_def.body {
+                lowering.lower_statement(stmt)?;
+            }
+
+            let cur_block = lowering.current_block;
+            if lowering.current_fn.blocks[cur_block.0].terminator.is_none() {
+                if let Some(root_cleanups) = lowering.cleanups.last().cloned() {
+                    for c in root_cleanups.iter().rev() {
+                        if matches!(c.kind, MirCleanupKind::Defer) {
+                            lowering.lower_statement(&c.stmt)?;
+                        }
+                    }
+                }
+                let final_block = lowering.current_block;
+                if lowering.current_fn.blocks[final_block.0].terminator.is_none() {
+                    lowering.current_fn.blocks[final_block.0].terminator =
+                        Some(Terminator::Return(None, crate::ast::Span::dummy()));
+                }
+            }
+            lowering.struct_ops
+        };
+
+        Ok((mir_fn, ops))
     }
 
     fn push_scope(&mut self) {
@@ -1705,8 +1860,41 @@ impl<'a> AstLowering<'a> {
                     }
                 };
                 let field_idx = self.resolve_field_idx(&base_place, field).unwrap_or(0);
-                let field_place = Place::Field(Box::new(base_place), field_idx);
-                let temp = self.current_fn.add_local(None, MirType::Int, true, expr.span);
+                let field_place = Place::Field(Box::new(base_place.clone()), field_idx);
+                let mut field_mir_ty = MirType::Int;
+                let mut recorded_load: Option<(String, u16, usize, CanonicalTypeTag)> = None;
+                if let Some(struct_name) = self.get_place_struct_name(&base_place) {
+                    if let Some(layout) = self.struct_layouts.get(&struct_name) {
+                        if let Some(f_desc) = layout.field_by_name(field) {
+                            field_mir_ty = match f_desc.tag {
+                                CanonicalTypeTag::Bool => MirType::Bool,
+                                CanonicalTypeTag::Int64
+                                | CanonicalTypeTag::UInt64
+                                | CanonicalTypeTag::DateTimeUtc => MirType::Int,
+                                CanonicalTypeTag::Float64 => MirType::Float,
+                                CanonicalTypeTag::StringSlice => MirType::String,
+                                _ => MirType::Int,
+                            };
+                            recorded_load = Some((
+                                struct_name,
+                                f_desc.ordinal,
+                                f_desc.byte_offset,
+                                f_desc.tag,
+                            ));
+                        }
+                    }
+                }
+                let temp = self.current_fn.add_local(None, field_mir_ty, true, expr.span);
+                if let Some((struct_name, ordinal, byte_offset, tag)) = recorded_load {
+                    self.struct_ops.push(MirStructOp::StructLoadField {
+                        struct_name,
+                        base: base_place,
+                        ordinal,
+                        byte_offset,
+                        tag,
+                        dst: temp,
+                    });
+                }
                 self.emit_stmt(Statement::StorageLive(temp, expr.span));
                 self.emit_stmt(Statement::Assign(
                     Place::Local(temp),
@@ -1838,6 +2026,13 @@ impl<'a> AstLowering<'a> {
                         return Ok(Operand::Constant(MirConstant::Int(0)));
                     }
                     _ => {}
+                }
+                if let Some(struct_name) = callee_name.strip_suffix(".decode") {
+                    if self.struct_layouts.contains_key(struct_name) && args.len() == 1 {
+                        let src_op = self.lower_expr(&args[0])?;
+                        let dst = self.lower_struct_decode_into(struct_name, src_op, expr.span)?;
+                        return Ok(Operand::Move(Place::Local(dst)));
+                    }
                 }
                 let mut lowered_args = Vec::with_capacity(args.len());
                 for a in args {

@@ -73,6 +73,18 @@ esp32c6-logging = ["dep:esp-println", "dep:log"]
 # JSONC optional CST support - off by default (WBS 12C-02)
 jsonc_cst = []
 
+# Telemetry features (Track 2C per RFC_TELEMETRY_AND_METRICS)
+telemetry = []
+telemetry-vm = ["telemetry"]
+telemetry-jit = ["telemetry"]
+telemetry-effects = ["telemetry"]
+telemetry-user = ["telemetry"]
+telemetry-all = ["telemetry-vm", "telemetry-jit", "telemetry-effects", "telemetry-user"]
+
+# WASI features (Track 2G per RFC_WASM_WASI_SUPPORT)
+wasi = ["std"]
+wasi-p2 = ["wasi"]
+
 [[bin]]
 name = "lust"
 path = "src/main.rs"
@@ -196,6 +208,7 @@ esp-println = { version = "0.18.0", optional = true, features = [
   "log-04",
 ] }
 log = { version = "0.4", optional = true }
+tempfile = "3.27.0"
 mimalloc = { version = "0.1.52", default-features = false }
 
 [build-dependencies]
@@ -206,11 +219,14 @@ tempfile = "3.27.0"
 tree-sitter = "0.20.10"
 tree-sitter-lust = { path = "tree-sitter-lust" }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen = "0.2.128"
 console_error_panic_hook = "0.1.7"
 web-sys = { version = "0.3.105", features = ["console"] }
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
+
+[target.'cfg(target_os = "wasi")'.dependencies]
+getrandom = { version = "0.4.3" }
 
 [profile.release]
 strip = false

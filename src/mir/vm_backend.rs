@@ -1,7 +1,14 @@
 use crate::bytecode::{Chunk, Function, Instruction, Register, Value};
+use crate::bytecode::value::{native_fn, NativeCallResult};
+use crate::data::layout::CanonicalTypeTag;
+use crate::data::materialize::{
+    decode_json_into_contiguous, ContiguousDecodeOptions, ContiguousStruct, LayoutPerfCounters,
+};
 use crate::mir::ir::*;
 use crate::number::{LustFloat, LustInt};
+use alloc::rc::Rc;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use hashbrown::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -459,5 +466,144 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 panic!("Target basic block {:?} not found during jump patching", target);
             }
         }
+    }
+
+    pub fn compile_module(module: &'a MirModule) -> Result<Vec<Function>, MirVmBackendError> {
+        let mut out = Vec::with_capacity(module.functions.len());
+        for func in &module.functions {
+            out.push(Self::compile(func)?);
+        }
+        Ok(out)
+    }
+}
+
+/// Structural bytecode audit for Gate-SCHEMA-09 zero name/hash lookup verification.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChunkFieldAccessAudit {
+    pub get_field_count: usize,
+    pub set_field_count: usize,
+    pub get_index_count: usize,
+    pub set_index_count: usize,
+}
+
+impl ChunkFieldAccessAudit {
+    pub fn has_zero_name_lookup(&self) -> bool {
+        self.get_field_count == 0 && self.set_field_count == 0
+    }
+}
+
+/// Audits a compiled VM bytecode chunk to verify zero `GetField`/`SetField` name lookups.
+pub fn audit_chunk_field_access(chunk: &Chunk) -> ChunkFieldAccessAudit {
+    let mut audit = ChunkFieldAccessAudit::default();
+    for instr in &chunk.instructions {
+        match instr {
+            Instruction::GetField(..) => audit.get_field_count += 1,
+            Instruction::SetField(..) => audit.set_field_count += 1,
+            Instruction::GetIndex(..) => audit.get_index_count += 1,
+            Instruction::SetIndex(..) => audit.set_index_count += 1,
+            _ => {}
+        }
+    }
+    audit
+}
+
+fn contiguous_to_vm_slots(s: &ContiguousStruct) -> Result<Value, String> {
+    let mut slots = Vec::with_capacity(s.layout.fields.len());
+    for field in &s.layout.fields {
+        let ord = field.ordinal;
+        let off = field.byte_offset;
+        if s.is_null(ord) || !s.is_initialized(ord) {
+            slots.push(Value::Nil);
+            continue;
+        }
+        let val = match field.tag {
+            CanonicalTypeTag::Bool => {
+                Value::Bool(s.read_bool_at(ord, off, None).map_err(|e| e.to_string())?.unwrap_or(false))
+            }
+            CanonicalTypeTag::Int64 | CanonicalTypeTag::DateTimeUtc => {
+                Value::Int(s.read_i64_at(ord, off, None).map_err(|e| e.to_string())?.unwrap_or(0) as LustInt)
+            }
+            CanonicalTypeTag::UInt64 => {
+                let u = s.read_u64_at(ord, off, None).map_err(|e| e.to_string())?.unwrap_or(0);
+                let i = i64::try_from(u).map_err(|_| "UInt64 overflows VM Int".to_string())?;
+                Value::Int(i as LustInt)
+            }
+            CanonicalTypeTag::Float64 => {
+                Value::Float(s.read_f64_at(ord, off, None).map_err(|e| e.to_string())?.unwrap_or(0.0) as LustFloat)
+            }
+            CanonicalTypeTag::StringSlice => {
+                let text = s.read_str_at(ord, off, None).map_err(|e| e.to_string())?.unwrap_or("");
+                Value::string(text.to_string())
+            }
+            CanonicalTypeTag::BinarySlice => {
+                let bytes = s.read_bytes_at(ord, off, None).map_err(|e| e.to_string())?.unwrap_or(&[]);
+                Value::string(String::from_utf8_lossy(bytes).into_owned())
+            }
+            CanonicalTypeTag::NestedStruct(_) => {
+                if let Some(nested) = s.read_nested_at(ord, None).map_err(|e| e.to_string())? {
+                    contiguous_to_vm_slots(nested)?
+                } else {
+                    Value::Nil
+                }
+            }
+            CanonicalTypeTag::ObjectId => {
+                let oid = s.read_object_id_at(ord, off, None).map_err(|e| e.to_string())?.unwrap_or([0u8; 12]);
+                let mut hex = String::with_capacity(24);
+                for b in oid {
+                    use core::fmt::Write;
+                    let _ = write!(&mut hex, "{:02x}", b);
+                }
+                Value::string(hex)
+            }
+            CanonicalTypeTag::Decimal128 => {
+                let dec = s.read_decimal128_at(ord, off, None).map_err(|e| e.to_string())?.unwrap_or(0);
+                Value::Int(dec as LustInt)
+            }
+        };
+        slots.push(val);
+    }
+    Ok(Value::array(slots))
+}
+
+/// Registers `StructDecodeInto` native decoders for all layouts in `module` onto `vm`.
+pub fn register_module_struct_decoders(vm: &mut crate::vm::VM, module: &MirModule) {
+    let counters = Rc::new(RefCell::new(LayoutPerfCounters::default()));
+    register_struct_decode_natives_with_counters(vm, &module.struct_layouts, counters);
+}
+
+/// Registers `StructDecodeInto` native decoders with shared instrumentation counters.
+pub fn register_struct_decode_natives_with_counters(
+    vm: &mut crate::vm::VM,
+    layouts: &[MirStructLayout],
+    counters: Rc<RefCell<LayoutPerfCounters>>,
+) {
+    let mut nested_map = std::collections::HashMap::new();
+    for l in layouts {
+        nested_map.insert(l.type_id, l.to_logical_layout());
+    }
+    let nested_map = Rc::new(nested_map);
+
+    for layout in layouts {
+        let callee = mir_struct_decode_callee(&layout.type_name);
+        let logical = layout.to_logical_layout();
+        let counters_ref = Rc::clone(&counters);
+        let nested_ref = Rc::clone(&nested_map);
+        let func = native_fn(move |args: &[Value]| {
+            let input_str = args
+                .first()
+                .and_then(|v| v.as_string())
+                .ok_or_else(|| "StructDecodeInto expects a JSON string argument".to_string())?;
+            let opts = ContiguousDecodeOptions {
+                cancel_check: None,
+                nested_layouts: Some(nested_ref.as_ref()),
+                require_nominal_tag: false,
+            };
+            let mut c = counters_ref.borrow_mut();
+            let decoded = decode_json_into_contiguous(&logical, input_str.as_bytes(), &mut c, &opts)
+                .map_err(|e| e.to_string())?;
+            let slots = contiguous_to_vm_slots(&decoded)?;
+            Ok(NativeCallResult::Return(slots))
+        });
+        vm.register_native(callee, Value::NativeFunction(func));
     }
 }

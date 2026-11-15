@@ -48,6 +48,7 @@ pub struct DependencySpec {
     default_features: Option<bool>,
     externs: Option<String>,
     legacy: bool,
+    link: Option<String>,
 }
 
 impl DependencySpec {
@@ -81,6 +82,10 @@ impl DependencySpec {
 
     pub fn is_legacy(&self) -> bool {
         self.legacy
+    }
+
+    pub fn link(&self) -> Option<&str> {
+        self.link.as_deref()
     }
 }
 
@@ -183,6 +188,94 @@ impl CapabilityMask {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TelemetryConfig {
+    pub enabled: bool,
+    pub service_name: String,
+    pub exporter: String,
+    pub sampling_rate: f64,
+    pub signals: TelemetrySignalsConfig,
+    pub limits: TelemetryLimitsConfig,
+    pub prometheus: TelemetryPrometheusConfig,
+    pub external: TelemetryExternalConfig,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            service_name: String::from("lust"),
+            exporter: String::from("none"),
+            sampling_rate: 1.0,
+            signals: TelemetrySignalsConfig::default(),
+            limits: TelemetryLimitsConfig::default(),
+            prometheus: TelemetryPrometheusConfig::default(),
+            external: TelemetryExternalConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TelemetrySignalsConfig {
+    pub gas: bool,
+    pub memory: bool,
+    pub jit_bailouts: bool,
+    pub effect_spans: bool,
+    pub user_metrics: bool,
+}
+
+impl Default for TelemetrySignalsConfig {
+    fn default() -> Self {
+        Self {
+            gas: true,
+            memory: true,
+            jit_bailouts: true,
+            effect_spans: true,
+            user_metrics: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TelemetryLimitsConfig {
+    pub max_unique_metric_names: usize,
+    pub max_label_pairs_per_metric: usize,
+    pub max_label_value_len: usize,
+    pub max_unique_series: usize,
+}
+
+impl Default for TelemetryLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_unique_metric_names: 256,
+            max_label_pairs_per_metric: 8,
+            max_label_value_len: 64,
+            max_unique_series: 4096,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TelemetryPrometheusConfig {
+    pub listen: String,
+    pub path: String,
+}
+
+impl Default for TelemetryPrometheusConfig {
+    fn default() -> Self {
+        Self {
+            listen: String::from("127.0.0.1:9464"),
+            path: String::from("/metrics"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct TelemetryExternalConfig {
+    pub library: Option<String>,
+    pub sha256: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LustConfig {
     enabled_modules: HashSet<String>,
@@ -205,6 +298,7 @@ pub struct LustConfig {
     use_mir: bool,
     strict_mir: bool,
     cranelift_jit: bool,
+    pub telemetry: TelemetryConfig,
     #[cfg(feature = "std")]
     dependencies: Vec<DependencySpec>,
 }
@@ -239,6 +333,7 @@ impl Default for LustConfig {
             use_mir: false,
             strict_mir: false,
             cranelift_jit: false,
+            telemetry: TelemetryConfig::default(),
             #[cfg(feature = "std")]
             dependencies: Vec::new(),
         }
@@ -284,6 +379,23 @@ impl LustConfig {
         config.capability_mask = CapabilityMask::none();
         config.enabled_modules.clear();
         config
+    }
+
+    pub fn telemetry(&self) -> &TelemetryConfig {
+        &self.telemetry
+    }
+
+    pub fn telemetry_mut(&mut self) -> &mut TelemetryConfig {
+        &mut self.telemetry
+    }
+
+    pub fn set_telemetry(&mut self, telemetry: TelemetryConfig) {
+        self.telemetry = telemetry;
+    }
+
+    pub fn with_telemetry(mut self, telemetry: TelemetryConfig) -> Self {
+        self.telemetry = telemetry;
+        self
     }
 
     pub fn prelude_mode(&self) -> &PreludeMode {
@@ -583,6 +695,7 @@ impl LustConfig {
         let LustConfigToml {
             settings,
             dependencies: mut root_dependencies,
+            telemetry: toml_telemetry,
         } = parsed;
         let Settings {
             stdlib_modules,
@@ -606,9 +719,9 @@ impl LustConfig {
 
         let mut dependencies = Vec::new();
         for (name, entry) in root_dependencies {
-            let (version, path, kind, features, default_features, externs) = match entry {
+            let (version, path, kind, features, default_features, externs, link) = match entry {
                 DependencyToml::Version(version) => {
-                    (Some(version), None, None, Vec::new(), None, None)
+                    (Some(version), None, None, Vec::new(), None, None, None)
                 }
                 DependencyToml::Detailed(table) => {
                     let kind = match table.kind {
@@ -632,6 +745,7 @@ impl LustConfig {
                         table.features,
                         table.default_features,
                         table.externs,
+                        table.link,
                     )
                 }
             };
@@ -648,6 +762,7 @@ impl LustConfig {
                 default_features,
                 externs,
                 legacy: false,
+                link,
             });
         }
 
@@ -666,6 +781,7 @@ impl LustConfig {
                 default_features: None,
                 externs: legacy.externs,
                 legacy: true,
+                link: None,
             });
         }
 
@@ -680,6 +796,69 @@ impl LustConfig {
             gc
         };
 
+        let telemetry_val = match toml_telemetry {
+            Some(t) => {
+                let mut cfg = TelemetryConfig::default();
+                if let Some(enabled) = t.enabled {
+                    cfg.enabled = enabled;
+                }
+                if let Some(service_name) = t.service_name {
+                    cfg.service_name = service_name;
+                }
+                if let Some(exporter) = t.exporter {
+                    cfg.exporter = exporter;
+                }
+                if let Some(sampling_rate) = t.sampling_rate {
+                    cfg.sampling_rate = sampling_rate;
+                }
+                if let Some(signals) = t.signals {
+                    if let Some(gas) = signals.gas {
+                        cfg.signals.gas = gas;
+                    }
+                    if let Some(memory) = signals.memory {
+                        cfg.signals.memory = memory;
+                    }
+                    if let Some(jit_bailouts) = signals.jit_bailouts {
+                        cfg.signals.jit_bailouts = jit_bailouts;
+                    }
+                    if let Some(effect_spans) = signals.effect_spans {
+                        cfg.signals.effect_spans = effect_spans;
+                    }
+                    if let Some(user_metrics) = signals.user_metrics {
+                        cfg.signals.user_metrics = user_metrics;
+                    }
+                }
+                if let Some(limits) = t.limits {
+                    if let Some(max_names) = limits.max_unique_metric_names {
+                        cfg.limits.max_unique_metric_names = max_names;
+                    }
+                    if let Some(max_pairs) = limits.max_label_pairs_per_metric {
+                        cfg.limits.max_label_pairs_per_metric = max_pairs;
+                    }
+                    if let Some(max_val_len) = limits.max_label_value_len {
+                        cfg.limits.max_label_value_len = max_val_len;
+                    }
+                    if let Some(max_series) = limits.max_unique_series {
+                        cfg.limits.max_unique_series = max_series;
+                    }
+                }
+                if let Some(prom) = t.prometheus {
+                    if let Some(listen) = prom.listen {
+                        cfg.prometheus.listen = listen;
+                    }
+                    if let Some(path) = prom.path {
+                        cfg.prometheus.path = path;
+                    }
+                }
+                if let Some(ext) = t.external {
+                    cfg.external.library = ext.library;
+                    cfg.external.sha256 = ext.sha256;
+                }
+                cfg
+            }
+            None => TelemetryConfig::default(),
+        };
+
         Ok(Self {
             enabled_modules: modules,
             prelude_mode: PreludeMode::Standard,
@@ -692,6 +871,7 @@ impl LustConfig {
             use_mir: use_mir_val,
             strict_mir: strict_mir_val,
             cranelift_jit: false,
+            telemetry: telemetry_val,
             dependencies,
         })
     }
@@ -704,6 +884,75 @@ struct LustConfigToml {
     settings: Settings,
     #[serde(default)]
     dependencies: BTreeMap<String, DependencyToml>,
+    #[serde(default)]
+    telemetry: Option<TelemetryToml>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug, Default, Deserialize)]
+struct TelemetryToml {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    service_name: Option<String>,
+    #[serde(default)]
+    exporter: Option<String>,
+    #[serde(default)]
+    sampling_rate: Option<f64>,
+    #[serde(default)]
+    signals: Option<TelemetrySignalsToml>,
+    #[serde(default)]
+    limits: Option<TelemetryLimitsToml>,
+    #[serde(default)]
+    prometheus: Option<TelemetryPrometheusToml>,
+    #[serde(default)]
+    external: Option<TelemetryExternalToml>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug, Default, Deserialize)]
+struct TelemetrySignalsToml {
+    #[serde(default)]
+    gas: Option<bool>,
+    #[serde(default)]
+    memory: Option<bool>,
+    #[serde(default)]
+    jit_bailouts: Option<bool>,
+    #[serde(default)]
+    effect_spans: Option<bool>,
+    #[serde(default)]
+    user_metrics: Option<bool>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug, Default, Deserialize)]
+struct TelemetryLimitsToml {
+    #[serde(default)]
+    max_unique_metric_names: Option<usize>,
+    #[serde(default)]
+    max_label_pairs_per_metric: Option<usize>,
+    #[serde(default)]
+    max_label_value_len: Option<usize>,
+    #[serde(default)]
+    max_unique_series: Option<usize>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug, Default, Deserialize)]
+struct TelemetryPrometheusToml {
+    #[serde(default)]
+    listen: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug, Default, Deserialize)]
+struct TelemetryExternalToml {
+    #[serde(default)]
+    library: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
 }
 
 #[cfg(feature = "std")]
@@ -756,6 +1005,8 @@ struct DependencyTomlTable {
     default_features: Option<bool>,
     #[serde(default)]
     externs: Option<String>,
+    #[serde(default)]
+    link: Option<String>,
 }
 
 #[allow(dead_code)]

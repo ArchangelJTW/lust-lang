@@ -1,0 +1,149 @@
+-- Example: Schema Definition and Validation via Structured Validator & Constraints
+-- Demonstrates constructing structured schemas with integer/string constraints,
+-- validating DataValue documents, optional fields, strict object checking, and fail-closed validation.
+
+struct UserPayload
+    id: int
+    username: string
+    age: Option<int>
+    unregistered_extra: Option<bool>
+end
+
+struct IntConstraint
+    min_val: int
+    max_val: int
+    is_optional: bool
+end
+
+struct StringConstraint
+    min_len: int
+    max_len: int
+    is_optional: bool
+end
+
+struct UserProfileSchema
+    id_rule: IntConstraint
+    username_rule: StringConstraint
+    age_rule: IntConstraint
+    strict_mode: bool
+end
+
+impl UserProfileSchema
+    function build_default(): UserProfileSchema
+        return UserProfileSchema {
+            id_rule = IntConstraint { min_val = 1, max_val = 1_000_000, is_optional = false },
+            username_rule = StringConstraint { min_len = 3, max_len = 32, is_optional = false },
+            age_rule = IntConstraint { min_val = 0, max_val = 150, is_optional = true },
+            strict_mode = true
+        }
+    end
+
+    function parse(self, user: UserPayload): Result<bool, string>
+        -- 1. Check strict mode extra fields
+        if self.strict_mode and user.unregistered_extra:is_some() then
+            return Result.Err("Strict schema violation: unrecognized field 'unregistered_extra'")
+        end
+
+        -- 2. Validate id (required, min 1, max 1_000_000)
+        if user.id < self.id_rule.min_val or user.id > self.id_rule.max_val then
+            return Result.Err(string.format("Validation error: id %d out of bounds [%d, %d]", user.id, self.id_rule.min_val, self.id_rule.max_val))
+        end
+
+        -- 3. Validate username (required, len 3..32)
+        local u_len = string.len(user.username)
+        if u_len < self.username_rule.min_len or u_len > self.username_rule.max_len then
+            return Result.Err(string.format("Validation error: username length %d out of bounds [%d, %d]", u_len, self.username_rule.min_len, self.username_rule.max_len))
+        end
+
+        -- 4. Validate age (optional, 0..150)
+        if user.age:is_some() then
+            local age_val = user.age:unwrap()
+            if age_val < self.age_rule.min_val or age_val > self.age_rule.max_val then
+                return Result.Err(string.format("Validation error: age %d out of bounds [%d, %d]", age_val, self.age_rule.min_val, self.age_rule.max_val))
+            end
+        end
+
+        return Result.Ok(true)
+    end
+end
+
+suite "Schema Definition & Validation Suite" do
+    test "valid user document passes fluent schema validation" do
+        local schema = UserProfileSchema.build_default()
+        local valid_doc = UserPayload {
+            id = 1042,
+            username = "alex_dev",
+            age = Option.Some(28),
+            unregistered_extra = Option.None
+        }
+
+        local res = schema:parse(valid_doc)
+        assert(res:is_ok())
+        assert_eq(res:unwrap(), true)
+    end
+
+    test "out of bounds integer id fails closed" do
+        local schema = UserProfileSchema.build_default()
+        local out_of_bounds_doc = UserPayload {
+            id = 0,
+            username = "alex_dev",
+            age = Option.Some(28),
+            unregistered_extra = Option.None
+        }
+
+        local res = schema:parse(out_of_bounds_doc)
+        assert(res:is_err())
+    end
+
+    test "strict schema rejects unrecognized extra fields" do
+        local schema = UserProfileSchema.build_default()
+        local extra_field_doc = UserPayload {
+            id = 1042,
+            username = "alex_dev",
+            age = Option.None,
+            unregistered_extra = Option.Some(true)
+        }
+
+        local res = schema:parse(extra_field_doc)
+        assert(res:is_err())
+    end
+
+    test "string length bounds constraints enforced" do
+        local schema = UserProfileSchema.build_default()
+        local short_name_doc = UserPayload {
+            id = 1042,
+            username = "al",
+            age = Option.Some(28),
+            unregistered_extra = Option.None
+        }
+
+        local res = schema:parse(short_name_doc)
+        assert(res:is_err())
+    end
+
+    test "optional field constraints and bounds enforcement" do
+        local schema = UserProfileSchema.build_default()
+        
+        -- Age omitted (Option.None) is valid because optional
+        local no_age_doc = UserPayload {
+            id = 1042,
+            username = "alex_dev",
+            age = Option.None,
+            unregistered_extra = Option.None
+        }
+        local res_no_age = schema:parse(no_age_doc)
+        assert(res_no_age:is_ok())
+
+        -- Age out of bounds fails closed
+        local bad_age_doc = UserPayload {
+            id = 1042,
+            username = "alex_dev",
+            age = Option.Some(200),
+            unregistered_extra = Option.None
+        }
+        local res_bad_age = schema:parse(bad_age_doc)
+        assert(res_bad_age:is_err())
+    end
+end
+
+println("All schema validation assertions passed!")

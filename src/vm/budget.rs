@@ -5,21 +5,48 @@ const MAP_ENTRY_BYTES_ESTIMATE: usize = 64;
 const UPVALUE_BYTES_ESTIMATE: usize = 64;
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct BudgetState {
-    gas: GasBudget,
-    memory: MemoryBudget,
+pub struct BudgetState {
+    pub(crate) gas: GasBudget,
+    pub(crate) memory: MemoryBudget,
+    #[cfg(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    ))]
+    pub(crate) telemetry_sink: Option<alloc::sync::Arc<dyn crate::vm::telemetry::TelemetrySink>>,
+    #[cfg(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    ))]
+    pub(crate) telemetry_mask: crate::vm::telemetry::TelemetrySignalMask,
+    #[cfg(any(
+        feature = "telemetry",
+        feature = "telemetry-all",
+        feature = "telemetry-vm",
+        feature = "telemetry-jit",
+        feature = "telemetry-effects",
+        feature = "telemetry-user"
+    ))]
+    pub(crate) last_gas_consumed_flushed: u64,
 }
 
 #[derive(Debug, Clone, Default)]
-struct GasBudget {
-    limit: Option<u64>,
-    used: u64,
+pub(crate) struct GasBudget {
+    pub(crate) limit: Option<u64>,
+    pub(crate) used: u64,
 }
 
 #[derive(Debug, Clone, Default)]
-struct MemoryBudget {
-    limit_bytes: Option<usize>,
-    used_bytes: usize,
+pub(crate) struct MemoryBudget {
+    pub(crate) limit_bytes: Option<usize>,
+    pub(crate) used_bytes: usize,
 }
 
 impl BudgetState {
@@ -154,11 +181,31 @@ impl VM {
     pub(crate) fn sync_gas_from_cells(&mut self) {
         if let Some(limit) = self.budgets.gas.limit {
             self.budgets.gas.used = limit.saturating_sub(self.jit_cells.gas_left);
+            #[cfg(any(
+                feature = "telemetry",
+                feature = "telemetry-all",
+                feature = "telemetry-vm"
+            ))]
+            self.flush_gas_telemetry();
         }
     }
 
     pub fn reset_gas_counter(&mut self) {
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        self.flush_gas_telemetry();
         self.budgets.gas.used = 0;
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            self.budgets.last_gas_consumed_flushed = 0;
+        }
     }
 
     pub fn gas_used(&self) -> u64 {
@@ -233,6 +280,12 @@ impl VM {
         }
         self.budgets.memory.limit_bytes = None;
         self.budgets.memory.used_bytes = 0;
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        self.record_memory_used(0);
         self.invalidate_jit_code();
         Ok(())
     }
@@ -251,6 +304,12 @@ impl VM {
             });
         }
         self.budgets.memory.used_bytes = 0;
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        self.record_memory_used(0);
         Ok(())
     }
 
@@ -274,11 +333,36 @@ impl VM {
     }
 
     pub fn try_charge_memory_bytes(&mut self, bytes: usize) -> bool {
-        self.budgets.try_charge_mem_bytes(bytes)
+        let success = self.budgets.try_charge_mem_bytes(bytes);
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        {
+            if success {
+                self.record_memory_used(self.budgets.memory.used_bytes);
+            } else {
+                self.record_memory_limit_rejection();
+            }
+        }
+        success
     }
 
     pub fn refund_memory_bytes(&mut self, bytes: usize) {
         self.budgets.memory.used_bytes = self.budgets.memory.used_bytes.saturating_sub(bytes);
+        #[cfg(any(
+            feature = "telemetry",
+            feature = "telemetry-all",
+            feature = "telemetry-vm"
+        ))]
+        self.record_memory_used(self.budgets.memory.used_bytes);
+    }
+
+    /// Releases memory safely using saturating_sub without resetting bytecode-charged bytes.
+    /// Provided for FFI capacity accounting (Track 2B).
+    pub fn release_memory_bytes(&mut self, bytes: usize) {
+        self.refund_memory_bytes(bytes);
     }
 
     pub(crate) fn try_charge_memory_value_vec(&mut self, element_count: usize) -> bool {

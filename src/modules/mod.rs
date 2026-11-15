@@ -95,7 +95,34 @@ pub fn compile_program_with_config(program: Program, config: &LustConfig) -> cra
     // Build imports map
     let mut imports_map: HashMap<String, ModuleImports> = HashMap::new();
     for module in &program.modules {
-        imports_map.insert(module.path.clone(), module.imports.clone());
+        let mut imports = module.imports.clone();
+        for target in imports.module_aliases.values() {
+            if crate::builtins::canonical_std_module_name(target) == "table" {
+                imports
+                    .type_aliases
+                    .entry("Table".to_string())
+                    .or_insert_with(|| "std.table.Table".to_string());
+                imports
+                    .type_aliases
+                    .entry("LuaTable".to_string())
+                    .or_insert_with(|| "std.table.LuaTable".to_string());
+            }
+        }
+        for (alias, target) in &imports.function_aliases {
+            if target == "std.table.Table" || target == "table.Table" {
+                imports
+                    .type_aliases
+                    .entry(alias.clone())
+                    .or_insert_with(|| "std.table.Table".to_string());
+            }
+            if target == "std.table.LuaTable" || target == "table.LuaTable" {
+                imports
+                    .type_aliases
+                    .entry(alias.clone())
+                    .or_insert_with(|| "std.table.LuaTable".to_string());
+            }
+        }
+        imports_map.insert(module.path.clone(), imports);
     }
 
     // Phase 1: Type check
@@ -1428,6 +1455,14 @@ impl ModuleLoader {
                     imports
                         .module_aliases
                         .insert(alias_name, canon.to_string());
+                    if canon == "table" {
+                        imports
+                            .type_aliases
+                            .insert("Table".to_string(), "std.table.Table".to_string());
+                        imports
+                            .type_aliases
+                            .insert("LuaTable".to_string(), "std.table.LuaTable".to_string());
+                    }
                 } else if path.len() > 1 {
                     let module = path[..path.len() - 1].join(".");
                     let item = path.last().unwrap().clone();
@@ -1450,6 +1485,11 @@ impl ModuleLoader {
                                     item
                                 )
                             });
+                        if canon == "table" && (item == "Table" || item == "LuaTable") {
+                            imports
+                                .type_aliases
+                                .insert(alias_name.clone(), format!("std.table.{}", item));
+                        }
                         imports.function_aliases.insert(alias_name, fq);
                     } else {
                         let classification = self.classify_import_target(&module, &item);
@@ -1494,6 +1534,11 @@ impl ModuleLoader {
                                     item_name
                                 )
                             });
+                        if canon == "table" && (item_name == "Table" || item_name == "LuaTable") {
+                            imports
+                                .type_aliases
+                                .insert(alias_name.clone(), format!("std.table.{}", item_name));
+                        }
                         imports.function_aliases.insert(alias_name, fq);
                     }
                 } else {
@@ -1552,6 +1597,14 @@ impl ModuleLoader {
                         imports.function_aliases.insert(fn_name.to_string(), fq.to_string());
                     }
                     imports.module_aliases.insert(canon.to_string(), canon.to_string());
+                    if canon == "table" {
+                        imports
+                            .type_aliases
+                            .insert("Table".to_string(), "std.table.Table".to_string());
+                        imports
+                            .type_aliases
+                            .insert("LuaTable".to_string(), "std.table.LuaTable".to_string());
+                    }
                 } else {
                     if let Some(loaded) = self.cache.get(&module) {
                         for (name, fq) in &loaded.exports.functions {

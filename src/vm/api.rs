@@ -333,6 +333,7 @@ impl VM {
         for (name, func) in super::stdlib::create_stdlib(config, &vm) {
             vm.register_native(name, func);
         }
+        super::channel::register_builtins(&mut vm);
         vm.register_jit_intrinsics();
 
         #[cfg(feature = "std")]

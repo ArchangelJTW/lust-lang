@@ -1277,6 +1277,22 @@ impl TypeChecker {
                     .iter()
                     .map(|arg| self.canonicalize_type(arg))
                     .collect();
+                if (resolved == "Table" || resolved == "std.table.Table")
+                    && canonical_args.len() == 1
+                {
+                    return Type::new(
+                        TK::Array(Box::new(canonical_args.into_iter().next().unwrap())),
+                        ty.span,
+                    );
+                }
+                if (resolved == "Table" || resolved == "std.table.Table")
+                    && canonical_args.len() == 2
+                {
+                    let mut args_iter = canonical_args.into_iter();
+                    let k = args_iter.next().unwrap();
+                    let v = args_iter.next().unwrap();
+                    return Type::new(TK::Map(Box::new(k), Box::new(v)), ty.span);
+                }
                 Type::new(
                     TK::GenericInstance {
                         name: resolved,

@@ -19,6 +19,7 @@ pub mod rx;
 #[cfg(feature = "std")]
 pub mod codegen_zig;
 pub mod effect_abi;
+#[cfg(feature = "std")]
 pub mod embed;
 pub mod error;
 #[cfg(feature = "std")]
@@ -45,8 +46,10 @@ pub mod sim;
 pub mod stdlib;
 #[cfg(feature = "std")]
 pub mod vfs;
-#[cfg(target_arch = "wasm32")]
 pub mod wasm;
+#[cfg(feature = "std")]
+pub mod wasi;
+pub use vm::telemetry;
 pub use ast::{Expr, Item, Span, Stmt, Type};
 pub use bytecode::{Chunk, Compiler, Function, Instruction, Value};
 pub use config::{ConfigError, DependencyKind, DependencySpec, LustConfig};
@@ -119,4 +122,10 @@ pub use sim::{
 pub use vfs::{
     DirectHostFsBypassPanic, MemFs, OsFs, VfsMetadata, VirtualConsole, VirtualEnv, VirtualFileSystem,
 };
+#[cfg(feature = "std")]
+pub use wasi::{
+    WasiAdapter, WasiCapabilities, WasiContext, WasiContextBuilder, WasiError, WasiErrno,
+    WasiFileHandle, WasiPreopen, WasiTimeoutGuard,
+};
+pub use wasm::{WasmAbi, WasmArchitecture, WasmRuntimeConfig, WasmTarget};
 pub use hashbrown;

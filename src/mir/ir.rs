@@ -1,4 +1,5 @@
 use crate::ast::Span;
+use crate::data::layout::{CanonicalTypeTag, LogicalFieldDesc, LogicalLayoutV1, TargetAbi};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::fmt;
 
@@ -440,10 +441,116 @@ impl MirFunction {
     }
 }
 
+pub const MIR_STRUCT_DECODE_PREFIX: &str = "__mir_struct_decode_into:";
+
+/// Builds the canonical MIR call target name for `StructDecodeInto`.
+pub fn mir_struct_decode_callee(struct_name: &str) -> String {
+    alloc::format!("{MIR_STRUCT_DECODE_PREFIX}{struct_name}")
+}
+
+/// Extracts the target struct name from a `StructDecodeInto` MIR call target.
+pub fn parse_mir_struct_decode_callee(callee: &str) -> Option<&str> {
+    callee.strip_prefix(MIR_STRUCT_DECODE_PREFIX)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirStructFieldLayout {
+    pub ordinal: u16,
+    pub name: String,
+    pub tag: CanonicalTypeTag,
+    pub byte_offset: usize,
+    pub byte_size: usize,
+    pub is_nullable: bool,
+    pub is_optional: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirStructLayout {
+    pub type_id: u64,
+    pub type_name: String,
+    pub fields: Vec<MirStructFieldLayout>,
+    pub size_bytes: usize,
+    pub align_bytes: usize,
+    pub is_c_flat: bool,
+    pub target_abi: TargetAbi,
+}
+
+impl From<&LogicalLayoutV1> for MirStructLayout {
+    fn from(layout: &LogicalLayoutV1) -> Self {
+        Self {
+            type_id: layout.type_id,
+            type_name: layout.type_name.clone(),
+            fields: layout
+                .fields
+                .iter()
+                .map(|f| MirStructFieldLayout {
+                    ordinal: f.ordinal,
+                    name: f.name.clone(),
+                    tag: f.tag,
+                    byte_offset: f.byte_offset,
+                    byte_size: f.byte_size,
+                    is_nullable: f.is_nullable,
+                    is_optional: f.is_optional,
+                })
+                .collect(),
+            size_bytes: layout.size_bytes,
+            align_bytes: layout.align_bytes,
+            is_c_flat: layout.is_c_flat,
+            target_abi: layout.target_abi,
+        }
+    }
+}
+
+impl MirStructLayout {
+    pub fn to_logical_layout(&self) -> LogicalLayoutV1 {
+        let fields = self
+            .fields
+            .iter()
+            .map(|f| {
+                let mut desc = LogicalFieldDesc::new(f.ordinal, f.name.clone(), f.tag)
+                    .with_nullability(f.is_nullable, f.is_optional);
+                desc.byte_offset = f.byte_offset;
+                desc.byte_size = f.byte_size;
+                desc
+            })
+            .collect();
+        LogicalLayoutV1::new_with_abi(self.type_id, self.type_name.clone(), fields, self.target_abi)
+    }
+
+    pub fn field_by_name(&self, name: &str) -> Option<&MirStructFieldLayout> {
+        self.fields.iter().find(|f| f.name == name)
+    }
+
+    pub fn field_by_ordinal(&self, ordinal: u16) -> Option<&MirStructFieldLayout> {
+        self.fields.iter().find(|f| f.ordinal == ordinal)
+    }
+}
+
+/// First-class MIR metadata for `D-LAYOUT` operations (`StructDecodeInto` / `StructLoadField`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirStructOp {
+    StructDecodeInto {
+        struct_name: String,
+        layout: MirStructLayout,
+        dst: LocalId,
+        src_bytes: Operand,
+    },
+    StructLoadField {
+        struct_name: String,
+        base: Place,
+        ordinal: u16,
+        byte_offset: usize,
+        tag: CanonicalTypeTag,
+        dst: LocalId,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirModule {
     pub name: String,
     pub functions: Vec<MirFunction>,
+    pub struct_layouts: Vec<MirStructLayout>,
+    pub struct_ops: Vec<MirStructOp>,
 }
 
 impl MirModule {
@@ -451,10 +558,32 @@ impl MirModule {
         Self {
             name,
             functions: Vec::new(),
+            struct_layouts: Vec::new(),
+            struct_ops: Vec::new(),
         }
     }
 
     pub fn add_function(&mut self, func: MirFunction) {
         self.functions.push(func);
+    }
+
+    pub fn register_struct_layout(&mut self, layout: MirStructLayout) {
+        if let Some(existing) = self
+            .struct_layouts
+            .iter_mut()
+            .find(|l| l.type_name == layout.type_name)
+        {
+            *existing = layout;
+        } else {
+            self.struct_layouts.push(layout);
+        }
+    }
+
+    pub fn find_struct_layout(&self, type_name: &str) -> Option<&MirStructLayout> {
+        self.struct_layouts.iter().find(|l| l.type_name == type_name)
+    }
+
+    pub fn record_struct_op(&mut self, op: MirStructOp) {
+        self.struct_ops.push(op);
     }
 }

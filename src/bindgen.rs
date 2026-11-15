@@ -73,6 +73,45 @@ use crate::typechecker::{FunctionSignature, TypeChecker};
 use crate::{LustConfig, LustError, Result};
 use hashbrown::{HashMap, HashSet};
 use std::fmt::Write as _;
+
+impl<A> crate::embed::FunctionArgs for (A,)
+where
+    A: crate::embed::IntoLustValue,
+{
+    fn into_values(self) -> Vec<crate::bytecode::Value> {
+        vec![self.0.into_value()]
+    }
+
+    fn write_args(self, dst: &mut [crate::bytecode::Value]) -> usize {
+        if !dst.is_empty() {
+            dst[0] = self.0.into_value();
+        }
+        1
+    }
+
+    fn validate_signature(function_name: &str, params: &[crate::ast::Type]) -> crate::Result<()> {
+        if params.len() != 1 {
+            return Err(crate::LustError::TypeError {
+                message: format!(
+                    "Function '{}' expects {} argument(s) but 1 were supplied",
+                    function_name,
+                    params.len()
+                ),
+            });
+        }
+        if !<A as crate::embed::IntoLustValue>::matches_lust_type(&params[0]) {
+            return Err(crate::LustError::TypeError {
+                message: format!(
+                    "Type mismatch for argument 1 of '{}': expected {}, got {}",
+                    function_name,
+                    params[0],
+                    <A as crate::embed::IntoLustValue>::type_description()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
 use std::path::{Path, PathBuf};
 
 const MAX_TYPED_BINDGEN_ARITY: usize = 12;
@@ -1288,7 +1327,7 @@ fn generate_source(
             .collect::<Vec<_>>();
         let args = match call_args.as_slice() {
             [] => "()".to_string(),
-            [arg] => arg.clone(),
+            [arg] => format!("({arg},)"),
             many => format!("({})", many.join(", ")),
         };
 
@@ -1485,7 +1524,7 @@ fn emit_bound_method(
     }));
     let args = match call_args.as_slice() {
         [] => "()".to_string(),
-        [arg] => arg.clone(),
+        [arg] => format!("({arg},)"),
         many => format!("({})", many.join(", ")),
     };
     writeln!(
@@ -2748,7 +2787,7 @@ end
                 .contains("pub fn echo_name(&mut self, name: &str)")
         );
         assert!(generated.source.contains(
-            "__lust_call_typed(&self.__lust_context, \"main.echo_name\", name.to_string())"
+            "__lust_call_typed(&self.__lust_context, \"main.echo_name\", (name.to_string(),))"
         ));
         assert!(!generated.source.contains("internal_helper"));
         assert!(generated.source.contains("/// Adds two values."));
@@ -2825,7 +2864,7 @@ end
         assert!(
             generated
                 .source
-                .contains("__lust_call_typed(&context, \"main.Player:double_id\", self.clone())")
+                .contains("__lust_call_typed(&context, \"main.Player:double_id\", (self.clone(),))")
         );
         assert!(generated.source.contains(
             "pub fn from_id(bindings: &mut GameBindings<'a>, id: ::lust::LustInt) -> ::lust::Result<Player<'a>>"
@@ -2833,7 +2872,7 @@ end
         assert!(
             generated
                 .source
-                .contains("__lust_call_typed(&context, \"main.Player.from_id\", id)")
+                .contains("__lust_call_typed(&context, \"main.Player.from_id\", (id,))")
         );
         assert!(
             generated.source.contains(
@@ -2842,7 +2881,7 @@ end
         );
         assert!(
             generated.source.contains(
-                "__lust_call_typed(&context, \"main.Player:display_name\", self.clone())"
+                "__lust_call_typed(&context, \"main.Player:display_name\", (self.clone(),))"
             )
         );
         assert!(generated.source.contains(
@@ -2851,7 +2890,7 @@ end
         assert!(
             generated
                 .source
-                .contains("__lust_call_typed(&context, \"main.Level:ordinal\", self.clone())")
+                .contains("__lust_call_typed(&context, \"main.Level:ordinal\", (self.clone(),))")
         );
     }
 

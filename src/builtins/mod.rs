@@ -540,6 +540,14 @@ fn build_array_functions() -> Vec<BuiltinFunction> {
             TypeExpr::Option(Box::new(t.clone())),
         ),
         generic_func(
+            "array.set",
+            "Set the element at the given index",
+            &["T"],
+            &["arr", "index", "value"],
+            vec![arr_t.clone(), TypeExpr::Int, t.clone()],
+            TypeExpr::Unit,
+        ),
+        generic_func(
             "array.first",
             "Return the first element, if any",
             &["T"],
@@ -686,6 +694,14 @@ fn build_array_functions() -> Vec<BuiltinFunction> {
             vec![arr_t.clone()],
             TypeExpr::Named("Iterator"),
         ),
+        generic_func(
+            "array.unpack",
+            "Unpack elements from an array into multiple values",
+            &["T"],
+            &["arr", "i", "j"],
+            vec![arr_t.clone(), TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
     ]
 }
 
@@ -693,29 +709,33 @@ fn build_table_functions() -> Vec<BuiltinFunction> {
     let t = TypeExpr::Generic("T");
     let arr_t = TypeExpr::Array(Box::new(t.clone()));
     vec![
-        generic_func(
+        func(
             "table.len",
             "Return the number of elements in the array/table",
-            &["T"],
-            &["arr"],
-            vec![arr_t.clone()],
+            &["col"],
+            vec![TypeExpr::Unknown],
             TypeExpr::Int,
         ),
-        generic_func(
+        func(
             "table.is_empty",
             "Check if the array/table contains no elements",
-            &["T"],
-            &["arr"],
-            vec![arr_t.clone()],
+            &["col"],
+            vec![TypeExpr::Unknown],
             TypeExpr::Bool,
         ),
-        generic_func(
+        func(
             "table.get",
-            "Return the element at the given index, if any",
-            &["T"],
-            &["arr", "index"],
-            vec![arr_t.clone(), TypeExpr::Int],
-            TypeExpr::Option(Box::new(t.clone())),
+            "Return the element at the given key or index, if any",
+            &["col", "key"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Option(Box::new(TypeExpr::Unknown)),
+        ),
+        func(
+            "table.set",
+            "Set the element at the given key or index in the array/table",
+            &["col", "key", "value"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unit,
         ),
         generic_func(
             "table.first",
@@ -766,6 +786,22 @@ fn build_table_functions() -> Vec<BuiltinFunction> {
             TypeExpr::Option(Box::new(t.clone())),
         ),
         generic_func(
+            "table.clear",
+            "Remove all elements from the array/table",
+            &["T"],
+            &["col"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unit,
+        ),
+        generic_func(
+            "table.slice",
+            "Return a slice of the array/table between two indices",
+            &["T"],
+            &["arr", "start", "end"],
+            vec![arr_t.clone(), TypeExpr::Int, TypeExpr::Int],
+            arr_t.clone(),
+        ),
+        generic_func(
             "table.concat",
             "Concatenate array/table elements into a string with an optional separator",
             &["T"],
@@ -790,14 +826,6 @@ fn build_table_functions() -> Vec<BuiltinFunction> {
             TypeExpr::Unit,
         ),
         generic_func(
-            "table.clear",
-            "Remove all elements from the array/table",
-            &["T"],
-            &["arr"],
-            vec![arr_t.clone()],
-            TypeExpr::Unit,
-        ),
-        generic_func(
             "table.contains",
             "Check if the array/table contains a given value",
             &["T"],
@@ -806,11 +834,75 @@ fn build_table_functions() -> Vec<BuiltinFunction> {
             TypeExpr::Bool,
         ),
         generic_func(
-            "table.slice",
-            "Return a slice of the array/table between two indices",
+            "table.map",
+            "Transform each element using the provided function",
             &["T"],
-            &["arr", "start", "end"],
-            vec![arr_t.clone(), TypeExpr::Int, TypeExpr::Int],
+            &["arr", "func"],
+            vec![
+                arr_t.clone(),
+                TypeExpr::Function {
+                    params: vec![t.clone()],
+                    return_type: Box::new(TypeExpr::Unknown),
+                },
+            ],
+            TypeExpr::Array(Box::new(TypeExpr::Unknown)),
+        ),
+        generic_func(
+            "table.filter",
+            "Keep elements where the predicate returns true",
+            &["T"],
+            &["arr", "func"],
+            vec![
+                arr_t.clone(),
+                TypeExpr::Function {
+                    params: vec![t.clone()],
+                    return_type: Box::new(TypeExpr::Bool),
+                },
+            ],
+            arr_t.clone(),
+        ),
+        generic_func(
+            "table.reduce",
+            "Fold elements into a single value",
+            &["T"],
+            &["arr", "initial", "func"],
+            vec![
+                arr_t.clone(),
+                TypeExpr::Unknown,
+                TypeExpr::Function {
+                    params: vec![TypeExpr::Unknown, t.clone()],
+                    return_type: Box::new(TypeExpr::Unknown),
+                },
+            ],
+            TypeExpr::Unknown,
+        ),
+        generic_func(
+            "table.iter",
+            "Return an iterator over the array/table items",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Named("Iterator"),
+        ),
+        func(
+            "table.unpack",
+            "Unpack elements from an array/table into multiple values",
+            &["arr", "i", "j"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        generic_func(
+            "table.move",
+            "Copy elements from one range/array to another",
+            &["T"],
+            &["a1", "f", "e", "t", "a2"],
+            vec![
+                arr_t.clone(),
+                TypeExpr::Int,
+                TypeExpr::Int,
+                TypeExpr::Int,
+                TypeExpr::Unknown,
+            ],
             arr_t.clone(),
         ),
     ]
@@ -2357,6 +2449,7 @@ pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'stat
             "len" => Some("table.len"),
             "is_empty" => Some("table.is_empty"),
             "get" => Some("table.get"),
+            "set" => Some("table.set"),
             "first" => Some("table.first"),
             "last" => Some("table.last"),
             "push" => Some("table.push"),
@@ -2374,6 +2467,9 @@ pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'stat
             "reduce" => Some("table.reduce"),
             "iter" => Some("table.iter"),
             "unpack" => Some("table.unpack"),
+            "move" => Some("table.move"),
+            "Table" => Some("table.Table"),
+            "LuaTable" => Some("table.LuaTable"),
             _ => None,
         },
         "string" => match item_name {
@@ -2412,6 +2508,7 @@ pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'stat
             "filter" => Some("array.filter"),
             "reduce" => Some("array.reduce"),
             "iter" => Some("array.iter"),
+            "unpack" => Some("array.unpack"),
             _ => None,
         },
         "map" => match item_name {
@@ -2503,6 +2600,7 @@ pub fn virtual_std_module_functions(module_path: &str) -> Vec<(&'static str, &'s
             ("len", "table.len"),
             ("is_empty", "table.is_empty"),
             ("get", "table.get"),
+            ("set", "table.set"),
             ("first", "table.first"),
             ("last", "table.last"),
             ("push", "table.push"),
@@ -2520,6 +2618,7 @@ pub fn virtual_std_module_functions(module_path: &str) -> Vec<(&'static str, &'s
             ("reduce", "table.reduce"),
             ("iter", "table.iter"),
             ("unpack", "table.unpack"),
+            ("move", "table.move"),
         ],
         "string" => vec![
             ("len", "string.len"),
@@ -2556,6 +2655,7 @@ pub fn virtual_std_module_functions(module_path: &str) -> Vec<(&'static str, &'s
             ("filter", "array.filter"),
             ("reduce", "array.reduce"),
             ("iter", "array.iter"),
+            ("unpack", "array.unpack"),
         ],
         "map" => vec![
             ("len", "map.len"),

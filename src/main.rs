@@ -34,8 +34,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 mod cli {
     #[path = "diag.rs"]
     pub mod diag;
+    #[path = "ext.rs"]
+    pub mod ext;
     #[path = "test.rs"]
     pub mod test;
+    #[path = "sim.rs"]
+    pub mod sim;
 }
 
 fn main() {
@@ -112,6 +116,19 @@ fn main() {
             return;
         }
 
+        "sim" => {
+            cli::sim::sim_command(&args[2..]);
+            return;
+        }
+
+        "ext" => {
+            if let Err(err) = cli::ext::run_ext_command(&args[2..]) {
+                eprintln!("Error: {err}");
+                process::exit(1);
+            }
+            return;
+        }
+
         "build" | "--aot" => {
             build_command(&args[2..]);
             return;
@@ -144,6 +161,7 @@ fn main() {
     let mut backend_mode: Option<String> = None;
     let mut jit_mode: Option<String> = None;
     let mut script_file: Option<String> = None;
+    let mut capture_failure: Option<String> = env::var("LUST_CAPTURE_FAILURE").ok();
     let mut json_diag = env::var("LUST_ERROR_FORMAT")
         .map(|v| v.eq_ignore_ascii_case("json"))
         .unwrap_or(false)
@@ -199,6 +217,25 @@ fn main() {
             }
             "--no-gc" => no_gc = true,
             "--pure-core" | "--no-prelude" => pure_core = true,
+            "--capture-failure" | "--capture-on-failure" => {
+                i += 1;
+                let Some(val) = run_args.get(i) else {
+                    eprintln!("Error: --capture-failure requires a path argument");
+                    process::exit(1);
+                };
+                capture_failure = Some(val.clone());
+            }
+            opt if opt.starts_with("--capture-failure=") => {
+                let val = opt.strip_prefix("--capture-failure=").unwrap();
+                capture_failure = Some(val.to_string());
+            }
+            opt if opt.starts_with("--capture-on-failure=") => {
+                let val = opt.strip_prefix("--capture-on-failure=").unwrap();
+                capture_failure = Some(val.to_string());
+            }
+            "--panic-for-test" => {
+                // Testing probe flag accepted
+            }
             "--backend" => {
                 i += 1;
                 let Some(val) = run_args.get(i) else {
@@ -297,6 +334,7 @@ fn main() {
                 no_gc,
                 pure_core,
                 json_diag,
+                capture_failure.as_deref(),
             );
         }
     } else {
@@ -1866,6 +1904,40 @@ fn bindgen_command(args: &[String]) {
 }
 
 
+fn handle_dst_failure_capture(
+    cap_path: &str,
+    filename: &str,
+    source: &str,
+    failure: lust::sim::replay::FailureKind,
+) {
+    let cap_config = lust::sim::replay::CaptureConfig::new(cap_path)
+        .with_script(filename, source)
+        .with_args(env::args().collect())
+        .with_env_vars(env::vars().collect());
+    let capture_res = lust::sim::replay::capture_failure_to_bundle(
+        &cap_config,
+        &failure,
+        lust::sim::replay::EventLog::new(),
+        lust::sim::replay::global_shadow_vfs().snapshot(),
+    );
+    match capture_res {
+        Ok(bundle) => {
+            if let Err(write_err) = lust::sim::replay::write_bundle_and_reproduction_task(
+                &bundle,
+                Path::new(cap_path),
+            ) {
+                eprintln!("[DST-CAP] Warning: Failed to write replay bundle: {}", write_err);
+            } else {
+                eprintln!("[DST-CAP] Failure captured to replay bundle: {}", cap_path);
+                eprintln!("[DST-CAP] Reproduce with: lust sim replay {}", cap_path);
+            }
+        }
+        Err(err) => {
+            eprintln!("[DST-CAP] Warning: Failed to capture replay bundle: {}", err);
+        }
+    }
+}
+
 fn run_file_with_options(
     filename: &str,
     disassemble: bool,
@@ -1875,6 +1947,7 @@ fn run_file_with_options(
     no_gc: bool,
     pure_core: bool,
     json_diag: bool,
+    capture_failure: Option<&str>,
 ) {
     let source = match fs::read_to_string(filename) {
         Ok(content) => content,
@@ -1887,6 +1960,19 @@ fn run_file_with_options(
             process::exit(1);
         }
     };
+
+    if let Some(cap_path) = capture_failure {
+        let cap_config = lust::sim::replay::CaptureConfig::new(cap_path)
+            .with_script(filename, &source)
+            .with_args(env::args().collect())
+            .with_env_vars(env::vars().collect());
+        lust::sim::replay::install_failure_panic_hook(cap_config);
+        lust::sim::replay::global_shadow_vfs().record_write(filename, source.as_bytes().to_vec());
+    }
+
+    if env::var("LUST_TRIGGER_PANIC_FOR_TEST").is_ok() || env::args().any(|a| a == "--panic-for-test") {
+        panic!("FORCED_PANIC_FOR_TEST: Artificial panic triggered to verify DST failure capture");
+    }
     let entry_path = Path::new(filename);
     let project_dir = entry_path
         .parent()
@@ -1944,6 +2030,14 @@ fn run_file_with_options(
     ) {
         Ok(result) => result,
         Err(e) => {
+            if let Some(cap_path) = capture_failure {
+                handle_dst_failure_capture(
+                    cap_path,
+                    filename,
+                    &source,
+                    lust::sim::replay::FailureKind::CompilationError(e.to_string()),
+                );
+            }
             print_error_with_context(&source, filename, &e, json_diag);
             process::exit(1);
         }
@@ -1963,6 +2057,14 @@ fn run_file_with_options(
     vm.load_functions(functions);
     for mir_fn in mir_functions {
         if let Err(e) = vm.load_mir_function(mir_fn) {
+            if let Some(cap_path) = capture_failure {
+                handle_dst_failure_capture(
+                    cap_path,
+                    filename,
+                    &source,
+                    lust::sim::replay::FailureKind::RuntimeError(e.to_string()),
+                );
+            }
             print_error_with_context(&source, filename, &e, json_diag);
             process::exit(1);
         }
@@ -2042,6 +2144,14 @@ fn run_file_with_options(
                 vm.set_global(module_path, module_value);
             }
             Err(e) => {
+                if let Some(cap_path) = capture_failure {
+                    handle_dst_failure_capture(
+                        cap_path,
+                        filename,
+                        &source,
+                        lust::sim::replay::FailureKind::RuntimeError(e.to_string()),
+                    );
+                }
                 print_error_with_context(&source, filename, &e, json_diag);
                 process::exit(1);
             }
@@ -2049,6 +2159,14 @@ fn run_file_with_options(
     }
 
     if let Err(e) = vm.call("__script", vec![]) {
+        if let Some(cap_path) = capture_failure {
+            handle_dst_failure_capture(
+                cap_path,
+                filename,
+                &source,
+                lust::sim::replay::FailureKind::RuntimeError(e.to_string()),
+            );
+        }
         print_error_with_context(&source, filename, &e, json_diag);
         process::exit(1);
     }

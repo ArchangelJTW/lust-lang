@@ -1,15 +1,22 @@
 #[cfg(feature = "std")]
 pub use jit_engine::{
-    CraneliftJitCompiler, MIR_STATUS_ERR_DIV_BY_ZERO, MIR_STATUS_ERR_NEG_EXPONENT,
-    MIR_STATUS_ERR_OOM, MIR_STATUS_ERR_OUT_OF_GAS, MIR_STATUS_OK, MirCraneliftBackendError,
-    lust_mir_abs_int, lust_mir_alloc_array, lust_mir_alloc_enum, lust_mir_alloc_map,
-    lust_mir_array_get, lust_mir_array_len, lust_mir_array_set, lust_mir_charge_gas,
-    lust_mir_clamp_int, lust_mir_div_int, lust_mir_enum_payload, lust_mir_enum_tag,
-    lust_mir_floordiv_float, lust_mir_floordiv_int, lust_mir_get_gas, lust_mir_get_memory_used,
-    lust_mir_get_status, lust_mir_map_get, lust_mir_map_len, lust_mir_map_set, lust_mir_max_int, lust_mir_min_int,
-    lust_mir_pow_float, lust_mir_pow_int, lust_mir_print_int, lust_mir_rem_float, lust_mir_rem_int,
-    lust_mir_set_gas, lust_mir_set_max_memory, lust_mir_set_memory_limit, lust_mir_set_status,
+    CraneliftJitCompiler, DeoptPayload, MIR_STATUS_DEOPT, MIR_STATUS_ERR_DIV_BY_ZERO,
+    MIR_STATUS_ERR_INTERRUPTED, MIR_STATUS_ERR_NEG_EXPONENT, MIR_STATUS_ERR_OOM,
+    MIR_STATUS_ERR_OUT_OF_GAS, MIR_STATUS_OK, MirCraneliftBackendError, OsrPromotionTracker,
+    SafepointRuntimeState, SafepointStatsSnapshot, find_loop_backedges, find_loop_headers,
+    is_loop_backedge, lust_mir_abs_int, lust_mir_alloc_array, lust_mir_alloc_enum,
+    lust_mir_alloc_map, lust_mir_array_get, lust_mir_array_len, lust_mir_array_set,
+    lust_mir_charge_gas, lust_mir_clamp_int, lust_mir_div_int, lust_mir_enum_payload,
+    lust_mir_enum_tag, lust_mir_floordiv_float, lust_mir_floordiv_int, lust_mir_get_gas,
+    lust_mir_get_memory_used, lust_mir_get_status, lust_mir_init_deopt, lust_mir_map_get,
+    lust_mir_map_len, lust_mir_map_set, lust_mir_max_int, lust_mir_min_int, lust_mir_pow_float,
+    lust_mir_pow_int, lust_mir_print_int, lust_mir_record_deopt, lust_mir_record_deopt_local,
+    lust_mir_rem_float, lust_mir_rem_int, lust_mir_safepoint, lust_mir_set_gas,
+    lust_mir_set_max_memory, lust_mir_set_memory_limit, lust_mir_set_status,
     lust_mir_string_concat, lust_mir_string_eq, lust_mir_string_len,
+    safepoint_enter_mask, safepoint_exit_mask, safepoint_register_finalizer,
+    safepoint_request_deopt, safepoint_request_interrupt, safepoint_reset, safepoint_stats,
+    take_deopt_payload,
 };
 
 #[cfg(feature = "std")]
@@ -40,6 +47,360 @@ pub mod jit_engine {
         CodegenError(String),
         #[error("Failed or unlowerable value cannot be replaced with silent Unit: {0}")]
         UnlowerableValue(String),
+    }
+
+    pub const MIR_STATUS_ERR_INTERRUPTED: i64 = crate::effect_abi::LUST_STATUS_ERR_INTERRUPTED as i64;
+    pub const MIR_STATUS_DEOPT: i64 = -100;
+
+    #[derive(Default)]
+    pub struct SafepointRuntimeState {
+        pub mask_depth: usize,
+        pub pending_interrupt: Option<crate::effect_abi::InterruptReason>,
+        pub safepoints_checked: u64,
+        pub safepoints_masked_deferred: u64,
+        pub safepoints_delivered: u64,
+        pub deopt_requested: bool,
+        pub cleanups_run: usize,
+        pub finalizers: Vec<alloc::boxed::Box<dyn FnOnce() + Send + 'static>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct DeoptPayload {
+        pub target_pc: usize,
+        pub live_locals: Vec<(usize, i64)>,
+    }
+
+    thread_local! {
+        static SAFEPOINT_STATE: core::cell::RefCell<SafepointRuntimeState> = core::cell::RefCell::new(SafepointRuntimeState::default());
+        static DEOPT_STATE: core::cell::RefCell<Option<DeoptPayload>> = const { core::cell::RefCell::new(None) };
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lust_mir_safepoint() -> i64 {
+        SAFEPOINT_STATE.with(|state_cell| {
+            let mut st = state_cell.borrow_mut();
+            st.safepoints_checked += 1;
+            if st.deopt_requested {
+                with_current_mir_context(|ctx| {
+                    ctx.last_status.store(MIR_STATUS_DEOPT, core::sync::atomic::Ordering::SeqCst);
+                });
+                return MIR_STATUS_DEOPT;
+            }
+            if st.mask_depth > 0 {
+                if st.pending_interrupt.is_some() {
+                    st.safepoints_masked_deferred += 1;
+                }
+                return 0;
+            }
+            if let Some(_reason) = st.pending_interrupt.take() {
+                st.safepoints_delivered += 1;
+                let finalizers = core::mem::take(&mut st.finalizers);
+                for f in finalizers {
+                    f();
+                    st.cleanups_run += 1;
+                }
+                with_current_mir_context(|ctx| {
+                    ctx.last_status.store(MIR_STATUS_ERR_INTERRUPTED, core::sync::atomic::Ordering::SeqCst);
+                });
+                return MIR_STATUS_ERR_INTERRUPTED;
+            }
+            0
+        })
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lust_mir_init_deopt(target_pc: i64) {
+        DEOPT_STATE.with(|d| {
+            *d.borrow_mut() = Some(DeoptPayload {
+                target_pc: target_pc as usize,
+                live_locals: Vec::new(),
+            });
+        });
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lust_mir_record_deopt_local(_target_pc: i64, local_idx: i64, val: i64) {
+        DEOPT_STATE.with(|d| {
+            let mut opt = d.borrow_mut();
+            if let Some(payload) = opt.as_mut() {
+                payload.live_locals.push((local_idx as usize, val));
+            }
+        });
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lust_mir_record_deopt(target_pc: i64, num_locals: i64, locals_ptr: *const i64) -> i64 {
+        let mut locals = Vec::new();
+        if !locals_ptr.is_null() && num_locals > 0 {
+            for i in 0..num_locals as usize {
+                let val = unsafe { *locals_ptr.add(i) };
+                locals.push((i, val));
+            }
+        }
+        DEOPT_STATE.with(|d| {
+            *d.borrow_mut() = Some(DeoptPayload {
+                target_pc: target_pc as usize,
+                live_locals: locals,
+            });
+        });
+        MIR_STATUS_DEOPT
+    }
+
+    pub fn safepoint_enter_mask() {
+        SAFEPOINT_STATE.with(|st| {
+            st.borrow_mut().mask_depth += 1;
+        });
+    }
+
+    pub fn safepoint_exit_mask() -> Option<crate::effect_abi::InterruptReason> {
+        SAFEPOINT_STATE.with(|st| {
+            let mut state = st.borrow_mut();
+            state.mask_depth = state.mask_depth.saturating_sub(1);
+            if state.mask_depth == 0 {
+                state.pending_interrupt
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn safepoint_request_interrupt(reason: crate::effect_abi::InterruptReason) {
+        SAFEPOINT_STATE.with(|st| {
+            let mut state = st.borrow_mut();
+            if state.pending_interrupt.is_none() {
+                state.pending_interrupt = Some(reason);
+            }
+        });
+    }
+
+    pub fn safepoint_register_finalizer<F: FnOnce() + Send + 'static>(f: F) {
+        SAFEPOINT_STATE.with(|st| {
+            st.borrow_mut().finalizers.push(alloc::boxed::Box::new(f));
+        });
+    }
+
+    pub fn safepoint_request_deopt(deopt: bool) {
+        SAFEPOINT_STATE.with(|st| {
+            st.borrow_mut().deopt_requested = deopt;
+        });
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SafepointStatsSnapshot {
+        pub mask_depth: usize,
+        pub safepoints_checked: u64,
+        pub safepoints_masked_deferred: u64,
+        pub safepoints_delivered: u64,
+        pub cleanups_run: usize,
+    }
+
+    pub fn safepoint_stats() -> SafepointStatsSnapshot {
+        SAFEPOINT_STATE.with(|st| {
+            let s = st.borrow();
+            SafepointStatsSnapshot {
+                mask_depth: s.mask_depth,
+                safepoints_checked: s.safepoints_checked,
+                safepoints_masked_deferred: s.safepoints_masked_deferred,
+                safepoints_delivered: s.safepoints_delivered,
+                cleanups_run: s.cleanups_run,
+            }
+        })
+    }
+
+    pub fn safepoint_reset() {
+        SAFEPOINT_STATE.with(|st| {
+            *st.borrow_mut() = SafepointRuntimeState::default();
+        });
+        DEOPT_STATE.with(|d| {
+            *d.borrow_mut() = None;
+        });
+    }
+
+    pub fn take_deopt_payload() -> Option<DeoptPayload> {
+        DEOPT_STATE.with(|d| d.borrow_mut().take())
+    }
+
+    pub fn find_loop_headers(blocks: &[BasicBlock]) -> hashbrown::HashSet<usize> {
+        let mut loop_headers = hashbrown::HashSet::new();
+        for (src_idx, block) in blocks.iter().enumerate() {
+            if let Some(term) = &block.terminator {
+                match term {
+                    Terminator::Goto(target, _) => {
+                        if target.0 <= src_idx {
+                            loop_headers.insert(target.0);
+                        }
+                    }
+                    Terminator::Cond { then_block, else_block, .. } => {
+                        if then_block.0 <= src_idx {
+                            loop_headers.insert(then_block.0);
+                        }
+                        if else_block.0 <= src_idx {
+                            loop_headers.insert(else_block.0);
+                        }
+                    }
+                    Terminator::Switch { cases, default, .. } => {
+                        for (_, target) in cases {
+                            if target.0 <= src_idx {
+                                loop_headers.insert(target.0);
+                            }
+                        }
+                        if default.0 <= src_idx {
+                            loop_headers.insert(default.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        loop_headers
+    }
+
+    pub fn find_loop_backedges(blocks: &[BasicBlock]) -> Vec<(usize, usize)> {
+        let mut backedges = Vec::new();
+        for (src_idx, block) in blocks.iter().enumerate() {
+            if let Some(term) = &block.terminator {
+                match term {
+                    Terminator::Goto(target, _) => {
+                        if target.0 <= src_idx {
+                            backedges.push((src_idx, target.0));
+                        }
+                    }
+                    Terminator::Cond { then_block, else_block, .. } => {
+                        if then_block.0 <= src_idx {
+                            backedges.push((src_idx, then_block.0));
+                        }
+                        if else_block.0 <= src_idx {
+                            backedges.push((src_idx, else_block.0));
+                        }
+                    }
+                    Terminator::Switch { cases, default, .. } => {
+                        for (_, target) in cases {
+                            if target.0 <= src_idx {
+                                backedges.push((src_idx, target.0));
+                            }
+                        }
+                        if default.0 <= src_idx {
+                            backedges.push((src_idx, default.0));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        backedges
+    }
+
+    pub fn is_loop_backedge(blocks: &[BasicBlock], from: usize, to: usize) -> bool {
+        if to > from {
+            return false;
+        }
+        if let Some(block) = blocks.get(from) {
+            if let Some(term) = &block.terminator {
+                return match term {
+                    Terminator::Goto(target, _) => target.0 == to,
+                    Terminator::Cond { then_block, else_block, .. } => {
+                        then_block.0 == to || else_block.0 == to
+                    }
+                    Terminator::Switch { cases, default, .. } => {
+                        cases.iter().any(|(_, t)| t.0 == to) || default.0 == to
+                    }
+                    _ => false,
+                };
+            }
+        }
+        false
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct OsrPromotionTracker {
+        pub hot_threshold: u32,
+        pub backedge_hits: hashbrown::HashMap<(String, usize), u32>,
+        pub promoted_entries: hashbrown::HashMap<(String, usize), *const u8>,
+    }
+
+    impl OsrPromotionTracker {
+        pub fn new(hot_threshold: u32) -> Self {
+            Self {
+                hot_threshold,
+                backedge_hits: hashbrown::HashMap::new(),
+                promoted_entries: hashbrown::HashMap::new(),
+            }
+        }
+
+        pub fn record_backedge(&mut self, func_name: &str, loop_header: usize) -> bool {
+            let key = (func_name.to_string(), loop_header);
+            let count = self.backedge_hits.entry(key).or_insert(0);
+            *count = count.saturating_add(1);
+            *count >= self.hot_threshold
+        }
+
+        pub fn get_promoted(&self, func_name: &str, loop_header: usize) -> Option<*const u8> {
+            self.promoted_entries.get(&(func_name.to_string(), loop_header)).copied()
+        }
+
+        pub fn register_promoted(&mut self, func_name: &str, loop_header: usize, code_ptr: *const u8) {
+            self.promoted_entries.insert((func_name.to_string(), loop_header), code_ptr);
+        }
+
+        pub fn is_promoted(&self, func_name: &str, loop_header: usize) -> bool {
+            self.promoted_entries.contains_key(&(func_name.to_string(), loop_header))
+        }
+
+        pub fn reset(&mut self) {
+            self.backedge_hits.clear();
+            self.promoted_entries.clear();
+        }
+
+        pub fn stats(&self) -> (usize, u32) {
+            let total_hits: u32 = self.backedge_hits.values().sum();
+            (self.promoted_entries.len(), total_hits)
+        }
+    }
+
+    fn emit_safepoint_check(
+        builder: &mut FunctionBuilder,
+        safepoint_fn: FuncRef,
+        init_deopt_fn: FuncRef,
+        record_deopt_local_fn: FuncRef,
+        target_block_idx: usize,
+        live_locals: &[LocalId],
+        local_vars: &[Variable],
+        emergency_exit_bb: Block,
+    ) {
+        let sp_call = builder.ins().call(safepoint_fn, &[]);
+        let sp_res = builder.inst_results(sp_call)[0];
+        let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, sp_res, 0);
+
+        let cont_bb = builder.create_block();
+        let err_dispatch_bb = builder.create_block();
+        builder.ins().brif(is_err, err_dispatch_bb, &[], cont_bb, &[]);
+
+        builder.switch_to_block(err_dispatch_bb);
+        let is_deopt = builder.ins().icmp_imm_s(IntCC::Equal, sp_res, MIR_STATUS_DEOPT);
+        let deopt_capture_bb = builder.create_block();
+        builder.ins().brif(is_deopt, deopt_capture_bb, &[], emergency_exit_bb, &[]);
+
+        builder.switch_to_block(deopt_capture_bb);
+        let target_pc_val = builder.ins().iconst(types::I64, target_block_idx as i64);
+        builder.ins().call(init_deopt_fn, &[target_pc_val]);
+        for &loc_id in live_locals {
+            if loc_id.0 < local_vars.len() {
+                let loc_idx_val = builder.ins().iconst(types::I64, loc_id.0 as i64);
+                let cur_val = builder.use_var(local_vars[loc_id.0]);
+                let val_ty = builder.func.dfg.value_type(cur_val);
+                let val_i64 = if val_ty == types::I8 {
+                    builder.ins().uextend(types::I64, cur_val)
+                } else if val_ty == types::F64 {
+                    builder.ins().bitcast(types::I64, MemFlagsData::new(), cur_val)
+                } else {
+                    cur_val
+                };
+                builder.ins().call(record_deopt_local_fn, &[target_pc_val, loc_idx_val, val_i64]);
+            }
+        }
+        builder.ins().jump(emergency_exit_bb, &[]);
+
+        builder.switch_to_block(cont_bb);
     }
 
     pub struct CraneliftJitCompiler {
@@ -106,6 +467,12 @@ pub mod jit_engine {
             builder.symbol("lust_mir_alloc_enum", lust_mir_alloc_enum as *const u8);
             builder.symbol("lust_mir_enum_tag", lust_mir_enum_tag as *const u8);
             builder.symbol("lust_mir_enum_payload", lust_mir_enum_payload as *const u8);
+
+            // Safepoint and deopt helpers
+            builder.symbol("lust_mir_safepoint", lust_mir_safepoint as *const u8);
+            builder.symbol("lust_mir_init_deopt", lust_mir_init_deopt as *const u8);
+            builder.symbol("lust_mir_record_deopt_local", lust_mir_record_deopt_local as *const u8);
+            builder.symbol("lust_mir_record_deopt", lust_mir_record_deopt as *const u8);
 
             let module = JITModule::new(builder);
 
@@ -176,11 +543,108 @@ pub mod jit_engine {
             Ok(res)
         }
 
+        pub fn compile_osr_entry(
+            &mut self,
+            mir_fn: &MirFunction,
+            target_block: BlockId,
+            live_locals: &[LocalId],
+        ) -> Result<*const u8, MirCraneliftBackendError> {
+            let mut module = MirModule::new(mir_fn.signature.name.clone());
+            module.add_function(mir_fn.clone());
+            self.compile_osr_entry_in_module(&module, &mir_fn.signature.name, target_block, live_locals)
+        }
+
+        pub fn compile_osr_entry_in_module(
+            &mut self,
+            module: &MirModule,
+            func_name: &str,
+            target_block: BlockId,
+            live_locals: &[LocalId],
+        ) -> Result<*const u8, MirCraneliftBackendError> {
+            let mir_fn = module
+                .functions
+                .iter()
+                .find(|f| f.signature.name == func_name)
+                .ok_or_else(|| {
+                    MirCraneliftBackendError::CodegenError(format!("Function '{func_name}' not found in module"))
+                })?;
+            let refined = refine_mir_function(mir_fn);
+            let osr_name = format!("{}_osr_{}", func_name, target_block.0);
+
+            // 1. Declare all module functions so OSR entry can call them
+            let mut module_funcs = hashbrown::HashMap::new();
+            for f in &module.functions {
+                let mut sig = self.module.make_signature();
+                for param_id in &f.params {
+                    let p_ty = &f.locals[param_id.0].ty;
+                    sig.params.push(AbiParam::new(mir_to_clif_type(p_ty)?));
+                }
+                let ret_clif_ty = mir_to_clif_type(&f.signature.return_type)?;
+                if ret_clif_ty != types::I8 || f.signature.return_type != MirType::Unit {
+                    sig.returns.push(AbiParam::new(ret_clif_ty));
+                }
+                let func_id = self
+                    .module
+                    .declare_function(&f.signature.name, Linkage::Export, &sig)
+                    .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+                module_funcs.insert(f.signature.name.clone(), func_id);
+            }
+
+            // 2. Declare OSR entry function taking i64 parameters for all live locals
+            let mut osr_sig = self.module.make_signature();
+            for _ in live_locals {
+                osr_sig.params.push(AbiParam::new(types::I64));
+            }
+            let ret_clif_ty = mir_to_clif_type(&refined.signature.return_type)?;
+            if ret_clif_ty != types::I8 || refined.signature.return_type != MirType::Unit {
+                osr_sig.returns.push(AbiParam::new(ret_clif_ty));
+            }
+            let osr_func_id = self
+                .module
+                .declare_function(&osr_name, Linkage::Export, &osr_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            module_funcs.insert(osr_name.clone(), osr_func_id);
+
+            // 3. Compile all other functions in module
+            for f in &module.functions {
+                if f.signature.name != func_name {
+                    let fid = module_funcs[&f.signature.name];
+                    let refined_other = refine_mir_function(f);
+                    self.compile_function_internal(&refined_other, fid, &module_funcs)?;
+                }
+            }
+
+            // 4. Compile OSR entry
+            self.compile_function_with_osr(
+                &refined,
+                osr_func_id,
+                &module_funcs,
+                Some((target_block, live_locals)),
+            )?;
+
+            self.module
+                .finalize_definitions()
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let code_ptr = self.module.get_finalized_function(osr_func_id);
+            Ok(code_ptr)
+        }
+
         fn compile_function_internal(
             &mut self,
             mir_fn: &MirFunction,
             func_id: FuncId,
             module_funcs: &hashbrown::HashMap<String, FuncId>,
+        ) -> Result<(), MirCraneliftBackendError> {
+            self.compile_function_with_osr(mir_fn, func_id, module_funcs, None)
+        }
+
+        fn compile_function_with_osr(
+            &mut self,
+            mir_fn: &MirFunction,
+            func_id: FuncId,
+            module_funcs: &hashbrown::HashMap<String, FuncId>,
+            osr_info: Option<(BlockId, &[LocalId])>,
         ) -> Result<(), MirCraneliftBackendError> {
             if mir_fn.signature.name == "unsupported_str_const" {
                 return Err(MirCraneliftBackendError::UnsupportedConstant(MirConstant::String("hello".into())));
@@ -188,9 +652,15 @@ pub mod jit_engine {
             self.ctx.func.signature.params.clear();
             self.ctx.func.signature.returns.clear();
 
-            for param_id in &mir_fn.params {
-                let p_ty = &mir_fn.locals[param_id.0].ty;
-                self.ctx.func.signature.params.push(AbiParam::new(mir_to_clif_type(p_ty)?));
+            if let Some((_, live_locals)) = osr_info {
+                for _ in live_locals {
+                    self.ctx.func.signature.params.push(AbiParam::new(types::I64));
+                }
+            } else {
+                for param_id in &mir_fn.params {
+                    let p_ty = &mir_fn.locals[param_id.0].ty;
+                    self.ctx.func.signature.params.push(AbiParam::new(mir_to_clif_type(p_ty)?));
+                }
             }
 
             let ret_clif_ty = mir_to_clif_type(&mir_fn.signature.return_type)?;
@@ -228,6 +698,30 @@ pub mod jit_engine {
             let print_callee = self
                 .module
                 .declare_function("lust_mir_print_int", Linkage::Import, &print_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            // Declare safepoint and deopt imports
+            let mut sp_sig = self.module.make_signature();
+            sp_sig.returns.push(AbiParam::new(types::I64));
+            let safepoint_callee = self
+                .module
+                .declare_function("lust_mir_safepoint", Linkage::Import, &sp_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let mut init_deopt_sig = self.module.make_signature();
+            init_deopt_sig.params.push(AbiParam::new(types::I64));
+            let init_deopt_callee = self
+                .module
+                .declare_function("lust_mir_init_deopt", Linkage::Import, &init_deopt_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let mut rec_deopt_sig = self.module.make_signature();
+            rec_deopt_sig.params.push(AbiParam::new(types::I64));
+            rec_deopt_sig.params.push(AbiParam::new(types::I64));
+            rec_deopt_sig.params.push(AbiParam::new(types::I64));
+            let rec_deopt_callee = self
+                .module
+                .declare_function("lust_mir_record_deopt_local", Linkage::Import, &rec_deopt_sig)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
             // Declare int binop helpers
@@ -395,6 +889,10 @@ pub mod jit_engine {
                 let string_eq_fn = self.module.declare_func_in_func(string_eq_callee, &mut builder.func);
                 let string_len_fn = self.module.declare_func_in_func(string_len_callee, &mut builder.func);
 
+                let safepoint_fn = self.module.declare_func_in_func(safepoint_callee, &mut builder.func);
+                let init_deopt_fn = self.module.declare_func_in_func(init_deopt_callee, &mut builder.func);
+                let record_deopt_local_fn = self.module.declare_func_in_func(rec_deopt_callee, &mut builder.func);
+
                 let emergency_exit_bb = builder.create_block();
 
                 // Create CLIF blocks corresponding 1-to-1 to MIR basic blocks
@@ -411,20 +909,85 @@ pub mod jit_engine {
                     local_vars.push(var);
                 }
 
-                // Append parameters to entry block
-                let entry_clif = clif_blocks[mir_fn.entry.0];
-                builder.append_block_params_for_function_params(entry_clif);
-                builder.switch_to_block(entry_clif);
+                let all_locals: Vec<LocalId> = (0..mir_fn.locals.len()).map(LocalId).collect();
+                let loop_headers = find_loop_headers(&mir_fn.blocks);
 
-                for (idx, p_id) in mir_fn.params.iter().enumerate() {
-                    let param_val = builder.block_params(entry_clif)[idx];
-                    builder.def_var(local_vars[p_id.0], param_val);
+                if let Some((target_block, live_locals)) = osr_info {
+                    let osr_entry_bb = builder.create_block();
+                    builder.append_block_params_for_function_params(osr_entry_bb);
+                    builder.switch_to_block(osr_entry_bb);
+
+                    for (idx, loc_id) in live_locals.iter().enumerate() {
+                        let param_val = builder.block_params(osr_entry_bb)[idx];
+                        let clif_ty = mir_to_clif_type(&mir_fn.locals[loc_id.0].ty)?;
+                        let var_val = if clif_ty == types::F64 {
+                            builder.ins().bitcast(types::F64, MemFlagsData::new(), param_val)
+                        } else if clif_ty == types::I8 {
+                            builder.ins().ireduce(types::I8, param_val)
+                        } else {
+                            param_val
+                        };
+                        builder.def_var(local_vars[loc_id.0], var_val);
+                    }
+                    for (l_idx, local) in mir_fn.locals.iter().enumerate() {
+                        if !live_locals.iter().any(|lid| lid.0 == l_idx) {
+                            let clif_ty = mir_to_clif_type(&local.ty)?;
+                            let zero = if clif_ty == types::F64 {
+                                builder.ins().f64const(0.0)
+                            } else {
+                                builder.ins().iconst(clif_ty, 0)
+                            };
+                            builder.def_var(local_vars[l_idx], zero);
+                        }
+                    }
+
+                    emit_safepoint_check(
+                        &mut builder,
+                        safepoint_fn,
+                        init_deopt_fn,
+                        record_deopt_local_fn,
+                        target_block.0,
+                        live_locals,
+                        &local_vars,
+                        emergency_exit_bb,
+                    );
+
+                    builder.ins().jump(clif_blocks[target_block.0], &[]);
+                } else {
+                    let entry_clif = clif_blocks[mir_fn.entry.0];
+                    builder.append_block_params_for_function_params(entry_clif);
+                    builder.switch_to_block(entry_clif);
+
+                    for (idx, p_id) in mir_fn.params.iter().enumerate() {
+                        let param_val = builder.block_params(entry_clif)[idx];
+                        builder.def_var(local_vars[p_id.0], param_val);
+                    }
                 }
 
                 // Lower each basic block
                 for (b_idx, mir_block) in mir_fn.blocks.iter().enumerate() {
                     let clif_bb = clif_blocks[b_idx];
                     builder.switch_to_block(clif_bb);
+
+                    let should_safepoint = loop_headers.contains(&b_idx);
+
+                    if should_safepoint {
+                        let locals_to_record = if let Some((_, live_locals)) = osr_info {
+                            live_locals
+                        } else {
+                            &all_locals
+                        };
+                        emit_safepoint_check(
+                            &mut builder,
+                            safepoint_fn,
+                            init_deopt_fn,
+                            record_deopt_local_fn,
+                            b_idx,
+                            locals_to_record,
+                            &local_vars,
+                            emergency_exit_bb,
+                        );
+                    }
 
                     for stmt in &mir_block.statements {
                         match stmt {

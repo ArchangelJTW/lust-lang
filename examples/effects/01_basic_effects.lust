@@ -1,0 +1,119 @@
+-- Example 1: Basic Effects, Exit and Cause handling in Lust.
+-- Demonstrates pure effect blueprints, suspension, execution, error handling,
+-- and fail-closed terminal interrupts.
+
+use std.effect
+
+enum Cause
+    Fail(string),
+    Die(string),
+    Interrupted(string),
+end
+
+enum Exit
+    Success(int),
+    Fail(string),
+    Interrupt,
+    Die(string),
+end
+
+function divide(a: int, b: int): Map
+    if b == 0 then
+        return effect.fail("division by zero")
+    else
+        return effect.succeed(a / b)
+    end
+end
+
+function compute_pipeline(x: int): Map
+    local eff1 = divide(100, x)
+    local r1: Exit = effect.run_sync(eff1)
+    if r1 is Success(step1) then
+        return divide(step1, 2)
+    elseif r1 is Fail(err) then
+        return effect.fail(err)
+    elseif r1 is Interrupt then
+        return effect.interrupt()
+    else
+        return effect.die("pipeline error")
+    end
+end
+
+suite "Basic Effects & Exit Handling Suite" do
+    test "pure effect execution and pipeline composition" do
+        local eff = compute_pipeline(5)
+        local outcome: Exit = effect.run_sync(eff)
+
+        local matched = false
+        if outcome is Success(val) then
+            assert_eq(val, 10)
+            matched = true
+        end
+        assert(matched)
+    end
+
+    test "recoverable failure with division by zero" do
+        local eff = compute_pipeline(0)
+        local outcome: Exit = effect.run_sync(eff)
+
+        local matched = false
+        if outcome is Fail(err) then
+            assert_eq(err, "division by zero")
+            matched = true
+        end
+        assert(matched)
+    end
+
+    test "terminal interrupt fail-closed semantics" do
+        local eff = effect.interrupt()
+        local outcome: Exit = effect.run_sync(eff)
+
+        local matched = false
+        if outcome is Interrupt then
+            matched = true
+        end
+        assert(matched)
+    end
+
+    test "lazy effect suspension and synchronous execution" do
+        local calls = []
+        local job = effect.suspend(function()
+            table.push(calls, 1)
+            return 42
+        end)
+
+        -- Blueprint is lazy: not executed until run_sync
+        assert_eq(table.len(calls), 0)
+
+        local outcome: Exit = effect.run_sync(job)
+        local matched = false
+        if outcome is Success(val) then
+            assert_eq(val, 42)
+            matched = true
+        end
+        assert(matched)
+        assert_eq(table.len(calls), 1)
+    end
+end
+
+println("--- [Example 1: Basic Effects & Exit] ---")
+
+-- Successful execution
+local r1: Exit = effect.run_sync(compute_pipeline(5))
+if r1 is Success(v1) then
+    println("Success: 100 / 5 / 2 = " .. tostring(v1))
+end
+
+-- Recoverable failure (Cause::Fail)
+local r2: Exit = effect.run_sync(compute_pipeline(0))
+if r2 is Fail(e2) then
+    println("Expected error caught: " .. e2)
+end
+
+-- Terminal Interrupt (OutOfGas / Timeout) - fail-closed semantics
+local r3: Exit = effect.run_sync(effect.interrupt())
+if r3 is Interrupt then
+    println("Interrupted status code: 130 (is_interrupt: true)")
+end
+
+println("All basic effect assertions passed!")

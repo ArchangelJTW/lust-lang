@@ -132,6 +132,11 @@ impl TypeEnv {
         self.register_builtin_type("Array");
         self.register_builtin_type("Map");
         self.register_builtin_type("Table");
+        self.register_builtin_type("LuaTable");
+        self.register_builtin_type("std.table.Table");
+        self.register_builtin_type("std.table.LuaTable");
+        self.register_builtin_type("table.Table");
+        self.register_builtin_type("table.LuaTable");
         self.register_builtin_type("Regex");
         self.register_builtin_type("Schema");
         let task_status_type = Type::new(TypeKind::Named("TaskStatus".to_string()), dummy_span);
@@ -271,6 +276,24 @@ impl TypeEnv {
                     doc: None,
                 },
             );
+        }
+        for name in ["Table", "std.table.Table", "table.Table"] {
+            self.structs.insert(
+                name.to_string(),
+                StructDef {
+                    name: name.to_string(),
+                    type_params: vec!["T".to_string()],
+                    trait_bounds: vec![],
+                    fields: vec![],
+                    visibility: Visibility::Public,
+                    doc: None,
+                },
+            );
+        }
+        for name in ["std.table.LuaTable", "table.LuaTable"] {
+            if let Some(lua_table_def) = self.structs.get("LuaTable").cloned() {
+                self.structs.insert(name.to_string(), lua_table_def);
+            }
         }
         self.structs.insert(
             "LuaUserdata".to_string(),
@@ -636,7 +659,9 @@ impl TypeEnv {
 
     pub fn resolve_type(&self, ty: &Type) -> Type {
         match &ty.kind {
-            TypeKind::GenericInstance { name, type_args } if name == "Table" => {
+            TypeKind::GenericInstance { name, type_args }
+                if name == "Table" || name == "std.table.Table" || name == "table.Table" =>
+            {
                 match type_args.len() {
                     1 => Type::new(
                         TypeKind::Array(Box::new(self.resolve_type(&type_args[0]))),
@@ -652,10 +677,19 @@ impl TypeEnv {
                     _ => ty.clone(),
                 }
             }
-            TypeKind::Named(name) if name == "Table" => Type::new(
-                TypeKind::Array(Box::new(Type::new(TypeKind::Unknown, ty.span))),
-                ty.span,
-            ),
+            TypeKind::Named(name)
+                if name == "Table" || name == "std.table.Table" || name == "table.Table" =>
+            {
+                Type::new(
+                    TypeKind::Array(Box::new(Type::new(TypeKind::Unknown, ty.span))),
+                    ty.span,
+                )
+            }
+            TypeKind::Named(name)
+                if name == "std.table.LuaTable" || name == "table.LuaTable" =>
+            {
+                Type::new(TypeKind::Named("LuaTable".to_string()), ty.span)
+            }
             TypeKind::Array(inner) => {
                 Type::new(TypeKind::Array(Box::new(self.resolve_type(inner))), ty.span)
             }
@@ -967,7 +1001,14 @@ impl TypeEnv {
     }
 
     pub fn lookup_method(&self, type_name: &str, method_name: &str) -> Option<&FunctionDef> {
-        let effective_name = if type_name == "Table" { "Array" } else { type_name };
+        let effective_name = if type_name == "Table"
+            || type_name == "std.table.Table"
+            || type_name == "table.Table"
+        {
+            "Array"
+        } else {
+            type_name
+        };
         for impl_block in &self.impls {
             if let TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } =
                 &impl_block.target_type.kind
@@ -991,7 +1032,14 @@ impl TypeEnv {
         type_name: &str,
         method_name: &str,
     ) -> Option<(&ImplBlock, &FunctionDef)> {
-        let effective_name = if type_name == "Table" { "Array" } else { type_name };
+        let effective_name = if type_name == "Table"
+            || type_name == "std.table.Table"
+            || type_name == "table.Table"
+        {
+            "Array"
+        } else {
+            type_name
+        };
         for impl_block in &self.impls {
             let target_name = match &impl_block.target_type.kind {
                 TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => name.as_str(),
@@ -1097,7 +1145,7 @@ impl TypeEnv {
         }
     }
 
-    fn types_match(&self, type1: &Type, type2: &Type) -> bool {
+    pub fn types_match(&self, type1: &Type, type2: &Type) -> bool {
         let t1_resolved = self.resolve_type(type1);
         let t2_resolved = self.resolve_type(type2);
         let type1 = &t1_resolved;
@@ -1230,5 +1278,46 @@ mod tests {
         );
         assert!(env.types_match(&table_map, &map_str_int));
         assert!(env.types_match(&map_str_int, &table_map));
+
+        // std.table.Table<int> -> Array<int>
+        let std_table_int = Type::new(
+            TypeKind::GenericInstance {
+                name: "std.table.Table".to_string(),
+                type_args: vec![Type::new(TypeKind::Int, dummy_span)],
+            },
+            dummy_span,
+        );
+        let resolved_std_table_int = env.resolve_type(&std_table_int);
+        assert_eq!(
+            resolved_std_table_int.kind,
+            TypeKind::Array(Box::new(Type::new(TypeKind::Int, dummy_span)))
+        );
+        assert!(env.types_match(&std_table_int, &array_int));
+
+        // std.table.Table<string, int> -> Map<string, int>
+        let std_table_map = Type::new(
+            TypeKind::GenericInstance {
+                name: "std.table.Table".to_string(),
+                type_args: vec![
+                    Type::new(TypeKind::String, dummy_span),
+                    Type::new(TypeKind::Int, dummy_span),
+                ],
+            },
+            dummy_span,
+        );
+        let resolved_std_table_map = env.resolve_type(&std_table_map);
+        assert_eq!(
+            resolved_std_table_map.kind,
+            TypeKind::Map(
+                Box::new(Type::new(TypeKind::String, dummy_span)),
+                Box::new(Type::new(TypeKind::Int, dummy_span))
+            )
+        );
+        assert!(env.types_match(&std_table_map, &map_str_int));
+
+        // std.table.LuaTable -> LuaTable
+        let std_lua_table = Type::new(TypeKind::Named("std.table.LuaTable".to_string()), dummy_span);
+        let resolved_std_lua_table = env.resolve_type(&std_lua_table);
+        assert_eq!(resolved_std_lua_table.kind, TypeKind::Named("LuaTable".to_string()));
     }
 }

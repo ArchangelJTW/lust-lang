@@ -160,16 +160,17 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
         ("bitwise.rshift", create_bit_rshift_fn()),
         ("bitwise.arshift", create_bit_arshift_fn()),
 
-        ("table.len", create_array_len_fn()),
-        ("table.is_empty", create_array_is_empty_fn()),
-        ("table.get", create_array_get_fn()),
+        ("table.len", create_table_len_fn()),
+        ("table.is_empty", create_table_is_empty_fn()),
+        ("table.get", create_table_get_fn()),
+        ("table.set", create_table_set_fn()),
         ("table.first", create_array_first_fn()),
         ("table.last", create_array_last_fn()),
         ("table.push", create_array_push_fn()),
         ("table.pop", create_array_pop_fn()),
         ("table.insert", create_table_insert_fn()),
         ("table.remove", create_table_remove_fn()),
-        ("table.clear", create_array_clear_fn()),
+        ("table.clear", create_table_clear_fn()),
         ("table.slice", create_array_slice_fn()),
         ("table.concat", create_array_concat_fn()),
         ("table.sort", create_array_sort_fn()),
@@ -180,10 +181,12 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
         ("table.reduce", create_array_reduce_fn()),
         ("table.iter", create_array_iter_fn()),
         ("table.unpack", create_table_unpack_fn()),
+        ("table.move", create_table_move_fn()),
 
         ("array.len", create_array_len_fn()),
         ("array.is_empty", create_array_is_empty_fn()),
         ("array.get", create_array_get_fn()),
+        ("array.set", create_array_set_fn()),
         ("array.first", create_array_first_fn()),
         ("array.last", create_array_last_fn()),
         ("array.push", create_array_push_fn()),
@@ -200,6 +203,7 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
         ("array.filter", create_array_filter_fn()),
         ("array.reduce", create_array_reduce_fn()),
         ("array.iter", create_array_iter_fn()),
+        ("array.unpack", create_array_unpack_fn()),
 
         ("string.len", create_string_len_fn()),
         ("string.sub", create_string_sub_fn()),
@@ -1607,6 +1611,7 @@ fn create_array_module(vm: &VM) -> Value {
         (string_key("len"), create_array_len_fn()),
         (string_key("is_empty"), create_array_is_empty_fn()),
         (string_key("get"), create_array_get_fn()),
+        (string_key("set"), create_array_set_fn()),
         (string_key("first"), create_array_first_fn()),
         (string_key("last"), create_array_last_fn()),
         (string_key("push"), create_array_push_fn()),
@@ -1623,6 +1628,7 @@ fn create_array_module(vm: &VM) -> Value {
         (string_key("filter"), create_array_filter_fn()),
         (string_key("reduce"), create_array_reduce_fn()),
         (string_key("iter"), create_array_iter_fn()),
+        (string_key("unpack"), create_array_unpack_fn()),
     ];
     vm.map_with_entries(entries)
 }
@@ -2275,18 +2281,473 @@ fn create_table_remove_fn() -> Value {
     }))
 }
 
+fn create_table_len_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
+        match val {
+            Value::Array(arr) => {
+                let len = crate::bytecode::value::get_specialized_cached_len(&arr)
+                    .unwrap_or_else(|| arr.borrow().len());
+                Ok(NativeCallResult::Return(Value::Int(len as LustInt)))
+            }
+            Value::Map(m) => {
+                let len = m.borrow().len();
+                Ok(NativeCallResult::Return(Value::Int(len as LustInt)))
+            }
+            other => {
+                if let Some(data) = table_data(&other) {
+                    let len = match data {
+                        TableData::Array(a) => a.as_array().map(|v| v.len()).unwrap_or(0),
+                        TableData::Map(m) => m.as_map().map(|v| v.len()).unwrap_or(0),
+                    };
+                    Ok(NativeCallResult::Return(Value::Int(len as LustInt)))
+                } else {
+                    Err(format!(
+                        "table.len expects an array or map, got {:?}",
+                        other.type_of()
+                    ))
+                }
+            }
+        }
+    }))
+}
+
+fn create_table_is_empty_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
+        match val {
+            Value::Array(arr) => {
+                let is_empty = crate::bytecode::value::get_specialized_cached_len(&arr)
+                    .map(|l| l == 0)
+                    .unwrap_or_else(|| arr.borrow().is_empty());
+                Ok(NativeCallResult::Return(Value::Bool(is_empty)))
+            }
+            Value::Map(m) => {
+                let is_empty = m.borrow().is_empty();
+                Ok(NativeCallResult::Return(Value::Bool(is_empty)))
+            }
+            other => {
+                if let Some(data) = table_data(&other) {
+                    let is_empty = match data {
+                        TableData::Array(a) => a.as_array().map(|v| v.is_empty()).unwrap_or(true),
+                        TableData::Map(m) => m.as_map().map(|v| v.is_empty()).unwrap_or(true),
+                    };
+                    Ok(NativeCallResult::Return(Value::Bool(is_empty)))
+                } else {
+                    Err(format!(
+                        "table.is_empty expects an array or map, got {:?}",
+                        other.type_of()
+                    ))
+                }
+            }
+        }
+    }))
+}
+
+fn create_table_get_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 2 {
+            return Err("table.get requires collection and key".to_string());
+        }
+        let val = unwrap_lua_value(args[0].clone());
+        match val {
+            Value::Array(arr) => {
+                let index = args
+                    .get(1)
+                    .map(|v| unwrap_lua_value(v.clone()))
+                    .and_then(|v| v.as_int())
+                    .ok_or_else(|| "table.get expects an integer index for array".to_string())?;
+                if let Some(elem) = crate::bytecode::value::get_specialized_cached_element(&arr, index) {
+                    Ok(NativeCallResult::Return(Value::some(elem)))
+                } else if crate::bytecode::value::get_specialized_cached_len(&arr).is_some() {
+                    Ok(NativeCallResult::Return(Value::none()))
+                } else {
+                    let borrowed = arr.borrow();
+                    if index < 0 || (index as usize) >= borrowed.len() {
+                        Ok(NativeCallResult::Return(Value::none()))
+                    } else {
+                        Ok(NativeCallResult::Return(Value::some(
+                            borrowed[index as usize].clone(),
+                        )))
+                    }
+                }
+            }
+            Value::Map(m) => {
+                let key = ValueKey::from_value(&unwrap_lua_value(args[1].clone()));
+                let borrowed = m.borrow();
+                match borrowed.get(&key) {
+                    Some(v) => Ok(NativeCallResult::Return(Value::some(v.clone()))),
+                    None => Ok(NativeCallResult::Return(Value::none())),
+                }
+            }
+            other => {
+                if let Some(data) = table_data(&other) {
+                    match data {
+                        TableData::Array(a) => {
+                            let index = args
+                                .get(1)
+                                .map(|v| unwrap_lua_value(v.clone()))
+                                .and_then(|v| v.as_int())
+                                .ok_or_else(|| "table.get expects an integer index for array".to_string())?;
+                            let arr = a.as_array().unwrap_or_default();
+                            if index < 0 || (index as usize) >= arr.len() {
+                                Ok(NativeCallResult::Return(Value::none()))
+                            } else {
+                                Ok(NativeCallResult::Return(Value::some(arr[index as usize].clone())))
+                            }
+                        }
+                        TableData::Map(m) => {
+                            let map = m.as_map().unwrap_or_default();
+                            let key = ValueKey::from_value(&unwrap_lua_value(args[1].clone()));
+                            match map.get(&key) {
+                                Some(v) if !matches!(v, Value::Nil) => Ok(NativeCallResult::Return(Value::some(v.clone()))),
+                                _ => Ok(NativeCallResult::Return(Value::none())),
+                            }
+                        }
+                    }
+                } else {
+                    Err(format!(
+                        "table.get expects an array or map, got {:?}",
+                        other.type_of()
+                    ))
+                }
+            }
+        }
+    }))
+}
+
+fn create_table_set_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 3 {
+            return Err("table.set requires collection, key, and value".to_string());
+        }
+        let val = unwrap_lua_value(args[0].clone());
+        let new_val = args[2].clone();
+        match val {
+            Value::Array(arr) => {
+                let index = unwrap_lua_value(args[1].clone())
+                    .as_int()
+                    .ok_or_else(|| "table.set expects an integer index for array".to_string())?;
+                if let Some(res) = crate::bytecode::value::set_specialized_cached_element(&arr, index, &new_val) {
+                    res.map_err(|e| e)?;
+                } else {
+                    let mut borrowed = arr.borrow_mut();
+                    if index < 0 || (index as usize) >= borrowed.len() {
+                        return Err(format!(
+                            "Array index {} out of bounds (length: {})",
+                            index,
+                            borrowed.len()
+                        ));
+                    }
+                    borrowed[index as usize] = new_val.clone();
+                    crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
+                }
+                if !crate::vm::cycle::CycleCollector::is_leaf(&new_val) {
+                    let _ = VM::with_current(|vm| {
+                        vm.cycle_collector.record_mutation();
+                        Ok::<(), String>(())
+                    });
+                }
+                Ok(NativeCallResult::Return(Value::Nil))
+            }
+            Value::Map(m) => {
+                let key = ValueKey::from_value(&unwrap_lua_value(args[1].clone()));
+                let mut borrowed = m.borrow_mut();
+                if !borrowed.contains_key(&key) {
+                    VM::with_current(|vm| {
+                        vm.budgets
+                            .charge_map_entry_estimate()
+                            .map_err(|e| e.to_string())
+                    })?;
+                }
+                if !crate::vm::cycle::CycleCollector::is_leaf(&new_val) {
+                    let _ = VM::with_current(|vm| {
+                        vm.cycle_collector.record_mutation();
+                        Ok::<(), String>(())
+                    });
+                }
+                borrowed.insert(key, new_val);
+                Ok(NativeCallResult::Return(Value::Nil))
+            }
+            other => {
+                if let Some(map_val) = other.struct_get_field("table")
+                    && let Value::Map(m) = map_val
+                {
+                    let key = ValueKey::from_value(&unwrap_lua_value(args[1].clone()));
+                    let mut borrowed = m.borrow_mut();
+                    if !borrowed.contains_key(&key) {
+                        VM::with_current(|vm| {
+                            vm.budgets
+                                .charge_map_entry_estimate()
+                                .map_err(|e| e.to_string())
+                        })?;
+                    }
+                    borrowed.insert(key, new_val);
+                    Ok(NativeCallResult::Return(Value::Nil))
+                } else {
+                    Err(format!(
+                        "table.set expects an array or map, got {:?}",
+                        other.type_of()
+                    ))
+                }
+            }
+        }
+    }))
+}
+
+fn create_table_clear_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let val = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
+        match val {
+            Value::Array(arr) => {
+                crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
+                arr.borrow_mut().clear();
+                Ok(NativeCallResult::Return(Value::Nil))
+            }
+            Value::Map(m) => {
+                m.borrow_mut().clear();
+                Ok(NativeCallResult::Return(Value::Nil))
+            }
+            other => {
+                if let Some(map_val) = other.struct_get_field("table")
+                    && let Value::Map(m) = map_val
+                {
+                    m.borrow_mut().clear();
+                    Ok(NativeCallResult::Return(Value::Nil))
+                } else {
+                    Err(format!(
+                        "table.clear expects an array or map, got {:?}",
+                        other.type_of()
+                    ))
+                }
+            }
+        }
+    }))
+}
+
+fn create_table_move_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 4 {
+            return Err("table.move requires at least 4 arguments (a1, f, e, t [, a2])".to_string());
+        }
+        let a1_val = unwrap_lua_value(args[0].clone());
+        let f = unwrap_lua_value(args[1].clone())
+            .as_int()
+            .ok_or_else(|| "table.move expects integer start index (f)".to_string())?;
+        let e = unwrap_lua_value(args[2].clone())
+            .as_int()
+            .ok_or_else(|| "table.move expects integer end index (e)".to_string())?;
+        let t = unwrap_lua_value(args[3].clone())
+            .as_int()
+            .ok_or_else(|| "table.move expects integer destination index (t)".to_string())?;
+        let a2_val = if args.len() >= 5 {
+            unwrap_lua_value(args[4].clone())
+        } else {
+            a1_val.clone()
+        };
+
+        // (c) Inverted range (f > e): evaluates as a no-op; a2 is returned immediately without modifications
+        if f > e {
+            return Ok(NativeCallResult::Return(a2_val));
+        }
+
+        if f < 0 {
+            return Err("table.move source start index out of bounds".to_string());
+        }
+        if t < 0 {
+            return Err("table.move destination index out of bounds".to_string());
+        }
+
+        let Value::Array(arr1) = &a1_val else {
+            return Err(format!("table.move expects an array for a1, got {:?}", a1_val.type_of()));
+        };
+        let Value::Array(arr2) = &a2_val else {
+            return Err(format!("table.move expects an array for a2, got {:?}", a2_val.type_of()));
+        };
+
+        let f_usize = f as usize;
+        let e_usize = e as usize;
+        let t_usize = t as usize;
+        let count = e_usize - f_usize + 1;
+
+        if std::rc::Rc::ptr_eq(arr1, arr2) {
+            // Overlapping in-place copy
+            crate::bytecode::value::sync_specialized_array(arr1);
+            let mut borrowed = arr1.borrow_mut();
+            let a_len = borrowed.len();
+            if e_usize >= a_len {
+                return Err(format!(
+                    "table.move source range {}..={} out of bounds for array of length {}",
+                    f, e, a_len
+                ));
+            }
+            // (a) Target gaps are errors: If t > a2.len(), error
+            if t_usize > a_len {
+                return Err("Cannot move with index gap into dense Array".to_string());
+            }
+
+            let needed_len = t_usize + count;
+            // (b) Contiguous Tail Extension
+            if needed_len > a_len {
+                let old_cap = borrowed.capacity();
+                if needed_len > old_cap {
+                    let new_cap = needed_len.max(old_cap.saturating_mul(2));
+                    VM::with_current(|vm| {
+                        vm.charge_vec_growth::<Value>(old_cap, new_cap)
+                            .map_err(|err| err.to_string())
+                    })?;
+                }
+                borrowed.resize(needed_len, Value::Nil);
+            }
+
+            // (d) Overlapping in-place copy using memmove directionality
+            if t_usize > f_usize {
+                for i in (0..count).rev() {
+                    borrowed[t_usize + i] = borrowed[f_usize + i].clone();
+                }
+            } else {
+                for i in 0..count {
+                    borrowed[t_usize + i] = borrowed[f_usize + i].clone();
+                }
+            }
+            crate::bytecode::value::invalidate_specialized_array_cache(arr1.as_ptr() as usize);
+        } else {
+            // Distinct arrays a1 != a2
+            crate::bytecode::value::sync_specialized_array(arr1);
+            let source_slice = {
+                let borrowed1 = arr1.borrow();
+                let a1_len = borrowed1.len();
+                if e_usize >= a1_len {
+                    return Err(format!(
+                        "table.move source range {}..={} out of bounds for array of length {}",
+                        f, e, a1_len
+                    ));
+                }
+                borrowed1[f_usize..=e_usize].to_vec()
+            };
+
+            crate::bytecode::value::sync_specialized_array(arr2);
+            let mut borrowed2 = arr2.borrow_mut();
+            let a2_len = borrowed2.len();
+            if t_usize > a2_len {
+                return Err("Cannot move with index gap into dense Array".to_string());
+            }
+
+            let needed_len = t_usize + count;
+            if needed_len > a2_len {
+                let old_cap = borrowed2.capacity();
+                if needed_len > old_cap {
+                    let new_cap = needed_len.max(old_cap.saturating_mul(2));
+                    VM::with_current(|vm| {
+                        vm.charge_vec_growth::<Value>(old_cap, new_cap)
+                            .map_err(|err| err.to_string())
+                    })?;
+                }
+            }
+
+            for (i, elem) in source_slice.into_iter().enumerate() {
+                let dest_idx = t_usize + i;
+                if dest_idx < borrowed2.len() {
+                    borrowed2[dest_idx] = elem;
+                } else {
+                    borrowed2.push(elem);
+                }
+            }
+            crate::bytecode::value::invalidate_specialized_array_cache(arr2.as_ptr() as usize);
+        }
+
+        Ok(NativeCallResult::Return(a2_val))
+    }))
+}
+
+fn create_array_set_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 3 {
+            return Err("array.set requires array, index, and value".to_string());
+        }
+        let index = args[1]
+            .as_int()
+            .ok_or_else(|| "array.set expects an integer index".to_string())?;
+        match &args[0] {
+            Value::Array(arr) => {
+                let value = args[2].clone();
+                if let Some(res) = crate::bytecode::value::set_specialized_cached_element(arr, index, &value) {
+                    res.map_err(|e| e)?;
+                } else {
+                    let mut borrowed = arr.borrow_mut();
+                    if index < 0 || (index as usize) >= borrowed.len() {
+                        return Err(format!(
+                            "Array index {} out of bounds (length: {})",
+                            index,
+                            borrowed.len()
+                        ));
+                    }
+                    borrowed[index as usize] = value.clone();
+                    crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
+                }
+                if !crate::vm::cycle::CycleCollector::is_leaf(&args[2]) {
+                    let _ = VM::with_current(|vm| {
+                        vm.cycle_collector.record_mutation();
+                        Ok::<(), String>(())
+                    });
+                }
+                Ok(NativeCallResult::Return(Value::Nil))
+            }
+            other => Err(format!(
+                "array.set expects an array, got {:?}",
+                other.type_of()
+            )),
+        }
+    }))
+}
+
+pub(crate) fn create_array_unpack_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.is_empty() {
+            return Err("array.unpack expects an array".to_string());
+        }
+        let val = unwrap_lua_value(args[0].clone());
+        let seq = match val {
+            Value::Array(arr) => {
+                crate::bytecode::value::sync_specialized_array(&arr);
+                arr.borrow().clone()
+            }
+            other => return Err(format!("array.unpack expects an array, got {:?}", other.type_of())),
+        };
+        let start = args
+            .get(1)
+            .and_then(|v| unwrap_lua_value(v.clone()).as_int())
+            .unwrap_or(0);
+        let end = args
+            .get(2)
+            .and_then(|v| unwrap_lua_value(v.clone()).as_int())
+            .unwrap_or(if seq.is_empty() { -1 } else { (seq.len() - 1) as LustInt });
+        let start_idx = start.max(0) as usize;
+        let end_idx = if end < 0 { 0 } else { (end as usize) + 1 };
+        let mut values: Vec<Value> = Vec::new();
+        for (i, val) in seq.iter().enumerate() {
+            if i < start_idx || i >= end_idx {
+                continue;
+            }
+            values.push(val.clone());
+        }
+        Ok(NativeCallResult::Return(Value::array(values)))
+    }))
+}
+
 fn create_table_module(vm: &VM) -> Value {
     let entries = [
-        (string_key("len"), create_array_len_fn()),
-        (string_key("is_empty"), create_array_is_empty_fn()),
-        (string_key("get"), create_array_get_fn()),
+        (string_key("len"), create_table_len_fn()),
+        (string_key("is_empty"), create_table_is_empty_fn()),
+        (string_key("get"), create_table_get_fn()),
+        (string_key("set"), create_table_set_fn()),
         (string_key("first"), create_array_first_fn()),
         (string_key("last"), create_array_last_fn()),
         (string_key("push"), create_array_push_fn()),
         (string_key("pop"), create_array_pop_fn()),
         (string_key("insert"), create_table_insert_fn()),
         (string_key("remove"), create_table_remove_fn()),
-        (string_key("clear"), create_array_clear_fn()),
+        (string_key("clear"), create_table_clear_fn()),
         (string_key("slice"), create_array_slice_fn()),
         (string_key("concat"), create_array_concat_fn()),
         (string_key("sort"), create_array_sort_fn()),
@@ -2297,6 +2758,7 @@ fn create_table_module(vm: &VM) -> Value {
         (string_key("reduce"), create_array_reduce_fn()),
         (string_key("iter"), create_array_iter_fn()),
         (string_key("unpack"), create_table_unpack_fn()),
+        (string_key("move"), create_table_move_fn()),
     ];
     vm.map_with_entries(entries)
 }

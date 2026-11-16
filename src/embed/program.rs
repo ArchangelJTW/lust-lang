@@ -202,6 +202,17 @@ impl EmbeddedBuilder {
         self
     }
 
+    pub fn entry(
+        &mut self,
+        module_path: impl Into<String>,
+        source: impl Into<String>,
+    ) -> &mut Self {
+        let path = module_path.into();
+        self.modules.insert(path.clone(), source.into());
+        self.entry_module = Some(path);
+        self
+    }
+
     /// Select the entry module to compile and execute.
     ///
     /// Its source must either be registered with [`Self::module`] / [`Self::add_module`]
@@ -1371,6 +1382,49 @@ impl EmbeddedProgram {
 
     pub fn has_pending_async_tasks(&self) -> bool {
         !self.async_registry.borrow().is_empty()
+    }
+
+    pub fn pending_async_task_count(&self) -> usize {
+        self.async_registry.borrow().len()
+    }
+
+    /// Cancels and drops all pending async tasks in the registry, firing cancel observers
+    /// and failing any associated VM task handles cleanly.
+    pub fn cancel_pending_async_tasks(&mut self) -> usize {
+        let mut drained = Vec::new();
+        {
+            let mut registry = self.async_registry.borrow_mut();
+            let keys: Vec<u64> = registry.pending.keys().copied().collect();
+            for id in keys {
+                if let Some(mut entry) = registry.pending.remove(&id) {
+                    entry.cancel();
+                    drained.push(entry);
+                }
+            }
+        }
+        let count = drained.len();
+        for entry in drained {
+            let err = LustError::RuntimeError {
+                message: "Cancelled".to_string(),
+            };
+            match entry.target {
+                AsyncTaskTarget::ScriptTask(handle) => {
+                    let _ = self.vm.fail_task_handle(handle, err);
+                }
+                AsyncTaskTarget::NativeTask(handle) => {
+                    let _ = self.vm.complete_native_future_task(handle, Err("Cancelled".to_string()));
+                }
+            }
+            drop(entry);
+        }
+        count
+    }
+
+    pub fn set_wake_notifier(
+        &mut self,
+        notifier: Option<std::sync::Arc<dyn crate::embed::async_runtime::AsyncWakeNotifier>>,
+    ) -> Option<std::sync::Arc<dyn crate::embed::async_runtime::AsyncWakeNotifier>> {
+        self.async_registry.borrow_mut().set_wake_notifier(notifier)
     }
 
     #[allow(dead_code)]

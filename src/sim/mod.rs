@@ -8,6 +8,7 @@ pub mod host_call;
 pub mod invariants;
 pub mod replay;
 pub mod scheduler;
+pub mod tier2;
 
 pub use clock::{
     CivilDateTime, LustClock, MonotonicClock, SimClock, SystemMonotonicClock, SystemWallClock,
@@ -29,6 +30,10 @@ pub use replay::{
     ReplayManifest, ReplayResult, Shrinker, ShrunkReplay,
 };
 pub use scheduler::PreemptiveExplorationScheduler;
+pub use tier2::{
+    Tier2InterruptSchedule, Tier2ReplayEngine, Tier2SafepointController, Tier2SimAction,
+    Tier2SimSession,
+};
 
 use crate::bytecode::{TaskHandle, Value};
 use crate::error::{LustError, Result};

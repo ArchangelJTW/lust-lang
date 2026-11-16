@@ -1,3 +1,4 @@
+pub mod coord;
 pub mod effects;
 #[path = "sync.rs"]
 pub mod sync;

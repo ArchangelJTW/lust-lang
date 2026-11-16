@@ -10,6 +10,18 @@ impl Stmt {
     pub fn new(kind: StmtKind, span: Span) -> Self {
         Self { kind, span }
     }
+
+    pub fn new_resume(value: Expr, span: Span) -> Self {
+        Self::new(StmtKind::Expr(Expr::new_resume(value, span)), span)
+    }
+
+    pub fn new_perform(effect_name: String, args: Vec<Expr>, span: Span) -> Self {
+        Self::new(StmtKind::Expr(Expr::new_perform(effect_name, args, span)), span)
+    }
+
+    pub fn new_handle(body: Expr, arms: Vec<super::expr::HandlerArm>, span: Span) -> Self {
+        Self::new(StmtKind::Expr(Expr::new_handle(body, arms, span)), span)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1325,6 +1325,18 @@ impl Parser {
                 ));
             }
 
+            TokenKind::Handle => {
+                return self.parse_handle_expr(&start_token);
+            }
+
+            TokenKind::Perform => {
+                return self.parse_perform_expr(&start_token);
+            }
+
+            TokenKind::Resume => {
+                return self.parse_resume_expr(&start_token);
+            }
+
             TokenKind::Identifier => {
                 if (self.current_token().lexeme == "regex"
                     || self.regex_aliases.contains(&self.current_token().lexeme))
@@ -1361,6 +1373,26 @@ impl Parser {
                         ExprKind::EffectBlock(statements),
                         self.make_span(&start_token, &end_token),
                     ));
+                }
+
+                if self.current_token().lexeme == "handle" && self.peek_has_with() {
+                    return self.parse_handle_expr(&start_token);
+                }
+
+                if self.current_token().lexeme == "perform"
+                    && (self.peek_ahead(1).is_some_and(|t| {
+                        t.kind == TokenKind::Identifier
+                            || t.kind == TokenKind::String
+                            || t.kind == TokenKind::LeftParen
+                    }))
+                {
+                    return self.parse_perform_expr(&start_token);
+                }
+
+                if self.current_token().lexeme == "resume"
+                    && self.peek_ahead(1).is_some_and(|t| t.kind == TokenKind::LeftParen)
+                {
+                    return self.parse_resume_expr(&start_token);
                 }
 
                 let name = self.expect_identifier()?;
@@ -1832,6 +1864,209 @@ impl Parser {
             self.make_span(&start_token, &end_token),
         ))
     }
+
+    fn peek_has_with(&self) -> bool {
+        let mut i = 1;
+        let mut depth = 0;
+        while let Some(tok) = self.peek_ahead(i) {
+            match tok.kind {
+                TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace | TokenKind::Do => {
+                    depth += 1;
+                }
+                TokenKind::RightParen | TokenKind::RightBracket | TokenKind::RightBrace => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                TokenKind::End => {
+                    if depth > 0 {
+                        depth -= 1;
+                    } else {
+                        return false;
+                    }
+                }
+                TokenKind::With => {
+                    if depth == 0 {
+                        return true;
+                    }
+                }
+                TokenKind::Identifier if tok.lexeme == "with" => {
+                    if depth == 0 {
+                        return true;
+                    }
+                }
+                TokenKind::Semicolon => {
+                    if depth == 0 {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn parse_handle_expr(&mut self, start_token: &Token) -> Result<Expr> {
+        self.advance();
+        let body = if self.match_token(&[TokenKind::Do]) {
+            let mut stmts = Vec::new();
+            while !self.check(TokenKind::End) && !self.is_at_end() {
+                stmts.push(self.parse_stmt()?);
+            }
+            self.consume(TokenKind::End, "Expected 'end' after handle do block")?;
+            let end_tok = self.tokens[self.current - 1].clone();
+            Expr::new(ExprKind::Block(stmts), self.make_span(start_token, &end_tok))
+        } else if self.match_token(&[TokenKind::LeftBrace]) {
+            let mut stmts = Vec::new();
+            while !self.check(TokenKind::RightBrace) && !self.is_at_end() {
+                stmts.push(self.parse_stmt()?);
+            }
+            self.consume(TokenKind::RightBrace, "Expected '}' after handle block")?;
+            let end_tok = self.tokens[self.current - 1].clone();
+            Expr::new(ExprKind::Block(stmts), self.make_span(start_token, &end_tok))
+        } else if self.check(TokenKind::Local)
+            || self.check(TokenKind::While)
+            || self.check(TokenKind::For)
+            || self.check(TokenKind::If)
+            || self.check(TokenKind::Return)
+        {
+            let mut stmts = Vec::new();
+            while !self.check(TokenKind::With)
+                && !(self.check(TokenKind::Identifier) && self.current_token().lexeme == "with")
+                && !self.is_at_end()
+            {
+                stmts.push(self.parse_stmt()?);
+            }
+            let end_tok = self.tokens[self.current - 1].clone();
+            Expr::new(ExprKind::Block(stmts), self.make_span(start_token, &end_tok))
+        } else {
+            self.parse_expr()?
+        };
+
+        if self.check(TokenKind::With) {
+            self.advance();
+        } else if self.check(TokenKind::Identifier) && self.current_token().lexeme == "with" {
+            self.advance();
+        } else {
+            return Err(self.error("Expected 'with' after handle body"));
+        }
+
+        let has_brace = self.match_token(&[TokenKind::LeftBrace]);
+        let mut arms = Vec::new();
+        while !self.check(TokenKind::End)
+            && !(has_brace && self.check(TokenKind::RightBrace))
+            && !self.is_at_end()
+        {
+            let arm_start = self.current_token().clone();
+            if self.check(TokenKind::Identifier) && self.current_token().lexeme == "case" {
+                self.advance();
+            }
+            let effect_name = self.expect_identifier()?;
+            let mut params = Vec::new();
+            if self.match_token(&[TokenKind::LeftParen]) {
+                if !self.check(TokenKind::RightParen) {
+                    loop {
+                        params.push(self.expect_identifier()?);
+                        if !self.match_token(&[TokenKind::Comma]) {
+                            break;
+                        }
+                    }
+                }
+                self.consume(TokenKind::RightParen, "Expected ')' after handler arm parameters")?;
+            }
+            self.consume(TokenKind::FatArrow, "Expected '=>' after handler arm pattern")?;
+            let arm_body = if self.match_token(&[TokenKind::LeftBrace]) {
+                let mut stmts = Vec::new();
+                while !self.check(TokenKind::RightBrace) && !self.is_at_end() {
+                    stmts.push(self.parse_stmt()?);
+                }
+                self.consume(TokenKind::RightBrace, "Expected '}' after handler arm block")?;
+                let arm_end = self.tokens[self.current - 1].clone();
+                Expr::new(ExprKind::Block(stmts), self.make_span(&arm_start, &arm_end))
+            } else {
+                self.parse_expr()?
+            };
+            let arm_end = self.tokens[self.current - 1].clone();
+            let arm_span = self.make_span(&arm_start, &arm_end);
+            arms.push(crate::ast::expr::HandlerArm {
+                effect_name,
+                params,
+                body: Box::new(arm_body),
+                span: arm_span,
+            });
+            self.match_token(&[TokenKind::Comma, TokenKind::Semicolon]);
+        }
+        if has_brace {
+            self.consume(TokenKind::RightBrace, "Expected '}' after handler arms")?;
+        } else {
+            self.consume(TokenKind::End, "Expected 'end' after handler arms")?;
+        }
+        let end_token = self.tokens[self.current - 1].clone();
+        let total_span = self.make_span(start_token, &end_token);
+        Ok(Expr::new_handle(body, arms, total_span))
+    }
+
+    fn parse_perform_expr(&mut self, start_token: &Token) -> Result<Expr> {
+        self.advance();
+        if self.match_token(&[TokenKind::LeftParen]) {
+            let effect_name = if self.check(TokenKind::String) {
+                let token = self.advance().clone();
+                self.unescape_string_literal(&token)?
+            } else {
+                self.expect_identifier()?
+            };
+            let mut args = Vec::new();
+            if self.match_token(&[TokenKind::Comma]) {
+                let first_arg = self.parse_expr()?;
+                if let ExprKind::Array(elems) = first_arg.kind {
+                    args = elems;
+                } else {
+                    args.push(first_arg);
+                    while self.match_token(&[TokenKind::Comma]) {
+                        args.push(self.parse_expr()?);
+                    }
+                }
+            }
+            self.consume(TokenKind::RightParen, "Expected ')' after perform arguments")?;
+            let end_token = self.tokens[self.current - 1].clone();
+            Ok(Expr::new_perform(effect_name, args, self.make_span(start_token, &end_token)))
+        } else {
+            let effect_name = self.expect_identifier()?;
+            let mut args = Vec::new();
+            if self.match_token(&[TokenKind::LeftParen]) {
+                if !self.check(TokenKind::RightParen) {
+                    loop {
+                        args.push(self.parse_expr()?);
+                        if !self.match_token(&[TokenKind::Comma]) {
+                            break;
+                        }
+                    }
+                }
+                self.consume(TokenKind::RightParen, "Expected ')' after effect arguments")?;
+            }
+            let end_token = self.tokens[self.current - 1].clone();
+            Ok(Expr::new_perform(effect_name, args, self.make_span(start_token, &end_token)))
+        }
+    }
+
+    fn parse_resume_expr(&mut self, start_token: &Token) -> Result<Expr> {
+        self.advance();
+        self.consume(TokenKind::LeftParen, "Expected '(' after 'resume'")?;
+        let val = if self.match_token(&[TokenKind::RightParen]) {
+            Expr::new(
+                ExprKind::Literal(Literal::Bool(false)),
+                self.make_span(start_token, &self.tokens[self.current - 1]),
+            )
+        } else {
+            let expr = self.parse_expr()?;
+            self.consume(TokenKind::RightParen, "Expected ')' after resume value")?;
+            expr
+        };
+        let end_token = self.tokens[self.current - 1].clone();
+        Ok(Expr::new_resume(val, self.make_span(start_token, &end_token)))
+    }
 }
 
 #[cfg(test)]
@@ -2068,5 +2303,29 @@ mod tests {
         let mut parser = Parser::new(tokens);
         let items = parser.parse().expect("parse items");
         assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn test_algebraic_handlers_parsing() {
+        let code = r#"
+            handle
+                local x = perform Read("foo.txt")
+                return x + 1
+            with
+                case Read(path) => resume(10)
+            end
+        "#;
+        let expr = parse_expression(code);
+        match &expr.kind {
+            ExprKind::Call { callee, args, .. } => {
+                if let ExprKind::Identifier(name) = &callee.kind {
+                    assert_eq!(name, "__lust_handle");
+                    assert_eq!(args.len(), 2);
+                } else {
+                    panic!("expected __lust_handle identifier call");
+                }
+            }
+            other => panic!("expected handle call, got {:?}", other),
+        }
     }
 }

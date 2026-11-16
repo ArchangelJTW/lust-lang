@@ -264,7 +264,7 @@ impl Compiler {
     }
 
     pub(super) fn is_stdlib_symbol(&self, name: &str) -> bool {
-        self.stdlib_symbols.contains(name)
+        self.stdlib_symbols.contains(name) || name.starts_with("__lust_")
     }
 
     pub(super) fn should_wrap_option(&self, span: Span) -> bool {

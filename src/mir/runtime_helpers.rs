@@ -37,6 +37,13 @@ impl Default for MirContext {
     }
 }
 
+impl Drop for MirContext {
+    fn drop(&mut self) {
+        #[cfg(feature = "std")]
+        self.clear_to_baseline(0);
+    }
+}
+
 impl MirContext {
     pub fn new() -> Self {
         Self {

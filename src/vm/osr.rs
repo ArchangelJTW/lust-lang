@@ -224,24 +224,10 @@ impl DeoptExitState {
         reason: DeoptReason,
         types: &[(usize, MirType)],
     ) -> Self {
-        let mut restored_locals = Vec::with_capacity(payload.live_locals.len());
-        for (loc_idx, raw_val) in payload.live_locals {
-            let mir_ty = types
-                .iter()
-                .find(|(i, _)| *i == loc_idx)
-                .map(|(_, ty)| ty)
-                .unwrap_or(&MirType::Int);
-            let val = match mir_ty {
-                MirType::Int => Value::Int(raw_val),
-                MirType::Float => Value::Float(f64::from_bits(raw_val as u64)),
-                MirType::Bool => Value::Bool(raw_val != 0),
-                MirType::Unit => Value::Nil,
-                _ => Value::Int(raw_val),
-            };
-            restored_locals.push((loc_idx, val));
-        }
+        let target_pc = payload.target_pc;
+        let restored_locals = payload.to_vm_values_with_types(types);
         Self {
-            target_pc: payload.target_pc,
+            target_pc,
             restored_locals,
             reason,
         }

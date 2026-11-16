@@ -1,5 +1,15 @@
 [workspace]
-members = [".", "crates/lust-analyzer", "crates/lust-macros", "crates/lust-fuzz"]
+members = [
+  ".",
+  "crates/lust-analyzer",
+  "crates/lust-macros",
+  "crates/lust-fuzz",
+  "crates/lust-tokio",
+  "crates/lust-telemetry-metrics",
+  "crates/lust-telemetry-otel",
+  "crates/lust-telemetry-prometheus",
+  "crates/lust-telemetry-tracing",
+]
 exclude = ["examples/rust-extension/extensions/**", "tree-sitter-lust", "tests/compile_fail/fs_gate"]
 
 [package]

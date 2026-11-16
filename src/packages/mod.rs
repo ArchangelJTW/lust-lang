@@ -2,18 +2,20 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use crate::embed::native_types::ModuleStub;
-use crate::{NativeExport, VM};
+use crate::{NativeEffectSpec, NativeExport, NativeExportParam, NativePurity, VM};
+use crate::bytecode::{NativeCallResult, Value};
 use dirs::home_dir;
 use libloading::Library;
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
-    sync::{Mutex, OnceLock},
+    rc::Rc,
+    sync::{Arc, Mutex, OnceLock},
 };
 use thiserror::Error;
 
@@ -215,6 +217,24 @@ pub enum LocalModuleError {
 
     #[error("register function reported failure in {0}")]
     RegisterFailed(String),
+
+    #[error("missing external library at '{0}'")]
+    MissingExternalLibrary(PathBuf),
+
+    #[error("IncompatibleAbiVersion: bad symbols in library '{path}': {message}")]
+    BadSymbols {
+        path: PathBuf,
+        message: String,
+    },
+
+    #[error("IncompatibleAbiVersion in '{path}': {message}")]
+    IncompatibleAbiVersion {
+        path: PathBuf,
+        message: String,
+    },
+
+    #[error("CapabilityDenied: {0}")]
+    CapabilityDenied(String),
 }
 
 #[derive(Debug, Clone)]
@@ -223,14 +243,27 @@ pub struct LocalBuildOutput {
     pub library_path: PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct LoadedRustModule {
-    name: String,
+    pub name: String,
+    pub library: Arc<Library>,
+}
+
+impl std::fmt::Debug for LoadedRustModule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadedRustModule")
+            .field("name", &self.name)
+            .finish()
+    }
 }
 
 impl LoadedRustModule {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn library(&self) -> &Arc<Library> {
+        &self.library
     }
 }
 
@@ -330,24 +363,857 @@ pub fn build_local_module(
     })
 }
 
+pub const EXPECTED_LUST_EXT_ABI_VERSION: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LustExtValTag {
+    Nil = 0,
+    Bool = 1,
+    Int = 2,
+    Float = 3,
+    String = 4,
+    Handle = 5,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union LustExtValPayload {
+    pub bool_val: bool,
+    pub int_val: i64,
+    pub float_val: f64,
+    pub str_val: *const core::ffi::c_char,
+    pub handle_val: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LustExtVal {
+    pub tag: LustExtValTag,
+    pub payload: LustExtValPayload,
+}
+
+pub type LustExtCleanFn = unsafe extern "C" fn(*mut core::ffi::c_void);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LustExtHostV1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub vm_or_runtime_ptr: *mut core::ffi::c_void,
+    pub charge_gas: unsafe extern "C" fn(ctx: *mut core::ffi::c_void, units: u64) -> i32,
+    pub check_interrupt: unsafe extern "C" fn(ctx: *mut core::ffi::c_void, out_reason: *mut u32) -> i32,
+    pub try_reserve_memory: unsafe extern "C" fn(
+        ctx: *mut core::ffi::c_void,
+        bytes: usize,
+        out_reservation_id: *mut u64,
+    ) -> i32,
+    pub commit_memory: unsafe extern "C" fn(
+        ctx: *mut core::ffi::c_void,
+        reservation_id: u64,
+        actual_bytes: usize,
+    ) -> i32,
+    pub rollback_memory: unsafe extern "C" fn(ctx: *mut core::ffi::c_void, reservation_id: u64) -> i32,
+    pub acquire_resource: unsafe extern "C" fn(
+        ctx: *mut core::ffi::c_void,
+        scope_id: u64,
+        handle: *mut core::ffi::c_void,
+        cleanup: LustExtCleanFn,
+        out_token: *mut u64,
+    ) -> i32,
+    pub release_resource: unsafe extern "C" fn(ctx: *mut core::ffi::c_void, token: u64) -> i32,
+    pub host_alloc_value_bytes: unsafe extern "C" fn(
+        ctx: *mut core::ffi::c_void,
+        len: usize,
+        out_ptr: *mut *mut u8,
+    ) -> i32,
+    pub host_free_value_bytes: unsafe extern "C" fn(ctx: *mut core::ffi::c_void, ptr: *mut u8, len: usize),
+}
+
+pub type LustExtNativeFn = unsafe extern "C" fn(
+    host: *const LustExtHostV1,
+    args: *const LustExtVal,
+    args_len: usize,
+    out_val: *mut LustExtVal,
+) -> i32;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LustExtExportMetaRaw {
+    pub name: *const core::ffi::c_char,
+    pub params: *const *const core::ffi::c_char,
+    pub params_len: usize,
+    pub return_type: *const core::ffi::c_char,
+    pub doc: *const core::ffi::c_char,
+    pub purity: u8,
+    pub required_capability: *const core::ffi::c_char,
+    pub deterministic: bool,
+    pub fn_ptr: Option<LustExtNativeFn>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LustExtManifestV1Raw {
+    pub abi_version: u32,
+    pub module_name: *const core::ffi::c_char,
+    pub exports: *const LustExtExportMetaRaw,
+    pub exports_len: usize,
+}
+
+pub struct VerifiedExtension {
+    pub module_name: String,
+    pub abi_version: u32,
+    pub exports_len: usize,
+    pub library: Library,
+}
+
+pub fn validate_extension_abi(
+    lib: &Library,
+    path: &Path,
+) -> Result<&'static LustExtManifestV1Raw, LocalModuleError> {
+    // 1. Fail closed on legacy raw *mut VM extension entry if present
+    let has_legacy_register = unsafe {
+        lib.get::<unsafe extern "C" fn(*mut core::ffi::c_void) -> bool>(b"lust_extension_register\0")
+            .is_ok()
+    };
+    if has_legacy_register {
+        return Err(LocalModuleError::IncompatibleAbiVersion {
+            path: path.to_path_buf(),
+            message: "legacy raw *mut VM extension entry 'lust_extension_register' is unsupported and rejected; extensions must use narrow stable C ABI (lust_ext_manifest_v1 with LustExtHostV1)".to_string(),
+        });
+    }
+
+    // 2. Validate narrow stable C ABI manifest entry point
+    let manifest_fn: libloading::Symbol<unsafe extern "C" fn() -> *const LustExtManifestV1Raw> = unsafe {
+        match lib.get(b"lust_ext_manifest_v1\0") {
+            Ok(sym) => sym,
+            Err(_) => {
+                return Err(LocalModuleError::IncompatibleAbiVersion {
+                    path: path.to_path_buf(),
+                    message: "missing required manifest symbol 'lust_ext_manifest_v1'".to_string(),
+                });
+            }
+        }
+    };
+
+    let manifest_ptr = unsafe { manifest_fn() };
+    if manifest_ptr.is_null() {
+        return Err(LocalModuleError::IncompatibleAbiVersion {
+            path: path.to_path_buf(),
+            message: "manifest function returned NULL pointer".to_string(),
+        });
+    }
+
+    if (manifest_ptr as usize) % core::mem::align_of::<LustExtManifestV1Raw>() != 0 {
+        return Err(LocalModuleError::IncompatibleAbiVersion {
+            path: path.to_path_buf(),
+            message: "manifest function returned misaligned pointer".to_string(),
+        });
+    }
+
+    let manifest = unsafe { &*manifest_ptr };
+    if manifest.abi_version != EXPECTED_LUST_EXT_ABI_VERSION {
+        return Err(LocalModuleError::IncompatibleAbiVersion {
+            path: path.to_path_buf(),
+            message: format!(
+                "extension ABI version {} does not match host ABI version {}",
+                manifest.abi_version, EXPECTED_LUST_EXT_ABI_VERSION
+            ),
+        });
+    }
+
+    if manifest.module_name.is_null() {
+        return Err(LocalModuleError::IncompatibleAbiVersion {
+            path: path.to_path_buf(),
+            message: "manifest module_name pointer is null".to_string(),
+        });
+    }
+
+    let module_name = unsafe { std::ffi::CStr::from_ptr(manifest.module_name) }
+        .to_str()
+        .map_err(|e| LocalModuleError::IncompatibleAbiVersion {
+            path: path.to_path_buf(),
+            message: format!("manifest module_name is not valid UTF-8: {e}"),
+        })?;
+
+    if module_name.is_empty() {
+        return Err(LocalModuleError::IncompatibleAbiVersion {
+            path: path.to_path_buf(),
+            message: "manifest module_name is empty".to_string(),
+        });
+    }
+
+    if manifest.exports_len > 0 {
+        if manifest.exports.is_null() {
+            return Err(LocalModuleError::IncompatibleAbiVersion {
+                path: path.to_path_buf(),
+                message: format!(
+                    "manifest exports pointer is null but exports_len is {}",
+                    manifest.exports_len
+                ),
+            });
+        }
+        if (manifest.exports as usize) % core::mem::align_of::<LustExtExportMetaRaw>() != 0 {
+            return Err(LocalModuleError::IncompatibleAbiVersion {
+                path: path.to_path_buf(),
+                message: "manifest exports pointer is misaligned".to_string(),
+            });
+        }
+        for i in 0..manifest.exports_len {
+            let export = unsafe { &*manifest.exports.add(i) };
+            if export.name.is_null() {
+                return Err(LocalModuleError::IncompatibleAbiVersion {
+                    path: path.to_path_buf(),
+                    message: format!("manifest export[{i}].name pointer is null"),
+                });
+            }
+            let _ = unsafe { std::ffi::CStr::from_ptr(export.name) }
+                .to_str()
+                .map_err(|e| LocalModuleError::IncompatibleAbiVersion {
+                    path: path.to_path_buf(),
+                    message: format!("manifest export[{i}].name is not valid UTF-8: {e}"),
+                })?;
+
+            if !export.return_type.is_null() {
+                let _ = unsafe { std::ffi::CStr::from_ptr(export.return_type) }
+                    .to_str()
+                    .map_err(|e| LocalModuleError::IncompatibleAbiVersion {
+                        path: path.to_path_buf(),
+                        message: format!("manifest export[{i}].return_type is not valid UTF-8: {e}"),
+                    })?;
+            }
+
+            if export.purity > 1 {
+                return Err(LocalModuleError::IncompatibleAbiVersion {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "manifest export[{i}].purity has invalid scalar value {} (expected 0 for Pure, 1 for Effectful)",
+                        export.purity
+                    ),
+                });
+            }
+
+            if !export.required_capability.is_null() {
+                let _ = unsafe { std::ffi::CStr::from_ptr(export.required_capability) }
+                    .to_str()
+                    .map_err(|e| LocalModuleError::IncompatibleAbiVersion {
+                        path: path.to_path_buf(),
+                        message: format!("manifest export[{i}].required_capability is not valid UTF-8: {e}"),
+                    })?;
+            }
+
+            if export.params_len > 0 {
+                if export.params.is_null() {
+                    return Err(LocalModuleError::IncompatibleAbiVersion {
+                        path: path.to_path_buf(),
+                        message: format!(
+                            "manifest export[{i}].params pointer is null but params_len is {}",
+                            export.params_len
+                        ),
+                    });
+                }
+                for p in 0..export.params_len {
+                    let param_ptr = unsafe { *export.params.add(p) };
+                    if param_ptr.is_null() {
+                        return Err(LocalModuleError::IncompatibleAbiVersion {
+                            path: path.to_path_buf(),
+                            message: format!("manifest export[{i}].params[{p}] pointer is null"),
+                        });
+                    }
+                    let _ = unsafe { std::ffi::CStr::from_ptr(param_ptr) }
+                        .to_str()
+                        .map_err(|e| LocalModuleError::IncompatibleAbiVersion {
+                            path: path.to_path_buf(),
+                            message: format!("manifest export[{i}].params[{p}] is not valid UTF-8: {e}"),
+                        })?;
+                }
+            }
+        }
+    }
+
+    Ok(manifest)
+}
+
+pub fn load_and_verify_extension(dylib_path: &Path) -> Result<VerifiedExtension, LocalModuleError> {
+    if !dylib_path.exists() {
+        return Err(LocalModuleError::MissingExternalLibrary(dylib_path.to_path_buf()));
+    }
+    let lib = unsafe { Library::new(dylib_path) }.map_err(|e| LocalModuleError::BadSymbols {
+        path: dylib_path.to_path_buf(),
+        message: format!("failed to load dynamic library: {e}"),
+    })?;
+
+    let manifest = validate_extension_abi(&lib, dylib_path)?;
+    let mod_name = unsafe { std::ffi::CStr::from_ptr(manifest.module_name) }
+        .to_string_lossy()
+        .into_owned();
+
+    Ok(VerifiedExtension {
+        module_name: mod_name,
+        abi_version: manifest.abi_version,
+        exports_len: manifest.exports_len,
+        library: lib,
+    })
+}
+
+// Memory reservations tracked across C ABI boundary
+static RESERVATION_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+static RESERVATIONS: Mutex<Option<HashMap<u64, usize>>> = Mutex::new(None);
+
+fn with_reservations<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut HashMap<u64, usize>) -> R,
+{
+    let mut guard = RESERVATIONS.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    f(map)
+}
+
+// Host callbacks backed by VM via ctx (*mut VM)
+unsafe extern "C" fn vm_host_charge_gas(ctx: *mut core::ffi::c_void, units: u64) -> i32 {
+    if ctx.is_null() {
+        return 1; // ERR_GENERIC
+    }
+    let vm = unsafe { &mut *(ctx as *mut VM) };
+    if units == 0 {
+        return 0;
+    }
+    match vm.charge_gas(units) {
+        Ok(()) => 0,
+        Err(_) => 2, // ERR_OUT_OF_GAS
+    }
+}
+
+unsafe extern "C" fn vm_host_check_interrupt(ctx: *mut core::ffi::c_void, out_reason: *mut u32) -> i32 {
+    if ctx.is_null() {
+        return 1;
+    }
+    let vm = unsafe { &*(ctx as *mut VM) };
+    if vm.pending_task_signal.is_some() {
+        if !out_reason.is_null() {
+            unsafe { *out_reason = 1; }
+        }
+        4 // ERR_INTERRUPTED
+    } else {
+        0
+    }
+}
+
+unsafe extern "C" fn vm_host_try_reserve_memory(
+    ctx: *mut core::ffi::c_void,
+    bytes: usize,
+    out_reservation_id: *mut u64,
+) -> i32 {
+    if ctx.is_null() || out_reservation_id.is_null() {
+        return 1;
+    }
+    let vm = unsafe { &mut *(ctx as *mut VM) };
+    if vm.memory_budget_bytes().is_some() && !vm.try_charge_memory_bytes(bytes) {
+        return 3; // ERR_OUT_OF_MEMORY
+    }
+    let id = RESERVATION_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    with_reservations(|map| {
+        map.insert(id, bytes);
+    });
+    unsafe { *out_reservation_id = id; }
+    0
+}
+
+unsafe extern "C" fn vm_host_commit_memory(
+    ctx: *mut core::ffi::c_void,
+    reservation_id: u64,
+    actual_bytes: usize,
+) -> i32 {
+    if ctx.is_null() {
+        return 1;
+    }
+    let vm = unsafe { &mut *(ctx as *mut VM) };
+    let reserved = with_reservations(|map| map.remove(&reservation_id));
+    if let Some(reserved_bytes) = reserved {
+        if actual_bytes < reserved_bytes {
+            vm.release_memory_bytes(reserved_bytes - actual_bytes);
+            0
+        } else if actual_bytes > reserved_bytes {
+            let extra = actual_bytes - reserved_bytes;
+            if vm.memory_budget_bytes().is_some() && !vm.try_charge_memory_bytes(extra) {
+                3 // ERR_OUT_OF_MEMORY
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    } else {
+        1
+    }
+}
+
+unsafe extern "C" fn vm_host_rollback_memory(
+    ctx: *mut core::ffi::c_void,
+    reservation_id: u64,
+) -> i32 {
+    if ctx.is_null() {
+        return 1;
+    }
+    let vm = unsafe { &mut *(ctx as *mut VM) };
+    let reserved = with_reservations(|map| map.remove(&reservation_id));
+    if let Some(reserved_bytes) = reserved {
+        vm.release_memory_bytes(reserved_bytes);
+        0
+    } else {
+        1
+    }
+}
+
+static EXT_RESOURCE_REGISTRY: Mutex<Option<HashMap<u64, (usize, LustExtCleanFn)>>> = Mutex::new(None);
+
+unsafe extern "C" fn vm_host_acquire_resource(
+    ctx: *mut core::ffi::c_void,
+    scope_id: u64,
+    handle: *mut core::ffi::c_void,
+    cleanup: LustExtCleanFn,
+    out_token: *mut u64,
+) -> i32 {
+    if ctx.is_null() || out_token.is_null() {
+        return 1;
+    }
+    let vm = unsafe { &mut *(ctx as *mut VM) };
+    match vm.host_ledger.acquire_scoped(handle as usize, |_| {}, scope_id) {
+        Ok(slot_idx) => {
+            let generation = vm.host_ledger.slots[slot_idx].generation;
+            let token = ((generation as u64) << 32) | (slot_idx as u64);
+            let mut guard = EXT_RESOURCE_REGISTRY.lock().unwrap();
+            let map = guard.get_or_insert_with(HashMap::new);
+            map.insert(token, (handle as usize, cleanup));
+            unsafe { *out_token = token; }
+            0
+        }
+        Err(_) => 1,
+    }
+}
+
+unsafe extern "C" fn vm_host_release_resource(
+    ctx: *mut core::ffi::c_void,
+    token: u64,
+) -> i32 {
+    if ctx.is_null() {
+        return 1;
+    }
+    let vm = unsafe { &mut *(ctx as *mut VM) };
+    let slot_idx = (token as u32) as usize;
+    let generation = (token >> 32) as u32;
+    if slot_idx < vm.host_ledger.slots.len()
+        && vm.host_ledger.slots[slot_idx].active
+        && vm.host_ledger.slots[slot_idx].generation == generation
+    {
+        vm.host_ledger.release(slot_idx);
+        let entry = {
+            let mut guard = EXT_RESOURCE_REGISTRY.lock().unwrap();
+            guard.as_mut().and_then(|m| m.remove(&token))
+        };
+        if let Some((handle_usize, cleanup)) = entry {
+            unsafe { cleanup(handle_usize as *mut core::ffi::c_void); }
+        }
+        0
+    } else {
+        5 // ERR_INVALID_HANDLE
+    }
+}
+
+unsafe extern "C" fn vm_host_alloc_value_bytes(
+    ctx: *mut core::ffi::c_void,
+    len: usize,
+    out_ptr: *mut *mut u8,
+) -> i32 {
+    if ctx.is_null() || out_ptr.is_null() {
+        return 1;
+    }
+    let vm = unsafe { &mut *(ctx as *mut VM) };
+    if vm.memory_budget_bytes().is_some() && !vm.try_charge_memory_bytes(len) {
+        return 3; // ERR_OUT_OF_MEMORY
+    }
+    let layout = match std::alloc::Layout::from_size_align(len.max(1), 8) {
+        Ok(l) => l,
+        Err(_) => return 1,
+    };
+    let ptr = unsafe { std::alloc::alloc(layout) };
+    if ptr.is_null() {
+        vm.release_memory_bytes(len);
+        return 3;
+    }
+    unsafe { *out_ptr = ptr; }
+    0
+}
+
+unsafe extern "C" fn vm_host_free_value_bytes(
+    ctx: *mut core::ffi::c_void,
+    ptr: *mut u8,
+    len: usize,
+) {
+    if !ptr.is_null() {
+        let layout = std::alloc::Layout::from_size_align(len.max(1), 8).unwrap();
+        unsafe { std::alloc::dealloc(ptr, layout); }
+        if !ctx.is_null() {
+            let vm = unsafe { &mut *(ctx as *mut VM) };
+            vm.release_memory_bytes(len);
+        }
+    }
+}
+
+pub fn test_load_extension_cli(dylib_path: &Path, canary_path: Option<&Path>) -> Result<(), String> {
+    if let Some(cp) = canary_path {
+        let _ = fs::write(cp, "HOST_VM_ACCESS_COUNT=0\n");
+    }
+
+    let mut vm = VM::new();
+    let build = LocalBuildOutput {
+        name: "test_ext".to_string(),
+        library_path: dylib_path.to_path_buf(),
+    };
+
+    let loaded = match load_local_module(&mut vm, &build) {
+        Ok(l) => l,
+        Err(err) => {
+            if let Some(cp) = canary_path {
+                let mut current = fs::read_to_string(cp).unwrap_or_default();
+                current.push_str("HOST_VALIDATION_FAILED=true\n");
+                let _ = fs::write(cp, current);
+            }
+            return Err(format!("{err}"));
+        }
+    };
+
+    if let Some(cp) = canary_path {
+        let mut current = fs::read_to_string(cp).unwrap_or_default();
+        current.push_str("HOST_VALIDATION_PASSED=true\nHOST_VALIDATION_FAILED=false\n");
+        let _ = fs::write(cp, current);
+    }
+
+    let mut invoked_count = 0;
+    let exports = vm.exported_natives().to_vec();
+    if !exports.is_empty() {
+        let first_export = &exports[0];
+        let fn_name = first_export.name().to_string();
+
+        let initial_gas = vm.gas_used();
+        let call_args = if first_export.params().is_empty() {
+            Vec::new()
+        } else {
+            vec![Value::Int(42)]
+        };
+        let call_res = vm.call(&fn_name, call_args);
+        match call_res {
+            Ok(val) => {
+                let gas_charged = vm.gas_used().saturating_sub(initial_gas);
+                let res_str = match &val {
+                    Value::Int(i) => i.to_string(),
+                    Value::Float(f) => f.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    Value::String(s) => s.to_string(),
+                    _ => format!("{val:?}"),
+                };
+                println!(
+                    "Export invoked successfully: input=42 => result={res_str}, gas_charged={gas_charged}"
+                );
+                invoked_count += 1;
+            }
+            Err(e) => {
+                return Err(format!("Export invocation failed through VM: {e}"));
+            }
+        }
+    }
+
+    if let Some(cp) = canary_path {
+        let mut current = fs::read_to_string(cp).unwrap_or_default();
+        let access_count = if invoked_count > 0 { 1 } else { 0 };
+        current.push_str(&format!("HOST_VM_ACCESS_COUNT={access_count}\n"));
+        let _ = fs::write(cp, current);
+    }
+
+    println!(
+        "Extension '{}' verified compatible and loaded successfully",
+        loaded.name()
+    );
+    Ok(())
+}
+
 pub fn load_local_module(
     vm: &mut VM,
     build: &LocalBuildOutput,
 ) -> Result<LoadedRustModule, LocalModuleError> {
-    let library = get_or_load_library(&build.library_path)?;
-    unsafe {
-        let register = library
-            .get::<unsafe extern "C" fn(*mut VM) -> bool>(b"lust_extension_register\0")
-            .map_err(|_| LocalModuleError::RegisterSymbolMissing(build.name.clone()))?;
-        vm.push_export_prefix(&build.name);
-        let success = register(vm as *mut VM);
-        vm.pop_export_prefix();
-        if !success {
-            return Err(LocalModuleError::RegisterFailed(build.name.clone()));
+    let verified = load_and_verify_extension(&build.library_path)?;
+    let lib_arc = Arc::new(verified.library);
+
+    let manifest_fn: libloading::Symbol<unsafe extern "C" fn() -> *const LustExtManifestV1Raw> = unsafe {
+        lib_arc.get(b"lust_ext_manifest_v1\0").map_err(|e| LocalModuleError::BadSymbols {
+            path: build.library_path.clone(),
+            message: format!("failed to get manifest symbol: {e}"),
+        })?
+    };
+    let manifest = unsafe { &*manifest_fn() };
+
+    // Transactional pre-validation: check for duplicates and unsupported operations
+    let mut export_names_seen = HashSet::new();
+    let mut planned_exports = Vec::new();
+
+    for i in 0..manifest.exports_len {
+        let export_raw = unsafe { &*manifest.exports.add(i) };
+        if export_raw.name.is_null() {
+            return Err(LocalModuleError::IncompatibleAbiVersion {
+                path: build.library_path.clone(),
+                message: format!("manifest export[{i}].name pointer is null"),
+            });
+        }
+        let export_name = unsafe { std::ffi::CStr::from_ptr(export_raw.name) }
+            .to_str()
+            .map_err(|e| LocalModuleError::IncompatibleAbiVersion {
+                path: build.library_path.clone(),
+                message: format!("manifest export[{i}].name is not valid UTF-8: {e}"),
+            })?;
+
+        if !export_names_seen.insert(export_name.to_string()) {
+            return Err(LocalModuleError::IncompatibleAbiVersion {
+                path: build.library_path.clone(),
+                message: format!("DuplicateExport: manifest contains duplicate export '{export_name}'"),
+            });
+        }
+
+        let full_reg_name = if !export_name.contains('.') && !export_name.contains(':') {
+            format!("{}.{}", verified.module_name, export_name)
+        } else {
+            export_name.to_string()
+        };
+
+        // Check for duplicates in VM globals/natives
+        if vm.get_global(&full_reg_name).is_some() || vm.get_global(export_name).is_some() {
+            return Err(LocalModuleError::RegisterFailed(format!(
+                "duplicate registration: export '{}' already exists in VM",
+                full_reg_name
+            )));
+        }
+
+        let fn_ptr = export_raw.fn_ptr.ok_or_else(|| LocalModuleError::IncompatibleAbiVersion {
+            path: build.library_path.clone(),
+            message: format!("manifest export[{i}] ('{export_name}') has null fn_ptr; unsupported operation fails closed"),
+        })?;
+
+        let ret_ty = if !export_raw.return_type.is_null() {
+            unsafe { std::ffi::CStr::from_ptr(export_raw.return_type) }
+                .to_str()
+                .map_err(|e| LocalModuleError::IncompatibleAbiVersion {
+                    path: build.library_path.clone(),
+                    message: format!("manifest export[{i}].return_type is not valid UTF-8: {e}"),
+                })?
+        } else {
+            "()"
+        };
+
+        let purity = match export_raw.purity {
+            0 => NativePurity::Pure,
+            1 => NativePurity::Effectful,
+            other => {
+                return Err(LocalModuleError::IncompatibleAbiVersion {
+                    path: build.library_path.clone(),
+                    message: format!("manifest export[{i}].purity has invalid scalar value {other}"),
+                });
+            }
+        };
+
+        let req_cap = if !export_raw.required_capability.is_null() {
+            Some(
+                unsafe { std::ffi::CStr::from_ptr(export_raw.required_capability) }
+                    .to_str()
+                    .map_err(|e| LocalModuleError::IncompatibleAbiVersion {
+                        path: build.library_path.clone(),
+                        message: format!("manifest export[{i}].required_capability is not valid UTF-8: {e}"),
+                    })?
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        let mut param_specs = Vec::new();
+        if export_raw.params_len > 0 && !export_raw.params.is_null() {
+            for p in 0..export_raw.params_len {
+                let param_ptr = unsafe { *export_raw.params.add(p) };
+                let p_str = unsafe { std::ffi::CStr::from_ptr(param_ptr) }
+                    .to_str()
+                    .map_err(|e| LocalModuleError::IncompatibleAbiVersion {
+                        path: build.library_path.clone(),
+                        message: format!("manifest export[{i}].params[{p}] is not valid UTF-8: {e}"),
+                    })?;
+                let (p_name, p_ty) = if let Some((n, t)) = p_str.split_once(':') {
+                    (n.trim().to_string(), t.trim().to_string())
+                } else {
+                    (format!("arg{p}"), p_str.trim().to_string())
+                };
+                param_specs.push(NativeExportParam::new(p_name, p_ty));
+            }
+        }
+
+        planned_exports.push((
+            export_name.to_string(),
+            full_reg_name,
+            param_specs,
+            ret_ty.to_string(),
+            purity,
+            req_cap,
+            export_raw.deterministic,
+            fn_ptr,
+        ));
+    }
+
+    // Register all exports into the VM
+    for (export_name, full_name, params, ret_ty, purity, req_cap, deterministic, fn_ptr) in planned_exports {
+        let mut effect_spec = if purity == NativePurity::Pure {
+            NativeEffectSpec::pure()
+        } else {
+            NativeEffectSpec::effectful(None::<String>, Vec::new())
+        };
+        if let Some(cap) = req_cap {
+            effect_spec = effect_spec.with_capability(cap);
+        }
+        effect_spec.deterministic = deterministic;
+
+        let export_meta = NativeExport::new(full_name.clone(), params.clone(), ret_ty.clone())
+            .with_effects(effect_spec);
+
+        let lib_holder = Arc::clone(&lib_arc);
+        let fn_name_for_err = export_name.clone();
+        let expected_params_count = params.len();
+
+        let native_callback = move |args: &[Value]| -> Result<NativeCallResult, String> {
+            let _keep_alive = &lib_holder; // Retains dylib as long as this callback can run
+            if expected_params_count > 0 && args.len() != expected_params_count {
+                return Err(format!(
+                    "Native '{}' expects {} arguments, got {}",
+                    fn_name_for_err,
+                    expected_params_count,
+                    args.len()
+                ));
+            }
+
+            // Convert arguments to LustExtVal
+            let mut ext_args = Vec::with_capacity(args.len());
+            let mut cstring_keeper = Vec::new();
+
+            for arg in args {
+                match arg {
+                    Value::Nil => ext_args.push(LustExtVal {
+                        tag: LustExtValTag::Nil,
+                        payload: LustExtValPayload { int_val: 0 },
+                    }),
+                    Value::Bool(b) => ext_args.push(LustExtVal {
+                        tag: LustExtValTag::Bool,
+                        payload: LustExtValPayload { bool_val: *b },
+                    }),
+                    Value::Int(i) => ext_args.push(LustExtVal {
+                        tag: LustExtValTag::Int,
+                        payload: LustExtValPayload { int_val: *i },
+                    }),
+                    Value::Float(f) => ext_args.push(LustExtVal {
+                        tag: LustExtValTag::Float,
+                        payload: LustExtValPayload { float_val: *f },
+                    }),
+                    Value::String(s) => {
+                        let cstr = std::ffi::CString::new(s.as_str())
+                            .map_err(|e| format!("Invalid string argument in native call: {e}"))?;
+                        let ptr = cstr.as_ptr();
+                        cstring_keeper.push(cstr);
+                        ext_args.push(LustExtVal {
+                            tag: LustExtValTag::String,
+                            payload: LustExtValPayload { str_val: ptr },
+                        });
+                    }
+                    other => {
+                        return Err(format!(
+                            "UnsupportedArgumentType: value of type '{:?}' is not supported across narrow C ABI; unsupported operations fail closed",
+                            other.type_of()
+                        ));
+                    }
+                }
+            }
+
+            let mut out_val = LustExtVal {
+                tag: LustExtValTag::Nil,
+                payload: LustExtValPayload { int_val: 0 },
+            };
+
+            let current_vm = crate::vm::current_vm_ptr().ok_or_else(|| {
+                "No active VM context; native call must execute within VM execution context".to_string()
+            })?;
+
+            let host_v1 = LustExtHostV1 {
+                abi_version: EXPECTED_LUST_EXT_ABI_VERSION,
+                struct_size: core::mem::size_of::<LustExtHostV1>() as u32,
+                vm_or_runtime_ptr: current_vm as *mut core::ffi::c_void,
+                charge_gas: vm_host_charge_gas,
+                check_interrupt: vm_host_check_interrupt,
+                try_reserve_memory: vm_host_try_reserve_memory,
+                commit_memory: vm_host_commit_memory,
+                rollback_memory: vm_host_rollback_memory,
+                acquire_resource: vm_host_acquire_resource,
+                release_resource: vm_host_release_resource,
+                host_alloc_value_bytes: vm_host_alloc_value_bytes,
+                host_free_value_bytes: vm_host_free_value_bytes,
+            };
+
+            let rc = unsafe {
+                fn_ptr(
+                    &host_v1,
+                    ext_args.as_ptr(),
+                    ext_args.len(),
+                    &mut out_val,
+                )
+            };
+
+            match rc {
+                0 => { // OK
+                    let res_val = match out_val.tag {
+                        LustExtValTag::Nil => Value::Nil,
+                        LustExtValTag::Bool => Value::Bool(unsafe { out_val.payload.bool_val }),
+                        LustExtValTag::Int => Value::Int(unsafe { out_val.payload.int_val }),
+                        LustExtValTag::Float => Value::Float(unsafe { out_val.payload.float_val }),
+                        LustExtValTag::String => {
+                            let ptr = unsafe { out_val.payload.str_val };
+                            if ptr.is_null() {
+                                Value::Nil
+                            } else {
+                                let s = unsafe { std::ffi::CStr::from_ptr(ptr) }
+                                    .to_str()
+                                    .map_err(|e| format!("Invalid UTF-8 in native return string: {e}"))?;
+                                Value::String(Rc::new(s.to_string()))
+                            }
+                        }
+                        LustExtValTag::Handle => {
+                            let handle = unsafe { out_val.payload.handle_val };
+                            Value::Int(handle as i64)
+                        }
+                    };
+                    Ok(NativeCallResult::Return(res_val))
+                }
+                2 => Err("Out of gas".to_string()),
+                3 => Err("Out of memory budget".to_string()),
+                4 => Err("Interrupted".to_string()),
+                7 => Err(format!("Capability denied for '{}'", fn_name_for_err)),
+                8 => Err(format!("Native '{}' panicked", fn_name_for_err)),
+                code => Err(format!("Native '{}' failed with status code {code}", fn_name_for_err)),
+            }
+        };
+
+        vm.register_exported_native(export_meta, native_callback);
+
+        if export_name != full_name {
+            if let Some(val) = vm.get_global(&full_name) {
+                vm.register_native(export_name.clone(), val);
+            }
         }
     }
+
     Ok(LoadedRustModule {
         name: build.name.clone(),
+        library: lib_arc,
     })
 }
 
@@ -395,6 +1261,93 @@ pub fn write_stub_files(
     }
 
     Ok(written)
+}
+
+pub fn verify_external_library(path: &Path, allow_ffi: bool) -> Result<(), LocalModuleError> {
+    if !allow_ffi {
+        return Err(LocalModuleError::CapabilityDenied(
+            "external library linking requires 'ffi' capability".to_string(),
+        ));
+    }
+    if !path.exists() {
+        return Err(LocalModuleError::MissingExternalLibrary(path.to_path_buf()));
+    }
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    if ext == "dylib" || ext == "so" || ext == "dll" {
+        let _ = load_and_verify_extension(path)?;
+    }
+    Ok(())
+}
+
+pub fn build_and_prepare_external_crate(
+    crate_dir: &Path,
+    allow_ffi: bool,
+    target_triple: Option<&str>,
+    is_release: bool,
+) -> Result<LocalBuildOutput, LocalModuleError> {
+    if !allow_ffi {
+        return Err(LocalModuleError::CapabilityDenied(
+            "external crate linking requires 'ffi' capability".to_string(),
+        ));
+    }
+    if !crate_dir.exists() || !crate_dir.join("Cargo.toml").exists() {
+        return Err(LocalModuleError::MissingExternalLibrary(crate_dir.to_path_buf()));
+    }
+    let crate_name = read_crate_name(crate_dir)?;
+    let mut cmd = Command::new("cargo");
+    if let Ok(rustup) = std::env::var("RUSTUP_HOME") {
+        cmd.env("RUSTUP_HOME", rustup);
+    }
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
+        cmd.env("CARGO_HOME", cargo_home);
+    }
+    cmd.arg("build").arg("--offline");
+    if is_release {
+        cmd.arg("--release");
+    }
+    if let Some(target) = target_triple {
+        cmd.arg("--target").arg(target);
+    }
+    cmd.current_dir(crate_dir);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let output = cmd.output()?;
+    if !output.status.success() {
+        let mut msg = String::new();
+        if !output.stdout.is_empty() {
+            msg.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+        if !output.stderr.is_empty() {
+            if !msg.is_empty() {
+                msg.push('\n');
+            }
+            msg.push_str(&String::from_utf8_lossy(&output.stderr));
+        }
+        return Err(LocalModuleError::CargoBuild {
+            module: crate_name,
+            status: output.status,
+            output: msg,
+        });
+    }
+
+    let profile = if is_release { "release" } else { "debug" };
+    let lib_name = library_file_name(&crate_name);
+    let target_dir = crate_dir.join("target");
+    let artifact = if let Some(target) = target_triple {
+        target_dir.join(target).join(profile).join(&lib_name)
+    } else {
+        target_dir.join(profile).join(&lib_name)
+    };
+
+    if !artifact.exists() {
+        return Err(LocalModuleError::LibraryMissing(artifact));
+    }
+
+    verify_external_library(&artifact, allow_ffi)?;
+
+    Ok(LocalBuildOutput {
+        name: crate_name,
+        library_path: artifact,
+    })
 }
 
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
@@ -543,6 +1496,7 @@ fn library_cache() -> &'static Mutex<HashMap<PathBuf, &'static Library>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[allow(dead_code)]
 fn get_or_load_library(path: &Path) -> Result<&'static Library, LocalModuleError> {
     {
         let cache = library_cache().lock().unwrap();

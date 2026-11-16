@@ -459,6 +459,118 @@ impl TypeChecker {
         }
     }
 
+    fn check_lust_handle(
+        &mut self,
+        span: Span,
+        args: &[Expr],
+        expected_type: Option<&Type>,
+    ) -> Result<Type> {
+        if args.len() != 2 {
+            return Err(self.type_error_at(
+                "__lust_handle expects exactly 2 arguments (body, arms)".to_string(),
+                span,
+            ));
+        }
+
+        let body_thunk_type = self.check_expr(&args[0])?;
+        let body_ret_type = match &body_thunk_type.kind {
+            TypeKind::Function { return_type, .. } => (**return_type).clone(),
+            TypeKind::Effect { success, .. } => (**success).clone(),
+            _ => Type::new(TypeKind::Unknown, span),
+        };
+
+        let arms_expr = &args[1];
+        let mut arm_return_types = Vec::new();
+        if let ExprKind::Array(tuples) = &arms_expr.kind {
+            for tuple in tuples {
+                if let ExprKind::Tuple(items) = &tuple.kind && items.len() == 2 {
+                    let arm_fn = &items[1];
+                    self.handler_arm_depth += 1;
+                    let arm_fn_type = self.check_expr(arm_fn)?;
+                    self.handler_arm_depth -= 1;
+                    if let TypeKind::Function { return_type, .. } = &arm_fn_type.kind {
+                        if !matches!(return_type.kind, TypeKind::Unit | TypeKind::Never | TypeKind::Infer | TypeKind::Unknown) {
+                            arm_return_types.push((**return_type).clone());
+                        }
+                    }
+                } else {
+                    self.handler_arm_depth += 1;
+                    self.check_expr(tuple)?;
+                    self.handler_arm_depth -= 1;
+                }
+            }
+        } else {
+            self.check_expr(arms_expr)?;
+        }
+
+        if !matches!(body_ret_type.kind, TypeKind::Unit | TypeKind::Never | TypeKind::Unknown | TypeKind::Infer) {
+            for arm_ret in &arm_return_types {
+                if !self.types_compatible(&body_ret_type, arm_ret) {
+                    return Err(self.type_error_at(
+                        format!(
+                            "Effect handler arm return type '{}' is incompatible with handle body return type '{}'",
+                            arm_ret, body_ret_type
+                        ),
+                        span,
+                    ));
+                }
+            }
+        }
+
+        if let Some(exp) = expected_type {
+            if !matches!(body_ret_type.kind, TypeKind::Unknown | TypeKind::Infer) {
+                self.unify(exp, &body_ret_type)?;
+            }
+            Ok(exp.clone())
+        } else {
+            Ok(body_ret_type)
+        }
+    }
+
+    fn check_lust_perform(
+        &mut self,
+        span: Span,
+        args: &[Expr],
+        expected_type: Option<&Type>,
+    ) -> Result<Type> {
+        if args.is_empty() {
+            return Err(self.type_error_at(
+                "__lust_perform expects effect name and arguments".to_string(),
+                span,
+            ));
+        }
+        for arg in args {
+            self.check_expr(arg)?;
+        }
+        if let Some(exp) = expected_type {
+            Ok(exp.clone())
+        } else {
+            Ok(Type::new(TypeKind::Infer, span))
+        }
+    }
+
+    fn check_lust_resume(
+        &mut self,
+        span: Span,
+        args: &[Expr],
+        _expected_type: Option<&Type>,
+    ) -> Result<Type> {
+        if args.len() != 1 {
+            return Err(self.type_error_at(
+                "'resume' requires exactly 1 argument".to_string(),
+                span,
+            ));
+        }
+        if self.handler_arm_depth == 0 {
+            return Err(self.type_error_at(
+                "'resume' called outside of an active effect handler arm".to_string(),
+                span,
+            ));
+        }
+        self.check_expr(&args[0])?;
+        Ok(Type::new(TypeKind::Unit, span))
+    }
+
     pub fn check_call_expr(
         &mut self,
         span: Span,
@@ -467,6 +579,17 @@ impl TypeChecker {
         args: &[Expr],
         expected_type: Option<&Type>,
     ) -> Result<Type> {
+        if let ExprKind::Identifier(fn_name) = &callee.kind {
+            if fn_name == "__lust_handle" {
+                return self.check_lust_handle(span, args, expected_type);
+            }
+            if fn_name == "__lust_perform" {
+                return self.check_lust_perform(span, args, expected_type);
+            }
+            if fn_name == "__lust_resume" {
+                return self.check_lust_resume(span, args, expected_type);
+            }
+        }
         if let ExprKind::FieldAccess { object, field } = &callee.kind {
             if let Ok(ty) = self.check_expr(object) {
                 if matches!(

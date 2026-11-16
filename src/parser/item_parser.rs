@@ -192,6 +192,9 @@ impl Parser {
                     TokenKind::End
                 };
                 while !self.check(terminator) && !self.is_at_end() {
+                    if self.match_token(&[TokenKind::Semicolon]) {
+                        continue;
+                    }
                     self.collect_pending_docs();
                     let mut item_doc = self.take_pending_docs();
                     if item_doc.is_none() {

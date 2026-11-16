@@ -44,6 +44,7 @@ pub struct TypeChecker {
     current_function_return_spec: Option<crate::ast::ReturnSpec>,
     effect_block_stack: Vec<EffectBlockContext>,
     pub(crate) current_function_name: Option<String>,
+    pub(crate) handler_arm_depth: usize,
 }
 
 pub fn normalize_requirements(reqs: &[Type]) -> Vec<Type> {
@@ -111,6 +112,7 @@ impl TypeChecker {
             current_function_return_spec: None,
             effect_block_stack: Vec::new(),
             current_function_name: None,
+            handler_arm_depth: 0,
         }
     }
 

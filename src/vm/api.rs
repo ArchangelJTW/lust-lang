@@ -333,6 +333,8 @@ impl VM {
         for (name, func) in super::stdlib::create_stdlib(config, &vm) {
             vm.register_native(name, func);
         }
+        #[cfg(feature = "std")]
+        crate::stdlib::coord::register_builtins(&mut vm);
         super::channel::register_builtins(&mut vm);
         vm.register_jit_intrinsics();
 
@@ -1155,27 +1157,31 @@ impl VM {
     }
 
     pub fn call(&mut self, function_name: &str, args: Vec<Value>) -> Result<Value> {
-        if let Some(func_idx) = self.functions.iter().position(|f| f.name == function_name) {
-            return self.call_function_index(func_idx, args);
-        }
-        if let Some(val) = self.natives.get(function_name).cloned().or_else(|| self.globals.get(function_name).cloned()) {
-            return self.call_value(&val, args);
-        }
-        Err(LustError::RuntimeError {
-            message: format!("Function not found: {}", function_name),
-        })
+        let res = if let Some(func_idx) = self.functions.iter().position(|f| f.name == function_name) {
+            self.call_function_index(func_idx, args)
+        } else if let Some(val) = self.natives.get(function_name).cloned().or_else(|| self.globals.get(function_name).cloned()) {
+            self.call_value(&val, args)
+        } else {
+            Err(LustError::RuntimeError {
+                message: format!("Function not found: {}", function_name),
+            })
+        };
+        let _ = self.run_finalizers_down_to(0);
+        res
     }
 
     pub fn call_slice(&mut self, function_name: &str, args: &[Value]) -> Result<Value> {
-        if let Some(func_idx) = self.functions.iter().position(|f| f.name == function_name) {
-            return self.call_function_index_slice(func_idx, args);
-        }
-        if let Some(val) = self.natives.get(function_name).cloned().or_else(|| self.globals.get(function_name).cloned()) {
-            return self.call_value(&val, args.to_vec());
-        }
-        Err(LustError::RuntimeError {
-            message: format!("Function not found: {}", function_name),
-        })
+        let res = if let Some(func_idx) = self.functions.iter().position(|f| f.name == function_name) {
+            self.call_function_index_slice(func_idx, args)
+        } else if let Some(val) = self.natives.get(function_name).cloned().or_else(|| self.globals.get(function_name).cloned()) {
+            self.call_value(&val, args.to_vec())
+        } else {
+            Err(LustError::RuntimeError {
+                message: format!("Function not found: {}", function_name),
+            })
+        };
+        let _ = self.run_finalizers_down_to(0);
+        res
     }
 
     pub(crate) fn functions(&self) -> &[Function] {

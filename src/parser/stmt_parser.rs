@@ -9,9 +9,11 @@ use alloc::{boxed::Box, vec, vec::Vec};
 impl Parser {
     #[inline(never)]
     pub(super) fn parse_stmt(&mut self) -> Result<Stmt> {
+        while self.match_token(&[TokenKind::Semicolon]) {}
         while self.check(TokenKind::DocComment) {
             self.advance();
         }
+        while self.match_token(&[TokenKind::Semicolon]) {}
         let start_token = self.current_token().clone();
 
         #[cfg(feature = "esp32c6-logging")]
@@ -22,7 +24,7 @@ impl Parser {
         );
 
         let kind = match self.peek_kind() {
-            TokenKind::Local => {
+            k if k == TokenKind::Local || (k == TokenKind::Identifier && self.current_token().lexeme == "let") => {
                 self.advance();
                 let mut bindings = Vec::new();
                 loop {
@@ -316,6 +318,7 @@ impl Parser {
                 }
             }
         };
+        self.match_token(&[TokenKind::Semicolon]);
         let end_token = self.tokens[self.current - 1].clone();
         Ok(Stmt::new(kind, self.make_span(&start_token, &end_token)))
     }

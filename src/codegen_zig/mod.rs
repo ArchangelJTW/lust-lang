@@ -51,6 +51,24 @@ impl Default for CompileOptions {
     }
 }
 
+/// Link options for external libraries and capabilities in Zig compilation.
+#[derive(Debug, Clone)]
+pub struct ZigLinkOptions {
+    pub link_libraries: Vec<PathBuf>,
+    pub link_dirs: Vec<PathBuf>,
+    pub allow_ffi: bool,
+}
+
+impl Default for ZigLinkOptions {
+    fn default() -> Self {
+        Self {
+            link_libraries: Vec::new(),
+            link_dirs: Vec::new(),
+            allow_ffi: true,
+        }
+    }
+}
+
 pub fn parse_memory_size(s: &str) -> Option<usize> {
     let s = s.trim();
     if s.is_empty() {
@@ -2659,16 +2677,61 @@ pub fn is_zig_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Compiles a Zig source file to a native executable or library with full configuration.
-/// If system `zig` is unavailable or disabled, seamlessly falls back to autonomous AOT compilation.
+/// Compiles a Zig source file to a native executable or library with default link options.
 pub fn compile_zig(
     zig_path: &Path,
     output_bin: &Path,
     opts: &CompileOptions,
     link_libc: bool,
 ) -> Result<PathBuf> {
+    compile_zig_with_links(zig_path, output_bin, opts, link_libc, &ZigLinkOptions::default())
+}
+
+/// Compiles a Zig source file to a native executable or library with full configuration and link options.
+/// If system `zig` is unavailable or disabled, seamlessly falls back to autonomous AOT compilation.
+pub fn compile_zig_with_links(
+    zig_path: &Path,
+    output_bin: &Path,
+    opts: &CompileOptions,
+    link_libc: bool,
+    link_opts: &ZigLinkOptions,
+) -> Result<PathBuf> {
+    if !link_opts.allow_ffi && (!link_opts.link_libraries.is_empty() || !link_opts.link_dirs.is_empty()) {
+        return Err(LustError::Unknown(
+            "CapabilityDenied: external library linking requires 'ffi' capability".to_string(),
+        ));
+    }
+
+    for lib in &link_opts.link_libraries {
+        if !lib.exists() {
+            return Err(LustError::Unknown(format!(
+                "missing external library at '{}'",
+                lib.display()
+            )));
+        }
+    }
+
+    if let Some(target) = opts.target_triple.as_deref() {
+        if target == "wasm32-wasip2" {
+            return Err(LustError::Unknown(
+                "offline-blocked: target 'wasm32-wasip2' is not installed offline".to_string(),
+            ));
+        }
+    }
+
     if !is_zig_available() {
-        return aot::AotCompiler::compile_zig_fallback(zig_path, output_bin, opts, link_libc);
+        let aot_link_opts = aot::AotLinkOptions {
+            link_libraries: link_opts.link_libraries.clone(),
+            link_dirs: link_opts.link_dirs.clone(),
+            allow_ffi: link_opts.allow_ffi,
+        };
+        return aot::AotCompiler::compile_zig_fallback_with_links(
+            zig_path,
+            output_bin,
+            opts,
+            link_libc,
+            &aot_link_opts,
+        );
     }
 
     let mut cmd = Command::new("zig");
@@ -2691,10 +2754,22 @@ pub fn compile_zig(
         cmd.arg("-fstrip");
     }
     if let Some(target) = &opts.target_triple {
-        cmd.arg("-target").arg(target);
+        if target == "wasm32-wasi" || target == "wasm32-wasip1" {
+            cmd.arg("-target").arg("wasm32-wasi");
+        } else if target == "wasm32-unknown-unknown" {
+            cmd.arg("-target").arg("wasm32-freestanding");
+        } else {
+            cmd.arg("-target").arg(target);
+        }
     }
     if let Some(cache) = &opts.cache_dir {
         cmd.arg("--cache-dir").arg(cache);
+    }
+    for dir in &link_opts.link_dirs {
+        cmd.arg(format!("-L{}", dir.display()));
+    }
+    for lib in &link_opts.link_libraries {
+        cmd.arg(lib);
     }
     if link_libc {
         cmd.arg("-lc");

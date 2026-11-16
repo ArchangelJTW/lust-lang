@@ -42,6 +42,24 @@ impl Default for AotCompileOptions {
     }
 }
 
+/// Link options for external libraries and capabilities in AOT compilation.
+#[derive(Debug, Clone)]
+pub struct AotLinkOptions {
+    pub link_libraries: Vec<PathBuf>,
+    pub link_dirs: Vec<PathBuf>,
+    pub allow_ffi: bool,
+}
+
+impl Default for AotLinkOptions {
+    fn default() -> Self {
+        Self {
+            link_libraries: Vec::new(),
+            link_dirs: Vec::new(),
+            allow_ffi: true,
+        }
+    }
+}
+
 /// Autonomous AOT Compiler: Produces native release binaries without requiring system `zig`.
 pub struct AotCompiler;
 
@@ -51,6 +69,16 @@ impl AotCompiler {
         module: &MirModule,
         output_bin: &Path,
         opts: &AotCompileOptions,
+    ) -> Result<PathBuf> {
+        Self::compile_module_with_links(module, output_bin, opts, &AotLinkOptions::default())
+    }
+
+    /// Compiles a MIR module with external link options.
+    pub fn compile_module_with_links(
+        module: &MirModule,
+        output_bin: &Path,
+        opts: &AotCompileOptions,
+        links: &AotLinkOptions,
     ) -> Result<PathBuf> {
         let mut opt_module = module.clone();
 
@@ -65,7 +93,7 @@ impl AotCompiler {
         let c_source = emit_c_from_mir(&opt_module, &emitter_opts);
 
         // 3. Compile C code with host C compiler
-        compile_c_source(&c_source, output_bin, opts)
+        compile_c_source(&c_source, output_bin, opts, links)
     }
 
     /// Compiles Lust source code string into a native machine-code binary.
@@ -73,6 +101,16 @@ impl AotCompiler {
         source: &str,
         output_bin: &Path,
         opts: &AotCompileOptions,
+    ) -> Result<PathBuf> {
+        Self::compile_source_with_links(source, output_bin, opts, &AotLinkOptions::default())
+    }
+
+    /// Compiles Lust source code string with external link options.
+    pub fn compile_source_with_links(
+        source: &str,
+        output_bin: &Path,
+        opts: &AotCompileOptions,
+        links: &AotLinkOptions,
     ) -> Result<PathBuf> {
         let mut interner = Interner::new();
         let tokens = Lexer::new(source, &mut interner)
@@ -86,7 +124,7 @@ impl AotCompiler {
         let module = AstLowering::lower_module_items("main_module", &prepared_items)
             .map_err(|e| LustError::Unknown(format!("MIR lowering error: {e}")))?;
 
-        Self::compile_module(&module, output_bin, opts)
+        Self::compile_module_with_links(&module, output_bin, opts, links)
     }
 
     /// Compiles a `.lust` source file on disk into a native binary.
@@ -95,9 +133,19 @@ impl AotCompiler {
         output_bin: &Path,
         opts: &AotCompileOptions,
     ) -> Result<PathBuf> {
+        Self::compile_file_with_links(source_path, output_bin, opts, &AotLinkOptions::default())
+    }
+
+    /// Compiles a `.lust` source file on disk with external link options.
+    pub fn compile_file_with_links(
+        source_path: &Path,
+        output_bin: &Path,
+        opts: &AotCompileOptions,
+        links: &AotLinkOptions,
+    ) -> Result<PathBuf> {
         let source = fs::read_to_string(source_path)
             .map_err(|e| LustError::Unknown(format!("Failed to read {}: {e}", source_path.display())))?;
-        Self::compile_source(&source, output_bin, opts)
+        Self::compile_source_with_links(&source, output_bin, opts, links)
     }
 
     /// Fallback invoked when system `zig` is unavailable or disabled.
@@ -105,7 +153,24 @@ impl AotCompiler {
         zig_path: &Path,
         output_bin: &Path,
         opts: &crate::codegen_zig::CompileOptions,
+        link_libc: bool,
+    ) -> Result<PathBuf> {
+        Self::compile_zig_fallback_with_links(
+            zig_path,
+            output_bin,
+            opts,
+            link_libc,
+            &AotLinkOptions::default(),
+        )
+    }
+
+    /// Fallback invoked when system `zig` is unavailable or disabled, passing link options.
+    pub fn compile_zig_fallback_with_links(
+        zig_path: &Path,
+        output_bin: &Path,
+        opts: &crate::codegen_zig::CompileOptions,
         _link_libc: bool,
+        links: &AotLinkOptions,
     ) -> Result<PathBuf> {
         let aot_opts = AotCompileOptions {
             target_kind: match opts.target_kind {
@@ -122,14 +187,14 @@ impl AotCompiler {
         // Try to find original .lust file beside the .zig file
         let lust_path = zig_path.with_extension("lust");
         if lust_path.exists() {
-            return Self::compile_file(&lust_path, output_bin, &aot_opts);
+            return Self::compile_file_with_links(&lust_path, output_bin, &aot_opts, links);
         }
 
         // Try to extract embedded source from the .zig file
         if zig_path.exists() {
             if let Ok(zig_content) = fs::read_to_string(zig_path) {
                 if let Some(source) = extract_embedded_lust_source(&zig_content) {
-                    return Self::compile_source(&source, output_bin, &aot_opts);
+                    return Self::compile_source_with_links(&source, output_bin, &aot_opts, links);
                 }
             }
         }
@@ -142,7 +207,7 @@ impl AotCompiler {
 }
 
 /// If script has top-level script statements, wrap them into `main` function for MIR lowering.
-fn prepare_items_for_mir(items: &[Item]) -> Vec<Item> {
+pub fn prepare_items_for_mir(items: &[Item]) -> Vec<Item> {
     let mut prepared = Vec::new();
     let mut script_stmts = Vec::new();
     let mut has_main = false;
@@ -231,6 +296,7 @@ fn compile_c_source(
     c_source: &str,
     output_bin: &Path,
     opts: &AotCompileOptions,
+    links: &AotLinkOptions,
 ) -> Result<PathBuf> {
     let temp_dir = tempfile::tempdir()
         .map_err(|e| LustError::Unknown(format!("Failed to create tempdir: {e}")))?;
@@ -246,7 +312,28 @@ fn compile_c_source(
         LustError::Unknown("No host C compiler found (cc, clang, gcc)".into())
     })?;
 
+    if !links.allow_ffi && (!links.link_libraries.is_empty() || !links.link_dirs.is_empty()) {
+        return Err(LustError::Unknown(
+            "CapabilityDenied: external library linking requires 'ffi' capability".to_string(),
+        ));
+    }
+    for lib in &links.link_libraries {
+        if !lib.exists() {
+            return Err(LustError::Unknown(format!(
+                "missing external library at '{}'",
+                lib.display()
+            )));
+        }
+    }
+
     let mut cmd = Command::new(&cc);
+
+    for dir in &links.link_dirs {
+        cmd.arg(format!("-L{}", dir.display()));
+    }
+    for lib in &links.link_libraries {
+        cmd.arg(lib);
+    }
 
     // Release mode optimization flags
     if opts.release_mode.starts_with("Release") || opts.release_mode == "release" {

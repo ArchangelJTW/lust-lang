@@ -51,7 +51,10 @@ pub use self::api::{
     NativeEffectSpec, NativeExport, NativeExportParam, NativeGasPolicy, NativeMemoryPolicy,
     NativePurity,
 };
-pub use self::execution::{MUTATION_M1_EXECUTION_COUNT, MUTATION_M1_SKIP_GAS, MutationM1Guard};
+pub use self::execution::{
+    register_effect_finalizer, reset_effect_handler_state, MUTATION_M1_EXECUTION_COUNT,
+    MUTATION_M1_SKIP_GAS, MutationM1Guard,
+};
 pub use self::tasks::{
     MUTATION_M2_EXECUTION_COUNT, MUTATION_M2_SKIP_PANIC_FINALIZER, MutationM2Guard,
 };

@@ -49,6 +49,48 @@ fn main() {
         process::exit(1);
     }
 
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+    if let Some(pos) = args.iter().position(|a| a == "--test-load-extension" || a.starts_with("--test-load-extension=")) {
+        let dylib_path = if args[pos] == "--test-load-extension" {
+            if pos + 1 < args.len() {
+                PathBuf::from(&args[pos + 1])
+            } else {
+                eprintln!("Error: IncompatibleAbiVersion: --test-load-extension requires a path argument");
+                process::exit(1);
+            }
+        } else {
+            PathBuf::from(args[pos].strip_prefix("--test-load-extension=").unwrap())
+        };
+
+        let canary_path = if let Some(cpos) = args.iter().position(|a| a == "--host-canary-path" || a.starts_with("--host-canary-path=")) {
+            if args[cpos] == "--host-canary-path" {
+                if cpos + 1 < args.len() {
+                    Some(PathBuf::from(&args[cpos + 1]))
+                } else {
+                    eprintln!("Error: IncompatibleAbiVersion: --host-canary-path requires a path argument");
+                    process::exit(1);
+                }
+            } else {
+                Some(PathBuf::from(args[cpos].strip_prefix("--host-canary-path=").unwrap()))
+            }
+        } else {
+            None
+        };
+
+        match lust::packages::test_load_extension_cli(&dylib_path, canary_path.as_deref()) {
+            Ok(()) => process::exit(0),
+            Err(err) => {
+                eprintln!("Error: {err}");
+                process::exit(1);
+            }
+        }
+    }
+
+    if args.iter().any(|a| a == "--test-hang-probe") {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        process::exit(0);
+    }
+
     // Collect all paths from --transpile / --tr flags before dispatching.
     // Each flag consumes subsequent non-flag arguments as paths, so both
     //   lust --transpile .
@@ -1548,8 +1590,13 @@ fn build_command(args: &[String]) {
     let mut backend = "zig".to_string();
     let mut output_bin = None;
     let mut emit_zig = false;
+    let mut emit_c = false;
     let mut emit_header_requested = false;
     let mut opts = lust::codegen_zig::CompileOptions::default();
+    let mut link_libraries: Vec<PathBuf> = Vec::new();
+    let mut link_dirs: Vec<PathBuf> = Vec::new();
+    let mut allow_ffi = true;
+    let mut link_crates: Vec<PathBuf> = Vec::new();
     let mut json_diag = env::var("LUST_ERROR_FORMAT")
         .map(|v| v.eq_ignore_ascii_case("json"))
         .unwrap_or(false)
@@ -1663,6 +1710,55 @@ fn build_command(args: &[String]) {
                 };
                 opts.cache_dir = Some(PathBuf::from(val));
             }
+            "--emit-c" => {
+                emit_c = true;
+            }
+            "--deny-ffi" | "--pure" => {
+                allow_ffi = false;
+            }
+            "--allow-ffi" => {
+                allow_ffi = true;
+            }
+            "--link" | "--link-lib" | "-l" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --link requires a library path or name");
+                    process::exit(1);
+                };
+                link_libraries.push(PathBuf::from(val));
+            }
+            opt if opt.starts_with("--link=") => {
+                let val = opt.strip_prefix("--link=").unwrap();
+                link_libraries.push(PathBuf::from(val));
+            }
+            opt if opt.starts_with("--link-lib=") => {
+                let val = opt.strip_prefix("--link-lib=").unwrap();
+                link_libraries.push(PathBuf::from(val));
+            }
+            "--link-crate" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --link-crate requires a crate directory");
+                    process::exit(1);
+                };
+                link_crates.push(PathBuf::from(val));
+            }
+            opt if opt.starts_with("--link-crate=") => {
+                let val = opt.strip_prefix("--link-crate=").unwrap();
+                link_crates.push(PathBuf::from(val));
+            }
+            "--link-dir" | "-L" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --link-dir requires a directory path");
+                    process::exit(1);
+                };
+                link_dirs.push(PathBuf::from(val));
+            }
+            opt if opt.starts_with("--link-dir=") => {
+                let val = opt.strip_prefix("--link-dir=").unwrap();
+                link_dirs.push(PathBuf::from(val));
+            }
             opt if opt.starts_with('-') => {
                 eprintln!("Error: unknown option '{opt}'");
                 process::exit(1);
@@ -1684,6 +1780,11 @@ fn build_command(args: &[String]) {
         process::exit(1);
     };
 
+    if opts.target_triple.as_deref() == Some("wasm32-wasip2") {
+        eprintln!("offline-blocked: target 'wasm32-wasip2' is not installed offline");
+        process::exit(1);
+    }
+
     match backend.to_ascii_lowercase().as_str() {
         "zig" | "mir-zig" | "mir" => {}
         other => {
@@ -1696,6 +1797,58 @@ fn build_command(args: &[String]) {
     }
 
     let entry_path = PathBuf::from(&entry_arg);
+    let project_dir = entry_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut config = lust::config::LustConfig::load_for_entry(&entry_path).unwrap_or_default();
+    if !allow_ffi {
+        config.capability_mask_mut().allow_ffi = false;
+    } else {
+        allow_ffi = config.capability_mask().allow_ffi;
+    }
+
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+    {
+        if !config.dependencies().is_empty() {
+            if let Ok(dep_res) = resolve_dependencies(&config, project_dir) {
+                if let Ok(prepared) = prepare_rust_dependencies(&dep_res, project_dir) {
+                    for dep in prepared {
+                        link_libraries.push(dep.build.library_path);
+                    }
+                }
+            }
+        }
+    }
+
+    if !allow_ffi && (!link_libraries.is_empty() || !link_dirs.is_empty() || !link_crates.is_empty()) {
+        eprintln!("Error: CapabilityDenied: external library linking requires 'ffi' capability");
+        process::exit(1);
+    }
+
+    #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
+    {
+        for crate_dir in &link_crates {
+            match lust::packages::build_and_prepare_external_crate(
+                crate_dir,
+                allow_ffi,
+                opts.target_triple.as_deref(),
+                opts.release_mode.starts_with("Release"),
+            ) {
+                Ok(out) => {
+                    link_libraries.push(out.library_path);
+                }
+                Err(err) => {
+                    eprintln!("Error: {}", err);
+                    process::exit(1);
+                }
+            }
+        }
+
+        for lib_path in &link_libraries {
+            if let Err(err) = lust::packages::verify_external_library(lib_path, allow_ffi) {
+                eprintln!("Error: {}", err);
+                process::exit(1);
+            }
+        }
+    }
     if emit_header_requested && opts.emit_header.is_none() {
         opts.emit_header = Some(entry_path.with_extension("h"));
     }
@@ -1730,6 +1883,110 @@ fn build_command(args: &[String]) {
         all_items
     };
 
+    let stem = entry_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+
+    let is_wasm = opts
+        .target_triple
+        .as_ref()
+        .map(|t| t.contains("wasm32"))
+        .unwrap_or(false);
+
+    let default_extension = if is_wasm {
+        "wasm"
+    } else {
+        match opts.target_kind {
+            lust::codegen_zig::BuildTargetKind::Executable => "",
+            lust::codegen_zig::BuildTargetKind::SharedLibrary => {
+                if cfg!(target_os = "macos") {
+                    "dylib"
+                } else if cfg!(target_os = "windows") {
+                    "dll"
+                } else {
+                    "so"
+                }
+            }
+            lust::codegen_zig::BuildTargetKind::StaticLibrary => {
+                if cfg!(target_os = "windows") {
+                    "lib"
+                } else {
+                    "a"
+                }
+            }
+        }
+    };
+
+    let target_bin = output_bin.unwrap_or_else(|| {
+        let parent = entry_path.parent().unwrap_or_else(|| Path::new("."));
+        if default_extension.is_empty() {
+            parent.join(stem)
+        } else {
+            parent.join(format!("{}.{}", stem, default_extension))
+        }
+    });
+
+    if backend.to_ascii_lowercase() == "mir" {
+        let prepared_items = lust::codegen_zig::aot::prepare_items_for_mir(&filtered_items);
+        let mir_module = match lust::mir::lowering::AstLowering::lower_module_items("main_module", &prepared_items) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("MIR lowering error: {}", e);
+                process::exit(1);
+            }
+        };
+
+        if emit_c {
+            let emitter_opts = lust::codegen_zig::aot::c_emitter::CEmitterOptions {
+                is_library,
+                max_memory_bytes: opts.max_memory_bytes,
+            };
+            let c_source = lust::codegen_zig::aot::c_emitter::emit_c_from_mir(&mir_module, &emitter_opts);
+            let c_file = entry_path.with_extension("c");
+            if let Err(e) = fs::write(&c_file, &c_source) {
+                eprintln!("Failed to write {}: {}", c_file.display(), e);
+                process::exit(1);
+            }
+            println!("Generated C source: {}", c_file.display());
+            return;
+        }
+
+        let aot_opts = lust::codegen_zig::aot::AotCompileOptions {
+            target_kind: match opts.target_kind {
+                lust::codegen_zig::BuildTargetKind::Executable => lust::codegen_zig::aot::AotTargetKind::Executable,
+                lust::codegen_zig::BuildTargetKind::SharedLibrary => lust::codegen_zig::aot::AotTargetKind::SharedLibrary,
+                lust::codegen_zig::BuildTargetKind::StaticLibrary => lust::codegen_zig::aot::AotTargetKind::StaticLibrary,
+            },
+            release_mode: opts.release_mode.clone(),
+            strip: opts.strip,
+            max_memory_bytes: opts.max_memory_bytes,
+            target_triple: opts.target_triple.clone(),
+        };
+
+        let aot_links = lust::codegen_zig::aot::AotLinkOptions {
+            link_libraries: link_libraries.clone(),
+            link_dirs: link_dirs.clone(),
+            allow_ffi,
+        };
+
+        match lust::codegen_zig::aot::AotCompiler::compile_module_with_links(
+            &mir_module,
+            &target_bin,
+            &aot_opts,
+            &aot_links,
+        ) {
+            Ok(bin) => {
+                println!("Successfully built AOT artifact: {}", bin.display());
+                return;
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        }
+    }
+
     let runtime_opts = lust::codegen_zig::analyze_runtime_requirements(
         &filtered_items,
         is_library,
@@ -1746,10 +2003,6 @@ fn build_command(args: &[String]) {
         }
     };
 
-    let stem = entry_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("output");
     let zig_file = entry_path.with_extension("zig");
     if let Err(e) = fs::write(&zig_file, &zig_source) {
         eprintln!("Failed to write {}: {}", zig_file.display(), e);
@@ -1770,35 +2023,19 @@ fn build_command(args: &[String]) {
         return;
     }
 
-    let default_extension = match opts.target_kind {
-        lust::codegen_zig::BuildTargetKind::Executable => "",
-        lust::codegen_zig::BuildTargetKind::SharedLibrary => {
-            if cfg!(target_os = "macos") {
-                "dylib"
-            } else if cfg!(target_os = "windows") {
-                "dll"
-            } else {
-                "so"
-            }
-        }
-        lust::codegen_zig::BuildTargetKind::StaticLibrary => {
-            if cfg!(target_os = "windows") {
-                "lib"
-            } else {
-                "a"
-            }
-        }
+    let zig_links = lust::codegen_zig::ZigLinkOptions {
+        link_libraries,
+        link_dirs,
+        allow_ffi,
     };
-    let target_bin = output_bin.unwrap_or_else(|| {
-        let parent = entry_path.parent().unwrap_or_else(|| Path::new("."));
-        if default_extension.is_empty() {
-            parent.join(stem)
-        } else {
-            parent.join(format!("{}.{}", stem, default_extension))
-        }
-    });
 
-    match lust::codegen_zig::compile_zig(&zig_file, &target_bin, &opts, link_libc) {
+    match lust::codegen_zig::compile_zig_with_links(
+        &zig_file,
+        &target_bin,
+        &opts,
+        link_libc,
+        &zig_links,
+    ) {
         Ok(bin) => {
             println!("Successfully built AOT artifact: {}", bin.display());
         }

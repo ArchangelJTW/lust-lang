@@ -472,7 +472,30 @@ impl Compiler {
         }
 
         self.scopes.push(scope);
-        for stmt in &func_def.body {
+        let has_value_return = func_def
+            .return_type
+            .as_ref()
+            .map_or(false, |t| !matches!(t.kind, TypeKind::Unit))
+            || func_def
+                .effects
+                .as_ref()
+                .and_then(|e| e.return_type.as_ref())
+                .map_or(false, |t| !matches!(t.kind, TypeKind::Unit));
+
+        let body_len = func_def.body.len();
+        for (i, stmt) in func_def.body.iter().enumerate() {
+            let is_last = i + 1 == body_len;
+            if is_last && has_value_return && matches!(&stmt.kind, StmtKind::Expr(_)) {
+                if let StmtKind::Expr(expr) = &stmt.kind {
+                    let ret_stmt = Stmt {
+                        kind: StmtKind::Return(vec![expr.clone()]),
+                        span: stmt.span.clone(),
+                    };
+                    self.compile_stmt(&ret_stmt)?;
+                    self.reset_temp_registers();
+                    continue;
+                }
+            }
             self.compile_stmt(stmt)?;
             self.reset_temp_registers();
         }

@@ -116,6 +116,7 @@ fn test_pure_math_array_no_bloat() {
             Some(Operand::Copy(Place::Local(LocalId(1)))),
             Span::dummy(),
         )),
+        is_cleanup: false,
     }];
 
     let mir_opts = ZigCompileOptions {

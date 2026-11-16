@@ -616,6 +616,14 @@ impl VM {
                             && let Some(pos) = self.functions.iter().position(|f| f.name == name)
                         {
                             self.set_register(dest, Value::Function(pos))?;
+                        } else if Self::is_effect_intrinsic(name) {
+                            self.set_register(
+                                dest,
+                                Value::String(alloc::rc::Rc::new(alloc::format!(
+                                    "__lust_effect_intrinsic:{}",
+                                    name
+                                ))),
+                            )?;
                         } else {
                             return Err(LustError::RuntimeError {
                                 message: format!("Undefined global: {}", name),
@@ -1090,6 +1098,15 @@ impl VM {
 
                 Instruction::Call(func_reg, first_arg, arg_count, dest_reg) => {
                     let func_value = self.get_register(func_reg)?.clone();
+                    if let Some(intrinsic_name) = Self::get_effect_intrinsic_name(&func_value) {
+                        let mut args = Vec::with_capacity(arg_count as usize);
+                        for i in 0..arg_count {
+                            args.push(self.get_register(first_arg + i)?.clone());
+                        }
+                        let result = self.dispatch_effect_intrinsic(&intrinsic_name, args)?;
+                        self.set_register(dest_reg, result)?;
+                        continue 'dispatch;
+                    }
                     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
                     let mut func_value = func_value;
                     // Check if this is a table/userdata with __call metamethod (Lua compat)
@@ -3249,6 +3266,10 @@ impl VM {
             return self.call_value(&callable, call_args);
         }
 
+        if let Some(intrinsic_name) = Self::get_effect_intrinsic_name(func) {
+            return self.dispatch_effect_intrinsic(&intrinsic_name, args);
+        }
+
         match func {
             #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             Value::Enum(object)
@@ -3428,4 +3449,439 @@ fn function_type_params(type_name: &str) -> Option<&str> {
 fn lua_socket_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("LUST_LUA_SOCKET_TRACE").is_some())
+}
+
+// =========================================================================
+// Track 3D (L-HANDLERS): Algebraic Effect Handlers & Deopt Continuation
+// =========================================================================
+
+#[derive(Debug, Clone)]
+pub struct EffectHandlerArm {
+    pub effect_name: String,
+    pub handler_fn: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct EffectHandlerFrame {
+    pub id: u64,
+    pub arms: Vec<EffectHandlerArm>,
+    pub active: bool,
+    pub finalizer_baseline: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumptionState {
+    pub handler_id: u64,
+    pub effect_name: String,
+    pub resumed: bool,
+    pub resume_value: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AbortPayload {
+    pub handler_id: u64,
+    pub value: Value,
+}
+
+pub enum EffectFinalizer {
+    Rust(Box<dyn FnOnce() + Send + 'static>),
+    Lust(Value),
+}
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    static EFFECT_HANDLER_STACK: std::cell::RefCell<Vec<EffectHandlerFrame>> = const { std::cell::RefCell::new(Vec::new()) };
+    static EFFECT_RESUMPTION_STACK: std::cell::RefCell<Vec<ResumptionState>> = const { std::cell::RefCell::new(Vec::new()) };
+    static EFFECT_ABORT_PAYLOAD: std::cell::RefCell<Option<AbortPayload>> = const { std::cell::RefCell::new(None) };
+    static EFFECT_FINALIZERS: std::cell::RefCell<Vec<EffectFinalizer>> = const { std::cell::RefCell::new(Vec::new()) };
+    static NEXT_EFFECT_HANDLER_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+pub fn register_effect_finalizer(f: impl FnOnce() + Send + 'static) {
+    #[cfg(feature = "std")]
+    EFFECT_FINALIZERS.with(|fins| {
+        fins.borrow_mut().push(EffectFinalizer::Rust(Box::new(f)));
+    });
+}
+
+pub fn get_effect_finalizer_count() -> usize {
+    #[cfg(feature = "std")]
+    {
+        EFFECT_FINALIZERS.with(|fins| fins.borrow().len())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        0
+    }
+}
+
+pub fn reset_effect_handler_state() {
+    #[cfg(feature = "std")]
+    {
+        EFFECT_HANDLER_STACK.with(|s| s.borrow_mut().clear());
+        EFFECT_RESUMPTION_STACK.with(|s| s.borrow_mut().clear());
+        EFFECT_ABORT_PAYLOAD.with(|s| *s.borrow_mut() = None);
+        EFFECT_FINALIZERS.with(|s| s.borrow_mut().clear());
+    }
+}
+
+impl VM {
+    pub fn run_finalizers_down_to(&mut self, target_depth: usize) -> Result<()> {
+        #[cfg(feature = "std")]
+        {
+            loop {
+                let maybe_fin = EFFECT_FINALIZERS.with(|fins| {
+                    let mut b = fins.borrow_mut();
+                    if b.len() > target_depth {
+                        b.pop()
+                    } else {
+                        None
+                    }
+                });
+                let Some(fin) = maybe_fin else { break };
+                match fin {
+                    EffectFinalizer::Rust(f) => {
+                        f();
+                    }
+                    EffectFinalizer::Lust(val) => {
+                        let _ = self.call_value(&val, Vec::new());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_effect_intrinsic(name: &str) -> bool {
+        matches!(
+            name,
+            "__lust_handle"
+                | "__lust_perform"
+                | "perform"
+                | "__lust_resume"
+                | "resume"
+                | "__lust_register_finalizer"
+                | "register_finalizer"
+        )
+    }
+
+    pub(crate) fn get_effect_intrinsic_name(func: &Value) -> Option<String> {
+        if let Value::String(s) = func {
+            if let Some(rest) = s.strip_prefix("__lust_effect_intrinsic:") {
+                return Some(rest.to_string());
+            }
+            if Self::is_effect_intrinsic(s) {
+                return Some(s.to_string());
+            }
+        }
+        None
+    }
+
+    pub fn dispatch_effect_intrinsic(&mut self, name: &str, args: Vec<Value>) -> Result<Value> {
+        match name {
+            "__lust_handle" => {
+                if args.len() < 2 {
+                    return Err(LustError::RuntimeError {
+                        message: "__lust_handle requires 2 arguments: (body_thunk, arms)".to_string(),
+                    });
+                }
+                let body_thunk = args[0].clone();
+                let arms_val = &args[1];
+                let mut arms = Vec::new();
+                match arms_val {
+                    Value::Array(arr_rc) => {
+                        let arr = arr_rc.borrow();
+                        for item in arr.iter() {
+                            if let Value::Tuple(tup) = item {
+                                if tup.len() >= 2 {
+                                    let effect_name = tup[0].as_string().map(|s| s.to_string()).unwrap_or_default();
+                                    arms.push(EffectHandlerArm {
+                                        effect_name,
+                                        handler_fn: tup[1].clone(),
+                                    });
+                                }
+                            } else if let Value::Array(sub_rc) = item {
+                                let sub = sub_rc.borrow();
+                                if sub.len() >= 2 {
+                                    let effect_name = sub[0].as_string().map(|s| s.to_string()).unwrap_or_default();
+                                    arms.push(EffectHandlerArm {
+                                        effect_name,
+                                        handler_fn: sub[1].clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Value::Tuple(tup_rc) => {
+                        for item in tup_rc.iter() {
+                            if let Value::Tuple(tup) = item {
+                                if tup.len() >= 2 {
+                                    let effect_name = tup[0].as_string().map(|s| s.to_string()).unwrap_or_default();
+                                    arms.push(EffectHandlerArm {
+                                        effect_name,
+                                        handler_fn: tup[1].clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.execute_effect_handle(body_thunk, arms)
+            }
+            "__lust_perform" | "perform" => {
+                if args.is_empty() {
+                    return Err(LustError::RuntimeError {
+                        message: "perform requires at least an effect name".to_string(),
+                    });
+                }
+                let mut effect_name = args[0].as_string().map(|s| s.to_string()).ok_or_else(|| {
+                    LustError::RuntimeError {
+                        message: "Effect name in perform must be a string".to_string(),
+                    }
+                })?;
+                if effect_name.starts_with('"') && effect_name.ends_with('"') && effect_name.len() >= 2 {
+                    effect_name = effect_name[1..effect_name.len() - 1].to_string();
+                }
+                let effect_args = if args.len() > 1 {
+                    match &args[1] {
+                        Value::Array(arr_rc) => arr_rc.borrow().clone(),
+                        Value::Tuple(tup_rc) => (**tup_rc).clone(),
+                        other => vec![other.clone()],
+                    }
+                } else {
+                    Vec::new()
+                };
+                self.execute_effect_perform(effect_name, effect_args)
+            }
+            "__lust_resume" | "resume" => {
+                if args.len() != 1 {
+                    return Err(LustError::RuntimeError {
+                        message: "resume requires exactly 1 argument".to_string(),
+                    });
+                }
+                self.execute_effect_resume(args[0].clone())
+            }
+            "__lust_register_finalizer" | "register_finalizer" => {
+                if args.is_empty() {
+                    return Err(LustError::RuntimeError {
+                        message: "register_finalizer requires a callable argument".to_string(),
+                    });
+                }
+                #[cfg(feature = "std")]
+                EFFECT_FINALIZERS.with(|fins| {
+                    fins.borrow_mut().push(EffectFinalizer::Lust(args[0].clone()));
+                });
+                Ok(Value::Nil)
+            }
+            other => Err(LustError::RuntimeError {
+                message: format!("Unknown effect intrinsic: {}", other),
+            }),
+        }
+    }
+
+    pub fn execute_effect_handle(
+        &mut self,
+        body_thunk: Value,
+        arms: Vec<EffectHandlerArm>,
+    ) -> Result<Value> {
+        #[cfg(feature = "std")]
+        {
+            let handler_id = NEXT_EFFECT_HANDLER_ID.with(|id| {
+                let cur = id.get();
+                id.set(cur + 1);
+                cur
+            });
+            let fin_baseline = get_effect_finalizer_count();
+            let frame = EffectHandlerFrame {
+                id: handler_id,
+                arms,
+                active: true,
+                finalizer_baseline: fin_baseline,
+            };
+            EFFECT_HANDLER_STACK.with(|s| s.borrow_mut().push(frame));
+
+            let body_res = self.call_value(&body_thunk, Vec::new());
+
+            // Remove this handler frame from stack
+            EFFECT_HANDLER_STACK.with(|s| {
+                let mut b = s.borrow_mut();
+                if let Some(pos) = b.iter().rposition(|f| f.id == handler_id) {
+                    b.remove(pos);
+                }
+            });
+
+            match body_res {
+                Ok(val) => {
+                    self.run_finalizers_down_to(fin_baseline)?;
+                    Ok(val)
+                }
+                Err(err) => {
+                    // Check if error is an abort directed at this handler
+                    let mut matched_abort = None;
+                    EFFECT_ABORT_PAYLOAD.with(|abort_cell| {
+                        let mut b = abort_cell.borrow_mut();
+                        if let Some(payload) = b.as_ref() {
+                            if payload.handler_id == handler_id {
+                                matched_abort = b.take();
+                            }
+                        }
+                    });
+
+                    if let Some(payload) = matched_abort {
+                        self.run_finalizers_down_to(fin_baseline)?;
+                        Ok(payload.value)
+                    } else {
+                        let _ = self.run_finalizers_down_to(fin_baseline);
+                        Err(err)
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            self.call_value(&body_thunk, Vec::new())
+        }
+    }
+
+    pub fn execute_effect_perform(
+        &mut self,
+        effect_name: String,
+        args: Vec<Value>,
+    ) -> Result<Value> {
+        #[cfg(feature = "std")]
+        {
+            let found = EFFECT_HANDLER_STACK.with(|s| {
+                let b = s.borrow();
+                for (idx, frame) in b.iter().enumerate().rev() {
+                    if frame.active {
+                        for arm in &frame.arms {
+                            if arm.effect_name == effect_name {
+                                return Some((idx, frame.id, arm.handler_fn.clone()));
+                            }
+                        }
+                    }
+                }
+                None
+            });
+
+            let Some((frame_idx, handler_id, handler_fn)) = found else {
+                let _ = self.run_finalizers_down_to(0);
+                return Err(LustError::RuntimeError {
+                    message: format!("Unhandled effect: {}", effect_name),
+                });
+            };
+
+            EFFECT_HANDLER_STACK.with(|s| {
+                s.borrow_mut()[frame_idx].active = false;
+            });
+
+            let resumption = ResumptionState {
+                handler_id,
+                effect_name: effect_name.clone(),
+                resumed: false,
+                resume_value: None,
+            };
+            EFFECT_RESUMPTION_STACK.with(|r| r.borrow_mut().push(resumption));
+
+            let arm_res = self.call_value(&handler_fn, args);
+
+            let popped_resumption = EFFECT_RESUMPTION_STACK.with(|r| r.borrow_mut().pop());
+
+            EFFECT_HANDLER_STACK.with(|s| {
+                let mut b = s.borrow_mut();
+                if let Some(frame) = b.iter_mut().find(|f| f.id == handler_id) {
+                    frame.active = true;
+                }
+            });
+
+            match arm_res {
+                Ok(arm_val) => {
+                    let resumption = popped_resumption.ok_or_else(|| LustError::RuntimeError {
+                        message: "Corrupted effect resumption stack".to_string(),
+                    })?;
+                    if resumption.resumed {
+                        Ok(resumption.resume_value.unwrap_or(Value::Nil))
+                    } else {
+                        EFFECT_ABORT_PAYLOAD.with(|abort_cell| {
+                            *abort_cell.borrow_mut() = Some(AbortPayload {
+                                handler_id,
+                                value: arm_val,
+                            });
+                        });
+                        Err(LustError::RuntimeError {
+                            message: format!("__lust_effect_abort:{}", handler_id),
+                        })
+                    }
+                }
+                Err(err) => Err(err),
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            Err(LustError::RuntimeError {
+                message: format!("Unhandled effect in no_std: {}", effect_name),
+            })
+        }
+    }
+
+    pub fn execute_effect_resume(&mut self, val: Value) -> Result<Value> {
+        #[cfg(feature = "std")]
+        {
+            EFFECT_RESUMPTION_STACK.with(|r| {
+                let mut b = r.borrow_mut();
+                let Some(resumption) = b.last_mut() else {
+                    return Err(LustError::RuntimeError {
+                        message: "Cannot resume outside of an effect handler arm".to_string(),
+                    });
+                };
+                if resumption.resumed {
+                    return Err(LustError::RuntimeError {
+                        message: "Effect already resumed: resumption can only be called once".to_string(),
+                    });
+                }
+                resumption.resumed = true;
+                resumption.resume_value = Some(val.clone());
+                Ok(val)
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            Ok(val)
+        }
+    }
+
+    /// 3A -> 3D deopt interface consumer:
+    /// Consumes a pending DeoptPayload from `take_deopt_payload()`, reconstructs the target CallFrame
+    /// state (target IP and live registers) via `DeoptExitState::from_payload` / `apply_to_call_frame`,
+    /// and resumes execution in the interpreter without duplicate execution.
+    pub fn resume_from_deopt(
+        &mut self,
+        types: Option<&[(usize, crate::mir::ir::MirType)]>,
+    ) -> Result<Value> {
+        let payload = crate::mir::cranelift_backend::take_deopt_payload()
+            .ok_or_else(|| LustError::RuntimeError {
+                message: "No deopt payload available to reconstruct VM state".to_string(),
+            })?;
+        if self.call_stack.is_empty() {
+            if !self.functions.is_empty() {
+                let frame = CallFrame::new(0, None, 0);
+                self.call_stack.push(frame);
+            } else {
+                return Err(LustError::RuntimeError {
+                    message: "Cannot resume deopt: call stack is empty and no functions defined".to_string(),
+                });
+            }
+        }
+        let top_frame = self.call_stack.last_mut().unwrap();
+        let default_types = Vec::new();
+        let types_ref = types.unwrap_or(&default_types);
+        let deopt_exit = crate::vm::osr::DeoptExitState::from_payload(
+            payload,
+            crate::vm::osr::DeoptReason::Safepoint,
+            types_ref,
+        );
+        deopt_exit.apply_to_call_frame(top_frame);
+        self.run()
+    }
 }

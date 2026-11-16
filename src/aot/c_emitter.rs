@@ -1,3 +1,4 @@
+use crate::data::layout::CanonicalTypeTag;
 use crate::mir::ir::*;
 use alloc::{format, string::String, vec::Vec};
 
@@ -33,6 +34,9 @@ pub fn emit_c_from_mir(module: &MirModule, opts: &CEmitterOptions) -> String {
     // 2. Runtime Helpers & Memory Management
     emit_runtime_preamble(&mut out, opts);
 
+    // 2.5. Struct Layouts & Decoders (Gate-SCHEMA-09/13 Lowering)
+    emit_struct_layouts_and_decoders(&mut out, module);
+
     // 3. Forward declarations for all module functions
     out.push_str("/* Function Declarations */\n");
     for func in &module.functions {
@@ -66,7 +70,10 @@ pub fn emit_c_from_mir(module: &MirModule, opts: &CEmitterOptions) -> String {
         out.push_str("int main(int argc, char** argv) {\n");
         out.push_str("    (void)argc;\n    (void)argv;\n");
 
-        let main_fn = module.functions.iter().find(|f| f.signature.name == "main");
+        let main_fn = module
+            .functions
+            .iter()
+            .find(|f| f.signature.name == "main" || f.signature.name.ends_with(".main"));
         if let Some(main) = main_fn {
             if main.signature.return_type == MirType::Unit {
                 out.push_str("    __lust_fn_main();\n");
@@ -222,6 +229,304 @@ fn emit_runtime_preamble(out: &mut String, opts: &CEmitterOptions) {
     );
 }
 
+fn emit_struct_layouts_and_decoders(out: &mut String, module: &MirModule) {
+    if module.struct_layouts.is_empty() {
+        return;
+    }
+
+    out.push_str("/* Struct Layouts & Decoders (Gate-SCHEMA-09/13 Lowering) */\n");
+
+    for layout in &module.struct_layouts {
+        let type_name = &layout.type_name;
+        out.push_str(&format!(
+            "/* Layout: {} (size={}, align={}, c_flat={}) */\n",
+            type_name, layout.size_bytes, layout.align_bytes, layout.is_c_flat
+        ));
+        out.push_str(&format!("typedef struct LustStruct_{type_name} {{\n"));
+        for f in &layout.fields {
+            let c_ty = match f.tag {
+                CanonicalTypeTag::Bool => "bool",
+                CanonicalTypeTag::Int64
+                | CanonicalTypeTag::UInt64
+                | CanonicalTypeTag::DateTimeUtc => "int64_t",
+                CanonicalTypeTag::Float64 => "double",
+                CanonicalTypeTag::StringSlice | CanonicalTypeTag::BinarySlice => "const char*",
+                _ => "int64_t",
+            };
+            out.push_str(&format!(
+                "    {c_ty} field_{}; /* {} (offset={}, size={}) */\n",
+                f.ordinal, f.name, f.byte_offset, f.byte_size
+            ));
+        }
+        out.push_str(&format!("}} LustStruct_{type_name};\n\n"));
+
+        let mut required_mask: u64 = 0;
+        for f in &layout.fields {
+            if !f.is_optional {
+                required_mask |= 1u64 << f.ordinal;
+            }
+        }
+
+        out.push_str(&format!(
+            "static LustStruct_{type_name} __mir_struct_decode_into_{type_name}(const char* json_input) {{\n\
+             if (!json_input) {{\n\
+                 fprintf(stderr, \"runtime error: null JSON input for struct {type_name}\\n\");\n\
+                 exit(1);\n\
+             }}\n\
+             const char* s = json_input;\n\
+             while (*s == ' ' || *s == '\\t' || *s == '\\r' || *s == '\\n') s++;\n\
+             if (*s != '{{') {{\n\
+                 fprintf(stderr, \"runtime error: JSON decode error for struct {type_name}: expected '{{' at offset %ld\\n\", (long)(s - json_input));\n\
+                 exit(1);\n\
+             }}\n\
+             s++;\n\
+             LustStruct_{type_name} out;\n\
+             memset(&out, 0, sizeof(out));\n\
+             uint64_t initialized_mask = 0;\n\
+             void* allocated_ptrs[64];\n\
+             int alloc_count = 0;\n\
+             memset(allocated_ptrs, 0, sizeof(allocated_ptrs));\n\
+             while (1) {{\n\
+                 while (*s == ' ' || *s == '\\t' || *s == '\\r' || *s == '\\n') s++;\n\
+                 if (*s == '}}') {{\n\
+                     s++;\n\
+                     break;\n\
+                 }}\n\
+                 if (*s != '\"') {{\n\
+                     for (int k = 0; k < alloc_count; k++) if (allocated_ptrs[k]) free(allocated_ptrs[k]);\n\
+                     fprintf(stderr, \"runtime error: JSON decode error for struct {type_name}: expected string key\\n\");\n\
+                     exit(1);\n\
+                 }}\n\
+                 s++;\n\
+                 const char* key_start = s;\n\
+                 while (*s && *s != '\"') {{\n\
+                     if (*s == '\\\\' && *(s + 1)) s += 2;\n\
+                     else s++;\n\
+                 }}\n\
+                 if (*s != '\"') {{\n\
+                     for (int k = 0; k < alloc_count; k++) if (allocated_ptrs[k]) free(allocated_ptrs[k]);\n\
+                     fprintf(stderr, \"runtime error: JSON decode error for struct {type_name}: unterminated key\\n\");\n\
+                     exit(1);\n\
+                 }}\n\
+                 size_t key_len = (size_t)(s - key_start);\n\
+                 s++;\n\
+                 while (*s == ' ' || *s == '\\t' || *s == '\\r' || *s == '\\n') s++;\n\
+                 if (*s != ':') {{\n\
+                     for (int k = 0; k < alloc_count; k++) if (allocated_ptrs[k]) free(allocated_ptrs[k]);\n\
+                     fprintf(stderr, \"runtime error: JSON decode error for struct {type_name}: expected ':'\\n\");\n\
+                     exit(1);\n\
+                 }}\n\
+                 s++;\n\
+                 while (*s == ' ' || *s == '\\t' || *s == '\\r' || *s == '\\n') s++;\n"
+        ));
+
+        for (i, f) in layout.fields.iter().enumerate() {
+            let else_if = if i == 0 { "if" } else { "else if" };
+            let f_name = &f.name;
+            let f_ord = f.ordinal;
+            out.push_str(&format!(
+                "                {else_if} (key_len == {} && strncmp(key_start, \"{f_name}\", key_len) == 0) {{\n\
+                 if (initialized_mask & (1ULL << {f_ord})) {{\n\
+                     for (int k = 0; k < alloc_count; k++) if (allocated_ptrs[k]) free(allocated_ptrs[k]);\n\
+                     fprintf(stderr, \"runtime error: JSON decode error for struct {type_name}: duplicate key '{f_name}'\\n\");\n\
+                     exit(1);\n\
+                 }}\n",
+                f_name.len()
+            ));
+
+            match f.tag {
+                CanonicalTypeTag::Int64
+                | CanonicalTypeTag::UInt64
+                | CanonicalTypeTag::DateTimeUtc => {
+                    out.push_str(&format!(
+                        "                    char* endptr = NULL;\n\
+                         long long v = strtoll(s, &endptr, 10);\n\
+                         if (endptr == s) {{\n\
+                             for (int k = 0; k < alloc_count; k++) if (allocated_ptrs[k]) free(allocated_ptrs[k]);\n\
+                             fprintf(stderr, \"runtime error: JSON decode error for struct {type_name}: invalid integer for {f_name}\\n\");\n\
+                             exit(1);\n\
+                         }}\n\
+                         s = endptr;\n\
+                         out.field_{f_ord} = (int64_t)v;\n\
+                         initialized_mask |= (1ULL << {f_ord});\n"
+                    ));
+                }
+                CanonicalTypeTag::Float64 => {
+                    out.push_str(&format!(
+                        "                    char* endptr = NULL;\n\
+                         double v = strtod(s, &endptr);\n\
+                         if (endptr == s) {{\n\
+                             for (int k = 0; k < alloc_count; k++) if (allocated_ptrs[k]) free(allocated_ptrs[k]);\n\
+                             fprintf(stderr, \"runtime error: JSON decode error for struct {type_name}: invalid float for {f_name}\\n\");\n\
+                             exit(1);\n\
+                         }}\n\
+                         s = endptr;\n\
+                         out.field_{f_ord} = v;\n\
+                         initialized_mask |= (1ULL << {f_ord});\n"
+                    ));
+                }
+                CanonicalTypeTag::Bool => {
+                    out.push_str(&format!(
+                        "                    if (strncmp(s, \"true\", 4) == 0) {{\n\
+                             out.field_{f_ord} = true;\n\
+                             s += 4;\n\
+                         }} else if (strncmp(s, \"false\", 5) == 0) {{\n\
+                             out.field_{f_ord} = false;\n\
+                             s += 5;\n\
+                         }} else {{\n\
+                             for (int k = 0; k < alloc_count; k++) if (allocated_ptrs[k]) free(allocated_ptrs[k]);\n\
+                             fprintf(stderr, \"runtime error: JSON decode error for struct {type_name}: invalid bool for {f_name}\\n\");\n\
+                             exit(1);\n\
+                         }}\n\
+                         initialized_mask |= (1ULL << {f_ord});\n"
+                    ));
+                }
+                CanonicalTypeTag::StringSlice | CanonicalTypeTag::BinarySlice => {
+                    out.push_str(&format!(
+                        "                    if (*s != '\"') {{\n\
+                             for (int k = 0; k < alloc_count; k++) if (allocated_ptrs[k]) free(allocated_ptrs[k]);\n\
+                             fprintf(stderr, \"runtime error: JSON decode error for struct {type_name}: expected string for {f_name}\\n\");\n\
+                             exit(1);\n\
+                         }}\n\
+                         s++;\n\
+                         const char* v_start = s;\n\
+                         while (*s && *s != '\"') {{\n\
+                             if (*s == '\\\\' && *(s + 1)) s += 2;\n\
+                             else s++;\n\
+                         }}\n\
+                         if (*s != '\"') {{\n\
+                             for (int k = 0; k < alloc_count; k++) if (allocated_ptrs[k]) free(allocated_ptrs[k]);\n\
+                             fprintf(stderr, \"runtime error: JSON decode error for struct {type_name}: unterminated string for {f_name}\\n\");\n\
+                             exit(1);\n\
+                         }}\n\
+                         size_t v_len = (size_t)(s - v_start);\n\
+                         s++;\n\
+                         char* str_copy = (char*)malloc(v_len + 1);\n\
+                         if (!str_copy) {{\n\
+                             for (int k = 0; k < alloc_count; k++) if (allocated_ptrs[k]) free(allocated_ptrs[k]);\n\
+                             fprintf(stderr, \"out of memory\\n\");\n\
+                             exit(1);\n\
+                         }}\n\
+                         memcpy(str_copy, v_start, v_len);\n\
+                         str_copy[v_len] = '\\0';\n\
+                         allocated_ptrs[alloc_count++] = str_copy;\n\
+                         out.field_{f_ord} = str_copy;\n\
+                         initialized_mask |= (1ULL << {f_ord});\n"
+                    ));
+                }
+                _ => {
+                    out.push_str(&format!(
+                        "                    out.field_{f_ord} = 0;\n\
+                         initialized_mask |= (1ULL << {f_ord});\n"
+                    ));
+                }
+            }
+            out.push_str("                }\n");
+        }
+
+        out.push_str(
+            "                else {\n\
+                 if (*s == '\"') {\n\
+                     s++;\n\
+                     while (*s && *s != '\"') {\n\
+                         if (*s == '\\\\' && *(s + 1)) s += 2;\n\
+                         else s++;\n\
+                     }\n\
+                     if (*s == '\"') s++;\n\
+                 } else if (*s == '{') {\n\
+                     int depth = 1;\n\
+                     s++;\n\
+                     while (*s && depth > 0) {\n\
+                         if (*s == '{') depth++;\n\
+                         else if (*s == '}') depth--;\n\
+                         s++;\n\
+                     }\n\
+                 } else if (*s == '[') {\n\
+                     int depth = 1;\n\
+                     s++;\n\
+                     while (*s && depth > 0) {\n\
+                         if (*s == '[') depth++;\n\
+                         else if (*s == ']') depth--;\n\
+                         s++;\n\
+                     }\n\
+                 } else {\n\
+                     while (*s && *s != ',' && *s != '}' && *s != ' ' && *s != '\\t' && *s != '\\r' && *s != '\\n') s++;\n\
+                 }\n\
+             }\n\
+             while (*s == ' ' || *s == '\\t' || *s == '\\r' || *s == '\\n') s++;\n\
+             if (*s == ',') {\n\
+                 s++;\n\
+                 continue;\n\
+             } else if (*s == '}') {\n\
+                 s++;\n\
+                 break;\n\
+             } else {\n\
+                 for (int k = 0; k < alloc_count; k++) if (allocated_ptrs[k]) free(allocated_ptrs[k]);\n\
+                 fprintf(stderr, \"runtime error: JSON decode error: expected ',' or '}'\\n\");\n\
+                 exit(1);\n\
+             }\n\
+         }\n"
+        );
+
+        out.push_str(&format!(
+            "    uint64_t required_mask = {required_mask}ULL;\n\
+             if ((initialized_mask & required_mask) != required_mask) {{\n\
+                 for (int k = 0; k < alloc_count; k++) if (allocated_ptrs[k]) free(allocated_ptrs[k]);\n\
+                 fprintf(stderr, \"runtime error: JSON decode error for struct {type_name}: missing required fields\\n\");\n\
+                 exit(1);\n\
+             }}\n\
+             while (*s == ' ' || *s == '\\t' || *s == '\\r' || *s == '\\n') s++;\n\
+             if (*s != '\\0') {{\n\
+                 for (int k = 0; k < alloc_count; k++) if (allocated_ptrs[k]) free(allocated_ptrs[k]);\n\
+                 fprintf(stderr, \"runtime error: JSON decode error for struct {type_name}: trailing junk after object\\n\");\n\
+                 exit(1);\n\
+             }}\n\
+             return out;\n\
+         }}\n\n"
+        ));
+
+        out.push_str(&format!(
+            "__attribute__((noinline)) static LustStruct_{type_name} __mir_struct_decode_binary_{type_name}(const uint8_t* raw, size_t len) {{\n\
+             if (!raw || len < {size_bytes}ULL) {{\n\
+                 fprintf(stderr, \"SchemaDecodeError::TruncatedPayload {{ expected: {size_bytes}, actual: %zu }}\\n\", len);\n\
+                 exit(1);\n\
+             }}\n\
+             LustStruct_{type_name} out;\n\
+             memset(&out, 0, sizeof(out));\n",
+            size_bytes = layout.size_bytes
+        ));
+        for f in &layout.fields {
+            let f_ord = f.ordinal;
+            let f_off = f.byte_offset;
+            match f.tag {
+                CanonicalTypeTag::Bool => {
+                    out.push_str(&format!(
+                        "             out.field_{f_ord} = (raw[{f_off}] != 0);\n"
+                    ));
+                }
+                CanonicalTypeTag::Int64
+                | CanonicalTypeTag::UInt64
+                | CanonicalTypeTag::DateTimeUtc => {
+                    out.push_str(&format!(
+                        "             memcpy(&out.field_{f_ord}, raw + {f_off}, sizeof(int64_t));\n"
+                    ));
+                }
+                CanonicalTypeTag::Float64 => {
+                    out.push_str(&format!(
+                        "             memcpy(&out.field_{f_ord}, raw + {f_off}, sizeof(double));\n"
+                    ));
+                }
+                _ => {
+                    out.push_str(&format!(
+                        "             memcpy(&out.field_{f_ord}, raw + {f_off}, sizeof(int64_t));\n"
+                    ));
+                }
+            }
+        }
+        out.push_str("             return out;\n         }\n\n");
+    }
+}
+
 fn emit_function(out: &mut String, func: &MirFunction) {
     let ret_ty = mir_type_to_c(&func.signature.return_type);
     let fn_name = c_fn_name(&func.signature.name);
@@ -340,6 +645,24 @@ fn emit_terminator(
             ..
         } => {
             let dest_expr = place_to_c(destination);
+
+            if let Some(struct_name) = parse_mir_struct_decode_callee(callee) {
+                let arg_expr = args.first().map(operand_to_c).unwrap_or_else(|| "\"\"".into());
+                out.push_str(&format!(
+                    "    {dest_expr} = __mir_struct_decode_into_{struct_name}({arg_expr});\n"
+                ));
+                out.push_str(&format!("    goto bb{};\n", success.0));
+                return;
+            }
+            if let Some(struct_name) = callee.strip_prefix("__lust_mir_struct_decode_binary:") {
+                let ptr_expr = args.first().map(operand_to_c).unwrap_or_else(|| "NULL".into());
+                let len_expr = args.get(1).map(operand_to_c).unwrap_or_else(|| "0".into());
+                out.push_str(&format!(
+                    "    {dest_expr} = __mir_struct_decode_binary_{struct_name}((const uint8_t*)(uintptr_t)({ptr_expr}), (size_t)({len_expr}));\n"
+                ));
+                out.push_str(&format!("    goto bb{};\n", success.0));
+                return;
+            }
 
             match callee.as_str() {
                 "print" | "println" => {
@@ -549,22 +872,23 @@ fn rvalue_to_c(rval: &Rvalue) -> String {
     }
 }
 
-fn mir_local_type_to_c(ty: &MirType) -> &'static str {
+fn mir_local_type_to_c(ty: &MirType) -> String {
     match ty {
-        MirType::Unit => "uint8_t",
+        MirType::Unit => "uint8_t".into(),
         _ => mir_type_to_c(ty),
     }
 }
 
-fn mir_type_to_c(ty: &MirType) -> &'static str {
+fn mir_type_to_c(ty: &MirType) -> String {
     match ty {
-        MirType::Unit => "void",
-        MirType::Bool => "bool",
-        MirType::Int => "int64_t",
-        MirType::Float => "double",
-        MirType::String => "const char*",
-        MirType::Array(_) => "LustArray*",
-        _ => "int64_t",
+        MirType::Unit => "void".into(),
+        MirType::Bool => "bool".into(),
+        MirType::Int => "int64_t".into(),
+        MirType::Float => "double".into(),
+        MirType::String => "const char*".into(),
+        MirType::Array(_) => "LustArray*".into(),
+        MirType::Struct(name) => format!("LustStruct_{name}"),
+        _ => "int64_t".into(),
     }
 }
 
@@ -576,15 +900,17 @@ fn default_c_value(ty: &MirType) -> &'static str {
         MirType::Float => "0.0",
         MirType::String => "\"\"",
         MirType::Array(_) => "NULL",
+        MirType::Struct(_) => "{0}",
         _ => "0",
     }
 }
 
 fn c_fn_name(name: &str) -> String {
-    if name == "main" {
+    if name == "main" || name.ends_with(".main") {
         "__lust_fn_main".into()
     } else {
-        format!("__lust_user_{name}")
+        let safe = name.replace('.', "_").replace('-', "_");
+        format!("__lust_user_{safe}")
     }
 }
 

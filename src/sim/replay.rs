@@ -181,6 +181,35 @@ pub enum ReplayEventKind {
         tag: String,
         payload: String,
     },
+    SafepointChecked {
+        safepoint_id: u64,
+        mask_depth: usize,
+    },
+    InterruptInjected {
+        reason: String,
+        deferred: bool,
+    },
+    InterruptDelivered {
+        reason: String,
+        safepoint_id: u64,
+    },
+    MaskEntered {
+        new_depth: usize,
+    },
+    MaskExited {
+        new_depth: usize,
+        unmasked_interrupt: Option<String>,
+    },
+    FinalizerRegistered {
+        finalizer_id: u64,
+    },
+    FinalizerExecuted {
+        finalizer_id: u64,
+    },
+    Tier2CompiledEntry {
+        func_name: String,
+        target_block: usize,
+    },
 }
 
 /// A timestamped, step-indexed simulation event.

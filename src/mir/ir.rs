@@ -91,6 +91,14 @@ pub struct LocalDecl {
     pub ty: MirType,
     pub is_mut: bool,
     pub span: Span,
+    pub is_stack_promoted: bool,
+}
+
+impl LocalDecl {
+    pub fn with_stack_promoted(mut self, promoted: bool) -> Self {
+        self.is_stack_promoted = promoted;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -348,6 +356,7 @@ pub struct BasicBlock {
     pub id: BlockId,
     pub statements: Vec<Statement>,
     pub terminator: Option<Terminator>,
+    pub is_cleanup: bool,
 }
 
 impl BasicBlock {
@@ -356,6 +365,7 @@ impl BasicBlock {
             id,
             statements: Vec::new(),
             terminator: None,
+            is_cleanup: false,
         }
     }
 }
@@ -391,6 +401,7 @@ impl MirFunction {
                 ty: p_ty.clone(),
                 is_mut: false,
                 span,
+                is_stack_promoted: false,
             });
             params.push(p_id);
         }
@@ -402,6 +413,7 @@ impl MirFunction {
             ty: signature.return_type.clone(),
             is_mut: true,
             span,
+            is_stack_promoted: false,
         };
         locals.push(ret_decl);
 
@@ -426,6 +438,7 @@ impl MirFunction {
             ty,
             is_mut,
             span,
+            is_stack_promoted: false,
         });
         id
     }

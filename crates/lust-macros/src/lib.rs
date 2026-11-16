@@ -912,69 +912,82 @@ fn expand_lust_struct_view(input: DeriveInput) -> SynResult<TokenStream> {
 fn expand_field(
     field: &syn::Field,
     crate_path: &Path,
-    _lifetime: &syn::Lifetime,
+    lifetime_param: &syn::Lifetime,
 ) -> SynResult<proc_macro2::TokenStream> {
-    let field_ident = field.ident.as_ref().ok_or_else(|| {
-        syn::Error::new(field.span(), "anonymous fields cannot be extracted")
-    })?;
-    let mut field_name = field_ident.to_string();
+    let ident = field
+        .ident
+        .clone()
+        .ok_or_else(|| syn::Error::new(field.span(), "expected named field"))?;
+    let mut field_name = ident.to_string();
 
     for attr in &field.attrs {
         if !attr.path().is_ident("lust") {
             continue;
         }
         for (key, lit) in parse_kv_attr(attr)? {
-            if key == "field" {
-                let lit_str = expect_lit_str(&lit, "field")?;
-                field_name = lit_str.value();
-            } else {
-                return Err(syn::Error::new(
-                    lit.span(),
-                    format!("unknown field attribute '{}'", key),
-                ));
-            }
-        }
-    }
-
-    let field_name_lit = LitStr::new(&field_name, field_ident.span());
-    Ok(quote! {
-        #field_ident: #crate_path::embed::FromStructField::extract_field(__handle, #field_name_lit)?
-    })
-}
-
-fn parse_kv_attr(attr: &Attribute) -> SynResult<Vec<(String, Lit)>> {
-    let mut entries = Vec::new();
-    let nested = attr.parse_args_with(
-        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-    )?;
-
-    for meta in nested {
-        match meta {
-            syn::Meta::NameValue(nv) => {
-                let key = nv
-                    .path
-                    .get_ident()
-                    .ok_or_else(|| syn::Error::new(nv.path.span(), "attribute key must be an ident"))?
-                    .to_string();
-                if let syn::Expr::Lit(expr_lit) = nv.value {
-                    entries.push((key, expr_lit.lit));
-                } else {
+            match key.as_str() {
+                "field" | "name" => {
+                    let lit_str = expect_lit_str(&lit, "field/name")?;
+                    field_name = lit_str.value();
+                }
+                other => {
                     return Err(syn::Error::new(
-                        nv.value.span(),
-                        "attribute values must be literal expressions",
+                        lit.span(),
+                        format!("unknown LustStructView field attribute '{}'", other),
                     ));
                 }
             }
-            other => {
-                return Err(syn::Error::new(
-                    other.span(),
-                    "expected name = value attribute parameter",
-                ));
-            }
         }
     }
 
-    Ok(entries)
+    let field_ty = &field.ty;
+    let field_name_lit = LitStr::new(&field_name, ident.span());
+    Ok(quote! {
+        #ident: {
+            let __value = __handle.borrow_field(#field_name_lit)?;
+            <#field_ty as #crate_path::embed::FromStructField<#lifetime_param>>::from_value(#field_name_lit, __value)?
+        }
+    })
+}
+
+struct KvEntry {
+    key: String,
+    lit: Lit,
+}
+
+impl syn::parse::Parse for KvEntry {
+    fn parse(input: syn::parse::ParseStream) -> SynResult<Self> {
+        use syn::ext::IdentExt;
+        let key_ident = Ident::parse_any(input).map_err(|_| {
+            syn::Error::new(input.span(), "attribute key must be an ident")
+        })?;
+        let _: syn::Token![=] = input.parse().map_err(|_| {
+            syn::Error::new(key_ident.span(), "expected name = value attribute parameter")
+        })?;
+        let expr: syn::Expr = input.parse()?;
+        if let syn::Expr::Lit(expr_lit) = expr {
+            Ok(Self {
+                key: key_ident.to_string(),
+                lit: expr_lit.lit,
+            })
+        } else {
+            Err(syn::Error::new(
+                expr.span(),
+                "attribute values must be literal expressions",
+            ))
+        }
+    }
+}
+
+fn parse_kv_attr(attr: &Attribute) -> SynResult<Vec<(String, Lit)>> {
+    let nested = attr.parse_args_with(
+        syn::punctuated::Punctuated::<KvEntry, syn::Token![,]>::parse_terminated,
+    )?;
+
+    Ok(nested
+        .into_iter()
+        .map(|entry| (entry.key, entry.lit))
+        .collect())
 }
 
 fn expect_lit_str<'a>(lit: &'a Lit, name: &str) -> SynResult<&'a LitStr> {

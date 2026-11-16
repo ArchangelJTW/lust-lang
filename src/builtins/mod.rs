@@ -4,6 +4,9 @@ use crate::lazy::StaticOnceCell;
 use alloc::{boxed::Box, collections::BTreeMap, string::ToString, vec, vec::Vec};
 use hashbrown::HashMap;
 
+#[cfg(feature = "std")]
+pub use crate::stdlib::coord;
+
 #[derive(Debug, Clone)]
 pub struct BuiltinSignature {
     pub type_params: &'static [&'static str],
@@ -510,6 +513,7 @@ static OS_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new(
 static RX_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 static TEST_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 static RANDOM_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+static COORD_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 
 fn build_array_functions() -> Vec<BuiltinFunction> {
     let t = TypeExpr::Generic("T");
@@ -1770,6 +1774,134 @@ pub fn random_functions() -> &'static [BuiltinFunction] {
     RANDOM_FUNCTIONS.get_or_init(build_random_functions).as_slice()
 }
 
+pub fn coord_functions() -> &'static [BuiltinFunction] {
+    COORD_FUNCTIONS.get_or_init(build_coord_functions).as_slice()
+}
+
+fn build_coord_functions() -> Vec<BuiltinFunction> {
+    vec![
+        func(
+            "coord.Ref",
+            "Create a new shared mutable Ref cell",
+            &["initial"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Deferred",
+            "Create a new single-assignment Deferred promise",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Semaphore",
+            "Create a new counting Semaphore",
+            &["permits"],
+            vec![TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Queue",
+            "Create a new bounded or unbounded Queue",
+            &["capacity", "overflow"],
+            vec![TypeExpr::Int, TypeExpr::String],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Schedule",
+            "Create a recurrence schedule",
+            &["recurs"],
+            vec![TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Schedule.recurs",
+            "Create a recurs schedule",
+            &["n"],
+            vec![TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Schedule.spaced",
+            "Create a spaced schedule",
+            &["ms"],
+            vec![TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Schedule.exponential",
+            "Create an exponential backoff schedule",
+            &["base", "factor", "max"],
+            vec![TypeExpr::Int, TypeExpr::Float, TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Schedule.retry",
+            "Retry an action under a schedule",
+            &["schedule", "action"],
+            vec![TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Schedule.timeout",
+            "Execute action with timeout",
+            &["timeout_ms", "action"],
+            vec![TypeExpr::Int, TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Stream",
+            "Create a pull stream from an array",
+            &["items"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Stream.from_array",
+            "Create a stream from an array",
+            &["items"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Stream.range",
+            "Create a numeric range stream",
+            &["start", "end", "step"],
+            vec![TypeExpr::Int, TypeExpr::Int, TypeExpr::Int],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Stream.collect",
+            "Collect all items from a stream",
+            &["stream"],
+            vec![TypeExpr::Unknown],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Sink",
+            "Create a collect sink",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Sink.collect",
+            "Create a collect sink",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
+        ),
+        func(
+            "coord.Sink.drain",
+            "Create a drain sink",
+            &[],
+            vec![],
+            TypeExpr::Unknown,
+        ),
+    ]
+}
+
 fn build_random_functions() -> Vec<BuiltinFunction> {
     vec![
         func(
@@ -2103,7 +2235,7 @@ static BUILTINS_DATABASE: StaticOnceCell<BuiltinsDatabase> = StaticOnceCell::new
 
 fn build_builtins_database() -> BuiltinsDatabase {
     let mut modules: BTreeMap<&'static str, BuiltinModule> = BTreeMap::new();
-    let module_specs: [(&'static str, &'static str, &'static [BuiltinFunction]); 11] = [
+    let module_specs: [(&'static str, &'static str, &'static [BuiltinFunction]); 12] = [
         ("array", "array collection module", array_functions()),
         ("map", "map collection module", map_functions()),
         ("math", "math module", math_functions()),
@@ -2115,6 +2247,7 @@ fn build_builtins_database() -> BuiltinsDatabase {
         ("rx", "reactive streams module", rx_functions()),
         ("test", "test framework module", test_functions()),
         ("random", "pseudorandom number and byte generator module", random_functions()),
+        ("coord", "coordination primitives module", coord_functions()),
     ];
     for (name, description, functions) in module_specs {
         let mut module_funcs: Vec<&'static BuiltinFunction> = functions.iter().collect();
@@ -2206,6 +2339,10 @@ pub fn is_virtual_std_module(module_path: &str) -> bool {
             | "jsonc"
             | "jsonl"
             | "rx"
+            | "coord"
+            | "sync"
+            | "stream"
+            | "schedule"
     )
 }
 
@@ -2245,6 +2382,10 @@ pub fn canonical_std_module_name(module_path: &str) -> &'static str {
         "jsonl" => "jsonl",
         "test" | "test.clock" | "test.mock" => "test",
         "rx" => "rx",
+        "coord" => "coord",
+        "sync" => "sync",
+        "stream" => "stream",
+        "schedule" => "schedule",
         _ => "unknown",
     }
 }
@@ -2553,6 +2694,35 @@ pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'stat
             "subscribe_with" => Some("rx.subscribe_with"),
             _ => crate::rx::resolve_rx_function(item_name),
         },
+        "coord" => match item_name {
+            "Stream" => Some("coord.Stream"),
+            "Sink" => Some("coord.Sink"),
+            "Queue" => Some("coord.Queue"),
+            "Deferred" => Some("coord.Deferred"),
+            "Semaphore" => Some("coord.Semaphore"),
+            "Ref" => Some("coord.Ref"),
+            "Schedule" => Some("coord.Schedule"),
+            _ => None,
+        },
+        "sync" => match item_name {
+            "Queue" => Some("coord.Queue"),
+            "Deferred" => Some("coord.Deferred"),
+            "Semaphore" => Some("coord.Semaphore"),
+            "Ref" => Some("coord.Ref"),
+            _ => None,
+        },
+        "stream" => match item_name {
+            "Stream" => Some("coord.Stream"),
+            "Sink" => Some("coord.Sink"),
+            _ => None,
+        },
+        "schedule" => match item_name {
+            "Schedule" => Some("coord.Schedule"),
+            "retry" => Some("coord.Schedule.retry"),
+            "repeat" => Some("coord.Schedule.repeat"),
+            "timeout" => Some("coord.Schedule.timeout"),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -2801,6 +2971,31 @@ pub fn virtual_std_module_functions(module_path: &str) -> Vec<(&'static str, &'s
             ("fiber_request_interrupt", "test.fiber_request_interrupt"),
             ("fiber_state", "test.fiber_state"),
         ],
+        "coord" => vec![
+            ("Stream", "coord.Stream"),
+            ("Sink", "coord.Sink"),
+            ("Queue", "coord.Queue"),
+            ("Deferred", "coord.Deferred"),
+            ("Semaphore", "coord.Semaphore"),
+            ("Ref", "coord.Ref"),
+            ("Schedule", "coord.Schedule"),
+        ],
+        "sync" => vec![
+            ("Queue", "coord.Queue"),
+            ("Deferred", "coord.Deferred"),
+            ("Semaphore", "coord.Semaphore"),
+            ("Ref", "coord.Ref"),
+        ],
+        "stream" => vec![
+            ("Stream", "coord.Stream"),
+            ("Sink", "coord.Sink"),
+        ],
+        "schedule" => vec![
+            ("Schedule", "coord.Schedule"),
+            ("retry", "coord.Schedule.retry"),
+            ("repeat", "coord.Schedule.repeat"),
+            ("timeout", "coord.Schedule.timeout"),
+        ],
         _ => Vec::new(),
     }
 }
@@ -2868,6 +3063,11 @@ pub fn find_builtin_function(name: &str) -> Option<&'static BuiltinFunction> {
     }
     for func in random_functions() {
         if func.name == name || func.name.strip_prefix("random.") == Some(name) {
+            return Some(func);
+        }
+    }
+    for func in coord_functions() {
+        if func.name == name || func.name.strip_prefix("coord.") == Some(name) {
             return Some(func);
         }
     }

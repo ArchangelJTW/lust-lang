@@ -40,7 +40,12 @@ impl Parser {
             self.current_token().line
         );
 
-        self.parse_assignment()
+        self.with_allow_range(false, |p| p.parse_assignment())
+    }
+
+    #[inline(never)]
+    pub(super) fn parse_for_iterator_expr(&mut self) -> Result<Expr> {
+        self.with_allow_range(true, |p| p.parse_assignment())
     }
 
     #[inline(never)]
@@ -652,7 +657,7 @@ impl Parser {
 
     fn parse_range(&mut self) -> Result<Expr> {
         let expr = self.parse_bit_or()?;
-        if self.match_token(&[TokenKind::DoubleDot]) {
+        if self.allow_range && self.match_token(&[TokenKind::DoubleDot]) {
             let end = self.parse_bit_or()?;
             let span = self.span_through_previous(expr.span);
             return Ok(Expr::new(
@@ -745,31 +750,9 @@ impl Parser {
         Ok(expr)
     }
 
-    fn is_string_like_expr(expr: &Expr) -> bool {
-        match &expr.kind {
-            ExprKind::Literal(Literal::String(_)) => true,
-            ExprKind::Binary {
-                op: BinaryOp::Concat,
-                ..
-            } => true,
-            _ => false,
-        }
-    }
-
     fn parse_concat(&mut self) -> Result<Expr> {
         let expr = self.parse_term()?;
-        if self.check(TokenKind::DoubleDot) {
-            if !Self::is_string_like_expr(&expr) {
-                let next_is_string = self
-                    .peek_ahead(1)
-                    .map(|next| matches!(next.kind, TokenKind::String))
-                    .unwrap_or(false);
-                if !next_is_string {
-                    return Ok(expr);
-                }
-            }
-
-            self.advance();
+        if !self.allow_range && self.match_token(&[TokenKind::DoubleDot]) {
             let right = self.parse_concat()?;
             let span = self.span_through_previous(expr.span);
             return Ok(Expr::new(
@@ -2279,19 +2262,60 @@ mod tests {
 
     #[test]
     fn test_string_concat_vs_range() {
-        let expr = parse_expression("\"str\" .. 10");
-        match &expr.kind {
-            ExprKind::Binary {
-                op: BinaryOp::Concat,
-                ..
-            } => {}
-            other => panic!("expected Concat for \"str\" .. 10, got {:?}", other),
+        use crate::ast::{ItemKind, StmtKind};
+        for expr_src in ["\"str\" .. 10", "s .. tostring(i % 10)", "a .. b"] {
+            let expr = parse_expression(expr_src);
+            match &expr.kind {
+                ExprKind::Binary {
+                    op: BinaryOp::Concat,
+                    ..
+                } => {}
+                other => panic!("expected Concat for `{expr_src}`, got {:?}", other),
+            }
         }
 
-        let expr = parse_expression("1..10");
-        match &expr.kind {
-            ExprKind::Range { .. } => {}
-            other => panic!("expected Range for 1..10, got {:?}", other),
+        for for_src in ["for i in 1..10 do end", "for i in a..b do end"] {
+            let mut interner = Interner::new();
+            let tokens = Lexer::new(for_src, &mut interner).tokenize().expect("tokenize");
+            let items = Parser::new(tokens).parse().expect("parse");
+            match &items[0].kind {
+                ItemKind::Script(stmts) => match &stmts[0].kind {
+                    StmtKind::ForIn { iterator, .. } => {
+                        assert!(
+                            matches!(iterator.kind, ExprKind::Range { .. }),
+                            "expected Range for `{for_src}`, got {:?}",
+                            iterator.kind
+                        );
+                    }
+                    other => panic!("expected ForIn for `{for_src}`, got {:?}", other),
+                },
+                other => panic!("expected Script for `{for_src}`, got {:?}", other),
+            }
+        }
+
+        let mut interner = Interner::new();
+        let tokens = Lexer::new("for x in split(s .. t) do end", &mut interner)
+            .tokenize()
+            .expect("tokenize");
+        let items = Parser::new(tokens).parse().expect("parse");
+        match &items[0].kind {
+            ItemKind::Script(stmts) => match &stmts[0].kind {
+                StmtKind::ForIn { iterator, .. } => match &iterator.kind {
+                    ExprKind::Call { args, .. } => {
+                        assert_eq!(args.len(), 1);
+                        assert!(matches!(
+                            args[0].kind,
+                            ExprKind::Binary {
+                                op: BinaryOp::Concat,
+                                ..
+                            }
+                        ));
+                    }
+                    other => panic!("expected Call(split, [Concat]), got {:?}", other),
+                },
+                other => panic!("expected ForIn, got {:?}", other),
+            },
+            other => panic!("expected Script, got {:?}", other),
         }
     }
 

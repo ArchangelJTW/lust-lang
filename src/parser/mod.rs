@@ -20,6 +20,7 @@ pub struct Parser {
     /// attached to the next declaration.
     pending_docs: Vec<String>,
     pub regex_aliases: Vec<String>,
+    allow_range: bool,
 }
 
 impl Parser {
@@ -29,7 +30,20 @@ impl Parser {
             current: 0,
             pending_docs: Vec::new(),
             regex_aliases: Vec::new(),
+            allow_range: false,
         }
+    }
+
+    fn with_allow_range<T>(
+        &mut self,
+        allow: bool,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let prev = self.allow_range;
+        self.allow_range = allow;
+        let res = f(self);
+        self.allow_range = prev;
+        res
     }
 
     /// Create a parser from a lexer using streaming tokenization.
@@ -68,6 +82,7 @@ impl Parser {
             current: 0,
             pending_docs: Vec::new(),
             regex_aliases: Vec::new(),
+            allow_range: false,
         })
     }
 

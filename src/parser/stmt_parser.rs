@@ -151,7 +151,7 @@ impl Parser {
                     }
 
                     self.consume(TokenKind::In, "Expected 'in' after for variable(s)")?;
-                    let iterator = self.parse_expr()?;
+                    let iterator = self.parse_for_iterator_expr()?;
                     self.consume(TokenKind::Do, "Expected 'do' after for iterator")?;
                     let mut body = Vec::new();
                     while !self.check(TokenKind::End) && !self.is_at_end() {

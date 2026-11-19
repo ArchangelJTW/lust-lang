@@ -673,120 +673,385 @@ impl VM {
     }
 
     #[cfg(feature = "std")]
+    fn check_refined_type(ty: &MirType, check_struct: &dyn Fn(&str) -> bool) -> bool {
+        if Self::type_contains_unknown(ty) || !Self::is_cranelift_supported_type(ty) {
+            return false;
+        }
+        match ty {
+            MirType::Struct(name) => check_struct(name),
+            MirType::Map(k, v) => {
+                Self::check_refined_type(k, check_struct)
+                    && Self::check_refined_type(v, check_struct)
+            }
+            _ => true,
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn check_refined_place(
+        place: &crate::mir::ir::Place,
+        locals: &[crate::mir::ir::LocalDecl],
+        struct_meta: Option<&hashbrown::HashMap<String, crate::vm::RuntimeStructInfo>>,
+        check_struct: &dyn Fn(&str) -> bool,
+    ) -> bool {
+        use crate::mir::ir::Place;
+        match place {
+            Place::Local(loc) => locals
+                .get(loc.0)
+                .map(|l| Self::check_refined_type(&l.ty, check_struct))
+                .unwrap_or(false),
+            Place::Index(base, idx_loc) => {
+                if !Self::check_refined_place(base, locals, struct_meta, check_struct) {
+                    return false;
+                }
+                if !locals
+                    .get(idx_loc.0)
+                    .map(|l| l.ty == MirType::Int)
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
+                match Self::mir_place_type_in_vm(base, locals, struct_meta) {
+                    Some(MirType::Array(elem)) => {
+                        Self::is_cranelift_supported_array_elem_type(&elem)
+                    }
+                    Some(MirType::Tuple(elems)) => {
+                        !elems.is_empty()
+                            && elems
+                                .iter()
+                                .all(Self::is_cranelift_supported_array_elem_type)
+                    }
+                    _ => false,
+                }
+            }
+            Place::Field(base, idx) => {
+                if !Self::check_refined_place(base, locals, struct_meta, check_struct) {
+                    return false;
+                }
+                match Self::mir_place_type_in_vm(base, locals, struct_meta) {
+                    Some(MirType::Struct(name)) => {
+                        if !check_struct(&name) {
+                            return false;
+                        }
+                        if let Some(meta) = struct_meta {
+                            let Some(info) = meta.get(&name) else {
+                                return false;
+                            };
+                            if *idx >= info.layout.field_names().len() {
+                                return false;
+                            }
+                            let field_ty = crate::mir::lowering::mir_type_from_ast(
+                                info.layout.field_type(*idx),
+                            );
+                            Self::check_refined_type(&field_ty, check_struct)
+                                && !matches!(
+                                    field_ty,
+                                    MirType::Array(_)
+                                        | MirType::Tuple(_)
+                                        | MirType::Struct(_)
+                                        | MirType::Function { .. }
+                                        | MirType::Unknown
+                                )
+                        } else {
+                            true
+                        }
+                    }
+                    Some(MirType::Tuple(elems)) => {
+                        let Some(elem_ty) = elems.get(*idx) else {
+                            return false;
+                        };
+                        Self::check_refined_type(elem_ty, check_struct)
+                            && !matches!(
+                                elem_ty,
+                                MirType::Array(_)
+                                    | MirType::Tuple(_)
+                                    | MirType::Struct(_)
+                                    | MirType::Function { .. }
+                                    | MirType::Unknown
+                            )
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn check_refined_operand(
+        op: &Operand,
+        locals: &[crate::mir::ir::LocalDecl],
+        struct_meta: Option<&hashbrown::HashMap<String, crate::vm::RuntimeStructInfo>>,
+        check_struct: &dyn Fn(&str) -> bool,
+    ) -> bool {
+        match op {
+            Operand::Copy(p) | Operand::Move(p) => {
+                Self::check_refined_place(p, locals, struct_meta, check_struct)
+            }
+            Operand::Constant(_) => Self::is_cranelift_eligible_operand(op),
+        }
+    }
+
+    #[cfg(feature = "std")]
     fn check_refined_cranelift_eligibility(
         refined: &MirFunction,
         struct_meta: Option<&hashbrown::HashMap<String, crate::vm::RuntimeStructInfo>>,
         check_struct: &dyn Fn(&str) -> bool,
     ) -> bool {
-        let check_type = |ty: &MirType| -> bool {
-            if Self::type_contains_unknown(ty) || !Self::is_cranelift_supported_type(ty) {
-                return false;
-            }
-            match ty {
-                MirType::Struct(name) => check_struct(name),
-                _ => true,
-            }
-        };
+        let check_type = |ty: &MirType| -> bool { Self::check_refined_type(ty, check_struct) };
         if !check_type(&refined.signature.return_type)
-            || !refined.params.iter().all(|p| check_type(&refined.locals[p.0].ty))
+            || !refined
+                .params
+                .iter()
+                .all(|p| check_type(&refined.locals[p.0].ty))
             || !refined.locals.iter().all(|l| check_type(&l.ty))
         {
             return false;
         }
         for block in &refined.blocks {
             for stmt in &block.statements {
-                if let Statement::Assign(place, rval, _) = stmt {
-                    if let crate::mir::ir::Place::Field(base, _) = place {
-                        if let Some(MirType::Struct(name)) =
-                            Self::mir_place_type_in_vm(base, &refined.locals, struct_meta)
-                        {
-                            if !check_struct(&name) {
-                                return false;
-                            }
+                match stmt {
+                    Statement::Assign(place, rval, _) => {
+                        if !Self::check_refined_place(
+                            place,
+                            &refined.locals,
+                            struct_meta,
+                            check_struct,
+                        ) {
+                            return false;
                         }
-                    }
-                    match rval {
-                        Rvalue::Aggregate(agg_ty, elems) => {
-                            if Self::type_contains_unknown(agg_ty) || !check_type(agg_ty) {
-                                return false;
+                        match rval {
+                            Rvalue::Use(op) => {
+                                if !Self::check_refined_operand(
+                                    op,
+                                    &refined.locals,
+                                    struct_meta,
+                                    check_struct,
+                                ) {
+                                    return false;
+                                }
                             }
-                            match agg_ty {
-                                MirType::Array(elem_ty) => {
-                                    if !Self::is_cranelift_supported_array_elem_type(elem_ty) {
+                            Rvalue::BinaryOp(_, lhs, rhs) => {
+                                if !Self::check_refined_operand(
+                                    lhs,
+                                    &refined.locals,
+                                    struct_meta,
+                                    check_struct,
+                                ) || !Self::check_refined_operand(
+                                    rhs,
+                                    &refined.locals,
+                                    struct_meta,
+                                    check_struct,
+                                ) {
+                                    return false;
+                                }
+                            }
+                            Rvalue::UnaryOp(op_kind, op) => {
+                                if !Self::check_refined_operand(
+                                    op,
+                                    &refined.locals,
+                                    struct_meta,
+                                    check_struct,
+                                ) {
+                                    return false;
+                                }
+                                if matches!(op_kind, MirUnaryOp::Len) {
+                                    let op_ty = Self::mir_operand_type_in_vm(
+                                        op,
+                                        &refined.locals,
+                                        struct_meta,
+                                    );
+                                    if !matches!(op_ty, Some(MirType::Array(_) | MirType::String)) {
                                         return false;
-                                    }
-                                    for elem in elems {
-                                        if Self::mir_operand_type_in_vm(
-                                            elem,
-                                            &refined.locals,
-                                            struct_meta,
-                                        )
-                                        .as_ref()
-                                            != Some(&**elem_ty)
-                                        {
-                                            return false;
-                                        }
                                     }
                                 }
-                                MirType::Tuple(elem_types) => {
-                                    if elem_types.len() != elems.len() {
-                                        return false;
+                            }
+                            Rvalue::Cast(op, target_ty) => {
+                                if !Self::check_refined_operand(
+                                    op,
+                                    &refined.locals,
+                                    struct_meta,
+                                    check_struct,
+                                ) || !check_type(target_ty)
+                                {
+                                    return false;
+                                }
+                            }
+                            Rvalue::Aggregate(agg_ty, elems) => {
+                                if Self::type_contains_unknown(agg_ty)
+                                    || !check_type(agg_ty)
+                                    || !elems.iter().all(|e| {
+                                        Self::check_refined_operand(
+                                            e,
+                                            &refined.locals,
+                                            struct_meta,
+                                            check_struct,
+                                        )
+                                    })
+                                {
+                                    return false;
+                                }
+                                match agg_ty {
+                                    MirType::Array(elem_ty) => {
+                                        if !Self::is_cranelift_supported_array_elem_type(elem_ty) {
+                                            return false;
+                                        }
+                                        for elem in elems {
+                                            if Self::mir_operand_type_in_vm(
+                                                elem,
+                                                &refined.locals,
+                                                struct_meta,
+                                            )
+                                            .as_ref()
+                                                != Some(&**elem_ty)
+                                            {
+                                                return false;
+                                            }
+                                        }
                                     }
-                                    for (elem, expected_ty) in elems.iter().zip(elem_types.iter()) {
-                                        if !Self::is_cranelift_supported_array_elem_type(expected_ty)
-                                            || Self::mir_operand_type_in_vm(
+                                    MirType::Tuple(elem_types) => {
+                                        if elem_types.len() != elems.len() {
+                                            return false;
+                                        }
+                                        for (elem, expected_ty) in
+                                            elems.iter().zip(elem_types.iter())
+                                        {
+                                            if !Self::is_cranelift_supported_array_elem_type(
+                                                expected_ty,
+                                            ) || Self::mir_operand_type_in_vm(
                                                 elem,
                                                 &refined.locals,
                                                 struct_meta,
                                             )
                                             .as_ref()
                                                 != Some(expected_ty)
-                                        {
+                                            {
+                                                return false;
+                                            }
+                                        }
+                                    }
+                                    MirType::Struct(name) => {
+                                        if !check_struct(name) {
                                             return false;
                                         }
                                     }
+                                    _ => {}
                                 }
-                                MirType::Struct(name) => {
-                                    if !check_struct(name) {
-                                        return false;
-                                    }
-                                }
-                                _ => {}
                             }
                         }
-                        Rvalue::UnaryOp(MirUnaryOp::Len, op) => {
-                            let op_ty =
-                                Self::mir_operand_type_in_vm(op, &refined.locals, struct_meta);
-                            if !matches!(op_ty, Some(MirType::Array(_) | MirType::String)) {
-                                return false;
-                            }
-                        }
-                        Rvalue::Cast(_, target_ty) => {
-                            if !check_type(target_ty) {
-                                return false;
-                            }
-                        }
-                        _ => {}
                     }
+                    Statement::StorageLive(_, _)
+                    | Statement::StorageDead(_, _)
+                    | Statement::ResourceCheck(_, _, _) => {}
                 }
             }
-            if let Some(Terminator::Call { callee, args, .. }) = &block.terminator {
-                if matches!(callee.as_str(), "table.len" | "array.len") {
-                    if args.len() != 1 {
-                        return false;
+            if let Some(term) = &block.terminator {
+                match term {
+                    Terminator::Goto(_, _) | Terminator::Unreachable(_) => {}
+                    Terminator::Cond { cond, .. } => {
+                        if !Self::check_refined_operand(
+                            cond,
+                            &refined.locals,
+                            struct_meta,
+                            check_struct,
+                        ) {
+                            return false;
+                        }
                     }
-                    let arg_ty =
-                        Self::mir_operand_type_in_vm(&args[0], &refined.locals, struct_meta);
-                    if !matches!(arg_ty, Some(MirType::Array(_))) {
-                        return false;
+                    Terminator::Switch { discr, .. } => {
+                        if !Self::check_refined_operand(
+                            discr,
+                            &refined.locals,
+                            struct_meta,
+                            check_struct,
+                        ) {
+                            return false;
+                        }
                     }
-                } else if callee == "string.len" {
-                    if args.len() != 1 {
-                        return false;
+                    Terminator::Call {
+                        callee,
+                        args,
+                        destination,
+                        ..
+                    } => {
+                        if !Self::check_refined_place(
+                            destination,
+                            &refined.locals,
+                            struct_meta,
+                            check_struct,
+                        ) || !args.iter().all(|a| {
+                            Self::check_refined_operand(
+                                a,
+                                &refined.locals,
+                                struct_meta,
+                                check_struct,
+                            )
+                        }) {
+                            return false;
+                        }
+                        if callee == "print" || callee == "println" {
+                            let dest_ok = matches!(
+                                destination,
+                                crate::mir::ir::Place::Local(loc)
+                                    if matches!(
+                                        refined.locals.get(loc.0).map(|l| &l.ty),
+                                        Some(MirType::Unit | MirType::Int)
+                                    )
+                            );
+                            if !dest_ok {
+                                return false;
+                            }
+                            for arg in args {
+                                let arg_ty = Self::mir_operand_type_in_vm(
+                                    arg,
+                                    &refined.locals,
+                                    struct_meta,
+                                );
+                                if !matches!(
+                                    arg_ty,
+                                    Some(MirType::Int | MirType::Float | MirType::Bool)
+                                ) {
+                                    return false;
+                                }
+                            }
+                        } else if matches!(callee.as_str(), "table.len" | "array.len") {
+                            if args.len() != 1 {
+                                return false;
+                            }
+                            let arg_ty = Self::mir_operand_type_in_vm(
+                                &args[0],
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            if !matches!(arg_ty, Some(MirType::Array(_))) {
+                                return false;
+                            }
+                        } else if callee == "string.len" {
+                            if args.len() != 1 {
+                                return false;
+                            }
+                            let arg_ty = Self::mir_operand_type_in_vm(
+                                &args[0],
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            if arg_ty != Some(MirType::String) {
+                                return false;
+                            }
+                        }
                     }
-                    let arg_ty =
-                        Self::mir_operand_type_in_vm(&args[0], &refined.locals, struct_meta);
-                    if arg_ty != Some(MirType::String) {
+                    Terminator::Return(opt_op, _) => {
+                        if let Some(op) = opt_op
+                            && !Self::check_refined_operand(
+                                op,
+                                &refined.locals,
+                                struct_meta,
+                                check_struct,
+                            )
+                        {
+                            return false;
+                        }
+                    }
+                    Terminator::Raise(_, _) => {
                         return false;
                     }
                 }
@@ -1371,9 +1636,10 @@ impl VM {
         let param_count = param_types.len();
 
         // --- INVOCATION CONTEXT ACTIVATION & RESOURCE INITIALIZATION ---
-        // Activate invocation context before any argument packing allocations.
-        // Keep host marshaling exempt from guest memory limit until native entry.
-        let _mir_guard = self.mir_context.enter();
+        // Activate VM and MIR invocation context before any argument packing allocations.
+        // CurrentVmGuard enters both CURRENT_VM_STACK (for console routing) and mir_context
+        // once, keeping host marshaling allocations inside this scope's ownership floor.
+        let _vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
 
         let vm_gas_budget = self.gas_remaining();
         let vm_has_mem_budget = self.memory_budget_bytes().is_some();
@@ -2415,5 +2681,268 @@ impl VM {
     #[cfg(not(feature = "std"))]
     pub fn run_cranelift(&mut self) -> Result<Value> {
         self.run_inner::<false>()
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod eligibility_walker_tests {
+    use super::*;
+    use crate::ast::{Span, Type, TypeKind};
+    use crate::bytecode::value::FieldStorage;
+    use crate::mir::ir::{
+        FunctionSignature, MirBinaryOp, MirConstant, MirFunction, MirType, MirUnaryOp, Operand,
+        Place, Rvalue, Statement, Terminator,
+    };
+    use alloc::rc::Rc;
+
+    fn make_base_fn(name: &str) -> (MirFunction, crate::mir::ir::LocalId, crate::mir::ir::LocalId) {
+        let span = Span::dummy();
+        let mut f = MirFunction::new(
+            FunctionSignature {
+                name: name.to_string(),
+                param_types: vec![MirType::Int],
+                return_type: MirType::Int,
+                is_public: true,
+                effects: None,
+            },
+            span,
+        );
+        let p0 = f.params[0];
+        let dst = f.add_local(Some("dst".to_string()), MirType::Int, true, span);
+        (f, p0, dst)
+    }
+
+    #[test]
+    fn test_eligibility_walker_rejects_bad_field_projection_in_every_ir_variant() {
+        let vm = VM::new();
+        let span = Span::dummy();
+
+        // 0. Baseline valid function MUST be eligible (proves assertions have teeth).
+        {
+            let (mut f, p0, _) = make_base_fn("valid_base");
+            f.blocks[0].terminator = Some(Terminator::Return(Some(Operand::Copy(Place::Local(p0))), span));
+            assert!(vm.is_cranelift_eligible_in_vm(&f), "baseline scalar fn must be eligible");
+        }
+
+        // 1. Statement::Assign LHS bad Place::Field(Local(int), 0)
+        {
+            let (mut f, p0, _) = make_base_fn("bad_assign_lhs");
+            let bad = Place::Field(Box::new(Place::Local(p0)), 0);
+            f.blocks[0].statements.push(Statement::Assign(
+                bad,
+                Rvalue::Use(Operand::Constant(MirConstant::Int(1))),
+                span,
+            ));
+            f.blocks[0].terminator = Some(Terminator::Return(Some(Operand::Copy(Place::Local(p0))), span));
+            assert!(!vm.is_cranelift_eligible_in_vm(&f), "Assign LHS bad field must be rejected");
+        }
+
+        // 2. Rvalue::Use bad field
+        {
+            let (mut f, p0, dst) = make_base_fn("bad_rvalue_use");
+            let bad = Operand::Copy(Place::Field(Box::new(Place::Local(p0)), 0));
+            f.blocks[0].statements.push(Statement::Assign(Place::Local(dst), Rvalue::Use(bad), span));
+            f.blocks[0].terminator = Some(Terminator::Return(Some(Operand::Copy(Place::Local(dst))), span));
+            assert!(!vm.is_cranelift_eligible_in_vm(&f), "Rvalue::Use bad field must be rejected");
+        }
+
+        // 3. Rvalue::BinaryOp (lhs & rhs)
+        for in_rhs in [false, true] {
+            let (mut f, p0, dst) = make_base_fn("bad_rvalue_binop");
+            let bad = Operand::Copy(Place::Field(Box::new(Place::Local(p0)), 0));
+            let good = Operand::Constant(MirConstant::Int(1));
+            let (l, r) = if in_rhs { (good, bad) } else { (bad, good) };
+            f.blocks[0].statements.push(Statement::Assign(
+                Place::Local(dst),
+                Rvalue::BinaryOp(MirBinaryOp::Add, l, r),
+                span,
+            ));
+            f.blocks[0].terminator = Some(Terminator::Return(Some(Operand::Copy(Place::Local(dst))), span));
+            assert!(!vm.is_cranelift_eligible_in_vm(&f), "BinaryOp bad field (rhs={in_rhs}) must be rejected");
+        }
+
+        // 4. Rvalue::UnaryOp
+        {
+            let (mut f, p0, dst) = make_base_fn("bad_rvalue_unop");
+            let bad = Operand::Copy(Place::Field(Box::new(Place::Local(p0)), 0));
+            f.blocks[0].statements.push(Statement::Assign(
+                Place::Local(dst),
+                Rvalue::UnaryOp(MirUnaryOp::Neg, bad),
+                span,
+            ));
+            f.blocks[0].terminator = Some(Terminator::Return(Some(Operand::Copy(Place::Local(dst))), span));
+            assert!(!vm.is_cranelift_eligible_in_vm(&f), "UnaryOp bad field must be rejected");
+        }
+
+        // 5. Rvalue::Cast
+        {
+            let (mut f, p0, _) = make_base_fn("bad_rvalue_cast");
+            let fdst = f.add_local(Some("fdst".to_string()), MirType::Float, true, span);
+            let bad = Operand::Copy(Place::Field(Box::new(Place::Local(p0)), 0));
+            f.blocks[0].statements.push(Statement::Assign(
+                Place::Local(fdst),
+                Rvalue::Cast(bad, MirType::Float),
+                span,
+            ));
+            f.blocks[0].terminator = Some(Terminator::Return(Some(Operand::Copy(Place::Local(p0))), span));
+            assert!(!vm.is_cranelift_eligible_in_vm(&f), "Cast bad field must be rejected");
+        }
+
+        // 6. Rvalue::Aggregate
+        {
+            let (mut f, p0, _) = make_base_fn("bad_rvalue_agg");
+            let arr = f.add_local(Some("arr".to_string()), MirType::Array(Box::new(MirType::Int)), true, span);
+            let bad = Operand::Copy(Place::Field(Box::new(Place::Local(p0)), 0));
+            f.blocks[0].statements.push(Statement::Assign(
+                Place::Local(arr),
+                Rvalue::Aggregate(MirType::Array(Box::new(MirType::Int)), vec![bad]),
+                span,
+            ));
+            f.blocks[0].terminator = Some(Terminator::Return(Some(Operand::Copy(Place::Local(p0))), span));
+            assert!(!vm.is_cranelift_eligible_in_vm(&f), "Aggregate bad field must be rejected");
+        }
+
+        // 7. Terminator::Cond
+        {
+            let (mut f, p0, _) = make_base_fn("bad_term_cond");
+            let b1 = f.new_block();
+            let bad = Operand::Copy(Place::Field(Box::new(Place::Local(p0)), 0));
+            f.blocks[0].terminator = Some(Terminator::Cond {
+                cond: bad,
+                then_block: b1,
+                else_block: b1,
+                span,
+            });
+            f.blocks[b1.0].terminator = Some(Terminator::Return(Some(Operand::Copy(Place::Local(p0))), span));
+            assert!(!vm.is_cranelift_eligible_in_vm(&f), "Cond bad field must be rejected");
+        }
+
+        // 8. Terminator::Switch
+        {
+            let (mut f, p0, _) = make_base_fn("bad_term_switch");
+            let b1 = f.new_block();
+            let bad = Operand::Copy(Place::Field(Box::new(Place::Local(p0)), 0));
+            f.blocks[0].terminator = Some(Terminator::Switch {
+                discr: bad,
+                cases: vec![(0, b1)],
+                default: b1,
+                span,
+            });
+            f.blocks[b1.0].terminator = Some(Terminator::Return(Some(Operand::Copy(Place::Local(p0))), span));
+            assert!(!vm.is_cranelift_eligible_in_vm(&f), "Switch bad field must be rejected");
+        }
+
+        // 9. Terminator::Call (bad arg AND bad destination)
+        for bad_dest in [false, true] {
+            let (mut f, p0, dst) = make_base_fn("bad_term_call");
+            let b1 = f.new_block();
+            let bad_place = Place::Field(Box::new(Place::Local(p0)), 0);
+            let (args, destination) = if bad_dest {
+                (vec![Operand::Copy(Place::Local(p0))], bad_place)
+            } else {
+                (vec![Operand::Copy(bad_place)], Place::Local(dst))
+            };
+            f.blocks[0].terminator = Some(Terminator::Call {
+                callee: "abs".to_string(),
+                args,
+                destination,
+                success: b1,
+                error: None,
+                span,
+            });
+            f.blocks[b1.0].terminator = Some(Terminator::Return(Some(Operand::Copy(Place::Local(dst))), span));
+            assert!(
+                !vm.is_cranelift_eligible_in_vm(&f),
+                "Call bad field (bad_dest={bad_dest}) must be rejected"
+            );
+        }
+
+        // 10. Terminator::Return
+        {
+            let (mut f, p0, _) = make_base_fn("bad_term_return");
+            let bad = Operand::Copy(Place::Field(Box::new(Place::Local(p0)), 0));
+            f.blocks[0].terminator = Some(Terminator::Return(Some(bad), span));
+            assert!(!vm.is_cranelift_eligible_in_vm(&f), "Return bad field must be rejected");
+        }
+
+        // 11. Terminator::Raise (always rejected)
+        {
+            let (mut f, p0, _) = make_base_fn("bad_term_raise");
+            f.blocks[0].terminator = Some(Terminator::Raise(Operand::Copy(Place::Local(p0)), span));
+            assert!(!vm.is_cranelift_eligible_in_vm(&f), "Raise must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_eligibility_walker_preserves_valid_option_result_struct_handles() {
+        let mut vm = VM::new();
+        let span = Span::dummy();
+        let layout = crate::bytecode::value::StructLayout::new(
+            "Envelope".to_string(),
+            vec![
+                Rc::new("id".to_string()),
+                Rc::new("opt".to_string()),
+                Rc::new("res".to_string()),
+            ],
+            vec![FieldStorage::Strong, FieldStorage::Strong, FieldStorage::Strong],
+            vec![
+                Type::new(TypeKind::Int, span),
+                Type::new(TypeKind::Option(Box::new(Type::new(TypeKind::Int, span))), span),
+                Type::new(
+                    TypeKind::Result(
+                        Box::new(Type::new(TypeKind::Int, span)),
+                        Box::new(Type::new(TypeKind::String, span)),
+                    ),
+                    span,
+                ),
+            ],
+            vec![None, None, None],
+        );
+        vm.struct_metadata.insert(
+            "Envelope".to_string(),
+            crate::vm::RuntimeStructInfo {
+                layout: Rc::new(layout),
+            },
+        );
+        assert!(
+            vm.is_cranelift_supported_struct("Envelope"),
+            "Struct with Int/Option/Result fields must remain supported"
+        );
+
+        let mut f = MirFunction::new(
+            FunctionSignature {
+                name: "read_env_id".to_string(),
+                param_types: vec![MirType::Struct("Envelope".to_string())],
+                return_type: MirType::Int,
+                is_public: true,
+                effects: None,
+            },
+            span,
+        );
+        let p0 = f.params[0];
+        let dst = f.add_local(Some("id".to_string()), MirType::Int, true, span);
+        f.blocks[0].statements.push(Statement::Assign(
+            Place::Local(dst),
+            Rvalue::Use(Operand::Copy(Place::Field(Box::new(Place::Local(p0)), 0))),
+            span,
+        ));
+        f.blocks[0].terminator = Some(Terminator::Return(Some(Operand::Copy(Place::Local(dst))), span));
+        assert!(
+            vm.is_cranelift_eligible_in_vm(&f),
+            "Valid struct field projection on Option/Result-bearing struct must stay eligible"
+        );
+
+        // Out-of-bounds field index on the same valid struct MUST be rejected.
+        let mut f_oob = f.clone();
+        f_oob.signature.name = "read_env_oob".to_string();
+        f_oob.blocks[0].statements[0] = Statement::Assign(
+            Place::Local(dst),
+            Rvalue::Use(Operand::Copy(Place::Field(Box::new(Place::Local(p0)), 9))),
+            span,
+        );
+        assert!(
+            !vm.is_cranelift_eligible_in_vm(&f_oob),
+            "Out-of-bounds field projection on valid struct must be rejected"
+        );
     }
 }

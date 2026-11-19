@@ -334,54 +334,79 @@ impl<'a> AstLowering<'a> {
     }
 
     fn resolve_field_idx(&self, base_place: &Place, field: &str) -> Option<usize> {
+        // 1. If the exact struct name of `base_place` is known and its schema is registered,
+        //    resolve strictly against that schema (never fall through to unrelated heuristics).
         if let Some(struct_name) = self.get_place_struct_name(base_place) {
+            let mut has_schema = false;
             if let Some(names) = self.struct_fields.get(&struct_name) {
+                has_schema = true;
                 if let Some(pos) = names.iter().position(|n| n == field) {
                     return Some(pos);
                 }
             }
-        }
-        if let Place::Local(loc) = base_place {
-            if let Some(names) = self.local_field_names.get(loc) {
-                if let Some(pos) = names.iter().position(|n| n == field) {
-                    return Some(pos);
+            if let Some(layout) = self.struct_layouts.get(&struct_name) {
+                has_schema = true;
+                if let Some(f_desc) = layout.field_by_name(field) {
+                    return Some(f_desc.ordinal as usize);
                 }
             }
+            if has_schema {
+                return None;
+            }
         }
-        let loc = match base_place {
-            Place::Local(loc) => *loc,
-            Place::Field(base, _) | Place::Index(base, _) => match &**base {
-                Place::Local(loc) => *loc,
-                _ => return None,
-            },
+
+        // 2. For direct locals only (never unwrap nested Field/Index back to a parent struct),
+        //    check per-local field names and declared local type.
+        let base_ty: Option<&MirType> = match base_place {
+            Place::Local(loc) => {
+                if let Some(names) = self.local_field_names.get(loc) {
+                    return names.iter().position(|n| n == field);
+                }
+                self.current_fn.locals.get(loc.0).map(|l| &l.ty)
+            }
+            Place::Index(inner, _) => {
+                if let Place::Local(loc) = &**inner {
+                    match self.current_fn.locals.get(loc.0).map(|l| &l.ty) {
+                        Some(MirType::Array(elem)) => Some(elem.as_ref()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            Place::Field(_, _) => None,
         };
-        if let Some(names) = self.local_field_names.get(&loc) {
-            if let Some(pos) = names.iter().position(|n| n == field) {
-                return Some(pos);
-            }
-        }
-        if let MirType::Struct(struct_name) = &self.current_fn.locals[loc.0].ty {
-            if let Some(names) = self.struct_fields.get(struct_name) {
-                if let Some(pos) = names.iter().position(|n| n == field) {
-                    return Some(pos);
+
+        // 3. Tuple numeric/underscore field access: only valid on Tuple (or Unknown) base.
+        if matches!(base_ty, Some(MirType::Tuple(_) | MirType::Unknown)) {
+            if let Ok(idx) = field.parse::<usize>() {
+                if let Some(MirType::Tuple(elems)) = base_ty {
+                    return (idx < elems.len()).then_some(idx);
                 }
-            }
-        }
-        if let Ok(idx) = field.parse::<usize>() {
-            return Some(idx);
-        }
-        if let Some(stripped) = field.strip_prefix('_') {
-            if let Ok(idx) = stripped.parse::<usize>() {
                 return Some(idx);
             }
+            if let Some(stripped) = field.strip_prefix('_') {
+                if let Ok(idx) = stripped.parse::<usize>() {
+                    if let Some(MirType::Tuple(elems)) = base_ty {
+                        return (idx < elems.len()).then_some(idx);
+                    }
+                    return Some(idx);
+                }
+            }
         }
-        match field {
-            "x" => Some(0),
-            "y" => Some(1),
-            "z" => Some(2),
-            "w" => Some(3),
-            _ => None,
+
+        // 4. Legacy coordinate fallback ONLY for unregistered Struct locals (never scalars/Enums/constants).
+        if matches!(base_ty, Some(MirType::Struct(_))) {
+            return match field {
+                "x" => Some(0),
+                "y" => Some(1),
+                "z" => Some(2),
+                "w" => Some(3),
+                _ => None,
+            };
         }
+
+        None
     }
 
     pub fn lower_function(func_def: &FunctionDef) -> Result<MirFunction, MirLowerError> {
@@ -1347,7 +1372,9 @@ impl<'a> AstLowering<'a> {
                             return Ok((Operand::Move(Place::Local(in_bounds_temp)), out_bindings));
                         }
 
-                        Ok((self.lower_expr(condition)?, Vec::new()))
+                        Err(MirLowerError::UnlowerableExpression(format!(
+                            "non-indexed is-pattern '{variant}' is not supported in MIR lowering"
+                        )))
                     }
                     crate::ast::Pattern::Wildcard => {
                         Ok((Operand::Constant(MirConstant::Bool(true)), Vec::new()))
@@ -1385,7 +1412,9 @@ impl<'a> AstLowering<'a> {
                         ));
                         Ok((Operand::Move(Place::Local(temp)), Vec::new()))
                     }
-                    _ => Ok((Operand::Constant(MirConstant::Bool(false)), Vec::new())),
+                    _ => Err(MirLowerError::UnlowerableExpression(
+                        "unsupported is-pattern in MIR lowering".to_string(),
+                    )),
                 }
             }
             _ => Ok((self.lower_expr(condition)?, Vec::new())),
@@ -1906,6 +1935,13 @@ impl<'a> AstLowering<'a> {
                 Ok(Operand::Move(Place::Local(temp)))
             }
             ExprKind::FieldAccess { object, field } if field != "len" => {
+                if let ExprKind::Identifier(name) = &object.kind
+                    && self.lookup_var(name).is_none()
+                {
+                    return Err(MirLowerError::UnlowerableExpression(format!(
+                        "field access on non-local '{name}.{field}' is not supported in MIR lowering"
+                    )));
+                }
                 let base_place = if let Some(p) = self.lower_place(object)? {
                     p
                 } else {
@@ -1913,14 +1949,17 @@ impl<'a> AstLowering<'a> {
                     match obj_op {
                         Operand::Copy(p) | Operand::Move(p) => p,
                         Operand::Constant(_) => {
-                            let temp = self.current_fn.add_local(None, MirType::Int, true, expr.span);
-                            self.emit_stmt(Statement::StorageLive(temp, expr.span));
-                            self.emit_stmt(Statement::Assign(Place::Local(temp), Rvalue::Use(obj_op), expr.span));
-                            Place::Local(temp)
+                            return Err(MirLowerError::UnlowerableExpression(format!(
+                                "field access '.{field}' on constant value is not supported in MIR lowering"
+                            )));
                         }
                     }
                 };
-                let field_idx = self.resolve_field_idx(&base_place, field).unwrap_or(0);
+                let field_idx = self.resolve_field_idx(&base_place, field).ok_or_else(|| {
+                    MirLowerError::UnlowerableExpression(format!(
+                        "cannot resolve field '{field}' in MIR lowering"
+                    ))
+                })?;
                 let field_place = Place::Field(Box::new(base_place.clone()), field_idx);
                 let mut field_mir_ty = MirType::Int;
                 let mut recorded_load: Option<(String, u16, usize, CanonicalTypeTag)> = None;

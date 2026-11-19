@@ -15,7 +15,9 @@ pub use jit_engine::{
     lust_mir_get_memory_used, lust_mir_get_status, lust_mir_ic_dispatch, lust_mir_ic_miss,
     lust_mir_ic_probe, lust_mir_init_deopt, lust_mir_init_deopt_at_terminator, lust_mir_map_get, lust_mir_map_len,
     lust_mir_map_set, lust_mir_max_int, lust_mir_min_int, lust_mir_pow_float,
-    lust_mir_pow_int, lust_mir_print_int, lust_mir_record_deopt, lust_mir_record_deopt_local,
+    lust_mir_pow_int, lust_mir_print_bool_part, lust_mir_print_float_part, lust_mir_print_int,
+    lust_mir_print_int_part, lust_mir_print_nl, lust_mir_print_sep, lust_mir_record_deopt,
+    lust_mir_record_deopt_local,
     lust_mir_record_native_entry, lust_mir_rem_float, lust_mir_rem_int, lust_mir_safepoint,
     lust_mir_set_gas, lust_mir_set_max_memory, lust_mir_set_memory_limit, lust_mir_set_status,
     lust_mir_string_concat, lust_mir_string_eq, lust_mir_string_len,
@@ -1668,6 +1670,11 @@ pub mod jit_engine {
             builder.symbol("lust_mir_get_status", lust_mir_get_status as *const u8);
             builder.symbol("lust_mir_set_status", lust_mir_set_status as *const u8);
             builder.symbol("lust_mir_print_int", lust_mir_print_int as *const u8);
+            builder.symbol("lust_mir_print_int_part", lust_mir_print_int_part as *const u8);
+            builder.symbol("lust_mir_print_float_part", lust_mir_print_float_part as *const u8);
+            builder.symbol("lust_mir_print_bool_part", lust_mir_print_bool_part as *const u8);
+            builder.symbol("lust_mir_print_sep", lust_mir_print_sep as *const u8);
+            builder.symbol("lust_mir_print_nl", lust_mir_print_nl as *const u8);
             builder.symbol("lust_mir_div_int", lust_mir_div_int as *const u8);
             builder.symbol("lust_mir_rem_int", lust_mir_rem_int as *const u8);
 
@@ -3035,11 +3042,32 @@ pub mod jit_engine {
                 .declare_function("lust_mir_alloc_cflat_struct", Linkage::Import, &alloc_named_sig)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
-            let mut print_sig = self.module.make_signature();
-            print_sig.params.push(AbiParam::new(types::I64));
-            let print_callee = self
+            let mut print_i64_sig = self.module.make_signature();
+            print_i64_sig.params.push(AbiParam::new(types::I64));
+            let print_int_part_callee = self
                 .module
-                .declare_function("lust_mir_print_int", Linkage::Import, &print_sig)
+                .declare_function("lust_mir_print_int_part", Linkage::Import, &print_i64_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let print_bool_part_callee = self
+                .module
+                .declare_function("lust_mir_print_bool_part", Linkage::Import, &print_i64_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let mut print_f64_sig = self.module.make_signature();
+            print_f64_sig.params.push(AbiParam::new(types::F64));
+            let print_float_part_callee = self
+                .module
+                .declare_function("lust_mir_print_float_part", Linkage::Import, &print_f64_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let print_void_sig = self.module.make_signature();
+            let print_sep_callee = self
+                .module
+                .declare_function("lust_mir_print_sep", Linkage::Import, &print_void_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let print_nl_callee = self
+                .module
+                .declare_function("lust_mir_print_nl", Linkage::Import, &print_void_sig)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
             // Declare safepoint and deopt imports
@@ -3284,7 +3312,11 @@ pub mod jit_engine {
                 let gas_fn = self.module.declare_func_in_func(gas_callee, &mut builder.func);
                 let status_fn = self.module.declare_func_in_func(status_callee, &mut builder.func);
                 let status_set_fn = self.module.declare_func_in_func(status_set_callee, &mut builder.func);
-                let print_fn = self.module.declare_func_in_func(print_callee, &mut builder.func);
+                let print_int_part_fn = self.module.declare_func_in_func(print_int_part_callee, &mut builder.func);
+                let print_float_part_fn = self.module.declare_func_in_func(print_float_part_callee, &mut builder.func);
+                let print_bool_part_fn = self.module.declare_func_in_func(print_bool_part_callee, &mut builder.func);
+                let print_sep_fn = self.module.declare_func_in_func(print_sep_callee, &mut builder.func);
+                let print_nl_fn = self.module.declare_func_in_func(print_nl_callee, &mut builder.func);
                 let floordiv_fn = self.module.declare_func_in_func(floordiv_callee, &mut builder.func);
                 let pow_fn = self.module.declare_func_in_func(pow_callee, &mut builder.func);
                 let div_fn = self.module.declare_func_in_func(div_callee, &mut builder.func);
@@ -3876,15 +3908,70 @@ pub mod jit_engine {
                             }
                             Terminator::Call { callee, args, destination, success, .. } => {
                                 if callee == "print" || callee == "println" {
-                                    let arg_val = if let Some(first) = args.first() {
-                                        lower_operand(first, &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?
-                                    } else {
-                                        builder.ins().iconst(types::I64, 0)
-                                    };
-                                    builder.ins().call(print_fn, &[arg_val]);
-                                    if let Place::Local(loc) = destination {
-                                        let zero = builder.ins().iconst(types::I64, 0);
-                                        store_local_val(*loc, zero, &mut builder, &local_vars, &stack_slots)?;
+                                    for (idx, arg) in args.iter().enumerate() {
+                                        if idx > 0 {
+                                            builder.ins().call(print_sep_fn, &[]);
+                                        }
+                                        let mir_ty = try_operand_type(arg, &mir_fn.locals, &self.struct_layouts)?;
+                                        let arg_val = lower_operand(arg, &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                        let clif_ty = builder.func.dfg.value_type(arg_val);
+                                        match (&mir_ty, clif_ty) {
+                                            (MirType::Int, types::I64) => {
+                                                builder.ins().call(print_int_part_fn, &[arg_val]);
+                                            }
+                                            (MirType::Float, types::F64) => {
+                                                builder.ins().call(print_float_part_fn, &[arg_val]);
+                                            }
+                                            (MirType::Bool, types::I8) => {
+                                                let ext = builder.ins().uextend(types::I64, arg_val);
+                                                builder.ins().call(print_bool_part_fn, &[ext]);
+                                            }
+                                            (MirType::Bool, types::I64) => {
+                                                builder.ins().call(print_bool_part_fn, &[arg_val]);
+                                            }
+                                            _ => {
+                                                return Err(MirCraneliftBackendError::CodegenError(format!(
+                                                    "Unsupported argument type ({mir_ty}, {clif_ty}) for Cranelift {callee}"
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    if callee == "println" {
+                                        builder.ins().call(print_nl_fn, &[]);
+                                    }
+                                    match destination {
+                                        Place::Local(loc) => {
+                                            let dest_mir_ty = &mir_fn
+                                                .locals
+                                                .get(loc.0)
+                                                .ok_or_else(|| {
+                                                    MirCraneliftBackendError::CodegenError(format!(
+                                                        "Destination local {loc:?} out of bounds for Cranelift {callee}"
+                                                    ))
+                                                })?
+                                                .ty;
+                                            let dest_clif_ty = mir_to_clif_type(dest_mir_ty)?;
+                                            match (dest_mir_ty, dest_clif_ty) {
+                                                (MirType::Unit, types::I8) => {
+                                                    let zero = builder.ins().iconst(types::I8, 0);
+                                                    store_local_val(*loc, zero, &mut builder, &local_vars, &stack_slots)?;
+                                                }
+                                                (MirType::Int, types::I64) => {
+                                                    let zero = builder.ins().iconst(types::I64, 0);
+                                                    store_local_val(*loc, zero, &mut builder, &local_vars, &stack_slots)?;
+                                                }
+                                                _ => {
+                                                    return Err(MirCraneliftBackendError::CodegenError(format!(
+                                                        "Unsupported destination type ({dest_mir_ty}, {dest_clif_ty}) for Cranelift {callee}"
+                                                    )));
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            return Err(MirCraneliftBackendError::CodegenError(format!(
+                                                "Unsupported non-local destination place for Cranelift {callee}"
+                                            )));
+                                        }
                                     }
                                     builder.ins().jump(clif_blocks[success.0], &[]);
                                 } else if let Some(struct_name) = crate::mir::ir::parse_mir_struct_decode_callee(callee) {
@@ -5920,7 +6007,15 @@ pub mod jit_engine {
         })?;
         builder.def_var(var, val);
         if let Some(&slot) = stack_slots.get(&loc.0) {
-            builder.ins().stack_store(types::I64, val, slot, 0);
+            let val_ty = builder.func.dfg.value_type(val);
+            let store_val = if val_ty == types::I8 {
+                builder.ins().uextend(types::I64, val)
+            } else if val_ty == types::F64 {
+                builder.ins().bitcast(types::I64, MemFlagsData::new(), val)
+            } else {
+                val
+            };
+            builder.ins().stack_store(types::I64, store_val, slot, 0);
         }
         Ok(())
     }

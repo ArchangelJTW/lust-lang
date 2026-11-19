@@ -1086,9 +1086,44 @@ pub extern "C" fn lust_mir_pow_int(mut base: i64, exp: i64) -> i64 {
     res
 }
 
+fn write_mir_stdout(text: &str) {
+    if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+        unsafe {
+            (*vm_ptr).console.write_stdout(text.as_bytes());
+        }
+    } else {
+        print!("{text}");
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_print_int(x: i64) {
-    println!("{x}");
+    write_mir_stdout(&alloc::format!("{}\n", crate::bytecode::Value::Int(x)));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_print_int_part(x: i64) {
+    write_mir_stdout(&alloc::format!("{}", crate::bytecode::Value::Int(x)));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_print_float_part(x: f64) {
+    write_mir_stdout(&alloc::format!("{}", crate::bytecode::Value::Float(x)));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_print_bool_part(x: i64) {
+    write_mir_stdout(&alloc::format!("{}", crate::bytecode::Value::Bool(x != 0)));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_print_sep() {
+    write_mir_stdout("\t");
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_print_nl() {
+    write_mir_stdout("\n");
 }
 
 #[unsafe(no_mangle)]

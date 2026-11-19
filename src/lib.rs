@@ -44,6 +44,8 @@ pub mod typechecker;
 pub mod vm;
 pub mod sim;
 #[cfg(feature = "std")]
+pub mod sandbox;
+#[cfg(feature = "std")]
 pub mod stdlib;
 #[cfg(feature = "std")]
 pub mod vfs;

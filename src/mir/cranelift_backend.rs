@@ -6393,7 +6393,15 @@ pub mod jit_engine {
                 }
                 let val = match unop {
                     MirUnaryOp::Neg => builder.ins().ineg(v),
-                    MirUnaryOp::Not => builder.ins().bnot(v),
+                    MirUnaryOp::Not => {
+                        if builder.func.dfg.value_type(v).is_int() {
+                            builder.ins().icmp_imm_s(IntCC::Equal, v, 0)
+                        } else {
+                            return Err(MirCraneliftBackendError::CodegenError(
+                                "MirUnaryOp::Not requires bool/int operand".into(),
+                            ));
+                        }
+                    }
                     MirUnaryOp::BitNot => builder.ins().bnot(v),
                     MirUnaryOp::Len => unreachable!("handled above"),
                 };

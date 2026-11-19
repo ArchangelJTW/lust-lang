@@ -93,6 +93,10 @@ pub struct Function {
     /// Only stored when minimal_runtime_types is disabled
     pub register_types: HashMap<u8, TypeKind>,
     pub signature: Option<FunctionSignature>,
+    /// Bytecode PC immediately before each basic block terminator (keyed by block id index)
+    pub terminator_pcs: HashMap<usize, usize>,
+    /// Authoritative bytecode PC at the entry of each basic block (keyed by block id index)
+    pub block_entry_pcs: HashMap<usize, usize>,
 }
 
 impl Function {
@@ -106,6 +110,8 @@ impl Function {
             upvalues: Vec::new(),
             register_types: HashMap::new(),
             signature: None,
+            terminator_pcs: HashMap::new(),
+            block_entry_pcs: HashMap::new(),
         }
     }
 
@@ -120,6 +126,8 @@ impl Function {
             upvalues: Vec::new(),
             register_types: HashMap::new(), // Empty, won't be populated
             signature: None,
+            terminator_pcs: HashMap::new(),
+            block_entry_pcs: HashMap::new(),
         }
     }
 

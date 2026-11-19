@@ -92,11 +92,41 @@ pub struct LocalDecl {
     pub is_mut: bool,
     pub span: Span,
     pub is_stack_promoted: bool,
+    pub is_param: bool,
 }
 
 impl LocalDecl {
+    pub fn new(id: LocalId, name: Option<String>, ty: MirType, is_mut: bool, span: Span) -> Self {
+        Self {
+            id,
+            name,
+            ty,
+            is_mut,
+            span,
+            is_stack_promoted: false,
+            is_param: false,
+        }
+    }
+
+    pub fn param(id: LocalId, name: Option<String>, ty: MirType, span: Span) -> Self {
+        Self {
+            id,
+            name,
+            ty,
+            is_mut: false,
+            span,
+            is_stack_promoted: false,
+            is_param: true,
+        }
+    }
+
     pub fn with_stack_promoted(mut self, promoted: bool) -> Self {
         self.is_stack_promoted = promoted;
+        self
+    }
+
+    pub fn with_param(mut self, is_param: bool) -> Self {
+        self.is_param = is_param;
         self
     }
 }
@@ -129,6 +159,27 @@ pub enum Place {
     Index(Box<Place>, LocalId),
 }
 
+impl Place {
+    pub fn root_local(&self) -> LocalId {
+        match self {
+            Place::Local(id) => *id,
+            Place::Field(base, _) => base.root_local(),
+            Place::Index(base, _) => base.root_local(),
+        }
+    }
+
+    pub fn collect_uses(&self, set: &mut hashbrown::HashSet<usize>) {
+        match self {
+            Place::Local(_) => {}
+            Place::Field(base, _) => base.collect_uses(set),
+            Place::Index(base, idx) => {
+                base.collect_uses(set);
+                set.insert(idx.0);
+            }
+        }
+    }
+}
+
 impl fmt::Display for Place {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -144,6 +195,18 @@ pub enum Operand {
     Copy(Place),
     Move(Place),
     Constant(MirConstant),
+}
+
+impl Operand {
+    pub fn collect_uses(&self, set: &mut hashbrown::HashSet<usize>) {
+        match self {
+            Operand::Copy(p) | Operand::Move(p) => {
+                set.insert(p.root_local().0);
+                p.collect_uses(set);
+            }
+            Operand::Constant(_) => {}
+        }
+    }
 }
 
 impl fmt::Display for Operand {
@@ -236,6 +299,25 @@ pub enum Rvalue {
     Aggregate(MirType, Vec<Operand>),
 }
 
+impl Rvalue {
+    pub fn collect_uses(&self, set: &mut hashbrown::HashSet<usize>) {
+        match self {
+            Rvalue::Use(op) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(op, _) => {
+                op.collect_uses(set);
+            }
+            Rvalue::BinaryOp(_, lhs, rhs) => {
+                lhs.collect_uses(set);
+                rhs.collect_uses(set);
+            }
+            Rvalue::Aggregate(_, ops) => {
+                for op in ops {
+                    op.collect_uses(set);
+                }
+            }
+        }
+    }
+}
+
 impl fmt::Display for Rvalue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -269,6 +351,29 @@ pub enum Statement {
     StorageLive(LocalId, Span),
     StorageDead(LocalId, Span),
     ResourceCheck(ResourceKind, u64, Span),
+}
+
+impl Statement {
+    pub fn collect_uses(&self, set: &mut hashbrown::HashSet<usize>) {
+        match self {
+            Statement::Assign(place, rval, _) => {
+                rval.collect_uses(set);
+                match place {
+                    Place::Local(_) => {}
+                    Place::Field(base, _) => {
+                        set.insert(base.root_local().0);
+                        base.collect_uses(set);
+                    }
+                    Place::Index(base, idx) => {
+                        set.insert(base.root_local().0);
+                        set.insert(idx.0);
+                        base.collect_uses(set);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl fmt::Display for Statement {
@@ -308,6 +413,56 @@ pub enum Terminator {
     Return(Option<Operand>, Span),
     Raise(Operand, Span),
     Unreachable(Span),
+}
+
+impl Terminator {
+    pub fn successors(&self) -> Vec<usize> {
+        match self {
+            Terminator::Goto(target, _) => vec![target.0],
+            Terminator::Cond { then_block, else_block, .. } => vec![then_block.0, else_block.0],
+            Terminator::Switch { cases, default, .. } => {
+                let mut succs = Vec::with_capacity(cases.len() + 1);
+                for (_, b) in cases {
+                    succs.push(b.0);
+                }
+                succs.push(default.0);
+                succs
+            }
+            Terminator::Call { success, error, .. } => {
+                if let Some(err_b) = error {
+                    vec![success.0, err_b.0]
+                } else {
+                    vec![success.0]
+                }
+            }
+            Terminator::Return(..) | Terminator::Raise(..) | Terminator::Unreachable(..) => vec![],
+        }
+    }
+
+    pub fn collect_uses(&self, set: &mut hashbrown::HashSet<usize>) {
+        match self {
+            Terminator::Goto(..) | Terminator::Unreachable(..) => {}
+            Terminator::Cond { cond, .. } => {
+                cond.collect_uses(set);
+            }
+            Terminator::Switch { discr, .. } => {
+                discr.collect_uses(set);
+            }
+            Terminator::Call { args, destination, .. } => {
+                for arg in args {
+                    arg.collect_uses(set);
+                }
+                if !matches!(destination, Place::Local(_)) {
+                    destination.collect_uses(set);
+                    set.insert(destination.root_local().0);
+                }
+            }
+            Terminator::Return(Some(op), _) | Terminator::Raise(op, _) => {
+                op.collect_uses(set);
+            }
+            Terminator::Return(None, _) => {}
+        }
+    }
 }
 
 impl fmt::Display for Terminator {
@@ -402,6 +557,7 @@ impl MirFunction {
                 is_mut: false,
                 span,
                 is_stack_promoted: false,
+                is_param: true,
             });
             params.push(p_id);
         }
@@ -414,6 +570,7 @@ impl MirFunction {
             is_mut: true,
             span,
             is_stack_promoted: false,
+            is_param: false,
         };
         locals.push(ret_decl);
 
@@ -439,7 +596,24 @@ impl MirFunction {
             is_mut,
             span,
             is_stack_promoted: false,
+            is_param: false,
         });
+        id
+    }
+
+    pub fn add_param(&mut self, name: Option<String>, ty: MirType, span: Span) -> LocalId {
+        let id = LocalId(self.locals.len());
+        self.locals.push(LocalDecl {
+            id,
+            name,
+            ty: ty.clone(),
+            is_mut: false,
+            span,
+            is_stack_promoted: false,
+            is_param: true,
+        });
+        self.params.push(id);
+        self.signature.param_types.push(ty);
         id
     }
 
@@ -451,6 +625,368 @@ impl MirFunction {
 
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock {
         &mut self.blocks[id.0]
+    }
+
+    pub fn derive_proven_site_metadata(&self, target_block_id: usize) -> Result<Vec<usize>, String> {
+        self.derive_proven_site_metadata_internal(target_block_id, false)
+    }
+
+    pub fn derive_proven_site_metadata_at_entry(&self, target_block_id: usize) -> Result<Vec<usize>, String> {
+        self.derive_proven_site_metadata_internal(target_block_id, true)
+    }
+
+    fn derive_proven_site_metadata_internal(
+        &self,
+        target_block_id: usize,
+        at_entry: bool,
+    ) -> Result<Vec<usize>, String> {
+        let num_blocks = self.blocks.len();
+        if target_block_id >= num_blocks {
+            return Err(alloc::format!(
+                "Deopt site block {} out of bounds (function '{}' has {} blocks)",
+                target_block_id, self.signature.name, num_blocks
+            ));
+        }
+
+        if self.entry.0 >= num_blocks {
+            return Err(alloc::format!(
+                "Invalid CFG: entry block {} is out of bounds (function '{}' has {} blocks)",
+                self.entry.0, self.signature.name, num_blocks
+            ));
+        }
+
+        if !at_entry
+            && let Some(Terminator::Call { destination, .. }) =
+                &self.blocks[target_block_id].terminator
+            && !matches!(destination, Place::Local(_))
+        {
+            return Err(alloc::format!(
+                "Cannot derive proven compiler site metadata for deopt site {}: projected call destination {:?} is unsupported at PreTerminator in function '{}'",
+                target_block_id, destination, self.signature.name
+            ));
+        }
+
+        // 1. Strict CFG validation: every block must have a terminator with valid targets
+        for (idx, block) in self.blocks.iter().enumerate() {
+            let term = match &block.terminator {
+                Some(t) => t,
+                None => {
+                    return Err(alloc::format!(
+                        "Invalid CFG: block {} is missing a terminator in function '{}'",
+                        idx, self.signature.name
+                    ));
+                }
+            };
+            for succ in term.successors() {
+                if succ >= num_blocks {
+                    return Err(alloc::format!(
+                        "Invalid CFG: block {} branches to out-of-bounds block {} in function '{}'",
+                        idx, succ, self.signature.name
+                    ));
+                }
+            }
+        }
+
+        // 2. Reachability analysis from entry
+        let mut reachable = hashbrown::HashSet::new();
+        let mut reach_worklist = Vec::new();
+        reachable.insert(self.entry.0);
+        reach_worklist.push(self.entry.0);
+        while let Some(u) = reach_worklist.pop() {
+            let term = self.blocks[u].terminator.as_ref().unwrap();
+            for succ in term.successors() {
+                if reachable.insert(succ) {
+                    reach_worklist.push(succ);
+                }
+            }
+        }
+
+        if !reachable.contains(&target_block_id) {
+            return Err(alloc::format!(
+                "Cannot derive proven compiler site metadata for deopt site {}: block is unreachable in function '{}'",
+                target_block_id, self.signature.name
+            ));
+        }
+
+        // 3. Loop/join/order-independent definite assignment fixed point (Forward dataflow, intersection meet)
+        let mut block_inits: Vec<Option<hashbrown::HashSet<usize>>> = vec![None; num_blocks];
+        let mut entry_set = hashbrown::HashSet::new();
+        for p in &self.params {
+            if p.0 < self.locals.len() {
+                entry_set.insert(p.0);
+            }
+        }
+        block_inits[self.entry.0] = Some(entry_set);
+
+        let mut da_worklist = Vec::new();
+        let mut da_in_worklist = hashbrown::HashSet::new();
+        da_worklist.push(self.entry.0);
+        da_in_worklist.insert(self.entry.0);
+
+        let max_iterations = num_blocks * (self.locals.len() + 1) * 4 + 100;
+        let mut da_iterations = 0;
+
+        while let Some(u) = da_worklist.pop() {
+            da_in_worklist.remove(&u);
+            da_iterations += 1;
+            if da_iterations > max_iterations {
+                return Err(alloc::format!(
+                    "Definite assignment dataflow did not converge to fixed point in function '{}'",
+                    self.signature.name
+                ));
+            }
+
+            let in_u = match &block_inits[u] {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+
+            let mut out_u = in_u;
+            for stmt in &self.blocks[u].statements {
+                match stmt {
+                    Statement::Assign(Place::Local(loc), _, _) => {
+                        out_u.insert(loc.0);
+                    }
+                    Statement::StorageDead(loc, _) => {
+                        out_u.remove(&loc.0);
+                    }
+                    _ => {}
+                }
+            }
+
+            let term = self.blocks[u].terminator.as_ref().unwrap();
+            match term {
+                Terminator::Goto(target, _) => {
+                    Self::propagate_da(&mut block_inits, &mut da_worklist, &mut da_in_worklist, target.0, &out_u);
+                }
+                Terminator::Cond { then_block, else_block, .. } => {
+                    Self::propagate_da(&mut block_inits, &mut da_worklist, &mut da_in_worklist, then_block.0, &out_u);
+                    Self::propagate_da(&mut block_inits, &mut da_worklist, &mut da_in_worklist, else_block.0, &out_u);
+                }
+                Terminator::Switch { cases, default, .. } => {
+                    for (_, target) in cases {
+                        Self::propagate_da(&mut block_inits, &mut da_worklist, &mut da_in_worklist, target.0, &out_u);
+                    }
+                    Self::propagate_da(&mut block_inits, &mut da_worklist, &mut da_in_worklist, default.0, &out_u);
+                }
+                Terminator::Call { destination, success, error, .. } => {
+                    let mut succ_out = out_u.clone();
+                    if let Place::Local(loc) = destination {
+                        succ_out.insert(loc.0);
+                    }
+                    Self::propagate_da(&mut block_inits, &mut da_worklist, &mut da_in_worklist, success.0, &succ_out);
+                    if let Some(err_b) = error {
+                        Self::propagate_da(&mut block_inits, &mut da_worklist, &mut da_in_worklist, err_b.0, &out_u);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let site_inits = if at_entry {
+            match &block_inits[target_block_id] {
+                Some(s) => s.clone(),
+                None => {
+                    return Err(alloc::format!(
+                        "Cannot derive proven compiler site metadata for deopt site {}: block has uncomputed inits in function '{}'",
+                        target_block_id, self.signature.name
+                    ));
+                }
+            }
+        } else {
+            let mut cur = match &block_inits[target_block_id] {
+                Some(s) => s.clone(),
+                None => {
+                    return Err(alloc::format!(
+                        "Cannot derive proven compiler site metadata for deopt site {}: block has uncomputed inits in function '{}'",
+                        target_block_id, self.signature.name
+                    ));
+                }
+            };
+            for stmt in &self.blocks[target_block_id].statements {
+                match stmt {
+                    Statement::Assign(Place::Local(loc), _, _) => {
+                        cur.insert(loc.0);
+                    }
+                    Statement::StorageDead(loc, _) => {
+                        cur.remove(&loc.0);
+                    }
+                    _ => {}
+                }
+            }
+            cur
+        };
+
+        // 4. Actual liveness analysis (Backward dataflow, union meet)
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+        for (u, block) in self.blocks.iter().enumerate() {
+            let term = block.terminator.as_ref().unwrap();
+            for succ in term.successors() {
+                preds[succ].push(u);
+            }
+        }
+
+        let mut live_in: Vec<hashbrown::HashSet<usize>> = vec![hashbrown::HashSet::new(); num_blocks];
+        let mut live_at_pre_term: Vec<hashbrown::HashSet<usize>> = vec![hashbrown::HashSet::new(); num_blocks];
+
+        let mut live_worklist: Vec<usize> = (0..num_blocks).collect();
+        let mut live_in_worklist: hashbrown::HashSet<usize> = (0..num_blocks).collect();
+        let mut live_iterations = 0;
+
+        while let Some(v) = live_worklist.pop() {
+            live_in_worklist.remove(&v);
+            live_iterations += 1;
+            if live_iterations > max_iterations {
+                return Err(alloc::format!(
+                    "Liveness dataflow did not converge to fixed point in function '{}'",
+                    self.signature.name
+                ));
+            }
+
+            // Compute live_at_pre_term[v] from successors
+            let term = self.blocks[v].terminator.as_ref().unwrap();
+            let mut pre_term = hashbrown::HashSet::new();
+            term.collect_uses(&mut pre_term);
+
+            match term {
+                Terminator::Call { destination, success, error, .. } => {
+                    for &loc in &live_in[success.0] {
+                        if let Place::Local(dst) = destination {
+                            if loc != dst.0 {
+                                pre_term.insert(loc);
+                            }
+                        } else {
+                            pre_term.insert(loc);
+                        }
+                    }
+                    if let Some(err_b) = error {
+                        for &loc in &live_in[err_b.0] {
+                            pre_term.insert(loc);
+                        }
+                    }
+                }
+                _ => {
+                    for succ in term.successors() {
+                        for &loc in &live_in[succ] {
+                            pre_term.insert(loc);
+                        }
+                    }
+                }
+            }
+            live_at_pre_term[v] = pre_term;
+
+            // Backward transfer through statements of v:
+            let mut cur_live = live_at_pre_term[v].clone();
+            for stmt in self.blocks[v].statements.iter().rev() {
+                match stmt {
+                    Statement::Assign(place, _, _) => {
+                        if let Place::Local(loc) = place {
+                            cur_live.remove(&loc.0);
+                        } else {
+                            cur_live.insert(place.root_local().0);
+                        }
+                        stmt.collect_uses(&mut cur_live);
+                    }
+                    Statement::StorageDead(loc, _) => {
+                        cur_live.remove(&loc.0);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Check if live_in[v] changed:
+            let mut changed = false;
+            for &loc in &cur_live {
+                if live_in[v].insert(loc) {
+                    changed = true;
+                }
+            }
+
+            if changed {
+                for &p in &preds[v] {
+                    if live_in_worklist.insert(p) {
+                        live_worklist.push(p);
+                    }
+                }
+            }
+        }
+
+        // 5. Authoritative capture metadata at exact site:
+        let site_live = if at_entry {
+            &live_in[target_block_id]
+        } else {
+            &live_at_pre_term[target_block_id]
+        };
+
+        // 6. Fail-closed validations:
+        // A) Every live local at deopt site must be definitely assigned (uninitialized fails closed)
+        for &loc_idx in site_live {
+            if !site_inits.contains(&loc_idx) {
+                return Err(alloc::format!(
+                    "Cannot derive proven compiler site metadata for deopt site {}: local {} is live at deopt site but not definitely assigned (uninitialized on some path) in function '{}'",
+                    target_block_id, loc_idx, self.signature.name
+                ));
+            }
+        }
+
+        // B) Validate bounds and scalar types for all live locals
+        let mut proven_indices: Vec<usize> = site_live.iter().copied().collect();
+        proven_indices.sort();
+
+        for &idx in &proven_indices {
+            if idx >= self.locals.len() {
+                return Err(alloc::format!(
+                    "Deopt site metadata derivation error: local index {} exceeds declared locals count {} in function '{}'",
+                    idx, self.locals.len(), self.signature.name
+                ));
+            }
+            let ty = &self.locals[idx].ty;
+            let is_supported = matches!(
+                ty,
+                MirType::Int | MirType::Bool | MirType::Float | MirType::Unit | MirType::String
+            ) || matches!(
+                ty,
+                MirType::Array(inner)
+                    if matches!(&**inner, MirType::Int | MirType::Bool | MirType::Float)
+            );
+            if !is_supported {
+                return Err(alloc::format!(
+                    "Cannot derive proven compiler site metadata for deopt site {}: local {} has unsupported deopt type {:?} (Unsupported non-scalar type)",
+                    target_block_id, idx, ty
+                ));
+            }
+        }
+
+        Ok(proven_indices)
+    }
+
+    fn propagate_da(
+        block_inits: &mut [Option<hashbrown::HashSet<usize>>],
+        worklist: &mut Vec<usize>,
+        in_worklist: &mut hashbrown::HashSet<usize>,
+        target: usize,
+        out: &hashbrown::HashSet<usize>,
+    ) {
+        if target >= block_inits.len() {
+            return;
+        }
+        match &mut block_inits[target] {
+            None => {
+                block_inits[target] = Some(out.clone());
+                if in_worklist.insert(target) {
+                    worklist.push(target);
+                }
+            }
+            Some(existing) => {
+                let old_len = existing.len();
+                existing.retain(|id| out.contains(id));
+                if existing.len() != old_len {
+                    if in_worklist.insert(target) {
+                        worklist.push(target);
+                    }
+                }
+            }
+        }
     }
 }
 

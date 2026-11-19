@@ -24,6 +24,7 @@ pub struct MirToBytecodeCompiler<'a> {
     scratch_count: usize,
     max_scratch: usize,
     block_pcs: HashMap<BlockId, usize>,
+    terminator_pcs: HashMap<usize, usize>,
     pending_jumps: Vec<(usize, BlockId)>,
     direct_callees: Option<&'a HashSet<String>>,
 }
@@ -54,6 +55,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
             scratch_count: 0,
             max_scratch: 0,
             block_pcs: HashMap::new(),
+            terminator_pcs: HashMap::new(),
             pending_jumps: Vec::new(),
             direct_callees,
         };
@@ -63,6 +65,12 @@ impl<'a> MirToBytecodeCompiler<'a> {
 
         bytecode_fn.chunk = compiler.chunk;
         bytecode_fn.register_count = (func.locals.len() + compiler.max_scratch) as u8;
+        bytecode_fn.terminator_pcs = compiler.terminator_pcs;
+        bytecode_fn.block_entry_pcs = compiler
+            .block_pcs
+            .into_iter()
+            .map(|(bid, pc)| (bid.0, pc))
+            .collect();
         Ok(bytecode_fn)
     }
 
@@ -90,6 +98,8 @@ impl<'a> MirToBytecodeCompiler<'a> {
             }
 
             self.reset_scratch();
+            let term_pc = self.chunk.instructions.len();
+            self.terminator_pcs.insert(block.id.0, term_pc);
             if let Some(term) = &block.terminator {
                 self.compile_terminator(term);
             }

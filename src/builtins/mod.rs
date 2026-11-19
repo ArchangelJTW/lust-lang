@@ -6,6 +6,8 @@ use hashbrown::HashMap;
 
 #[cfg(feature = "std")]
 pub use crate::stdlib::coord;
+#[cfg(feature = "std")]
+pub use crate::stdlib::{net, services};
 
 #[derive(Debug, Clone)]
 pub struct BuiltinSignature {

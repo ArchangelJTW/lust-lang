@@ -1,0 +1,66 @@
+-- Example 6: Structured Concurrency, Fiber Supervision & Gate-NEG-02.
+-- Ported from `examples/effects/06_concurrency_and_supervision.rs`.
+-- Demonstrates fiber hierarchies in Scope, cascading cancellation on failure,
+-- deferred interrupt masking, and guaranteed LIFO finalization.
+
+use std.test
+
+suite "Structured Concurrency, Supervision & Gate-NEG-02 Suite" do
+    test "cascading cancellation, interrupt masking, and LIFO finalization" do
+        local scope = test.scope_new(100)
+        assert(test.scope_is_open(scope))
+        assert_eq(test.scope_teardown_state(scope), "Idle")
+
+        local res1 = test.resource_new("PostgreSQL Connection Pool")
+        test.scope_register_finalizer(scope, res1)
+        local res2 = test.resource_new("TCP Socket Listener")
+        test.scope_register_finalizer(scope, res2)
+        local res3 = test.resource_new("Worker Scratch Arena Buffer")
+        test.scope_register_finalizer(scope, res3)
+
+        assert_eq(test.resource_is_active(res1), true)
+        assert_eq(test.resource_is_active(res2), true)
+        assert_eq(test.resource_is_active(res3), true)
+
+        local fiber_a = test.fiber_new(101, 100)
+        local fiber_b = test.fiber_new(102, 100)
+        local fiber_c = test.fiber_new(103, 100)
+        test.scope_register_child(scope, fiber_a)
+        test.scope_register_child(scope, fiber_b)
+        test.scope_register_child(scope, fiber_c)
+
+        test.fiber_enter_mask(fiber_b)
+        assert_eq(test.fiber_is_masked(fiber_b), true)
+
+        test.fiber_set_state(fiber_c, "Failed")
+        assert_eq(test.fiber_state(fiber_c), "Failed")
+
+        local children_to_cancel = test.scope_begin_teardown(scope)
+        assert_eq(children_to_cancel, [101, 102, 103])
+        assert_eq(test.scope_admission_state(scope), "Closed")
+        assert_eq(test.scope_teardown_state(scope), "Cancelling")
+        assert_eq(test.scope_register_child(scope, 104), false)
+        assert_eq(test.scope_register_finalizer(scope, "Rejected"), false)
+
+        assert_eq(test.fiber_request_interrupt(fiber_a, "Cancelled"), true)
+        assert_eq(test.fiber_request_interrupt(fiber_b, "Cancelled"), false)
+
+        test.scope_mark_joining(scope)
+        assert_eq(test.scope_teardown_state(scope), "Joining")
+        assert_eq(test.scope_current_releases(scope), [])
+
+        assert_eq(test.fiber_exit_mask(fiber_b), "Cancelled")
+        assert_eq(test.fiber_state(fiber_b), "Interrupted")
+
+        local releases = test.scope_finalize(scope)
+        assert_eq(test.scope_teardown_state(scope), "Done")
+        assert_eq(releases, [
+            "release:Worker Scratch Arena Buffer",
+            "release:TCP Socket Listener",
+            "release:PostgreSQL Connection Pool"
+        ])
+        assert_eq(test.resource_is_active(res1), false)
+        assert_eq(test.resource_is_active(res2), false)
+        assert_eq(test.resource_is_active(res3), false)
+    end
+end

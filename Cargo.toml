@@ -9,6 +9,7 @@ members = [
   "crates/lust-telemetry-otel",
   "crates/lust-telemetry-prometheus",
   "crates/lust-telemetry-tracing",
+  "crates/lust-napi",
 ]
 exclude = ["examples/rust-extension/extensions/**", "tree-sitter-lust", "tests/compile_fail/fs_gate"]
 
@@ -52,10 +53,19 @@ name = "lust"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["std", "packages", "bindgen"]
+default = ["std", "packages", "bindgen", "net-services"]
 bindgen = ["std"]
+net-services = [
+  "std",
+  "dep:tokio",
+  "dep:hyper",
+  "dep:hyper-util",
+  "dep:http-body-util",
+  "dep:bytes",
+  "dep:rusqlite",
+]
+test-deopt = ["std"]
 std = [
-  "dep:dynasmrt",
   "dep:toml",
   "serde/std",
   "thiserror/std",
@@ -74,6 +84,7 @@ std = [
 # (memmap2, std::sync). Requires a std-capable runtime (e.g. Linux/RISC-V).
 # Floats require the RV32F extension.
 rv32 = ["std", "dep:dynasmrt"]
+legacy-dynasm = ["std", "dep:dynasmrt"]
 libloading = ["std", "dep:libloading"]
 dirs = ["std", "dep:dirs"]
 packages = ["std", "libloading", "dirs", "dep:object"]
@@ -220,9 +231,14 @@ esp-println = { version = "0.18.0", optional = true, features = [
 log = { version = "0.4", optional = true }
 tempfile = "3.27.0"
 mimalloc = { version = "0.1.52", default-features = false }
+tokio = { version = "1.53.1", optional = true, features = ["net", "io-util", "rt", "rt-multi-thread", "sync", "time", "macros"] }
+hyper = { version = "1.12.0", optional = true, features = ["http1", "client", "server"] }
+hyper-util = { version = "0.1.21", optional = true, features = ["tokio", "http1", "client-legacy", "server"] }
+http-body-util = { version = "0.1.5", optional = true }
+bytes = { version = "1.12.1", optional = true }
+rusqlite = { version = "0.33.0", optional = true }
 
 [build-dependencies]
-dynasm = "5.1.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -246,6 +262,13 @@ debug = 1
 overflow-checks = false
 panic = "abort"
 codegen-units = 1
+
+[profile.nostd_32]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
 
 [lints.clippy]
 approx_constant = "allow"

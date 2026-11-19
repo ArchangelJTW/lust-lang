@@ -1,0 +1,13 @@
+[package]
+name = "lust-napi"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Standard C Node-API addon host for the Lust scripting engine (actor-pool over !Send VM)"
+
+[lib]
+name = "lust_napi"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lust = { package = "lust-rs", path = "../..", default-features = false, features = ["std"] }

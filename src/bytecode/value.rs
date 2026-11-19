@@ -2483,6 +2483,7 @@ thread_local! {
     static SPECIALIZED_INT_CACHE: RefCell<HashMap<SpecializedCacheKey, (Vec<LustInt>, bool, Weak<RefCell<Vec<Value>>>)>> = RefCell::new(HashMap::new());
     static SPECIALIZED_FLOAT_CACHE: RefCell<HashMap<SpecializedCacheKey, (Vec<LustFloat>, bool, Weak<RefCell<Vec<Value>>>)>> = RefCell::new(HashMap::new());
     static FALLBACK_ARRAY_MAP: RefCell<HashMap<usize, ArraySequenceId>> = RefCell::new(HashMap::new());
+    static NEXT_FALLBACK_SEQ: core::cell::Cell<u64> = const { core::cell::Cell::new(1) };
 }
 
 pub fn resolve_array_key_from_ptr(arr_ptr: usize) -> SpecializedCacheKey {
@@ -2494,8 +2495,13 @@ pub fn resolve_array_key_from_ptr(arr_ptr: usize) -> SpecializedCacheKey {
         } else {
             FALLBACK_ARRAY_MAP.with(|m| {
                 let mut map = m.borrow_mut();
-                let next_idx = map.len() as u64 + 1;
-                let seq = *map.entry(arr_ptr).or_insert(ArraySequenceId(next_idx));
+                let seq = *map.entry(arr_ptr).or_insert_with(|| {
+                    NEXT_FALLBACK_SEQ.with(|c| {
+                        let id = c.get();
+                        c.set(id.saturating_add(1));
+                        ArraySequenceId(id)
+                    })
+                });
                 (VmId(0), seq)
             })
         }
@@ -2503,6 +2509,69 @@ pub fn resolve_array_key_from_ptr(arr_ptr: usize) -> SpecializedCacheKey {
     #[cfg(not(feature = "std"))]
     {
         (VmId(0), ArraySequenceId(arr_ptr as u64))
+    }
+}
+
+#[cfg(feature = "std")]
+fn primary_array_key_from_ptr_opt(arr_ptr: usize) -> Option<SpecializedCacheKey> {
+    if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+        let vm = unsafe { &*vm_ptr };
+        vm.array_id_map
+            .borrow()
+            .get(&arr_ptr)
+            .copied()
+            .map(|seq| (vm.id, seq))
+    } else {
+        fallback_array_key_from_ptr(arr_ptr)
+    }
+}
+
+#[cfg(feature = "std")]
+fn fallback_array_key_from_ptr(arr_ptr: usize) -> Option<SpecializedCacheKey> {
+    FALLBACK_ARRAY_MAP.with(|m| {
+        m.borrow()
+            .get(&arr_ptr)
+            .copied()
+            .map(|seq| (VmId(0), seq))
+    })
+}
+
+#[cfg(feature = "std")]
+fn matching_keys_in_cache<T>(
+    cache: &HashMap<SpecializedCacheKey, (Vec<T>, bool, Weak<RefCell<Vec<Value>>>)>,
+    arr_ptr: usize,
+    primary: Option<SpecializedCacheKey>,
+) -> Vec<SpecializedCacheKey> {
+    let mut keys = Vec::new();
+    if let Some(pk) = primary
+        && cache.contains_key(&pk)
+    {
+        keys.push(pk);
+    }
+    if let Some(fk) = fallback_array_key_from_ptr(arr_ptr)
+        && !keys.contains(&fk)
+        && cache.contains_key(&fk)
+    {
+        keys.push(fk);
+    }
+    for (k, (_, _, weak)) in cache.iter() {
+        if weak
+            .upgrade()
+            .is_some_and(|rc| rc.as_ptr() as usize == arr_ptr)
+            && !keys.contains(k)
+        {
+            keys.push(*k);
+        }
+    }
+    keys
+}
+
+#[cfg(feature = "std")]
+fn remove_stale_fallback_if_vm_active(arr_ptr: usize, removed_key: SpecializedCacheKey) {
+    if removed_key.0 == VmId(0) && crate::vm::current_vm_ptr().is_some() {
+        FALLBACK_ARRAY_MAP.with(|m| {
+            m.borrow_mut().remove(&arr_ptr);
+        });
     }
 }
 
@@ -2539,16 +2608,37 @@ impl ArrayCacheKey for &Rc<RefCell<Vec<Value>>> {
 
 #[cfg(feature = "std")]
 pub fn invalidate_specialized_array_cache<K: ArrayCacheKey>(key: K) {
-    let cache_key = key.to_cache_key();
-    invalidate_specialized_array_cache_by_key(cache_key);
     if let Some(arr_ptr) = key.to_ptr_opt() {
         if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
             let vm = unsafe { &*vm_ptr };
-            vm.unregister_array_id(arr_ptr);
+            if let Some(vm_key) = vm.unregister_array_id(arr_ptr) {
+                invalidate_specialized_array_cache_by_key(vm_key);
+            }
         }
-        FALLBACK_ARRAY_MAP.with(|m| {
-            m.borrow_mut().remove(&arr_ptr);
+        if let Some(seq0) = FALLBACK_ARRAY_MAP.with(|m| m.borrow_mut().remove(&arr_ptr)) {
+            invalidate_specialized_array_cache_by_key((VmId(0), seq0));
+        }
+        SPECIALIZED_BOOL_CACHE.with(|c| {
+            c.borrow_mut().retain(|_, (_, _, weak)| {
+                weak.upgrade()
+                    .is_some_and(|rc| rc.as_ptr() as usize != arr_ptr)
+            });
         });
+        SPECIALIZED_INT_CACHE.with(|c| {
+            c.borrow_mut().retain(|_, (_, _, weak)| {
+                weak.upgrade()
+                    .is_some_and(|rc| rc.as_ptr() as usize != arr_ptr)
+            });
+        });
+        SPECIALIZED_FLOAT_CACHE.with(|c| {
+            c.borrow_mut().retain(|_, (_, _, weak)| {
+                weak.upgrade()
+                    .is_some_and(|rc| rc.as_ptr() as usize != arr_ptr)
+            });
+        });
+    } else {
+        let cache_key = key.to_cache_key();
+        invalidate_specialized_array_cache_by_key(cache_key);
     }
 }
 
@@ -2562,34 +2652,47 @@ pub fn invalidate_specialized_array_cache_by_key(key: SpecializedCacheKey) {
 pub fn get_specialized_cached_element(arr: &Rc<RefCell<Vec<Value>>>, idx: i64) -> Option<Value> {
     #[cfg(feature = "std")]
     {
-        let arr_key = resolve_array_key_from_ptr(arr.as_ptr() as usize);
+        let arr_ptr = arr.as_ptr() as usize;
+        let primary = primary_array_key_from_ptr_opt(arr_ptr);
         SPECIALIZED_BOOL_CACHE.with(|c| {
-            c.borrow().get(&arr_key).and_then(|(vec, _, _)| {
-                if idx >= 0 && (idx as usize) < vec.len() {
-                    Some(Value::Bool(vec[idx as usize] != 0))
-                } else {
-                    None
+            let cache = c.borrow();
+            let keys = matching_keys_in_cache(&cache, arr_ptr, primary);
+            for k in keys {
+                if let Some((vec, _, _)) = cache.get(&k) {
+                    if idx >= 0 && (idx as usize) < vec.len() {
+                        return Some(Value::Bool(vec[idx as usize] != 0));
+                    }
+                    return None;
                 }
-            })
+            }
+            None
         }).or_else(|| {
             SPECIALIZED_INT_CACHE.with(|c| {
-                c.borrow().get(&arr_key).and_then(|(vec, _, _)| {
-                    if idx >= 0 && (idx as usize) < vec.len() {
-                        Some(Value::Int(vec[idx as usize]))
-                    } else {
-                        None
+                let cache = c.borrow();
+                let keys = matching_keys_in_cache(&cache, arr_ptr, primary);
+                for k in keys {
+                    if let Some((vec, _, _)) = cache.get(&k) {
+                        if idx >= 0 && (idx as usize) < vec.len() {
+                            return Some(Value::Int(vec[idx as usize]));
+                        }
+                        return None;
                     }
-                })
+                }
+                None
             })
         }).or_else(|| {
             SPECIALIZED_FLOAT_CACHE.with(|c| {
-                c.borrow().get(&arr_key).and_then(|(vec, _, _)| {
-                    if idx >= 0 && (idx as usize) < vec.len() {
-                        Some(Value::Float(vec[idx as usize]))
-                    } else {
-                        None
+                let cache = c.borrow();
+                let keys = matching_keys_in_cache(&cache, arr_ptr, primary);
+                for k in keys {
+                    if let Some((vec, _, _)) = cache.get(&k) {
+                        if idx >= 0 && (idx as usize) < vec.len() {
+                            return Some(Value::Float(vec[idx as usize]));
+                        }
+                        return None;
                     }
-                })
+                }
+                None
             })
         })
     }
@@ -2600,16 +2703,26 @@ pub fn get_specialized_cached_element(arr: &Rc<RefCell<Vec<Value>>>, idx: i64) -
 pub fn get_specialized_cached_len(arr: &Rc<RefCell<Vec<Value>>>) -> Option<usize> {
     #[cfg(feature = "std")]
     {
-        let arr_key = resolve_array_key_from_ptr(arr.as_ptr() as usize);
+        let arr_ptr = arr.as_ptr() as usize;
+        let primary = primary_array_key_from_ptr_opt(arr_ptr);
         SPECIALIZED_BOOL_CACHE.with(|c| {
-            c.borrow().get(&arr_key).map(|(vec, _, _)| vec.len())
+            let cache = c.borrow();
+            matching_keys_in_cache(&cache, arr_ptr, primary)
+                .into_iter()
+                .find_map(|k| cache.get(&k).map(|(vec, _, _)| vec.len()))
         }).or_else(|| {
             SPECIALIZED_INT_CACHE.with(|c| {
-                c.borrow().get(&arr_key).map(|(vec, _, _)| vec.len())
+                let cache = c.borrow();
+                matching_keys_in_cache(&cache, arr_ptr, primary)
+                    .into_iter()
+                    .find_map(|k| cache.get(&k).map(|(vec, _, _)| vec.len()))
             })
         }).or_else(|| {
             SPECIALIZED_FLOAT_CACHE.with(|c| {
-                c.borrow().get(&arr_key).map(|(vec, _, _)| vec.len())
+                let cache = c.borrow();
+                matching_keys_in_cache(&cache, arr_ptr, primary)
+                    .into_iter()
+                    .find_map(|k| cache.get(&k).map(|(vec, _, _)| vec.len()))
             })
         })
     }
@@ -2624,9 +2737,14 @@ pub fn set_specialized_cached_element(
 ) -> Option<Result<(), String>> {
     #[cfg(feature = "std")]
     {
-        let arr_key = resolve_array_key_from_ptr(arr.as_ptr() as usize);
-        let is_bool = SPECIALIZED_BOOL_CACHE.with(|c| c.borrow().contains_key(&arr_key));
-        if is_bool {
+        let arr_ptr = arr.as_ptr() as usize;
+        let primary = primary_array_key_from_ptr_opt(arr_ptr);
+
+        let bool_key = SPECIALIZED_BOOL_CACHE.with(|c| {
+            let cache = c.borrow();
+            matching_keys_in_cache(&cache, arr_ptr, primary).into_iter().next()
+        });
+        if let Some(arr_key) = bool_key {
             if let Value::Bool(b) = val {
                 return SPECIALIZED_BOOL_CACHE.with(|c| {
                     let mut cache = c.borrow_mut();
@@ -2652,8 +2770,11 @@ pub fn set_specialized_cached_element(
             }
         }
 
-        let is_int = SPECIALIZED_INT_CACHE.with(|c| c.borrow().contains_key(&arr_key));
-        if is_int {
+        let int_key = SPECIALIZED_INT_CACHE.with(|c| {
+            let cache = c.borrow();
+            matching_keys_in_cache(&cache, arr_ptr, primary).into_iter().next()
+        });
+        if let Some(arr_key) = int_key {
             if let Value::Int(i) = val {
                 return SPECIALIZED_INT_CACHE.with(|c| {
                     let mut cache = c.borrow_mut();
@@ -2679,8 +2800,11 @@ pub fn set_specialized_cached_element(
             }
         }
 
-        let is_float = SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow().contains_key(&arr_key));
-        if is_float {
+        let float_key = SPECIALIZED_FLOAT_CACHE.with(|c| {
+            let cache = c.borrow();
+            matching_keys_in_cache(&cache, arr_ptr, primary).into_iter().next()
+        });
+        if let Some(arr_key) = float_key {
             if let Value::Float(f) = val {
                 return SPECIALIZED_FLOAT_CACHE.with(|c| {
                     let mut cache = c.borrow_mut();
@@ -2709,85 +2833,78 @@ pub fn set_specialized_cached_element(
     None
 }
 
-pub fn sync_specialized_array(arr: &Rc<RefCell<Vec<Value>>>) {
-    #[cfg(feature = "std")]
-    {
-        let arr_key = resolve_array_key_from_ptr(arr.as_ptr() as usize);
-        let remove_bool = SPECIALIZED_BOOL_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            if let Some((vec, dirty, _)) = cache.get_mut(&arr_key) {
-                if *dirty {
-                    let arr_mut = unsafe { &mut *arr.as_ptr() };
-                    if arr_mut.len() == vec.len() {
-                        for (val, &b) in arr_mut.iter_mut().zip(vec.iter()) {
-                            *val = Value::Bool(b != 0);
-                        }
-                    } else {
-                        *arr_mut = vec.iter().map(|&b| Value::Bool(b != 0)).collect();
+#[cfg(feature = "std")]
+fn sync_cache_for_array<T: Copy, F: Fn(T) -> Value>(
+    cache_cell: &RefCell<HashMap<SpecializedCacheKey, (Vec<T>, bool, Weak<RefCell<Vec<Value>>>)>>,
+    arr: &Rc<RefCell<Vec<Value>>>,
+    arr_ptr: usize,
+    primary: Option<SpecializedCacheKey>,
+    kind_label: &str,
+    to_value: F,
+) -> Result<(), String> {
+    let mut cache = cache_cell.borrow_mut();
+    let keys = matching_keys_in_cache(&cache, arr_ptr, primary);
+    let mut to_remove = Vec::new();
+    for k in keys {
+        let is_non_primary = primary != Some(k);
+        let remove_entry = if let Some((vec, dirty, _)) = cache.get_mut(&k) {
+            if *dirty {
+                let mut arr_mut = arr.try_borrow_mut().map_err(|_| {
+                    format!(
+                        "Failed to acquire mutable borrow for specialized {kind_label} array sync: array is currently borrowed"
+                    )
+                })?;
+                if arr_mut.len() == vec.len() {
+                    for (val, &elem) in arr_mut.iter_mut().zip(vec.iter()) {
+                        *val = to_value(elem);
                     }
-                    *dirty = false;
-                    false
                 } else {
-                    unsafe { (*arr.as_ptr()).len() != vec.len() }
+                    *arr_mut = vec.iter().copied().map(&to_value).collect();
                 }
+                *dirty = false;
+                is_non_primary
             } else {
-                false
+                let arr_ref = arr.try_borrow().map_err(|_| {
+                    format!(
+                        "Failed to acquire borrow for specialized {kind_label} array sync: mutable borrow active"
+                    )
+                })?;
+                is_non_primary || arr_ref.len() != vec.len()
             }
-        });
-        if remove_bool {
-            SPECIALIZED_BOOL_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
-        }
-
-        let remove_int = SPECIALIZED_INT_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            if let Some((vec, dirty, _)) = cache.get_mut(&arr_key) {
-                if *dirty {
-                    let arr_mut = unsafe { &mut *arr.as_ptr() };
-                    if arr_mut.len() == vec.len() {
-                        for (val, &i) in arr_mut.iter_mut().zip(vec.iter()) {
-                            *val = Value::Int(i);
-                        }
-                    } else {
-                        *arr_mut = vec.iter().map(|&i| Value::Int(i)).collect();
-                    }
-                    *dirty = false;
-                    false
-                } else {
-                    unsafe { (*arr.as_ptr()).len() != vec.len() }
-                }
-            } else {
-                false
-            }
-        });
-        if remove_int {
-            SPECIALIZED_INT_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
-        }
-
-        let remove_float = SPECIALIZED_FLOAT_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            if let Some((vec, dirty, _)) = cache.get_mut(&arr_key) {
-                if *dirty {
-                    let arr_mut = unsafe { &mut *arr.as_ptr() };
-                    if arr_mut.len() == vec.len() {
-                        for (val, &f) in arr_mut.iter_mut().zip(vec.iter()) {
-                            *val = Value::Float(f);
-                        }
-                    } else {
-                        *arr_mut = vec.iter().map(|&f| Value::Float(f)).collect();
-                    }
-                    *dirty = false;
-                    false
-                } else {
-                    unsafe { (*arr.as_ptr()).len() != vec.len() }
-                }
-            } else {
-                false
-            }
-        });
-        if remove_float {
-            SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
+        } else {
+            false
+        };
+        if remove_entry {
+            to_remove.push(k);
         }
     }
+    for k in to_remove {
+        cache.remove(&k);
+        remove_stale_fallback_if_vm_active(arr_ptr, k);
+    }
+    Ok(())
+}
+
+pub fn try_sync_specialized_array(arr: &Rc<RefCell<Vec<Value>>>) -> Result<(), String> {
+    #[cfg(feature = "std")]
+    {
+        let arr_ptr = arr.as_ptr() as usize;
+        let primary = primary_array_key_from_ptr_opt(arr_ptr);
+
+        SPECIALIZED_BOOL_CACHE
+            .with(|c| sync_cache_for_array(c, arr, arr_ptr, primary, "bool", |b| Value::Bool(b != 0)))?;
+        SPECIALIZED_INT_CACHE
+            .with(|c| sync_cache_for_array(c, arr, arr_ptr, primary, "int", Value::Int))?;
+        SPECIALIZED_FLOAT_CACHE
+            .with(|c| sync_cache_for_array(c, arr, arr_ptr, primary, "float", Value::Float))?;
+    }
+    #[cfg(not(feature = "std"))]
+    let _ = arr;
+    Ok(())
+}
+
+pub fn sync_specialized_array(arr: &Rc<RefCell<Vec<Value>>>) {
+    let _ = try_sync_specialized_array(arr);
 }
 
 pub fn sync_all_specialized_arrays() {
@@ -2798,15 +2915,16 @@ pub fn sync_all_specialized_arrays() {
             cache.retain(|&_arr_key, (vec, dirty, weak)| {
                 if let Some(rc) = weak.upgrade() {
                     if *dirty {
-                        let arr_mut = unsafe { &mut *rc.as_ptr() };
-                        if arr_mut.len() == vec.len() {
-                            for (val, &b) in arr_mut.iter_mut().zip(vec.iter()) {
-                                *val = Value::Bool(b != 0);
+                        if let Ok(mut arr_mut) = rc.try_borrow_mut() {
+                            if arr_mut.len() == vec.len() {
+                                for (val, &b) in arr_mut.iter_mut().zip(vec.iter()) {
+                                    *val = Value::Bool(b != 0);
+                                }
+                            } else {
+                                *arr_mut = vec.iter().map(|&b| Value::Bool(b != 0)).collect();
                             }
-                        } else {
-                            *arr_mut = vec.iter().map(|&b| Value::Bool(b != 0)).collect();
+                            *dirty = false;
                         }
-                        *dirty = false;
                     }
                     true
                 } else {
@@ -2819,15 +2937,16 @@ pub fn sync_all_specialized_arrays() {
             cache.retain(|&_arr_key, (vec, dirty, weak)| {
                 if let Some(rc) = weak.upgrade() {
                     if *dirty {
-                        let arr_mut = unsafe { &mut *rc.as_ptr() };
-                        if arr_mut.len() == vec.len() {
-                            for (val, &i) in arr_mut.iter_mut().zip(vec.iter()) {
-                                *val = Value::Int(i);
+                        if let Ok(mut arr_mut) = rc.try_borrow_mut() {
+                            if arr_mut.len() == vec.len() {
+                                for (val, &i) in arr_mut.iter_mut().zip(vec.iter()) {
+                                    *val = Value::Int(i);
+                                }
+                            } else {
+                                *arr_mut = vec.iter().map(|&i| Value::Int(i)).collect();
                             }
-                        } else {
-                            *arr_mut = vec.iter().map(|&i| Value::Int(i)).collect();
+                            *dirty = false;
                         }
-                        *dirty = false;
                     }
                     true
                 } else {
@@ -2840,15 +2959,16 @@ pub fn sync_all_specialized_arrays() {
             cache.retain(|&_arr_key, (vec, dirty, weak)| {
                 if let Some(rc) = weak.upgrade() {
                     if *dirty {
-                        let arr_mut = unsafe { &mut *rc.as_ptr() };
-                        if arr_mut.len() == vec.len() {
-                            for (val, &f) in arr_mut.iter_mut().zip(vec.iter()) {
-                                *val = Value::Float(f);
+                        if let Ok(mut arr_mut) = rc.try_borrow_mut() {
+                            if arr_mut.len() == vec.len() {
+                                for (val, &f) in arr_mut.iter_mut().zip(vec.iter()) {
+                                    *val = Value::Float(f);
+                                }
+                            } else {
+                                *arr_mut = vec.iter().map(|&f| Value::Float(f)).collect();
                             }
-                        } else {
-                            *arr_mut = vec.iter().map(|&f| Value::Float(f)).collect();
+                            *dirty = false;
                         }
-                        *dirty = false;
                     }
                     true
                 } else {
@@ -2879,12 +2999,28 @@ pub unsafe extern "C" fn jit_unbox_array_int(
         let Value::Array(arr_rc) = &*array_value_ptr else {
             return 0;
         };
-        let arr_key = resolve_array_key_from_ptr(arr_rc.as_ptr() as usize);
-        let cached = SPECIALIZED_INT_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
+        let arr_ptr = arr_rc.as_ptr() as usize;
+        let arr_key = resolve_array_key_from_ptr(arr_ptr);
+        let cached = SPECIALIZED_INT_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            let keys = matching_keys_in_cache(&cache, arr_ptr, Some(arr_key));
+            let mut found = None;
+            for k in keys {
+                if let Some(entry) = cache.remove(&k) {
+                    remove_stale_fallback_if_vm_active(arr_ptr, k);
+                    if found.is_none() {
+                        found = Some(entry);
+                    }
+                }
+            }
+            found
+        });
         let mut specialized_vec = if let Some((vec, _dirty, _weak)) = cached {
             vec
         } else {
-            let vec_ref = &*arr_rc.as_ptr();
+            let Ok(vec_ref) = arr_rc.try_borrow() else {
+                return 0;
+            };
             if vec_ref.iter().any(|value| !matches!(value, Value::Int(_))) {
                 return 0;
             }
@@ -2923,12 +3059,28 @@ pub unsafe extern "C" fn jit_unbox_array_bool(
         let Value::Array(arr_rc) = &*array_value_ptr else {
             return 0;
         };
-        let arr_key = resolve_array_key_from_ptr(arr_rc.as_ptr() as usize);
-        let cached = SPECIALIZED_BOOL_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
+        let arr_ptr = arr_rc.as_ptr() as usize;
+        let arr_key = resolve_array_key_from_ptr(arr_ptr);
+        let cached = SPECIALIZED_BOOL_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            let keys = matching_keys_in_cache(&cache, arr_ptr, Some(arr_key));
+            let mut found = None;
+            for k in keys {
+                if let Some(entry) = cache.remove(&k) {
+                    remove_stale_fallback_if_vm_active(arr_ptr, k);
+                    if found.is_none() {
+                        found = Some(entry);
+                    }
+                }
+            }
+            found
+        });
         let mut specialized_vec = if let Some((vec, _dirty, _weak)) = cached {
             vec
         } else {
-            let vec_ref = &*arr_rc.as_ptr();
+            let Ok(vec_ref) = arr_rc.try_borrow() else {
+                return 0;
+            };
             if vec_ref.iter().any(|value| !matches!(value, Value::Bool(_))) {
                 return 0;
             }
@@ -2967,12 +3119,28 @@ pub unsafe extern "C" fn jit_unbox_array_float(
         let Value::Array(arr_rc) = &*array_value_ptr else {
             return 0;
         };
-        let arr_key = resolve_array_key_from_ptr(arr_rc.as_ptr() as usize);
-        let cached = SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
+        let arr_ptr = arr_rc.as_ptr() as usize;
+        let arr_key = resolve_array_key_from_ptr(arr_ptr);
+        let cached = SPECIALIZED_FLOAT_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            let keys = matching_keys_in_cache(&cache, arr_ptr, Some(arr_key));
+            let mut found = None;
+            for k in keys {
+                if let Some(entry) = cache.remove(&k) {
+                    remove_stale_fallback_if_vm_active(arr_ptr, k);
+                    if found.is_none() {
+                        found = Some(entry);
+                    }
+                }
+            }
+            found
+        });
         let mut specialized_vec = if let Some((vec, _dirty, _weak)) = cached {
             vec
         } else {
-            let vec_ref = &*arr_rc.as_ptr();
+            let Ok(vec_ref) = arr_rc.try_borrow() else {
+                return 0;
+            };
             if vec_ref.iter().any(|value| !matches!(value, Value::Float(_))) {
                 return 0;
             }
@@ -3004,10 +3172,18 @@ pub unsafe extern "C" fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8 {
         let (vec, array) = (*slot).take_int();
         match (vec, array) {
             (Some(vec), Some(array)) => {
-                let arr_key = resolve_array_key_from_ptr(array.as_ptr() as usize);
+                let arr_ptr = array.as_ptr() as usize;
+                let arr_key = resolve_array_key_from_ptr(arr_ptr);
                 let weak = Rc::downgrade(&array);
                 SPECIALIZED_INT_CACHE.with(|c| {
-                    c.borrow_mut().insert(arr_key, (vec, true, weak));
+                    let mut cache = c.borrow_mut();
+                    for k in matching_keys_in_cache(&cache, arr_ptr, Some(arr_key)) {
+                        if k != arr_key {
+                            cache.remove(&k);
+                            remove_stale_fallback_if_vm_active(arr_ptr, k);
+                        }
+                    }
+                    cache.insert(arr_key, (vec, true, weak));
                 });
                 1
             }
@@ -3028,10 +3204,18 @@ pub unsafe extern "C" fn jit_rebox_array_bool(slot: *mut JitVecSlot) -> u8 {
         let (vec, array) = (*slot).take_bool();
         match (vec, array) {
             (Some(vec), Some(array)) => {
-                let arr_key = resolve_array_key_from_ptr(array.as_ptr() as usize);
+                let arr_ptr = array.as_ptr() as usize;
+                let arr_key = resolve_array_key_from_ptr(arr_ptr);
                 let weak = Rc::downgrade(&array);
                 SPECIALIZED_BOOL_CACHE.with(|c| {
-                    c.borrow_mut().insert(arr_key, (vec, true, weak));
+                    let mut cache = c.borrow_mut();
+                    for k in matching_keys_in_cache(&cache, arr_ptr, Some(arr_key)) {
+                        if k != arr_key {
+                            cache.remove(&k);
+                            remove_stale_fallback_if_vm_active(arr_ptr, k);
+                        }
+                    }
+                    cache.insert(arr_key, (vec, true, weak));
                 });
                 1
             }
@@ -3052,10 +3236,18 @@ pub unsafe extern "C" fn jit_rebox_array_float(slot: *mut JitVecSlot) -> u8 {
         let (vec, array) = (*slot).take_float();
         match (vec, array) {
             (Some(vec), Some(array)) => {
-                let arr_key = resolve_array_key_from_ptr(array.as_ptr() as usize);
+                let arr_ptr = array.as_ptr() as usize;
+                let arr_key = resolve_array_key_from_ptr(arr_ptr);
                 let weak = Rc::downgrade(&array);
                 SPECIALIZED_FLOAT_CACHE.with(|c| {
-                    c.borrow_mut().insert(arr_key, (vec, true, weak));
+                    let mut cache = c.borrow_mut();
+                    for k in matching_keys_in_cache(&cache, arr_ptr, Some(arr_key)) {
+                        if k != arr_key {
+                            cache.remove(&k);
+                            remove_stale_fallback_if_vm_active(arr_ptr, k);
+                        }
+                    }
+                    cache.insert(arr_key, (vec, true, weak));
                 });
                 1
             }

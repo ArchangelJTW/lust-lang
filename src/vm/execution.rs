@@ -3859,29 +3859,172 @@ impl VM {
         &mut self,
         types: Option<&[(usize, crate::mir::ir::MirType)]>,
     ) -> Result<Value> {
+        if self.call_stack.is_empty() {
+            return Err(LustError::RuntimeError {
+                message: "Cannot resume deopt: call stack is empty".to_string(),
+            });
+        }
+
         let payload = crate::mir::cranelift_backend::take_deopt_payload()
             .ok_or_else(|| LustError::RuntimeError {
                 message: "No deopt payload available to reconstruct VM state".to_string(),
             })?;
-        if self.call_stack.is_empty() {
-            if !self.functions.is_empty() {
-                let frame = CallFrame::new(0, None, 0);
-                self.call_stack.push(frame);
-            } else {
+
+        // 1. Validate call frame identity before mutation
+        let top_frame = self.call_stack.last().expect("call stack validated non-empty");
+        let fn_idx = top_frame.function_idx;
+        let func = self.functions.get(fn_idx).ok_or_else(|| LustError::RuntimeError {
+            message: format!("Function index {} out of bounds on top call frame", fn_idx),
+        })?;
+
+        if let Some(ref expected_fn_name) = payload.func_name {
+            if func.name != *expected_fn_name {
                 return Err(LustError::RuntimeError {
-                    message: "Cannot resume deopt: call stack is empty and no functions defined".to_string(),
+                    message: format!(
+                        "Deopt payload function identity mismatch: expected '{}', top frame has '{}'",
+                        expected_fn_name, func.name
+                    ),
                 });
             }
         }
-        let top_frame = self.call_stack.last_mut().unwrap();
-        let default_types = Vec::new();
-        let types_ref = types.unwrap_or(&default_types);
-        let deopt_exit = crate::vm::osr::DeoptExitState::from_payload(
-            payload,
-            crate::vm::osr::DeoptReason::Safepoint,
-            types_ref,
-        );
-        deopt_exit.apply_to_call_frame(top_frame);
+
+        if let Some(ref expected_ident) = payload.frame_identity {
+            if expected_ident.frame_depth != self.call_stack.len() {
+                return Err(LustError::RuntimeError {
+                    message: format!(
+                        "Deopt payload frame depth mismatch: expected {}, call stack depth is {}",
+                        expected_ident.frame_depth,
+                        self.call_stack.len()
+                    ),
+                });
+            }
+        }
+
+        // 2. Separate site/block identity from authoritative bytecode resume PC
+        let site_id = payload.target_pc;
+        let resume_pc = match payload.site_kind {
+            crate::mir::cranelift_backend::DeoptSiteKind::BlockEntry => {
+                if let Some(pc) = func.block_entry_pcs.get(&site_id) {
+                    *pc
+                } else if func.block_entry_pcs.is_empty() && site_id <= func.chunk.instructions.len() {
+                    // Hand-crafted bytecode function where site_id directly indicates the bytecode PC
+                    site_id
+                } else {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "Deopt payload site/block ID {} has no proven block-entry bytecode resume PC mapping for function '{}'",
+                            site_id, func.name
+                        ),
+                    });
+                }
+            }
+            crate::mir::cranelift_backend::DeoptSiteKind::PreTerminator => {
+                if let Some(pc) = func.terminator_pcs.get(&site_id) {
+                    *pc
+                } else if func.terminator_pcs.is_empty() && site_id <= func.chunk.instructions.len() {
+                    site_id
+                } else {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "Deopt payload site/block ID {} has no proven pre-terminator bytecode resume PC mapping for function '{}'",
+                            site_id, func.name
+                        ),
+                    });
+                }
+            }
+        };
+
+        if resume_pc > func.chunk.instructions.len() {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Deopt resume PC {} is out of bounds for function '{}' (instruction count {})",
+                    resume_pc, func.name, func.chunk.instructions.len()
+                ),
+            });
+        }
+
+        // 3. Validate entire payload and types before mutating any frame state
+        let provided_types = types.ok_or_else(|| LustError::RuntimeError {
+            message: "Cannot resume deopt: type metadata required but None provided".to_string(),
+        })?;
+
+        let mut seen_type_indices = hashbrown::HashSet::with_capacity(provided_types.len());
+        for &(t_idx, _) in provided_types {
+            if !seen_type_indices.insert(t_idx) {
+                return Err(LustError::RuntimeError {
+                    message: format!("Duplicate type metadata for local index {}", t_idx),
+                });
+            }
+        }
+
+        let mut validated_restorations = Vec::with_capacity(payload.live_locals.len());
+        let mut seen_indices = hashbrown::HashSet::new();
+
+        for &(loc_idx, raw_val) in &payload.live_locals {
+            if !seen_indices.insert(loc_idx) {
+                return Err(LustError::RuntimeError {
+                    message: format!("Duplicate local index {} in deopt payload", loc_idx),
+                });
+            }
+            if loc_idx >= top_frame.registers.len() {
+                return Err(LustError::RuntimeError {
+                    message: format!(
+                        "Deopt payload local index {} exceeds frame register count {}",
+                        loc_idx,
+                        top_frame.registers.len()
+                    ),
+                });
+            }
+            let mir_ty = provided_types
+                .iter()
+                .find(|(i, _)| *i == loc_idx)
+                .map(|(_, ty)| ty)
+                .ok_or_else(|| LustError::RuntimeError {
+                    message: format!("Missing type metadata for deopt local index {}", loc_idx),
+                })?;
+            let restored_val = match mir_ty {
+                crate::mir::ir::MirType::Int => Value::Int(raw_val),
+                crate::mir::ir::MirType::Float => Value::Float(f64::from_bits(raw_val as u64)),
+                crate::mir::ir::MirType::Bool => Value::Bool(raw_val != 0),
+                crate::mir::ir::MirType::Unit => Value::Nil,
+                crate::mir::ir::MirType::String
+                | crate::mir::ir::MirType::Array(_)
+                | crate::mir::ir::MirType::Tuple(_)
+                | crate::mir::ir::MirType::Map(_, _)
+                | crate::mir::ir::MirType::Struct(_)
+                | crate::mir::ir::MirType::Enum(_) => {
+                    let handle_val = crate::mir::runtime_helpers::with_current_mir_context(|ctx| ctx.get_handle(raw_val));
+                    match handle_val {
+                        Some(val) => val,
+                        None => {
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "Invalid or absent reference handle {} for deopt local {} of type {:?}",
+                                    raw_val, loc_idx, mir_ty
+                                ),
+                            });
+                        }
+                    }
+                }
+                _ => {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "Unsupported type {:?} for deopt local {}",
+                            mir_ty, loc_idx
+                        ),
+                    });
+                }
+            };
+            validated_restorations.push((loc_idx, restored_val));
+        }
+
+        // 4. All validations passed; apply restored state to top call frame
+        let top_frame = self.call_stack.last_mut().expect("call stack validated non-empty");
+        top_frame.ip = resume_pc;
+        for (loc_idx, val) in validated_restorations {
+            top_frame.registers[loc_idx] = val;
+        }
+
         self.run()
     }
 }

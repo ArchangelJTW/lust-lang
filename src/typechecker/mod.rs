@@ -1,5 +1,6 @@
 mod expr_checker;
 mod item_checker;
+pub mod lifetime;
 mod stmt_checker;
 mod type_env;
 use crate::modules::{LoadedModule, ModuleImports};
@@ -139,6 +140,7 @@ impl TypeChecker {
         }
 
         self.env.pop_scope();
+        lifetime::check_module_lifetimes(items, &self.current_module)?;
         Ok(())
     }
 
@@ -177,6 +179,7 @@ impl TypeChecker {
             self.env.pop_scope();
         }
 
+        lifetime::check_program_lifetimes(modules)?;
         self.current_module = None;
         Ok(())
     }

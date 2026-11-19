@@ -223,9 +223,17 @@ impl VM {
                 }
             },
             cranelift_entry_count: 0,
+            #[cfg(feature = "test-deopt")]
+            test_deopt_spike_hook: None,
+            #[cfg(feature = "test-deopt")]
+            last_deopt_source: None,
             cranelift_compilation_count: 0,
+            cranelift_generation: 0,
+            cranelift_compiled_generation: 0,
             #[cfg(feature = "std")]
             cranelift_jit: None,
+            #[cfg(feature = "std")]
+            cranelift_recipes: HashMap::new(),
             mir_functions: HashMap::new(),
             cranelift_compiled: HashMap::new(),
             jit: JitState::new(),
@@ -335,6 +343,8 @@ impl VM {
         }
         #[cfg(feature = "std")]
         crate::stdlib::coord::register_builtins(&mut vm);
+        #[cfg(feature = "std")]
+        crate::stdlib::services::register_builtins(&mut vm);
         super::channel::register_builtins(&mut vm);
         vm.register_jit_intrinsics();
 

@@ -34,6 +34,7 @@ pub mod lexer;
 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 pub mod lua_compat;
 pub mod modules;
+pub mod no_std;
 pub mod number;
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 pub mod packages;

@@ -268,7 +268,7 @@ fn test_batch_schemas_and_effects_directories() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains("0 failed"), "Must report 0 failed tests: {stdout}");
-    assert!(stdout.contains("37 passed"), "Must report all 37 passed tests: {stdout}");
+    assert!(stdout.contains("38 passed"), "Must report all 38 passed tests: {stdout}");
 }
 
 // ---------------------------------------------------------------------------

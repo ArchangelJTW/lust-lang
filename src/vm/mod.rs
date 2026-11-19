@@ -256,15 +256,83 @@ pub enum VmBackend {
     Cranelift,
 }
 
+/// Test-only bounded deopt spike configuration (default-off, per-VM, per-call, one-site).
+#[cfg(feature = "test-deopt")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeoptPayloadSource {
+    NativeExecution,
+    TestInjectedSeam,
+}
+
+#[cfg(feature = "test-deopt")]
+#[derive(Debug, Clone)]
+pub struct TestDeoptSpikeHook {
+    pub target_function: String,
+    pub deopt_block: usize,
+    pub triggered_count: usize,
+    pub max_triggers: usize,
+    pub expected_locals: Option<Vec<usize>>,
+    pub injected_payload: Option<crate::mir::cranelift_backend::DeoptPayload>,
+}
+
+#[cfg(feature = "test-deopt")]
+impl TestDeoptSpikeHook {
+    pub fn new(target_function: impl Into<String>, deopt_block: usize) -> Self {
+        Self {
+            target_function: target_function.into(),
+            deopt_block,
+            triggered_count: 0,
+            max_triggers: 1,
+            expected_locals: None,
+            injected_payload: None,
+        }
+    }
+
+    pub fn with_expected_locals(
+        target_function: impl Into<String>,
+        deopt_block: usize,
+        expected_locals: Vec<usize>,
+    ) -> Self {
+        Self {
+            target_function: target_function.into(),
+            deopt_block,
+            triggered_count: 0,
+            max_triggers: 1,
+            expected_locals: Some(expected_locals),
+            injected_payload: None,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug, Clone)]
+pub struct CompiledDeoptRecipe {
+    pub func_name: String,
+    pub compilation_generation: u64,
+    pub block_id: usize,
+    pub site_kind: crate::mir::cranelift_backend::DeoptSiteKind,
+    pub precise_pc: usize,
+    pub proven_locals: Vec<(usize, crate::mir::ir::MirType)>,
+}
+
 pub struct VM {
     // Retain the host runtime's lookup function across dynamic-library boundaries.
     // Each extension can have its own copy of CURRENT_VM_STACK.
     current_vm_lookup: fn() -> Option<*mut VM>,
     pub backend: VmBackend,
+    #[cfg(feature = "test-deopt")]
+    pub test_deopt_spike_hook: Option<TestDeoptSpikeHook>,
+    #[cfg(feature = "test-deopt")]
+    pub last_deopt_source: Option<DeoptPayloadSource>,
     pub cranelift_entry_count: u64,
     pub cranelift_compilation_count: u64,
+    pub(crate) cranelift_generation: u64,
+    pub(crate) cranelift_compiled_generation: u64,
     #[cfg(feature = "std")]
     pub(crate) cranelift_jit: Option<crate::mir::cranelift_backend::jit_engine::CraneliftJitCompiler>,
+    #[cfg(feature = "std")]
+    pub(crate) cranelift_recipes:
+        HashMap<(String, usize, crate::mir::cranelift_backend::DeoptSiteKind), CompiledDeoptRecipe>,
     pub mir_functions: HashMap<String, crate::mir::ir::MirFunction>,
     pub cranelift_compiled: HashMap<String, *const u8>,
     pub(super) jit: JitState,
@@ -452,6 +520,36 @@ impl TrustedHostResourceLedger {
 }
 
 impl VM {
+    #[inline]
+    pub fn call_stack_depth(&self) -> usize {
+        self.call_stack.len()
+    }
+
+    #[doc(hidden)]
+    #[cfg(feature = "test-deopt")]
+    pub fn push_call_frame_for_test(&mut self, frame: CallFrame) {
+        self.call_stack.push(Box::new(frame));
+    }
+
+    #[inline]
+    pub fn is_dynasm_retired() -> bool {
+        crate::jit::is_dynasm_retired()
+    }
+
+    #[inline]
+    pub fn set_dynasm_retired(retired: bool) {
+        crate::jit::set_dynasm_retired(retired);
+    }
+
+    #[inline]
+    pub fn dynasm_status() -> &'static str {
+        if crate::jit::is_dynasm_retired() {
+            "retired (safe fallback to Cranelift / interpreter)"
+        } else {
+            "legacy"
+        }
+    }
+
     #[inline]
     pub fn config(&self) -> &crate::config::LustConfig {
         &self.config
@@ -930,12 +1028,19 @@ impl VM {
         self
     }
 
-    /// Loads a MIR function into the VM, automatically generating its bytecode representation
-    /// for interpreter oracle parity while registering it for native Cranelift JIT compilation.
-    pub fn load_mir_function(&mut self, mir_fn: crate::mir::ir::MirFunction) -> Result<()> {
+    fn collect_direct_callees(&self) -> hashbrown::HashSet<String> {
         let mut direct_callees: hashbrown::HashSet<String> =
             self.functions.iter().map(|f| f.name.clone()).collect();
         direct_callees.extend(self.mir_functions.keys().cloned());
+        direct_callees.extend(self.natives.keys().cloned());
+        direct_callees.extend(self.globals.keys().cloned());
+        direct_callees
+    }
+
+    /// Loads a MIR function into the VM, automatically generating its bytecode representation
+    /// for interpreter oracle parity while registering it for native Cranelift JIT compilation.
+    pub fn load_mir_function(&mut self, mir_fn: crate::mir::ir::MirFunction) -> Result<()> {
+        let mut direct_callees = self.collect_direct_callees();
         direct_callees.insert(mir_fn.signature.name.clone());
         self.load_mir_function_with_callees(mir_fn, &direct_callees)
     }
@@ -975,19 +1080,19 @@ impl VM {
         self.jit.reset_function_tables(self.functions.len());
         self.jit_cells.entry_table = self.jit.function_entry_table();
         self.mir_functions.insert(name, mir_fn);
+        self.cranelift_generation = self.cranelift_generation.wrapping_add(1);
         #[cfg(feature = "std")]
         {
             self.cranelift_jit = None;
             self.cranelift_compiled.clear();
+            self.cranelift_recipes.clear();
         }
         Ok(())
     }
 
     /// Loads all functions from a MIR module into the VM.
     pub fn load_mir_module(&mut self, module: &crate::mir::ir::MirModule) -> Result<()> {
-        let mut direct_callees: hashbrown::HashSet<String> =
-            self.functions.iter().map(|f| f.name.clone()).collect();
-        direct_callees.extend(self.mir_functions.keys().cloned());
+        let mut direct_callees = self.collect_direct_callees();
         for mir_fn in &module.functions {
             direct_callees.insert(mir_fn.signature.name.clone());
         }

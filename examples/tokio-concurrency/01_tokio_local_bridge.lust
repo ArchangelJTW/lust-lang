@@ -1,0 +1,13 @@
+-- Example: Tokio Concurrency Actor/Owner Script Companion.
+-- Ported alongside `examples/tokio-concurrency/src/main.rs` (`EmbeddedBuilder` worker).
+
+function evaluate(input: int): int
+    return input * 2 + 1
+end
+
+local out_batch_1 = evaluate(10)
+local out_batch_2 = evaluate(21)
+assert(out_batch_1 == 21, "evaluate(10) must equal 21")
+assert(out_batch_2 == 43, "evaluate(21) must equal 43")
+println("EVALUATE_10=" .. tostring(out_batch_1))
+println("EVALUATE_21=" .. tostring(out_batch_2))

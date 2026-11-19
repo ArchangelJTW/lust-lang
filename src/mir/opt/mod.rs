@@ -3,12 +3,14 @@ pub mod dce;
 pub mod escape_analysis;
 pub mod inline;
 pub mod safepoints;
+pub mod simd;
 
 pub use constant_folding::ConstantFolding;
 pub use dce::DeadCodeElimination;
 pub use escape_analysis::{EscapeAnalysis, EscapeStatus};
 pub use inline::{InlinerConfig, MirInliner};
 pub use safepoints::{SafepointConfig, SafepointStats, Safepoints};
+pub use simd::{SimdConfig, SimdOptimizer, SimdStats, SIMD_LANE_WIDTH};
 
 use crate::mir::ir::{
     BlockId, LocalId, MirFunction, MirModule, Operand, Place, Rvalue, Statement, Terminator,
@@ -47,6 +49,7 @@ impl MirOptimizer {
             let mut changed = false;
             changed |= ConstantFolding::run_on_function(func);
             changed |= DeadCodeElimination::run_on_function(func);
+            changed |= SimdOptimizer::run_on_function(func);
             for (i, block) in func.blocks.iter_mut().enumerate() {
                 block.id = BlockId(i);
             }
@@ -68,6 +71,7 @@ impl MirOptimizer {
                     let mut iter_changed = false;
                     iter_changed |= ConstantFolding::run_on_function(func);
                     iter_changed |= DeadCodeElimination::run_on_function(func);
+                    iter_changed |= SimdOptimizer::run_on_function(func);
                     for (i, block) in func.blocks.iter_mut().enumerate() {
                         block.id = BlockId(i);
                     }
@@ -113,21 +117,24 @@ impl MirOptimizer {
         Safepoints::run_on_module_with_config(module, config)
     }
 
-    /// Runs general optimizations followed by deterministic safepoint insertion.
+    /// Instruments scalar control flow before optimization so gas checks retain
+    /// their per-iteration meaning and prevent unsafe loop vectorization.
     pub fn optimize_function_with_safepoints(
         func: &mut MirFunction,
         config: &SafepointConfig,
     ) -> usize {
+        let inserted = Safepoints::run_on_function_with_config(func, config);
         Self::optimize_function(func);
-        Safepoints::run_on_function_with_config(func, config)
+        inserted
     }
 
-    /// Runs general module optimizations followed by deterministic safepoint insertion.
+    /// Instruments scalar module control flow before general optimization.
     pub fn optimize_module_with_safepoints(
         module: &mut MirModule,
         config: &SafepointConfig,
     ) -> SafepointStats {
+        let stats = Safepoints::run_on_module_with_config(module, config);
         Self::optimize_module(module);
-        Safepoints::run_on_module_with_config(module, config)
+        stats
     }
 }

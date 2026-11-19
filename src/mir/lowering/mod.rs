@@ -58,6 +58,7 @@ pub struct AstLowering<'a> {
     struct_layouts: HashMap<String, LogicalLayoutV1>,
     struct_ops: Vec<MirStructOp>,
     local_field_names: HashMap<LocalId, Vec<String>>,
+    known_typed_locals: HashSet<LocalId>,
     thunk_return_target: Option<(LocalId, BlockId)>,
 }
 
@@ -65,8 +66,10 @@ impl<'a> AstLowering<'a> {
     pub fn new(func: &'a mut MirFunction) -> Self {
         let entry = func.entry;
         let mut scope = HashMap::new();
+        let mut known_typed_locals = HashSet::new();
         // Register parameters in the root scope
         for (idx, p_id) in func.params.iter().enumerate() {
+            known_typed_locals.insert(*p_id);
             let p_name = func.locals[p_id.0]
                 .name
                 .clone()
@@ -85,7 +88,29 @@ impl<'a> AstLowering<'a> {
             struct_layouts: HashMap::new(),
             struct_ops: Vec::new(),
             local_field_names: HashMap::new(),
+            known_typed_locals,
             thunk_return_target: None,
+        }
+    }
+
+    fn operand_definite_mir_type(&self, op: &Operand) -> MirType {
+        match op {
+            Operand::Constant(c) => match c {
+                MirConstant::Int(_) => MirType::Int,
+                MirConstant::Float(_) => MirType::Float,
+                MirConstant::Bool(_) => MirType::Bool,
+                MirConstant::String(_) => MirType::String,
+                MirConstant::Unit => MirType::Unit,
+            },
+            Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
+                let ty = &self.current_fn.locals[loc.0].ty;
+                if *ty == MirType::Int && !self.known_typed_locals.contains(loc) {
+                    MirType::Unknown
+                } else {
+                    ty.clone()
+                }
+            }
+            _ => MirType::Unknown,
         }
     }
 
@@ -482,31 +507,30 @@ impl<'a> AstLowering<'a> {
                 };
 
                 for (idx, b) in bindings.iter().enumerate() {
+                    let has_init = initializer.as_ref().is_some_and(|inits| idx < inits.len());
                     let init_op = init_operands.get(idx).cloned().unwrap_or(Operand::Constant(MirConstant::Int(0)));
-                    let inferred_ty = match &init_op {
-                        Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
-                            self.current_fn.locals[loc.0].ty.clone()
-                        }
-                        Operand::Constant(c) => match c {
-                            MirConstant::Int(_) => MirType::Int,
-                            MirConstant::Float(_) => MirType::Float,
-                            MirConstant::Bool(_) => MirType::Bool,
-                            MirConstant::String(_) => MirType::String,
-                            MirConstant::Unit => MirType::Unit,
-                        },
-                        _ => MirType::Int,
+                    let inferred_ty = if has_init {
+                        self.operand_definite_mir_type(&init_op)
+                    } else {
+                        MirType::Int
                     };
                     let ty = b
                         .type_annotation
                         .as_ref()
                         .map(mir_type_from_ast)
                         .unwrap_or(inferred_ty);
+                    let is_known = b.type_annotation.is_some()
+                        || (ty == MirType::Int
+                            && (!has_init || matches!(init_op, Operand::Constant(MirConstant::Int(_)))));
                     let local_id = self.current_fn.add_local(
                         Some(b.name.clone()),
                         ty,
                         true,
                         b.span,
                     );
+                    if is_known {
+                        self.known_typed_locals.insert(local_id);
+                    }
                     self.insert_var(b.name.clone(), local_id);
 
                     if let Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)) = &init_op {
@@ -634,7 +658,15 @@ impl<'a> AstLowering<'a> {
                 } else {
                     let ret_op = if let Some(first) = exprs.first() {
                         let op = self.lower_expr(first)?;
-                        let temp = self.current_fn.add_local(None, MirType::Int, true, stmt.span);
+                        let ret_ty = if matches!(
+                            self.current_fn.signature.return_type,
+                            MirType::Unit | MirType::Unknown
+                        ) {
+                            MirType::Int
+                        } else {
+                            self.current_fn.signature.return_type.clone()
+                        };
+                        let temp = self.current_fn.add_local(None, ret_ty, true, stmt.span);
                         self.emit_stmt(Statement::StorageLive(temp, stmt.span));
                         self.emit_stmt(Statement::Assign(Place::Local(temp), Rvalue::Use(op), stmt.span));
                         Some(Operand::Copy(Place::Local(temp)))
@@ -695,6 +727,7 @@ impl<'a> AstLowering<'a> {
                     true,
                     stmt.span,
                 );
+                self.known_typed_locals.insert(var_local);
                 self.emit_stmt(Statement::StorageLive(var_local, stmt.span));
                 self.emit_stmt(Statement::Assign(
                     Place::Local(var_local),
@@ -1672,7 +1705,32 @@ impl<'a> AstLowering<'a> {
                 for e in elements {
                     lowered_elems.push(self.lower_expr(e)?);
                 }
-                let elem_ty = MirType::Int;
+                let elem_ty = if lowered_elems.is_empty() {
+                    MirType::Unknown
+                } else {
+                    let mut unified: Option<MirType> = None;
+                    let mut unresolved_or_conflict = false;
+                    for op in &lowered_elems {
+                        let ty = self.operand_definite_mir_type(op);
+                        if ty == MirType::Unknown {
+                            unresolved_or_conflict = true;
+                            break;
+                        }
+                        match &unified {
+                            None => unified = Some(ty),
+                            Some(prev) if *prev == ty => {}
+                            Some(_) => {
+                                unresolved_or_conflict = true;
+                                break;
+                            }
+                        }
+                    }
+                    if unresolved_or_conflict {
+                        MirType::Unknown
+                    } else {
+                        unified.unwrap_or(MirType::Unknown)
+                    }
+                };
                 let arr_ty = MirType::Array(Box::new(elem_ty));
                 let temp = self.current_fn.add_local(None, arr_ty.clone(), true, expr.span);
                 self.emit_stmt(Statement::StorageLive(temp, expr.span));
@@ -1802,12 +1860,15 @@ impl<'a> AstLowering<'a> {
             }
             ExprKind::Tuple(elements) => {
                 let mut lowered = Vec::with_capacity(elements.len());
+                let mut elem_types = Vec::with_capacity(elements.len());
                 let mut field_names = Vec::with_capacity(elements.len());
                 for (i, elem) in elements.iter().enumerate() {
-                    lowered.push(self.lower_expr(elem)?);
+                    let op = self.lower_expr(elem)?;
+                    elem_types.push(self.operand_definite_mir_type(&op));
+                    lowered.push(op);
                     field_names.push(format!("{i}"));
                 }
-                let tuple_ty = MirType::Tuple(vec![MirType::Int; elements.len()]);
+                let tuple_ty = MirType::Tuple(elem_types);
                 let temp = self.current_fn.add_local(None, tuple_ty.clone(), true, expr.span);
                 self.local_field_names.insert(temp, field_names);
                 self.emit_stmt(Statement::StorageLive(temp, expr.span));

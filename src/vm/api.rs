@@ -228,18 +228,25 @@ impl VM {
             #[cfg(feature = "test-deopt")]
             last_deopt_source: None,
             cranelift_compilation_count: 0,
+            cranelift_dispatch_refine_count: 0,
+            cranelift_struct_sync_count: 0,
             cranelift_generation: 0,
             cranelift_compiled_generation: 0,
+            mir_context_struct_gen: 0,
+            cranelift_compiled_struct_gen: 0,
             #[cfg(feature = "std")]
             cranelift_jit: None,
             #[cfg(feature = "std")]
             cranelift_recipes: HashMap::new(),
+            #[cfg(feature = "std")]
+            cranelift_fn_cache: Vec::new(),
             mir_functions: HashMap::new(),
             cranelift_compiled: HashMap::new(),
             jit: JitState::new(),
             budgets: BudgetState::default(),
             functions: Vec::new(),
             call_meta: Vec::new(),
+            ast_bytecode_backup: HashMap::new(),
             natives: HashMap::new(),
             globals: HashMap::new(),
             globals_version: 0,
@@ -259,7 +266,7 @@ impl VM {
             skip_next_trace_record: false,
             trait_impls: HashMap::new(),
             struct_tostring_cache: HashMap::new(),
-            struct_metadata: HashMap::new(),
+            struct_metadata: super::StructMetadataRegistry::new(),
             call_until_depth: None,
             task_manager: TaskManager::new(),
             current_task: None,
@@ -294,11 +301,10 @@ impl VM {
             config: config.clone(),
         };
         vm.cycle_collector.set_enabled(config.gc_enabled());
-        if config.use_mir() {
-            vm.jit.enabled = false;
-        } else {
-            vm.jit.enabled = vm.jit.enabled && config.jit_enabled();
-        }
+        vm.jit.enabled = vm.jit.enabled
+            && !crate::jit::is_dynasm_retired()
+            && !config.use_mir()
+            && config.jit_enabled();
 
         #[cfg(feature = "std")]
         let cache_key = {
@@ -320,7 +326,7 @@ impl VM {
         #[cfg(feature = "std")]
         if let Some(cached) = cached {
             vm.trait_impls = cached.trait_impls;
-            vm.struct_metadata = cached.struct_metadata;
+            vm.struct_metadata.replace_all(cached.struct_metadata);
             vm.natives = cached.natives;
             vm.globals = cached.globals;
             vm.jit.intrinsics = cached.intrinsics;
@@ -354,7 +360,7 @@ impl VM {
                 cache_key,
                 VmBuiltinsCache {
                     trait_impls: vm.trait_impls.clone(),
-                    struct_metadata: vm.struct_metadata.clone(),
+                    struct_metadata: vm.struct_metadata.clone_map(),
                     natives: vm.natives.clone(),
                     globals: vm.globals.clone(),
                     intrinsics: vm.jit.intrinsics.clone(),
@@ -593,6 +599,11 @@ impl VM {
         self.jit_cells.entry_table = self.jit.function_entry_table();
         self.call_meta = functions.iter().map(CallMeta::of).collect();
         self.functions = functions;
+        self.ast_bytecode_backup.clear();
+        #[cfg(feature = "std")]
+        {
+            self.cranelift_fn_cache.clear();
+        }
     }
 
     pub fn jit_stats(&self) -> crate::jit::JitStats {
@@ -643,6 +654,15 @@ impl VM {
                     },
                 );
             }
+        }
+        #[cfg(feature = "std")]
+        if !defs.is_empty()
+            && self.cranelift_compiled_struct_gen != self.struct_metadata.generation()
+            && (!self.cranelift_compiled.is_empty()
+                || !self.cranelift_recipes.is_empty()
+                || !self.cranelift_fn_cache.is_empty())
+        {
+            self.invalidate_cranelift_for_struct_change();
         }
     }
 

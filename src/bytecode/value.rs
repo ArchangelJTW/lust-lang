@@ -2482,8 +2482,56 @@ thread_local! {
     static SPECIALIZED_BOOL_CACHE: RefCell<HashMap<SpecializedCacheKey, (Vec<u8>, bool, Weak<RefCell<Vec<Value>>>)>> = RefCell::new(HashMap::new());
     static SPECIALIZED_INT_CACHE: RefCell<HashMap<SpecializedCacheKey, (Vec<LustInt>, bool, Weak<RefCell<Vec<Value>>>)>> = RefCell::new(HashMap::new());
     static SPECIALIZED_FLOAT_CACHE: RefCell<HashMap<SpecializedCacheKey, (Vec<LustFloat>, bool, Weak<RefCell<Vec<Value>>>)>> = RefCell::new(HashMap::new());
+    static SPECIALIZED_ACTIVE_ENTRIES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     static FALLBACK_ARRAY_MAP: RefCell<HashMap<usize, ArraySequenceId>> = RefCell::new(HashMap::new());
     static NEXT_FALLBACK_SEQ: core::cell::Cell<u64> = const { core::cell::Cell::new(1) };
+}
+
+#[cfg(all(test, feature = "std"))]
+thread_local! {
+    static SPECIALIZED_CACHE_HASHMAP_PROBES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "std")]
+#[inline(always)]
+fn record_specialized_cache_probe() {
+    #[cfg(test)]
+    SPECIALIZED_CACHE_HASHMAP_PROBES.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(feature = "std")]
+#[inline(always)]
+fn specialized_cache_inc() {
+    SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(feature = "std")]
+#[inline(always)]
+fn specialized_cache_sub(removed: usize) {
+    if removed > 0 {
+        SPECIALIZED_ACTIVE_ENTRIES.with(|c| {
+            let cur = c.get();
+            debug_assert!(
+                cur >= removed,
+                "SPECIALIZED_ACTIVE_ENTRIES underflow: cur={cur}, removed={removed}"
+            );
+            c.set(cur.saturating_sub(removed));
+        });
+    }
+}
+
+/// Returns the number of active entries currently tracked across the thread-local
+/// specialized bool, int, and float array caches.
+#[inline(always)]
+pub fn specialized_cache_active_entries() -> usize {
+    #[cfg(feature = "std")]
+    {
+        SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        0
+    }
 }
 
 pub fn resolve_array_key_from_ptr(arr_ptr: usize) -> SpecializedCacheKey {
@@ -2608,6 +2656,9 @@ impl ArrayCacheKey for &Rc<RefCell<Vec<Value>>> {
 
 #[cfg(feature = "std")]
 pub fn invalidate_specialized_array_cache<K: ArrayCacheKey>(key: K) {
+    if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+        return;
+    }
     if let Some(arr_ptr) = key.to_ptr_opt() {
         if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
             let vm = unsafe { &*vm_ptr };
@@ -2618,23 +2669,38 @@ pub fn invalidate_specialized_array_cache<K: ArrayCacheKey>(key: K) {
         if let Some(seq0) = FALLBACK_ARRAY_MAP.with(|m| m.borrow_mut().remove(&arr_ptr)) {
             invalidate_specialized_array_cache_by_key((VmId(0), seq0));
         }
+        if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            return;
+        }
         SPECIALIZED_BOOL_CACHE.with(|c| {
-            c.borrow_mut().retain(|_, (_, _, weak)| {
+            record_specialized_cache_probe();
+            let mut cache = c.borrow_mut();
+            let before = cache.len();
+            cache.retain(|_, (_, _, weak)| {
                 weak.upgrade()
                     .is_some_and(|rc| rc.as_ptr() as usize != arr_ptr)
             });
+            specialized_cache_sub(before - cache.len());
         });
         SPECIALIZED_INT_CACHE.with(|c| {
-            c.borrow_mut().retain(|_, (_, _, weak)| {
+            record_specialized_cache_probe();
+            let mut cache = c.borrow_mut();
+            let before = cache.len();
+            cache.retain(|_, (_, _, weak)| {
                 weak.upgrade()
                     .is_some_and(|rc| rc.as_ptr() as usize != arr_ptr)
             });
+            specialized_cache_sub(before - cache.len());
         });
         SPECIALIZED_FLOAT_CACHE.with(|c| {
-            c.borrow_mut().retain(|_, (_, _, weak)| {
+            record_specialized_cache_probe();
+            let mut cache = c.borrow_mut();
+            let before = cache.len();
+            cache.retain(|_, (_, _, weak)| {
                 weak.upgrade()
                     .is_some_and(|rc| rc.as_ptr() as usize != arr_ptr)
             });
+            specialized_cache_sub(before - cache.len());
         });
     } else {
         let cache_key = key.to_cache_key();
@@ -2644,17 +2710,41 @@ pub fn invalidate_specialized_array_cache<K: ArrayCacheKey>(key: K) {
 
 #[cfg(feature = "std")]
 pub fn invalidate_specialized_array_cache_by_key(key: SpecializedCacheKey) {
-    SPECIALIZED_BOOL_CACHE.with(|c| c.borrow_mut().remove(&key));
-    SPECIALIZED_INT_CACHE.with(|c| c.borrow_mut().remove(&key));
-    SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow_mut().remove(&key));
+    if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+        return;
+    }
+    let mut removed = 0usize;
+    SPECIALIZED_BOOL_CACHE.with(|c| {
+        record_specialized_cache_probe();
+        if c.borrow_mut().remove(&key).is_some() {
+            removed += 1;
+        }
+    });
+    SPECIALIZED_INT_CACHE.with(|c| {
+        record_specialized_cache_probe();
+        if c.borrow_mut().remove(&key).is_some() {
+            removed += 1;
+        }
+    });
+    SPECIALIZED_FLOAT_CACHE.with(|c| {
+        record_specialized_cache_probe();
+        if c.borrow_mut().remove(&key).is_some() {
+            removed += 1;
+        }
+    });
+    specialized_cache_sub(removed);
 }
 
 pub fn get_specialized_cached_element(arr: &Rc<RefCell<Vec<Value>>>, idx: i64) -> Option<Value> {
     #[cfg(feature = "std")]
     {
+        if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            return None;
+        }
         let arr_ptr = arr.as_ptr() as usize;
         let primary = primary_array_key_from_ptr_opt(arr_ptr);
         SPECIALIZED_BOOL_CACHE.with(|c| {
+            record_specialized_cache_probe();
             let cache = c.borrow();
             let keys = matching_keys_in_cache(&cache, arr_ptr, primary);
             for k in keys {
@@ -2668,6 +2758,7 @@ pub fn get_specialized_cached_element(arr: &Rc<RefCell<Vec<Value>>>, idx: i64) -
             None
         }).or_else(|| {
             SPECIALIZED_INT_CACHE.with(|c| {
+                record_specialized_cache_probe();
                 let cache = c.borrow();
                 let keys = matching_keys_in_cache(&cache, arr_ptr, primary);
                 for k in keys {
@@ -2682,6 +2773,7 @@ pub fn get_specialized_cached_element(arr: &Rc<RefCell<Vec<Value>>>, idx: i64) -
             })
         }).or_else(|| {
             SPECIALIZED_FLOAT_CACHE.with(|c| {
+                record_specialized_cache_probe();
                 let cache = c.borrow();
                 let keys = matching_keys_in_cache(&cache, arr_ptr, primary);
                 for k in keys {
@@ -2703,15 +2795,20 @@ pub fn get_specialized_cached_element(arr: &Rc<RefCell<Vec<Value>>>, idx: i64) -
 pub fn get_specialized_cached_len(arr: &Rc<RefCell<Vec<Value>>>) -> Option<usize> {
     #[cfg(feature = "std")]
     {
+        if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            return None;
+        }
         let arr_ptr = arr.as_ptr() as usize;
         let primary = primary_array_key_from_ptr_opt(arr_ptr);
         SPECIALIZED_BOOL_CACHE.with(|c| {
+            record_specialized_cache_probe();
             let cache = c.borrow();
             matching_keys_in_cache(&cache, arr_ptr, primary)
                 .into_iter()
                 .find_map(|k| cache.get(&k).map(|(vec, _, _)| vec.len()))
         }).or_else(|| {
             SPECIALIZED_INT_CACHE.with(|c| {
+                record_specialized_cache_probe();
                 let cache = c.borrow();
                 matching_keys_in_cache(&cache, arr_ptr, primary)
                     .into_iter()
@@ -2719,6 +2816,7 @@ pub fn get_specialized_cached_len(arr: &Rc<RefCell<Vec<Value>>>) -> Option<usize
             })
         }).or_else(|| {
             SPECIALIZED_FLOAT_CACHE.with(|c| {
+                record_specialized_cache_probe();
                 let cache = c.borrow();
                 matching_keys_in_cache(&cache, arr_ptr, primary)
                     .into_iter()
@@ -2737,10 +2835,14 @@ pub fn set_specialized_cached_element(
 ) -> Option<Result<(), String>> {
     #[cfg(feature = "std")]
     {
+        if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            return None;
+        }
         let arr_ptr = arr.as_ptr() as usize;
         let primary = primary_array_key_from_ptr_opt(arr_ptr);
 
         let bool_key = SPECIALIZED_BOOL_CACHE.with(|c| {
+            record_specialized_cache_probe();
             let cache = c.borrow();
             matching_keys_in_cache(&cache, arr_ptr, primary).into_iter().next()
         });
@@ -2771,6 +2873,7 @@ pub fn set_specialized_cached_element(
         }
 
         let int_key = SPECIALIZED_INT_CACHE.with(|c| {
+            record_specialized_cache_probe();
             let cache = c.borrow();
             matching_keys_in_cache(&cache, arr_ptr, primary).into_iter().next()
         });
@@ -2801,6 +2904,7 @@ pub fn set_specialized_cached_element(
         }
 
         let float_key = SPECIALIZED_FLOAT_CACHE.with(|c| {
+            record_specialized_cache_probe();
             let cache = c.borrow();
             matching_keys_in_cache(&cache, arr_ptr, primary).into_iter().next()
         });
@@ -2842,6 +2946,7 @@ fn sync_cache_for_array<T: Copy, F: Fn(T) -> Value>(
     kind_label: &str,
     to_value: F,
 ) -> Result<(), String> {
+    record_specialized_cache_probe();
     let mut cache = cache_cell.borrow_mut();
     let keys = matching_keys_in_cache(&cache, arr_ptr, primary);
     let mut to_remove = Vec::new();
@@ -2878,16 +2983,23 @@ fn sync_cache_for_array<T: Copy, F: Fn(T) -> Value>(
             to_remove.push(k);
         }
     }
+    let mut removed = 0usize;
     for k in to_remove {
-        cache.remove(&k);
+        if cache.remove(&k).is_some() {
+            removed += 1;
+        }
         remove_stale_fallback_if_vm_active(arr_ptr, k);
     }
+    specialized_cache_sub(removed);
     Ok(())
 }
 
 pub fn try_sync_specialized_array(arr: &Rc<RefCell<Vec<Value>>>) -> Result<(), String> {
     #[cfg(feature = "std")]
     {
+        if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            return Ok(());
+        }
         let arr_ptr = arr.as_ptr() as usize;
         let primary = primary_array_key_from_ptr_opt(arr_ptr);
 
@@ -2910,8 +3022,13 @@ pub fn sync_specialized_array(arr: &Rc<RefCell<Vec<Value>>>) {
 pub fn sync_all_specialized_arrays() {
     #[cfg(feature = "std")]
     {
+        if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            return;
+        }
         SPECIALIZED_BOOL_CACHE.with(|c| {
+            record_specialized_cache_probe();
             let mut cache = c.borrow_mut();
+            let before = cache.len();
             cache.retain(|&_arr_key, (vec, dirty, weak)| {
                 if let Some(rc) = weak.upgrade() {
                     if *dirty {
@@ -2931,9 +3048,12 @@ pub fn sync_all_specialized_arrays() {
                     false
                 }
             });
+            specialized_cache_sub(before - cache.len());
         });
         SPECIALIZED_INT_CACHE.with(|c| {
+            record_specialized_cache_probe();
             let mut cache = c.borrow_mut();
+            let before = cache.len();
             cache.retain(|&_arr_key, (vec, dirty, weak)| {
                 if let Some(rc) = weak.upgrade() {
                     if *dirty {
@@ -2953,9 +3073,12 @@ pub fn sync_all_specialized_arrays() {
                     false
                 }
             });
+            specialized_cache_sub(before - cache.len());
         });
         SPECIALIZED_FLOAT_CACHE.with(|c| {
+            record_specialized_cache_probe();
             let mut cache = c.borrow_mut();
+            let before = cache.len();
             cache.retain(|&_arr_key, (vec, dirty, weak)| {
                 if let Some(rc) = weak.upgrade() {
                     if *dirty {
@@ -2975,6 +3098,7 @@ pub fn sync_all_specialized_arrays() {
                     false
                 }
             });
+            specialized_cache_sub(before - cache.len());
         });
     }
 }
@@ -3001,20 +3125,27 @@ pub unsafe extern "C" fn jit_unbox_array_int(
         };
         let arr_ptr = arr_rc.as_ptr() as usize;
         let arr_key = resolve_array_key_from_ptr(arr_ptr);
-        let cached = SPECIALIZED_INT_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            let keys = matching_keys_in_cache(&cache, arr_ptr, Some(arr_key));
-            let mut found = None;
-            for k in keys {
-                if let Some(entry) = cache.remove(&k) {
-                    remove_stale_fallback_if_vm_active(arr_ptr, k);
-                    if found.is_none() {
-                        found = Some(entry);
+        let cached = if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            None
+        } else {
+            SPECIALIZED_INT_CACHE.with(|c| {
+                let mut cache = c.borrow_mut();
+                let keys = matching_keys_in_cache(&cache, arr_ptr, Some(arr_key));
+                let mut found = None;
+                let mut removed = 0usize;
+                for k in keys {
+                    if let Some(entry) = cache.remove(&k) {
+                        removed += 1;
+                        remove_stale_fallback_if_vm_active(arr_ptr, k);
+                        if found.is_none() {
+                            found = Some(entry);
+                        }
                     }
                 }
-            }
-            found
-        });
+                specialized_cache_sub(removed);
+                found
+            })
+        };
         let mut specialized_vec = if let Some((vec, _dirty, _weak)) = cached {
             vec
         } else {
@@ -3061,20 +3192,27 @@ pub unsafe extern "C" fn jit_unbox_array_bool(
         };
         let arr_ptr = arr_rc.as_ptr() as usize;
         let arr_key = resolve_array_key_from_ptr(arr_ptr);
-        let cached = SPECIALIZED_BOOL_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            let keys = matching_keys_in_cache(&cache, arr_ptr, Some(arr_key));
-            let mut found = None;
-            for k in keys {
-                if let Some(entry) = cache.remove(&k) {
-                    remove_stale_fallback_if_vm_active(arr_ptr, k);
-                    if found.is_none() {
-                        found = Some(entry);
+        let cached = if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            None
+        } else {
+            SPECIALIZED_BOOL_CACHE.with(|c| {
+                let mut cache = c.borrow_mut();
+                let keys = matching_keys_in_cache(&cache, arr_ptr, Some(arr_key));
+                let mut found = None;
+                let mut removed = 0usize;
+                for k in keys {
+                    if let Some(entry) = cache.remove(&k) {
+                        removed += 1;
+                        remove_stale_fallback_if_vm_active(arr_ptr, k);
+                        if found.is_none() {
+                            found = Some(entry);
+                        }
                     }
                 }
-            }
-            found
-        });
+                specialized_cache_sub(removed);
+                found
+            })
+        };
         let mut specialized_vec = if let Some((vec, _dirty, _weak)) = cached {
             vec
         } else {
@@ -3121,20 +3259,27 @@ pub unsafe extern "C" fn jit_unbox_array_float(
         };
         let arr_ptr = arr_rc.as_ptr() as usize;
         let arr_key = resolve_array_key_from_ptr(arr_ptr);
-        let cached = SPECIALIZED_FLOAT_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            let keys = matching_keys_in_cache(&cache, arr_ptr, Some(arr_key));
-            let mut found = None;
-            for k in keys {
-                if let Some(entry) = cache.remove(&k) {
-                    remove_stale_fallback_if_vm_active(arr_ptr, k);
-                    if found.is_none() {
-                        found = Some(entry);
+        let cached = if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
+            None
+        } else {
+            SPECIALIZED_FLOAT_CACHE.with(|c| {
+                let mut cache = c.borrow_mut();
+                let keys = matching_keys_in_cache(&cache, arr_ptr, Some(arr_key));
+                let mut found = None;
+                let mut removed = 0usize;
+                for k in keys {
+                    if let Some(entry) = cache.remove(&k) {
+                        removed += 1;
+                        remove_stale_fallback_if_vm_active(arr_ptr, k);
+                        if found.is_none() {
+                            found = Some(entry);
+                        }
                     }
                 }
-            }
-            found
-        });
+                specialized_cache_sub(removed);
+                found
+            })
+        };
         let mut specialized_vec = if let Some((vec, _dirty, _weak)) = cached {
             vec
         } else {
@@ -3177,13 +3322,19 @@ pub unsafe extern "C" fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8 {
                 let weak = Rc::downgrade(&array);
                 SPECIALIZED_INT_CACHE.with(|c| {
                     let mut cache = c.borrow_mut();
+                    let mut removed = 0usize;
                     for k in matching_keys_in_cache(&cache, arr_ptr, Some(arr_key)) {
                         if k != arr_key {
-                            cache.remove(&k);
+                            if cache.remove(&k).is_some() {
+                                removed += 1;
+                            }
                             remove_stale_fallback_if_vm_active(arr_ptr, k);
                         }
                     }
-                    cache.insert(arr_key, (vec, true, weak));
+                    specialized_cache_sub(removed);
+                    if cache.insert(arr_key, (vec, true, weak)).is_none() {
+                        specialized_cache_inc();
+                    }
                 });
                 1
             }
@@ -3209,13 +3360,19 @@ pub unsafe extern "C" fn jit_rebox_array_bool(slot: *mut JitVecSlot) -> u8 {
                 let weak = Rc::downgrade(&array);
                 SPECIALIZED_BOOL_CACHE.with(|c| {
                     let mut cache = c.borrow_mut();
+                    let mut removed = 0usize;
                     for k in matching_keys_in_cache(&cache, arr_ptr, Some(arr_key)) {
                         if k != arr_key {
-                            cache.remove(&k);
+                            if cache.remove(&k).is_some() {
+                                removed += 1;
+                            }
                             remove_stale_fallback_if_vm_active(arr_ptr, k);
                         }
                     }
-                    cache.insert(arr_key, (vec, true, weak));
+                    specialized_cache_sub(removed);
+                    if cache.insert(arr_key, (vec, true, weak)).is_none() {
+                        specialized_cache_inc();
+                    }
                 });
                 1
             }
@@ -3241,13 +3398,19 @@ pub unsafe extern "C" fn jit_rebox_array_float(slot: *mut JitVecSlot) -> u8 {
                 let weak = Rc::downgrade(&array);
                 SPECIALIZED_FLOAT_CACHE.with(|c| {
                     let mut cache = c.borrow_mut();
+                    let mut removed = 0usize;
                     for k in matching_keys_in_cache(&cache, arr_ptr, Some(arr_key)) {
                         if k != arr_key {
-                            cache.remove(&k);
+                            if cache.remove(&k).is_some() {
+                                removed += 1;
+                            }
                             remove_stale_fallback_if_vm_active(arr_ptr, k);
                         }
                     }
-                    cache.insert(arr_key, (vec, true, weak));
+                    specialized_cache_sub(removed);
+                    if cache.insert(arr_key, (vec, true, weak)).is_none() {
+                        specialized_cache_inc();
+                    }
                 });
                 1
             }
@@ -5155,5 +5318,158 @@ mod jit_replacement_tests {
         assert_eq!(Rc::strong_count(rc), 2);
         unsafe { jit_drop_vec_int(&mut slot) };
         assert_eq!(Rc::strong_count(rc), 1);
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::*;
+
+    fn empty_slot() -> JitVecSlot {
+        JitVecSlot {
+            ptr: core::ptr::null_mut(),
+            len: 0,
+            cap: 0,
+            array: core::ptr::null(),
+        }
+    }
+
+    fn reset_probes() {
+        SPECIALIZED_CACHE_HASHMAP_PROBES.with(|c| c.set(0));
+    }
+
+    fn probe_count() -> usize {
+        SPECIALIZED_CACHE_HASHMAP_PROBES.with(|c| c.get())
+    }
+
+    fn actual_cache_len() -> usize {
+        SPECIALIZED_BOOL_CACHE.with(|c| c.borrow().len())
+            + SPECIALIZED_INT_CACHE.with(|c| c.borrow().len())
+            + SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow().len())
+    }
+
+    #[test]
+    fn test_perf_t1_6_specialized_cache_empty_fast_path() {
+        // Ensure clean starting state on this test thread.
+        sync_all_specialized_arrays();
+        assert_eq!(specialized_cache_active_entries(), 0);
+        assert_eq!(actual_cache_len(), 0);
+
+        let arr_int = Rc::new(RefCell::new(vec![Value::Int(10), Value::Int(20)]));
+        let arr_bool = Rc::new(RefCell::new(vec![Value::Bool(true), Value::Bool(false)]));
+        let arr_float = Rc::new(RefCell::new(vec![Value::Float(1.5), Value::Float(2.5)]));
+
+        // 1. Empty fast-path: all 6 functions (plus by_key) must trigger 0 HashMap probes.
+        reset_probes();
+        assert_eq!(get_specialized_cached_element(&arr_int, 0), None);
+        assert_eq!(get_specialized_cached_len(&arr_int), None);
+        assert!(set_specialized_cached_element(&arr_int, 0, &Value::Int(99)).is_none());
+        invalidate_specialized_array_cache(&arr_int);
+        invalidate_specialized_array_cache(arr_int.as_ptr() as usize);
+        invalidate_specialized_array_cache_by_key((VmId(0), ArraySequenceId(999)));
+        assert_eq!(try_sync_specialized_array(&arr_int), Ok(()));
+        sync_all_specialized_arrays();
+        assert_eq!(
+            probe_count(),
+            0,
+            "All 6 specialized cache entrypoints must skip HashMap probes when cache is empty"
+        );
+        assert_eq!(specialized_cache_active_entries(), 0);
+        assert_eq!(actual_cache_len(), 0);
+
+        // 2. Populate bool, int, and float caches via jit_unbox + jit_rebox.
+        let val_int = Value::Array(Rc::clone(&arr_int));
+        let val_bool = Value::Array(Rc::clone(&arr_bool));
+        let val_float = Value::Array(Rc::clone(&arr_float));
+
+        let mut slot = empty_slot();
+        unsafe {
+            assert_eq!(jit_unbox_array_int(&val_int, &mut slot), 1);
+            *slot.ptr = 111;
+            assert_eq!(jit_rebox_array_int(&mut slot), 1);
+        }
+        assert_eq!(specialized_cache_active_entries(), 1);
+        assert_eq!(actual_cache_len(), 1);
+
+        unsafe {
+            assert_eq!(jit_unbox_array_bool(&val_bool, &mut slot), 1);
+            *(slot.ptr as *mut u8) = 0;
+            assert_eq!(jit_rebox_array_bool(&mut slot), 1);
+        }
+        assert_eq!(specialized_cache_active_entries(), 2);
+        assert_eq!(actual_cache_len(), 2);
+
+        unsafe {
+            assert_eq!(jit_unbox_array_float(&val_float, &mut slot), 1);
+            *(slot.ptr as *mut LustFloat) = 9.25;
+            assert_eq!(jit_rebox_array_float(&mut slot), 1);
+        }
+        assert_eq!(specialized_cache_active_entries(), 3);
+        assert_eq!(actual_cache_len(), 3);
+
+        // 3. Reads, writes, and syncs work identically when active > 0.
+        assert_eq!(get_specialized_cached_len(&arr_int), Some(2));
+        assert_eq!(get_specialized_cached_element(&arr_int, 0), Some(Value::Int(111)));
+        assert_eq!(get_specialized_cached_len(&arr_bool), Some(2));
+        assert_eq!(get_specialized_cached_element(&arr_bool, 0), Some(Value::Bool(false)));
+        assert_eq!(get_specialized_cached_len(&arr_float), Some(2));
+        assert_eq!(get_specialized_cached_element(&arr_float, 0), Some(Value::Float(9.25)));
+
+        assert_eq!(
+            set_specialized_cached_element(&arr_int, 1, &Value::Int(222)),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            set_specialized_cached_element(&arr_bool, 1, &Value::Bool(true)),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            set_specialized_cached_element(&arr_float, 1, &Value::Float(4.5)),
+            Some(Ok(()))
+        );
+        assert_eq!(specialized_cache_active_entries(), 3);
+        assert_eq!(actual_cache_len(), 3);
+
+        // Sync writes dirty values back to underlying Vec<Value>.
+        assert_eq!(try_sync_specialized_array(&arr_int), Ok(()));
+        assert_eq!(arr_int.borrow()[0], Value::Int(111));
+        assert_eq!(arr_int.borrow()[1], Value::Int(222));
+
+        sync_all_specialized_arrays();
+        assert_eq!(arr_bool.borrow()[0], Value::Bool(false));
+        assert_eq!(arr_bool.borrow()[1], Value::Bool(true));
+        assert_eq!(arr_float.borrow()[0], Value::Float(9.25));
+        assert_eq!(arr_float.borrow()[1], Value::Float(4.5));
+        assert_eq!(specialized_cache_active_entries(), 3);
+        assert_eq!(actual_cache_len(), 3);
+
+        // 4. Invalidation decrements active count accurately back to 0.
+        invalidate_specialized_array_cache(&arr_int);
+        assert_eq!(specialized_cache_active_entries(), 2);
+        assert_eq!(actual_cache_len(), 2);
+
+        // Mismatched type write syncs & invalidates bool entry.
+        assert!(set_specialized_cached_element(&arr_bool, 0, &Value::Int(7)).is_none());
+        assert_eq!(specialized_cache_active_entries(), 1);
+        assert_eq!(actual_cache_len(), 1);
+
+        // Invalidate remaining float entry by raw pointer usize.
+        invalidate_specialized_array_cache(arr_float.as_ptr() as usize);
+        assert_eq!(specialized_cache_active_entries(), 0);
+        assert_eq!(actual_cache_len(), 0);
+
+        // 5. After returning to 0, all 6 functions again trigger 0 HashMap probes.
+        reset_probes();
+        assert_eq!(get_specialized_cached_element(&arr_int, 0), None);
+        assert_eq!(get_specialized_cached_len(&arr_bool), None);
+        assert!(set_specialized_cached_element(&arr_float, 0, &Value::Float(1.0)).is_none());
+        invalidate_specialized_array_cache(&arr_int);
+        assert_eq!(try_sync_specialized_array(&arr_bool), Ok(()));
+        sync_all_specialized_arrays();
+        assert_eq!(
+            probe_count(),
+            0,
+            "Fast path must re-engage with 0 HashMap probes after active count returns to 0"
+        );
     }
 }

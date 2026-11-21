@@ -344,14 +344,18 @@ fn main() {
             }
         }
     }
+    let mut jit_disabled = false;
     if let Some(mode) = jit_mode {
         match mode.to_ascii_lowercase().as_str() {
             "cranelift" => {
-                use_mir = true;
                 cranelift_jit = true;
             }
-            "auto" | "default" | "vm" | "bytecode" | "off" | "none" => {
+            "auto" | "default" => {
                 cranelift_jit = false;
+            }
+            "off" | "none" | "vm" | "bytecode" => {
+                cranelift_jit = false;
+                jit_disabled = true;
             }
             other => {
                 eprintln!(
@@ -373,6 +377,7 @@ fn main() {
                 use_mir,
                 strict_mir,
                 cranelift_jit,
+                jit_disabled,
                 no_gc,
                 pure_core,
                 json_diag,
@@ -2181,6 +2186,7 @@ fn run_file_with_options(
     use_mir: bool,
     strict_mir: bool,
     cranelift_jit: bool,
+    jit_disabled: bool,
     no_gc: bool,
     pure_core: bool,
     json_diag: bool,
@@ -2229,6 +2235,7 @@ fn run_file_with_options(
     if pure_core {
         config.set_prelude_mode(lust::config::PreludeMode::Pure);
     }
+    let config_had_use_mir = config.use_mir();
     if use_mir {
         config.set_use_mir(true);
     }
@@ -2237,6 +2244,12 @@ fn run_file_with_options(
     }
     if cranelift_jit {
         config.set_cranelift_jit(true);
+        if !config_had_use_mir && !use_mir && !strict_mir {
+            config.set_use_mir(false);
+        }
+    }
+    if jit_disabled {
+        config.set_jit_enabled(false);
     }
     if no_gc {
         config.set_gc_enabled(false);
@@ -2293,17 +2306,21 @@ fn run_file_with_options(
     let mut vm = VM::with_config(&config);
     vm.load_functions(functions);
     for mir_fn in mir_functions {
-        if let Err(e) = vm.load_mir_function(mir_fn) {
-            if let Some(cap_path) = capture_failure {
-                handle_dst_failure_capture(
-                    cap_path,
-                    filename,
-                    &source,
-                    lust::sim::replay::FailureKind::RuntimeError(e.to_string()),
-                );
+        if config.use_mir() {
+            if let Err(e) = vm.load_mir_function(mir_fn) {
+                if let Some(cap_path) = capture_failure {
+                    handle_dst_failure_capture(
+                        cap_path,
+                        filename,
+                        &source,
+                        lust::sim::replay::FailureKind::RuntimeError(e.to_string()),
+                    );
+                }
+                print_error_with_context(&source, filename, &e, json_diag);
+                process::exit(1);
             }
-            print_error_with_context(&source, filename, &e, json_diag);
-            process::exit(1);
+        } else {
+            vm.register_mir_candidate(mir_fn);
         }
     }
     vm.register_structs(&struct_defs);
@@ -2673,6 +2690,7 @@ fn compile_program(
     compiler.set_entry_module(program.entry_module.clone());
     compiler.set_function_signatures(function_signatures);
     compiler.set_use_mir(config.use_mir());
+    compiler.set_collect_mir(config.use_mir() || config.cranelift_jit());
     compiler.set_strict_mir(config.strict_mir());
     let functions = compiler.compile_module(&wrapped_items)?;
     let mir_functions = compiler.take_mir_functions();

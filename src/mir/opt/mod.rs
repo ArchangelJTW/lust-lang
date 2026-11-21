@@ -8,7 +8,7 @@ pub mod simd;
 pub use constant_folding::ConstantFolding;
 pub use dce::DeadCodeElimination;
 pub use escape_analysis::{EscapeAnalysis, EscapeStatus};
-pub use inline::{InlinerConfig, MirInliner};
+pub use inline::{InlinerConfig, JitInlineConfig, MirInliner};
 pub use safepoints::{SafepointConfig, SafepointStats, Safepoints};
 pub use simd::{SimdConfig, SimdOptimizer, SimdStats, SIMD_LANE_WIDTH};
 
@@ -87,6 +87,45 @@ impl MirOptimizer {
                 break;
             }
         }
+    }
+
+    /// JIT-safe module optimization (`PERF-T1-4` / Hazard 3 Step A):
+    /// 1. Runs `MirInliner::inline_module_for_jit` enforcing all JIT guards (no direct/mutual
+    ///    recursion, no effect/handler callees, no loop-bearing callees, `excluded_functions`,
+    ///    local count cap, and `MirVerifier::verify_fn` fail-closed revert).
+    /// 2. Runs `MirOptimizer::optimize_function` ONLY on functions that received inlined code
+    ///    to clean up redundant copies/constants/dead blocks before continuation bytecode,
+    ///    deopt recipe construction, and Cranelift codegen.
+    /// 3. Re-verifies every optimized function with `MirVerifier::verify_fn`, reverting to the
+    ///    pre-inline snapshot on any verification failure (fail-closed).
+    ///
+    /// Returns the set of function names that retain verified post-inline MIR.
+    pub fn optimize_module_for_jit(
+        module: &mut MirModule,
+        config: &JitInlineConfig,
+    ) -> hashbrown::HashSet<alloc::string::String> {
+        let pre_inline_snapshots: hashbrown::HashMap<alloc::string::String, MirFunction> = module
+            .functions
+            .iter()
+            .map(|f| (f.signature.name.clone(), f.clone()))
+            .collect();
+
+        let mut inlined = MirInliner::inline_module_for_jit(module, config);
+
+        for func in &mut module.functions {
+            if !inlined.contains(&func.signature.name) {
+                continue;
+            }
+            Self::optimize_function(func);
+            if crate::mir::verifier::MirVerifier::verify_fn(func).is_err() {
+                if let Some(orig) = pre_inline_snapshots.get(&func.signature.name) {
+                    *func = orig.clone();
+                }
+                inlined.remove(&func.signature.name);
+            }
+        }
+
+        inlined
     }
 
     /// Performs escape analysis on a MIR function local variables.

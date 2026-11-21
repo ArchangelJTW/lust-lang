@@ -395,7 +395,7 @@ impl Compiler {
         func_idx: usize,
         func_def: &crate::ast::FunctionDef,
     ) -> Result<()> {
-        if self.use_mir {
+        if self.use_mir || self.collect_mir {
             match crate::mir::AstLowering::lower_function(func_def) {
                 Ok(mut mir_fn) => {
                     mir_fn.signature.name = self.functions[func_idx].name.clone();
@@ -403,26 +403,32 @@ impl Compiler {
                     match crate::mir::MirVerifier::verify_fn(&mir_fn) {
                         Ok(_) => {
                             crate::mir::MirOptimizer::optimize_function(&mut mir_fn);
-                            let direct_callees: hashbrown::HashSet<String> =
-                                self.function_table.keys().cloned().collect();
-                            match crate::mir::MirToBytecodeCompiler::compile_with_direct_callees(
-                                &mir_fn,
-                                &direct_callees,
-                            ) {
-                                Ok(mut bytecode_fn) => {
-                                    bytecode_fn.is_method = self.functions[func_idx].is_method;
-                                    self.functions[func_idx] = bytecode_fn;
-                                    self.mir_functions.push(mir_fn);
-                                    return Ok(());
-                                }
-                                Err(err) => {
-                                    if self.strict_mir {
-                                        return Err(LustError::CompileError(format!(
-                                            "Strict MIR compilation failed for function '{}': {err}",
-                                            func_def.name
-                                        )));
+                            if self.use_mir {
+                                let direct_callees: hashbrown::HashSet<String> =
+                                    self.function_table.keys().cloned().collect();
+                                match crate::mir::MirToBytecodeCompiler::compile_with_direct_callees(
+                                    &mir_fn,
+                                    &direct_callees,
+                                ) {
+                                    Ok(mut bytecode_fn) => {
+                                        bytecode_fn.is_method = self.functions[func_idx].is_method;
+                                        self.functions[func_idx] = bytecode_fn;
+                                        self.mir_functions.push(mir_fn);
+                                        return Ok(());
+                                    }
+                                    Err(err) => {
+                                        if self.strict_mir {
+                                            return Err(LustError::CompileError(format!(
+                                                "Strict MIR compilation failed for function '{}': {err}",
+                                                func_def.name
+                                            )));
+                                        }
                                     }
                                 }
+                            } else {
+                                // PERF-T1-7: collect MIR candidate for Cranelift while keeping
+                                // direct AST->Bytecode as the primary VM representation.
+                                self.mir_functions.push(mir_fn);
                             }
                         }
                         Err(errors) => {

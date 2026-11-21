@@ -164,6 +164,7 @@ pub fn compile_program_with_config(program: Program, config: &LustConfig) -> cra
     compiler.set_function_signatures(signatures);
     compiler.set_minimal_runtime_types(config.minimal_runtime_types());
     compiler.set_use_mir(config.use_mir());
+    compiler.set_collect_mir(config.use_mir() || config.cranelift_jit());
     compiler.set_strict_mir(config.strict_mir());
     let functions = compiler.compile_module(&wrapped_items)?;
     let mir_functions = compiler.take_mir_functions();
@@ -175,7 +176,11 @@ pub fn compile_program_with_config(program: Program, config: &LustConfig) -> cra
     let mut vm = VM::with_config(&config);
     vm.load_functions(functions);
     for mir_fn in mir_functions {
-        vm.load_mir_function(mir_fn)?;
+        if config.use_mir() {
+            vm.load_mir_function(mir_fn)?;
+        } else {
+            vm.register_mir_candidate(mir_fn);
+        }
     }
     vm.register_structs(&struct_defs);
     for (type_name, trait_name) in trait_impls {

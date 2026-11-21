@@ -1,6 +1,6 @@
 #[cfg(feature = "std")]
 pub use jit_engine::{
-    clear_registered_struct_layouts, find_loop_backedges, find_loop_headers,
+    analyze_module_call_effects, clear_registered_struct_layouts, find_loop_backedges, find_loop_headers,
     get_registered_struct_layout, get_registered_struct_layout_by_name, ic_dispatch,
     ic_invalidate, ic_invalidate_all, ic_probe, ic_register_site, ic_reset, ic_site_stats,
     ic_update, is_loop_backedge, lust_mir_abs_int, lust_mir_alloc_array,
@@ -19,6 +19,7 @@ pub use jit_engine::{
     lust_mir_print_int_part, lust_mir_print_nl, lust_mir_print_sep, lust_mir_record_deopt,
     lust_mir_record_deopt_local,
     lust_mir_record_native_entry, lust_mir_rem_float, lust_mir_rem_int, lust_mir_safepoint,
+    lust_mir_safepoint_slow, lust_mir_safepoint_state_ptr,
     lust_mir_set_gas, lust_mir_set_max_memory, lust_mir_set_memory_limit, lust_mir_set_status,
     lust_mir_string_concat, lust_mir_string_eq, lust_mir_string_len,
     lust_mir_struct_decode_binary, lust_mir_struct_decode_contiguous, publish_deopt_payload,
@@ -26,7 +27,8 @@ pub use jit_engine::{
     publish_deopt_payload_at_terminator, publish_deopt_payload_with_site_kind,
     refine_locals, refine_locals_with_params, refine_locals_with_context, refine_mir_function, refine_mir_function_with_layouts, apply_module_callee_return_types, register_struct_layout, reset_native_instrumentation_counters, safepoint_enter_mask,
     safepoint_exit_mask, safepoint_register_finalizer, safepoint_request_deopt,
-    safepoint_request_interrupt, safepoint_reset, safepoint_stats, take_deopt_payload,
+    safepoint_request_interrupt, safepoint_reset, safepoint_set_gas_budget_active,
+    safepoint_stats, take_deopt_payload,
     set_current_deopt_payload, with_current_deopt_payload_mut,
     take_current_sticky_error, get_current_sticky_error, set_current_sticky_error,
     take_last_schema_decode_error, set_current_native_function, get_current_native_function,
@@ -36,7 +38,9 @@ pub use jit_engine::{
     NativeInvocationIdentity, NativeInvocationGuard, DeoptSiteKind,
     CraneliftJitCompiler, DeoptPayload, IcEntry, IcSiteStats,
     IcStateKind, InlineCacheSite, MirCraneliftBackendError, OsrPromotionTracker,
-    SafepointRuntimeState, SafepointStatsSnapshot, SchemaDecodeError,
+    SafepointFastState, SafepointRuntimeState, SafepointStatsSnapshot, SchemaDecodeError,
+    SLOW_FLAG_DEOPT, SLOW_FLAG_FINALIZERS, SLOW_FLAG_GAS_BUDGET, SLOW_FLAG_INTERRUPT,
+    SLOW_FLAG_MASKED,
     CRANELIFT_NATIVE_ENTRY_COUNT, CRANELIFT_SIMD_SCALAR_COUNT, CRANELIFT_SIMD_VECTOR_COUNT,
     DIRECT_DECODE_COUNT, DYNAMIC_LOOKUP_COUNT,
     lust_mir_is_simd_scalar_forced, lust_mir_record_simd_scalar_op,
@@ -48,6 +52,7 @@ pub use jit_engine::{
 #[cfg(all(feature = "std", feature = "test-deopt"))]
 pub use jit_engine::{
     refine_locals_with_seam, refine_mir_function_with_seam, safepoint_request_deopt_on_poll,
+    SLOW_FLAG_TEST_DEOPT,
 };
 
 #[cfg(feature = "std")]
@@ -59,8 +64,8 @@ pub mod jit_engine {
     use cranelift_codegen::Context;
     use cranelift_codegen::ir::{
         condcodes::{FloatCC, IntCC},
-        types, AbiParam, Block, FuncRef, InstBuilder, MemFlagsData, Signature, StackSlot, StackSlotData,
-        StackSlotKind, Value as ClifValue,
+        types, AbiParam, Block, BlockArg, FuncRef, InstBuilder, MemFlagsData, Signature, StackSlot,
+        StackSlotData, StackSlotKind, Value as ClifValue,
     };
     use cranelift_codegen::settings::{self, Configurable};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -87,14 +92,30 @@ pub mod jit_engine {
     pub const MIR_STATUS_ERR_GENERIC: i64 = crate::effect_abi::LUST_STATUS_ERR_GENERIC as i64;
     pub const MIR_STATUS_DEOPT: i64 = -100;
 
+    pub const SLOW_FLAG_DEOPT: u64 = 1 << 0;
+    pub const SLOW_FLAG_INTERRUPT: u64 = 1 << 1;
+    pub const SLOW_FLAG_MASKED: u64 = 1 << 2;
+    pub const SLOW_FLAG_FINALIZERS: u64 = 1 << 3;
+    pub const SLOW_FLAG_GAS_BUDGET: u64 = 1 << 4;
+    #[cfg(feature = "test-deopt")]
+    pub const SLOW_FLAG_TEST_DEOPT: u64 = 1 << 5;
+
+    #[repr(C)]
+    pub struct SafepointFastState {
+        /// Non-zero bitmask iff ANY slow-path condition is armed on this thread.
+        pub slow_flags: u64,
+        /// Single authoritative per-thread counter for `SafepointStatsSnapshot::safepoints_checked`.
+        pub safepoints_checked: u64,
+    }
+
     #[derive(Default)]
     pub struct SafepointRuntimeState {
         pub mask_depth: usize,
         pub pending_interrupt: Option<crate::effect_abi::InterruptReason>,
-        pub safepoints_checked: u64,
         pub safepoints_masked_deferred: u64,
         pub safepoints_delivered: u64,
         pub deopt_requested: bool,
+        pub gas_budget_active: bool,
         #[cfg(feature = "test-deopt")]
         pub deopt_at_check_ordinal: Option<u64>,
         #[cfg(feature = "test-deopt")]
@@ -519,11 +540,45 @@ pub mod jit_engine {
     thread_local! {
         static IC_REGISTRY: core::cell::RefCell<hashbrown::HashMap<u32, InlineCacheSite>> = core::cell::RefCell::new(hashbrown::HashMap::new());
         static SAFEPOINT_STATE: core::cell::RefCell<SafepointRuntimeState> = core::cell::RefCell::new(SafepointRuntimeState::default());
+        static SAFEPOINT_FAST_STATE: core::cell::UnsafeCell<SafepointFastState> =
+            const { core::cell::UnsafeCell::new(SafepointFastState { slow_flags: 0, safepoints_checked: 0 }) };
         static STANDALONE_DEOPT_PAYLOAD: core::cell::RefCell<Option<DeoptPayload>> = const { core::cell::RefCell::new(None) };
         static STANDALONE_STICKY_ERROR: core::cell::RefCell<Option<String>> = const { core::cell::RefCell::new(None) };
         static CURRENT_NATIVE_INVOCATION_STACK: core::cell::RefCell<Vec<NativeInvocationEntry>> = const { core::cell::RefCell::new(Vec::new()) };
         static STRUCT_LAYOUT_REGISTRY: core::cell::RefCell<hashbrown::HashMap<u64, MirStructLayout>> = core::cell::RefCell::new(hashbrown::HashMap::new());
         static STRUCT_NAME_MAP: core::cell::RefCell<hashbrown::HashMap<String, u64>> = core::cell::RefCell::new(hashbrown::HashMap::new());
+    }
+
+    #[inline(always)]
+    fn sync_safepoint_fast_flags(st: &SafepointRuntimeState) {
+        let mut flags: u64 = 0;
+        if st.deopt_requested {
+            flags |= SLOW_FLAG_DEOPT;
+        }
+        if st.pending_interrupt.is_some() {
+            flags |= SLOW_FLAG_INTERRUPT;
+        }
+        if st.mask_depth > 0 {
+            flags |= SLOW_FLAG_MASKED;
+        }
+        if !st.finalizers.is_empty() {
+            flags |= SLOW_FLAG_FINALIZERS;
+        }
+        if st.gas_budget_active {
+            flags |= SLOW_FLAG_GAS_BUDGET;
+        }
+        #[cfg(feature = "test-deopt")]
+        if st.deopt_at_check_ordinal.is_some() {
+            flags |= SLOW_FLAG_TEST_DEOPT;
+        }
+        SAFEPOINT_FAST_STATE.with(|cell| unsafe {
+            (*cell.get()).slow_flags = flags;
+        });
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lust_mir_safepoint_state_ptr() -> *mut SafepointFastState {
+        SAFEPOINT_FAST_STATE.with(|c| c.get())
     }
 
     pub struct NativeInvocationGuard;
@@ -550,6 +605,7 @@ pub mod jit_engine {
                             {
                                 st.deopt_at_check_ordinal = None;
                                 st.deopt_target_func = None;
+                                sync_safepoint_fast_flags(&st);
                             }
                         });
                     }
@@ -1029,10 +1085,20 @@ pub mod jit_engine {
     }
 
     #[unsafe(no_mangle)]
-    pub extern "C" fn lust_mir_safepoint() -> i64 {
-        SAFEPOINT_STATE.with(|state_cell| {
+    pub extern "C" fn lust_mir_safepoint_slow() -> i64 {
+        #[cfg(feature = "test-deopt")]
+        let fast_checked = SAFEPOINT_FAST_STATE.with(|c| unsafe { (*c.get()).safepoints_checked });
+
+        enum SlowOutcome {
+            Continue,
+            Deopt,
+            NestedDeoptErr,
+            DeliverInterrupt(Vec<alloc::boxed::Box<dyn FnOnce() + Send + 'static>>),
+        }
+
+        let outcome = SAFEPOINT_STATE.with(|state_cell| {
             let mut st = state_cell.borrow_mut();
-            st.safepoints_checked += 1;
+
             #[cfg(feature = "test-deopt")]
             if let Some(target_poll) = st.deopt_at_check_ordinal {
                 let target_func = st.deopt_target_func.as_deref();
@@ -1045,51 +1111,86 @@ pub mod jit_engine {
                         }
                         (fn_ok, top.safepoint_polls)
                     } else {
-                        (target_func.is_none(), st.safepoints_checked)
+                        (target_func.is_none(), fast_checked)
                     }
                 });
                 if matches_fn && current_poll == target_poll {
                     st.deopt_at_check_ordinal = None;
                     st.deopt_target_func = None;
+                    sync_safepoint_fast_flags(&st);
                     if is_nested_native_callee() {
-                        return fail_nested_native_deopt();
+                        return SlowOutcome::NestedDeoptErr;
                     }
-                    with_current_mir_context(|ctx| {
-                        ctx.last_status.store(MIR_STATUS_DEOPT, core::sync::atomic::Ordering::SeqCst);
-                    });
-                    return MIR_STATUS_DEOPT;
+                    return SlowOutcome::Deopt;
                 }
             }
+
             if st.deopt_requested {
                 if is_nested_native_callee() {
                     st.deopt_requested = false;
-                    return fail_nested_native_deopt();
+                    sync_safepoint_fast_flags(&st);
+                    return SlowOutcome::NestedDeoptErr;
                 }
-                with_current_mir_context(|ctx| {
-                    ctx.last_status.store(MIR_STATUS_DEOPT, core::sync::atomic::Ordering::SeqCst);
-                });
-                return MIR_STATUS_DEOPT;
+                return SlowOutcome::Deopt;
             }
+
             if st.mask_depth > 0 {
                 if st.pending_interrupt.is_some() {
                     st.safepoints_masked_deferred += 1;
                 }
-                return 0;
+                return SlowOutcome::Continue;
             }
+
             if let Some(_reason) = st.pending_interrupt.take() {
                 st.safepoints_delivered += 1;
                 let finalizers = core::mem::take(&mut st.finalizers);
+                sync_safepoint_fast_flags(&st);
+                return SlowOutcome::DeliverInterrupt(finalizers);
+            }
+
+            SlowOutcome::Continue
+        });
+
+        match outcome {
+            SlowOutcome::Continue => 0,
+            SlowOutcome::NestedDeoptErr => fail_nested_native_deopt(),
+            SlowOutcome::Deopt => {
+                with_current_mir_context(|ctx| {
+                    ctx.last_status
+                        .store(MIR_STATUS_DEOPT, core::sync::atomic::Ordering::SeqCst);
+                });
+                MIR_STATUS_DEOPT
+            }
+            SlowOutcome::DeliverInterrupt(finalizers) => {
+                // SAFEPOINT_STATE borrow is dropped before invoking finalizers so reentrant
+                // calls to safepoint_stats() or safepoint_* mutators never RefCell-panic.
                 for f in finalizers {
                     f();
-                    st.cleanups_run += 1;
+                    SAFEPOINT_STATE.with(|state_cell| {
+                        let mut st = state_cell.borrow_mut();
+                        st.cleanups_run += 1;
+                        sync_safepoint_fast_flags(&st);
+                    });
                 }
-                with_current_mir_context(|ctx| {
-                    ctx.last_status.store(MIR_STATUS_ERR_INTERRUPTED, core::sync::atomic::Ordering::SeqCst);
+                SAFEPOINT_STATE.with(|state_cell| {
+                    let st = state_cell.borrow();
+                    sync_safepoint_fast_flags(&st);
                 });
-                return MIR_STATUS_ERR_INTERRUPTED;
+                with_current_mir_context(|ctx| {
+                    ctx.last_status
+                        .store(MIR_STATUS_ERR_INTERRUPTED, core::sync::atomic::Ordering::SeqCst);
+                });
+                MIR_STATUS_ERR_INTERRUPTED
             }
-            0
-        })
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn lust_mir_safepoint() -> i64 {
+        SAFEPOINT_FAST_STATE.with(|cell| unsafe {
+            (*cell.get()).safepoints_checked += 1;
+        });
+        lust_mir_safepoint_slow()
     }
 
     fn init_deopt_impl(target_pc: i64, site_kind: DeoptSiteKind, label: &str) {
@@ -1231,7 +1332,9 @@ pub mod jit_engine {
 
     pub fn safepoint_enter_mask() {
         SAFEPOINT_STATE.with(|st| {
-            st.borrow_mut().mask_depth += 1;
+            let mut state = st.borrow_mut();
+            state.mask_depth += 1;
+            sync_safepoint_fast_flags(&state);
         });
     }
 
@@ -1239,6 +1342,7 @@ pub mod jit_engine {
         SAFEPOINT_STATE.with(|st| {
             let mut state = st.borrow_mut();
             state.mask_depth = state.mask_depth.saturating_sub(1);
+            sync_safepoint_fast_flags(&state);
             if state.mask_depth == 0 {
                 state.pending_interrupt
             } else {
@@ -1253,18 +1357,31 @@ pub mod jit_engine {
             if state.pending_interrupt.is_none() {
                 state.pending_interrupt = Some(reason);
             }
+            sync_safepoint_fast_flags(&state);
         });
     }
 
     pub fn safepoint_register_finalizer<F: FnOnce() + Send + 'static>(f: F) {
         SAFEPOINT_STATE.with(|st| {
-            st.borrow_mut().finalizers.push(alloc::boxed::Box::new(f));
+            let mut state = st.borrow_mut();
+            state.finalizers.push(alloc::boxed::Box::new(f));
+            sync_safepoint_fast_flags(&state);
         });
     }
 
     pub fn safepoint_request_deopt(deopt: bool) {
         SAFEPOINT_STATE.with(|st| {
-            st.borrow_mut().deopt_requested = deopt;
+            let mut state = st.borrow_mut();
+            state.deopt_requested = deopt;
+            sync_safepoint_fast_flags(&state);
+        });
+    }
+
+    pub fn safepoint_set_gas_budget_active(active: bool) {
+        SAFEPOINT_STATE.with(|st| {
+            let mut state = st.borrow_mut();
+            state.gas_budget_active = active;
+            sync_safepoint_fast_flags(&state);
         });
     }
 
@@ -1274,6 +1391,7 @@ pub mod jit_engine {
             let mut state = st.borrow_mut();
             state.deopt_target_func = func_name;
             state.deopt_at_check_ordinal = Some(poll_ordinal);
+            sync_safepoint_fast_flags(&state);
         });
     }
 
@@ -1287,11 +1405,12 @@ pub mod jit_engine {
     }
 
     pub fn safepoint_stats() -> SafepointStatsSnapshot {
+        let checked = SAFEPOINT_FAST_STATE.with(|c| unsafe { (*c.get()).safepoints_checked });
         SAFEPOINT_STATE.with(|st| {
             let s = st.borrow();
             SafepointStatsSnapshot {
                 mask_depth: s.mask_depth,
-                safepoints_checked: s.safepoints_checked,
+                safepoints_checked: checked,
                 safepoints_masked_deferred: s.safepoints_masked_deferred,
                 safepoints_delivered: s.safepoints_delivered,
                 cleanups_run: s.cleanups_run,
@@ -1301,7 +1420,12 @@ pub mod jit_engine {
 
     pub fn safepoint_reset() {
         SAFEPOINT_STATE.with(|st| {
-            *st.borrow_mut() = SafepointRuntimeState::default();
+            let mut state = st.borrow_mut();
+            *state = SafepointRuntimeState::default();
+            SAFEPOINT_FAST_STATE.with(|cell| unsafe {
+                (*cell.get()).safepoints_checked = 0;
+            });
+            sync_safepoint_fast_flags(&state);
         });
         CURRENT_NATIVE_INVOCATION_STACK.with(|stack| {
             let mut s = stack.borrow_mut();
@@ -1553,7 +1677,8 @@ pub mod jit_engine {
 
     fn emit_safepoint_check(
         builder: &mut FunctionBuilder,
-        safepoint_fn: FuncRef,
+        sp_ptr_var: Variable,
+        safepoint_slow_fn: FuncRef,
         init_deopt_fn: FuncRef,
         record_deopt_local_fn: FuncRef,
         target_block_idx: usize,
@@ -1564,17 +1689,41 @@ pub mod jit_engine {
         emergency_exit_bb: Block,
         pending_vec_reduction: Option<(LocalId, Variable, Variable)>,
     ) {
-        let sp_call = builder.ins().call(safepoint_fn, &[]);
-        let sp_res = builder.inst_results(sp_call)[0];
-        let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, sp_res, 0);
+        const OFF_SLOW_FLAGS: i32 = core::mem::offset_of!(SafepointFastState, slow_flags) as i32;
+        const OFF_SAFEPOINTS_CHECKED: i32 =
+            core::mem::offset_of!(SafepointFastState, safepoints_checked) as i32;
 
+        let sp_ptr = builder.use_var(sp_ptr_var);
+        let cnt = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), sp_ptr, OFF_SAFEPOINTS_CHECKED);
+        let cnt1 = builder.ins().iadd_imm_s(cnt, 1);
+        builder
+            .ins()
+            .store(MemFlagsData::trusted(), cnt1, sp_ptr, OFF_SAFEPOINTS_CHECKED);
+        let flags = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), sp_ptr, OFF_SLOW_FLAGS);
+        let is_slow = builder.ins().icmp_imm_s(IntCC::NotEqual, flags, 0);
+
+        let slow_safepoint_bb = builder.create_block();
         let cont_bb = builder.create_block();
         let err_dispatch_bb = builder.create_block();
+        let deopt_capture_bb = builder.create_block();
+        builder.set_cold_block(slow_safepoint_bb);
+        builder.set_cold_block(err_dispatch_bb);
+        builder.set_cold_block(deopt_capture_bb);
+
+        builder.ins().brif(is_slow, slow_safepoint_bb, &[], cont_bb, &[]);
+
+        builder.switch_to_block(slow_safepoint_bb);
+        let sp_call = builder.ins().call(safepoint_slow_fn, &[]);
+        let sp_res = builder.inst_results(sp_call)[0];
+        let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, sp_res, 0);
         builder.ins().brif(is_err, err_dispatch_bb, &[], cont_bb, &[]);
 
         builder.switch_to_block(err_dispatch_bb);
         let is_deopt = builder.ins().icmp_imm_s(IntCC::Equal, sp_res, MIR_STATUS_DEOPT);
-        let deopt_capture_bb = builder.create_block();
         builder.ins().brif(is_deopt, deopt_capture_bb, &[], emergency_exit_bb, &[]);
 
         builder.switch_to_block(deopt_capture_bb);
@@ -1624,13 +1773,34 @@ pub mod jit_engine {
         compiled_code_ranges: hashbrown::HashMap<String, (usize, usize)>,
         pub compiled_osr_entries: hashbrown::HashMap<String, *const u8>,
         osr_request_counter: u64,
+        capture_ir: bool,
+        captured_ir: hashbrown::HashMap<String, String>,
+        host_callbacks: hashbrown::HashMap<String, (Vec<MirType>, MirType)>,
+        gas_budget_active: bool,
         #[cfg(feature = "test-deopt")]
         refine_max_iterations_override: Option<usize>,
     }
 
     impl CraneliftJitCompiler {
         pub fn new() -> Result<Self, String> {
+            // SAFETY: Empty external callback slice registers no extra pointers.
+            unsafe { Self::new_with_host_callbacks(&[]) }
+        }
+
+        /// Creates a `CraneliftJitCompiler` with additional C-ABI host callback symbols
+        /// callable via `Terminator::Call` from compiled MIR functions.
+        ///
+        /// # Safety
+        /// Every `(name, param_types, ret_type, fn_ptr)` entry must point to a valid
+        /// `extern "C"` function matching the Cranelift ABI for `(param_types) -> ret_type`
+        /// that outlives this compiler and any compiled code pointers.
+        pub unsafe fn new_with_host_callbacks(
+            callbacks: &[(&str, Vec<MirType>, MirType, *const u8)],
+        ) -> Result<Self, String> {
             let mut flag_builder = settings::builder();
+            flag_builder
+                .set("opt_level", "speed")
+                .map_err(|e| format!("{e}"))?;
             flag_builder
                 .set("use_colocated_libcalls", "false")
                 .map_err(|e| format!("{e}"))?;
@@ -1701,6 +1871,8 @@ pub mod jit_engine {
 
             // Safepoint and deopt helpers
             builder.symbol("lust_mir_safepoint", lust_mir_safepoint as *const u8);
+            builder.symbol("lust_mir_safepoint_state_ptr", lust_mir_safepoint_state_ptr as *const u8);
+            builder.symbol("lust_mir_safepoint_slow", lust_mir_safepoint_slow as *const u8);
             builder.symbol("lust_mir_init_deopt", lust_mir_init_deopt as *const u8);
             builder.symbol("lust_mir_init_deopt_at_terminator", lust_mir_init_deopt_at_terminator as *const u8);
             builder.symbol("lust_mir_record_deopt_local", lust_mir_record_deopt_local as *const u8);
@@ -1721,6 +1893,12 @@ pub mod jit_engine {
             builder.symbol("lust_mir_record_simd_scalar_op", lust_mir_record_simd_scalar_op as *const u8);
             builder.symbol("lust_mir_is_simd_scalar_forced", lust_mir_is_simd_scalar_forced as *const u8);
 
+            let mut host_callbacks = hashbrown::HashMap::new();
+            for (name, params, ret, ptr) in callbacks {
+                builder.symbol(*name, *ptr);
+                host_callbacks.insert((*name).to_string(), (params.clone(), ret.clone()));
+            }
+
             let module = JITModule::new(builder);
 
             Ok(Self {
@@ -1732,9 +1910,17 @@ pub mod jit_engine {
                 compiled_code_ranges: hashbrown::HashMap::new(),
                 compiled_osr_entries: hashbrown::HashMap::new(),
                 osr_request_counter: 0,
+                capture_ir: false,
+                captured_ir: hashbrown::HashMap::new(),
+                host_callbacks,
+                gas_budget_active: false,
                 #[cfg(feature = "test-deopt")]
                 refine_max_iterations_override: None,
             })
+        }
+
+        pub fn set_gas_budget_active(&mut self, active: bool) {
+            self.gas_budget_active = active;
         }
 
         /// Configures an explicit type refinement maximum iteration override for testing convergence boundaries.
@@ -1761,6 +1947,128 @@ pub mod jit_engine {
             self.compiled_code_ranges.get(name).copied()
         }
 
+        pub fn isa_opt_level(&self) -> settings::OptLevel {
+            self.module.isa().flags().opt_level()
+        }
+
+        pub fn isa_opt_level_str(&self) -> &'static str {
+            match self.isa_opt_level() {
+                settings::OptLevel::None => "none",
+                settings::OptLevel::Speed => "speed",
+                settings::OptLevel::SpeedAndSize => "speed_and_size",
+            }
+        }
+
+        pub fn dump_function_ir(&mut self, mir_fn: &MirFunction) -> Result<String, MirCraneliftBackendError> {
+            let prev = self.capture_ir;
+            self.capture_ir = true;
+            let compile_res = self.compile_function(mir_fn);
+            self.capture_ir = prev;
+            compile_res?;
+            let fast_key = format!("{}$fast", mir_fn.signature.name);
+            self.captured_ir
+                .get(&fast_key)
+                .or_else(|| self.captured_ir.get(&mir_fn.signature.name))
+                .cloned()
+                .ok_or_else(|| {
+                    MirCraneliftBackendError::CodegenError(format!(
+                        "No IR captured for function '{}'",
+                        mir_fn.signature.name
+                    ))
+                })
+        }
+
+        pub fn dump_module_ir(
+            &mut self,
+            module: &MirModule,
+        ) -> Result<hashbrown::HashMap<String, String>, MirCraneliftBackendError> {
+            let prev = self.capture_ir;
+            self.captured_ir.clear();
+            self.capture_ir = true;
+            let compile_res = self.compile_module(module);
+            self.capture_ir = prev;
+            compile_res?;
+            Ok(self.captured_ir.clone())
+        }
+
+        fn format_captured_ir(&self) -> String {
+            let mut ir_text = format!("{}", self.ctx.func.display());
+            let decls = self.module.declarations();
+            for (func_ref, ext_data) in self.ctx.func.dfg.ext_funcs.iter() {
+                if let cranelift_codegen::ir::ExternalName::User(uref) = ext_data.name {
+                    let uname = &self.ctx.func.params.user_named_funcs()[uref];
+                    if uname.namespace == 0 {
+                        let fid = FuncId::from_u32(uname.index);
+                        if let Some(sym_name) = &decls.get_function_decl(fid).name {
+                            ir_text.push_str(&format!("\n; sym {func_ref} = {sym_name}"));
+                        }
+                    }
+                }
+            }
+            ir_text
+        }
+
+        fn compile_export_wrapper(
+            &mut self,
+            export_name: &str,
+            sig: &Signature,
+            export_func_id: FuncId,
+            fast_func_id: FuncId,
+        ) -> Result<(), MirCraneliftBackendError> {
+            self.module.clear_context(&mut self.ctx);
+            self.builder_ctx = FunctionBuilderContext::new();
+            self.ctx.func.signature = sig.clone();
+
+            let sig_void0 = self.module.make_signature();
+            let native_entry_callee = self
+                .module
+                .declare_function("lust_mir_record_native_entry", Linkage::Import, &sig_void0)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            {
+                let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_ctx);
+                let native_entry_fn = self
+                    .module
+                    .declare_func_in_func(native_entry_callee, &mut builder.func);
+                let fast_fn = self
+                    .module
+                    .declare_func_in_func(fast_func_id, &mut builder.func);
+
+                let entry_bb = builder.create_block();
+                builder.append_block_params_for_function_params(entry_bb);
+                builder.switch_to_block(entry_bb);
+                builder.ins().call(native_entry_fn, &[]);
+
+                let params: Vec<ClifValue> = builder.block_params(entry_bb).to_vec();
+                let call_inst = builder.ins().call(fast_fn, &params);
+                let results: Vec<ClifValue> = builder.inst_results(call_inst).to_vec();
+                builder.ins().return_(&results);
+
+                builder.seal_all_blocks();
+                builder.finalize(self.module.target_config());
+            }
+
+            if self.capture_ir {
+                let ir_text = self.format_captured_ir();
+                self.captured_ir.insert(export_name.to_string(), ir_text);
+            }
+
+            self.module
+                .define_function(export_func_id, &mut self.ctx)
+                .map_err(|e| {
+                    eprintln!("Verifier error in define_function (wrapper {export_name}): {:?}", e);
+                    MirCraneliftBackendError::CodegenError(format!("{e:?}"))
+                })?;
+            let code_size = self
+                .ctx
+                .compiled_code()
+                .map(|c| c.code_info().total_size as usize)
+                .unwrap_or(1);
+            self.compiled_code_sizes.insert(export_func_id, code_size);
+            self.module.clear_context(&mut self.ctx);
+            Ok(())
+        }
+
         pub fn register_struct_layouts(&mut self, layouts: &[MirStructLayout]) {
             for layout in layouts {
                 self.struct_layouts.insert(layout.type_name.clone(), layout.clone());
@@ -1782,7 +2090,7 @@ pub mod jit_engine {
         ) -> Result<hashbrown::HashMap<String, *const u8>, MirCraneliftBackendError> {
             self.register_struct_layouts(&module.struct_layouts);
 
-            let mut module_funcs = hashbrown::HashMap::new();
+            let mut fast_funcs = hashbrown::HashMap::new();
             let callee_rets: hashbrown::HashMap<String, MirType> = module
                 .functions
                 .iter()
@@ -1795,7 +2103,35 @@ pub mod jit_engine {
                 refined_functions.push(self.refine_function_for_compiler(&f_with_calls));
             }
 
+            // Compute compile-time fixed-point transitive deopt & fail effects before lowering.
+            let call_effects =
+                analyze_refined_module_call_effects(&refined_functions, self.gas_budget_active);
+
+            // Identify functions that are targets of at least one module-local `Terminator::Call`.
+            // Functions with internal callers get a dual entrypoint (`F` Export wrapper -> `F$fast` Local body)
+            // so internal calls bypass `lust_mir_record_native_entry`. Top-level-only functions (including
+            // standalone SIMD kernels inspected via `compiled_code_range`) compile directly as `F` with
+            // zero wrapper trampoline overhead while still calling internal callees via `G$fast`.
+            let known_fn_names: hashbrown::HashSet<&str> = refined_functions
+                .iter()
+                .map(|f| f.signature.name.as_str())
+                .collect();
+            let mut internally_called: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+            for f in &refined_functions {
+                for b in &f.blocks {
+                    if let Some(Terminator::Call { callee, .. }) = &b.terminator {
+                        if !is_builtin_or_special_callee(callee)
+                            && known_fn_names.contains(callee.as_str())
+                        {
+                            internally_called.insert(callee.clone());
+                        }
+                    }
+                }
+            }
+
             // 1. Declare all functions first so they can reference each other
+            let mut export_entries: Vec<(String, Option<(String, FuncId)>, FuncId, Signature)> =
+                Vec::with_capacity(refined_functions.len());
             for mir_fn in &refined_functions {
                 let mut sig = self.module.make_signature();
                 for param_id in &mir_fn.params {
@@ -1808,17 +2144,66 @@ pub mod jit_engine {
                     sig.returns.push(AbiParam::new(ret_clif_ty));
                 }
 
-                let func_id = self
+                let export_func_id = self
                     .module
                     .declare_function(&mir_fn.signature.name, Linkage::Export, &sig)
                     .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
-                module_funcs.insert(mir_fn.signature.name.clone(), func_id);
+
+                if internally_called.contains(&mir_fn.signature.name) {
+                    let fast_name = format!("{}$fast", mir_fn.signature.name);
+                    let fast_func_id = self
+                        .module
+                        .declare_function(&fast_name, Linkage::Local, &sig)
+                        .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+                    fast_funcs.insert(mir_fn.signature.name.clone(), fast_func_id);
+                    export_entries.push((
+                        mir_fn.signature.name.clone(),
+                        Some((fast_name, fast_func_id)),
+                        export_func_id,
+                        sig,
+                    ));
+                } else {
+                    fast_funcs.insert(mir_fn.signature.name.clone(), export_func_id);
+                    export_entries.push((
+                        mir_fn.signature.name.clone(),
+                        None,
+                        export_func_id,
+                        sig,
+                    ));
+                }
             }
 
             // 2. Compile each function definition
-            for mir_fn in &refined_functions {
-                let func_id = module_funcs[&mir_fn.signature.name];
-                self.compile_function_internal(mir_fn, func_id, &module_funcs)?;
+            for (mir_fn, (export_name, fast_opt, export_func_id, sig)) in
+                refined_functions.iter().zip(export_entries.iter())
+            {
+                if let Some((fast_name, fast_func_id)) = fast_opt {
+                    self.compile_function_with_options(
+                        mir_fn,
+                        *fast_func_id,
+                        &fast_funcs,
+                        None,
+                        false,
+                        Some(&call_effects),
+                        Some(fast_name.as_str()),
+                    )?;
+                    self.compile_export_wrapper(
+                        export_name,
+                        sig,
+                        *export_func_id,
+                        *fast_func_id,
+                    )?;
+                } else {
+                    self.compile_function_with_options(
+                        mir_fn,
+                        *export_func_id,
+                        &fast_funcs,
+                        None,
+                        true,
+                        Some(&call_effects),
+                        Some(export_name.as_str()),
+                    )?;
+                }
             }
 
             // 3. Finalize definitions
@@ -1826,18 +2211,36 @@ pub mod jit_engine {
                 .finalize_definitions()
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
-            // 4. Collect finalized code pointers and code ranges
+            // 4. Collect finalized code pointers (public export `F`) and code ranges
             let mut res = hashbrown::HashMap::new();
-            for mir_fn in &refined_functions {
-                let func_id = module_funcs[&mir_fn.signature.name];
-                let code_ptr = self.module.get_finalized_function(func_id);
-                let size = self.compiled_code_sizes.get(&func_id).copied().unwrap_or(1);
+            for (export_name, fast_opt, export_func_id, _) in export_entries {
+                let code_ptr = self.module.get_finalized_function(export_func_id);
+                let size = self
+                    .compiled_code_sizes
+                    .get(&export_func_id)
+                    .copied()
+                    .unwrap_or(1);
                 let start = code_ptr as usize;
                 self.compiled_code_ranges.insert(
-                    mir_fn.signature.name.clone(),
+                    export_name.clone(),
                     (start, start.saturating_add(size.max(1))),
                 );
-                res.insert(mir_fn.signature.name.clone(), code_ptr);
+
+                if let Some((fast_name, fast_func_id)) = fast_opt {
+                    let fast_ptr = self.module.get_finalized_function(fast_func_id);
+                    let fast_size = self
+                        .compiled_code_sizes
+                        .get(&fast_func_id)
+                        .copied()
+                        .unwrap_or(1);
+                    let fast_start = fast_ptr as usize;
+                    self.compiled_code_ranges.insert(
+                        fast_name,
+                        (fast_start, fast_start.saturating_add(fast_size.max(1))),
+                    );
+                }
+
+                res.insert(export_name, code_ptr);
             }
 
             Ok(res)
@@ -2892,7 +3295,7 @@ pub mod jit_engine {
             func_id: FuncId,
             module_funcs: &hashbrown::HashMap<String, FuncId>,
         ) -> Result<(), MirCraneliftBackendError> {
-            self.compile_function_with_osr(mir_fn, func_id, module_funcs, None)
+            self.compile_function_with_options(mir_fn, func_id, module_funcs, None, true, None, None)
         }
 
         fn compile_function_with_osr(
@@ -2902,9 +3305,38 @@ pub mod jit_engine {
             module_funcs: &hashbrown::HashMap<String, FuncId>,
             osr_info: Option<(BlockId, &[LocalId])>,
         ) -> Result<(), MirCraneliftBackendError> {
+            self.compile_function_with_options(
+                mir_fn,
+                func_id,
+                module_funcs,
+                osr_info,
+                true,
+                None,
+                None,
+            )
+        }
+
+        fn compile_function_with_options(
+            &mut self,
+            mir_fn: &MirFunction,
+            func_id: FuncId,
+            module_funcs: &hashbrown::HashMap<String, FuncId>,
+            osr_info: Option<(BlockId, &[LocalId])>,
+            emit_native_entry: bool,
+            call_effects: Option<&hashbrown::HashMap<String, (bool, bool)>>,
+            ir_capture_key: Option<&str>,
+        ) -> Result<(), MirCraneliftBackendError> {
             self.module.clear_context(&mut self.ctx);
             self.builder_ctx = FunctionBuilderContext::new();
-            let res = self.compile_function_with_osr_inner(mir_fn, func_id, module_funcs, osr_info);
+            let res = self.compile_function_with_osr_inner(
+                mir_fn,
+                func_id,
+                module_funcs,
+                osr_info,
+                emit_native_entry,
+                call_effects,
+                ir_capture_key,
+            );
             if res.is_err() {
                 self.module.clear_context(&mut self.ctx);
                 self.builder_ctx = FunctionBuilderContext::new();
@@ -2918,6 +3350,9 @@ pub mod jit_engine {
             func_id: FuncId,
             module_funcs: &hashbrown::HashMap<String, FuncId>,
             osr_info: Option<(BlockId, &[LocalId])>,
+            emit_native_entry: bool,
+            call_effects: Option<&hashbrown::HashMap<String, (bool, bool)>>,
+            ir_capture_key: Option<&str>,
         ) -> Result<(), MirCraneliftBackendError> {
             // Fail-closed validation for SIMD calls before lowering
             for block in &mir_fn.blocks {
@@ -3073,9 +3508,13 @@ pub mod jit_engine {
             // Declare safepoint and deopt imports
             let mut sp_sig = self.module.make_signature();
             sp_sig.returns.push(AbiParam::new(types::I64));
-            let safepoint_callee = self
+            let safepoint_state_ptr_callee = self
                 .module
-                .declare_function("lust_mir_safepoint", Linkage::Import, &sp_sig)
+                .declare_function("lust_mir_safepoint_state_ptr", Linkage::Import, &sp_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let safepoint_slow_callee = self
+                .module
+                .declare_function("lust_mir_safepoint_slow", Linkage::Import, &sp_sig)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
             let mut init_deopt_sig = self.module.make_signature();
@@ -3113,16 +3552,6 @@ pub mod jit_engine {
             let pow_callee = self
                 .module
                 .declare_function("lust_mir_pow_int", Linkage::Import, &binop_sig)
-                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
-
-            let div_callee = self
-                .module
-                .declare_function("lust_mir_div_int", Linkage::Import, &binop_sig)
-                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
-
-            let rem_callee = self
-                .module
-                .declare_function("lust_mir_rem_int", Linkage::Import, &binop_sig)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
             // Declare float binop helpers
@@ -3319,15 +3748,12 @@ pub mod jit_engine {
                 let print_nl_fn = self.module.declare_func_in_func(print_nl_callee, &mut builder.func);
                 let floordiv_fn = self.module.declare_func_in_func(floordiv_callee, &mut builder.func);
                 let pow_fn = self.module.declare_func_in_func(pow_callee, &mut builder.func);
-                let div_fn = self.module.declare_func_in_func(div_callee, &mut builder.func);
-                let rem_fn = self.module.declare_func_in_func(rem_callee, &mut builder.func);
                 let floordiv_float_fn = self.module.declare_func_in_func(floordiv_float_callee, &mut builder.func);
                 let pow_float_fn = self.module.declare_func_in_func(pow_float_callee, &mut builder.func);
                 let rem_float_fn = self.module.declare_func_in_func(rem_float_callee, &mut builder.func);
                 let string_concat_fn = self.module.declare_func_in_func(string_concat_callee, &mut builder.func);
                 let string_eq_fn = self.module.declare_func_in_func(string_eq_callee, &mut builder.func);
                 let string_len_fn = self.module.declare_func_in_func(string_len_callee, &mut builder.func);
-                let safepoint_fn = self.module.declare_func_in_func(safepoint_callee, &mut builder.func);
                 let init_deopt_fn = self.module.declare_func_in_func(init_deopt_callee, &mut builder.func);
                 let init_deopt_at_terminator_fn = self.module.declare_func_in_func(init_deopt_at_terminator_callee, &mut builder.func);
                 let record_deopt_local_fn = self.module.declare_func_in_func(rec_deopt_callee, &mut builder.func);
@@ -3391,12 +3817,31 @@ pub mod jit_engine {
                 }
 
                 let loop_headers = find_loop_headers(&mir_fn.blocks);
+                let needs_safepoint = !loop_headers.is_empty() || osr_info.is_some();
+                let safepoint_ctx: Option<(Variable, FuncRef, FuncRef)> = if needs_safepoint {
+                    let sp_ptr_fn = self
+                        .module
+                        .declare_func_in_func(safepoint_state_ptr_callee, &mut builder.func);
+                    let sp_slow_fn = self
+                        .module
+                        .declare_func_in_func(safepoint_slow_callee, &mut builder.func);
+                    let sp_ptr_var = builder.declare_var(types::I64);
+                    Some((sp_ptr_var, sp_ptr_fn, sp_slow_fn))
+                } else {
+                    None
+                };
 
                 if let Some((target_block, live_locals)) = osr_info {
                     let osr_entry_bb = builder.create_block();
                     builder.append_block_params_for_function_params(osr_entry_bb);
                     builder.switch_to_block(osr_entry_bb);
                     builder.ins().call(native_entry_fn, &[]);
+
+                    let (sp_ptr_var, sp_ptr_fn, sp_slow_fn) =
+                        safepoint_ctx.expect("osr_info implies needs_safepoint");
+                    let sp_ptr_call = builder.ins().call(sp_ptr_fn, &[]);
+                    let sp_ptr_val = builder.inst_results(sp_ptr_call)[0];
+                    builder.def_var(sp_ptr_var, sp_ptr_val);
 
                     for (idx, loc_id) in live_locals.iter().enumerate() {
                         let param_val = builder.block_params(osr_entry_bb)[idx];
@@ -3430,7 +3875,8 @@ pub mod jit_engine {
 
                     emit_safepoint_check(
                         &mut builder,
-                        safepoint_fn,
+                        sp_ptr_var,
+                        sp_slow_fn,
                         init_deopt_fn,
                         record_deopt_local_fn,
                         target_block.0,
@@ -3447,7 +3893,14 @@ pub mod jit_engine {
                     let fn_entry_bb = builder.create_block();
                     builder.append_block_params_for_function_params(fn_entry_bb);
                     builder.switch_to_block(fn_entry_bb);
-                    builder.ins().call(native_entry_fn, &[]);
+                    if emit_native_entry {
+                        builder.ins().call(native_entry_fn, &[]);
+                    }
+                    if let Some((sp_ptr_var, sp_ptr_fn, _)) = safepoint_ctx {
+                        let sp_ptr_call = builder.ins().call(sp_ptr_fn, &[]);
+                        let sp_ptr_val = builder.inst_results(sp_ptr_call)[0];
+                        builder.def_var(sp_ptr_var, sp_ptr_val);
+                    }
 
                     for (idx, p_id) in mir_fn.params.iter().enumerate() {
                         let param_val = builder.block_params(fn_entry_bb)[idx];
@@ -3495,9 +3948,12 @@ pub mod jit_engine {
                             vec_acc_vars[vl_idx]
                                 .and_then(|(v0, v1)| vl.acc_local.map(|acc_id| (acc_id, v0, v1)))
                         });
+                        let (sp_ptr_var, _, sp_slow_fn) =
+                            safepoint_ctx.expect("loop header implies needs_safepoint");
                         emit_safepoint_check(
                             &mut builder,
-                            safepoint_fn,
+                            sp_ptr_var,
+                            sp_slow_fn,
                             init_deopt_fn,
                             record_deopt_local_fn,
                             b_idx,
@@ -3649,8 +4105,6 @@ pub mod jit_engine {
                                     len_fn,
                                     floordiv_fn,
                                     pow_fn,
-                                    div_fn,
-                                    rem_fn,
                                     floordiv_float_fn,
                                     pow_float_fn,
                                     rem_float_fn,
@@ -3684,8 +4138,6 @@ pub mod jit_engine {
                                     len_fn,
                                     floordiv_fn,
                                     pow_fn,
-                                    div_fn,
-                                    rem_fn,
                                     floordiv_float_fn,
                                     pow_float_fn,
                                     rem_float_fn,
@@ -3727,8 +4179,6 @@ pub mod jit_engine {
                                     len_fn,
                                     floordiv_fn,
                                     pow_fn,
-                                    div_fn,
-                                    rem_fn,
                                     floordiv_float_fn,
                                     pow_float_fn,
                                     rem_float_fn,
@@ -4871,13 +5321,32 @@ pub mod jit_engine {
                                         "enum.payload" => (enum_payload_callee, 1),
                                         "enum.new" | "enum.alloc" => (alloc_enum_callee, 2),
                                         _ => {
-                                            let Some(&fid) = module_funcs.get(callee) else {
+                                            if let Some(&fid) = module_funcs.get(callee) {
+                                                is_native_mir_call = true;
+                                                (fid, args.len())
+                                            } else if let Some((cb_params, cb_ret)) =
+                                                self.host_callbacks.get(callee)
+                                            {
+                                                let mut cb_sig = self.module.make_signature();
+                                                for p_ty in cb_params {
+                                                    cb_sig.params.push(AbiParam::new(mir_to_clif_type(p_ty)?));
+                                                }
+                                                let cb_ret_clif = mir_to_clif_type(cb_ret)?;
+                                                if cb_ret_clif != types::I8 || *cb_ret != MirType::Unit {
+                                                    cb_sig.returns.push(AbiParam::new(cb_ret_clif));
+                                                }
+                                                let fid = self
+                                                    .module
+                                                    .declare_function(callee, Linkage::Import, &cb_sig)
+                                                    .map_err(|e| {
+                                                        MirCraneliftBackendError::CodegenError(format!("{e}"))
+                                                    })?;
+                                                (fid, cb_params.len())
+                                            } else {
                                                 return Err(MirCraneliftBackendError::UnlowerableValue(format!(
                                                     "External or unknown callee '{callee}' is not supported by Cranelift backend"
                                                 )));
-                                            };
-                                            is_native_mir_call = true;
-                                            (fid, args.len())
+                                            }
                                         }
                                     };
                                     let callee_ref = self.module.declare_func_in_func(callee_func_id, &mut builder.func);
@@ -4888,11 +5357,18 @@ pub mod jit_engine {
                                     while arg_vals.len() < param_count {
                                         arg_vals.push(builder.ins().iconst(types::I64, 0));
                                     }
-                                    if is_native_mir_call {
+                                    let (callee_can_deopt, callee_can_fail) = if is_native_mir_call {
+                                        call_effects
+                                            .and_then(|m| m.get(callee).copied())
+                                            .unwrap_or((true, true))
+                                    } else {
+                                        (true, true)
+                                    };
+                                    if is_native_mir_call && callee_can_deopt {
                                         builder.ins().call(enter_native_callee_fn, &[]);
                                     }
                                     let call_inst = builder.ins().call(callee_ref, &arg_vals);
-                                    if is_native_mir_call {
+                                    if is_native_mir_call && callee_can_deopt {
                                         builder.ins().call(exit_native_callee_fn, &[]);
                                     }
                                     let ret_vals = builder.inst_results(call_inst);
@@ -4939,12 +5415,14 @@ pub mod jit_engine {
                                         let zero_val = cast_clif_type(&mut builder, zero, target_ty);
                                         store_local_val(*loc, zero_val, &mut builder, &local_vars, &stack_slots)?;
                                     }
-                                    let stat_call = builder.ins().call(status_fn, &[]);
-                                    let stat_val = builder.inst_results(stat_call)[0];
-                                    let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, stat_val, 0);
-                                    let call_cont_bb = builder.create_block();
-                                    builder.ins().brif(is_err, emergency_exit_bb, &[], call_cont_bb, &[]);
-                                    builder.switch_to_block(call_cont_bb);
+                                    if !is_native_mir_call || callee_can_fail {
+                                        let stat_call = builder.ins().call(status_fn, &[]);
+                                        let stat_val = builder.inst_results(stat_call)[0];
+                                        let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, stat_val, 0);
+                                        let call_cont_bb = builder.create_block();
+                                        builder.ins().brif(is_err, emergency_exit_bb, &[], call_cont_bb, &[]);
+                                        builder.switch_to_block(call_cont_bb);
+                                    }
 
                                     let succ_bb = clif_blocks.get(success.0).copied().ok_or_else(|| {
                                         MirCraneliftBackendError::CodegenError(format!(
@@ -5007,6 +5485,12 @@ pub mod jit_engine {
                 builder.finalize(self.module.target_config());
             }
 
+            if self.capture_ir {
+                let ir_text = self.format_captured_ir();
+                let key = ir_capture_key.unwrap_or(&mir_fn.signature.name).to_string();
+                self.captured_ir.insert(key, ir_text);
+            }
+
             self.module
                 .define_function(func_id, &mut self.ctx)
                 .map_err(|e| {
@@ -5022,6 +5506,316 @@ pub mod jit_engine {
             self.module.clear_context(&mut self.ctx);
             Ok(())
         }
+    }
+
+    #[inline(always)]
+    fn is_strict_scalar_type(ty: &MirType) -> bool {
+        matches!(ty, MirType::Int | MirType::Float | MirType::Bool)
+    }
+
+    #[inline(always)]
+    fn is_builtin_or_special_callee(callee: &str) -> bool {
+        is_effect_or_handler_callee(callee)
+            || callee == "print"
+            || callee == "println"
+            || CraneliftJitCompiler::is_simd_callee_name(callee)
+            || crate::mir::ir::parse_mir_struct_decode_callee(callee).is_some()
+            || matches!(
+                callee,
+                "math.abs"
+                    | "abs"
+                    | "math.min"
+                    | "min"
+                    | "math.max"
+                    | "max"
+                    | "math.clamp"
+                    | "clamp"
+                    | "table.len"
+                    | "array.len"
+                    | "map.len"
+                    | "map.get"
+                    | "map.set"
+                    | "map.new"
+                    | "enum.tag"
+                    | "enum.payload"
+                    | "enum.new"
+                    | "enum.alloc"
+            )
+    }
+
+    #[inline(always)]
+    fn scalar_operand_type(op: &Operand, locals: &[LocalDecl]) -> Option<MirType> {
+        match op {
+            Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => locals
+                .get(loc.0)
+                .map(|d| &d.ty)
+                .filter(|ty| is_strict_scalar_type(ty))
+                .cloned(),
+            Operand::Constant(MirConstant::Int(_)) => Some(MirType::Int),
+            Operand::Constant(MirConstant::Float(_)) => Some(MirType::Float),
+            Operand::Constant(MirConstant::Bool(_)) => Some(MirType::Bool),
+            _ => None,
+        }
+    }
+
+    /// Strict closed-world allowlist check (fail-closed default: returns `false` on any
+    /// non-whitelisted operation, place projection, allocation, non-scalar type, resource
+    /// check, raise/unreachable, or non-module-local call).
+    fn local_body_is_whitelisted_non_failing(
+        f: &MirFunction,
+        known_fns: &hashbrown::HashSet<&str>,
+    ) -> bool {
+        if f.blocks.is_empty() || !is_strict_scalar_type(&f.signature.return_type) {
+            return false;
+        }
+        for &p in &f.params {
+            if !f
+                .locals
+                .get(p.0)
+                .is_some_and(|d| is_strict_scalar_type(&d.ty))
+            {
+                return false;
+            }
+        }
+        for block in &f.blocks {
+            for stmt in &block.statements {
+                match stmt {
+                    Statement::StorageLive(_, _) | Statement::StorageDead(_, _) => {}
+                    Statement::Assign(Place::Local(dst), rvalue, _) => {
+                        if !f
+                            .locals
+                            .get(dst.0)
+                            .is_some_and(|d| is_strict_scalar_type(&d.ty))
+                        {
+                            return false;
+                        }
+                        match rvalue {
+                            Rvalue::Use(op) => {
+                                if scalar_operand_type(op, &f.locals).is_none() {
+                                    return false;
+                                }
+                            }
+                            Rvalue::BinaryOp(op, lhs, rhs) => {
+                                let allowed_op = matches!(
+                                    op,
+                                    MirBinaryOp::Add
+                                        | MirBinaryOp::Sub
+                                        | MirBinaryOp::Mul
+                                        | MirBinaryOp::BitAnd
+                                        | MirBinaryOp::BitOr
+                                        | MirBinaryOp::BitXor
+                                        | MirBinaryOp::Shl
+                                        | MirBinaryOp::Shr
+                                        | MirBinaryOp::Eq
+                                        | MirBinaryOp::NotEq
+                                        | MirBinaryOp::Lt
+                                        | MirBinaryOp::LtEq
+                                        | MirBinaryOp::Gt
+                                        | MirBinaryOp::GtEq
+                                        | MirBinaryOp::And
+                                        | MirBinaryOp::Or
+                                );
+                                if !allowed_op
+                                    || scalar_operand_type(lhs, &f.locals).is_none()
+                                    || scalar_operand_type(rhs, &f.locals).is_none()
+                                {
+                                    return false;
+                                }
+                            }
+                            Rvalue::UnaryOp(op, operand) => {
+                                let allowed_op = matches!(
+                                    op,
+                                    MirUnaryOp::Neg | MirUnaryOp::Not | MirUnaryOp::BitNot
+                                );
+                                if !allowed_op
+                                    || scalar_operand_type(operand, &f.locals).is_none()
+                                {
+                                    return false;
+                                }
+                            }
+                            Rvalue::Cast(operand, target_ty) => {
+                                let Some(src_ty) = scalar_operand_type(operand, &f.locals) else {
+                                    return false;
+                                };
+                                if !matches!(
+                                    (src_ty, target_ty),
+                                    (MirType::Int, MirType::Float) | (MirType::Float, MirType::Int)
+                                ) {
+                                    return false;
+                                }
+                            }
+                            Rvalue::Aggregate(_, _) => return false,
+                        }
+                    }
+                    // Fail-closed on Place::Index, Place::Field, Statement::ResourceCheck, etc.
+                    _ => return false,
+                }
+            }
+
+            match &block.terminator {
+                Some(Terminator::Goto(_, _)) => {}
+                Some(Terminator::Cond { cond, .. }) => {
+                    if scalar_operand_type(cond, &f.locals).is_none() {
+                        return false;
+                    }
+                }
+                Some(Terminator::Switch { discr, .. }) => {
+                    if scalar_operand_type(discr, &f.locals).is_none() {
+                        return false;
+                    }
+                }
+                Some(Terminator::Return(Some(op), _)) => {
+                    if scalar_operand_type(op, &f.locals).is_none() {
+                        return false;
+                    }
+                }
+                Some(Terminator::Call {
+                    callee,
+                    args,
+                    destination: Place::Local(dst),
+                    error: None,
+                    ..
+                }) => {
+                    if is_builtin_or_special_callee(callee)
+                        || !known_fns.contains(callee.as_str())
+                        || !f
+                            .locals
+                            .get(dst.0)
+                            .is_some_and(|d| is_strict_scalar_type(&d.ty))
+                        || args
+                            .iter()
+                            .any(|a| scalar_operand_type(a, &f.locals).is_none())
+                    {
+                        return false;
+                    }
+                }
+                // Fail-closed on None, Return(None), Raise, Unreachable, Call with unwind/projected dst
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    fn analyze_refined_module_call_effects(
+        refined_functions: &[MirFunction],
+        gas_budget_active: bool,
+    ) -> hashbrown::HashMap<String, (bool, bool)> {
+        let known_fns: hashbrown::HashSet<&str> = refined_functions
+            .iter()
+            .map(|f| f.signature.name.as_str())
+            .collect();
+
+        let mut can_deopt: hashbrown::HashMap<String, bool> =
+            hashbrown::HashMap::with_capacity(refined_functions.len());
+        let mut local_callees: hashbrown::HashMap<String, Vec<String>> =
+            hashbrown::HashMap::with_capacity(refined_functions.len());
+
+        // 1. Direct seed for can_deopt_transitively(F)
+        for f in refined_functions {
+            let mut deopt = !find_loop_headers(&f.blocks).is_empty();
+            let mut callees = Vec::new();
+            for b in &f.blocks {
+                if let Some(Terminator::Call { callee, .. }) = &b.terminator {
+                    if is_effect_or_handler_callee(callee)
+                        || is_builtin_or_special_callee(callee)
+                        || !known_fns.contains(callee.as_str())
+                    {
+                        deopt = true;
+                    } else {
+                        callees.push(callee.clone());
+                    }
+                }
+            }
+            can_deopt.insert(f.signature.name.clone(), deopt);
+            local_callees.insert(f.signature.name.clone(), callees);
+        }
+
+        // 2. Fixed-point propagation for can_deopt_transitively
+        loop {
+            let mut changed = false;
+            for f in refined_functions {
+                let name = &f.signature.name;
+                if *can_deopt.get(name).unwrap_or(&true) {
+                    continue;
+                }
+                if let Some(callees) = local_callees.get(name) {
+                    if callees.iter().any(|c| *can_deopt.get(c).unwrap_or(&true)) {
+                        can_deopt.insert(name.clone(), true);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // 3. Direct seed for can_fail_transitively(F) (strict closed-world allowlist, fail-closed)
+        let mut can_fail: hashbrown::HashMap<String, bool> =
+            hashbrown::HashMap::with_capacity(refined_functions.len());
+        for f in refined_functions {
+            let name = &f.signature.name;
+            let deopt = *can_deopt.get(name).unwrap_or(&true);
+            let fail = gas_budget_active
+                || deopt
+                || !local_body_is_whitelisted_non_failing(f, &known_fns);
+            can_fail.insert(name.clone(), fail);
+        }
+
+        // 4. Fixed-point propagation for can_fail_transitively
+        loop {
+            let mut changed = false;
+            for f in refined_functions {
+                let name = &f.signature.name;
+                if *can_fail.get(name).unwrap_or(&true) {
+                    continue;
+                }
+                if let Some(callees) = local_callees.get(name) {
+                    if callees.iter().any(|c| {
+                        *can_fail.get(c).unwrap_or(&true) || *can_deopt.get(c).unwrap_or(&true)
+                    }) {
+                        can_fail.insert(name.clone(), true);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut out = hashbrown::HashMap::with_capacity(refined_functions.len());
+        for f in refined_functions {
+            let name = &f.signature.name;
+            let d = *can_deopt.get(name).unwrap_or(&true);
+            let fl = *can_fail.get(name).unwrap_or(&true);
+            out.insert(name.clone(), (d, fl));
+        }
+        out
+    }
+
+    /// Compile-time closed-world call effect analysis over a `MirModule`.
+    /// Returns `map[func_name] = (can_deopt_transitively, can_fail_transitively)`.
+    pub fn analyze_module_call_effects(
+        module: &MirModule,
+        gas_budget_active: bool,
+    ) -> hashbrown::HashMap<String, (bool, bool)> {
+        let mut struct_layouts = hashbrown::HashMap::new();
+        for layout in &module.struct_layouts {
+            struct_layouts.insert(layout.type_name.clone(), layout.clone());
+        }
+        let callee_rets: hashbrown::HashMap<String, MirType> = module
+            .functions
+            .iter()
+            .map(|f| (f.signature.name.clone(), f.signature.return_type.clone()))
+            .collect();
+        let mut refined_functions = Vec::with_capacity(module.functions.len());
+        for f in &module.functions {
+            let mut f_with_calls = f.clone();
+            apply_module_callee_return_types(&mut f_with_calls, &callee_rets);
+            refined_functions.push(refine_mir_function_with_layouts(&f_with_calls, &struct_layouts));
+        }
+        analyze_refined_module_call_effects(&refined_functions, gas_budget_active)
     }
 
     pub(crate) fn mir_type_contains_unknown(ty: &MirType) -> bool {
@@ -6281,6 +7075,85 @@ pub mod jit_engine {
         (leaked.as_ptr(), leaked.len())
     }
 
+    fn emit_inline_int_div_or_rem(
+        is_div: bool,
+        l: ClifValue,
+        r: ClifValue,
+        rhs_operand: &Operand,
+        builder: &mut FunctionBuilder,
+        bc_ctx: BoundsCheckCtx,
+    ) -> ClifValue {
+        let emergency_exit_bb = bc_ctx.emergency_exit_bb;
+        if let Operand::Constant(MirConstant::Int(c)) = rhs_operand {
+            if *c == 0 {
+                let code = builder.ins().iconst(types::I64, MIR_STATUS_ERR_DIV_BY_ZERO);
+                builder.ins().call(bc_ctx.status_set_fn, &[code]);
+                builder.ins().jump(emergency_exit_bb, &[]);
+                let dead_bb = builder.create_block();
+                builder.switch_to_block(dead_bb);
+                builder.seal_block(dead_bb);
+                return builder.ins().iconst(types::I64, 0);
+            }
+            if *c == -1 {
+                return if is_div {
+                    builder.ins().ineg(l)
+                } else {
+                    builder.ins().iconst(types::I64, 0)
+                };
+            }
+            return if is_div {
+                builder.ins().sdiv(l, r)
+            } else {
+                builder.ins().srem(l, r)
+            };
+        }
+
+        let div_zero_bb = builder.create_block();
+        let non_zero_bb = builder.create_block();
+        let neg_one_bb = builder.create_block();
+        let safe_div_bb = builder.create_block();
+        let merge_bb = builder.create_block();
+        let res_param = builder.append_block_param(merge_bb, types::I64);
+        builder.set_cold_block(div_zero_bb);
+        builder.set_cold_block(neg_one_bb);
+
+        let is_zero = builder.ins().icmp_imm_s(IntCC::Equal, r, 0);
+        builder.ins().brif(is_zero, div_zero_bb, &[], non_zero_bb, &[]);
+
+        builder.switch_to_block(div_zero_bb);
+        builder.seal_block(div_zero_bb);
+        let code = builder.ins().iconst(types::I64, MIR_STATUS_ERR_DIV_BY_ZERO);
+        builder.ins().call(bc_ctx.status_set_fn, &[code]);
+        builder.ins().jump(emergency_exit_bb, &[]);
+
+        builder.switch_to_block(non_zero_bb);
+        builder.seal_block(non_zero_bb);
+        let is_neg_one = builder.ins().icmp_imm_s(IntCC::Equal, r, -1);
+        builder.ins().brif(is_neg_one, neg_one_bb, &[], safe_div_bb, &[]);
+
+        builder.switch_to_block(neg_one_bb);
+        builder.seal_block(neg_one_bb);
+        let neg_one_res = if is_div {
+            builder.ins().ineg(l)
+        } else {
+            builder.ins().iconst(types::I64, 0)
+        };
+        builder.ins().jump(merge_bb, &[BlockArg::Value(neg_one_res)]);
+
+        builder.switch_to_block(safe_div_bb);
+        builder.seal_block(safe_div_bb);
+        let div_res = if is_div {
+            builder.ins().sdiv(l, r)
+        } else {
+            builder.ins().srem(l, r)
+        };
+        builder.ins().jump(merge_bb, &[BlockArg::Value(div_res)]);
+
+        builder.switch_to_block(merge_bb);
+        builder.seal_block(merge_bb);
+        res_param
+    }
+
     fn lower_rvalue(
         rval: &Rvalue,
         builder: &mut FunctionBuilder,
@@ -6295,8 +7168,6 @@ pub mod jit_engine {
         len_fn: FuncRef,
         floordiv_fn: FuncRef,
         pow_fn: FuncRef,
-        div_fn: FuncRef,
-        rem_fn: FuncRef,
         floordiv_float_fn: FuncRef,
         pow_float_fn: FuncRef,
         rem_float_fn: FuncRef,
@@ -6411,16 +7282,10 @@ pub mod jit_engine {
                     MirBinaryOp::Sub => builder.ins().isub(l, r),
                     MirBinaryOp::Mul => builder.ins().imul(l, r),
                     MirBinaryOp::Div => {
-                        let call = builder.ins().call(div_fn, &[l, r]);
-                        let res = builder.inst_results(call)[0];
-                        emit_status_check(builder, status_fn, emergency_exit_bb);
-                        res
+                        emit_inline_int_div_or_rem(true, l, r, rhs, builder, bc_ctx)
                     }
                     MirBinaryOp::Mod => {
-                        let call = builder.ins().call(rem_fn, &[l, r]);
-                        let res = builder.inst_results(call)[0];
-                        emit_status_check(builder, status_fn, emergency_exit_bb);
-                        res
+                        emit_inline_int_div_or_rem(false, l, r, rhs, builder, bc_ctx)
                     }
                     MirBinaryOp::FloorDiv => {
                         let call = builder.ins().call(floordiv_fn, &[l, r]);

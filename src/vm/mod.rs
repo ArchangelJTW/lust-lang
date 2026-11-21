@@ -326,13 +326,19 @@ pub struct VM {
     pub last_deopt_source: Option<DeoptPayloadSource>,
     pub cranelift_entry_count: u64,
     pub cranelift_compilation_count: u64,
+    pub(super) cranelift_dispatch_refine_count: u64,
+    pub(super) cranelift_struct_sync_count: u64,
     pub(crate) cranelift_generation: u64,
     pub(crate) cranelift_compiled_generation: u64,
+    pub(super) mir_context_struct_gen: u64,
+    pub(super) cranelift_compiled_struct_gen: u64,
     #[cfg(feature = "std")]
     pub(crate) cranelift_jit: Option<crate::mir::cranelift_backend::jit_engine::CraneliftJitCompiler>,
     #[cfg(feature = "std")]
     pub(crate) cranelift_recipes:
         HashMap<(String, usize, crate::mir::cranelift_backend::DeoptSiteKind), CompiledDeoptRecipe>,
+    #[cfg(feature = "std")]
+    pub(super) cranelift_fn_cache: Vec<Option<Rc<CompiledFnEntry>>>,
     pub mir_functions: HashMap<String, crate::mir::ir::MirFunction>,
     pub cranelift_compiled: HashMap<String, *const u8>,
     pub(super) jit: JitState,
@@ -346,6 +352,9 @@ pub struct VM {
     /// Per-function facts the call path needs, indexed like `functions`
     /// (see `CallMeta`).
     pub(super) call_meta: Vec<CallMeta>,
+    /// Original pre-Cranelift bytecode (typically direct AST->Bytecode) backed up
+    /// transactionally whenever `compile_cranelift()` installs MIR continuation bytecode.
+    pub(super) ast_bytecode_backup: HashMap<usize, Function>,
     pub(super) natives: HashMap<String, Value>,
     pub(super) globals: HashMap<String, Value>,
     /// Bumped on every change to `globals` or `natives`. Traces snapshot
@@ -378,7 +387,7 @@ pub struct VM {
     pub(super) skip_next_trace_record: bool,
     pub(super) trait_impls: HashMap<(String, String), bool>,
     pub(super) struct_tostring_cache: HashMap<usize, Rc<String>>,
-    pub(super) struct_metadata: HashMap<String, RuntimeStructInfo>,
+    pub(super) struct_metadata: StructMetadataRegistry,
     pub(super) call_until_depth: Option<usize>,
     pub(super) task_manager: TaskManager,
     pub(super) current_task: Option<TaskId>,
@@ -1028,13 +1037,66 @@ impl VM {
         self
     }
 
-    fn collect_direct_callees(&self) -> hashbrown::HashSet<String> {
+    pub(super) fn collect_direct_callees(&self) -> hashbrown::HashSet<String> {
         let mut direct_callees: hashbrown::HashSet<String> =
             self.functions.iter().map(|f| f.name.clone()).collect();
         direct_callees.extend(self.mir_functions.keys().cloned());
         direct_callees.extend(self.natives.keys().cloned());
         direct_callees.extend(self.globals.keys().cloned());
         direct_callees
+    }
+
+    pub fn function_by_name(&self, name: &str) -> Option<&Function> {
+        self.functions.iter().find(|f| f.name == name)
+    }
+
+    #[inline]
+    pub fn cranelift_dispatch_refine_count(&self) -> u64 {
+        self.cranelift_dispatch_refine_count
+    }
+
+    #[inline]
+    pub fn cranelift_struct_sync_count(&self) -> u64 {
+        self.cranelift_struct_sync_count
+    }
+
+    #[inline]
+    pub fn struct_metadata_generation(&self) -> u64 {
+        self.struct_metadata.generation()
+    }
+
+    #[inline]
+    pub fn mir_context_struct_gen(&self) -> u64 {
+        self.mir_context_struct_gen
+    }
+
+    pub(super) fn restore_all_ast_bytecode_backups(&mut self) {
+        for (func_idx, orig_fn) in self.ast_bytecode_backup.drain() {
+            if func_idx < self.functions.len() {
+                let meta = CallMeta::of(&orig_fn);
+                self.functions[func_idx] = orig_fn;
+                if func_idx < self.call_meta.len() {
+                    self.call_meta[func_idx] = meta;
+                }
+            }
+        }
+    }
+
+    /// Registers a MIR candidate for Cranelift JIT compilation without overwriting the
+    /// primary AST->Bytecode function in `self.functions`.
+    pub fn register_mir_candidate(&mut self, mir_fn: crate::mir::ir::MirFunction) {
+        let name = mir_fn.signature.name.clone();
+        self.mir_functions.insert(name, mir_fn);
+        self.cranelift_generation = self.cranelift_generation.wrapping_add(1).max(1);
+        self.cranelift_compiled_struct_gen = 0;
+        self.restore_all_ast_bytecode_backups();
+        #[cfg(feature = "std")]
+        {
+            self.cranelift_jit = None;
+            self.cranelift_compiled.clear();
+            self.cranelift_recipes.clear();
+            self.cranelift_fn_cache.clear();
+        }
     }
 
     /// Loads a MIR function into the VM, automatically generating its bytecode representation
@@ -1075,17 +1137,20 @@ impl VM {
             self.call_meta.push(meta);
             idx
         };
+        self.ast_bytecode_backup.remove(&func_idx);
         self.globals.insert(name.clone(), Value::Function(func_idx));
         self.globals_version = self.globals_version.wrapping_add(1);
         self.jit.reset_function_tables(self.functions.len());
         self.jit_cells.entry_table = self.jit.function_entry_table();
         self.mir_functions.insert(name, mir_fn);
-        self.cranelift_generation = self.cranelift_generation.wrapping_add(1);
+        self.cranelift_generation = self.cranelift_generation.wrapping_add(1).max(1);
+        self.cranelift_compiled_struct_gen = 0;
         #[cfg(feature = "std")]
         {
             self.cranelift_jit = None;
             self.cranelift_compiled.clear();
             self.cranelift_recipes.clear();
+            self.cranelift_fn_cache.clear();
         }
         Ok(())
     }
@@ -1314,6 +1379,95 @@ impl CallFrame {
 #[derive(Debug, Clone)]
 pub(super) struct RuntimeStructInfo {
     pub layout: Rc<StructLayout>,
+}
+
+/// Compiler-enforced encapsulating registry for VM struct layouts (Hazard 4 / PERF-T1-8).
+/// Every mutation bumps `generation` (invariant: always >= 1, never 0), making uncounted
+/// mutations impossible at compile time.
+#[derive(Clone)]
+pub(super) struct StructMetadataRegistry {
+    map: HashMap<String, RuntimeStructInfo>,
+    generation: u64,
+}
+
+impl StructMetadataRegistry {
+    pub(super) fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            generation: 1,
+        }
+    }
+
+    #[inline(always)]
+    fn bump(&mut self) {
+        self.generation = self.generation.wrapping_add(1).max(1);
+    }
+
+    #[inline(always)]
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(super) fn insert(
+        &mut self,
+        k: String,
+        v: RuntimeStructInfo,
+    ) -> Option<RuntimeStructInfo> {
+        self.bump();
+        self.map.insert(k, v)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn remove(&mut self, k: &str) -> Option<RuntimeStructInfo> {
+        self.bump();
+        self.map.remove(k)
+    }
+
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(super) fn replace_all(&mut self, map: HashMap<String, RuntimeStructInfo>) {
+        self.bump();
+        self.map = map;
+    }
+
+    #[inline]
+    pub(super) fn get(&self, k: &str) -> Option<&RuntimeStructInfo> {
+        self.map.get(k)
+    }
+
+    #[inline]
+    pub(super) fn contains_key(&self, k: &str) -> bool {
+        self.map.contains_key(k)
+    }
+
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&String, &RuntimeStructInfo)> {
+        self.map.iter()
+    }
+
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(super) fn as_map(&self) -> &HashMap<String, RuntimeStructInfo> {
+        &self.map
+    }
+
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(super) fn clone_map(&self) -> HashMap<String, RuntimeStructInfo> {
+        self.map.clone()
+    }
+}
+
+/// Direct `func_idx`-indexed compiled Cranelift metadata cache entry (Hazard 4 / PERF-T1-8).
+#[cfg(feature = "std")]
+#[derive(Clone)]
+pub(crate) struct CompiledFnEntry {
+    pub func_name: alloc::rc::Rc<str>,
+    pub code_ptr: *const u8,
+    pub param_types: Vec<crate::mir::ir::MirType>,
+    pub ret_type: crate::mir::ir::MirType,
+    pub local_types: Vec<crate::mir::ir::MirType>,
+    pub compiled_generation: u64,
+    pub struct_metadata_generation: u64,
+    #[allow(dead_code)] // Populated in PERF-T2-4
+    pub readonly_params: Vec<bool>,
 }
 
 #[derive(Debug, Clone)]

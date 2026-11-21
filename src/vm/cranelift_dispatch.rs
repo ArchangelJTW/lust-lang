@@ -1169,7 +1169,7 @@ impl VM {
         let refined = self.refine_mir_function_in_vm(mir_fn);
         Self::check_refined_cranelift_eligibility(
             &refined,
-            Some(&self.struct_metadata),
+            Some(self.struct_metadata.as_map()),
             &|name| self.is_cranelift_supported_struct(name),
         )
     }
@@ -1219,12 +1219,10 @@ impl VM {
         &self,
         func_name: &str,
         mir_fn: &MirFunction,
+        bc_fn: &crate::bytecode::Function,
         compilation_generation: u64,
         hook_authorized_for_fn: bool,
     ) -> core::result::Result<(Vec<CompiledDeoptRecipe>, bool), String> {
-        let Some(bc_fn) = self.functions.iter().find(|f| f.name == func_name) else {
-            return Err(format!("Missing bytecode function for '{}'", func_name));
-        };
         let refined = self.refine_mir_function_in_vm(mir_fn);
         let mut recipes = Vec::new();
         let mut has_effect_site = false;
@@ -1337,10 +1335,65 @@ impl VM {
         Ok((recipes, has_effect_site))
     }
 
-    /// Compiles all uncompiled eligible registered MIR functions using CraneliftJitCompiler.
+    /// Syncs `self.struct_metadata` into `self.mir_context.struct_fields` ONLY when
+    /// `self.mir_context_struct_gen != self.struct_metadata.generation()`.
     #[cfg(feature = "std")]
-    pub fn compile_cranelift(&mut self) -> Result<()> {
-        let _guard = self.mir_context.enter();
+    pub(super) fn sync_mir_context_struct_metadata(&mut self) {
+        let current_gen = self.struct_metadata.generation();
+        if self.mir_context_struct_gen == current_gen {
+            return;
+        }
+        {
+            let mut sf = self.mir_context.struct_fields.lock().unwrap();
+            sf.clear();
+            for (name, info) in self.struct_metadata.iter() {
+                let field_types: Vec<MirType> = (0..info.layout.field_names().len())
+                    .map(|i| crate::mir::lowering::mir_type_from_ast(info.layout.field_type(i)))
+                    .collect();
+                sf.insert(name.clone(), field_types);
+            }
+        }
+        self.mir_context_struct_gen = current_gen;
+        self.cranelift_struct_sync_count += 1;
+    }
+
+    /// Invalidates all Cranelift compiled artifacts, deopt recipes, and metadata cache entries
+    /// after a `struct_metadata` generation change so stale struct layouts can never execute.
+    #[cfg(feature = "std")]
+    pub(super) fn invalidate_cranelift_for_struct_change(&mut self) {
+        self.restore_all_ast_bytecode_backups();
+        self.cranelift_jit = None;
+        self.cranelift_compiled.clear();
+        self.cranelift_recipes.clear();
+        self.cranelift_fn_cache.clear();
+        self.cranelift_compiled_struct_gen = 0;
+        self.cranelift_generation = self.cranelift_generation.wrapping_add(1).max(1);
+    }
+
+    /// Builds the candidate post-inline Cranelift MIR module, continuation bytecodes, and
+    /// authoritative deopt recipes following Hazard 3 Steps A-C:
+    /// - Pre-filter eligible functions and run initial call-graph eligibility fixpoint.
+    /// - Step A (`PERF-T1-4`): Clone refined eligible functions into a candidate `MirModule` and
+    ///   run `MirOptimizer::optimize_module_for_jit` (with `test_deopt_spike_hook.target_function`
+    ///   excluded under `test-deopt`, no loop-bearing / effect / recursive callees, and
+    ///   `MirVerifier::verify_fn` fail-closed revert).
+    /// - Step B: Compile continuation bytecode (`MirToBytecodeCompiler::compile_with_direct_callees`)
+    ///   from the exact post-inline `MirFunction`.
+    /// - Step C: Build deopt recipes (`build_function_deopt_recipes`) from the identical post-inline
+    ///   `MirFunction` and `continuation_bc`. If a post-inline function fails Step B/C, revert it
+    ///   to its pre-inline MIR snapshot and retry before dropping; then re-run the call-graph
+    ///   eligibility fixpoint on the final module.
+    #[cfg(feature = "std")]
+    #[allow(clippy::type_complexity)]
+    fn prepare_cranelift_module(
+        &self,
+        next_gen: u64,
+    ) -> Result<(
+        crate::mir::ir::MirModule,
+        hashbrown::HashSet<String>,
+        hashbrown::HashMap<String, Vec<CompiledDeoptRecipe>>,
+        hashbrown::HashMap<String, (usize, crate::bytecode::Function)>,
+    )> {
         let mut eligible: hashbrown::HashSet<String> = self
             .mir_functions
             .iter()
@@ -1356,38 +1409,55 @@ impl VM {
         #[cfg(not(feature = "test-deopt"))]
         let hook_target: Option<String> = None;
 
-        let next_gen = if self.cranelift_compiled_generation == self.cranelift_generation {
-            self.cranelift_generation.wrapping_add(1).max(1)
-        } else {
-            self.cranelift_generation.max(1)
-        };
-        let mut recipes_by_fn: hashbrown::HashMap<String, Vec<CompiledDeoptRecipe>> =
-            hashbrown::HashMap::new();
-        let mut may_deopt_effect: hashbrown::HashSet<String> = hashbrown::HashSet::new();
-
-        let candidate_names: Vec<String> = eligible.iter().cloned().collect();
-        for name in candidate_names {
+        // Pre-Step A: validate bytecode function presence and effect-hook authorization, and
+        // seed initial `may_deopt_effect` set before running the initial call-graph fixpoint.
+        let mut func_idx_by_name: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+        let mut pre_may_deopt_effect: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        let pre_candidates: Vec<String> = eligible.iter().cloned().collect();
+        for name in pre_candidates {
             let Some(mir_fn) = self.mir_functions.get(&name) else {
                 eligible.remove(&name);
                 continue;
             };
             let hook_auth = hook_target.as_deref() == Some(name.as_str());
-            match self.build_function_deopt_recipes(&name, mir_fn, next_gen, hook_auth) {
-                Ok((recipes, has_effect)) => {
-                    if has_effect {
-                        may_deopt_effect.insert(name.clone());
-                    }
-                    recipes_by_fn.insert(name, recipes);
+            let Some(func_idx) = self.functions.iter().position(|f| f.name == name) else {
+                let err_msg = format!("Missing bytecode function for '{}'", name);
+                if hook_auth {
+                    return Err(LustError::RuntimeError { message: err_msg });
                 }
-                Err(err_msg) => {
-                    if hook_auth {
-                        return Err(LustError::RuntimeError { message: err_msg });
+                eligible.remove(&name);
+                continue;
+            };
+            let mut unauthorized_effect: Option<String> = None;
+            let mut has_effect = false;
+            for block in &mir_fn.blocks {
+                if let Some(Terminator::Call { callee, .. }) = &block.terminator
+                    && is_effect_or_handler_callee(callee)
+                {
+                    if !is_vm_effect_intrinsic_callee(callee) && !hook_auth {
+                        unauthorized_effect = Some(format!(
+                            "Callee '{}' in '{}' requires test-deopt hook authorization",
+                            callee, name
+                        ));
+                        break;
                     }
-                    eligible.remove(&name);
+                    has_effect = true;
                 }
             }
+            if let Some(err_msg) = unauthorized_effect {
+                if hook_auth {
+                    return Err(LustError::RuntimeError { message: err_msg });
+                }
+                eligible.remove(&name);
+                continue;
+            }
+            if has_effect {
+                pre_may_deopt_effect.insert(name.clone());
+            }
+            func_idx_by_name.insert(name, func_idx);
         }
 
+        // Initial call-graph eligibility fixpoint so only Cranelift-eligible functions enter Step A.
         loop {
             let to_remove: Vec<String> = eligible
                 .iter()
@@ -1399,13 +1469,12 @@ impl VM {
                         let Some(Terminator::Call { callee, args, .. }) = &block.terminator else {
                             return false;
                         };
-                        if Self::is_cranelift_builtin_callee(callee) {
+                        if Self::is_cranelift_builtin_callee(callee)
+                            || is_effect_or_handler_callee(callee)
+                        {
                             return false;
                         }
-                        if is_effect_or_handler_callee(callee) {
-                            return false;
-                        }
-                        if !eligible.contains(callee) || may_deopt_effect.contains(callee) {
+                        if !eligible.contains(callee) || pre_may_deopt_effect.contains(callee) {
                             return true;
                         }
                         self.mir_functions
@@ -1424,10 +1493,267 @@ impl VM {
         }
 
         if eligible.is_empty() {
+            return Ok((
+                crate::mir::ir::MirModule::new("vm_cranelift_module".into()),
+                eligible,
+                hashbrown::HashMap::new(),
+                hashbrown::HashMap::new(),
+            ));
+        }
+
+        // Step A (Hazard 3 / PERF-T1-4): Clone raw eligible functions into candidate module
+        // and run JIT-safe MIR inlining + post-inline optimization BEFORE Steps B, C, and D.
+        let mut sorted_names: Vec<String> = eligible.iter().cloned().collect();
+        sorted_names.sort();
+
+        let mut module = crate::mir::ir::MirModule::new("vm_cranelift_module".into());
+        let mut pre_inline_fns: hashbrown::HashMap<String, MirFunction> =
+            hashbrown::HashMap::with_capacity(sorted_names.len());
+        for name in &sorted_names {
+            if let Some(raw_fn) = self.mir_functions.get(name) {
+                pre_inline_fns.insert(name.clone(), raw_fn.clone());
+                module.add_function(raw_fn.clone());
+            }
+        }
+
+        let mut jit_inline_cfg = crate::mir::opt::JitInlineConfig::default();
+        if let Some(ref target) = hook_target {
+            jit_inline_cfg.excluded_functions.insert(target.clone());
+        }
+        let mut inlined_names =
+            crate::mir::opt::MirOptimizer::optimize_module_for_jit(&mut module, &jit_inline_cfg);
+
+        // Fail-closed post-inline eligibility check: revert any inlined function that became ineligible.
+        for func in &mut module.functions {
+            if inlined_names.contains(&func.signature.name)
+                && !self.is_cranelift_eligible_in_vm(func)
+            {
+                if let Some(orig) = pre_inline_fns.get(&func.signature.name) {
+                    *func = orig.clone();
+                }
+                inlined_names.remove(&func.signature.name);
+            }
+        }
+
+        // Step B & Step C (Hazard 3): Derive continuation bytecode and deopt recipes strictly
+        // from the identical post-inline `MirFunction` in `module`.
+        let mut recipes_by_fn: hashbrown::HashMap<String, Vec<CompiledDeoptRecipe>> =
+            hashbrown::HashMap::new();
+        let mut continuations_by_fn: hashbrown::HashMap<String, (usize, crate::bytecode::Function)> =
+            hashbrown::HashMap::new();
+        let mut may_deopt_effect: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        let direct_callees = self.collect_direct_callees();
+
+        for func in &mut module.functions {
+            let name = func.signature.name.clone();
+            let hook_auth = hook_target.as_deref() == Some(name.as_str());
+            let Some(&func_idx) = func_idx_by_name.get(&name) else {
+                eligible.remove(&name);
+                continue;
+            };
+
+            let compile_bc_and_recipes = |candidate: &MirFunction| -> core::result::Result<
+                (crate::bytecode::Function, Vec<CompiledDeoptRecipe>, bool),
+                String,
+            > {
+                if candidate.locals.len() > u8::MAX as usize {
+                    return Err(format!(
+                        "MIR local count {} exceeds 255-register VM limit in '{}'",
+                        candidate.locals.len(),
+                        name
+                    ));
+                }
+                let mut continuation_bc =
+                    crate::mir::vm_backend::MirToBytecodeCompiler::compile_with_direct_callees(
+                        candidate,
+                        &direct_callees,
+                    )
+                    .map_err(|err| {
+                        format!(
+                            "Failed to compile MIR continuation bytecode for '{}': {:?}",
+                            name, err
+                        )
+                    })?;
+                if (continuation_bc.register_count as usize) < candidate.locals.len() {
+                    return Err(format!(
+                        "MIR continuation register_count overflow for '{}' (locals={}, register_count={})",
+                        name,
+                        candidate.locals.len(),
+                        continuation_bc.register_count
+                    ));
+                }
+                continuation_bc.is_method = self.functions[func_idx].is_method;
+                continuation_bc.signature = self.functions[func_idx].signature.clone();
+
+                let (recipes, has_effect) = self.build_function_deopt_recipes(
+                    &name,
+                    candidate,
+                    &continuation_bc,
+                    next_gen,
+                    hook_auth,
+                )?;
+                Ok((continuation_bc, recipes, has_effect))
+            };
+
+            let attempt = match compile_bc_and_recipes(func) {
+                Ok(ok) => Ok(ok),
+                Err(_) if inlined_names.contains(&name) => {
+                    // Post-inline Step B/C failed: revert cleanly to pre-inline MIR and retry.
+                    if let Some(orig) = pre_inline_fns.get(&name) {
+                        *func = orig.clone();
+                    }
+                    inlined_names.remove(&name);
+                    compile_bc_and_recipes(func)
+                }
+                Err(err) => Err(err),
+            };
+
+            match attempt {
+                Ok((continuation_bc, recipes, has_effect)) => {
+                    if has_effect {
+                        may_deopt_effect.insert(name.clone());
+                    }
+                    recipes_by_fn.insert(name.clone(), recipes);
+                    continuations_by_fn.insert(name, (func_idx, continuation_bc));
+                }
+                Err(err_msg) => {
+                    if hook_auth {
+                        return Err(LustError::RuntimeError { message: err_msg });
+                    }
+                    eligible.remove(&name);
+                }
+            }
+        }
+
+        // Post-Step C call-graph eligibility fixpoint on the FINAL post-inline module functions.
+        module
+            .functions
+            .retain(|f| eligible.contains(&f.signature.name));
+        loop {
+            let param_counts: hashbrown::HashMap<&str, usize> = module
+                .functions
+                .iter()
+                .map(|f| (f.signature.name.as_str(), f.params.len()))
+                .collect();
+            let to_remove: Vec<String> = module
+                .functions
+                .iter()
+                .filter(|mir_fn| {
+                    mir_fn.blocks.iter().any(|block| {
+                        let Some(Terminator::Call { callee, args, .. }) = &block.terminator else {
+                            return false;
+                        };
+                        if Self::is_cranelift_builtin_callee(callee)
+                            || is_effect_or_handler_callee(callee)
+                        {
+                            return false;
+                        }
+                        if !eligible.contains(callee) || may_deopt_effect.contains(callee) {
+                            return true;
+                        }
+                        param_counts
+                            .get(callee.as_str())
+                            .is_none_or(|&cnt| cnt != args.len())
+                    })
+                })
+                .map(|f| f.signature.name.clone())
+                .collect();
+            if to_remove.is_empty() {
+                break;
+            }
+            drop(param_counts);
+            for name in to_remove {
+                eligible.remove(&name);
+                recipes_by_fn.remove(&name);
+                continuations_by_fn.remove(&name);
+            }
+            module
+                .functions
+                .retain(|f| eligible.contains(&f.signature.name));
+        }
+
+        Ok((module, eligible, recipes_by_fn, continuations_by_fn))
+    }
+
+    /// Read-only inspection helper returning the exact post-inline compiled `MirFunction`
+    /// for a function currently compiled in Cranelift JIT (zero runtime dispatch overhead).
+    #[cfg(feature = "std")]
+    pub fn cranelift_compiled_mir(&self, func_name: &str) -> Option<MirFunction> {
+        if !self.cranelift_compiled.contains_key(func_name) {
+            return None;
+        }
+        let (module, _, _, _) = self
+            .prepare_cranelift_module(self.cranelift_compiled_generation)
+            .ok()?;
+        module
+            .functions
+            .into_iter()
+            .find(|f| f.signature.name == func_name)
+    }
+
+    /// Read-only inspection helper returning the cached `local_types.len()` for a compiled
+    /// Cranelift function.
+    #[cfg(feature = "std")]
+    pub fn cranelift_compiled_local_count(&self, func_name: &str) -> Option<usize> {
+        let func_idx = self.functions.iter().position(|f| f.name == func_name)?;
+        self.cranelift_fn_cache
+            .get(func_idx)?
+            .as_ref()
+            .map(|entry| entry.local_types.len())
+    }
+
+    /// Read-only inspection helper returning the compiled deopt recipe sites
+    /// `(block_id, site_kind, precise_pc)` for `func_name`.
+    #[cfg(feature = "std")]
+    pub fn cranelift_deopt_recipe_sites(&self, func_name: &str) -> Vec<(usize, DeoptSiteKind, usize)> {
+        let mut sites: Vec<(usize, DeoptSiteKind, usize)> = self
+            .cranelift_recipes
+            .values()
+            .filter(|r| r.func_name == func_name)
+            .map(|r| (r.block_id, r.site_kind, r.precise_pc))
+            .collect();
+        sites.sort_by_key(|&(block_id, _, precise_pc)| (block_id, precise_pc));
+        sites
+    }
+
+    /// Compiles all uncompiled eligible registered MIR functions using CraneliftJitCompiler.
+    #[cfg(feature = "std")]
+    pub fn compile_cranelift(&mut self) -> Result<()> {
+        let _guard = self.mir_context.enter();
+        let current_struct_gen = self.struct_metadata.generation();
+        if self.cranelift_compiled_struct_gen != current_struct_gen
+            && (!self.cranelift_compiled.is_empty()
+                || !self.cranelift_recipes.is_empty()
+                || !self.cranelift_fn_cache.is_empty())
+        {
+            self.invalidate_cranelift_for_struct_change();
+        }
+        self.sync_mir_context_struct_metadata();
+
+        let next_gen = if self.cranelift_compiled_generation == self.cranelift_generation {
+            self.cranelift_generation.wrapping_add(1).max(1)
+        } else {
+            self.cranelift_generation.max(1)
+        };
+
+        let (module, eligible, mut recipes_by_fn, mut continuations_by_fn) =
+            self.prepare_cranelift_module(next_gen)?;
+
+        if eligible.is_empty() {
+            self.restore_all_ast_bytecode_backups();
+            self.cranelift_compiled.clear();
+            self.cranelift_recipes.clear();
+            self.cranelift_fn_cache.clear();
+            self.cranelift_fn_cache.resize(self.functions.len(), None);
+            self.cranelift_compiled_generation = self.cranelift_generation;
+            self.cranelift_compiled_struct_gen = current_struct_gen;
             return Ok(());
         }
 
         let all_compiled = self.cranelift_jit.is_some()
+            && self.cranelift_compiled_generation == self.cranelift_generation
+            && self.cranelift_compiled_struct_gen == current_struct_gen
+            && eligible.len() == self.cranelift_compiled.len()
             && eligible
                 .iter()
                 .all(|name| self.cranelift_compiled.contains_key(name));
@@ -1436,30 +1762,14 @@ impl VM {
         }
 
         let mut pending_recipes = hashbrown::HashMap::new();
-        let mut sorted_names: Vec<String> = eligible.into_iter().collect();
-        sorted_names.sort();
-        for name in &sorted_names {
-            if let Some(fn_recipes) = recipes_by_fn.remove(name) {
+        for f in &module.functions {
+            if let Some(fn_recipes) = recipes_by_fn.remove(&f.signature.name) {
                 for recipe in fn_recipes {
                     pending_recipes.insert(
                         (recipe.func_name.clone(), recipe.block_id, recipe.site_kind),
                         recipe,
                     );
                 }
-            }
-        }
-
-        for (name, info) in &self.struct_metadata {
-            let field_types: Vec<MirType> = (0..info.layout.field_names().len())
-                .map(|i| crate::mir::lowering::mir_type_from_ast(info.layout.field_type(i)))
-                .collect();
-            self.mir_context.register_struct_field_types(name, field_types);
-        }
-
-        let mut module = crate::mir::ir::MirModule::new("vm_cranelift_module".into());
-        for name in &sorted_names {
-            if let Some(f) = self.mir_functions.get(name) {
-                module.add_function(f.clone());
             }
         }
 
@@ -1482,11 +1792,103 @@ impl VM {
             }
         };
 
+        // Precompute per-function refined metadata strictly from the FINAL post-inline
+        // compiled module functions before mutating VM state.
+        let mut entry_meta_by_name: hashbrown::HashMap<
+            String,
+            (Vec<MirType>, MirType, Vec<MirType>),
+        > = hashbrown::HashMap::with_capacity(module.functions.len());
+        for f in &module.functions {
+            let refined = self.refine_mir_function_in_vm(f);
+            let param_types: Vec<MirType> = f
+                .params
+                .iter()
+                .map(|pid| {
+                    let sig_ty = &f.locals[pid.0].ty;
+                    if Self::type_contains_unknown(sig_ty) {
+                        refined.locals[pid.0].ty.clone()
+                    } else {
+                        sig_ty.clone()
+                    }
+                })
+                .collect();
+            let local_types: Vec<MirType> = f
+                .locals
+                .iter()
+                .enumerate()
+                .map(|(idx, l)| {
+                    if Self::type_contains_unknown(&l.ty) {
+                        refined.locals[idx].ty.clone()
+                    } else {
+                        l.ty.clone()
+                    }
+                })
+                .collect();
+            entry_meta_by_name.insert(
+                f.signature.name.clone(),
+                (param_types, f.signature.return_type.clone(), local_types),
+            );
+        }
+
         // Transactional publish ONLY after compile_module returns Ok
+        let mut compiled_func_indices: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
+        for name in compiled_map.keys() {
+            if let Some((func_idx, _)) = continuations_by_fn.get(name) {
+                compiled_func_indices.insert(*func_idx);
+            }
+        }
+        // Restore any previously-compiled function that was dropped in this recompilation.
+        let dropped_indices: Vec<usize> = self
+            .ast_bytecode_backup
+            .keys()
+            .copied()
+            .filter(|idx| !compiled_func_indices.contains(idx))
+            .collect();
+        for func_idx in dropped_indices {
+            if let Some(orig_fn) = self.ast_bytecode_backup.remove(&func_idx)
+                && func_idx < self.functions.len()
+            {
+                let meta = crate::vm::CallMeta::of(&orig_fn);
+                self.functions[func_idx] = orig_fn;
+                if func_idx < self.call_meta.len() {
+                    self.call_meta[func_idx] = meta;
+                }
+            }
+        }
+
         self.cranelift_jit = Some(compiler);
         self.cranelift_compiled.clear();
         self.cranelift_recipes.clear();
+        self.cranelift_fn_cache.clear();
+        self.cranelift_fn_cache.resize(self.functions.len(), None);
         for (name, ptr) in compiled_map {
+            if let Some((func_idx, continuation_bc)) = continuations_by_fn.remove(&name)
+                && func_idx < self.functions.len()
+            {
+                let meta = crate::vm::CallMeta::of(&continuation_bc);
+                let prev_fn = core::mem::replace(&mut self.functions[func_idx], continuation_bc);
+                self.ast_bytecode_backup.entry(func_idx).or_insert(prev_fn);
+                if func_idx < self.call_meta.len() {
+                    self.call_meta[func_idx] = meta;
+                }
+                if let Some((param_types, ret_type, local_types)) = entry_meta_by_name.remove(&name)
+                    && param_types.len() == self.functions[func_idx].param_count as usize
+                    && !Self::type_contains_unknown(&ret_type)
+                    && self.is_cranelift_supported_type_in_vm(&ret_type)
+                {
+                    let readonly_params = vec![false; param_types.len()];
+                    self.cranelift_fn_cache[func_idx] = Some(Rc::new(crate::vm::CompiledFnEntry {
+                        func_name: alloc::rc::Rc::<str>::from(name.as_str()),
+                        code_ptr: ptr,
+                        param_types,
+                        ret_type,
+                        local_types,
+                        compiled_generation: next_gen,
+                        struct_metadata_generation: current_struct_gen,
+                        readonly_params,
+                    }));
+                }
+            }
             self.cranelift_compiled.insert(name, ptr);
             self.cranelift_compilation_count += 1;
         }
@@ -1495,6 +1897,7 @@ impl VM {
         }
         self.cranelift_generation = next_gen;
         self.cranelift_compiled_generation = next_gen;
+        self.cranelift_compiled_struct_gen = current_struct_gen;
         Ok(())
     }
 
@@ -1524,79 +1927,82 @@ impl VM {
         if has_upvalues || param_count > 6 {
             return Ok(None);
         }
-        let func_name = match self.functions.get(func_idx) {
-            Some(f) => f.name.clone(),
-            None => {
-                return Err(LustError::RuntimeError {
-                    message: format!("Function index {} not found in VM", func_idx),
-                });
-            }
-        };
-
-        let Some((param_types, ret_type, local_types)) = self.mir_functions.get(&func_name).and_then(|f| {
-            if !self.is_cranelift_eligible_in_vm(f) {
-                return None;
-            }
-            let refined = self.refine_mir_function_in_vm(f);
-            let param_types: Vec<MirType> = f
-                .params
-                .iter()
-                .map(|pid| {
-                    let sig_ty = &f.locals[pid.0].ty;
-                    if Self::type_contains_unknown(sig_ty) {
-                        refined.locals[pid.0].ty.clone()
-                    } else {
-                        sig_ty.clone()
-                    }
-                })
-                .collect();
-            let local_types: Vec<MirType> = f
-                .locals
-                .iter()
-                .enumerate()
-                .map(|(idx, l)| {
-                    if Self::type_contains_unknown(&l.ty) {
-                        refined.locals[idx].ty.clone()
-                    } else {
-                        l.ty.clone()
-                    }
-                })
-                .collect();
-            Some((param_types, f.signature.return_type.clone(), local_types))
-        }) else {
-            return Ok(None);
-        };
-        if param_types.len() != param_count
-            || Self::type_contains_unknown(&ret_type)
-            || !self.is_cranelift_supported_type_in_vm(&ret_type)
-        {
-            return Ok(None);
-        }
-        if self
-            .call_stack
-            .last()
-            .is_none_or(|frame| frame.registers.len() < param_count)
-        {
-            return Ok(None);
+        if func_idx >= self.functions.len() {
+            return Err(LustError::RuntimeError {
+                message: format!("Function index {} not found in VM", func_idx),
+            });
         }
 
-        // Compile before entering MirContext invocation scope and packing arguments
-        if !self.cranelift_compiled.contains_key(&func_name) {
-            self.compile_cranelift()?;
-        }
-        let Some(code_ptr) = self.cranelift_compiled.get(&func_name).copied() else {
-            return Ok(None);
+        let current_struct_gen = self.struct_metadata.generation();
+        #[cfg(feature = "test-deopt")]
+        let has_spike_hook = self.test_deopt_spike_hook.is_some();
+        #[cfg(not(feature = "test-deopt"))]
+        let has_spike_hook = false;
+
+        let entry = if self.cranelift_compiled_generation == self.cranelift_generation
+            && self.cranelift_compiled_struct_gen == current_struct_gen
+            && self.mir_context_struct_gen == current_struct_gen
+            && func_idx < self.cranelift_fn_cache.len()
+        {
+            match self.cranelift_fn_cache[func_idx].as_ref() {
+                Some(cached)
+                    if cached.compiled_generation == self.cranelift_compiled_generation
+                        && cached.struct_metadata_generation == current_struct_gen
+                        && cached.param_types.len() == param_count =>
+                {
+                    Rc::clone(cached)
+                }
+                None if !has_spike_hook => {
+                    // Already compiled for current (cranelift_generation, struct_metadata_generation)
+                    // and this func_idx was ineligible.
+                    return Ok(None);
+                }
+                _ => {
+                    // Fallback to slow path if hook active or metadata mismatch.
+                    let Some(e) = self.resolve_cranelift_fn_entry_slow(func_idx, param_count)? else {
+                        return Ok(None);
+                    };
+                    e
+                }
+            }
+        } else {
+            let Some(e) = self.resolve_cranelift_fn_entry_slow(func_idx, param_count)? else {
+                return Ok(None);
+            };
+            e
         };
+
+        // Step E (Hazard 3): Ensure top_frame register capacity covers installed continuation
+        // bytecode register_count and MIR local_types before native entry / deopt restoration.
+        let required_regs = self
+            .functions
+            .get(func_idx)
+            .map(|f| f.register_count as usize)
+            .unwrap_or(0)
+            .max(entry.local_types.len());
+        {
+            let Some(top_frame) = self.call_stack.last_mut() else {
+                return Ok(None);
+            };
+            if top_frame.registers.len() < param_count || required_regs > top_frame.registers.len() {
+                return Ok(None);
+            }
+            if required_regs > param_count {
+                for slot in &mut top_frame.registers[param_count..required_regs] {
+                    *slot = Value::Nil;
+                }
+            }
+        }
 
         let baseline = self.mir_context.capture_baseline();
         let mut native_entered = false;
         let outcome = self.try_run_cranelift_top_frame_scoped(
             func_idx,
-            &func_name,
-            &param_types,
-            &ret_type,
-            &local_types,
-            code_ptr,
+            &entry.func_name,
+            &entry.param_types,
+            &entry.ret_type,
+            &entry.local_types,
+            entry.code_ptr,
             &mut native_entered,
         );
         self.mir_context
@@ -1619,6 +2025,67 @@ impl VM {
                 Err(err)
             }
         }
+    }
+
+    #[cfg(feature = "std")]
+    fn resolve_cranelift_fn_entry_slow(
+        &mut self,
+        func_idx: usize,
+        param_count: usize,
+    ) -> Result<Option<Rc<crate::vm::CompiledFnEntry>>> {
+        let current_struct_gen = self.struct_metadata.generation();
+        if self.cranelift_compiled_struct_gen != current_struct_gen
+            && (!self.cranelift_compiled.is_empty()
+                || !self.cranelift_recipes.is_empty()
+                || !self.cranelift_fn_cache.is_empty())
+        {
+            self.invalidate_cranelift_for_struct_change();
+        }
+
+        let func_name = match self.functions.get(func_idx) {
+            Some(f) => f.name.clone(),
+            None => {
+                return Err(LustError::RuntimeError {
+                    message: format!("Function index {} not found in VM", func_idx),
+                });
+            }
+        };
+
+        let is_eligible = match self.mir_functions.get(&func_name) {
+            Some(f) => {
+                self.cranelift_dispatch_refine_count += 1;
+                self.is_cranelift_eligible_in_vm(f)
+            }
+            None => return Ok(None),
+        };
+        if !is_eligible {
+            return Ok(None);
+        }
+
+        // Compile before entering MirContext invocation scope and packing arguments
+        if !self.cranelift_compiled.contains_key(&func_name)
+            || self.cranelift_compiled_generation != self.cranelift_generation
+            || self.cranelift_compiled_struct_gen != self.struct_metadata.generation()
+        {
+            self.compile_cranelift()?;
+        }
+
+        let post_struct_gen = self.struct_metadata.generation();
+        if self.mir_context_struct_gen != post_struct_gen {
+            self.sync_mir_context_struct_metadata();
+        }
+
+        let entry = self
+            .cranelift_fn_cache
+            .get(func_idx)
+            .and_then(|slot| slot.as_ref())
+            .filter(|entry| {
+                entry.compiled_generation == self.cranelift_compiled_generation
+                    && entry.struct_metadata_generation == post_struct_gen
+                    && entry.param_types.len() == param_count
+            })
+            .cloned();
+        Ok(entry)
     }
 
     #[cfg(feature = "std")]
@@ -1656,12 +2123,7 @@ impl VM {
                 .set_gas(i64::try_from(rem_gas).unwrap_or(i64::MAX));
         }
 
-        for (name, info) in &self.struct_metadata {
-            let field_types: Vec<MirType> = (0..info.layout.field_names().len())
-                .map(|i| crate::mir::lowering::mir_type_from_ast(info.layout.field_type(i)))
-                .collect();
-            self.mir_context.register_struct_field_types(name, field_types);
-        }
+        self.sync_mir_context_struct_metadata();
 
         // Convert parameters to RawArg with alias-preserving tracking
         let mut raw_args = Vec::with_capacity(param_count);

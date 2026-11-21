@@ -47,6 +47,7 @@ pub struct Compiler {
     function_signatures: HashMap<String, FunctionSignature>,
     minimal_runtime_types: bool,
     pub(super) use_mir: bool,
+    pub(super) collect_mir: bool,
     pub(super) strict_mir: bool,
     pub(super) mir_functions: Vec<crate::mir::ir::MirFunction>,
     pub(super) thunk_return_target: Option<(Register, Vec<usize>)>,
@@ -116,6 +117,7 @@ impl Compiler {
             function_signatures: HashMap::new(),
             minimal_runtime_types: false,
             use_mir: false,
+            collect_mir: false,
             strict_mir: false,
             mir_functions: Vec::new(),
             thunk_return_target: None,
@@ -134,12 +136,20 @@ impl Compiler {
 
     pub fn set_use_mir(&mut self, enabled: bool) {
         self.use_mir = enabled;
+        if enabled {
+            self.collect_mir = true;
+        }
+    }
+
+    pub fn set_collect_mir(&mut self, enabled: bool) {
+        self.collect_mir = enabled;
     }
 
     pub fn set_strict_mir(&mut self, enabled: bool) {
         self.strict_mir = enabled;
         if enabled {
             self.use_mir = true;
+            self.collect_mir = true;
         }
     }
 
@@ -147,6 +157,7 @@ impl Compiler {
     pub fn configure(&mut self, config: &LustConfig) {
         self.minimal_runtime_types = config.minimal_runtime_types();
         self.use_mir = config.use_mir();
+        self.collect_mir = config.use_mir() || config.cranelift_jit();
         self.strict_mir = config.strict_mir();
         self.configure_stdlib(config);
     }

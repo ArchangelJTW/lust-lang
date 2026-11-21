@@ -1,7 +1,7 @@
 use crate::ast::Span;
 use crate::mir::ir::*;
 use alloc::{format, string::String, vec::Vec};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 /// Configuration for MIR-to-MIR inlining pass.
 #[derive(Debug, Clone)]
@@ -20,6 +20,29 @@ impl Default for InlinerConfig {
             max_depth: 4,
             max_callee_blocks: 64,
             max_callee_statements: 256,
+        }
+    }
+}
+
+/// Configuration for JIT-safe MIR-to-MIR inlining pass (`PERF-T1-4` / Hazard 3 Step A).
+#[derive(Debug, Clone)]
+pub struct JitInlineConfig {
+    /// Base inliner limits (depth, callee blocks, callee statements).
+    pub base: InlinerConfig,
+    /// Functions that must NEVER be inlined INTO or OUT OF
+    /// (e.g., `test_deopt_spike_hook.target_function`).
+    pub excluded_functions: HashSet<String>,
+    /// Maximum total locals allowed in a caller after inlining a callee.
+    /// Keeps MIR-VM continuation bytecode register indices safely within `u8` (`< 256` with scratch headroom).
+    pub max_caller_locals: usize,
+}
+
+impl Default for JitInlineConfig {
+    fn default() -> Self {
+        Self {
+            base: InlinerConfig::default(),
+            excluded_functions: HashSet::new(),
+            max_caller_locals: 200,
         }
     }
 }
@@ -201,6 +224,179 @@ impl MirInliner {
         }
 
         true
+    }
+
+    /// Evaluates JIT-safe eligibility of `callee` for inlining (`PERF-T1-4` / Hazard 3 Step A):
+    /// - Enforces all base `is_eligible_callee` guards (direct recursion, cycle in `call_stack`,
+    ///   `max_depth`, valid entry, `max_callee_blocks`, `max_callee_statements`, self-recursion).
+    /// - Guard 1: Never inline a callee containing any `is_effect_or_handler_callee`.
+    /// - Guard 2: Never inline a callee containing loops (`!find_loop_headers(&callee.blocks).is_empty()`).
+    /// - Guard 3: Never inline INTO or OUT OF any function in `jit_config.excluded_functions`.
+    /// - Rejects `Terminator::Raise` callees and callers exceeding `max_caller_locals` (keeps
+    ///   MIR-VM continuation bytecode register indices safely within `u8`).
+    pub fn is_eligible_callee_for_jit(
+        &self,
+        callee: &MirFunction,
+        caller_name: &str,
+        caller_local_count: usize,
+        call_stack: &[String],
+        jit_config: &JitInlineConfig,
+    ) -> bool {
+        if jit_config.excluded_functions.contains(caller_name)
+            || jit_config.excluded_functions.contains(&callee.signature.name)
+        {
+            return false;
+        }
+        if !self.is_eligible_callee(callee, caller_name, call_stack) {
+            return false;
+        }
+        if callee_has_effect_or_handler_call(callee) {
+            return false;
+        }
+        if callee_has_loops(callee) {
+            return false;
+        }
+        if callee
+            .blocks
+            .iter()
+            .any(|b| matches!(b.terminator, Some(Terminator::Raise(..))))
+        {
+            return false;
+        }
+        if caller_local_count.saturating_add(callee.locals.len()) > jit_config.max_caller_locals {
+            return false;
+        }
+        true
+    }
+
+    /// Runs JIT-safe inlining across all functions in `module`.
+    ///
+    /// Enforces all Hazard 3 Step A guards:
+    /// - Skips direct and mutual recursion cycles (via call-graph reachability + stack cycle checks).
+    /// - Guard 1: Never inlines effect/handler callees (directly or transitively).
+    /// - Guard 2: Never inlines loop-bearing callees.
+    /// - Guard 3: Never inlines INTO or OUT OF `jit_config.excluded_functions`.
+    /// - Guard 4: Verifies every modified `MirFunction` with `MirVerifier::verify_fn`, reverting
+    ///   to its pre-inline snapshot on any verification failure (fail-closed).
+    ///
+    /// Returns the set of function names that received verified inlined code.
+    pub fn inline_module_for_jit(
+        module: &mut MirModule,
+        jit_config: &JitInlineConfig,
+    ) -> HashSet<String> {
+        let inliner = Self::with_config(jit_config.base.clone());
+        let callees: HashMap<String, MirFunction> = module
+            .functions
+            .iter()
+            .map(|f| (f.signature.name.clone(), f.clone()))
+            .collect();
+
+        let recursive_fns = compute_recursive_functions(&callees);
+        let transitive_effect_fns = compute_transitive_effect_functions(&callees);
+
+        let mut inlined_functions = HashSet::new();
+        for func in &mut module.functions {
+            if jit_config.excluded_functions.contains(&func.signature.name) {
+                continue;
+            }
+            let pre_inline = func.clone();
+            let changed = inliner.inline_function_for_jit(
+                func,
+                &callees,
+                jit_config,
+                &recursive_fns,
+                &transitive_effect_fns,
+            );
+            if changed {
+                if crate::mir::verifier::MirVerifier::verify_fn(func).is_err() {
+                    *func = pre_inline;
+                } else {
+                    inlined_functions.insert(func.signature.name.clone());
+                }
+            }
+        }
+
+        inlined_functions
+    }
+
+    fn inline_function_for_jit(
+        &self,
+        caller: &mut MirFunction,
+        callees: &HashMap<String, MirFunction>,
+        jit_config: &JitInlineConfig,
+        recursive_fns: &HashSet<String>,
+        transitive_effect_fns: &HashSet<String>,
+    ) -> bool {
+        if jit_config.excluded_functions.contains(&caller.signature.name) {
+            return false;
+        }
+        let mut block_stacks: Vec<Vec<String>> =
+            vec![vec![caller.signature.name.clone()]; caller.blocks.len()];
+        let mut changed = false;
+        let mut block_idx = 0;
+
+        while block_idx < caller.blocks.len() {
+            let term = caller.blocks[block_idx].terminator.clone();
+            if let Some(Terminator::Call {
+                callee,
+                args,
+                destination,
+                success,
+                error,
+                span,
+            }) = term
+            {
+                if !recursive_fns.contains(&callee)
+                    && !transitive_effect_fns.contains(&callee)
+                    && let Some(callee_fn) = callees.get(&callee)
+                {
+                    let current_stack = if block_idx < block_stacks.len() {
+                        block_stacks[block_idx].clone()
+                    } else {
+                        vec![caller.signature.name.clone()]
+                    };
+
+                    if self.is_eligible_callee_for_jit(
+                        callee_fn,
+                        &caller.signature.name,
+                        caller.locals.len(),
+                        &current_stack,
+                        jit_config,
+                    ) && callee_fn.params.len() == args.len()
+                    {
+                        let mut next_stack = current_stack;
+                        next_stack.push(callee);
+
+                        let added_blocks = self.perform_inline(
+                            caller,
+                            block_idx,
+                            callee_fn,
+                            &args,
+                            destination,
+                            success,
+                            error,
+                            span,
+                        );
+
+                        for _ in 0..added_blocks {
+                            block_stacks.push(next_stack.clone());
+                        }
+
+                        changed = true;
+                    }
+                }
+            }
+            block_idx += 1;
+        }
+
+        if changed {
+            while Self::simplify_cfg(caller) {}
+            for (i, block) in caller.blocks.iter_mut().enumerate() {
+                block.id = BlockId(i);
+            }
+        }
+
+        changed
     }
 
     /// Performs the splicing of `callee` into `caller` at `call_block_idx`.
@@ -450,6 +646,108 @@ impl MirInliner {
 
         changed
     }
+}
+
+fn is_jit_effect_or_handler_callee(callee: &str) -> bool {
+    #[cfg(feature = "std")]
+    {
+        crate::mir::cranelift_backend::is_effect_or_handler_callee(callee)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        matches!(
+            callee,
+            "__lust_handle"
+                | "__lust_perform"
+                | "perform"
+                | "__lust_resume"
+                | "resume"
+                | "__lust_register_finalizer"
+                | "register_finalizer"
+                | "effect.perform"
+        )
+    }
+}
+
+fn callee_has_effect_or_handler_call(callee: &MirFunction) -> bool {
+    callee.blocks.iter().any(|block| {
+        matches!(
+            &block.terminator,
+            Some(Terminator::Call { callee: inner, .. }) if is_jit_effect_or_handler_callee(inner)
+        )
+    })
+}
+
+fn callee_has_loops(callee: &MirFunction) -> bool {
+    !crate::mir::opt::Safepoints::find_loop_headers(&callee.blocks).is_empty()
+}
+
+/// Computes all module functions that participate in a direct or mutual recursion cycle
+/// (i.e., `f` can reach `f` in 1 or more module-local calls).
+fn compute_recursive_functions(callees: &HashMap<String, MirFunction>) -> HashSet<String> {
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::with_capacity(callees.len());
+    for (name, func) in callees {
+        let mut targets = Vec::new();
+        for block in &func.blocks {
+            if let Some(Terminator::Call { callee, .. }) = &block.terminator
+                && callees.contains_key(callee.as_str())
+            {
+                targets.push(callee.as_str());
+            }
+        }
+        edges.insert(name.as_str(), targets);
+    }
+
+    let mut recursive = HashSet::new();
+    for start in callees.keys() {
+        let start_str = start.as_str();
+        let mut visited: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&str> = edges.get(start_str).cloned().unwrap_or_default();
+        while let Some(node) = stack.pop() {
+            if node == start_str {
+                recursive.insert(start.clone());
+                break;
+            }
+            if visited.insert(node)
+                && let Some(nexts) = edges.get(node)
+            {
+                stack.extend(nexts.iter().copied());
+            }
+        }
+    }
+    recursive
+}
+
+/// Computes all module functions that directly or transitively call an effect/handler intrinsic.
+fn compute_transitive_effect_functions(callees: &HashMap<String, MirFunction>) -> HashSet<String> {
+    let mut effect_fns: HashSet<String> = callees
+        .iter()
+        .filter(|(_, func)| callee_has_effect_or_handler_call(func))
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    loop {
+        let mut added = false;
+        for (name, func) in callees {
+            if effect_fns.contains(name) {
+                continue;
+            }
+            let calls_effect = func.blocks.iter().any(|block| {
+                matches!(
+                    &block.terminator,
+                    Some(Terminator::Call { callee, .. }) if effect_fns.contains(callee)
+                )
+            });
+            if calls_effect {
+                effect_fns.insert(name.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    effect_fns
 }
 
 fn terminator_successors(term: &Terminator) -> Vec<BlockId> {

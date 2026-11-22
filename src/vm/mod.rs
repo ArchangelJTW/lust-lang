@@ -1205,6 +1205,8 @@ impl VM {
     /// reuses `self.mir_context` with synced gas/memory budgets, and deducts consumed budgets
     /// on every exit path (`Completed`, `Deoptimized`, or `Error`).
     #[cfg(feature = "std")]
+    #[cold]
+    #[inline(never)]
     pub(super) fn try_enter_osr_at_backedge(
         &mut self,
         func_idx: usize,

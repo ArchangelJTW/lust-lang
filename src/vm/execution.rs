@@ -244,16 +244,6 @@ impl VM {
             } else {
                 (false, 0)
             };
-            #[cfg(feature = "std")]
-            if should_check_jit && self.backend == crate::vm::VmBackend::Cranelift {
-                if let Some(outcome) = self.try_enter_osr_at_backedge(func_idx, loop_start_ip)? {
-                    match outcome {
-                        crate::vm::OsrBackedgeOutcome::Return(Some(val)) => return Ok(val),
-                        crate::vm::OsrBackedgeOutcome::Return(None)
-                        | crate::vm::OsrBackedgeOutcome::DeoptimizedResume => continue 'dispatch,
-                    }
-                }
-            }
             if should_check_jit && JIT_ENABLED && self.quantum_fuel.is_none() {
                 let count = self.jit.profiler.record_backedge(func_idx, loop_start_ip);
                 let backedge_ip = ip_before_execution.saturating_sub(1);
@@ -1048,7 +1038,27 @@ impl VM {
 
                 Instruction::Jump(offset) => {
                     let frame = self.call_stack.last_mut().unwrap();
-                    frame.ip = (frame.ip as isize + offset as isize) as usize;
+                    let target_ip = (frame.ip as isize + offset as isize) as usize;
+                    frame.ip = target_ip;
+                    #[cfg(feature = "std")]
+                    if offset < 0
+                        && self.backend == crate::vm::VmBackend::Cranelift
+                        && !self.functions[func_idx].block_entry_pcs.is_empty()
+                    {
+                        if let Some(outcome) =
+                            self.try_enter_osr_at_backedge(func_idx, target_ip)?
+                        {
+                            match outcome {
+                                crate::vm::OsrBackedgeOutcome::Return(Some(val)) => {
+                                    return Ok(val);
+                                }
+                                crate::vm::OsrBackedgeOutcome::Return(None)
+                                | crate::vm::OsrBackedgeOutcome::DeoptimizedResume => {
+                                    continue 'dispatch;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 Instruction::JumpIf(cond, offset) => {

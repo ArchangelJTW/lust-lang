@@ -2689,6 +2689,7 @@ fn compile_program(
     compiler.set_imports_by_module(imports_map);
     compiler.set_entry_module(program.entry_module.clone());
     compiler.set_function_signatures(function_signatures);
+    compiler.set_struct_defs(struct_defs.clone());
     compiler.set_use_mir(config.use_mir());
     compiler.set_collect_mir(config.use_mir() || config.cranelift_jit());
     compiler.set_strict_mir(config.strict_mir());

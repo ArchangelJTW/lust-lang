@@ -240,6 +240,15 @@ impl VM {
             cranelift_recipes: HashMap::new(),
             #[cfg(feature = "std")]
             cranelift_fn_cache: Vec::new(),
+            #[cfg(feature = "std")]
+            osr_engine: None,
+            #[cfg(feature = "std")]
+            osr_backedge_counts: HashMap::new(),
+            #[cfg(feature = "std")]
+            osr_cold_sites: hashbrown::HashSet::new(),
+            osr_compilation_count: 0,
+            osr_last_cranelift_gen: 0,
+            osr_last_struct_gen: 0,
             mir_functions: HashMap::new(),
             cranelift_compiled: HashMap::new(),
             jit: JitState::new(),
@@ -604,6 +613,7 @@ impl VM {
         {
             self.cranelift_fn_cache.clear();
         }
+        self.invalidate_osr_state();
     }
 
     pub fn jit_stats(&self) -> crate::jit::JitStats {

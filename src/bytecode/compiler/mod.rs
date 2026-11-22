@@ -45,6 +45,7 @@ pub struct Compiler {
     lambda_return_types: HashMap<String, HashMap<Span, Type>>,
     numeric_types: HashMap<String, HashMap<Span, NumericType>>,
     function_signatures: HashMap<String, FunctionSignature>,
+    pub(super) struct_defs: HashMap<String, crate::ast::StructDef>,
     minimal_runtime_types: bool,
     pub(super) use_mir: bool,
     pub(super) collect_mir: bool,
@@ -115,6 +116,7 @@ impl Compiler {
             lambda_return_types: HashMap::new(),
             numeric_types: HashMap::new(),
             function_signatures: HashMap::new(),
+            struct_defs: HashMap::new(),
             minimal_runtime_types: false,
             use_mir: false,
             collect_mir: false,
@@ -272,6 +274,20 @@ impl Compiler {
 
     pub fn take_function_signatures(&mut self) -> HashMap<String, FunctionSignature> {
         core::mem::take(&mut self.function_signatures)
+    }
+
+    pub fn set_struct_defs(&mut self, defs: HashMap<String, crate::ast::StructDef>) {
+        self.struct_defs = defs;
+    }
+
+    pub(super) fn register_ast_struct_def(&mut self, def: &crate::ast::StructDef) {
+        let resolved = self.resolve_type_name(&def.name);
+        self.struct_defs
+            .entry(resolved)
+            .or_insert_with(|| def.clone());
+        self.struct_defs
+            .entry(def.name.clone())
+            .or_insert_with(|| def.clone());
     }
 
     pub(super) fn is_stdlib_symbol(&self, name: &str) -> bool {

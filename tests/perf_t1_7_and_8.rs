@@ -213,9 +213,11 @@ end
 
 function sum_points(n: int): int
     local p: Point = Point { x = 1, y = 2 }
+    local pair = (1, 2)
     local acc: int = 0
     local i: int = 0
     while i < n do
+        local _keep = pair
         p.x = p.x + 1
         acc = acc + p.x + p.y
         i = i + 1

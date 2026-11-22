@@ -21,12 +21,38 @@ use alloc::vec::Vec;
 use crate::bytecode::Value;
 use crate::effect_abi::InterruptReason;
 use crate::mir::cranelift_backend::{
-    take_deopt_payload, CraneliftJitCompiler, DeoptPayload, DeoptSiteKind, MIR_STATUS_DEOPT,
-    MIR_STATUS_ERR_INTERRUPTED,
+    find_loop_headers, is_effect_or_handler_callee, take_deopt_payload, CraneliftJitCompiler,
+    DeoptPayload, DeoptSiteKind, MIR_STATUS_DEOPT, MIR_STATUS_ERR_INTERRUPTED,
 };
-use crate::mir::ir::{BlockId, LocalId, MirFunction, MirType};
+use crate::mir::ir::{BlockId, LocalId, MirFunction, MirType, Statement, Terminator};
 use crate::mir::runtime_helpers::{enter_mir_context, MirContext};
 use crate::vm::CallFrame;
+
+/// Default hot backedge iteration threshold for production VM OSR promotion.
+pub const OSR_HOT_BACKEDGE_THRESHOLD: u32 = 64;
+
+/// Maximum number of live scalar locals supported across a native OSR entry boundary.
+pub const MAX_OSR_LIVE_LOCALS: usize = 8;
+
+/// Cache key for compiled production OSR entries, invalidating automatically on any
+/// Cranelift module or struct metadata generation change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OsrCacheKey {
+    pub func_idx: usize,
+    pub target_block: usize,
+    pub cranelift_generation: u64,
+    pub struct_metadata_generation: u64,
+}
+
+/// Cached metadata and finalized native code pointer for a compiled OSR entry.
+#[derive(Debug, Clone)]
+pub struct OsrCompiledEntry {
+    pub fn_ptr: *const u8,
+    pub target_block: BlockId,
+    pub live_locals: Vec<LocalId>,
+    pub live_local_types: Vec<(usize, MirType)>,
+    pub return_type: MirType,
+}
 
 /// Reasons why OSR entry cannot proceed and must fall back to the interpreter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,7 +357,7 @@ pub enum OsrExecutionResult {
     Interrupted(InterruptReason),
 }
 
-/// Invocates a compiled OSR function pointer with raw 64-bit arguments.
+/// Invokes a compiled OSR function pointer with raw 64-bit arguments.
 ///
 /// # Safety
 /// The caller must ensure that `fn_ptr` is a valid finalized function pointer
@@ -341,109 +367,379 @@ pub unsafe fn invoke_osr_entry(
     raw_args: &[i64],
     return_type: &MirType,
 ) -> Result<Value, String> {
+    macro_rules! call_osr {
+        ($($ty:ty => $arg:expr),*) => {{
+            if *return_type == MirType::Float {
+                let f: extern "C" fn($($ty),*) -> f64 = unsafe { core::mem::transmute(fn_ptr) };
+                Ok(Value::Float(f($($arg),*)))
+            } else if *return_type == MirType::Unit {
+                let f: extern "C" fn($($ty),*) = unsafe { core::mem::transmute(fn_ptr) };
+                f($($arg),*);
+                Ok(Value::Nil)
+            } else if *return_type == MirType::Bool {
+                let f: extern "C" fn($($ty),*) -> u8 = unsafe { core::mem::transmute(fn_ptr) };
+                Ok(Value::Bool(f($($arg),*) != 0))
+            } else {
+                let f: extern "C" fn($($ty),*) -> i64 = unsafe { core::mem::transmute(fn_ptr) };
+                Ok(Value::Int(f($($arg),*)))
+            }
+        }};
+    }
+
     match raw_args.len() {
-        0 => {
-            if *return_type == MirType::Float {
-                let f: extern "C" fn() -> f64 = unsafe { core::mem::transmute(fn_ptr) };
-                Ok(Value::Float(f()))
-            } else {
-                let f: extern "C" fn() -> i64 = unsafe { core::mem::transmute(fn_ptr) };
-                let res = f();
-                if *return_type == MirType::Bool {
-                    Ok(Value::Bool(res != 0))
-                } else {
-                    Ok(Value::Int(res))
-                }
-            }
-        }
-        1 => {
-            if *return_type == MirType::Float {
-                let f: extern "C" fn(i64) -> f64 = unsafe { core::mem::transmute(fn_ptr) };
-                Ok(Value::Float(f(raw_args[0])))
-            } else {
-                let f: extern "C" fn(i64) -> i64 = unsafe { core::mem::transmute(fn_ptr) };
-                let res = f(raw_args[0]);
-                if *return_type == MirType::Bool {
-                    Ok(Value::Bool(res != 0))
-                } else {
-                    Ok(Value::Int(res))
-                }
-            }
-        }
-        2 => {
-            if *return_type == MirType::Float {
-                let f: extern "C" fn(i64, i64) -> f64 = unsafe { core::mem::transmute(fn_ptr) };
-                Ok(Value::Float(f(raw_args[0], raw_args[1])))
-            } else {
-                let f: extern "C" fn(i64, i64) -> i64 = unsafe { core::mem::transmute(fn_ptr) };
-                let res = f(raw_args[0], raw_args[1]);
-                if *return_type == MirType::Bool {
-                    Ok(Value::Bool(res != 0))
-                } else {
-                    Ok(Value::Int(res))
-                }
-            }
-        }
-        3 => {
-            if *return_type == MirType::Float {
-                let f: extern "C" fn(i64, i64, i64) -> f64 = unsafe { core::mem::transmute(fn_ptr) };
-                Ok(Value::Float(f(raw_args[0], raw_args[1], raw_args[2])))
-            } else {
-                let f: extern "C" fn(i64, i64, i64) -> i64 = unsafe { core::mem::transmute(fn_ptr) };
-                let res = f(raw_args[0], raw_args[1], raw_args[2]);
-                if *return_type == MirType::Bool {
-                    Ok(Value::Bool(res != 0))
-                } else {
-                    Ok(Value::Int(res))
-                }
-            }
-        }
-        4 => {
-            if *return_type == MirType::Float {
-                let f: extern "C" fn(i64, i64, i64, i64) -> f64 = unsafe { core::mem::transmute(fn_ptr) };
-                Ok(Value::Float(f(raw_args[0], raw_args[1], raw_args[2], raw_args[3])))
-            } else {
-                let f: extern "C" fn(i64, i64, i64, i64) -> i64 = unsafe { core::mem::transmute(fn_ptr) };
-                let res = f(raw_args[0], raw_args[1], raw_args[2], raw_args[3]);
-                if *return_type == MirType::Bool {
-                    Ok(Value::Bool(res != 0))
-                } else {
-                    Ok(Value::Int(res))
-                }
-            }
-        }
-        5 => {
-            if *return_type == MirType::Float {
-                let f: extern "C" fn(i64, i64, i64, i64, i64) -> f64 = unsafe { core::mem::transmute(fn_ptr) };
-                Ok(Value::Float(f(
-                    raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4],
-                )))
-            } else {
-                let f: extern "C" fn(i64, i64, i64, i64, i64) -> i64 = unsafe { core::mem::transmute(fn_ptr) };
-                let res = f(
-                    raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4],
-                );
-                if *return_type == MirType::Bool {
-                    Ok(Value::Bool(res != 0))
-                } else {
-                    Ok(Value::Int(res))
-                }
-            }
-        }
+        0 => call_osr!(),
+        1 => call_osr!(i64 => raw_args[0]),
+        2 => call_osr!(i64 => raw_args[0], i64 => raw_args[1]),
+        3 => call_osr!(i64 => raw_args[0], i64 => raw_args[1], i64 => raw_args[2]),
+        4 => call_osr!(
+            i64 => raw_args[0],
+            i64 => raw_args[1],
+            i64 => raw_args[2],
+            i64 => raw_args[3]
+        ),
+        5 => call_osr!(
+            i64 => raw_args[0],
+            i64 => raw_args[1],
+            i64 => raw_args[2],
+            i64 => raw_args[3],
+            i64 => raw_args[4]
+        ),
+        6 => call_osr!(
+            i64 => raw_args[0],
+            i64 => raw_args[1],
+            i64 => raw_args[2],
+            i64 => raw_args[3],
+            i64 => raw_args[4],
+            i64 => raw_args[5]
+        ),
+        7 => call_osr!(
+            i64 => raw_args[0],
+            i64 => raw_args[1],
+            i64 => raw_args[2],
+            i64 => raw_args[3],
+            i64 => raw_args[4],
+            i64 => raw_args[5],
+            i64 => raw_args[6]
+        ),
+        8 => call_osr!(
+            i64 => raw_args[0],
+            i64 => raw_args[1],
+            i64 => raw_args[2],
+            i64 => raw_args[3],
+            i64 => raw_args[4],
+            i64 => raw_args[5],
+            i64 => raw_args[6],
+            i64 => raw_args[7]
+        ),
         n => Err(format!("Unsupported arity {} for OSR native call", n)),
     }
+}
+
+#[inline]
+fn is_osr_scalar_type(ty: &MirType) -> bool {
+    matches!(ty, MirType::Int | MirType::Float | MirType::Bool | MirType::Unit)
+}
+
+fn collect_block_referenced_locals(
+    block: &crate::mir::ir::BasicBlock,
+    used: &mut hashbrown::HashSet<usize>,
+) {
+    for stmt in &block.statements {
+        stmt.collect_uses(used);
+        match stmt {
+            Statement::Assign(place, _, _) => {
+                used.insert(place.root_local().0);
+                place.collect_uses(used);
+            }
+            Statement::StorageLive(loc, _) | Statement::StorageDead(loc, _) => {
+                used.insert(loc.0);
+            }
+            Statement::ResourceCheck(..) => {}
+        }
+    }
+    if let Some(term) = &block.terminator {
+        match term {
+            Terminator::Goto(..) | Terminator::Unreachable(_) => {}
+            Terminator::Cond { cond, .. } => cond.collect_uses(used),
+            Terminator::Switch { discr, .. } => discr.collect_uses(used),
+            Terminator::Call {
+                args, destination, ..
+            } => {
+                for arg in args {
+                    arg.collect_uses(used);
+                }
+                used.insert(destination.root_local().0);
+                destination.collect_uses(used);
+            }
+            Terminator::Return(Some(op), _) | Terminator::Raise(op, _) => op.collect_uses(used),
+            Terminator::Return(None, _) => {}
+        }
+    }
+}
+
+/// Validates and prepares a cloned, unreachable-prefix-pruned `MirFunction` for safe
+/// production OSR compilation starting at `target_block`.
+///
+/// Unreachable setup blocks (such as host calls executed before the loop) are replaced
+/// in-place with `Terminator::Unreachable` while preserving every `BlockId` and
+/// `LocalId` index 1-for-1 so `block_entry_pcs` and deopt payloads remain authoritative.
+pub fn prepare_osr_mir_for_target_block(
+    mir_fn: &MirFunction,
+    target_block: BlockId,
+    block_entry_pcs: &hashbrown::HashMap<usize, usize>,
+) -> Result<(MirFunction, Vec<LocalId>, Vec<(usize, MirType)>, MirType), OsrFallbackReason> {
+    if target_block.0 >= mir_fn.blocks.len() {
+        return Err(OsrFallbackReason::InvalidTargetBlock(target_block.0));
+    }
+
+    let loop_headers = find_loop_headers(&mir_fn.blocks);
+    if !loop_headers.contains(&target_block.0) {
+        return Err(OsrFallbackReason::InvalidTargetBlock(target_block.0));
+    }
+
+    // Derive proven live locals at loop header entry from the ORIGINAL unpruned CFG.
+    let live_indices = mir_fn
+        .derive_proven_site_metadata_at_entry(target_block.0)
+        .map_err(OsrFallbackReason::UnsupportedFrame)?;
+    if live_indices.len() > MAX_OSR_LIVE_LOCALS {
+        return Err(OsrFallbackReason::UnsupportedFrame(format!(
+            "OSR live local count {} exceeds maximum supported arity {}",
+            live_indices.len(),
+            MAX_OSR_LIVE_LOCALS
+        )));
+    }
+
+    let refined = crate::mir::cranelift_backend::jit_engine::refine_mir_function(mir_fn);
+    let return_type = refined.signature.return_type.clone();
+    if !is_osr_scalar_type(&return_type) {
+        return Err(OsrFallbackReason::UnsupportedType(format!(
+            "Unsupported OSR return type {:?}",
+            return_type
+        )));
+    }
+
+    let mut live_locals = Vec::with_capacity(live_indices.len());
+    let mut live_local_types = Vec::with_capacity(live_indices.len());
+    let mut live_set = hashbrown::HashSet::with_capacity(live_indices.len());
+    for idx in live_indices {
+        let ty = refined
+            .locals
+            .get(idx)
+            .map(|l| l.ty.clone())
+            .ok_or(OsrFallbackReason::MissingRegister(idx))?;
+        if !is_osr_scalar_type(&ty) {
+            return Err(OsrFallbackReason::UnsupportedType(format!(
+                "Unsupported OSR live local r{} type {:?}",
+                idx, ty
+            )));
+        }
+        live_locals.push(LocalId(idx));
+        live_local_types.push((idx, ty));
+        live_set.insert(idx);
+    }
+
+    // Compute blocks reachable from `target_block`.
+    let mut reachable = hashbrown::HashSet::new();
+    let mut worklist = Vec::new();
+    reachable.insert(target_block.0);
+    worklist.push(target_block.0);
+    while let Some(b_idx) = worklist.pop() {
+        let Some(term) = &refined.blocks[b_idx].terminator else {
+            return Err(OsrFallbackReason::UnsupportedFrame(format!(
+                "Block {} missing terminator",
+                b_idx
+            )));
+        };
+        for succ in term.successors() {
+            if succ >= refined.blocks.len() {
+                return Err(OsrFallbackReason::InvalidTargetBlock(succ));
+            }
+            if reachable.insert(succ) {
+                worklist.push(succ);
+            }
+        }
+    }
+
+    // Verify every reachable loop header has an authoritative bytecode resume PC and its
+    // entry-live locals are covered by `live_set` (fail-closed nested-loop deopt soundness).
+    for &hdr in &loop_headers {
+        if !reachable.contains(&hdr) {
+            continue;
+        }
+        if !block_entry_pcs.contains_key(&hdr) {
+            return Err(OsrFallbackReason::UnsupportedFrame(format!(
+                "Reachable loop header block {} lacks authoritative bytecode PC mapping",
+                hdr
+            )));
+        }
+        if hdr != target_block.0 {
+            let hdr_live = mir_fn
+                .derive_proven_site_metadata_at_entry(hdr)
+                .map_err(OsrFallbackReason::UnsupportedFrame)?;
+            if hdr_live.iter().any(|idx| !live_set.contains(idx)) {
+                return Err(OsrFallbackReason::UnsupportedFrame(format!(
+                    "Nested reachable loop header block {} has live locals outside OSR entry set",
+                    hdr
+                )));
+            }
+        }
+    }
+
+    let pruned_any_block = reachable.len() < refined.blocks.len();
+    let mut used_in_reachable = live_set;
+    for &b_idx in &reachable {
+        let block = &refined.blocks[b_idx];
+        collect_block_referenced_locals(block, &mut used_in_reachable);
+        if let Some(term) = &block.terminator {
+            match term {
+                Terminator::Raise(..) => {
+                    return Err(OsrFallbackReason::UnsupportedFrame(
+                        "Reachable OSR region contains Raise terminator".into(),
+                    ));
+                }
+                Terminator::Call { callee, .. } => {
+                    if is_effect_or_handler_callee(callee) {
+                        return Err(OsrFallbackReason::UnsupportedFrame(format!(
+                            "Reachable OSR region contains effect/handler call '{}'",
+                            callee
+                        )));
+                    }
+                    if pruned_any_block && callee == &refined.signature.name {
+                        return Err(OsrFallbackReason::UnsupportedFrame(format!(
+                            "Reachable OSR region contains recursive call to '{}'",
+                            callee
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Construct pruned OSR MIR clone preserving exact block and local indices.
+    let mut pruned = refined;
+    let fallback_span = pruned
+        .locals
+        .first()
+        .map(|l| l.span)
+        .ok_or_else(|| OsrFallbackReason::UnsupportedFrame("MIR function has no locals".into()))?;
+    for (b_idx, block) in pruned.blocks.iter_mut().enumerate() {
+        if !reachable.contains(&b_idx) {
+            block.statements.clear();
+            block.terminator = Some(Terminator::Unreachable(fallback_span));
+        }
+    }
+
+    for (l_idx, local) in pruned.locals.iter_mut().enumerate() {
+        if used_in_reachable.contains(&l_idx) {
+            if local.ty == MirType::Unknown {
+                return Err(OsrFallbackReason::UnsupportedType(format!(
+                    "Reachable OSR local r{} has unproven Unknown type",
+                    l_idx
+                )));
+            }
+        } else if !is_osr_scalar_type(&local.ty) {
+            // Dead setup-only locals outside the reachable OSR region are zero-initialized
+            // placeholders in Cranelift OSR prologue; normalize to scalar Int so setup-only
+            // dynamic/unknown types never block compilation of a pure scalar hot loop.
+            local.ty = MirType::Int;
+        }
+    }
+
+    Ok((pruned, live_locals, live_local_types, return_type))
 }
 
 /// Orchestrator for compiling and executing OSR entries.
 pub struct OsrEngine {
     compiler: CraneliftJitCompiler,
+    compiled_cache: hashbrown::HashMap<OsrCacheKey, OsrCompiledEntry>,
+    compilation_count: u64,
 }
 
 impl OsrEngine {
     /// Creates a new `OsrEngine` with an initialized Cranelift JIT compiler.
     pub fn new() -> Result<Self, String> {
         let compiler = CraneliftJitCompiler::new()?;
-        Ok(Self { compiler })
+        Ok(Self {
+            compiler,
+            compiled_cache: hashbrown::HashMap::new(),
+            compilation_count: 0,
+        })
+    }
+
+    /// Returns the total number of cached OSR compilations performed by this engine.
+    pub fn compilation_count(&self) -> u64 {
+        self.compilation_count
+    }
+
+    /// Clears all cached compiled OSR entries.
+    pub fn invalidate_cache(&mut self) {
+        self.compiled_cache.clear();
+    }
+
+    /// Returns a cached compiled OSR entry for `key`, compiling and caching it on miss.
+    pub fn get_or_compile_osr_entry(
+        &mut self,
+        key: OsrCacheKey,
+        mir_fn: &MirFunction,
+        block_entry_pcs: &hashbrown::HashMap<usize, usize>,
+    ) -> Result<OsrCompiledEntry, OsrFallbackReason> {
+        if let Some(cached) = self.compiled_cache.get(&key) {
+            return Ok(cached.clone());
+        }
+
+        let target_block = BlockId(key.target_block);
+        let (pruned_fn, live_locals, live_local_types, return_type) =
+            prepare_osr_mir_for_target_block(mir_fn, target_block, block_entry_pcs)?;
+
+        let fn_ptr = self
+            .compiler
+            .compile_osr_entry(&pruned_fn, target_block, &live_locals)
+            .map_err(|e| OsrFallbackReason::CompilationFailed(format!("{e}")))?;
+
+        self.compilation_count = self.compilation_count.saturating_add(1);
+        let entry = OsrCompiledEntry {
+            fn_ptr,
+            target_block,
+            live_locals,
+            live_local_types,
+            return_type,
+        };
+        self.compiled_cache.insert(key, entry.clone());
+        Ok(entry)
+    }
+
+    /// Strictly validates active `CallFrame` state against `entry`'s expected live local
+    /// types and packs raw 64-bit scalar arguments for native OSR entry.
+    pub fn validate_and_pack_frame_args(
+        entry: &OsrCompiledEntry,
+        frame: &CallFrame,
+    ) -> Result<Vec<i64>, OsrFallbackReason> {
+        if !frame.upvalues.is_empty() || !frame.shared_upvalues.is_empty() {
+            return Err(OsrFallbackReason::ActiveUpvalues);
+        }
+
+        let mut raw_args = Vec::with_capacity(entry.live_local_types.len());
+        for (reg_idx, expected_ty) in &entry.live_local_types {
+            let val = frame
+                .registers
+                .get(*reg_idx)
+                .ok_or(OsrFallbackReason::MissingRegister(*reg_idx))?;
+            let raw = match (val, expected_ty) {
+                (&Value::Int(i), MirType::Int) => i,
+                (&Value::Float(f), MirType::Float) => f.to_bits() as i64,
+                (&Value::Bool(b), MirType::Bool) => i64::from(b),
+                (Value::Nil, MirType::Unit) => 0,
+                (other, ty) => {
+                    return Err(OsrFallbackReason::UnsupportedType(format!(
+                        "Register r{} value {:?} does not match expected OSR scalar type {:?}",
+                        reg_idx, other, ty
+                    )));
+                }
+            };
+            raw_args.push(raw);
+        }
+        Ok(raw_args)
     }
 
     /// Compiles an OSR entry point for `mir_fn` starting at `target_block`.

@@ -32,7 +32,10 @@ impl Compiler {
                                 self.assign_signature_by_name(func_idx, &func_def.name);
                             }
 
-                            ItemKind::Struct(_) | ItemKind::Enum(_) => {}
+                            ItemKind::Struct(struct_def) => {
+                                self.register_ast_struct_def(struct_def);
+                            }
+                            ItemKind::Enum(_) => {}
                             ItemKind::Trait(trait_def) => {
                                 self.trait_names.insert(trait_def.name.clone());
                                 self.trait_names
@@ -131,7 +134,10 @@ impl Compiler {
                     self.assign_signature_by_name(func_idx, &func_def.name);
                 }
 
-                ItemKind::Struct(_) | ItemKind::Enum(_) => {}
+                ItemKind::Struct(struct_def) => {
+                    self.register_ast_struct_def(struct_def);
+                }
+                ItemKind::Enum(_) => {}
                 ItemKind::Trait(trait_def) => {
                     self.trait_names.insert(trait_def.name.clone());
                     self.trait_names
@@ -203,6 +209,7 @@ impl Compiler {
             .insert("__script".to_string(), script_func_idx);
         self.functions.push(script_func);
         self.assign_signature_by_name(script_func_idx, "__script");
+        let mut pending_mir: Vec<(usize, crate::mir::ir::MirFunction)> = Vec::new();
         let mut func_idx = 0;
         for item in items {
             match &item.kind {
@@ -212,13 +219,30 @@ impl Compiler {
                     for ni in items {
                         match &ni.kind {
                             ItemKind::Function(func_def) => {
-                                self.compile_function(func_idx, func_def)?;
+                                if let Some(mir_fn) =
+                                    self.compile_function_with_owner(func_idx, func_def, None)?
+                                {
+                                    pending_mir.push((func_idx, mir_fn));
+                                }
                                 func_idx += 1;
                             }
 
                             ItemKind::Impl(impl_block) => {
+                                let owner_type = match &impl_block.target_type.kind {
+                                    crate::ast::TypeKind::Named(name)
+                                    | crate::ast::TypeKind::GenericInstance { name, .. } => {
+                                        Some(self.resolve_type_name(name))
+                                    }
+                                    _ => None,
+                                };
                                 for method in &impl_block.methods {
-                                    self.compile_function(func_idx, method)?;
+                                    if let Some(mir_fn) = self.compile_function_with_owner(
+                                        func_idx,
+                                        method,
+                                        owner_type.as_deref(),
+                                    )? {
+                                        pending_mir.push((func_idx, mir_fn));
+                                    }
                                     func_idx += 1;
                                 }
                             }
@@ -232,13 +256,30 @@ impl Compiler {
                 }
 
                 ItemKind::Function(func_def) => {
-                    self.compile_function(func_idx, func_def)?;
+                    if let Some(mir_fn) =
+                        self.compile_function_with_owner(func_idx, func_def, None)?
+                    {
+                        pending_mir.push((func_idx, mir_fn));
+                    }
                     func_idx += 1;
                 }
 
                 ItemKind::Impl(impl_block) => {
+                    let owner_type = match &impl_block.target_type.kind {
+                        crate::ast::TypeKind::Named(name)
+                        | crate::ast::TypeKind::GenericInstance { name, .. } => {
+                            Some(self.resolve_type_name(name))
+                        }
+                        _ => None,
+                    };
                     for method in &impl_block.methods {
-                        self.compile_function(func_idx, method)?;
+                        if let Some(mir_fn) = self.compile_function_with_owner(
+                            func_idx,
+                            method,
+                            owner_type.as_deref(),
+                        )? {
+                            pending_mir.push((func_idx, mir_fn));
+                        }
                         func_idx += 1;
                     }
                 }
@@ -265,9 +306,80 @@ impl Compiler {
                 self.current_module = Some(entry.clone());
             }
 
-            self.compile_function(script_func_idx, &fake_func)?;
+            if let Some(mir_fn) =
+                self.compile_function_with_owner(script_func_idx, &fake_func, None)?
+            {
+                pending_mir.push((script_func_idx, mir_fn));
+            }
             self.assign_signature_by_name(script_func_idx, &fake_func.name);
             self.current_module = prev;
+        }
+
+        if self.use_mir {
+            // In mixed MIR + AST->Bytecode modules (`use_mir && !strict_mir`), keep only the
+            // closed call-graph subset of MIR functions whose module-local callees also lowered
+            // to MIR. Otherwise a MIR-VM caller would emit `LoadGlobal` / `GetIndex` against an
+            // AST->Bytecode callee that returns `Value::Struct` and is not registered as a global.
+            let mut valid_mir_names: HashSet<String> = pending_mir
+                .iter()
+                .map(|(_, f)| f.signature.name.clone())
+                .collect();
+            if !self.strict_mir {
+                loop {
+                    let mut dropped = Vec::new();
+                    for (_, mir_fn) in &pending_mir {
+                        if !valid_mir_names.contains(&mir_fn.signature.name) {
+                            continue;
+                        }
+                        let calls_non_mir_local = mir_fn.blocks.iter().any(|b| {
+                            matches!(
+                                &b.terminator,
+                                Some(crate::mir::ir::Terminator::Call { callee, .. })
+                                    if self.function_table.contains_key(callee.as_str())
+                                        && !valid_mir_names.contains(callee.as_str())
+                            )
+                        });
+                        if calls_non_mir_local {
+                            dropped.push(mir_fn.signature.name.clone());
+                        }
+                    }
+                    if dropped.is_empty() {
+                        break;
+                    }
+                    for name in dropped {
+                        valid_mir_names.remove(&name);
+                    }
+                }
+            }
+
+            for (f_idx, mir_fn) in pending_mir {
+                if !valid_mir_names.contains(&mir_fn.signature.name) {
+                    continue;
+                }
+                match crate::mir::MirToBytecodeCompiler::compile_with_direct_callee_indices(
+                    &mir_fn,
+                    &self.function_table,
+                ) {
+                    Ok(mut bytecode_fn) => {
+                        bytecode_fn.is_method = self.functions[f_idx].is_method;
+                        bytecode_fn.signature = self.functions[f_idx].signature.clone();
+                        self.functions[f_idx] = bytecode_fn;
+                        self.mir_functions.push(mir_fn);
+                    }
+                    Err(err) => {
+                        if self.strict_mir {
+                            return Err(LustError::CompileError(format!(
+                                "Strict MIR compilation failed for function '{}': {err}",
+                                mir_fn.signature.name
+                            )));
+                        }
+                    }
+                }
+            }
+        } else {
+            for (_, mir_fn) in pending_mir {
+                self.mir_functions.push(mir_fn);
+            }
         }
 
         Ok(self.functions.clone())
@@ -353,6 +465,118 @@ impl Compiler {
         }
     }
 
+    fn collect_struct_defs_for_mir(&self) -> Vec<crate::ast::StructDef> {
+        let mut defs: Vec<crate::ast::StructDef> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // 1. Prioritize simple names belonging to the current module scope or imported type aliases.
+        if let Some(module) = self.module_scope_name() {
+            if let Some(imports) = self.imports_by_module.get(module) {
+                for (alias, fq) in &imports.type_aliases {
+                    if let Some(def) = self.struct_defs.get(fq)
+                        && seen.insert(alias.clone())
+                    {
+                        let mut aliased = def.clone();
+                        aliased.name = alias.clone();
+                        defs.push(aliased);
+                    }
+                }
+            }
+            for (key, def) in &self.struct_defs {
+                let simple = key.rsplit('.').next().unwrap_or(key.as_str());
+                if self.resolve_type_name(simple) == *key && seen.insert(simple.to_string()) {
+                    let mut scoped = def.clone();
+                    scoped.name = simple.to_string();
+                    defs.push(scoped);
+                }
+            }
+        }
+
+        // 2. Register all known struct definitions under their exact keys (qualified & simple).
+        for (key, def) in &self.struct_defs {
+            if seen.insert(key.clone()) {
+                let mut keyed = def.clone();
+                keyed.name = key.clone();
+                defs.push(keyed);
+            }
+        }
+
+        // 3. Fallback simple names for any remaining definitions not yet registered.
+        for (key, def) in &self.struct_defs {
+            let simple = key.rsplit('.').next().unwrap_or(key.as_str());
+            if seen.insert(simple.to_string()) {
+                let mut named = def.clone();
+                named.name = simple.to_string();
+                defs.push(named);
+            }
+        }
+
+        defs
+    }
+
+    fn resolve_mir_type(&self, ty: &mut crate::mir::ir::MirType) {
+        use crate::mir::ir::MirType;
+        match ty {
+            MirType::Struct(name) => {
+                let resolved = self.resolve_type_name(name);
+                if self.struct_defs.contains_key(&resolved) {
+                    *name = resolved;
+                }
+            }
+            MirType::Array(inner) => self.resolve_mir_type(inner),
+            MirType::Option(inner) => self.resolve_mir_type(inner),
+            MirType::Tuple(elems) => {
+                for elem in elems {
+                    self.resolve_mir_type(elem);
+                }
+            }
+            MirType::Map(k, v) => {
+                self.resolve_mir_type(k);
+                self.resolve_mir_type(v);
+            }
+            MirType::Function {
+                params,
+                return_type,
+            } => {
+                for p in params {
+                    self.resolve_mir_type(p);
+                }
+                self.resolve_mir_type(return_type);
+            }
+            MirType::Effect {
+                return_type,
+                error_type,
+            } => {
+                self.resolve_mir_type(return_type);
+                self.resolve_mir_type(error_type);
+            }
+            _ => {}
+        }
+    }
+
+    fn resolve_mir_struct_types(&self, mir_fn: &mut crate::mir::ir::MirFunction) {
+        for param_ty in &mut mir_fn.signature.param_types {
+            self.resolve_mir_type(param_ty);
+        }
+        self.resolve_mir_type(&mut mir_fn.signature.return_type);
+        for local in &mut mir_fn.locals {
+            self.resolve_mir_type(&mut local.ty);
+        }
+        for block in &mut mir_fn.blocks {
+            for stmt in &mut block.statements {
+                if let crate::mir::ir::Statement::Assign(_, rval, _) = stmt {
+                    match rval {
+                        crate::mir::ir::Rvalue::Aggregate(ty, _)
+                        | crate::mir::ir::Rvalue::Cast(_, ty) => {
+                            self.resolve_mir_type(ty);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     fn resolve_mir_callees(&self, mir_fn: &mut crate::mir::ir::MirFunction) {
         let module_name = self.module_scope_name();
         let imports = module_name.and_then(|m| self.imports_by_module.get(m));
@@ -362,6 +586,18 @@ impl Compiler {
             else {
                 continue;
             };
+
+            if let Some((ty_part, method_part)) = callee.split_once(':') {
+                if self.function_table.contains_key(callee.as_str()) {
+                    continue;
+                }
+                let resolved_ty = self.resolve_type_name(ty_part);
+                let cand = format!("{resolved_ty}:{method_part}");
+                if self.function_table.contains_key(&cand) {
+                    *callee = cand;
+                    continue;
+                }
+            }
 
             if !callee.contains('.') {
                 if let Some(fq) = imports
@@ -379,10 +615,18 @@ impl Compiler {
                 }
             } else if !self.function_table.contains_key(callee.as_str())
                 && let Some((mod_alias, fn_name)) = callee.split_once('.')
-                && let Some(real_mod) =
-                    imports.and_then(|imp| imp.module_aliases.get(mod_alias))
             {
-                let cand = format!("{real_mod}.{fn_name}");
+                if let Some(real_mod) =
+                    imports.and_then(|imp| imp.module_aliases.get(mod_alias))
+                {
+                    let cand = format!("{real_mod}.{fn_name}");
+                    if self.function_table.contains_key(&cand) {
+                        *callee = cand;
+                        continue;
+                    }
+                }
+                let resolved_ty = self.resolve_type_name(mod_alias);
+                let cand = format!("{resolved_ty}.{fn_name}");
                 if self.function_table.contains_key(&cand) {
                     *callee = cand;
                 }
@@ -390,46 +634,29 @@ impl Compiler {
         }
     }
 
-    pub(super) fn compile_function(
+    pub(super) fn compile_function_with_owner(
         &mut self,
         func_idx: usize,
         func_def: &crate::ast::FunctionDef,
-    ) -> Result<()> {
+        owner_struct: Option<&str>,
+    ) -> Result<Option<crate::mir::ir::MirFunction>> {
+        let mut lowered_mir: Option<crate::mir::ir::MirFunction> = None;
         if self.use_mir || self.collect_mir {
-            match crate::mir::AstLowering::lower_function(func_def) {
-                Ok(mut mir_fn) => {
+            let scope_structs = self.collect_struct_defs_for_mir();
+            let struct_refs: Vec<&crate::ast::StructDef> = scope_structs.iter().collect();
+            match crate::mir::AstLowering::lower_function_with_structs_and_owner(
+                func_def,
+                owner_struct,
+                &struct_refs,
+            ) {
+                Ok((mut mir_fn, _ops)) => {
                     mir_fn.signature.name = self.functions[func_idx].name.clone();
+                    self.resolve_mir_struct_types(&mut mir_fn);
                     self.resolve_mir_callees(&mut mir_fn);
                     match crate::mir::MirVerifier::verify_fn(&mir_fn) {
                         Ok(_) => {
                             crate::mir::MirOptimizer::optimize_function(&mut mir_fn);
-                            if self.use_mir {
-                                let direct_callees: hashbrown::HashSet<String> =
-                                    self.function_table.keys().cloned().collect();
-                                match crate::mir::MirToBytecodeCompiler::compile_with_direct_callees(
-                                    &mir_fn,
-                                    &direct_callees,
-                                ) {
-                                    Ok(mut bytecode_fn) => {
-                                        bytecode_fn.is_method = self.functions[func_idx].is_method;
-                                        self.functions[func_idx] = bytecode_fn;
-                                        self.mir_functions.push(mir_fn);
-                                        return Ok(());
-                                    }
-                                    Err(err) => {
-                                        if self.strict_mir {
-                                            return Err(LustError::CompileError(format!(
-                                                "Strict MIR compilation failed for function '{}': {err}",
-                                                func_def.name
-                                            )));
-                                        }
-                                    }
-                                }
-                            } else {
-                                // PERF-T1-7: collect MIR candidate for Cranelift while keeping
-                                // direct AST->Bytecode as the primary VM representation.
-                                self.mir_functions.push(mir_fn);
-                            }
+                            lowered_mir = Some(mir_fn);
                         }
                         Err(errors) => {
                             if self.strict_mir {
@@ -515,6 +742,6 @@ impl Compiler {
         self.functions[func_idx].set_register_count(self.max_register + 1);
         self.scopes.pop();
         self.current_function_name = prev_function_name;
-        Ok(())
+        Ok(lowered_mir)
     }
 }

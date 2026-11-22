@@ -33,6 +33,7 @@ pub enum MirType {
     Map(Box<MirType>, Box<MirType>),
     Struct(String),
     Enum(String),
+    Option(Box<MirType>),
     Function {
         params: Vec<MirType>,
         return_type: Box<MirType>,
@@ -66,6 +67,7 @@ impl fmt::Display for MirType {
             MirType::Map(k, v) => write!(f, "map[{k} -> {v}]"),
             MirType::Struct(name) => write!(f, "struct {name}"),
             MirType::Enum(name) => write!(f, "enum {name}"),
+            MirType::Option(inner) => write!(f, "Option<{inner}>"),
             MirType::Function { params, return_type } => {
                 write!(f, "fn(")?;
                 for (i, p) in params.iter().enumerate() {
@@ -241,6 +243,7 @@ pub enum MirBinaryOp {
     GtEq,
     And,
     Or,
+    Concat,
 }
 
 impl fmt::Display for MirBinaryOp {
@@ -266,6 +269,7 @@ impl fmt::Display for MirBinaryOp {
             MirBinaryOp::GtEq => ">=",
             MirBinaryOp::And => "and",
             MirBinaryOp::Or => "or",
+            MirBinaryOp::Concat => "..",
         };
         write!(f, "{s}")
     }
@@ -948,7 +952,12 @@ impl MirFunction {
                 ty,
                 MirType::Array(inner)
                     if matches!(&**inner, MirType::Int | MirType::Bool | MirType::Float)
-            );
+            ) || matches!(ty, MirType::Struct(name) if !name.is_empty())
+                || matches!(
+                    ty,
+                    MirType::Option(inner)
+                        if matches!(&**inner, MirType::Struct(name) if !name.is_empty())
+                );
             if !is_supported {
                 return Err(alloc::format!(
                     "Cannot derive proven compiler site metadata for deopt site {}: local {} has unsupported deopt type {:?} (Unsupported non-scalar type)",

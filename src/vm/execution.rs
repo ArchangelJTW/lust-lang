@@ -244,6 +244,16 @@ impl VM {
             } else {
                 (false, 0)
             };
+            #[cfg(feature = "std")]
+            if should_check_jit && self.backend == crate::vm::VmBackend::Cranelift {
+                if let Some(outcome) = self.try_enter_osr_at_backedge(func_idx, loop_start_ip)? {
+                    match outcome {
+                        crate::vm::OsrBackedgeOutcome::Return(Some(val)) => return Ok(val),
+                        crate::vm::OsrBackedgeOutcome::Return(None)
+                        | crate::vm::OsrBackedgeOutcome::DeoptimizedResume => continue 'dispatch,
+                    }
+                }
+            }
             if should_check_jit && JIT_ENABLED && self.quantum_fuel.is_none() {
                 let count = self.jit.profiler.record_backedge(func_idx, loop_start_ip);
                 let backedge_ip = ip_before_execution.saturating_sub(1);
@@ -1778,6 +1788,16 @@ impl VM {
                             // Fall through to the trace recorder below: it
                             // inlines user-defined struct methods like calls.
                             self.call_stack.push(frame);
+                            #[cfg(feature = "std")]
+                            if self.backend == crate::vm::VmBackend::Cranelift
+                                && self.trace_recorder.is_none()
+                                && let Some(finished) = self.try_run_cranelift_top_frame()?
+                            {
+                                if let Some(val) = finished {
+                                    return Ok(val);
+                                }
+                                continue 'dispatch;
+                            }
                             if JIT_ENABLED
                                 && self.trace_recorder.is_none()
                                 && let Some(finished) = self.run_compiled_function(target)?
@@ -1855,6 +1875,16 @@ impl VM {
                             let frame =
                                 self.make_call_frame(func_idx, Some(dest_reg), args, Vec::new())?;
                             self.call_stack.push(frame);
+                            #[cfg(feature = "std")]
+                            if self.backend == crate::vm::VmBackend::Cranelift
+                                && self.trace_recorder.is_none()
+                                && let Some(finished) = self.try_run_cranelift_top_frame()?
+                            {
+                                if let Some(val) = finished {
+                                    return Ok(val);
+                                }
+                                continue 'dispatch;
+                            }
                             break 'method;
                         }
 

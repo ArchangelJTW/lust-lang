@@ -27,23 +27,40 @@ pub struct MirToBytecodeCompiler<'a> {
     terminator_pcs: HashMap<usize, usize>,
     pending_jumps: Vec<(usize, BlockId)>,
     direct_callees: Option<&'a HashSet<String>>,
+    direct_callee_indices: Option<&'a HashMap<String, usize>>,
 }
 
 impl<'a> MirToBytecodeCompiler<'a> {
     pub fn compile(func: &'a MirFunction) -> Result<Function, MirVmBackendError> {
-        Self::compile_inner(func, None)
+        Self::compile_inner(func, None, None)
     }
 
     pub fn compile_with_direct_callees(
         func: &'a MirFunction,
         direct_callees: &'a HashSet<String>,
     ) -> Result<Function, MirVmBackendError> {
-        Self::compile_inner(func, Some(direct_callees))
+        Self::compile_inner(func, Some(direct_callees), None)
+    }
+
+    pub fn compile_with_direct_callee_indices(
+        func: &'a MirFunction,
+        direct_callee_indices: &'a HashMap<String, usize>,
+    ) -> Result<Function, MirVmBackendError> {
+        Self::compile_inner(func, None, Some(direct_callee_indices))
+    }
+
+    pub fn compile_with_direct_callees_and_indices(
+        func: &'a MirFunction,
+        direct_callees: &'a HashSet<String>,
+        direct_callee_indices: &'a HashMap<String, usize>,
+    ) -> Result<Function, MirVmBackendError> {
+        Self::compile_inner(func, Some(direct_callees), Some(direct_callee_indices))
     }
 
     fn compile_inner(
         func: &'a MirFunction,
         direct_callees: Option<&'a HashSet<String>>,
+        direct_callee_indices: Option<&'a HashMap<String, usize>>,
     ) -> Result<Function, MirVmBackendError> {
         let param_count = func.params.len() as u8;
         let mut bytecode_fn = Function::new(func.signature.name.clone(), param_count, false);
@@ -58,6 +75,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
             terminator_pcs: HashMap::new(),
             pending_jumps: Vec::new(),
             direct_callees,
+            direct_callee_indices,
         };
 
         compiler.compile_blocks()?;
@@ -164,6 +182,18 @@ impl<'a> MirToBytecodeCompiler<'a> {
         }
     }
 
+    fn operand_is_option(&self, op: &Operand) -> bool {
+        match op {
+            Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
+                matches!(
+                    self.func.locals.get(loc.0).map(|l| &l.ty),
+                    Some(MirType::Option(_))
+                )
+            }
+            _ => false,
+        }
+    }
+
     fn compile_rvalue(&mut self, rvalue: &Rvalue, dst_reg: Register, line: usize) -> Result<(), MirVmBackendError> {
         match rvalue {
             Rvalue::Use(op) => {
@@ -190,14 +220,41 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 }
             }
             Rvalue::Cast(op, target_ty) => {
-                let r_op = self.operand_to_reg(op, line);
                 match target_ty {
+                    MirType::Option(_) => {
+                        let option_idx = self.chunk.add_constant(Value::string("Option".to_string()));
+                        if matches!(op, Operand::Constant(MirConstant::Int(0))) {
+                            let none_idx = self.chunk.add_constant(Value::string("None".to_string()));
+                            self.chunk.emit(
+                                Instruction::NewEnumUnit(dst_reg, option_idx, none_idx),
+                                line,
+                            );
+                        } else if self.operand_is_option(op) {
+                            let r_op = self.operand_to_reg(op, line);
+                            if dst_reg != r_op {
+                                self.chunk.emit(Instruction::Move(dst_reg, r_op), line);
+                            }
+                        } else {
+                            let r_op = self.operand_to_reg(op, line);
+                            let some_idx = self.chunk.add_constant(Value::string("Some".to_string()));
+                            self.chunk.emit(
+                                Instruction::NewEnumVariant(dst_reg, option_idx, some_idx, r_op, 1),
+                                line,
+                            );
+                        }
+                    }
+                    MirType::Struct(_) if self.operand_is_option(op) => {
+                        let r_op = self.operand_to_reg(op, line);
+                        self.chunk.emit(Instruction::GetEnumValue(dst_reg, r_op, 0), line);
+                    }
                     MirType::Float => {
+                        let r_op = self.operand_to_reg(op, line);
                         let zero_f_reg = self.next_scratch();
                         self.load_constant_into_reg(&MirConstant::Float(0.0), zero_f_reg, line);
                         self.chunk.emit(Instruction::Add(dst_reg, r_op, zero_f_reg), line);
                     }
                     MirType::Int => {
+                        let r_op = self.operand_to_reg(op, line);
                         let obj_idx = self.chunk.add_constant(Value::string("math".to_string()));
                         let field_idx = self.chunk.add_constant(Value::string("floor".to_string()));
                         let func_reg = self.next_scratch();
@@ -208,6 +265,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
                         self.chunk.emit(Instruction::Call(func_reg, arg_reg, 1, dst_reg), line);
                     }
                     _ => {
+                        let r_op = self.operand_to_reg(op, line);
                         if dst_reg != r_op {
                             self.chunk.emit(Instruction::Move(dst_reg, r_op), line);
                         }
@@ -215,6 +273,30 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 }
             }
             Rvalue::BinaryOp(binop, lhs, rhs) => {
+                if matches!(binop, MirBinaryOp::Eq | MirBinaryOp::NotEq) {
+                    let opt_operand = if self.operand_is_option(lhs)
+                        && matches!(rhs, Operand::Constant(MirConstant::Int(0)))
+                    {
+                        Some(lhs)
+                    } else if self.operand_is_option(rhs)
+                        && matches!(lhs, Operand::Constant(MirConstant::Int(0)))
+                    {
+                        Some(rhs)
+                    } else {
+                        None
+                    };
+                    if let Some(opt_op) = opt_operand {
+                        let r_opt = self.operand_to_reg(opt_op, line);
+                        let option_idx = self.chunk.add_constant(Value::string("Option".to_string()));
+                        let variant_name = if *binop == MirBinaryOp::NotEq { "Some" } else { "None" };
+                        let variant_idx = self.chunk.add_constant(Value::string(variant_name.to_string()));
+                        self.chunk.emit(
+                            Instruction::IsEnumVariant(dst_reg, r_opt, option_idx, variant_idx),
+                            line,
+                        );
+                        return Ok(());
+                    }
+                }
                 let is_string = match (lhs, rhs) {
                     (Operand::Constant(MirConstant::String(_)), _) | (_, Operand::Constant(MirConstant::String(_))) => true,
                     (Operand::Copy(Place::Local(l)) | Operand::Move(Place::Local(l)), _) if self.func.locals[l.0].ty == MirType::String => true,
@@ -360,6 +442,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
             MirBinaryOp::GtEq => Instruction::Ge(dst, lhs, rhs),
             MirBinaryOp::And => Instruction::And(dst, lhs, rhs),
             MirBinaryOp::Or => Instruction::Or(dst, lhs, rhs),
+            MirBinaryOp::Concat => Instruction::Concat(dst, lhs, rhs),
         };
         self.chunk.emit(instr, line);
         Ok(())
@@ -440,19 +523,27 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 };
 
                 let func_reg = self.next_scratch();
-                let is_direct = self
-                    .direct_callees
-                    .is_some_and(|set| set.contains(callee.as_str()));
-                if !is_direct
-                    && let Some((obj_name, field_name)) = callee.split_once('.')
+                if let Some(&callee_idx) = self
+                    .direct_callee_indices
+                    .and_then(|map| map.get(callee.as_str()))
                 {
-                    let obj_idx = self.chunk.add_constant(Value::string(obj_name.to_string()));
-                    let field_idx = self.chunk.add_constant(Value::string(field_name.to_string()));
-                    self.chunk.emit(Instruction::LoadGlobal(func_reg, obj_idx), line);
-                    self.chunk.emit(Instruction::GetField(func_reg, func_reg, field_idx), line);
+                    let fn_const_idx = self.chunk.add_constant(Value::Function(callee_idx));
+                    self.chunk.emit(Instruction::LoadConst(func_reg, fn_const_idx), line);
                 } else {
-                    let name_idx = self.chunk.add_constant(Value::string(callee.clone()));
-                    self.chunk.emit(Instruction::LoadGlobal(func_reg, name_idx), line);
+                    let is_direct = self
+                        .direct_callees
+                        .is_some_and(|set| set.contains(callee.as_str()));
+                    if !is_direct
+                        && let Some((obj_name, field_name)) = callee.split_once('.')
+                    {
+                        let obj_idx = self.chunk.add_constant(Value::string(obj_name.to_string()));
+                        let field_idx = self.chunk.add_constant(Value::string(field_name.to_string()));
+                        self.chunk.emit(Instruction::LoadGlobal(func_reg, obj_idx), line);
+                        self.chunk.emit(Instruction::GetField(func_reg, func_reg, field_idx), line);
+                    } else {
+                        let name_idx = self.chunk.add_constant(Value::string(callee.clone()));
+                        self.chunk.emit(Instruction::LoadGlobal(func_reg, name_idx), line);
+                    }
                 }
 
                 let dest_reg = self.place_to_reg(destination);

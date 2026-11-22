@@ -14,9 +14,17 @@ pub const MIR_STATUS_ERR_DIV_BY_ZERO: i64 = 5;
 pub const MIR_STATUS_ERR_NEG_EXPONENT: i64 = 6;
 pub const MIR_STATUS_ERR_OUT_OF_BOUNDS: i64 = 7;
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MirArrayHeader {
+    pub len: i64,
+    pub cap: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MirAllocationKind {
     Array(crate::mir::ir::MirType),
+    ArrayBacking,
     Tuple(Vec<crate::mir::ir::MirType>),
     Struct(alloc::string::String),
     CFlatStruct(alloc::string::String),
@@ -63,6 +71,8 @@ pub struct MirContext {
     #[cfg(feature = "std")]
     pub interned_list: Mutex<Vec<alloc::string::String>>,
     #[cfg(feature = "std")]
+    pub small_digit_handles: [AtomicI64; 10],
+    #[cfg(feature = "std")]
     pub struct_fields: Mutex<hashbrown::HashMap<alloc::string::String, Vec<crate::mir::ir::MirType>>>,
 }
 
@@ -101,6 +111,8 @@ impl MirContext {
             interned_strings: Mutex::new(hashbrown::HashMap::new()),
             #[cfg(feature = "std")]
             interned_list: Mutex::new(Vec::new()),
+            #[cfg(feature = "std")]
+            small_digit_handles: core::array::from_fn(|_| AtomicI64::new(0)),
             #[cfg(feature = "std")]
             struct_fields: Mutex::new(hashbrown::HashMap::new()),
         }
@@ -530,7 +542,11 @@ impl MirContext {
                 } else {
                     let records = self.allocation_records.lock().unwrap();
                     let first_after = (floor..bufs.len()).find(|&idx| {
-                        let ptr_addr = bufs[idx].0 as usize;
+                        let ptr = bufs[idx].0;
+                        if ptr.is_null() {
+                            return false;
+                        }
+                        let ptr_addr = ptr as usize;
                         match records.get(&ptr_addr) {
                             Some(rec) => rec.handle_epoch >= baseline_handles,
                             None => true,
@@ -545,6 +561,12 @@ impl MirContext {
         {
             let _ = baseline_handles;
         }
+    }
+
+    /// Validates an active array header pointer (both flat `cap >= 0` and redirected `cap < 0`)
+    /// without mutating `last_status`. Returns `(len, cap, data_ptr)` on success.
+    pub fn resolve_validated_array_data(&self, ptr: *const i64) -> Option<(usize, usize, *const i64)> {
+        validate_active_array_inner(self, ptr).map(|v| (v.len, v.cap, v.data_ptr as *const i64))
     }
 }
 
@@ -709,7 +731,17 @@ pub fn mir_array_elem_type_from_tag(tag: i64) -> Option<crate::mir::ir::MirType>
 
 fn alloc_mir_buffer_with_kind(len: i64, kind: MirAllocationKind) -> *mut i64 {
     let count = if len < 0 { 0 } else { len as usize };
-    let Some(size) = count.checked_add(2) else {
+    // Arrays always allocate at least 3 words (`max(count, 1) + 2`) so word[2] can hold
+    // a redirected backing-buffer pointer when growing via `lust_mir_array_push`.
+    let payload_slots = if matches!(
+        kind,
+        MirAllocationKind::Array(_) | MirAllocationKind::RawWords
+    ) {
+        count.max(1)
+    } else {
+        count
+    };
+    let Some(size) = payload_slots.checked_add(2) else {
         with_current_mir_context(|ctx| {
             ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
         });
@@ -914,61 +946,114 @@ pub extern "C" fn lust_mir_alloc_cflat_struct(
     ptr
 }
 
-fn validate_active_array_ptr(ctx: &MirContext, ptr: *const i64) -> Option<(*mut i64, usize)> {
+#[cfg(feature = "std")]
+struct ValidatedArray {
+    base_ptr: *mut i64,
+    len: usize,
+    cap: usize,
+    data_ptr: *mut i64,
+    header_rec: MirAllocationRecord,
+    backing_rec: Option<MirAllocationRecord>,
+}
+
+#[cfg(not(feature = "std"))]
+struct ValidatedArray {
+    base_ptr: *mut i64,
+    len: usize,
+    cap: usize,
+    data_ptr: *mut i64,
+}
+
+fn validate_active_array_inner(ctx: &MirContext, ptr: *const i64) -> Option<ValidatedArray> {
     if ptr.is_null() {
-        ctx.last_status
-            .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
         return None;
     }
     #[cfg(feature = "std")]
     {
-        let Some(rec) = ctx.get_active_allocation_record(ptr as usize) else {
-            ctx.last_status
-                .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
-            return None;
-        };
+        let rec = ctx.get_active_allocation_record(ptr as usize)?;
         if !matches!(
             rec.kind,
             MirAllocationKind::Array(_) | MirAllocationKind::RawWords
         ) {
-            ctx.last_status
-                .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
             return None;
         }
         if rec.word_capacity < 2 {
-            ctx.last_status
-                .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
             return None;
         }
         let len_raw = unsafe { *rec.base_ptr };
         let cap_raw = unsafe { *rec.base_ptr.add(1) };
-        if len_raw < 0 || cap_raw < 0 {
-            ctx.last_status
-                .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
+        if len_raw < 0 {
             return None;
         }
         let len = len_raw as usize;
-        let cap = cap_raw as usize;
-        if len > cap || cap.checked_add(2).is_none_or(|n| n > rec.word_capacity) {
-            ctx.last_status
-                .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
-            return None;
+        if cap_raw >= 0 {
+            let cap = cap_raw as usize;
+            if len > cap || cap.checked_add(2).is_none_or(|n| n > rec.word_capacity) {
+                return None;
+            }
+            let data_ptr = unsafe { rec.base_ptr.add(2) };
+            Some(ValidatedArray {
+                base_ptr: rec.base_ptr,
+                len,
+                cap,
+                data_ptr,
+                header_rec: rec,
+                backing_rec: None,
+            })
+        } else {
+            // Bit 63 set: redirected backing buffer stored at word[2]
+            if rec.word_capacity < 3 {
+                return None;
+            }
+            let cap = (cap_raw & i64::MAX) as usize;
+            if cap == 0 || len > cap {
+                return None;
+            }
+            let data_raw = unsafe { *rec.base_ptr.add(2) };
+            if data_raw == 0 {
+                return None;
+            }
+            let backing_rec = ctx.get_active_allocation_record(data_raw as usize)?;
+            if backing_rec.kind != MirAllocationKind::ArrayBacking
+                || !backing_rec.is_ctx_owned
+                || backing_rec.word_capacity < cap
+                || backing_rec.base_ptr == rec.base_ptr
+            {
+                return None;
+            }
+            let data_ptr = backing_rec.base_ptr;
+            Some(ValidatedArray {
+                base_ptr: rec.base_ptr,
+                len,
+                cap,
+                data_ptr,
+                header_rec: rec,
+                backing_rec: Some(backing_rec),
+            })
         }
-        Some((rec.base_ptr, len))
     }
     #[cfg(not(feature = "std"))]
     {
-        let _ = ptr;
-        ctx.last_status
-            .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
+        let _ = (ctx, ptr);
         None
+    }
+}
+
+fn validate_active_array_ptr(ctx: &MirContext, ptr: *const i64) -> Option<ValidatedArray> {
+    match validate_active_array_inner(ctx, ptr) {
+        Some(v) => Some(v),
+        None => {
+            ctx.last_status
+                .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
+            None
+        }
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_array_len(ptr: *const i64) -> i64 {
     with_current_mir_context(|ctx| {
-        validate_active_array_ptr(ctx, ptr).map_or(0, |(_, len)| len as i64)
+        validate_active_array_ptr(ctx, ptr).map_or(0, |v| v.len as i64)
     })
 }
 
@@ -979,40 +1064,195 @@ pub extern "C" fn lust_mir_array_len(ptr: *const i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_array_len_checked(ptr: *const i64) -> i64 {
     with_current_mir_context(|ctx| {
-        validate_active_array_ptr(ctx, ptr).map_or(-1, |(_, len)| len as i64)
+        validate_active_array_ptr(ctx, ptr).map_or(-1, |v| v.len as i64)
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_array_get(ptr: *const i64, idx: i64) -> i64 {
     with_current_mir_context(|ctx| {
-        let Some((base, len)) = validate_active_array_ptr(ctx, ptr) else {
+        let Some(v) = validate_active_array_ptr(ctx, ptr) else {
             return 0;
         };
-        if idx < 0 || (idx as usize) >= len {
+        if idx < 0 || (idx as usize) >= v.len {
             ctx.last_status
                 .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
             return 0;
         }
-        unsafe { *base.add(2 + idx as usize) }
+        unsafe { *v.data_ptr.add(idx as usize) }
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_array_set(ptr: *mut i64, idx: i64, val: i64) {
     with_current_mir_context(|ctx| {
-        let Some((base, len)) = validate_active_array_ptr(ctx, ptr) else {
+        let Some(v) = validate_active_array_ptr(ctx, ptr) else {
             return;
         };
-        if idx < 0 || (idx as usize) >= len {
+        if idx < 0 || (idx as usize) >= v.len {
             ctx.last_status
                 .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
             return;
         }
         unsafe {
-            *base.add(2 + idx as usize) = val;
+            *v.data_ptr.add(idx as usize) = val;
         }
     });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
+    with_current_mir_context(|ctx| {
+        #[cfg(feature = "std")]
+        {
+            let Some(v) = validate_active_array_ptr(ctx, ptr) else {
+                return MIR_STATUS_ERR_OUT_OF_BOUNDS;
+            };
+            if v.header_rec.word_capacity < 3 {
+                ctx.last_status
+                    .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
+                return MIR_STATUS_ERR_OUT_OF_BOUNDS;
+            }
+            if v.len < v.cap {
+                unsafe {
+                    *v.data_ptr.add(v.len) = val;
+                    *v.base_ptr = (v.len + 1) as i64;
+                }
+                return MIR_STATUS_OK;
+            }
+            let Some(new_len) = v.len.checked_add(1) else {
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                return MIR_STATUS_ERR_OOM;
+            };
+            let new_cap = v.cap.saturating_mul(2).max(4).max(new_len);
+            if new_cap > (i64::MAX as usize) {
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                return MIR_STATUS_ERR_OOM;
+            }
+            let Some(bytes_u) = new_cap.checked_mul(core::mem::size_of::<i64>()) else {
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                return MIR_STATUS_ERR_OOM;
+            };
+            let Ok(bytes_needed) = i64::try_from(bytes_u) else {
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                return MIR_STATUS_ERR_OOM;
+            };
+            // Check memory limit BEFORE allocating or mutating header
+            let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
+            let prev = ctx.memory_used.fetch_add(bytes_needed, Ordering::SeqCst);
+            if prev.saturating_add(bytes_needed) > limit {
+                ctx.memory_used.fetch_sub(bytes_needed, Ordering::SeqCst);
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                return MIR_STATUS_ERR_OOM;
+            }
+
+            let mut new_vec = Vec::<i64>::new();
+            if new_vec.try_reserve_exact(new_cap).is_err() {
+                ctx.memory_used.fetch_sub(bytes_needed, Ordering::SeqCst);
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                return MIR_STATUS_ERR_OOM;
+            }
+            if v.len > 0 {
+                let src = unsafe { core::slice::from_raw_parts(v.data_ptr, v.len) };
+                new_vec.extend_from_slice(src);
+            }
+            new_vec.push(val);
+            new_vec.resize(new_cap, 0);
+            let new_slice = new_vec.into_boxed_slice();
+            let new_data_ptr = Box::into_raw(new_slice) as *mut i64;
+
+            let old_to_free: Option<(*mut i64, usize)> = {
+                let seq = ctx.next_alloc_seq.fetch_add(1, Ordering::SeqCst);
+                let scope_depth = ctx.scope_alloc_floors.lock().unwrap().len();
+                let mut bufs = ctx.allocated_buffers.lock().unwrap();
+                let mut records = ctx.allocation_records.lock().unwrap();
+                if let Some(old_backing) = v.backing_rec {
+                    let old_idx = old_backing.buffer_index;
+                    let old_words = old_backing.word_capacity;
+                    records.remove(&(old_backing.base_ptr as usize));
+                    if old_idx < bufs.len() && bufs[old_idx].0 == old_backing.base_ptr {
+                        bufs[old_idx] = (new_data_ptr, new_cap);
+                        records.insert(
+                            new_data_ptr as usize,
+                            MirAllocationRecord {
+                                base_ptr: new_data_ptr,
+                                word_capacity: new_cap,
+                                kind: MirAllocationKind::ArrayBacking,
+                                buffer_index: old_idx,
+                                handle_epoch: v.header_rec.handle_epoch,
+                                alloc_seq: seq,
+                                is_ctx_owned: true,
+                                registered_scope_depth: scope_depth,
+                            },
+                        );
+                        Some((old_backing.base_ptr, old_words))
+                    } else {
+                        let buffer_index = bufs.len();
+                        bufs.push((new_data_ptr, new_cap));
+                        records.insert(
+                            new_data_ptr as usize,
+                            MirAllocationRecord {
+                                base_ptr: new_data_ptr,
+                                word_capacity: new_cap,
+                                kind: MirAllocationKind::ArrayBacking,
+                                buffer_index,
+                                handle_epoch: v.header_rec.handle_epoch,
+                                alloc_seq: seq,
+                                is_ctx_owned: true,
+                                registered_scope_depth: scope_depth,
+                            },
+                        );
+                        None
+                    }
+                } else {
+                    let buffer_index = bufs.len();
+                    bufs.push((new_data_ptr, new_cap));
+                    records.insert(
+                        new_data_ptr as usize,
+                        MirAllocationRecord {
+                            base_ptr: new_data_ptr,
+                            word_capacity: new_cap,
+                            kind: MirAllocationKind::ArrayBacking,
+                            buffer_index,
+                            handle_epoch: v.header_rec.handle_epoch,
+                            alloc_seq: seq,
+                            is_ctx_owned: true,
+                            registered_scope_depth: scope_depth,
+                        },
+                    );
+                    None
+                }
+            };
+
+            // Commit header update: base_ptr never moves, keeping all aliases valid.
+            unsafe {
+                *v.base_ptr.add(2) = new_data_ptr as i64;
+                *v.base_ptr.add(1) = (new_cap as i64) | i64::MIN;
+                *v.base_ptr = new_len as i64;
+            }
+
+            if let Some((old_ptr, old_words)) = old_to_free {
+                unsafe {
+                    let slice = core::ptr::slice_from_raw_parts_mut(old_ptr, old_words);
+                    drop(Box::from_raw(slice));
+                }
+                if let Some(old_bytes_u) = old_words.checked_mul(core::mem::size_of::<i64>()) {
+                    if let Ok(old_bytes) = i64::try_from(old_bytes_u) {
+                        ctx.memory_used.fetch_sub(old_bytes, Ordering::SeqCst);
+                    }
+                }
+            }
+
+            MIR_STATUS_OK
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = (ptr, val);
+            ctx.last_status
+                .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
+            MIR_STATUS_ERR_OUT_OF_BOUNDS
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1117,6 +1357,15 @@ pub extern "C" fn lust_mir_print_bool_part(x: i64) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_print_string_part(handle: i64) {
+    with_current_mir_context(|ctx| {
+        if let Some(crate::bytecode::Value::String(s)) = ctx.get_handle(handle) {
+            write_mir_stdout(s.as_str());
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_print_sep() {
     write_mir_stdout("\t");
 }
@@ -1188,8 +1437,14 @@ pub extern "C" fn lust_mir_string_concat(a_handle: i64, b_handle: i64) -> i64 {
             Some(crate::bytecode::Value::String(s)) => s,
             _ => return 0,
         };
-        let res = alloc::format!("{}{}", *s1, *s2);
-        let bytes = res.len() as i64;
+        let Some(total_len) = s1.len().checked_add(s2.len()) else {
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            return 0;
+        };
+        let Ok(bytes) = i64::try_from(total_len) else {
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            return 0;
+        };
         let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
         let prev = ctx.memory_used.fetch_add(bytes, Ordering::SeqCst);
         if prev.saturating_add(bytes) > limit {
@@ -1197,7 +1452,204 @@ pub extern "C" fn lust_mir_string_concat(a_handle: i64, b_handle: i64) -> i64 {
             ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
             return 0;
         }
+        let mut res = alloc::string::String::new();
+        if res.try_reserve_exact(total_len).is_err() {
+            ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            return 0;
+        }
+        res.push_str(s1.as_str());
+        res.push_str(s2.as_str());
         ctx.register_handle(crate::bytecode::Value::string(res))
+    })
+}
+
+/// Appends `rhs_handle` onto `lhs_handle` in place via `Rc::get_mut` when `lhs_handle > 0`
+/// (non-interned heap handle in the active `MirContext`), `lhs_handle != rhs_handle`, and
+/// `Rc::strong_count == 1`. Enforces `max_memory_limit` BEFORE mutating `lhs` (rolling back
+/// `memory_used` and leaving `lhs` unmodified on `MIR_STATUS_ERR_OOM`). Falls back to COW
+/// `lust_mir_string_concat` whenever `lhs` is interned, aliased (`strong_count > 1`), or
+/// `lhs_handle == rhs_handle`.
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_string_append_inplace(lhs_handle: i64, rhs_handle: i64) -> i64 {
+    if lhs_handle <= 0 || lhs_handle == rhs_handle {
+        return lust_mir_string_concat(lhs_handle, rhs_handle);
+    }
+    #[cfg(feature = "std")]
+    {
+        enum RhsBuf {
+            Inline([u8; 64], usize),
+            Heap(alloc::rc::Rc<alloc::string::String>),
+            Owned(alloc::string::String),
+        }
+        impl RhsBuf {
+            #[inline(always)]
+            fn as_str(&self) -> &str {
+                match self {
+                    RhsBuf::Inline(buf, len) => unsafe {
+                        core::str::from_utf8_unchecked(&buf[..*len])
+                    },
+                    RhsBuf::Heap(rc) => rc.as_str(),
+                    RhsBuf::Owned(s) => s.as_str(),
+                }
+            }
+        }
+
+        let need_cow_fallback = with_current_mir_context(|ctx| {
+            let rhs_buf = if rhs_handle < 0 {
+                let idx = ((-rhs_handle) - 1) as usize;
+                let mut found: Option<RhsBuf> = None;
+                {
+                    let list = ctx.interned_list.lock().unwrap();
+                    if let Some(s) = list.get(idx) {
+                        let b = s.as_bytes();
+                        if b.len() <= 64 {
+                            let mut arr = [0u8; 64];
+                            arr[..b.len()].copy_from_slice(b);
+                            found = Some(RhsBuf::Inline(arr, b.len()));
+                        } else {
+                            found = Some(RhsBuf::Owned(s.clone()));
+                        }
+                    }
+                }
+                if found.is_none() {
+                    DEFAULT_MIR_CONTEXT.with(|d| {
+                        let d_list = d.interned_list.lock().unwrap();
+                        if let Some(s) = d_list.get(idx) {
+                            let b = s.as_bytes();
+                            if b.len() <= 64 {
+                                let mut arr = [0u8; 64];
+                                arr[..b.len()].copy_from_slice(b);
+                                found = Some(RhsBuf::Inline(arr, b.len()));
+                            } else {
+                                found = Some(RhsBuf::Owned(s.clone()));
+                            }
+                        }
+                    });
+                }
+                match found {
+                    Some(rb) => rb,
+                    None => return Some(0),
+                }
+            } else {
+                match ctx.get_handle(rhs_handle) {
+                    Some(crate::bytecode::Value::String(s)) => RhsBuf::Heap(s),
+                    _ => return Some(0),
+                }
+            };
+
+            let rhs_str = rhs_buf.as_str();
+            let lhs_idx = (lhs_handle - 1) as usize;
+            let mut hv = ctx.heap_values.lock().unwrap();
+            if let Some(Some(crate::bytecode::Value::String(lhs_rc))) = hv.get_mut(lhs_idx) {
+                if alloc::rc::Rc::strong_count(lhs_rc) == 1 {
+                    if let Some(lhs_str) = alloc::rc::Rc::get_mut(lhs_rc) {
+                        let Ok(rhs_bytes) = i64::try_from(rhs_str.len()) else {
+                            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                            return Some(0);
+                        };
+                        let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
+                        let prev = ctx.memory_used.fetch_add(rhs_bytes, Ordering::SeqCst);
+                        if prev.saturating_add(rhs_bytes) > limit {
+                            ctx.memory_used.fetch_sub(rhs_bytes, Ordering::SeqCst);
+                            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                            return Some(0);
+                        }
+                        if lhs_str.try_reserve(rhs_str.len()).is_err() {
+                            ctx.memory_used.fetch_sub(rhs_bytes, Ordering::SeqCst);
+                            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                            return Some(0);
+                        }
+                        lhs_str.push_str(rhs_str);
+                        return Some(lhs_handle);
+                    }
+                }
+            }
+            None
+        });
+
+        match need_cow_fallback {
+            Some(handle) => handle,
+            None => lust_mir_string_concat(lhs_handle, rhs_handle),
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        lust_mir_string_concat(lhs_handle, rhs_handle)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_tostring_int(v: i64) -> i64 {
+    with_current_mir_context(|ctx| {
+        #[cfg(feature = "std")]
+        if (0..10).contains(&v) {
+            const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+            let bytes: i64 = 1;
+            let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
+            let prev = ctx.memory_used.fetch_add(bytes, Ordering::SeqCst);
+            if prev.saturating_add(bytes) > limit {
+                ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                return 0;
+            }
+            let idx = v as usize;
+            let cached = ctx.small_digit_handles[idx].load(Ordering::Relaxed);
+            if cached < 0 {
+                return cached;
+            }
+            let h = ctx.intern_string(DIGITS[idx]);
+            ctx.small_digit_handles[idx].store(h, Ordering::Relaxed);
+            return h;
+        }
+        let s = alloc::format!("{}", crate::bytecode::Value::Int(v));
+        let Ok(bytes) = i64::try_from(s.len()) else {
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            return 0;
+        };
+        let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
+        let prev = ctx.memory_used.fetch_add(bytes, Ordering::SeqCst);
+        if prev.saturating_add(bytes) > limit {
+            ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            return 0;
+        }
+        ctx.register_handle(crate::bytecode::Value::string(s))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_tostring_float(v: f64) -> i64 {
+    with_current_mir_context(|ctx| {
+        let s = alloc::format!("{}", crate::bytecode::Value::Float(v));
+        let Ok(bytes) = i64::try_from(s.len()) else {
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            return 0;
+        };
+        let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
+        let prev = ctx.memory_used.fetch_add(bytes, Ordering::SeqCst);
+        if prev.saturating_add(bytes) > limit {
+            ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            return 0;
+        }
+        ctx.register_handle(crate::bytecode::Value::string(s))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_tostring_bool(v: i64) -> i64 {
+    with_current_mir_context(|ctx| {
+        let s = if v != 0 { "true" } else { "false" };
+        let bytes = s.len() as i64;
+        let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
+        let prev = ctx.memory_used.fetch_add(bytes, Ordering::SeqCst);
+        if prev.saturating_add(bytes) > limit {
+            ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            return 0;
+        }
+        ctx.intern_string(s)
     })
 }
 

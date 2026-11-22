@@ -47,6 +47,7 @@ pub struct MarshalledStruct {
     pub param_indices: Vec<usize>,
 }
 
+#[derive(Debug)]
 enum CraneliftOutcome {
     Fallback,
     Return(Value),
@@ -143,32 +144,107 @@ pub fn validate_and_decode_array(
         });
     }
 
-    let (base_ptr, len) = validate_owned_header(mir_ctx, raw_ptr_val, "array", |kind| {
-        match kind {
-            crate::mir::runtime_helpers::MirAllocationKind::Array(existing_elem_ty) => {
-                if existing_elem_ty != expected_elem_ty {
-                    return Err(LustError::RuntimeError {
-                        message: format!(
-                            "Array element type mismatch: expected {:?}, found {:?}",
-                            expected_elem_ty, existing_elem_ty
-                        ),
-                    });
-                }
-                Ok(())
+    if raw_ptr_val == 0 {
+        return Err(LustError::RuntimeError {
+            message: "Invalid array pointer provenance: null pointer (0x0) is not an owned allocation base".into(),
+        });
+    }
+    if raw_ptr_val < 0 {
+        return Err(LustError::RuntimeError {
+            message: format!(
+                "Invalid array pointer provenance: negative pointer {}",
+                raw_ptr_val
+            ),
+        });
+    }
+
+    let raw_addr = raw_ptr_val as usize;
+    let alloc_rec = mir_ctx
+        .get_active_allocation_record(raw_addr)
+        .ok_or_else(|| LustError::RuntimeError {
+            message: format!(
+                "Invalid array pointer provenance: pointer {:#x} is not an owned allocation base of current invocation",
+                raw_addr
+            ),
+        })?;
+
+    match &alloc_rec.kind {
+        crate::mir::runtime_helpers::MirAllocationKind::Array(existing_elem_ty) => {
+            if existing_elem_ty != expected_elem_ty {
+                return Err(LustError::RuntimeError {
+                    message: format!(
+                        "Array element type mismatch: expected {:?}, found {:?}",
+                        expected_elem_ty, existing_elem_ty
+                    ),
+                });
             }
-            other => Err(LustError::RuntimeError {
+        }
+        other => {
+            return Err(LustError::RuntimeError {
                 message: format!(
                     "Type/kind mismatch: expected Array({:?}) but allocation is {:?}",
                     expected_elem_ty, other
                 ),
-            }),
+            });
         }
-    })?;
+    }
 
-    // Element decoding
+    if alloc_rec.word_capacity < 2 {
+        return Err(LustError::RuntimeError {
+            message: format!(
+                "Malformed array allocation: word_capacity ({}) < 2",
+                alloc_rec.word_capacity
+            ),
+        });
+    }
+
+    let base_ptr = alloc_rec.base_ptr;
+    let len_raw = unsafe { *base_ptr };
+    let cap_raw = unsafe { *base_ptr.add(1) };
+    let (len, data_ptr) = if cap_raw < 0 {
+        let (len, _cap, data_ptr) = mir_ctx
+            .resolve_validated_array_data(base_ptr)
+            .ok_or_else(|| LustError::RuntimeError {
+                message: format!(
+                    "Malformed array header: negative cap ({cap_raw}) or invalid redirected backing buffer at {:#x} (word_capacity={})",
+                    raw_addr, alloc_rec.word_capacity
+                ),
+            })?;
+        (len, data_ptr)
+    } else {
+        if len_raw < 0 {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Malformed array header: negative len ({len_raw}) or cap ({cap_raw})"
+                ),
+            });
+        }
+        let len = len_raw as usize;
+        let cap = cap_raw as usize;
+        if len > cap {
+            return Err(LustError::RuntimeError {
+                message: format!("Malformed array header: len ({len}) > cap ({cap})"),
+            });
+        }
+        if cap
+            .checked_add(2)
+            .is_none_or(|needed| needed > alloc_rec.word_capacity)
+        {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Malformed array header: extent ({} words) exceeds owned buffer capacity ({} words)",
+                    cap + 2,
+                    alloc_rec.word_capacity
+                ),
+            });
+        }
+        (len, unsafe { base_ptr.add(2) as *const i64 })
+    };
+
+    // Element decoding (supports both flat inline and cap < 0 redirected backing buffers)
     let mut elements = Vec::with_capacity(len);
     for i in 0..len {
-        let raw = unsafe { *base_ptr.add(2 + i) };
+        let raw = unsafe { *data_ptr.add(i) };
         let elem = match expected_elem_ty {
             MirType::Int => Value::Int(raw),
             MirType::Bool => Value::Bool(raw != 0),
@@ -259,17 +335,71 @@ pub fn validate_and_decode_tuple(
     Ok(elems)
 }
 
-pub fn validate_and_decode_struct(
+pub const MAX_STRUCT_DECODE_DEPTH: usize = 256;
+
+fn resolve_option_struct_target_name(
+    owner_struct_name: &str,
+    inner_name: &str,
+    struct_meta: Option<&hashbrown::HashMap<String, crate::vm::RuntimeStructInfo>>,
+) -> String {
+    if !inner_name.contains('.')
+        && let Some((mod_prefix, _)) = owner_struct_name.rsplit_once('.')
+    {
+        let qualified = format!("{mod_prefix}.{inner_name}");
+        if struct_meta.is_some_and(|m| m.contains_key(&qualified)) {
+            return qualified;
+        }
+    }
+    inner_name.to_string()
+}
+
+fn validate_and_decode_struct_inner(
     mir_ctx: &crate::mir::runtime_helpers::MirContext,
     marshalled_structs: &[MarshalledStruct],
     raw_ptr_val: i64,
     expected_name: &str,
     layout_opt: Option<&Rc<StructLayout>>,
+    struct_meta: Option<&hashbrown::HashMap<String, crate::vm::RuntimeStructInfo>>,
+    visited_ptrs: &mut hashbrown::HashSet<usize>,
+    materialized_fresh_structs: &mut hashbrown::HashMap<usize, Rc<StructObject>>,
+    depth: usize,
 ) -> Result<Value> {
+    if depth > MAX_STRUCT_DECODE_DEPTH {
+        return Err(LustError::RuntimeError {
+            message: format!(
+                "Struct decoding depth limit ({MAX_STRUCT_DECODE_DEPTH}) exceeded for '{expected_name}'"
+            ),
+        });
+    }
+
     let (base_ptr, len) = validate_owned_header(mir_ctx, raw_ptr_val, "struct", |kind| {
         match kind {
             crate::mir::runtime_helpers::MirAllocationKind::Struct(existing_name) => {
-                if existing_name != expected_name {
+                let layout_matches = layout_opt.is_some_and(|l| existing_name == l.name());
+                let simple_expected = expected_name
+                    .rsplit_once('.')
+                    .map(|(_, s)| s)
+                    .unwrap_or(expected_name);
+                let simple_existing = existing_name
+                    .rsplit_once('.')
+                    .map(|(_, s)| s)
+                    .unwrap_or(existing_name.as_str());
+                let qualified_same = layout_matches
+                    || (existing_name != expected_name
+                        && existing_name == simple_expected
+                        && struct_meta.is_some_and(|m| {
+                            m.get(expected_name)
+                                .zip(m.get(existing_name.as_str()))
+                                .is_some_and(|(a, b)| Rc::ptr_eq(&a.layout, &b.layout))
+                        }))
+                    || (existing_name != expected_name
+                        && expected_name == simple_existing
+                        && struct_meta.is_some_and(|m| {
+                            m.get(expected_name)
+                                .zip(m.get(existing_name.as_str()))
+                                .is_some_and(|(a, b)| Rc::ptr_eq(&a.layout, &b.layout))
+                        }));
+                if existing_name != expected_name && !qualified_same {
                     return Err(LustError::RuntimeError {
                         message: format!(
                             "Struct type mismatch: expected '{}', found '{}'",
@@ -300,59 +430,118 @@ pub fn validate_and_decode_struct(
         }
     }
 
+    let base_addr = base_ptr as usize;
+    if !visited_ptrs.insert(base_addr) {
+        return Err(LustError::RuntimeError {
+            message: format!(
+                "Cyclic struct pointer graph detected at {:#x} while decoding '{expected_name}'",
+                base_addr
+            ),
+        });
+    }
+
     if let Some(matched) = marshalled_structs.iter().find(|m| m.ptr == base_ptr) {
+        visited_ptrs.remove(&base_addr);
         return Ok(Value::Struct(matched.rc.clone()));
     }
 
-    let mut fields = Vec::with_capacity(len);
-    for i in 0..len {
-        let raw = unsafe { *base_ptr.add(2 + i) };
-        let fld_val = if let Some(layout) = layout_opt {
-            if i < layout.field_names().len() {
-                match &layout.field_type(i).kind {
-                    TypeKind::Int => Value::Int(raw),
-                    TypeKind::Float => Value::Float(f64::from_bits(raw as u64)),
-                    TypeKind::Bool => Value::Bool(raw != 0),
-                    TypeKind::String => {
-                        mir_ctx.get_handle(raw).unwrap_or_else(|| Value::string(""))
+    if let Some(cached_rc) = materialized_fresh_structs.get(&base_addr) {
+        visited_ptrs.remove(&base_addr);
+        return Ok(Value::Struct(cached_rc.clone()));
+    }
+
+    let decode_fields_res: Result<Vec<Value>> = (|| {
+        let mut fields = Vec::with_capacity(len);
+        for i in 0..len {
+            let raw = unsafe { *base_ptr.add(2 + i) };
+            let fld_val = if let Some(layout) = layout_opt {
+                if i < layout.field_names().len() {
+                    match &layout.field_type(i).kind {
+                        TypeKind::Int => Value::Int(raw),
+                        TypeKind::Float => Value::Float(f64::from_bits(raw as u64)),
+                        TypeKind::Bool => Value::Bool(raw != 0),
+                        TypeKind::String => {
+                            mir_ctx.get_handle(raw).unwrap_or_else(|| Value::string(""))
+                        }
+                        TypeKind::Map(_, _) => {
+                            mir_ctx.get_handle(raw).unwrap_or_else(|| Value::map(LustMap::default()))
+                        }
+                        TypeKind::Option(inner) => match &inner.kind {
+                            TypeKind::Named(sub) => {
+                                if raw == 0 {
+                                    Value::none()
+                                } else {
+                                    let sub_name = resolve_option_struct_target_name(
+                                        expected_name,
+                                        sub,
+                                        struct_meta,
+                                    );
+                                    let sub_layout: Option<&Rc<StructLayout>> =
+                                        if let Some(meta) = struct_meta {
+                                            meta.get(&sub_name).map(|info| &info.layout)
+                                        } else if layout.name() == sub.as_str()
+                                            || expected_name == sub.as_str()
+                                        {
+                                            Some(layout)
+                                        } else {
+                                            None
+                                        };
+                                    let decoded_sub = validate_and_decode_struct_inner(
+                                        mir_ctx,
+                                        marshalled_structs,
+                                        raw,
+                                        &sub_name,
+                                        sub_layout,
+                                        struct_meta,
+                                        visited_ptrs,
+                                        materialized_fresh_structs,
+                                        depth + 1,
+                                    )?;
+                                    Value::some(decoded_sub)
+                                }
+                            }
+                            _ => mir_ctx.get_handle(raw).unwrap_or(Value::Nil),
+                        },
+                        TypeKind::Result(_, _) => {
+                            mir_ctx.get_handle(raw).unwrap_or(Value::Nil)
+                        }
+                        other => {
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "Unsupported struct field type '{}' at '{}.{}' for Cranelift decoding",
+                                    other, expected_name, i
+                                ),
+                            });
+                        }
                     }
-                    TypeKind::Map(_, _) => {
-                        mir_ctx.get_handle(raw).unwrap_or_else(|| Value::map(LustMap::default()))
-                    }
-                    TypeKind::Option(_) | TypeKind::Result(_, _) => {
-                        mir_ctx.get_handle(raw).unwrap_or(Value::Nil)
-                    }
-                    other => {
-                        return Err(LustError::RuntimeError {
-                            message: format!(
-                                "Unsupported struct field type '{}' at '{}.{}' for Cranelift decoding",
-                                other, expected_name, i
-                            ),
-                        });
-                    }
+                } else {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "Struct field index {i} out of bounds for '{}'",
+                            expected_name
+                        ),
+                    });
                 }
-            } else {
+            } else if let Some(h_val) = mir_ctx.get_handle(raw) {
+                h_val
+            } else if mir_ctx.get_allocation_record(raw as usize).is_some() {
                 return Err(LustError::RuntimeError {
                     message: format!(
-                        "Struct field index {i} out of bounds for '{}'",
-                        expected_name
+                        "Unsupported aggregate pointer field at '{}.{}' without struct layout metadata",
+                        expected_name, i
                     ),
                 });
-            }
-        } else if let Some(h_val) = mir_ctx.get_handle(raw) {
-            h_val
-        } else if mir_ctx.get_allocation_record(raw as usize).is_some() {
-            return Err(LustError::RuntimeError {
-                message: format!(
-                    "Unsupported aggregate pointer field at '{}.{}' without struct layout metadata",
-                    expected_name, i
-                ),
-            });
-        } else {
-            Value::Int(raw)
-        };
-        fields.push(fld_val);
-    }
+            } else {
+                Value::Int(raw)
+            };
+            fields.push(fld_val);
+        }
+        Ok(fields)
+    })();
+
+    visited_ptrs.remove(&base_addr);
+    let fields = decode_fields_res?;
+
     let layout = layout_opt.cloned().unwrap_or_else(|| {
         Rc::new(StructLayout::new(
             expected_name.to_string(),
@@ -362,35 +551,112 @@ pub fn validate_and_decode_struct(
             vec![],
         ))
     });
-    Ok(Value::Struct(StructObject::new(
-        expected_name.to_string(),
-        layout,
-        fields,
-    )))
+    let struct_name = if layout.name().is_empty() {
+        expected_name.to_string()
+    } else {
+        layout.name().to_string()
+    };
+    let rc = StructObject::new(struct_name, layout, fields);
+    materialized_fresh_structs.insert(base_addr, rc.clone());
+    Ok(Value::Struct(rc))
+}
+
+pub(super) fn validate_and_decode_struct_with_metadata(
+    mir_ctx: &crate::mir::runtime_helpers::MirContext,
+    marshalled_structs: &[MarshalledStruct],
+    raw_ptr_val: i64,
+    expected_name: &str,
+    layout_opt: Option<&Rc<StructLayout>>,
+    struct_meta: Option<&hashbrown::HashMap<String, crate::vm::RuntimeStructInfo>>,
+) -> Result<Value> {
+    let mut visited_ptrs = hashbrown::HashSet::new();
+    let mut materialized_fresh_structs = hashbrown::HashMap::new();
+    validate_and_decode_struct_inner(
+        mir_ctx,
+        marshalled_structs,
+        raw_ptr_val,
+        expected_name,
+        layout_opt,
+        struct_meta,
+        &mut visited_ptrs,
+        &mut materialized_fresh_structs,
+        0,
+    )
+}
+
+pub fn validate_and_decode_struct(
+    mir_ctx: &crate::mir::runtime_helpers::MirContext,
+    marshalled_structs: &[MarshalledStruct],
+    raw_ptr_val: i64,
+    expected_name: &str,
+    layout_opt: Option<&Rc<StructLayout>>,
+) -> Result<Value> {
+    validate_and_decode_struct_with_metadata(
+        mir_ctx,
+        marshalled_structs,
+        raw_ptr_val,
+        expected_name,
+        layout_opt,
+        None,
+    )
+}
+
+#[inline]
+fn param_indices_need_writeback(param_indices: &[usize], readonly_params: &[bool]) -> bool {
+    if param_indices.is_empty() {
+        return true;
+    }
+    param_indices
+        .iter()
+        .any(|&p| !readonly_params.get(p).copied().unwrap_or(false))
+}
+
+pub fn stage_input_writebacks_with_readonly(
+    mir_ctx: &crate::mir::runtime_helpers::MirContext,
+    marshalled_arrays: &[MarshalledArray],
+    readonly_params: &[bool],
+) -> Result<Vec<(Rc<RefCell<Vec<Value>>>, Vec<Value>)>> {
+    let mut staged = Vec::new();
+    for m in marshalled_arrays {
+        if !param_indices_need_writeback(&m.param_indices, readonly_params) {
+            continue;
+        }
+        let decoded =
+            validate_and_decode_array(mir_ctx, marshalled_arrays, m.ptr as i64, &m.elem_ty)?;
+        staged.push((m.rc.clone(), decoded.elements));
+    }
+    Ok(staged)
 }
 
 pub fn stage_input_writebacks(
     mir_ctx: &crate::mir::runtime_helpers::MirContext,
     marshalled_arrays: &[MarshalledArray],
 ) -> Result<Vec<(Rc<RefCell<Vec<Value>>>, Vec<Value>)>> {
-    let mut staged = Vec::with_capacity(marshalled_arrays.len());
-    for m in marshalled_arrays {
-        let decoded = validate_and_decode_array(mir_ctx, marshalled_arrays, m.ptr as i64, &m.elem_ty)?;
-        staged.push((m.rc.clone(), decoded.elements));
-    }
-    Ok(staged)
+    stage_input_writebacks_with_readonly(mir_ctx, marshalled_arrays, &[])
 }
 
-pub fn stage_struct_writebacks(
+fn stage_struct_writebacks_with_readonly_and_meta(
     mir_ctx: &crate::mir::runtime_helpers::MirContext,
     marshalled_structs: &[MarshalledStruct],
+    readonly_params: &[bool],
+    struct_meta: Option<&hashbrown::HashMap<String, crate::vm::RuntimeStructInfo>>,
 ) -> Result<Vec<(Rc<StructObject>, Vec<Value>)>> {
-    let mut staged = Vec::with_capacity(marshalled_structs.len());
+    let mut staged = Vec::new();
+    let mut materialized_fresh_structs = hashbrown::HashMap::new();
     for m in marshalled_structs {
+        if !param_indices_need_writeback(&m.param_indices, readonly_params) {
+            continue;
+        }
         let (base_ptr, len) = validate_owned_header(mir_ctx, m.ptr as i64, "struct", |kind| {
             match kind {
                 crate::mir::runtime_helpers::MirAllocationKind::Struct(alloc_name) => {
-                    if alloc_name != m.rc.name.as_str() {
+                    let simple_name = m
+                        .rc
+                        .name
+                        .rsplit_once('.')
+                        .map(|(_, s)| s)
+                        .unwrap_or(m.rc.name.as_str());
+                    if alloc_name != m.rc.name.as_str() && alloc_name != simple_name {
                         return Err(LustError::RuntimeError {
                             message: format!(
                                 "Struct type mismatch: expected '{}', found '{}'",
@@ -422,6 +688,48 @@ pub fn stage_struct_writebacks(
         let mut staged_fields = current_fields.clone();
         for (i, field) in staged_fields.iter_mut().take(len).enumerate() {
             let raw = unsafe { *base_ptr.add(2 + i) };
+            let opt_struct_sub = (i < m.rc.layout.field_names().len())
+                .then(|| &m.rc.layout.field_type(i).kind)
+                .and_then(|k| match k {
+                    TypeKind::Option(inner) => match &inner.kind {
+                        TypeKind::Named(sub) => Some(sub.as_str()),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+            if let Some(sub) = opt_struct_sub {
+                if raw == 0 {
+                    *field = Value::none();
+                } else {
+                    let sub_name = resolve_option_struct_target_name(
+                        m.rc.name.as_str(),
+                        sub,
+                        struct_meta,
+                    );
+                    let sub_layout: Option<&Rc<StructLayout>> = if let Some(meta) = struct_meta {
+                        meta.get(&sub_name).map(|info| &info.layout)
+                    } else if m.rc.layout.name() == sub || m.rc.name.as_str() == sub {
+                        Some(&m.rc.layout)
+                    } else {
+                        None
+                    };
+                    let mut visited_ptrs = hashbrown::HashSet::new();
+                    visited_ptrs.insert(base_ptr as usize);
+                    let decoded_sub = validate_and_decode_struct_inner(
+                        mir_ctx,
+                        marshalled_structs,
+                        raw,
+                        &sub_name,
+                        sub_layout,
+                        struct_meta,
+                        &mut visited_ptrs,
+                        &mut materialized_fresh_structs,
+                        1,
+                    )?;
+                    *field = Value::some(decoded_sub);
+                }
+                continue;
+            }
             match field {
                 Value::Int(n) => *n = raw,
                 Value::Bool(b) => *b = raw != 0,
@@ -439,10 +747,44 @@ pub fn stage_struct_writebacks(
     Ok(staged)
 }
 
+pub fn stage_struct_writebacks_with_readonly(
+    mir_ctx: &crate::mir::runtime_helpers::MirContext,
+    marshalled_structs: &[MarshalledStruct],
+    readonly_params: &[bool],
+) -> Result<Vec<(Rc<StructObject>, Vec<Value>)>> {
+    stage_struct_writebacks_with_readonly_and_meta(mir_ctx, marshalled_structs, readonly_params, None)
+}
+
+pub fn stage_struct_writebacks(
+    mir_ctx: &crate::mir::runtime_helpers::MirContext,
+    marshalled_structs: &[MarshalledStruct],
+) -> Result<Vec<(Rc<StructObject>, Vec<Value>)>> {
+    stage_struct_writebacks_with_readonly(mir_ctx, marshalled_structs, &[])
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+    static CRANELIFT_WRITEBACK_COMMIT_COUNT: core::cell::Cell<u64> =
+        const { core::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "std")]
+pub fn cranelift_writeback_commit_count() -> u64 {
+    CRANELIFT_WRITEBACK_COMMIT_COUNT.with(|c| c.get())
+}
+
+#[cfg(feature = "std")]
+pub fn reset_cranelift_writeback_commit_count() {
+    CRANELIFT_WRITEBACK_COMMIT_COUNT.with(|c| c.set(0));
+}
+
 pub fn commit_staged_writebacks_and_structs(
     staged_arrays: Vec<(Rc<RefCell<Vec<Value>>>, Vec<Value>)>,
     staged_structs: Vec<(Rc<StructObject>, Vec<Value>)>,
 ) -> Result<()> {
+    if staged_arrays.is_empty() && staged_structs.is_empty() {
+        return Ok(());
+    }
     // 1. Acquire all mutable borrows for arrays and structs before publishing any changes
     let array_rcs: Vec<Rc<RefCell<Vec<Value>>>> =
         staged_arrays.iter().map(|(rc, _)| rc.clone()).collect();
@@ -485,6 +827,9 @@ pub fn commit_staged_writebacks_and_structs(
         crate::bytecode::value::invalidate_specialized_array_cache(rc);
     }
 
+    #[cfg(feature = "std")]
+    CRANELIFT_WRITEBACK_COMMIT_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
+
     Ok(())
 }
 
@@ -494,14 +839,396 @@ pub fn commit_staged_writebacks(
     commit_staged_writebacks_and_structs(staged, Vec::new())
 }
 
-fn stage_and_commit_all_writebacks(
+fn stage_and_commit_all_writebacks_with_readonly(
     mir_ctx: &crate::mir::runtime_helpers::MirContext,
     marshalled_arrays: &[MarshalledArray],
     marshalled_structs: &[MarshalledStruct],
+    readonly_params: &[bool],
+    struct_meta: Option<&hashbrown::HashMap<String, crate::vm::RuntimeStructInfo>>,
 ) -> Result<()> {
-    let staged_arrays = stage_input_writebacks(mir_ctx, marshalled_arrays)?;
-    let staged_structs = stage_struct_writebacks(mir_ctx, marshalled_structs)?;
+    let staged_arrays =
+        stage_input_writebacks_with_readonly(mir_ctx, marshalled_arrays, readonly_params)?;
+    let staged_structs = stage_struct_writebacks_with_readonly_and_meta(
+        mir_ctx,
+        marshalled_structs,
+        readonly_params,
+        struct_meta,
+    )?;
     commit_staged_writebacks_and_structs(staged_arrays, staged_structs)
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn is_proven_immutable_scalar(ty: &MirType) -> bool {
+    matches!(
+        ty,
+        MirType::Int | MirType::Float | MirType::Bool | MirType::Unit | MirType::String
+    )
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn is_readonly_cranelift_builtin(callee: &str) -> bool {
+    matches!(
+        callee,
+        "print"
+            | "println"
+            | "math.abs"
+            | "abs"
+            | "math.min"
+            | "min"
+            | "math.max"
+            | "max"
+            | "math.clamp"
+            | "clamp"
+            | "table.len"
+            | "array.len"
+            | "string.len"
+            | "tostring"
+            | "map.len"
+            | "enum.tag"
+    )
+}
+
+#[cfg(feature = "std")]
+fn operand_alias_source_local(
+    op: &Operand,
+    locals: &[crate::mir::ir::LocalDecl],
+    struct_meta: Option<&hashbrown::HashMap<String, crate::vm::RuntimeStructInfo>>,
+) -> Option<usize> {
+    use crate::mir::ir::Place;
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => match place {
+            Place::Local(loc) => Some(loc.0),
+            Place::Field(..) | Place::Index(..) => {
+                let projected_ty = VM::mir_place_type_in_vm(place, locals, struct_meta)
+                    .unwrap_or(MirType::Unknown);
+                if is_proven_immutable_scalar(&projected_ty) {
+                    None
+                } else {
+                    Some(place.root_local().0)
+                }
+            }
+        },
+        Operand::Constant(_) => None,
+    }
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn union_bool_row(dst: &mut [bool], src: &[bool]) -> bool {
+    let mut changed = false;
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        if s && !*d {
+            *d = true;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Computes per-function proven read-only parameter masks over the final post-inline
+/// compiled `MirModule` via monotone fixed-point alias and mutation propagation.
+#[cfg(feature = "std")]
+pub fn compute_readonly_params(
+    module: &crate::mir::ir::MirModule,
+) -> hashbrown::HashMap<String, Vec<bool>> {
+    compute_readonly_params_with_structs(module, None)
+}
+
+#[cfg(feature = "std")]
+fn compute_readonly_params_with_structs(
+    module: &crate::mir::ir::MirModule,
+    struct_meta: Option<&hashbrown::HashMap<String, crate::vm::RuntimeStructInfo>>,
+) -> hashbrown::HashMap<String, Vec<bool>> {
+    use crate::mir::ir::Place;
+
+    let fn_count = module.functions.len();
+    let mut fn_index_by_name: hashbrown::HashMap<&str, Option<usize>> =
+        hashbrown::HashMap::with_capacity(fn_count);
+    for (fi, f) in module.functions.iter().enumerate() {
+        fn_index_by_name
+            .entry(f.signature.name.as_str())
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(fi));
+    }
+
+    let mut alias_params: Vec<Vec<Vec<bool>>> = Vec::with_capacity(fn_count);
+    let mut mutated: Vec<Vec<bool>> = Vec::with_capacity(fn_count);
+    let mut returns_param: Vec<Vec<bool>> = Vec::with_capacity(fn_count);
+
+    for f in &module.functions {
+        let p_len = f.params.len();
+        let l_len = f.locals.len();
+        let mut fn_aliases = vec![vec![false; p_len]; l_len];
+        let mut fn_mutated = vec![false; p_len];
+        for (pi, param_loc) in f.params.iter().enumerate() {
+            if param_loc.0 < l_len {
+                fn_aliases[param_loc.0][pi] = true;
+            } else {
+                // Malformed MIR parameter local index: fail conservative.
+                fn_mutated[pi] = true;
+            }
+        }
+        alias_params.push(fn_aliases);
+        mutated.push(fn_mutated);
+        returns_param.push(vec![false; p_len]);
+    }
+
+    loop {
+        let mut changed = false;
+        for (fi, f) in module.functions.iter().enumerate() {
+            let l_len = f.locals.len();
+            let p_len = f.params.len();
+            if p_len == 0 {
+                continue;
+            }
+
+            for block in &f.blocks {
+                for stmt in &block.statements {
+                    let Statement::Assign(lhs, rval, _) = stmt else {
+                        continue;
+                    };
+                    match lhs {
+                        Place::Local(dst) => match rval {
+                            Rvalue::Use(op) | Rvalue::Cast(op, _) => {
+                                if dst.0 < l_len {
+                                    let maybe_src = match op {
+                                        Operand::Copy(Place::Local(src))
+                                        | Operand::Move(Place::Local(src)) => Some(src.0),
+                                        Operand::Copy(place @ (Place::Field(..) | Place::Index(..)))
+                                        | Operand::Move(place @ (Place::Field(..) | Place::Index(..))) => {
+                                            let dst_scalar =
+                                                is_proven_immutable_scalar(&f.locals[dst.0].ty);
+                                            let proj_scalar = VM::mir_place_type_in_vm(
+                                                place,
+                                                &f.locals,
+                                                struct_meta,
+                                            )
+                                            .is_some_and(|t| is_proven_immutable_scalar(&t));
+                                            if dst_scalar || proj_scalar {
+                                                None
+                                            } else {
+                                                Some(place.root_local().0)
+                                            }
+                                        }
+                                        Operand::Constant(_) => None,
+                                    };
+                                    if let Some(src) = maybe_src
+                                        && src < l_len
+                                        && src != dst.0
+                                    {
+                                        let src_bits = alias_params[fi][src].clone();
+                                        if union_bool_row(&mut alias_params[fi][dst.0], &src_bits) {
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            Rvalue::Aggregate(_, elems) => {
+                                // Condition (c): storing a parameter alias into another aggregate escapes it.
+                                for elem in elems {
+                                    if let Some(src) =
+                                        operand_alias_source_local(elem, &f.locals, struct_meta)
+                                        && src < l_len
+                                    {
+                                        if union_bool_row(&mut mutated[fi], &alias_params[fi][src])
+                                        {
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            Rvalue::BinaryOp(..) | Rvalue::UnaryOp(..) => {}
+                        },
+                        Place::Field(..) | Place::Index(..) => {
+                            // Condition (a): projected write mutates root base local.
+                            let root = lhs.root_local().0;
+                            if root < l_len
+                                && union_bool_row(&mut mutated[fi], &alias_params[fi][root])
+                            {
+                                changed = true;
+                            }
+                            // Condition (c): storing a parameter alias into a projected field/index escapes it.
+                            match rval {
+                                Rvalue::Use(op) | Rvalue::Cast(op, _) => {
+                                    if let Some(src) =
+                                        operand_alias_source_local(op, &f.locals, struct_meta)
+                                        && src < l_len
+                                    {
+                                        if union_bool_row(&mut mutated[fi], &alias_params[fi][src])
+                                        {
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                                Rvalue::Aggregate(_, elems) => {
+                                    for elem in elems {
+                                        if let Some(src) =
+                                            operand_alias_source_local(elem, &f.locals, struct_meta)
+                                            && src < l_len
+                                        {
+                                            if union_bool_row(
+                                                &mut mutated[fi],
+                                                &alias_params[fi][src],
+                                            ) {
+                                                changed = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                Rvalue::BinaryOp(..) | Rvalue::UnaryOp(..) => {}
+                            }
+                        }
+                    }
+                }
+
+                match &block.terminator {
+                    Some(Terminator::Return(Some(op), _)) => {
+                        if let Some(src) = operand_alias_source_local(op, &f.locals, struct_meta)
+                            && src < l_len
+                        {
+                            if union_bool_row(&mut returns_param[fi], &alias_params[fi][src]) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    Some(Terminator::Raise(op, _)) => {
+                        if let Some(src) = operand_alias_source_local(op, &f.locals, struct_meta)
+                            && src < l_len
+                        {
+                            if union_bool_row(&mut mutated[fi], &alias_params[fi][src]) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    Some(Terminator::Call {
+                        callee,
+                        args,
+                        destination,
+                        ..
+                    }) => {
+                        // Condition (a): projected destination of a Call mutates its root base local.
+                        if matches!(destination, Place::Field(..) | Place::Index(..)) {
+                            let root = destination.root_local().0;
+                            if root < l_len
+                                && union_bool_row(&mut mutated[fi], &alias_params[fi][root])
+                            {
+                                changed = true;
+                            }
+                        }
+
+                        if is_effect_or_handler_callee(callee) {
+                            // Condition (e): effect/handler callees are conservatively mutating.
+                            for arg in args {
+                                if let Some(src) =
+                                    operand_alias_source_local(arg, &f.locals, struct_meta)
+                                    && src < l_len
+                                {
+                                    if union_bool_row(&mut mutated[fi], &alias_params[fi][src]) {
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        } else if is_readonly_cranelift_builtin(callee) {
+                            // Proven pure read-only scalar-returning builtin.
+                        } else if let Some(Some(gi)) =
+                            fn_index_by_name.get(callee.as_str()).copied()
+                        {
+                            let g_param_len = module.functions[gi].params.len();
+                            if args.len() != g_param_len {
+                                // Arity mismatch: fail conservative.
+                                for arg in args {
+                                    if let Some(src) =
+                                        operand_alias_source_local(arg, &f.locals, struct_meta)
+                                        && src < l_len
+                                    {
+                                        if union_bool_row(&mut mutated[fi], &alias_params[fi][src])
+                                        {
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            } else {
+                                for (k, arg) in args.iter().enumerate() {
+                                    if let Some(src) =
+                                        operand_alias_source_local(arg, &f.locals, struct_meta)
+                                        && src < l_len
+                                    {
+                                        // Condition (d): callee mutates argument k.
+                                        if mutated[gi][k]
+                                            && union_bool_row(
+                                                &mut mutated[fi],
+                                                &alias_params[fi][src],
+                                            )
+                                        {
+                                            changed = true;
+                                        }
+                                        // Callee returns an alias of argument k.
+                                        if returns_param[gi][k] {
+                                            match destination {
+                                                Place::Local(dst) if dst.0 < l_len => {
+                                                    if src != dst.0 {
+                                                        let src_bits = alias_params[fi][src].clone();
+                                                        if union_bool_row(
+                                                            &mut alias_params[fi][dst.0],
+                                                            &src_bits,
+                                                        ) {
+                                                            changed = true;
+                                                        }
+                                                    }
+                                                }
+                                                Place::Field(..) | Place::Index(..) => {
+                                                    if union_bool_row(
+                                                        &mut mutated[fi],
+                                                        &alias_params[fi][src],
+                                                    ) {
+                                                        changed = true;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Conditions (b) & (e): mutating builtins (array.push, table.push,
+                            // map.set, etc.) and unknown/external callees are conservatively mutating.
+                            for arg in args {
+                                if let Some(src) =
+                                    operand_alias_source_local(arg, &f.locals, struct_meta)
+                                    && src < l_len
+                                {
+                                    if union_bool_row(&mut mutated[fi], &alias_params[fi][src]) {
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(
+                        Terminator::Goto(..)
+                        | Terminator::Cond { .. }
+                        | Terminator::Switch { .. }
+                        | Terminator::Return(None, _)
+                        | Terminator::Unreachable(_),
+                    )
+                    | None => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut out = hashbrown::HashMap::with_capacity(fn_count);
+    for (fi, f) in module.functions.iter().enumerate() {
+        let ro: Vec<bool> = mutated[fi].iter().map(|&m| !m).collect();
+        out.insert(f.signature.name.clone(), ro);
+    }
+    out
 }
 
 impl VM {
@@ -518,6 +1245,7 @@ impl VM {
         match ty {
             MirType::Unknown => true,
             MirType::Array(inner) => Self::type_contains_unknown(inner),
+            MirType::Option(inner) => Self::type_contains_unknown(inner),
             MirType::Tuple(elems) => elems.iter().any(Self::type_contains_unknown),
             MirType::Map(k, v) => {
                 Self::type_contains_unknown(k) || Self::type_contains_unknown(v)
@@ -544,6 +1272,9 @@ impl VM {
             MirType::Array(inner) => {
                 Self::is_cranelift_supported_array_elem_type(inner)
                     || matches!(&**inner, MirType::Unknown)
+            }
+            MirType::Option(inner) => {
+                matches!(&**inner, MirType::Struct(name) if !name.is_empty())
             }
             MirType::Tuple(elems) => elems
                 .iter()
@@ -588,31 +1319,82 @@ impl VM {
     }
 
     #[cfg(feature = "std")]
+    fn resolve_struct_field_mir_type_in_map(
+        owner_struct_name: &str,
+        field_ty: &crate::ast::Type,
+        struct_meta: &hashbrown::HashMap<String, crate::vm::RuntimeStructInfo>,
+    ) -> MirType {
+        let mut ty = crate::mir::lowering::mir_type_from_ast(field_ty);
+        if let MirType::Option(inner) = &mut ty
+            && let MirType::Struct(inner_name) = inner.as_mut()
+        {
+            *inner_name = resolve_option_struct_target_name(
+                owner_struct_name,
+                inner_name,
+                Some(struct_meta),
+            );
+        }
+        ty
+    }
+
+    #[cfg(feature = "std")]
     pub(crate) fn is_cranelift_supported_struct(&self, name: &str) -> bool {
+        let mut visiting = hashbrown::HashSet::new();
+        self.is_cranelift_supported_struct_inner(name, &mut visiting)
+    }
+
+    #[cfg(feature = "std")]
+    fn is_cranelift_supported_struct_inner(
+        &self,
+        name: &str,
+        visiting: &mut hashbrown::HashSet<String>,
+    ) -> bool {
         if name.is_empty() || get_registered_struct_layout_by_name(name).is_some() {
             return false;
         }
         let Some(info) = self.struct_metadata.get(name) else {
             return false;
         };
-        (0..info.layout.field_names().len()).all(|i| {
-            matches!(
-                info.layout.field_type(i).kind,
-                TypeKind::Int
-                    | TypeKind::Bool
-                    | TypeKind::Float
-                    | TypeKind::String
-                    | TypeKind::Map(_, _)
-                    | TypeKind::Option(_)
-                    | TypeKind::Result(_, _)
-            )
-        })
+        let canonical = info.layout.name().to_string();
+        if !visiting.insert(canonical.clone()) {
+            return true;
+        }
+        let ok = (0..info.layout.field_names().len()).all(|i| match &info.layout.field_type(i).kind {
+            TypeKind::Int
+            | TypeKind::Bool
+            | TypeKind::Float
+            | TypeKind::String
+            | TypeKind::Map(_, _)
+            | TypeKind::Result(_, _) => true,
+            TypeKind::Option(inner) => match &inner.kind {
+                TypeKind::Named(sub) => {
+                    let resolved = resolve_option_struct_target_name(
+                        name,
+                        sub,
+                        Some(self.struct_metadata.as_map()),
+                    );
+                    if self.struct_metadata.contains_key(&resolved) {
+                        self.is_cranelift_supported_struct_inner(&resolved, visiting)
+                    } else {
+                        false
+                    }
+                }
+                _ => true,
+            },
+            _ => false,
+        });
+        visiting.remove(&canonical);
+        ok
     }
 
     #[cfg(feature = "std")]
     fn is_cranelift_supported_type_in_vm(&self, ty: &MirType) -> bool {
         match ty {
             MirType::Struct(name) => self.is_cranelift_supported_struct(name),
+            MirType::Option(inner) => match &**inner {
+                MirType::Struct(name) => self.is_cranelift_supported_struct(name),
+                _ => false,
+            },
             MirType::Map(k, v) => {
                 self.is_cranelift_supported_type_in_vm(k) && self.is_cranelift_supported_type_in_vm(v)
             }
@@ -637,11 +1419,13 @@ impl VM {
             Place::Field(base, idx) => match Self::mir_place_type_in_vm(base, locals, struct_meta)? {
                 MirType::Tuple(elems) => elems.get(*idx).cloned(),
                 MirType::Struct(name) => struct_meta
-                    .and_then(|m| m.get(&name))
-                    .and_then(|info| {
+                    .and_then(|m| {
+                        let info = m.get(&name)?;
                         if *idx < info.layout.field_names().len() {
-                            Some(crate::mir::lowering::mir_type_from_ast(
+                            Some(Self::resolve_struct_field_mir_type_in_map(
+                                &name,
                                 info.layout.field_type(*idx),
+                                m,
                             ))
                         } else {
                             None
@@ -679,6 +1463,10 @@ impl VM {
         }
         match ty {
             MirType::Struct(name) => check_struct(name),
+            MirType::Option(inner) => match &**inner {
+                MirType::Struct(name) => check_struct(name),
+                _ => false,
+            },
             MirType::Map(k, v) => {
                 Self::check_refined_type(k, check_struct)
                     && Self::check_refined_type(v, check_struct)
@@ -740,8 +1528,10 @@ impl VM {
                             if *idx >= info.layout.field_names().len() {
                                 return false;
                             }
-                            let field_ty = crate::mir::lowering::mir_type_from_ast(
+                            let field_ty = Self::resolve_struct_field_mir_type_in_map(
+                                &name,
                                 info.layout.field_type(*idx),
+                                meta,
                             );
                             Self::check_refined_type(&field_ty, check_struct)
                                 && !matches!(
@@ -830,7 +1620,7 @@ impl VM {
                                     return false;
                                 }
                             }
-                            Rvalue::BinaryOp(_, lhs, rhs) => {
+                            Rvalue::BinaryOp(op_kind, lhs, rhs) => {
                                 if !Self::check_refined_operand(
                                     lhs,
                                     &refined.locals,
@@ -843,6 +1633,32 @@ impl VM {
                                     check_struct,
                                 ) {
                                     return false;
+                                }
+                                if matches!(op_kind, crate::mir::ir::MirBinaryOp::Concat) {
+                                    let l_ty = Self::mir_operand_type_in_vm(
+                                        lhs,
+                                        &refined.locals,
+                                        struct_meta,
+                                    );
+                                    let r_ty = Self::mir_operand_type_in_vm(
+                                        rhs,
+                                        &refined.locals,
+                                        struct_meta,
+                                    );
+                                    let ok_ty = |t: &Option<MirType>| {
+                                        matches!(
+                                            t,
+                                            Some(
+                                                MirType::String
+                                                    | MirType::Int
+                                                    | MirType::Float
+                                                    | MirType::Bool
+                                            )
+                                        )
+                                    };
+                                    if !ok_ty(&l_ty) || !ok_ty(&r_ty) {
+                                        return false;
+                                    }
                                 }
                             }
                             Rvalue::UnaryOp(op_kind, op) => {
@@ -1008,10 +1824,43 @@ impl VM {
                                 );
                                 if !matches!(
                                     arg_ty,
-                                    Some(MirType::Int | MirType::Float | MirType::Bool)
+                                    Some(
+                                        MirType::Int
+                                            | MirType::Float
+                                            | MirType::Bool
+                                            | MirType::String
+                                    )
                                 ) {
                                     return false;
                                 }
+                            }
+                        } else if callee == "tostring" {
+                            if args.len() != 1 {
+                                return false;
+                            }
+                            let arg_ty = Self::mir_operand_type_in_vm(
+                                &args[0],
+                                &refined.locals,
+                                struct_meta,
+                            );
+                            if !matches!(
+                                arg_ty,
+                                Some(
+                                    MirType::Int
+                                        | MirType::Float
+                                        | MirType::Bool
+                                        | MirType::String
+                                )
+                            ) {
+                                return false;
+                            }
+                            let dest_ok = matches!(
+                                destination,
+                                crate::mir::ir::Place::Local(loc)
+                                    if refined.locals.get(loc.0).map(|l| &l.ty) == Some(&MirType::String)
+                            );
+                            if !dest_ok {
+                                return false;
                             }
                         } else if matches!(callee.as_str(), "table.len" | "array.len") {
                             if args.len() != 1 {
@@ -1190,7 +2039,10 @@ impl VM {
                 | "clamp"
                 | "table.len"
                 | "array.len"
+                | "array.push"
+                | "table.push"
                 | "string.len"
+                | "tostring"
                 | "map.len"
                 | "map.get"
                 | "map.set"
@@ -1203,7 +2055,7 @@ impl VM {
     }
 
     #[cfg(feature = "std")]
-    fn is_supported_deopt_recipe_type(ty: &MirType) -> bool {
+    fn is_supported_deopt_recipe_type(&self, ty: &MirType) -> bool {
         matches!(
             ty,
             MirType::Int | MirType::Bool | MirType::Float | MirType::Unit | MirType::String
@@ -1211,7 +2063,205 @@ impl VM {
             ty,
             MirType::Array(inner)
                 if matches!(&**inner, MirType::Int | MirType::Bool | MirType::Float)
+        ) || matches!(
+            ty,
+            MirType::Struct(name) if self.is_cranelift_supported_struct(name)
+        ) || matches!(
+            ty,
+            MirType::Option(inner)
+                if matches!(&**inner, MirType::Struct(name) if self.is_cranelift_supported_struct(name))
         )
+    }
+
+    /// Rewrites MIR-VM continuation bytecode operations on `MirType::Struct` locals from
+    /// `NewArray` / `GetIndex` / `SetIndex` to `NewStruct` / `GetField` / `SetField` 1-for-1
+    /// in place (preserving exact instruction PCs, `block_entry_pcs`, `terminator_pcs`, and
+    /// jump offsets) so post-deopt interpreter resumption operates directly on `Value::Struct`.
+    #[cfg(feature = "std")]
+    fn rewrite_continuation_struct_ops(
+        &self,
+        candidate: &MirFunction,
+        continuation_bc: &mut crate::bytecode::Function,
+    ) -> core::result::Result<(), String> {
+        use crate::bytecode::Instruction;
+
+        let refined = self.refine_mir_function_in_vm(candidate);
+        if !refined
+            .locals
+            .iter()
+            .any(|l| matches!(l.ty, MirType::Struct(_)))
+        {
+            return Ok(());
+        }
+
+        let func_name = &candidate.signature.name;
+        let len = continuation_bc.chunk.instructions.len();
+        for pc in 0..len {
+            let insn = continuation_bc.chunk.instructions[pc];
+            match insn {
+                Instruction::NewArray(dst, first_field, count) => {
+                    let Some(MirType::Struct(struct_name)) =
+                        refined.locals.get(dst as usize).map(|l| &l.ty)
+                    else {
+                        continue;
+                    };
+                    let info = self.struct_metadata.get(struct_name).ok_or_else(|| {
+                        format!(
+                            "Missing struct layout metadata for '{struct_name}' rewriting continuation of '{func_name}'"
+                        )
+                    })?;
+                    let field_names = info.layout.field_names();
+                    if field_names.len() != count as usize {
+                        // Leave synthetic/malformed struct constructors untouched so runtime
+                        // validate_and_decode_struct enforces fail-closed field-count rejection.
+                        continue;
+                    }
+                    let name_val = Value::string(struct_name.clone());
+                    let name_exists = continuation_bc
+                        .chunk
+                        .constants
+                        .iter()
+                        .any(|v| v == &name_val);
+                    if !name_exists && continuation_bc.chunk.constants.len() >= u16::MAX as usize {
+                        return Err(format!(
+                            "Constant pool overflow rewriting struct '{struct_name}' constructor in '{func_name}'"
+                        ));
+                    }
+                    let name_idx = continuation_bc.chunk.add_constant(name_val);
+                    let first_field_name_idx = if count == 0 {
+                        0u16
+                    } else {
+                        let start = continuation_bc.chunk.constants.len();
+                        if start
+                            .checked_add(field_names.len())
+                            .is_none_or(|end| end > u16::MAX as usize)
+                        {
+                            return Err(format!(
+                                "Constant pool overflow appending struct '{struct_name}' field names in '{func_name}'"
+                            ));
+                        }
+                        for fname in field_names {
+                            continuation_bc
+                                .chunk
+                                .constants
+                                .push(Value::String(Rc::clone(fname)));
+                        }
+                        start as u16
+                    };
+                    continuation_bc.chunk.instructions[pc] = Instruction::NewStruct(
+                        dst,
+                        name_idx,
+                        first_field_name_idx,
+                        first_field,
+                        count,
+                    );
+                }
+                Instruction::GetIndex(dst, base_reg, idx_reg) => {
+                    let Some(MirType::Struct(struct_name)) =
+                        refined.locals.get(base_reg as usize).map(|l| &l.ty)
+                    else {
+                        continue;
+                    };
+                    let field_idx = match pc
+                        .checked_sub(1)
+                        .and_then(|prev| continuation_bc.chunk.instructions.get(prev))
+                    {
+                        Some(Instruction::LoadConst(reg, c_idx)) if *reg == idx_reg => {
+                            match continuation_bc.chunk.constants.get(*c_idx as usize) {
+                                Some(Value::Int(n)) if *n >= 0 => *n as usize,
+                                other => {
+                                    return Err(format!(
+                                        "Invalid struct field index constant {other:?} at pc {pc} in '{func_name}'"
+                                    ));
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "Expected LoadConst before struct GetIndex at pc {pc} in '{func_name}', found {other:?}"
+                            ));
+                        }
+                    };
+                    let info = self.struct_metadata.get(struct_name).ok_or_else(|| {
+                        format!(
+                            "Missing struct layout metadata for '{struct_name}' rewriting GetIndex in '{func_name}'"
+                        )
+                    })?;
+                    let fname = info.layout.field_names().get(field_idx).ok_or_else(|| {
+                        format!(
+                            "Struct '{struct_name}' field index {field_idx} out of bounds in '{func_name}'"
+                        )
+                    })?;
+                    let fname_val = Value::String(Rc::clone(fname));
+                    let fname_exists = continuation_bc
+                        .chunk
+                        .constants
+                        .iter()
+                        .any(|v| v == &fname_val);
+                    if !fname_exists && continuation_bc.chunk.constants.len() >= u16::MAX as usize {
+                        return Err(format!(
+                            "Constant pool overflow rewriting struct GetField in '{func_name}'"
+                        ));
+                    }
+                    let field_const_idx = continuation_bc.chunk.add_constant(fname_val);
+                    continuation_bc.chunk.instructions[pc] =
+                        Instruction::GetField(dst, base_reg, field_const_idx);
+                }
+                Instruction::SetIndex(base_reg, idx_reg, val_reg) => {
+                    let Some(MirType::Struct(struct_name)) =
+                        refined.locals.get(base_reg as usize).map(|l| &l.ty)
+                    else {
+                        continue;
+                    };
+                    let field_idx = match pc
+                        .checked_sub(1)
+                        .and_then(|prev| continuation_bc.chunk.instructions.get(prev))
+                    {
+                        Some(Instruction::LoadConst(reg, c_idx)) if *reg == idx_reg => {
+                            match continuation_bc.chunk.constants.get(*c_idx as usize) {
+                                Some(Value::Int(n)) if *n >= 0 => *n as usize,
+                                other => {
+                                    return Err(format!(
+                                        "Invalid struct field index constant {other:?} at pc {pc} in '{func_name}'"
+                                    ));
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "Expected LoadConst before struct SetIndex at pc {pc} in '{func_name}', found {other:?}"
+                            ));
+                        }
+                    };
+                    let info = self.struct_metadata.get(struct_name).ok_or_else(|| {
+                        format!(
+                            "Missing struct layout metadata for '{struct_name}' rewriting SetIndex in '{func_name}'"
+                        )
+                    })?;
+                    let fname = info.layout.field_names().get(field_idx).ok_or_else(|| {
+                        format!(
+                            "Struct '{struct_name}' field index {field_idx} out of bounds in '{func_name}'"
+                        )
+                    })?;
+                    let fname_val = Value::String(Rc::clone(fname));
+                    let fname_exists = continuation_bc
+                        .chunk
+                        .constants
+                        .iter()
+                        .any(|v| v == &fname_val);
+                    if !fname_exists && continuation_bc.chunk.constants.len() >= u16::MAX as usize {
+                        return Err(format!(
+                            "Constant pool overflow rewriting struct SetField in '{func_name}'"
+                        ));
+                    }
+                    let field_const_idx = continuation_bc.chunk.add_constant(fname_val);
+                    continuation_bc.chunk.instructions[pc] =
+                        Instruction::SetField(base_reg, field_const_idx, val_reg);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     #[cfg(feature = "std")]
@@ -1261,7 +2311,7 @@ impl VM {
                         .get(idx)
                         .map(|l| l.ty.clone())
                         .ok_or_else(|| format!("Local index {} out of bounds in '{}'", idx, func_name))?;
-                    if Self::type_contains_unknown(&ty) || !Self::is_supported_deopt_recipe_type(&ty) {
+                    if Self::type_contains_unknown(&ty) || !self.is_supported_deopt_recipe_type(&ty) {
                         return Err(format!(
                             "Unsupported deopt local {} type {:?} at site {} in '{}'",
                             idx, ty, b_idx, func_name
@@ -1297,7 +2347,7 @@ impl VM {
                     .get(idx)
                     .map(|l| l.ty.clone())
                     .ok_or_else(|| format!("Local index {} out of bounds in '{}'", idx, func_name))?;
-                if Self::type_contains_unknown(&ty) || !Self::is_supported_deopt_recipe_type(&ty) {
+                if Self::type_contains_unknown(&ty) || !self.is_supported_deopt_recipe_type(&ty) {
                     return Err(format!(
                         "Unsupported deopt local {} type {:?} at loop header {} in '{}'",
                         idx, ty, b_idx, func_name
@@ -1346,9 +2396,16 @@ impl VM {
         {
             let mut sf = self.mir_context.struct_fields.lock().unwrap();
             sf.clear();
+            let meta_map = self.struct_metadata.as_map();
             for (name, info) in self.struct_metadata.iter() {
                 let field_types: Vec<MirType> = (0..info.layout.field_names().len())
-                    .map(|i| crate::mir::lowering::mir_type_from_ast(info.layout.field_type(i)))
+                    .map(|i| {
+                        Self::resolve_struct_field_mir_type_in_map(
+                            name,
+                            info.layout.field_type(i),
+                            meta_map,
+                        )
+                    })
                     .collect();
                 sf.insert(name.clone(), field_types);
             }
@@ -1543,6 +2600,12 @@ impl VM {
             hashbrown::HashMap::new();
         let mut may_deopt_effect: hashbrown::HashSet<String> = hashbrown::HashSet::new();
         let direct_callees = self.collect_direct_callees();
+        let direct_callee_indices: hashbrown::HashMap<String, usize> = self
+            .functions
+            .iter()
+            .enumerate()
+            .map(|(idx, f)| (f.name.clone(), idx))
+            .collect();
 
         for func in &mut module.functions {
             let name = func.signature.name.clone();
@@ -1564,9 +2627,10 @@ impl VM {
                     ));
                 }
                 let mut continuation_bc =
-                    crate::mir::vm_backend::MirToBytecodeCompiler::compile_with_direct_callees(
+                    crate::mir::vm_backend::MirToBytecodeCompiler::compile_with_direct_callees_and_indices(
                         candidate,
                         &direct_callees,
+                        &direct_callee_indices,
                     )
                     .map_err(|err| {
                         format!(
@@ -1584,6 +2648,7 @@ impl VM {
                 }
                 continuation_bc.is_method = self.functions[func_idx].is_method;
                 continuation_bc.signature = self.functions[func_idx].signature.clone();
+                self.rewrite_continuation_struct_ops(candidate, &mut continuation_bc)?;
 
                 let (recipes, has_effect) = self.build_function_deopt_recipes(
                     &name,
@@ -1691,6 +2756,30 @@ impl VM {
             .find(|f| f.signature.name == func_name)
     }
 
+    /// Read-only inspection helper returning the current compiled Cranelift generation.
+    #[cfg(feature = "std")]
+    pub fn cranelift_compiled_generation(&self) -> u64 {
+        self.cranelift_compiled_generation
+    }
+
+    /// Read-only inspection helper returning the per-thread count of non-empty Cranelift
+    /// array/struct writeback commits.
+    #[cfg(feature = "std")]
+    pub fn cranelift_writeback_commit_count(&self) -> u64 {
+        cranelift_writeback_commit_count()
+    }
+
+    /// Read-only inspection helper returning the proven `readonly_params` flags for a compiled
+    /// Cranelift function.
+    #[cfg(feature = "std")]
+    pub fn cranelift_readonly_params(&self, func_name: &str) -> Option<Vec<bool>> {
+        let func_idx = self.functions.iter().position(|f| f.name == func_name)?;
+        self.cranelift_fn_cache
+            .get(func_idx)?
+            .as_ref()
+            .map(|entry| entry.readonly_params.clone())
+    }
+
     /// Read-only inspection helper returning the cached `local_types.len()` for a compiled
     /// Cranelift function.
     #[cfg(feature = "std")]
@@ -1792,8 +2881,9 @@ impl VM {
             }
         };
 
-        // Precompute per-function refined metadata strictly from the FINAL post-inline
-        // compiled module functions before mutating VM state.
+        // Precompute per-function refined metadata and read-only parameter masks strictly from
+        // the FINAL post-inline compiled module functions before mutating VM state.
+        let mut refined_module = crate::mir::ir::MirModule::new(module.name.clone());
         let mut entry_meta_by_name: hashbrown::HashMap<
             String,
             (Vec<MirType>, MirType, Vec<MirType>),
@@ -1828,7 +2918,12 @@ impl VM {
                 f.signature.name.clone(),
                 (param_types, f.signature.return_type.clone(), local_types),
             );
+            refined_module.add_function(refined);
         }
+        let mut readonly_params_by_name = compute_readonly_params_with_structs(
+            &refined_module,
+            Some(self.struct_metadata.as_map()),
+        );
 
         // Transactional publish ONLY after compile_module returns Ok
         let mut compiled_func_indices: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
@@ -1876,7 +2971,10 @@ impl VM {
                     && !Self::type_contains_unknown(&ret_type)
                     && self.is_cranelift_supported_type_in_vm(&ret_type)
                 {
-                    let readonly_params = vec![false; param_types.len()];
+                    let readonly_params = readonly_params_by_name
+                        .remove(&name)
+                        .filter(|flags| flags.len() == param_types.len())
+                        .unwrap_or_else(|| vec![false; param_types.len()]);
                     self.cranelift_fn_cache[func_idx] = Some(Rc::new(crate::vm::CompiledFnEntry {
                         func_name: alloc::rc::Rc::<str>::from(name.as_str()),
                         code_ptr: ptr,
@@ -2002,6 +3100,7 @@ impl VM {
             &entry.param_types,
             &entry.ret_type,
             &entry.local_types,
+            &entry.readonly_params,
             entry.code_ptr,
             &mut native_entered,
         );
@@ -2090,6 +3189,143 @@ impl VM {
 
     #[cfg(feature = "std")]
     #[allow(clippy::too_many_arguments)]
+    fn marshal_struct_recursive(
+        &self,
+        rc: &Rc<StructObject>,
+        expected_name: &str,
+        param_idx: usize,
+        marshalled_structs: &mut Vec<MarshalledStruct>,
+        marshalled_struct_by_ptr: &mut hashbrown::HashMap<*const StructObject, usize>,
+        visiting: &mut hashbrown::HashSet<*const StructObject>,
+        depth: usize,
+    ) -> Result<Option<*mut i64>> {
+        if depth > MAX_STRUCT_DECODE_DEPTH {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Struct marshaling depth limit ({MAX_STRUCT_DECODE_DEPTH}) exceeded for '{expected_name}'"
+                ),
+            });
+        }
+        let rc_key = Rc::as_ptr(rc);
+        if visiting.contains(&rc_key) {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Cyclic struct reference detected while marshaling '{expected_name}' at {:p}",
+                    rc_key
+                ),
+            });
+        }
+        if let Some(&existing_idx) = marshalled_struct_by_ptr.get(&rc_key) {
+            let existing = &mut marshalled_structs[existing_idx];
+            if !existing.param_indices.contains(&param_idx) {
+                existing.param_indices.push(param_idx);
+            }
+            return Ok(Some(existing.ptr));
+        }
+
+        if !self.is_cranelift_supported_struct(expected_name) {
+            return Ok(None);
+        }
+        let Some(expected_info) = self.struct_metadata.get(expected_name) else {
+            return Ok(None);
+        };
+        if rc.name.as_str() != expected_name
+            && rc.name.as_str() != expected_info.layout.name()
+        {
+            return Ok(None);
+        }
+        let fields = rc.fields.try_borrow().map_err(|_| LustError::RuntimeError {
+            message: "Failed to acquire borrow for struct parameter packing: mutable borrow active".into(),
+        })?;
+        let expected_field_count = expected_info.layout.field_names().len();
+        if rc.layout.field_names() != expected_info.layout.field_names()
+            || fields.len() != expected_field_count
+        {
+            return Ok(None);
+        }
+
+        visiting.insert(rc_key);
+        let marshal_fields_res: Result<Option<Vec<i64>>> = (|| {
+            let mut raw_fields = Vec::with_capacity(fields.len());
+            for (idx, fld) in fields.iter().enumerate() {
+                let raw_fld = match (fld, &expected_info.layout.field_type(idx).kind) {
+                    (Value::Int(n), TypeKind::Int) => *n,
+                    (Value::Bool(b), TypeKind::Bool) => i64::from(*b),
+                    (Value::Float(f), TypeKind::Float) => f.to_bits() as i64,
+                    (Value::String(_), TypeKind::String)
+                    | (Value::Map(_), TypeKind::Map(_, _))
+                    | (Value::Enum(_), TypeKind::Result(_, _)) => {
+                        self.mir_context.register_handle(fld.clone())
+                    }
+                    (Value::Enum(_), TypeKind::Option(inner)) => match &inner.kind {
+                        TypeKind::Named(sub) => {
+                            let sub_name = resolve_option_struct_target_name(
+                                expected_name,
+                                sub,
+                                Some(self.struct_metadata.as_map()),
+                            );
+                            match fld.as_enum() {
+                                Some(("Option", "None", None))
+                                | Some(("Option", "None", Some([]))) => 0i64,
+                                Some(("Option", "Some", Some([Value::Struct(sub_rc)]))) => {
+                                    match self.marshal_struct_recursive(
+                                        sub_rc,
+                                        &sub_name,
+                                        param_idx,
+                                        marshalled_structs,
+                                        marshalled_struct_by_ptr,
+                                        visiting,
+                                        depth + 1,
+                                    )? {
+                                        Some(sub_ptr) => sub_ptr as i64,
+                                        None => return Ok(None),
+                                    }
+                                }
+                                _ => return Ok(None),
+                            }
+                        }
+                        _ => self.mir_context.register_handle(fld.clone()),
+                    },
+                    _ => return Ok(None),
+                };
+                raw_fields.push(raw_fld);
+            }
+            Ok(Some(raw_fields))
+        })();
+        visiting.remove(&rc_key);
+        let Some(raw_fields) = marshal_fields_res? else {
+            return Ok(None);
+        };
+
+        let len = raw_fields.len();
+        let ptr = lust_mir_alloc_struct_named(
+            len as i64,
+            expected_name.as_ptr(),
+            expected_name.len() as i64,
+        );
+        if ptr.is_null() {
+            return Err(LustError::RuntimeError {
+                message: "Out of memory allocating struct buffer for Cranelift JIT".into(),
+            });
+        }
+        for (idx, raw_fld) in raw_fields.into_iter().enumerate() {
+            unsafe {
+                *ptr.add(2 + idx) = raw_fld;
+            }
+        }
+        let new_idx = marshalled_structs.len();
+        marshalled_structs.push(MarshalledStruct {
+            rc: rc.clone(),
+            ptr,
+            field_count: len,
+            param_indices: vec![param_idx],
+        });
+        marshalled_struct_by_ptr.insert(rc_key, new_idx);
+        Ok(Some(ptr))
+    }
+
+    #[cfg(feature = "std")]
+    #[allow(clippy::too_many_arguments)]
     fn try_run_cranelift_top_frame_scoped(
         &mut self,
         _func_idx: usize,
@@ -2097,6 +3333,7 @@ impl VM {
         param_types: &[MirType],
         ret_type: &MirType,
         local_types: &[MirType],
+        readonly_params: &[bool],
         code_ptr: *const u8,
         native_entered: &mut bool,
     ) -> Result<CraneliftOutcome> {
@@ -2265,81 +3502,43 @@ impl VM {
                         RawArg::Int(ptr as i64)
                     }
                     (Value::Struct(rc), MirType::Struct(expected_name)) => {
-                        if rc.name.as_str() != expected_name.as_str()
-                            || !self.is_cranelift_supported_struct(expected_name)
-                        {
-                            return Ok(CraneliftOutcome::Fallback);
+                        let mut visiting = hashbrown::HashSet::new();
+                        match self.marshal_struct_recursive(
+                            rc,
+                            expected_name,
+                            i,
+                            &mut marshalled_structs,
+                            &mut marshalled_struct_by_ptr,
+                            &mut visiting,
+                            0,
+                        )? {
+                            Some(ptr) => RawArg::Int(ptr as i64),
+                            None => return Ok(CraneliftOutcome::Fallback),
                         }
-                        let Some(expected_info) = self.struct_metadata.get(expected_name) else {
-                            return Ok(CraneliftOutcome::Fallback);
-                        };
-                        let rc_key = Rc::as_ptr(rc);
-                        if let Some(&existing_idx) = marshalled_struct_by_ptr.get(&rc_key) {
-                            let existing = &mut marshalled_structs[existing_idx];
-                            existing.param_indices.push(i);
-                            raw_args.push(RawArg::Int(existing.ptr as i64));
-                            continue;
-                        }
-
-                        let fields = rc.fields.try_borrow().map_err(|_| LustError::RuntimeError {
-                            message: "Failed to acquire borrow for struct parameter packing: mutable borrow active".into(),
-                        })?;
-                        let expected_field_count = expected_info.layout.field_names().len();
-                        if rc.layout.field_names() != expected_info.layout.field_names()
-                            || fields.len() != expected_field_count
-                        {
-                            return Ok(CraneliftOutcome::Fallback);
-                        }
-                        let all_fields_match = fields.iter().enumerate().all(|(idx, fld)| {
-                            matches!(
-                                (fld, &expected_info.layout.field_type(idx).kind),
-                                (Value::Int(_), TypeKind::Int)
-                                    | (Value::Bool(_), TypeKind::Bool)
-                                    | (Value::Float(_), TypeKind::Float)
-                                    | (Value::String(_), TypeKind::String)
-                                    | (Value::Map(_), TypeKind::Map(_, _))
-                                    | (Value::Enum(_), TypeKind::Option(_) | TypeKind::Result(_, _))
-                            )
-                        });
-                        if !all_fields_match {
-                            return Ok(CraneliftOutcome::Fallback);
-                        }
-
-                        let len = fields.len();
-                        let ptr = lust_mir_alloc_struct_named(
-                            len as i64,
-                            expected_name.as_ptr(),
-                            expected_name.len() as i64,
-                        );
-                        if ptr.is_null() {
-                            return Err(LustError::RuntimeError {
-                                message: "Out of memory allocating struct buffer for Cranelift JIT".into(),
-                            });
-                        }
-                        for (idx, fld) in fields.iter().enumerate() {
-                            let raw_fld = match fld {
-                                Value::Int(n) => *n,
-                                Value::Bool(b) => i64::from(*b),
-                                Value::Float(f) => f.to_bits() as i64,
-                                Value::String(_) | Value::Map(_) | Value::Enum(_) => {
-                                    self.mir_context.register_handle(fld.clone())
-                                }
-                                _ => unreachable!("struct fields pre-verified"),
-                            };
-                            unsafe {
-                                *ptr.add(2 + idx) = raw_fld;
-                            }
-                        }
-                        let new_idx = marshalled_structs.len();
-                        marshalled_structs.push(MarshalledStruct {
-                            rc: rc.clone(),
-                            ptr,
-                            field_count: len,
-                            param_indices: vec![i],
-                        });
-                        marshalled_struct_by_ptr.insert(rc_key, new_idx);
-                        RawArg::Int(ptr as i64)
                     }
+                    (Value::Enum(_), MirType::Option(inner)) => match &**inner {
+                        MirType::Struct(expected_name) => match val.as_enum() {
+                            Some(("Option", "None", None))
+                            | Some(("Option", "None", Some([]))) => RawArg::Int(0),
+                            Some(("Option", "Some", Some([Value::Struct(rc)]))) => {
+                                let mut visiting = hashbrown::HashSet::new();
+                                match self.marshal_struct_recursive(
+                                    rc,
+                                    expected_name,
+                                    i,
+                                    &mut marshalled_structs,
+                                    &mut marshalled_struct_by_ptr,
+                                    &mut visiting,
+                                    0,
+                                )? {
+                                    Some(ptr) => RawArg::Int(ptr as i64),
+                                    None => return Ok(CraneliftOutcome::Fallback),
+                                }
+                            }
+                            _ => return Ok(CraneliftOutcome::Fallback),
+                        },
+                        _ => return Ok(CraneliftOutcome::Fallback),
+                    },
                     (Value::Map(_), MirType::Map(_, _) | MirType::Unknown) => {
                         let h = self.mir_context.register_handle(val.clone());
                         RawArg::Int(h)
@@ -2659,10 +3858,12 @@ impl VM {
             if status == MIR_STATUS_DEOPT {
                 if let Err(err) = gas_charge_res {
                     crate::mir::cranelift_backend::take_deopt_payload();
-                    if let Err(wb_err) = stage_and_commit_all_writebacks(
+                    if let Err(wb_err) = stage_and_commit_all_writebacks_with_readonly(
                         &self.mir_context,
                         &marshalled_arrays,
                         &marshalled_structs,
+                        readonly_params,
+                        Some(self.struct_metadata.as_map()),
                     ) {
                         return Err(LustError::RuntimeError {
                             message: format!("{}; writeback failed: {}", err, wb_err),
@@ -2672,10 +3873,12 @@ impl VM {
                 }
                 if let Err(err) = mem_charge_res {
                     crate::mir::cranelift_backend::take_deopt_payload();
-                    if let Err(wb_err) = stage_and_commit_all_writebacks(
+                    if let Err(wb_err) = stage_and_commit_all_writebacks_with_readonly(
                         &self.mir_context,
                         &marshalled_arrays,
                         &marshalled_structs,
+                        readonly_params,
+                        Some(self.struct_metadata.as_map()),
                     ) {
                         return Err(LustError::RuntimeError {
                             message: format!("{}; writeback failed: {}", err, wb_err),
@@ -2690,6 +3893,7 @@ impl VM {
                     local_types,
                     &marshalled_arrays,
                     &marshalled_structs,
+                    readonly_params,
                 );
             }
 
@@ -2729,10 +3933,12 @@ impl VM {
                 || status == MIR_STATUS_ERR_NEG_EXPONENT
                 || status == MIR_STATUS_ERR_OOM
             {
-                if let Err(wb_err) = stage_and_commit_all_writebacks(
+                if let Err(wb_err) = stage_and_commit_all_writebacks_with_readonly(
                     &self.mir_context,
                     &marshalled_arrays,
                     &marshalled_structs,
+                    readonly_params,
+                    Some(self.struct_metadata.as_map()),
                 ) {
                     return Err(LustError::RuntimeError {
                         message: format!("{}; writeback failed: {}", primary_err, wb_err),
@@ -2743,10 +3949,12 @@ impl VM {
         }
 
         if let Err(err) = gas_charge_res {
-            if let Err(wb_err) = stage_and_commit_all_writebacks(
+            if let Err(wb_err) = stage_and_commit_all_writebacks_with_readonly(
                 &self.mir_context,
                 &marshalled_arrays,
                 &marshalled_structs,
+                readonly_params,
+                Some(self.struct_metadata.as_map()),
             ) {
                 return Err(LustError::RuntimeError {
                     message: format!("{}; writeback failed: {}", err, wb_err),
@@ -2755,10 +3963,12 @@ impl VM {
             return Err(err);
         }
         if let Err(err) = mem_charge_res {
-            if let Err(wb_err) = stage_and_commit_all_writebacks(
+            if let Err(wb_err) = stage_and_commit_all_writebacks_with_readonly(
                 &self.mir_context,
                 &marshalled_arrays,
                 &marshalled_structs,
+                readonly_params,
+                Some(self.struct_metadata.as_map()),
             ) {
                 return Err(LustError::RuntimeError {
                     message: format!("{}; writeback failed: {}", err, wb_err),
@@ -2767,9 +3977,18 @@ impl VM {
             return Err(err);
         }
 
-        // Stage writebacks for all marshalled input arrays and structs BEFORE mutating any caller state
-        let staged_arrays = stage_input_writebacks(&self.mir_context, &marshalled_arrays)?;
-        let staged_structs = stage_struct_writebacks(&self.mir_context, &marshalled_structs)?;
+        // Stage writebacks for all non-readonly marshalled input arrays and structs BEFORE mutating any caller state
+        let staged_arrays = stage_input_writebacks_with_readonly(
+            &self.mir_context,
+            &marshalled_arrays,
+            readonly_params,
+        )?;
+        let staged_structs = stage_struct_writebacks_with_readonly_and_meta(
+            &self.mir_context,
+            &marshalled_structs,
+            readonly_params,
+            Some(self.struct_metadata.as_map()),
+        )?;
 
         // Reconstruct return value
         let result_val = match ret_type {
@@ -2814,14 +4033,49 @@ impl VM {
                             "Missing struct layout metadata for '{name}' during Cranelift return decoding"
                         ),
                     })?;
-                validate_and_decode_struct(
+                validate_and_decode_struct_with_metadata(
                     &self.mir_context,
                     &marshalled_structs,
                     raw_int,
                     name,
                     Some(layout),
+                    Some(self.struct_metadata.as_map()),
                 )?
             }
+            MirType::Option(inner) => match &**inner {
+                MirType::Struct(name) => {
+                    if raw_int == 0 {
+                        Value::none()
+                    } else {
+                        let layout = self
+                            .struct_metadata
+                            .get(name)
+                            .map(|info| &info.layout)
+                            .ok_or_else(|| LustError::RuntimeError {
+                                message: format!(
+                                    "Missing struct layout metadata for '{name}' during Cranelift Option return decoding"
+                                ),
+                            })?;
+                        let decoded_struct = validate_and_decode_struct_with_metadata(
+                            &self.mir_context,
+                            &marshalled_structs,
+                            raw_int,
+                            name,
+                            Some(layout),
+                            Some(self.struct_metadata.as_map()),
+                        )?;
+                        Value::some(decoded_struct)
+                    }
+                }
+                _ => {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "Unsupported Option return element type {:?} in Cranelift return decoding",
+                            inner
+                        ),
+                    });
+                }
+            },
             MirType::Map(_, _) => {
                 self.mir_context.get_handle(raw_int).unwrap_or_else(|| Value::map(LustMap::default()))
             }
@@ -2877,6 +4131,7 @@ impl VM {
         local_types: &[MirType],
         marshalled_arrays: &[MarshalledArray],
         marshalled_structs: &[MarshalledStruct],
+        readonly_params: &[bool],
     ) -> Result<CraneliftOutcome> {
         #[cfg(feature = "test-deopt")]
         let (expected_block, payload, source_label) = {
@@ -3038,6 +4293,8 @@ impl VM {
 
         let mut materialized_fresh_arrays: hashbrown::HashMap<usize, Rc<RefCell<Vec<Value>>>> =
             hashbrown::HashMap::new();
+        let mut materialized_fresh_structs: hashbrown::HashMap<usize, Rc<StructObject>> =
+            hashbrown::HashMap::new();
         let mut validated_restorations = Vec::with_capacity(payload.live_locals.len());
         for &(loc_idx, raw_val) in &payload.live_locals {
             if loc_idx >= local_types.len() || loc_idx >= top_frame_reg_count {
@@ -3092,6 +4349,94 @@ impl VM {
                         Value::Array(rc)
                     }
                 }
+                MirType::Struct(name) => {
+                    if !self.is_cranelift_supported_struct(name) {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Unsupported struct type '{}' for deopt local {} in ({source_label})",
+                                name, loc_idx
+                            ),
+                        });
+                    }
+                    let layout = self
+                        .struct_metadata
+                        .get(name)
+                        .map(|info| &info.layout)
+                        .ok_or_else(|| LustError::RuntimeError {
+                            message: format!(
+                                "Missing struct layout metadata for '{name}' during deopt reconstruction ({source_label})"
+                            ),
+                        })?;
+                    let mut visited_ptrs = hashbrown::HashSet::new();
+                    let decoded_val = validate_and_decode_struct_inner(
+                        &self.mir_context,
+                        marshalled_structs,
+                        raw_val,
+                        name,
+                        Some(layout),
+                        Some(self.struct_metadata.as_map()),
+                        &mut visited_ptrs,
+                        &mut materialized_fresh_structs,
+                        0,
+                    )?;
+                    match decoded_val {
+                        Value::Struct(rc) => Value::Struct(rc),
+                        other => {
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "Expected Struct value for deopt local {} in ({source_label}), got {:?}",
+                                    loc_idx, other
+                                ),
+                            });
+                        }
+                    }
+                }
+                MirType::Option(inner) => match &**inner {
+                    MirType::Struct(name) => {
+                        if !self.is_cranelift_supported_struct(name) {
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "Unsupported Option<Struct('{}')> type for deopt local {} in ({source_label})",
+                                    name, loc_idx
+                                ),
+                            });
+                        }
+                        if raw_val == 0 {
+                            Value::none()
+                        } else {
+                            let layout = self
+                                .struct_metadata
+                                .get(name)
+                                .map(|info| &info.layout)
+                                .ok_or_else(|| LustError::RuntimeError {
+                                    message: format!(
+                                        "Missing struct layout metadata for '{name}' during deopt Option reconstruction ({source_label})"
+                                    ),
+                                })?;
+                            let mut visited_ptrs = hashbrown::HashSet::new();
+                            let decoded_val = validate_and_decode_struct_inner(
+                                &self.mir_context,
+                                marshalled_structs,
+                                raw_val,
+                                name,
+                                Some(layout),
+                                Some(self.struct_metadata.as_map()),
+                                &mut visited_ptrs,
+                                &mut materialized_fresh_structs,
+                                0,
+                            )?;
+                            Value::some(decoded_val)
+                        }
+                    }
+                    _ => {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Unsupported Option type {:?} for deopt local {} in ({source_label})",
+                                mir_ty, loc_idx
+                            ),
+                        });
+                    }
+                },
                 _ => {
                     return Err(LustError::RuntimeError {
                         message: format!(
@@ -3104,7 +4449,13 @@ impl VM {
             validated_restorations.push((loc_idx, restored_val));
         }
 
-        stage_and_commit_all_writebacks(&self.mir_context, marshalled_arrays, marshalled_structs)?;
+        stage_and_commit_all_writebacks_with_readonly(
+            &self.mir_context,
+            marshalled_arrays,
+            marshalled_structs,
+            readonly_params,
+            Some(self.struct_metadata.as_map()),
+        )?;
 
         let top_frame = self.call_stack.last_mut().expect("validated non-empty");
         top_frame.ip = recipe.precise_pc;
@@ -3406,5 +4757,372 @@ mod eligibility_walker_tests {
             !vm.is_cranelift_eligible_in_vm(&f_oob),
             "Out-of-bounds field projection on valid struct must be rejected"
         );
+    }
+
+    fn register_point_struct(vm: &mut VM) -> Rc<StructLayout> {
+        let span = Span::dummy();
+        let layout = Rc::new(StructLayout::new(
+            "Point".to_string(),
+            vec![Rc::new("x".to_string()), Rc::new("y".to_string())],
+            vec![FieldStorage::Strong, FieldStorage::Strong],
+            vec![Type::new(TypeKind::Int, span), Type::new(TypeKind::Int, span)],
+            vec![None, None],
+        ));
+        vm.struct_metadata.insert(
+            "Point".to_string(),
+            crate::vm::RuntimeStructInfo {
+                layout: layout.clone(),
+            },
+        );
+        layout
+    }
+
+    #[test]
+    fn test_perf_t2_1_unit_is_supported_deopt_recipe_type_struct_filtering() {
+        let mut vm = VM::new();
+        let span = Span::dummy();
+        // Unregistered struct must be rejected
+        assert!(!vm.is_supported_deopt_recipe_type(&MirType::Struct("Point".into())));
+        assert!(!vm.is_supported_deopt_recipe_type(&MirType::Struct(String::new())));
+
+        // Register valid Point { x: int, y: int }
+        register_point_struct(&mut vm);
+        assert!(vm.is_supported_deopt_recipe_type(&MirType::Struct("Point".into())));
+
+        // Struct with unsupported nested Array field must be rejected
+        let bad_layout = Rc::new(StructLayout::new(
+            "BadStruct".to_string(),
+            vec![Rc::new("items".to_string())],
+            vec![FieldStorage::Strong],
+            vec![Type::new(
+                TypeKind::Array(Box::new(Type::new(TypeKind::Int, span))),
+                span,
+            )],
+            vec![None],
+        ));
+        vm.struct_metadata.insert(
+            "BadStruct".to_string(),
+            crate::vm::RuntimeStructInfo { layout: bad_layout },
+        );
+        assert!(!vm.is_supported_deopt_recipe_type(&MirType::Struct("BadStruct".into())));
+    }
+
+    #[test]
+    fn test_perf_t2_1_unit_restore_deopt_fresh_struct_alias_and_continuation_resume() {
+        let mut vm = VM::new();
+        let _layout = register_point_struct(&mut vm);
+        let span = Span::dummy();
+
+        // MIR function:
+        //   bb0: a = Point { 1, 10 }; b = a; goto bb1
+        //   bb1 (loop / resume target): a.x = a.x + 5; tmp = b.x; out = tmp + a.y; return out
+        // After deopt at bb1, mutating a.x MUST be observed through b.x (shared Rc::ptr_eq)!
+        let mut f = MirFunction::new(
+            FunctionSignature {
+                name: "alias_resume".to_string(),
+                param_types: vec![],
+                return_type: MirType::Int,
+                is_public: true,
+                effects: None,
+            },
+            span,
+        );
+        let a = f.add_local(Some("a".into()), MirType::Struct("Point".into()), true, span);
+        let b = f.add_local(Some("b".into()), MirType::Struct("Point".into()), true, span);
+        let ax = f.add_local(Some("ax".into()), MirType::Int, true, span);
+        let bx = f.add_local(Some("bx".into()), MirType::Int, true, span);
+        let ay = f.add_local(Some("ay".into()), MirType::Int, true, span);
+        let out = f.add_local(Some("out".into()), MirType::Int, true, span);
+        let bb1 = f.new_block();
+
+        f.blocks[0].statements.push(Statement::Assign(
+            Place::Local(a),
+            Rvalue::Aggregate(
+                MirType::Struct("Point".into()),
+                vec![
+                    Operand::Constant(MirConstant::Int(1)),
+                    Operand::Constant(MirConstant::Int(10)),
+                ],
+            ),
+            span,
+        ));
+        f.blocks[0].statements.push(Statement::Assign(
+            Place::Local(b),
+            Rvalue::Use(Operand::Copy(Place::Local(a))),
+            span,
+        ));
+        f.blocks[0].terminator = Some(Terminator::Goto(bb1, span));
+
+        f.blocks[bb1.0].statements.push(Statement::Assign(
+            Place::Local(ax),
+            Rvalue::Use(Operand::Copy(Place::Field(Box::new(Place::Local(a)), 0))),
+            span,
+        ));
+        f.blocks[bb1.0].statements.push(Statement::Assign(
+            Place::Local(ax),
+            Rvalue::BinaryOp(
+                MirBinaryOp::Add,
+                Operand::Copy(Place::Local(ax)),
+                Operand::Constant(MirConstant::Int(5)),
+            ),
+            span,
+        ));
+        f.blocks[bb1.0].statements.push(Statement::Assign(
+            Place::Field(Box::new(Place::Local(a)), 0),
+            Rvalue::Use(Operand::Copy(Place::Local(ax))),
+            span,
+        ));
+        f.blocks[bb1.0].statements.push(Statement::Assign(
+            Place::Local(bx),
+            Rvalue::Use(Operand::Copy(Place::Field(Box::new(Place::Local(b)), 0))),
+            span,
+        ));
+        f.blocks[bb1.0].statements.push(Statement::Assign(
+            Place::Local(ay),
+            Rvalue::Use(Operand::Copy(Place::Field(Box::new(Place::Local(a)), 1))),
+            span,
+        ));
+        f.blocks[bb1.0].statements.push(Statement::Assign(
+            Place::Local(out),
+            Rvalue::BinaryOp(
+                MirBinaryOp::Add,
+                Operand::Copy(Place::Local(bx)),
+                Operand::Copy(Place::Local(ay)),
+            ),
+            span,
+        ));
+        f.blocks[bb1.0].terminator = Some(Terminator::Return(
+            Some(Operand::Copy(Place::Local(out))),
+            span,
+        ));
+
+        let mut bc = crate::mir::vm_backend::MirToBytecodeCompiler::compile(&f).expect("compile bc");
+        let orig_len = bc.chunk.instructions.len();
+        let orig_block_pcs = bc.block_entry_pcs.clone();
+        vm.rewrite_continuation_struct_ops(&f, &mut bc)
+            .expect("rewrite_continuation_struct_ops");
+        assert_eq!(
+            bc.chunk.instructions.len(),
+            orig_len,
+            "1-for-1 struct rewrite must preserve exact instruction count and PCs"
+        );
+        assert_eq!(bc.block_entry_pcs, orig_block_pcs);
+        assert!(
+            bc.chunk
+                .instructions
+                .iter()
+                .any(|i| matches!(i, crate::bytecode::Instruction::NewStruct(..))),
+            "expected NewStruct after continuation rewrite"
+        );
+        assert!(
+            bc.chunk
+                .instructions
+                .iter()
+                .any(|i| matches!(i, crate::bytecode::Instruction::GetField(..)))
+                && bc
+                    .chunk
+                    .instructions
+                    .iter()
+                    .any(|i| matches!(i, crate::bytecode::Instruction::SetField(..))),
+            "expected GetField and SetField after continuation rewrite"
+        );
+
+        let resume_pc = bc.block_entry_pcs[&bb1.0];
+        let func_idx = vm.functions.len();
+        vm.functions.push(bc);
+        vm.call_meta.push(crate::vm::CallMeta::of(&vm.functions[func_idx]));
+        vm.cranelift_compiled_generation = 7;
+        vm.cranelift_recipes.insert(
+            ("alias_resume".to_string(), bb1.0, DeoptSiteKind::BlockEntry),
+            CompiledDeoptRecipe {
+                func_name: "alias_resume".to_string(),
+                compilation_generation: 7,
+                block_id: bb1.0,
+                site_kind: DeoptSiteKind::BlockEntry,
+                precise_pc: resume_pc,
+                proven_locals: vec![
+                    (a.0, MirType::Struct("Point".into())),
+                    (b.0, MirType::Struct("Point".into())),
+                ],
+            },
+        );
+
+        let local_types: Vec<MirType> = f.locals.iter().map(|l| l.ty.clone()).collect();
+        let mut frame = Box::new(crate::vm::CallFrame {
+            function_idx: func_idx,
+            ip: 0,
+            registers: [const { Value::Nil }; 256],
+            base_register: 0,
+            return_dest: None,
+            upvalues: Vec::new(),
+            shared_upvalues: Vec::new(),
+        });
+        frame.registers[0] = Value::Int(-999);
+        vm.call_stack.push(frame);
+
+        let _ctx_guard = vm.mir_context.enter();
+        let fresh_ptr = lust_mir_alloc_struct_named(2, "Point".as_ptr(), "Point".len() as i64);
+        assert!(!fresh_ptr.is_null());
+        unsafe {
+            *fresh_ptr.add(2) = 100; // x = 100
+            *fresh_ptr.add(3) = 20; // y = 20
+        }
+
+        let payload = {
+            let _inv = crate::mir::cranelift_backend::push_native_invocation_with_generation(
+                "alias_resume".to_string(),
+                1,
+                1,
+                7,
+            );
+            crate::mir::cranelift_backend::DeoptPayload::new(
+                bb1.0,
+                vec![(a.0, fresh_ptr as i64), (b.0, fresh_ptr as i64)],
+            )
+        };
+        crate::mir::cranelift_backend::set_current_deopt_payload(payload);
+
+        let outcome = vm
+            .restore_deopt_top_frame("alias_resume", 1, 1, &local_types, &[], &[], &[])
+            .expect("restore_deopt_top_frame must succeed for aliased fresh structs");
+        assert!(matches!(outcome, CraneliftOutcome::Fallback));
+
+        // Verify exact Rc::ptr_eq identity between restored locals `a` and `b`!
+        let (rc_a, rc_b) = {
+            let top = vm.call_stack.last().unwrap();
+            assert_eq!(top.ip, resume_pc);
+            match (&top.registers[a.0], &top.registers[b.0]) {
+                (Value::Struct(ra), Value::Struct(rb)) => (Rc::clone(ra), Rc::clone(rb)),
+                other => panic!("expected (Struct, Struct), got {other:?}"),
+            }
+        };
+        assert!(
+            Rc::ptr_eq(&rc_a, &rc_b),
+            "two live locals aliasing the same fresh struct MUST share Rc::ptr_eq identity post-deopt"
+        );
+
+        // Resume interpreter execution on rewritten continuation bytecode:
+        // a.x becomes 100 + 5 = 105; b.x observes 105; out = 105 + 20 = 125!
+        drop(_ctx_guard);
+        let resumed_val = vm.run_inner::<false>().expect("interpreter continuation resume");
+        assert_eq!(resumed_val, Value::Int(125));
+    }
+
+    #[test]
+    fn test_perf_t2_1_unit_restore_deopt_rejects_corrupted_ptr_and_field_count_mismatch() {
+        let mut vm = VM::new();
+        let layout = register_point_struct(&mut vm);
+
+        let local_types = vec![MirType::Struct("Point".into())];
+        vm.cranelift_compiled_generation = 3;
+        vm.cranelift_recipes.insert(
+            ("neg_struct_deopt".to_string(), 1, DeoptSiteKind::BlockEntry),
+            CompiledDeoptRecipe {
+                func_name: "neg_struct_deopt".to_string(),
+                compilation_generation: 3,
+                block_id: 1,
+                site_kind: DeoptSiteKind::BlockEntry,
+                precise_pc: 42,
+                proven_locals: vec![(0, MirType::Struct("Point".into()))],
+            },
+        );
+
+        let mut frame = Box::new(crate::vm::CallFrame {
+            function_idx: 0,
+            ip: 7,
+            registers: [const { Value::Nil }; 256],
+            base_register: 0,
+            return_dest: None,
+            upvalues: Vec::new(),
+            shared_upvalues: Vec::new(),
+        });
+        frame.registers[0] = Value::Int(12345);
+        vm.call_stack.push(frame);
+
+        let caller_struct = StructObject::new(
+            "Point".to_string(),
+            layout,
+            vec![Value::Int(10), Value::Int(20)],
+        );
+
+        let _ctx_guard = vm.mir_context.enter();
+        let input_ptr = lust_mir_alloc_struct_named(2, "Point".as_ptr(), "Point".len() as i64);
+        assert!(!input_ptr.is_null());
+        unsafe {
+            *input_ptr.add(2) = 999; // staged mutation that MUST NOT commit on error!
+            *input_ptr.add(3) = 888;
+        }
+        let marshalled_structs = vec![MarshalledStruct {
+            rc: caller_struct.clone(),
+            ptr: input_ptr,
+            field_count: 2,
+            param_indices: vec![0],
+        }];
+
+        // Case 1: Corrupted / unowned pointers (null & 0xdeadbeef)
+        for bad_ptr in [0_i64, 0x0000_dead_beef_i64] {
+            let payload = {
+                let _inv = crate::mir::cranelift_backend::push_native_invocation_with_generation(
+                    "neg_struct_deopt".to_string(),
+                    1,
+                    1,
+                    3,
+                );
+                crate::mir::cranelift_backend::DeoptPayload::new(1, vec![(0, bad_ptr)])
+            };
+            crate::mir::cranelift_backend::set_current_deopt_payload(payload);
+            let err = vm
+                .restore_deopt_top_frame(
+                    "neg_struct_deopt",
+                    1,
+                    1,
+                    &local_types,
+                    &[],
+                    &marshalled_structs,
+                    &[],
+                )
+                .expect_err("corrupted/unowned struct pointer must fail closed");
+            assert!(
+                err.to_string().contains("provenance") || err.to_string().contains("null pointer"),
+                "unexpected error for {bad_ptr:#x}: {err}"
+            );
+            // Zero frame mutation AND zero input-struct writeback mutation!
+            assert_eq!(vm.call_stack.last().unwrap().ip, 7);
+            assert_eq!(vm.call_stack.last().unwrap().registers[0], Value::Int(12345));
+            assert_eq!(*caller_struct.fields.borrow(), vec![Value::Int(10), Value::Int(20)]);
+        }
+
+        // Case 2: Owned `Point` allocation with mismatched field count (len=1 != expected 2)
+        let mismatch_ptr = lust_mir_alloc_struct_named(1, "Point".as_ptr(), "Point".len() as i64);
+        assert!(!mismatch_ptr.is_null());
+        let payload = {
+            let _inv = crate::mir::cranelift_backend::push_native_invocation_with_generation(
+                "neg_struct_deopt".to_string(),
+                1,
+                2,
+                3,
+            );
+            crate::mir::cranelift_backend::DeoptPayload::new(1, vec![(0, mismatch_ptr as i64)])
+        };
+        crate::mir::cranelift_backend::set_current_deopt_payload(payload);
+        let err = vm
+            .restore_deopt_top_frame(
+                "neg_struct_deopt",
+                1,
+                2,
+                &local_types,
+                &[],
+                &marshalled_structs,
+                &[],
+            )
+            .expect_err("struct field count mismatch must fail closed");
+        assert!(
+            err.to_string().contains("field count") || err.to_string().contains("Malformed struct"),
+            "unexpected error: {err}"
+        );
+        // Zero frame mutation AND zero input-struct writeback mutation!
+        assert_eq!(vm.call_stack.last().unwrap().ip, 7);
+        assert_eq!(vm.call_stack.last().unwrap().registers[0], Value::Int(12345));
+        assert_eq!(*caller_struct.fields.borrow(), vec![Value::Int(10), Value::Int(20)]);
     }
 }

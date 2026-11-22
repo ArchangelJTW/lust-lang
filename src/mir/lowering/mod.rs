@@ -54,6 +54,7 @@ pub struct AstLowering<'a> {
     cleanups: Vec<Vec<MirCleanup>>,
     loop_stack: Vec<(BlockId, BlockId)>, // (header/continue_block, exit_block)
     struct_fields: HashMap<String, Vec<String>>,
+    struct_field_types: HashMap<String, Vec<MirType>>,
     struct_field_substructs: HashMap<String, Vec<Option<String>>>,
     struct_layouts: HashMap<String, LogicalLayoutV1>,
     struct_ops: Vec<MirStructOp>,
@@ -84,6 +85,7 @@ impl<'a> AstLowering<'a> {
             cleanups: vec![Vec::new()],
             loop_stack: Vec::new(),
             struct_fields: HashMap::new(),
+            struct_field_types: HashMap::new(),
             struct_field_substructs: HashMap::new(),
             struct_layouts: HashMap::new(),
             struct_ops: Vec::new(),
@@ -116,6 +118,13 @@ impl<'a> AstLowering<'a> {
 
     pub fn register_struct_def(&mut self, def: &StructDef) {
         let layout = struct_def_to_layout(def);
+        let field_mir_types: Vec<MirType> = def
+            .fields
+            .iter()
+            .map(|f| mir_type_from_ast(&f.ty))
+            .collect();
+        self.struct_field_types
+            .insert(def.name.clone(), field_mir_types);
         let substructs = def
             .fields
             .iter()
@@ -210,17 +219,45 @@ impl<'a> AstLowering<'a> {
         func_def: &FunctionDef,
         struct_defs: &[&StructDef],
     ) -> Result<(MirFunction, Vec<MirStructOp>), MirLowerError> {
+        Self::lower_function_with_structs_and_owner(func_def, None, struct_defs)
+    }
+
+    pub fn lower_function_with_structs_and_owner(
+        func_def: &FunctionDef,
+        owner_struct: Option<&str>,
+        struct_defs: &[&StructDef],
+    ) -> Result<(MirFunction, Vec<MirStructOp>), MirLowerError> {
         let sig = FunctionSignature {
             name: func_def.name.clone(),
             param_types: func_def
                 .params
                 .iter()
-                .map(|p| mir_type_from_ast(&p.ty))
+                .map(|p| {
+                    if let Some(owner) = owner_struct {
+                        if (p.is_self || p.name == "self")
+                            && matches!(p.ty.kind, TypeKind::Infer | TypeKind::Unknown)
+                        {
+                            return MirType::Struct(owner.to_string());
+                        }
+                        if matches!(&p.ty.kind, TypeKind::Named(n) if n == "Self") {
+                            return MirType::Struct(owner.to_string());
+                        }
+                    }
+                    mir_type_from_ast(&p.ty)
+                })
                 .collect(),
             return_type: func_def
                 .return_type
                 .as_ref()
-                .map(mir_type_from_ast)
+                .map(|rt| {
+                    if let Some(owner) = owner_struct
+                        && matches!(&rt.kind, TypeKind::Named(n) if n == "Self")
+                    {
+                        MirType::Struct(owner.to_string())
+                    } else {
+                        mir_type_from_ast(rt)
+                    }
+                })
                 .unwrap_or(MirType::Unit),
             is_public: true,
             effects: func_def.effects.clone(),
@@ -330,6 +367,67 @@ impl<'a> AstLowering<'a> {
                 subs.get(*field_idx).cloned().flatten()
             }
             Place::Index(..) => None,
+        }
+    }
+
+    fn get_place_mir_type(&self, place: &Place) -> Option<MirType> {
+        match place {
+            Place::Local(loc) => self.current_fn.locals.get(loc.0).map(|l| l.ty.clone()),
+            Place::Index(base, _) => match self.get_place_mir_type(base)? {
+                MirType::Array(inner) => Some(*inner),
+                MirType::Tuple(elems) => elems.first().cloned(),
+                _ => None,
+            },
+            Place::Field(base, field_idx) => {
+                if let Some(base_struct) = self.get_place_struct_name(base) {
+                    if let Some(fty) = self
+                        .struct_field_types
+                        .get(&base_struct)
+                        .and_then(|v| v.get(*field_idx))
+                    {
+                        return Some(fty.clone());
+                    }
+                    if let Some(layout) = self.struct_layouts.get(&base_struct)
+                        && let Some(f_desc) = layout.fields.get(*field_idx)
+                    {
+                        return Some(match f_desc.tag {
+                            CanonicalTypeTag::Bool => MirType::Bool,
+                            CanonicalTypeTag::Int64
+                            | CanonicalTypeTag::UInt64
+                            | CanonicalTypeTag::DateTimeUtc => MirType::Int,
+                            CanonicalTypeTag::Float64 => MirType::Float,
+                            CanonicalTypeTag::StringSlice => MirType::String,
+                            _ => MirType::Int,
+                        });
+                    }
+                }
+                match self.get_place_mir_type(base)? {
+                    MirType::Tuple(elems) => elems.get(*field_idx).cloned(),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    fn peek_place_expected_type(&self, expr: &Expr) -> Option<MirType> {
+        match &expr.kind {
+            ExprKind::Paren(inner) => self.peek_place_expected_type(inner),
+            ExprKind::Identifier(name) => {
+                let loc = self.lookup_var(name)?;
+                self.current_fn.locals.get(loc.0).map(|l| l.ty.clone())
+            }
+            ExprKind::FieldAccess { object, field } if field != "len" => {
+                let base_ty = self.peek_place_expected_type(object)?;
+                if let MirType::Struct(struct_name) = base_ty
+                    && let Some(names) = self.struct_fields.get(&struct_name)
+                    && let Some(pos) = names.iter().position(|n| n == field)
+                    && let Some(ftys) = self.struct_field_types.get(&struct_name)
+                {
+                    return ftys.get(pos).cloned();
+                }
+                None
+            }
+            _ => None,
         }
     }
 
@@ -523,8 +621,12 @@ impl<'a> AstLowering<'a> {
 
                 let init_operands = if let Some(inits) = initializer {
                     let mut ops = Vec::with_capacity(inits.len());
-                    for expr in inits {
-                        ops.push(self.lower_expr(expr)?);
+                    for (idx, expr) in inits.iter().enumerate() {
+                        let expected_ty = bindings
+                            .get(idx)
+                            .and_then(|b| b.type_annotation.as_ref())
+                            .map(mir_type_from_ast);
+                        ops.push(self.lower_expr_with_expected(expr, expected_ty.as_ref())?);
                     }
                     ops
                 } else {
@@ -544,6 +646,29 @@ impl<'a> AstLowering<'a> {
                         .as_ref()
                         .map(mir_type_from_ast)
                         .unwrap_or(inferred_ty);
+                    // Part A (`sieve.lust`): when an explicitly annotated `Array<T>` local is initialized
+                    // with an empty array literal `[]`, specialize the temporary local and its empty
+                    // aggregate from `Array(Unknown)` directly to `Array(T)`.
+                    if let MirType::Array(elem_ty) = &ty
+                        && **elem_ty != MirType::Unknown
+                        && let Operand::Move(Place::Local(tmp)) | Operand::Copy(Place::Local(tmp)) = &init_op
+                        && self.current_fn.locals[tmp.0].ty == MirType::Array(Box::new(MirType::Unknown))
+                    {
+                        self.current_fn.locals[tmp.0].ty = ty.clone();
+                        for prev_stmt in self.current_fn.blocks[self.current_block.0].statements.iter_mut().rev() {
+                            if let Statement::Assign(
+                                Place::Local(dst),
+                                Rvalue::Aggregate(agg_ty, elems),
+                                _,
+                            ) = prev_stmt
+                                && *dst == *tmp
+                                && elems.is_empty()
+                            {
+                                *agg_ty = ty.clone();
+                                break;
+                            }
+                        }
+                    }
                     let is_known = b.type_annotation.is_some()
                         || (ty == MirType::Int
                             && (!has_init || matches!(init_op, Operand::Constant(MirConstant::Int(_)))));
@@ -584,7 +709,32 @@ impl<'a> AstLowering<'a> {
                             )));
                         }
                     }
-                    let rval_op = self.lower_expr(val)?;
+                    let expected_ty = self.peek_place_expected_type(target);
+                    if targets.len() == 1
+                        && let ExprKind::Identifier(name) = &target.kind
+                        && let Some(dst_local) = self.lookup_var(name)
+                    {
+                        let mut inner_val = val;
+                        while let ExprKind::Paren(p) = &inner_val.kind {
+                            inner_val = p;
+                        }
+                        if let ExprKind::Binary {
+                            op: BinaryOp::Concat,
+                            left,
+                            right,
+                        } = &inner_val.kind
+                        {
+                            let lhs_op = self.lower_expr(left)?;
+                            let rhs_op = self.lower_expr(right)?;
+                            self.emit_stmt(Statement::Assign(
+                                Place::Local(dst_local),
+                                Rvalue::BinaryOp(MirBinaryOp::Concat, lhs_op, rhs_op),
+                                stmt.span,
+                            ));
+                            continue;
+                        }
+                    }
+                    let rval_op = self.lower_expr_with_expected(val, expected_ty.as_ref())?;
                     let place = self.lower_place(target)?
                         .ok_or_else(|| MirLowerError::UnsupportedLvalue(format!("{:?}", target.kind)))?;
                     self.emit_stmt(Statement::Assign(place, Rvalue::Use(rval_op), stmt.span));
@@ -643,12 +793,20 @@ impl<'a> AstLowering<'a> {
                 self.current_block = body_block;
                 self.loop_stack.push((header, exit_block));
                 self.push_scope();
-                for (name, ty, place) in body_bindings {
-                    let binding_local = self.current_fn.add_local(Some(name.clone()), ty, false, stmt.span);
+                for (name, ty, place, unwrap_option) in body_bindings {
+                    let binding_local = self.current_fn.add_local(Some(name.clone()), ty.clone(), false, stmt.span);
+                    if ty != MirType::Unknown {
+                        self.known_typed_locals.insert(binding_local);
+                    }
                     self.emit_stmt(Statement::StorageLive(binding_local, stmt.span));
+                    let rval = if unwrap_option {
+                        Rvalue::Cast(Operand::Copy(place), ty)
+                    } else {
+                        Rvalue::Use(Operand::Copy(place))
+                    };
                     self.emit_stmt(Statement::Assign(
                         Place::Local(binding_local),
-                        Rvalue::Use(Operand::Copy(place)),
+                        rval,
                         stmt.span,
                     ));
                     self.insert_var(name, binding_local);
@@ -682,7 +840,8 @@ impl<'a> AstLowering<'a> {
                     self.terminate_block(Terminator::Goto(cont_bb, stmt.span));
                 } else {
                     let ret_op = if let Some(first) = exprs.first() {
-                        let op = self.lower_expr(first)?;
+                        let expected_ret = self.current_fn.signature.return_type.clone();
+                        let op = self.lower_expr_with_expected(first, Some(&expected_ret))?;
                         let ret_ty = if matches!(
                             self.current_fn.signature.return_type,
                             MirType::Unit | MirType::Unknown
@@ -1267,7 +1426,7 @@ impl<'a> AstLowering<'a> {
         &mut self,
         condition: &Expr,
         span: crate::ast::Span,
-    ) -> Result<(Operand, Vec<(String, MirType, Place)>), MirLowerError> {
+    ) -> Result<(Operand, Vec<(String, MirType, Place, bool)>), MirLowerError> {
         match &condition.kind {
             ExprKind::Paren(inner) => self.lower_condition_with_bindings(inner, span),
             ExprKind::IsPattern { expr: scrutinee, pattern } => {
@@ -1366,15 +1525,116 @@ impl<'a> AstLowering<'a> {
                             let elem_place = Place::Index(Box::new(base_place), idx_local);
                             let mut out_bindings = Vec::new();
                             if let Some(crate::ast::Pattern::Identifier(binding_name)) = bindings.first() {
-                                out_bindings.push((binding_name.clone(), elem_ty, elem_place));
+                                out_bindings.push((binding_name.clone(), elem_ty, elem_place, false));
                             }
 
                             return Ok((Operand::Move(Place::Local(in_bounds_temp)), out_bindings));
                         }
 
+                        // PERF-T2-5: Lower `if place is Some(binding)` on struct fields or locals of
+                        // type `Option<Struct(S)>` into a zero-boxing null-pointer check (`val != 0`).
+                        if variant == "Some" && bindings.len() <= 1 {
+                            let valid_binding = bindings.first().is_none_or(|p| {
+                                matches!(
+                                    p,
+                                    crate::ast::Pattern::Identifier(_) | crate::ast::Pattern::Wildcard
+                                )
+                            });
+                            if valid_binding {
+                                let (scrutinee_op, scrutinee_ty) = if let Some(p) = self.lower_place(scrutinee)? {
+                                    let ty = self.get_place_mir_type(&p);
+                                    (Operand::Copy(p), ty)
+                                } else {
+                                    let op = self.lower_expr(scrutinee)?;
+                                    let ty = Some(self.operand_definite_mir_type(&op));
+                                    (op, ty)
+                                };
+                                if let Some(MirType::Option(inner)) = scrutinee_ty
+                                    && let MirType::Struct(struct_name) = *inner
+                                    && !struct_name.is_empty()
+                                {
+                                    let opt_ty = MirType::Option(Box::new(MirType::Struct(struct_name.clone())));
+                                    let opt_tmp = self.current_fn.add_local(None, opt_ty, true, span);
+                                    self.known_typed_locals.insert(opt_tmp);
+                                    self.emit_stmt(Statement::StorageLive(opt_tmp, span));
+                                    self.emit_stmt(Statement::Assign(
+                                        Place::Local(opt_tmp),
+                                        Rvalue::Use(scrutinee_op),
+                                        span,
+                                    ));
+
+                                    let cond_tmp = self.current_fn.add_local(None, MirType::Bool, true, span);
+                                    self.emit_stmt(Statement::StorageLive(cond_tmp, span));
+                                    self.emit_stmt(Statement::Assign(
+                                        Place::Local(cond_tmp),
+                                        Rvalue::BinaryOp(
+                                            MirBinaryOp::NotEq,
+                                            Operand::Copy(Place::Local(opt_tmp)),
+                                            Operand::Constant(MirConstant::Int(0)),
+                                        ),
+                                        span,
+                                    ));
+
+                                    let mut out_bindings = Vec::new();
+                                    if let Some(crate::ast::Pattern::Identifier(binding_name)) = bindings.first() {
+                                        out_bindings.push((
+                                            binding_name.clone(),
+                                            MirType::Struct(struct_name),
+                                            Place::Local(opt_tmp),
+                                            true,
+                                        ));
+                                    }
+                                    return Ok((Operand::Move(Place::Local(cond_tmp)), out_bindings));
+                                }
+                            }
+                        }
+
                         Err(MirLowerError::UnlowerableExpression(format!(
                             "non-indexed is-pattern '{variant}' is not supported in MIR lowering"
                         )))
+                    }
+                    crate::ast::Pattern::Enum { variant, bindings, .. }
+                        if variant == "None" && bindings.is_empty() =>
+                    {
+                        let (scrutinee_op, scrutinee_ty) = if let Some(p) = self.lower_place(scrutinee)? {
+                            let ty = self.get_place_mir_type(&p);
+                            (Operand::Copy(p), ty)
+                        } else {
+                            let op = self.lower_expr(scrutinee)?;
+                            let ty = Some(self.operand_definite_mir_type(&op));
+                            (op, ty)
+                        };
+                        if let Some(MirType::Option(inner)) = scrutinee_ty
+                            && let MirType::Struct(struct_name) = *inner
+                            && !struct_name.is_empty()
+                        {
+                            let opt_ty = MirType::Option(Box::new(MirType::Struct(struct_name)));
+                            let opt_tmp = self.current_fn.add_local(None, opt_ty, true, span);
+                            self.known_typed_locals.insert(opt_tmp);
+                            self.emit_stmt(Statement::StorageLive(opt_tmp, span));
+                            self.emit_stmt(Statement::Assign(
+                                Place::Local(opt_tmp),
+                                Rvalue::Use(scrutinee_op),
+                                span,
+                            ));
+
+                            let cond_tmp = self.current_fn.add_local(None, MirType::Bool, true, span);
+                            self.emit_stmt(Statement::StorageLive(cond_tmp, span));
+                            self.emit_stmt(Statement::Assign(
+                                Place::Local(cond_tmp),
+                                Rvalue::BinaryOp(
+                                    MirBinaryOp::Eq,
+                                    Operand::Copy(Place::Local(opt_tmp)),
+                                    Operand::Constant(MirConstant::Int(0)),
+                                ),
+                                span,
+                            ));
+                            return Ok((Operand::Move(Place::Local(cond_tmp)), Vec::new()));
+                        }
+
+                        Err(MirLowerError::UnlowerableExpression(
+                            "non-indexed is-pattern 'None' is not supported in MIR lowering".to_string(),
+                        ))
                     }
                     crate::ast::Pattern::Wildcard => {
                         Ok((Operand::Constant(MirConstant::Bool(true)), Vec::new()))
@@ -1393,7 +1653,7 @@ impl<'a> AstLowering<'a> {
                             self.emit_stmt(Statement::Assign(Place::Local(temp), Rvalue::Use(op), span));
                             (Place::Local(temp), MirType::Int)
                         };
-                        Ok((Operand::Constant(MirConstant::Bool(true)), vec![(name.clone(), ty, place)]))
+                        Ok((Operand::Constant(MirConstant::Bool(true)), vec![(name.clone(), ty, place, false)]))
                     }
                     crate::ast::Pattern::Literal(lit) => {
                         let scrutinee_op = self.lower_expr(scrutinee)?;
@@ -1416,6 +1676,49 @@ impl<'a> AstLowering<'a> {
                         "unsupported is-pattern in MIR lowering".to_string(),
                     )),
                 }
+            }
+            ExprKind::TypeCheck { expr: scrutinee, check_type }
+                if matches!(&check_type.kind, TypeKind::Named(n) if n == "None") =>
+            {
+                let (scrutinee_op, scrutinee_ty) = if let Some(p) = self.lower_place(scrutinee)? {
+                    let ty = self.get_place_mir_type(&p);
+                    (Operand::Copy(p), ty)
+                } else {
+                    let op = self.lower_expr(scrutinee)?;
+                    let ty = Some(self.operand_definite_mir_type(&op));
+                    (op, ty)
+                };
+                if let Some(MirType::Option(inner)) = scrutinee_ty
+                    && let MirType::Struct(struct_name) = *inner
+                    && !struct_name.is_empty()
+                {
+                    let opt_ty = MirType::Option(Box::new(MirType::Struct(struct_name)));
+                    let opt_tmp = self.current_fn.add_local(None, opt_ty, true, span);
+                    self.known_typed_locals.insert(opt_tmp);
+                    self.emit_stmt(Statement::StorageLive(opt_tmp, span));
+                    self.emit_stmt(Statement::Assign(
+                        Place::Local(opt_tmp),
+                        Rvalue::Use(scrutinee_op),
+                        span,
+                    ));
+
+                    let cond_tmp = self.current_fn.add_local(None, MirType::Bool, true, span);
+                    self.emit_stmt(Statement::StorageLive(cond_tmp, span));
+                    self.emit_stmt(Statement::Assign(
+                        Place::Local(cond_tmp),
+                        Rvalue::BinaryOp(
+                            MirBinaryOp::Eq,
+                            Operand::Copy(Place::Local(opt_tmp)),
+                            Operand::Constant(MirConstant::Int(0)),
+                        ),
+                        span,
+                    ));
+                    return Ok((Operand::Move(Place::Local(cond_tmp)), Vec::new()));
+                }
+                Err(MirLowerError::UnlowerableExpression(
+                    "TypeCheck 'is None' on non-Option<Struct> is not supported in MIR lowering"
+                        .to_string(),
+                ))
             }
             _ => Ok((self.lower_expr(condition)?, Vec::new())),
         }
@@ -1449,12 +1752,20 @@ impl<'a> AstLowering<'a> {
         // Lower Then Block
         self.current_block = then_bb;
         self.push_scope();
-        for (name, ty, place) in then_bindings {
-            let binding_local = self.current_fn.add_local(Some(name.clone()), ty, false, span);
+        for (name, ty, place, unwrap_option) in then_bindings {
+            let binding_local = self.current_fn.add_local(Some(name.clone()), ty.clone(), false, span);
+            if ty != MirType::Unknown {
+                self.known_typed_locals.insert(binding_local);
+            }
             self.emit_stmt(Statement::StorageLive(binding_local, span));
+            let rval = if unwrap_option {
+                Rvalue::Cast(Operand::Copy(place), ty)
+            } else {
+                Rvalue::Use(Operand::Copy(place))
+            };
             self.emit_stmt(Statement::Assign(
                 Place::Local(binding_local),
-                Rvalue::Use(Operand::Copy(place)),
+                rval,
                 span,
             ));
             self.insert_var(name, binding_local);
@@ -1491,12 +1802,20 @@ impl<'a> AstLowering<'a> {
 
             self.current_block = elif_then;
             self.push_scope();
-            for (name, ty, place) in elif_bindings {
-                let binding_local = self.current_fn.add_local(Some(name.clone()), ty, false, span);
+            for (name, ty, place, unwrap_option) in elif_bindings {
+                let binding_local = self.current_fn.add_local(Some(name.clone()), ty.clone(), false, span);
+                if ty != MirType::Unknown {
+                    self.known_typed_locals.insert(binding_local);
+                }
                 self.emit_stmt(Statement::StorageLive(binding_local, span));
+                let rval = if unwrap_option {
+                    Rvalue::Cast(Operand::Copy(place), ty)
+                } else {
+                    Rvalue::Use(Operand::Copy(place))
+                };
                 self.emit_stmt(Statement::Assign(
                     Place::Local(binding_local),
-                    Rvalue::Use(Operand::Copy(place)),
+                    rval,
                     span,
                 ));
                 self.insert_var(name, binding_local);
@@ -1532,6 +1851,76 @@ impl<'a> AstLowering<'a> {
     }
 
     pub fn lower_expr(&mut self, expr: &Expr) -> Result<Operand, MirLowerError> {
+        self.lower_expr_with_expected(expr, None)
+    }
+
+    fn lower_option_struct_none(
+        &mut self,
+        expected_ty: Option<&MirType>,
+        span: crate::ast::Span,
+    ) -> Option<Operand> {
+        let Some(MirType::Option(inner)) = expected_ty else {
+            return None;
+        };
+        if !matches!(&**inner, MirType::Struct(name) if !name.is_empty()) {
+            return None;
+        }
+        let opt_ty = MirType::Option(inner.clone());
+        let temp = self.current_fn.add_local(None, opt_ty.clone(), true, span);
+        self.known_typed_locals.insert(temp);
+        self.emit_stmt(Statement::StorageLive(temp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(temp),
+            Rvalue::Cast(Operand::Constant(MirConstant::Int(0)), opt_ty),
+            span,
+        ));
+        Some(Operand::Move(Place::Local(temp)))
+    }
+
+    fn lower_option_struct_some(
+        &mut self,
+        arg_expr: &Expr,
+        expected_ty: Option<&MirType>,
+        span: crate::ast::Span,
+    ) -> Result<Operand, MirLowerError> {
+        let inner_expected = match expected_ty {
+            Some(MirType::Option(inner)) => Some(inner.as_ref()),
+            _ => None,
+        };
+        let arg_op = self.lower_expr_with_expected(arg_expr, inner_expected)?;
+        let arg_ty = self.operand_definite_mir_type(&arg_op);
+        let opt_ty = match arg_ty {
+            MirType::Struct(struct_name) if !struct_name.is_empty() => {
+                Some(MirType::Option(Box::new(MirType::Struct(struct_name))))
+            }
+            _ => match expected_ty {
+                Some(MirType::Option(inner))
+                    if matches!(&**inner, MirType::Struct(name) if !name.is_empty()) =>
+                {
+                    Some(MirType::Option(inner.clone()))
+                }
+                _ => None,
+            },
+        };
+        if let Some(opt_ty) = opt_ty {
+            let temp = self.current_fn.add_local(None, opt_ty.clone(), true, span);
+            self.known_typed_locals.insert(temp);
+            self.emit_stmt(Statement::StorageLive(temp, span));
+            self.emit_stmt(Statement::Assign(
+                Place::Local(temp),
+                Rvalue::Cast(arg_op, opt_ty),
+                span,
+            ));
+            return Ok(Operand::Move(Place::Local(temp)));
+        }
+        Ok(arg_op)
+    }
+
+    pub fn lower_expr_with_expected(
+        &mut self,
+        expr: &Expr,
+        expected_ty: Option<&MirType>,
+    ) -> Result<Operand, MirLowerError> {
         match &expr.kind {
             ExprKind::Literal(lit) => Ok(match lit {
                 Literal::Integer(i) => Operand::Constant(MirConstant::Int(*i)),
@@ -1549,6 +1938,12 @@ impl<'a> AstLowering<'a> {
                     Err(MirLowerError::UnlowerableExpression(format!(
                         "Effect thunk '{name}' cannot escape or be used as a value"
                     )))
+                } else if name == "None" {
+                    if let Some(none_op) = self.lower_option_struct_none(expected_ty, expr.span) {
+                        Ok(none_op)
+                    } else {
+                        Ok(Operand::Constant(MirConstant::Int(0)))
+                    }
                 } else {
                     Ok(Operand::Constant(MirConstant::Int(0)))
                 }
@@ -1558,7 +1953,7 @@ impl<'a> AstLowering<'a> {
                     "Bare EffectBlock in unsupported value context; only local bindings are supported".into(),
                 ))
             }
-            ExprKind::Paren(inner) => self.lower_expr(inner),
+            ExprKind::Paren(inner) => self.lower_expr_with_expected(inner, expected_ty),
             ExprKind::Binary { left, op, right } => {
                 if *op == BinaryOp::And {
                     let res_local = self.current_fn.add_local(None, MirType::Bool, true, expr.span);
@@ -1635,6 +2030,7 @@ impl<'a> AstLowering<'a> {
                 let mir_op = mir_binop_from_ast(*op)?;
                 let res_ty = match mir_op {
                     MirBinaryOp::Eq | MirBinaryOp::NotEq | MirBinaryOp::Lt | MirBinaryOp::LtEq | MirBinaryOp::Gt | MirBinaryOp::GtEq => MirType::Bool,
+                    MirBinaryOp::Concat => MirType::String,
                     _ => MirType::Int,
                 };
                 let temp = self.current_fn.add_local(None, res_ty, true, expr.span);
@@ -1688,17 +2084,25 @@ impl<'a> AstLowering<'a> {
 
                 self.current_block = then_bb;
                 self.push_scope();
-                for (name, ty, place) in bindings {
-                    let binding_local = self.current_fn.add_local(Some(name.clone()), ty, false, expr.span);
+                for (name, ty, place, unwrap_option) in bindings {
+                    let binding_local = self.current_fn.add_local(Some(name.clone()), ty.clone(), false, expr.span);
+                    if ty != MirType::Unknown {
+                        self.known_typed_locals.insert(binding_local);
+                    }
                     self.emit_stmt(Statement::StorageLive(binding_local, expr.span));
+                    let rval = if unwrap_option {
+                        Rvalue::Cast(Operand::Copy(place), ty)
+                    } else {
+                        Rvalue::Use(Operand::Copy(place))
+                    };
                     self.emit_stmt(Statement::Assign(
                         Place::Local(binding_local),
-                        Rvalue::Use(Operand::Copy(place)),
+                        rval,
                         expr.span,
                     ));
                     self.insert_var(name, binding_local);
                 }
-                let then_op = self.lower_expr(then_branch)?;
+                let then_op = self.lower_expr_with_expected(then_branch, expected_ty)?;
                 self.emit_stmt(Statement::Assign(
                     Place::Local(res_local),
                     Rvalue::Use(then_op),
@@ -1711,7 +2115,7 @@ impl<'a> AstLowering<'a> {
 
                 self.current_block = else_bb;
                 if let Some(eb) = else_branch {
-                    let else_op = self.lower_expr(eb)?;
+                    let else_op = self.lower_expr_with_expected(eb, expected_ty)?;
                     self.emit_stmt(Statement::Assign(
                         Place::Local(res_local),
                         Rvalue::Use(else_op),
@@ -1726,6 +2130,12 @@ impl<'a> AstLowering<'a> {
                 Ok(Operand::Move(Place::Local(res_local)))
             }
             ExprKind::IsPattern { .. } => {
+                let (cond_op, _) = self.lower_condition_with_bindings(expr, expr.span)?;
+                Ok(cond_op)
+            }
+            ExprKind::TypeCheck { check_type, .. }
+                if matches!(&check_type.kind, TypeKind::Named(n) if n == "None") =>
+            {
                 let (cond_op, _) = self.lower_condition_with_bindings(expr, expr.span)?;
                 Ok(cond_op)
             }
@@ -1811,6 +2221,17 @@ impl<'a> AstLowering<'a> {
             }
             ExprKind::MethodCall { receiver, method, args, .. } if method == "len" && args.is_empty() => {
                 let rec_op = self.lower_expr(receiver)?;
+                if let MirType::Struct(struct_name) = self.operand_definite_mir_type(&rec_op)
+                    && !struct_name.is_empty()
+                {
+                    return self.lower_struct_method_call(
+                        struct_name,
+                        method,
+                        rec_op,
+                        args,
+                        expr.span,
+                    );
+                }
                 let temp = self.current_fn.add_local(None, MirType::Int, true, expr.span);
                 self.emit_stmt(Statement::StorageLive(temp, expr.span));
                 self.emit_stmt(Statement::Assign(
@@ -1821,7 +2242,26 @@ impl<'a> AstLowering<'a> {
                 Ok(Operand::Move(Place::Local(temp)))
             }
             ExprKind::MethodCall { receiver, method, args, .. } if method == "unwrap" && args.is_empty() => {
-                self.lower_expr(receiver)
+                if Self::is_index_expr(receiver) {
+                    self.lower_expr(receiver)
+                } else {
+                    let rec_op = self.lower_expr(receiver)?;
+                    if let MirType::Struct(struct_name) = self.operand_definite_mir_type(&rec_op)
+                        && !struct_name.is_empty()
+                    {
+                        self.lower_struct_method_call(
+                            struct_name,
+                            method,
+                            rec_op,
+                            args,
+                            expr.span,
+                        )
+                    } else {
+                        Err(MirLowerError::UnlowerableExpression(format!(
+                            "method call ':{method}' on non-index non-struct receiver is not supported in MIR lowering"
+                        )))
+                    }
+                }
             }
             ExprKind::MethodCall { receiver, method, args, .. } if method == "run_sync" => {
                 if !args.is_empty() {
@@ -1912,32 +2352,73 @@ impl<'a> AstLowering<'a> {
                 let mut lowered = Vec::with_capacity(fields.len());
                 let mut field_names = Vec::with_capacity(fields.len());
                 let mut field_substructs = Vec::with_capacity(fields.len());
+                let declared_names_opt = self.struct_fields.get(name).cloned();
+                let declared_types_opt = self.struct_field_types.get(name).cloned();
                 for f in fields {
                     let sub = match &f.value.kind {
                         ExprKind::StructLiteral { name: sub_name, .. } => Some(sub_name.clone()),
                         _ => None,
                     };
                     field_substructs.push(sub);
-                    lowered.push(self.lower_expr(&f.value)?);
+                    let expected_field_ty = declared_names_opt
+                        .as_ref()
+                        .and_then(|names| names.iter().position(|n| n == &f.name))
+                        .and_then(|pos| declared_types_opt.as_ref().and_then(|tys| tys.get(pos)));
+                    lowered.push(self.lower_expr_with_expected(&f.value, expected_field_ty)?);
                     field_names.push(f.name.clone());
                 }
-                self.struct_fields.insert(name.clone(), field_names.clone());
-                self.struct_field_substructs.insert(name.clone(), field_substructs);
+                let (ordered_lowered, ordered_names) =
+                    if let Some(declared_fields) = declared_names_opt
+                        && declared_fields.len() == fields.len()
+                        && declared_fields.iter().all(|df| field_names.contains(df))
+                    {
+                        let mut by_name: HashMap<String, Operand> = field_names
+                            .into_iter()
+                            .zip(lowered.into_iter())
+                            .collect();
+                        let ordered: Vec<Operand> = declared_fields
+                            .iter()
+                            .map(|df| by_name.remove(df).unwrap())
+                            .collect();
+                        (ordered, declared_fields)
+                    } else {
+                        self.struct_fields.insert(name.clone(), field_names.clone());
+                        self.struct_field_substructs
+                            .insert(name.clone(), field_substructs);
+                        (lowered, field_names)
+                    };
                 let struct_ty = MirType::Struct(name.clone());
                 let temp = self.current_fn.add_local(None, struct_ty.clone(), true, expr.span);
-                self.local_field_names.insert(temp, field_names);
+                self.local_field_names.insert(temp, ordered_names);
                 self.emit_stmt(Statement::StorageLive(temp, expr.span));
                 self.emit_stmt(Statement::Assign(
                     Place::Local(temp),
-                    Rvalue::Aggregate(struct_ty, lowered),
+                    Rvalue::Aggregate(struct_ty, ordered_lowered),
                     expr.span,
                 ));
                 Ok(Operand::Move(Place::Local(temp)))
+            }
+            ExprKind::EnumConstructor { enum_name, variant, args } => {
+                if enum_name == "Option" && variant == "None" && args.is_empty() {
+                    if let Some(none_op) = self.lower_option_struct_none(expected_ty, expr.span) {
+                        return Ok(none_op);
+                    }
+                } else if enum_name == "Option" && variant == "Some" && args.len() == 1 {
+                    return self.lower_option_struct_some(&args[0], expected_ty, expr.span);
+                }
+                Err(MirLowerError::UnlowerableExpression(format!(
+                    "enum constructor '{enum_name}.{variant}' is not supported in MIR lowering"
+                )))
             }
             ExprKind::FieldAccess { object, field } if field != "len" => {
                 if let ExprKind::Identifier(name) = &object.kind
                     && self.lookup_var(name).is_none()
                 {
+                    if name == "Option" && field == "None" {
+                        if let Some(none_op) = self.lower_option_struct_none(expected_ty, expr.span) {
+                            return Ok(none_op);
+                        }
+                    }
                     return Err(MirLowerError::UnlowerableExpression(format!(
                         "field access on non-local '{name}.{field}' is not supported in MIR lowering"
                     )));
@@ -1964,17 +2445,27 @@ impl<'a> AstLowering<'a> {
                 let mut field_mir_ty = MirType::Int;
                 let mut recorded_load: Option<(String, u16, usize, CanonicalTypeTag)> = None;
                 if let Some(struct_name) = self.get_place_struct_name(&base_place) {
+                    let explicit_field_ty = self
+                        .struct_field_types
+                        .get(&struct_name)
+                        .and_then(|v| v.get(field_idx))
+                        .cloned();
+                    if let Some(fty) = explicit_field_ty.as_ref() {
+                        field_mir_ty = fty.clone();
+                    }
                     if let Some(layout) = self.struct_layouts.get(&struct_name) {
                         if let Some(f_desc) = layout.field_by_name(field) {
-                            field_mir_ty = match f_desc.tag {
-                                CanonicalTypeTag::Bool => MirType::Bool,
-                                CanonicalTypeTag::Int64
-                                | CanonicalTypeTag::UInt64
-                                | CanonicalTypeTag::DateTimeUtc => MirType::Int,
-                                CanonicalTypeTag::Float64 => MirType::Float,
-                                CanonicalTypeTag::StringSlice => MirType::String,
-                                _ => MirType::Int,
-                            };
+                            if explicit_field_ty.is_none() {
+                                field_mir_ty = match f_desc.tag {
+                                    CanonicalTypeTag::Bool => MirType::Bool,
+                                    CanonicalTypeTag::Int64
+                                    | CanonicalTypeTag::UInt64
+                                    | CanonicalTypeTag::DateTimeUtc => MirType::Int,
+                                    CanonicalTypeTag::Float64 => MirType::Float,
+                                    CanonicalTypeTag::StringSlice => MirType::String,
+                                    _ => MirType::Int,
+                                };
+                            }
                             recorded_load = Some((
                                 struct_name,
                                 f_desc.ordinal,
@@ -2112,7 +2603,12 @@ impl<'a> AstLowering<'a> {
                     _ => "unknown_callee".into(),
                 };
                 match callee_name.as_str() {
-                    "Ok" | "Result.Ok" | "Some" | "Option.Some" => {
+                    "Some" | "Option.Some" => {
+                        if let Some(arg) = args.first() {
+                            return self.lower_option_struct_some(arg, expected_ty, expr.span);
+                        }
+                    }
+                    "Ok" | "Result.Ok" => {
                         if let Some(arg) = args.first() {
                             return self.lower_expr(arg);
                         }
@@ -2123,6 +2619,9 @@ impl<'a> AstLowering<'a> {
                         }
                     }
                     "None" | "Option.None" => {
+                        if let Some(none_op) = self.lower_option_struct_none(expected_ty, expr.span) {
+                            return Ok(none_op);
+                        }
                         return Ok(Operand::Constant(MirConstant::Int(0)));
                     }
                     _ => {}
@@ -2138,7 +2637,12 @@ impl<'a> AstLowering<'a> {
                 for a in args {
                     lowered_args.push(self.lower_expr(a)?);
                 }
-                let temp = self.current_fn.add_local(None, MirType::Int, true, expr.span);
+                let call_ret_ty = if callee_name == "tostring" {
+                    MirType::String
+                } else {
+                    MirType::Int
+                };
+                let temp = self.current_fn.add_local(None, call_ret_ty, true, expr.span);
                 let succ_bb = self.current_fn.new_block();
 
                 self.emit_stmt(Statement::StorageLive(temp, expr.span));
@@ -2153,6 +2657,18 @@ impl<'a> AstLowering<'a> {
 
                 self.current_block = succ_bb;
                 Ok(Operand::Move(Place::Local(temp)))
+            }
+            ExprKind::MethodCall { receiver, method, args, .. } => {
+                let rec_op = self.lower_expr(receiver)?;
+                if let MirType::Struct(struct_name) = self.operand_definite_mir_type(&rec_op)
+                    && !struct_name.is_empty()
+                {
+                    self.lower_struct_method_call(struct_name, method, rec_op, args, expr.span)
+                } else {
+                    Err(MirLowerError::UnlowerableExpression(format!(
+                        "method call ':{method}' on non-struct receiver is not supported in MIR lowering"
+                    )))
+                }
             }
             ExprKind::Cast { expr: inner, target_type } => {
                 let inner_op = self.lower_expr(inner)?;
@@ -2212,6 +2728,45 @@ impl<'a> AstLowering<'a> {
             ExprKind::FieldAccess { .. } => Err(MirLowerError::UnsupportedLvalue(format!("{:?}", expr.kind))),
             _ => Ok(None),
         }
+    }
+
+    fn is_index_expr(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Index { .. } => true,
+            ExprKind::Paren(inner) => Self::is_index_expr(inner),
+            _ => false,
+        }
+    }
+
+    fn lower_struct_method_call(
+        &mut self,
+        struct_name: String,
+        method: &str,
+        rec_op: Operand,
+        args: &[Expr],
+        span: crate::ast::Span,
+    ) -> Result<Operand, MirLowerError> {
+        let mut lowered_args = Vec::with_capacity(1 + args.len());
+        lowered_args.push(rec_op);
+        for a in args {
+            lowered_args.push(self.lower_expr(a)?);
+        }
+        let callee_name = format!("{struct_name}:{method}");
+        let temp = self.current_fn.add_local(None, MirType::Int, true, span);
+        let succ_bb = self.current_fn.new_block();
+
+        self.emit_stmt(Statement::StorageLive(temp, span));
+        self.terminate_block(Terminator::Call {
+            callee: callee_name,
+            args: lowered_args,
+            destination: Place::Local(temp),
+            success: succ_bb,
+            error: None,
+            span,
+        });
+
+        self.current_block = succ_bb;
+        Ok(Operand::Move(Place::Local(temp)))
     }
 
     fn emit_stmt(&mut self, stmt: Statement) {
@@ -2596,7 +3151,12 @@ pub fn mir_type_from_ast(ty: &Type) -> MirType {
         TypeKind::Map(k, v) => {
             MirType::Map(Box::new(mir_type_from_ast(k)), Box::new(mir_type_from_ast(v)))
         }
-        TypeKind::Option(_) => MirType::Enum("Option".to_string()),
+        TypeKind::Option(inner) => match mir_type_from_ast(inner) {
+            MirType::Struct(name) if !name.is_empty() => {
+                MirType::Option(Box::new(MirType::Struct(name)))
+            }
+            _ => MirType::Enum("Option".to_string()),
+        },
         TypeKind::Result(_, _) => MirType::Enum("Result".to_string()),
         TypeKind::Effect { success, error, .. } => MirType::Effect {
             return_type: Box::new(mir_type_from_ast(success)),
@@ -2633,6 +3193,7 @@ pub fn mir_binop_from_ast(op: BinaryOp) -> Result<MirBinaryOp, MirLowerError> {
         BinaryOp::Ge => Ok(MirBinaryOp::GtEq),
         BinaryOp::And => Ok(MirBinaryOp::And),
         BinaryOp::Or => Ok(MirBinaryOp::Or),
+        BinaryOp::Concat => Ok(MirBinaryOp::Concat),
         _ => Err(MirLowerError::UnsupportedBinaryOp(op)),
     }
 }

@@ -836,6 +836,7 @@ fn rvalue_to_c(rval: &Rvalue) -> String {
                 MirBinaryOp::GtEq => format!("({l_expr} >= {r_expr})"),
                 MirBinaryOp::And => format!("({l_expr} && {r_expr})"),
                 MirBinaryOp::Or => format!("({l_expr} || {r_expr})"),
+                MirBinaryOp::Concat => format!("__lust_str_concat({l_expr}, {r_expr})"),
             }
         }
         Rvalue::UnaryOp(unop, op) => {

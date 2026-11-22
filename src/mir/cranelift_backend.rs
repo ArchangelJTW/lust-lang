@@ -7,7 +7,7 @@ pub use jit_engine::{
     lust_mir_alloc_array_typed, lust_mir_alloc_cflat_struct, lust_mir_alloc_enum,
     lust_mir_alloc_map, lust_mir_alloc_struct, lust_mir_alloc_struct_named,
     lust_mir_alloc_tuple, lust_mir_alloc_tuple_typed, lust_mir_array_get, lust_mir_array_len,
-    lust_mir_array_len_checked, lust_mir_array_set,
+    lust_mir_array_len_checked, lust_mir_array_push, lust_mir_array_set, MirArrayHeader,
     mir_array_elem_tag, MIR_ARRAY_ELEM_TAG_BOOL, MIR_ARRAY_ELEM_TAG_FLOAT,
     MIR_ARRAY_ELEM_TAG_INT, MIR_ARRAY_ELEM_TAG_STRING,
     lust_mir_charge_gas, lust_mir_clamp_int, lust_mir_div_int, lust_mir_enum_payload,
@@ -16,12 +16,14 @@ pub use jit_engine::{
     lust_mir_ic_probe, lust_mir_init_deopt, lust_mir_init_deopt_at_terminator, lust_mir_map_get, lust_mir_map_len,
     lust_mir_map_set, lust_mir_max_int, lust_mir_min_int, lust_mir_pow_float,
     lust_mir_pow_int, lust_mir_print_bool_part, lust_mir_print_float_part, lust_mir_print_int,
-    lust_mir_print_int_part, lust_mir_print_nl, lust_mir_print_sep, lust_mir_record_deopt,
+    lust_mir_print_int_part, lust_mir_print_nl, lust_mir_print_sep, lust_mir_print_string_part,
+    lust_mir_record_deopt,
     lust_mir_record_deopt_local,
     lust_mir_record_native_entry, lust_mir_rem_float, lust_mir_rem_int, lust_mir_safepoint,
     lust_mir_safepoint_slow, lust_mir_safepoint_state_ptr,
     lust_mir_set_gas, lust_mir_set_max_memory, lust_mir_set_memory_limit, lust_mir_set_status,
-    lust_mir_string_concat, lust_mir_string_eq, lust_mir_string_len,
+    lust_mir_string_append_inplace, lust_mir_string_concat, lust_mir_string_eq,
+    lust_mir_string_len, lust_mir_tostring_bool, lust_mir_tostring_float, lust_mir_tostring_int,
     lust_mir_struct_decode_binary, lust_mir_struct_decode_contiguous, publish_deopt_payload,
     publish_deopt_payload_with_func, publish_deopt_payload_name_only,
     publish_deopt_payload_at_terminator, publish_deopt_payload_with_site_kind,
@@ -293,6 +295,23 @@ pub mod jit_engine {
                             }
                         }
                     }
+                    MirType::Option(_) => {
+                        if raw_val == 0 {
+                            crate::bytecode::Value::none()
+                        } else {
+                            let handle_val = with_current_mir_context(|ctx| ctx.get_handle(raw_val));
+                            match handle_val {
+                                Some(v) => v,
+                                None => {
+                                    return Err(DeoptConversionError::InvalidReferenceHandle {
+                                        local_idx: loc_idx,
+                                        handle: raw_val,
+                                        ty: opt_ty.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
                     other => {
                         return Err(DeoptConversionError::UnsupportedType {
                             local_idx: loc_idx,
@@ -341,6 +360,14 @@ pub mod jit_engine {
                     | Some(MirType::Enum(_)) => {
                         let handle_val = with_current_mir_context(|ctx| ctx.get_handle(raw_val));
                         handle_val.unwrap_or(crate::bytecode::Value::Nil)
+                    }
+                    Some(MirType::Option(_)) => {
+                        if raw_val == 0 {
+                            crate::bytecode::Value::none()
+                        } else {
+                            let handle_val = with_current_mir_context(|ctx| ctx.get_handle(raw_val));
+                            handle_val.unwrap_or(crate::bytecode::Value::Nil)
+                        }
                     }
                     _ => crate::bytecode::Value::Nil,
                 };
@@ -1831,6 +1858,7 @@ pub mod jit_engine {
             builder.symbol("lust_mir_array_len_checked", lust_mir_array_len_checked as *const u8);
             builder.symbol("lust_mir_array_get", lust_mir_array_get as *const u8);
             builder.symbol("lust_mir_array_set", lust_mir_array_set as *const u8);
+            builder.symbol("lust_mir_array_push", lust_mir_array_push as *const u8);
             builder.symbol("lust_mir_floordiv_int", lust_mir_floordiv_int as *const u8);
             builder.symbol("lust_mir_pow_int", lust_mir_pow_int as *const u8);
             builder.symbol("lust_mir_abs_int", lust_mir_abs_int as *const u8);
@@ -1843,6 +1871,7 @@ pub mod jit_engine {
             builder.symbol("lust_mir_print_int_part", lust_mir_print_int_part as *const u8);
             builder.symbol("lust_mir_print_float_part", lust_mir_print_float_part as *const u8);
             builder.symbol("lust_mir_print_bool_part", lust_mir_print_bool_part as *const u8);
+            builder.symbol("lust_mir_print_string_part", lust_mir_print_string_part as *const u8);
             builder.symbol("lust_mir_print_sep", lust_mir_print_sep as *const u8);
             builder.symbol("lust_mir_print_nl", lust_mir_print_nl as *const u8);
             builder.symbol("lust_mir_div_int", lust_mir_div_int as *const u8);
@@ -1855,8 +1884,12 @@ pub mod jit_engine {
 
             // String helpers
             builder.symbol("lust_mir_string_concat", lust_mir_string_concat as *const u8);
+            builder.symbol("lust_mir_string_append_inplace", lust_mir_string_append_inplace as *const u8);
             builder.symbol("lust_mir_string_eq", lust_mir_string_eq as *const u8);
             builder.symbol("lust_mir_string_len", lust_mir_string_len as *const u8);
+            builder.symbol("lust_mir_tostring_int", lust_mir_tostring_int as *const u8);
+            builder.symbol("lust_mir_tostring_float", lust_mir_tostring_float as *const u8);
+            builder.symbol("lust_mir_tostring_bool", lust_mir_tostring_bool as *const u8);
 
             // Map helpers
             builder.symbol("lust_mir_alloc_map", lust_mir_alloc_map as *const u8);
@@ -3487,6 +3520,10 @@ pub mod jit_engine {
                 .module
                 .declare_function("lust_mir_print_bool_part", Linkage::Import, &print_i64_sig)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+            let print_string_part_callee = self
+                .module
+                .declare_function("lust_mir_print_string_part", Linkage::Import, &print_i64_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
             let mut print_f64_sig = self.module.make_signature();
             print_f64_sig.params.push(AbiParam::new(types::F64));
@@ -3580,6 +3617,11 @@ pub mod jit_engine {
                 .declare_function("lust_mir_string_concat", Linkage::Import, &binop_sig)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
+            let string_append_inplace_callee = self
+                .module
+                .declare_function("lust_mir_string_append_inplace", Linkage::Import, &binop_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
             let mut str_eq_sig = self.module.make_signature();
             str_eq_sig.params.push(AbiParam::new(types::I64));
             str_eq_sig.params.push(AbiParam::new(types::I64));
@@ -3594,15 +3636,29 @@ pub mod jit_engine {
                 .declare_function("lust_mir_string_len", Linkage::Import, &sig1)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
+            let tostring_int_callee = self
+                .module
+                .declare_function("lust_mir_tostring_int", Linkage::Import, &sig1)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let mut tostring_float_sig = self.module.make_signature();
+            tostring_float_sig.params.push(AbiParam::new(types::F64));
+            tostring_float_sig.returns.push(AbiParam::new(types::I64));
+            let tostring_float_callee = self
+                .module
+                .declare_function("lust_mir_tostring_float", Linkage::Import, &tostring_float_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let tostring_bool_callee = self
+                .module
+                .declare_function("lust_mir_tostring_bool", Linkage::Import, &sig1)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
             let abs_callee = self
                 .module
                 .declare_function("lust_mir_abs_int", Linkage::Import, &sig1)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
-            let len_callee = self
-                .module
-                .declare_function("lust_mir_array_len", Linkage::Import, &sig1)
-                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
             let len_checked_callee = self
                 .module
                 .declare_function("lust_mir_array_len_checked", Linkage::Import, &sig1)
@@ -3616,6 +3672,11 @@ pub mod jit_engine {
             let min_callee = self
                 .module
                 .declare_function("lust_mir_min_int", Linkage::Import, &sig2)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let array_push_callee = self
+                .module
+                .declare_function("lust_mir_array_push", Linkage::Import, &sig2)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
             let max_callee = self
@@ -3738,12 +3799,14 @@ pub mod jit_engine {
                 let alloc_struct_named_fn = self.module.declare_func_in_func(alloc_struct_named_callee, &mut builder.func);
                 let alloc_cflat_struct_fn = self.module.declare_func_in_func(alloc_cflat_struct_callee, &mut builder.func);
                 let len_fn = self.module.declare_func_in_func(len_checked_callee, &mut builder.func);
+                let array_push_fn = self.module.declare_func_in_func(array_push_callee, &mut builder.func);
                 let gas_fn = self.module.declare_func_in_func(gas_callee, &mut builder.func);
                 let status_fn = self.module.declare_func_in_func(status_callee, &mut builder.func);
                 let status_set_fn = self.module.declare_func_in_func(status_set_callee, &mut builder.func);
                 let print_int_part_fn = self.module.declare_func_in_func(print_int_part_callee, &mut builder.func);
                 let print_float_part_fn = self.module.declare_func_in_func(print_float_part_callee, &mut builder.func);
                 let print_bool_part_fn = self.module.declare_func_in_func(print_bool_part_callee, &mut builder.func);
+                let print_string_part_fn = self.module.declare_func_in_func(print_string_part_callee, &mut builder.func);
                 let print_sep_fn = self.module.declare_func_in_func(print_sep_callee, &mut builder.func);
                 let print_nl_fn = self.module.declare_func_in_func(print_nl_callee, &mut builder.func);
                 let floordiv_fn = self.module.declare_func_in_func(floordiv_callee, &mut builder.func);
@@ -3752,8 +3815,22 @@ pub mod jit_engine {
                 let pow_float_fn = self.module.declare_func_in_func(pow_float_callee, &mut builder.func);
                 let rem_float_fn = self.module.declare_func_in_func(rem_float_callee, &mut builder.func);
                 let string_concat_fn = self.module.declare_func_in_func(string_concat_callee, &mut builder.func);
+                let string_append_inplace_fn = self.module.declare_func_in_func(string_append_inplace_callee, &mut builder.func);
                 let string_eq_fn = self.module.declare_func_in_func(string_eq_callee, &mut builder.func);
                 let string_len_fn = self.module.declare_func_in_func(string_len_callee, &mut builder.func);
+                let tostring_int_fn = self.module.declare_func_in_func(tostring_int_callee, &mut builder.func);
+                let tostring_float_fn = self.module.declare_func_in_func(tostring_float_callee, &mut builder.func);
+                let tostring_bool_fn = self.module.declare_func_in_func(tostring_bool_callee, &mut builder.func);
+                let string_helpers = StringHelperFns {
+                    concat_fn: string_concat_fn,
+                    append_inplace_fn: string_append_inplace_fn,
+                    eq_fn: string_eq_fn,
+                    len_fn: string_len_fn,
+                    tostring_int_fn,
+                    tostring_float_fn,
+                    tostring_bool_fn,
+                };
+                let unaliased_string_locals = compute_unaliased_string_locals(mir_fn);
                 let init_deopt_fn = self.module.declare_func_in_func(init_deopt_callee, &mut builder.func);
                 let init_deopt_at_terminator_fn = self.module.declare_func_in_func(init_deopt_at_terminator_callee, &mut builder.func);
                 let record_deopt_local_fn = self.module.declare_func_in_func(rec_deopt_callee, &mut builder.func);
@@ -3817,6 +3894,34 @@ pub mod jit_engine {
                 }
 
                 let loop_headers = find_loop_headers(&mir_fn.blocks);
+                let prov_plan = compute_array_len_provenance_plan(mir_fn, &loop_headers, osr_info);
+                let mut pre_header_blocks: hashbrown::HashMap<usize, Block> =
+                    hashbrown::HashMap::new();
+                for (&hdr_idx, locs) in &prov_plan.hoist_at_header_entry {
+                    if !locs.is_empty() {
+                        pre_header_blocks.insert(hdr_idx, builder.create_block());
+                    }
+                }
+                let resolve_target_bb = |from_block: Option<usize>, target: usize| -> Result<Block, MirCraneliftBackendError> {
+                    let direct_bb = clif_blocks.get(target).copied().ok_or_else(|| {
+                        MirCraneliftBackendError::CodegenError(format!(
+                            "Target block BlockId({target}) out of bounds"
+                        ))
+                    })?;
+                    if let Some(&pre_bb) = pre_header_blocks.get(&target) {
+                        let is_backedge_or_internal = from_block.is_some_and(|fb| {
+                            prov_plan
+                                .loop_bodies
+                                .get(&target)
+                                .is_some_and(|body| body.contains(&fb))
+                        });
+                        if !is_backedge_or_internal {
+                            return Ok(pre_bb);
+                        }
+                    }
+                    Ok(direct_bb)
+                };
+
                 let needs_safepoint = !loop_headers.is_empty() || osr_info.is_some();
                 let safepoint_ctx: Option<(Variable, FuncRef, FuncRef)> = if needs_safepoint {
                     let sp_ptr_fn = self
@@ -3888,7 +3993,8 @@ pub mod jit_engine {
                         None,
                     );
 
-                    builder.ins().jump(clif_blocks[target_block.0], &[]);
+                    let osr_target_bb = resolve_target_bb(None, target_block.0)?;
+                    builder.ins().jump(osr_target_bb, &[]);
                 } else {
                     let fn_entry_bb = builder.create_block();
                     builder.append_block_params_for_function_params(fn_entry_bb);
@@ -3915,13 +4021,36 @@ pub mod jit_engine {
                         builder.def_var(acc_pair.0, vzero);
                         builder.def_var(acc_pair.1, vzero);
                     }
-                    builder.ins().jump(clif_blocks[mir_fn.entry.0], &[]);
+                    let entry_target_bb = resolve_target_bb(None, mir_fn.entry.0)?;
+                    builder.ins().jump(entry_target_bb, &[]);
+                }
+
+                // Emit loop-preheader hoisted array provenance validation blocks (run once per loop entry)
+                let mut hoisted_hdrs: Vec<usize> = pre_header_blocks.keys().copied().collect();
+                hoisted_hdrs.sort_unstable();
+                for hdr_idx in hoisted_hdrs {
+                    let pre_bb = pre_header_blocks[&hdr_idx];
+                    builder.switch_to_block(pre_bb);
+                    if let Some(locs) = prov_plan.hoist_at_header_entry.get(&hdr_idx) {
+                        for &loc in locs {
+                            let arr_val =
+                                load_local_i64(loc, &mut builder, &local_vars, &stack_slots)?;
+                            let call_inst = builder.ins().call(len_fn, &[arr_val]);
+                            let res = builder.inst_results(call_inst)[0];
+                            let is_err = builder.ins().icmp_imm_s(IntCC::SignedLessThan, res, 0);
+                            let ok_bb = builder.create_block();
+                            builder.ins().brif(is_err, emergency_exit_bb, &[], ok_bb, &[]);
+                            builder.switch_to_block(ok_bb);
+                        }
+                    }
+                    builder.ins().jump(clif_blocks[hdr_idx], &[]);
                 }
 
                 // Lower each basic block
                 for (b_idx, mir_block) in mir_fn.blocks.iter().enumerate() {
                     let clif_bb = clif_blocks[b_idx];
                     builder.switch_to_block(clif_bb);
+                    let mut cur_validated = prov_plan.validated_in[b_idx].clone();
 
                     let should_safepoint = loop_headers.contains(&b_idx);
 
@@ -3992,9 +4121,12 @@ pub mod jit_engine {
                             let cur_acc = load_local_i64(acc_loc, &mut builder, &local_vars, &stack_slots)?;
                             let new_acc = builder.ins().iadd(cur_acc, lane_sum);
                             store_local_val(acc_loc, new_acc, &mut builder, &local_vars, &stack_slots)?;
-                            builder.ins().jump(clif_blocks[vl.tail_block.0], &[]);
+                            let tail_target = resolve_target_bb(Some(b_idx), vl.tail_block.0)?;
+                            builder.ins().jump(tail_target, &[]);
                         } else {
-                            builder.ins().brif(cond, clif_blocks[vl.body_block.0], &[], clif_blocks[vl.tail_block.0], &[]);
+                            let body_target = resolve_target_bb(Some(b_idx), vl.body_block.0)?;
+                            let tail_target = resolve_target_bb(Some(b_idx), vl.tail_block.0)?;
+                            builder.ins().brif(cond, body_target, &[], tail_target, &[]);
                         }
                         continue;
                     }
@@ -4091,41 +4223,22 @@ pub mod jit_engine {
                     for stmt in &mir_block.statements {
                         match stmt {
                             Statement::Assign(Place::Local(dst), rvalue, _) => {
-                                let val = lower_rvalue(
-                                    rvalue,
-                                    &mut builder,
-                                    &local_vars,
-                                    &stack_slots,
-                                    &mir_fn.locals,
-                                    &self.struct_layouts,
-                                    alloc_array_typed_fn,
-                                    alloc_tuple_typed_fn,
-                                    alloc_struct_named_fn,
-                                    alloc_cflat_struct_fn,
-                                    len_fn,
-                                    floordiv_fn,
-                                    pow_fn,
-                                    floordiv_float_fn,
-                                    pow_float_fn,
-                                    rem_float_fn,
-                                    string_concat_fn,
-                                    string_eq_fn,
-                                    string_len_fn,
-                                    status_fn,
-                                    bc_ctx,
-                                )?;
                                 let dst_decl = mir_fn.locals.get(dst.0).ok_or_else(|| {
                                     MirCraneliftBackendError::CodegenError(format!(
                                         "Destination local {dst:?} out of bounds"
                                     ))
                                 })?;
-                                let target_ty = mir_to_clif_type(&dst_decl.ty)?;
-                                let val = cast_clif_type(&mut builder, val, target_ty);
-                                store_local_val(*dst, val, &mut builder, &local_vars, &stack_slots)?;
-                            }
-                            Statement::Assign(lhs_place @ Place::Index(..), rvalue, _) => {
+                                let inplace_concat_dst =
+                                    if unaliased_string_locals.contains(&dst.0) {
+                                        Some(*dst)
+                                    } else {
+                                        None
+                                    };
                                 let val = lower_rvalue(
                                     rvalue,
+                                    Some(&dst_decl.ty),
+                                    inplace_concat_dst,
+                                    &mut cur_validated,
                                     &mut builder,
                                     &local_vars,
                                     &stack_slots,
@@ -4141,9 +4254,50 @@ pub mod jit_engine {
                                     floordiv_float_fn,
                                     pow_float_fn,
                                     rem_float_fn,
-                                    string_concat_fn,
-                                    string_eq_fn,
-                                    string_len_fn,
+                                    string_helpers,
+                                    status_fn,
+                                    bc_ctx,
+                                )?;
+                                let target_ty = mir_to_clif_type(&dst_decl.ty)?;
+                                let val = cast_clif_type(&mut builder, val, target_ty);
+                                store_local_val(*dst, val, &mut builder, &local_vars, &stack_slots)?;
+                                match rvalue {
+                                    Rvalue::Aggregate(MirType::Array(_), _) => {
+                                        cur_validated.insert(dst.0);
+                                    }
+                                    Rvalue::Use(
+                                        Operand::Copy(Place::Local(src))
+                                        | Operand::Move(Place::Local(src)),
+                                    ) if cur_validated.contains(&src.0) => {
+                                        cur_validated.insert(dst.0);
+                                    }
+                                    _ => {
+                                        cur_validated.remove(&dst.0);
+                                    }
+                                }
+                            }
+                            Statement::Assign(lhs_place @ Place::Index(..), rvalue, _) => {
+                                let val = lower_rvalue(
+                                    rvalue,
+                                    None,
+                                    None,
+                                    &mut cur_validated,
+                                    &mut builder,
+                                    &local_vars,
+                                    &stack_slots,
+                                    &mir_fn.locals,
+                                    &self.struct_layouts,
+                                    alloc_array_typed_fn,
+                                    alloc_tuple_typed_fn,
+                                    alloc_struct_named_fn,
+                                    alloc_cflat_struct_fn,
+                                    len_fn,
+                                    floordiv_fn,
+                                    pow_fn,
+                                    floordiv_float_fn,
+                                    pow_float_fn,
+                                    rem_float_fn,
+                                    string_helpers,
                                     status_fn,
                                     bc_ctx,
                                 )?;
@@ -4167,6 +4321,9 @@ pub mod jit_engine {
                             Statement::Assign(lhs_place @ Place::Field(..), rvalue, _) => {
                                 let val = lower_rvalue(
                                     rvalue,
+                                    None,
+                                    None,
+                                    &mut cur_validated,
                                     &mut builder,
                                     &local_vars,
                                     &stack_slots,
@@ -4182,9 +4339,7 @@ pub mod jit_engine {
                                     floordiv_float_fn,
                                     pow_float_fn,
                                     rem_float_fn,
-                                    string_concat_fn,
-                                    string_eq_fn,
-                                    string_len_fn,
+                                    string_helpers,
                                     status_fn,
                                     bc_ctx,
                                 )?;
@@ -4264,6 +4419,21 @@ pub mod jit_engine {
                         builder.ins().brif(fallback_cond, scalar_fallback_bb, &[], chk_alias_bb, &[]);
 
                         builder.switch_to_block(chk_alias_bb);
+                        // Redirected arrays (cap < 0) store elements in a separate backing buffer;
+                        // divert them cleanly to the scalar loop whose Place::Index resolves redirection.
+                        let cap_off = core::mem::offset_of!(MirArrayHeader, cap) as i32;
+                        let a_cap = builder.ins().load(types::I64, MemFlagsData::trusted(), a_ptr, cap_off);
+                        let mut any_redir = builder.ins().icmp_imm_s(IntCC::SignedLessThan, a_cap, 0);
+                        if let Some(b_ptr) = b_ptr_opt {
+                            let b_cap = builder.ins().load(types::I64, MemFlagsData::trusted(), b_ptr, cap_off);
+                            let b_redir = builder.ins().icmp_imm_s(IntCC::SignedLessThan, b_cap, 0);
+                            any_redir = builder.ins().bor(any_redir, b_redir);
+                        }
+                        if let Some(out_ptr) = out_ptr_opt {
+                            let out_cap = builder.ins().load(types::I64, MemFlagsData::trusted(), out_ptr, cap_off);
+                            let out_redir = builder.ins().icmp_imm_s(IntCC::SignedLessThan, out_cap, 0);
+                            any_redir = builder.ins().bor(any_redir, out_redir);
+                        }
                         if let Some(out_ptr) = out_ptr_opt {
                             let eight = builder.ins().iconst(types::I64, 8);
                             let vec_bytes = builder.ins().imul(end_val, eight);
@@ -4291,14 +4461,16 @@ pub mod jit_engine {
                                 any_shifted_ov = builder.ins().bor(any_shifted_ov, b_shifted_ov);
                             }
 
-                            builder.ins().brif(any_shifted_ov, scalar_fallback_bb, &[], enter_vec_bb, &[]);
+                            let must_fallback = builder.ins().bor(any_redir, any_shifted_ov);
+                            builder.ins().brif(must_fallback, scalar_fallback_bb, &[], enter_vec_bb, &[]);
                         } else {
-                            builder.ins().jump(enter_vec_bb, &[]);
+                            builder.ins().brif(any_redir, scalar_fallback_bb, &[], enter_vec_bb, &[]);
                         }
 
                         builder.switch_to_block(scalar_fallback_bb);
                         builder.ins().call(simd_scalar_fn, &[]);
-                        builder.ins().jump(clif_blocks[vl.tail_block.0], &[]);
+                        let tail_target = resolve_target_bb(Some(b_idx), vl.tail_block.0)?;
+                        builder.ins().jump(tail_target, &[]);
 
                         builder.switch_to_block(enter_vec_bb);
                         builder.ins().call(simd_vector_fn, &[]);
@@ -4308,32 +4480,21 @@ pub mod jit_engine {
                             builder.def_var(vacc0, vzero);
                             builder.def_var(vacc1, vzero);
                         }
-                        builder.ins().jump(clif_blocks[vl.hdr_block.0], &[]);
+                        let hdr_target = resolve_target_bb(Some(b_idx), vl.hdr_block.0)?;
+                        builder.ins().jump(hdr_target, &[]);
                         continue;
                     }
 
                     if let Some(term) = &mir_block.terminator {
                         match term {
                             Terminator::Goto(target, _) => {
-                                let target_bb = clif_blocks.get(target.0).copied().ok_or_else(|| {
-                                    MirCraneliftBackendError::CodegenError(format!(
-                                        "Goto target block {target:?} out of bounds"
-                                    ))
-                                })?;
+                                let target_bb = resolve_target_bb(Some(b_idx), target.0)?;
                                 builder.ins().jump(target_bb, &[]);
                             }
                             Terminator::Cond { cond, then_block, else_block, .. } => {
                                 let c_val = lower_operand(cond, &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
-                                let then_bb = clif_blocks.get(then_block.0).copied().ok_or_else(|| {
-                                    MirCraneliftBackendError::CodegenError(format!(
-                                        "Cond then block {then_block:?} out of bounds"
-                                    ))
-                                })?;
-                                let else_bb = clif_blocks.get(else_block.0).copied().ok_or_else(|| {
-                                    MirCraneliftBackendError::CodegenError(format!(
-                                        "Cond else block {else_block:?} out of bounds"
-                                    ))
-                                })?;
+                                let then_bb = resolve_target_bb(Some(b_idx), then_block.0)?;
+                                let else_bb = resolve_target_bb(Some(b_idx), else_block.0)?;
                                 builder.ins().brif(c_val, then_bb, &[], else_bb, &[]);
                             }
                             Terminator::Switch { discr, cases, default, .. } => {
@@ -4341,19 +4502,11 @@ pub mod jit_engine {
                                 for (val, target_bb) in cases {
                                     let is_eq = builder.ins().icmp_imm_s(IntCC::Equal, d_val, *val);
                                     let next_check = builder.create_block();
-                                    let t_bb = clif_blocks.get(target_bb.0).copied().ok_or_else(|| {
-                                        MirCraneliftBackendError::CodegenError(format!(
-                                            "Switch target block {target_bb:?} out of bounds"
-                                        ))
-                                    })?;
+                                    let t_bb = resolve_target_bb(Some(b_idx), target_bb.0)?;
                                     builder.ins().brif(is_eq, t_bb, &[], next_check, &[]);
                                     builder.switch_to_block(next_check);
                                 }
-                                let def_bb = clif_blocks.get(default.0).copied().ok_or_else(|| {
-                                    MirCraneliftBackendError::CodegenError(format!(
-                                        "Switch default block {default:?} out of bounds"
-                                    ))
-                                })?;
+                                let def_bb = resolve_target_bb(Some(b_idx), default.0)?;
                                 builder.ins().jump(def_bb, &[]);
                             }
                             Terminator::Call { callee, args, destination, success, .. } => {
@@ -4378,6 +4531,9 @@ pub mod jit_engine {
                                             }
                                             (MirType::Bool, types::I64) => {
                                                 builder.ins().call(print_bool_part_fn, &[arg_val]);
+                                            }
+                                            (MirType::String, types::I64) => {
+                                                builder.ins().call(print_string_part_fn, &[arg_val]);
                                             }
                                             _ => {
                                                 return Err(MirCraneliftBackendError::CodegenError(format!(
@@ -4423,7 +4579,8 @@ pub mod jit_engine {
                                             )));
                                         }
                                     }
-                                    builder.ins().jump(clif_blocks[success.0], &[]);
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
                                 } else if let Some(struct_name) = crate::mir::ir::parse_mir_struct_decode_callee(callee) {
                                     let layout_id = if let Some(layout) = self.struct_layouts.get(struct_name) {
                                         layout.type_id as i64
@@ -4451,7 +4608,8 @@ pub mod jit_engine {
                                     let call_cont_bb = builder.create_block();
                                     builder.ins().brif(is_err, emergency_exit_bb, &[], call_cont_bb, &[]);
                                     builder.switch_to_block(call_cont_bb);
-                                    builder.ins().jump(clif_blocks[success.0], &[]);
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
                                 } else if is_effect_or_handler_callee(callee) {
                                     // 3A->3D deopt seam: publish DeoptPayload and exit with MIR_STATUS_DEOPT
                                     let proven_locals_storage;
@@ -4517,7 +4675,8 @@ pub mod jit_engine {
                                         let res_cast = cast_clif_type(&mut builder, res_val, target_ty);
                                         store_local_val(*loc, res_cast, &mut builder, &local_vars, &stack_slots)?;
                                     }
-                                    builder.ins().jump(clif_blocks[success.0], &[]);
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
                                 } else if callee == "simd.add" || callee == "simd_add" || callee == "vector.add" {
                                     let a_val = lower_operand(&args[0], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
                                     let b_val = lower_operand(&args[1], &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
@@ -4542,7 +4701,7 @@ pub mod jit_engine {
                                     let scalar_bwd_hdr = builder.create_block();
                                     let scalar_bwd_body = builder.create_block();
                                     let done_success_bb = builder.create_block();
-                                    let next_mir_bb = clif_blocks[success.0];
+                                    let next_mir_bb = resolve_target_bb(Some(b_idx), success.0)?;
 
                                     // Null checks: a == 0 || b == 0 || out == 0
                                     let a_is_zero = builder.ins().icmp_imm_s(IntCC::Equal, a_val, 0);
@@ -4770,7 +4929,7 @@ pub mod jit_engine {
                                     let scalar_bwd_hdr = builder.create_block();
                                     let scalar_bwd_body = builder.create_block();
                                     let done_success_bb = builder.create_block();
-                                    let next_mir_bb = clif_blocks[success.0];
+                                    let next_mir_bb = resolve_target_bb(Some(b_idx), success.0)?;
 
                                     // Null checks: a == 0 || b == 0 || out == 0
                                     let a_is_zero = builder.ins().icmp_imm_s(IntCC::Equal, a_val, 0);
@@ -5003,7 +5162,7 @@ pub mod jit_engine {
                                     let scalar_hdr = builder.create_block();
                                     let scalar_body = builder.create_block();
                                     let done_bb = builder.create_block();
-                                    let next_mir_bb = clif_blocks[success.0];
+                                    let next_mir_bb = resolve_target_bb(Some(b_idx), success.0)?;
 
                                     let a_is_zero = builder.ins().icmp_imm_s(IntCC::Equal, a_val, 0);
                                     let len_le_zero = builder.ins().icmp_imm_s(IntCC::SignedLessThanOrEqual, len_val, 0);
@@ -5154,7 +5313,7 @@ pub mod jit_engine {
                                     let scalar_hdr = builder.create_block();
                                     let scalar_body = builder.create_block();
                                     let done_bb = builder.create_block();
-                                    let next_mir_bb = clif_blocks[success.0];
+                                    let next_mir_bb = resolve_target_bb(Some(b_idx), success.0)?;
 
                                     let a_is_zero = builder.ins().icmp_imm_s(IntCC::Equal, a_val, 0);
                                     let b_is_zero = builder.ins().icmp_imm_s(IntCC::Equal, b_val, 0);
@@ -5290,7 +5449,232 @@ pub mod jit_engine {
                                             builder.ins().stack_store(types::I64, res_cast, slot, 0);
                                         }
                                     }
-                                    builder.ins().jump(next_mir_bb, &[]);
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
+                                } else if callee == "array.len" || callee == "table.len" {
+                                    if args.len() != 1 {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to '{callee}' arity mismatch: got {} arguments, expected 1",
+                                            args.len()
+                                        )));
+                                    }
+                                    let arg_ty = try_operand_type(&args[0], &mir_fn.locals, &self.struct_layouts)?;
+                                    if !matches!(arg_ty, MirType::Array(_)) {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to '{callee}' requires Array argument, got '{arg_ty}'"
+                                        )));
+                                    }
+                                    let arr_val = lower_operand(
+                                        &args[0],
+                                        &mut builder,
+                                        &local_vars,
+                                        &stack_slots,
+                                        &mir_fn.locals,
+                                        &self.struct_layouts,
+                                        bc_ctx,
+                                    )?;
+                                    let res_val = emit_array_len(
+                                        &args[0],
+                                        arr_val,
+                                        &mut builder,
+                                        len_fn,
+                                        emergency_exit_bb,
+                                        &mut cur_validated,
+                                    );
+                                    match destination {
+                                        Place::Local(loc) => {
+                                            let loc_decl = mir_fn.locals.get(loc.0).ok_or_else(|| {
+                                                MirCraneliftBackendError::CodegenError(format!(
+                                                    "Call destination local {loc:?} out of bounds"
+                                                ))
+                                            })?;
+                                            let target_ty = mir_to_clif_type(&loc_decl.ty)?;
+                                            let res_val = cast_clif_type(&mut builder, res_val, target_ty);
+                                            store_local_val(*loc, res_val, &mut builder, &local_vars, &stack_slots)?;
+                                        }
+                                        Place::Index(..) | Place::Field(..) => {
+                                            let dst_addr = lower_place_addr(
+                                                destination,
+                                                &mut builder,
+                                                &local_vars,
+                                                &stack_slots,
+                                                &mir_fn.locals,
+                                                &self.struct_layouts,
+                                                bc_ctx,
+                                            )?;
+                                            builder.ins().store(MemFlagsData::trusted(), res_val, dst_addr, 0);
+                                        }
+                                    }
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
+                                } else if callee == "array.push" || callee == "table.push" {
+                                    if args.len() != 2 {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to '{callee}' arity mismatch: got {} arguments, expected 2",
+                                            args.len()
+                                        )));
+                                    }
+                                    let arr_ty = try_operand_type(&args[0], &mir_fn.locals, &self.struct_layouts)?;
+                                    let MirType::Array(elem_ty) = arr_ty else {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to '{callee}' requires Array first argument, got '{arr_ty}'"
+                                        )));
+                                    };
+                                    if mir_array_elem_tag(&elem_ty).is_none() {
+                                        return Err(MirCraneliftBackendError::UnsupportedType(*elem_ty));
+                                    }
+                                    let val_ty = try_operand_type(&args[1], &mir_fn.locals, &self.struct_layouts)?;
+                                    if val_ty != *elem_ty {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to '{callee}' element type mismatch: expected '{elem_ty}', got '{val_ty}'"
+                                        )));
+                                    }
+                                    let arr_val = lower_operand(
+                                        &args[0],
+                                        &mut builder,
+                                        &local_vars,
+                                        &stack_slots,
+                                        &mir_fn.locals,
+                                        &self.struct_layouts,
+                                        bc_ctx,
+                                    )?;
+                                    let val_raw = lower_operand(
+                                        &args[1],
+                                        &mut builder,
+                                        &local_vars,
+                                        &stack_slots,
+                                        &mir_fn.locals,
+                                        &self.struct_layouts,
+                                        bc_ctx,
+                                    )?;
+                                    let val_clif_ty = builder.func.dfg.value_type(val_raw);
+                                    let val_i64 = if val_clif_ty == types::F64 {
+                                        builder.ins().bitcast(types::I64, MemFlagsData::new(), val_raw)
+                                    } else if val_clif_ty == types::I8 {
+                                        builder.ins().uextend(types::I64, val_raw)
+                                    } else {
+                                        val_raw
+                                    };
+                                    let push_call = builder.ins().call(array_push_fn, &[arr_val, val_i64]);
+                                    let push_status = builder.inst_results(push_call)[0];
+                                    if let Place::Local(loc) = destination {
+                                        let loc_decl = mir_fn.locals.get(loc.0).ok_or_else(|| {
+                                            MirCraneliftBackendError::CodegenError(format!(
+                                                "Call destination local {loc:?} out of bounds"
+                                            ))
+                                        })?;
+                                        let target_ty = mir_to_clif_type(&loc_decl.ty)?;
+                                        let zero = builder.ins().iconst(types::I64, 0);
+                                        let zero_val = cast_clif_type(&mut builder, zero, target_ty);
+                                        store_local_val(*loc, zero_val, &mut builder, &local_vars, &stack_slots)?;
+                                    }
+                                    let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, push_status, 0);
+                                    let push_ok_bb = builder.create_block();
+                                    builder.ins().brif(is_err, emergency_exit_bb, &[], push_ok_bb, &[]);
+                                    builder.switch_to_block(push_ok_bb);
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
+                                } else if callee == "string.len" {
+                                    if args.len() != 1 {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to 'string.len' arity mismatch: got {} arguments, expected 1",
+                                            args.len()
+                                        )));
+                                    }
+                                    let arg_ty = try_operand_type(&args[0], &mir_fn.locals, &self.struct_layouts)?;
+                                    if arg_ty != MirType::String {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to 'string.len' requires String argument, got '{arg_ty}'"
+                                        )));
+                                    }
+                                    let s_val = lower_operand(
+                                        &args[0],
+                                        &mut builder,
+                                        &local_vars,
+                                        &stack_slots,
+                                        &mir_fn.locals,
+                                        &self.struct_layouts,
+                                        bc_ctx,
+                                    )?;
+                                    let len_call = builder.ins().call(string_len_fn, &[s_val]);
+                                    let res_val = builder.inst_results(len_call)[0];
+                                    match destination {
+                                        Place::Local(loc) => {
+                                            let loc_decl = mir_fn.locals.get(loc.0).ok_or_else(|| {
+                                                MirCraneliftBackendError::CodegenError(format!(
+                                                    "Call destination local {loc:?} out of bounds"
+                                                ))
+                                            })?;
+                                            let target_ty = mir_to_clif_type(&loc_decl.ty)?;
+                                            let res_val = cast_clif_type(&mut builder, res_val, target_ty);
+                                            store_local_val(*loc, res_val, &mut builder, &local_vars, &stack_slots)?;
+                                        }
+                                        Place::Index(..) | Place::Field(..) => {
+                                            let dst_addr = lower_place_addr(
+                                                destination,
+                                                &mut builder,
+                                                &local_vars,
+                                                &stack_slots,
+                                                &mir_fn.locals,
+                                                &self.struct_layouts,
+                                                bc_ctx,
+                                            )?;
+                                            builder.ins().store(MemFlagsData::trusted(), res_val, dst_addr, 0);
+                                        }
+                                    }
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
+                                } else if callee == "tostring" {
+                                    if args.len() != 1 {
+                                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                                            "Call to 'tostring' arity mismatch: got {} arguments, expected 1",
+                                            args.len()
+                                        )));
+                                    }
+                                    let arg_ty = try_operand_type(&args[0], &mir_fn.locals, &self.struct_layouts)?;
+                                    let arg_val = lower_operand(
+                                        &args[0],
+                                        &mut builder,
+                                        &local_vars,
+                                        &stack_slots,
+                                        &mir_fn.locals,
+                                        &self.struct_layouts,
+                                        bc_ctx,
+                                    )?;
+                                    let res_val = lower_to_string_handle(
+                                        &arg_ty,
+                                        arg_val,
+                                        &mut builder,
+                                        string_helpers,
+                                        status_fn,
+                                        emergency_exit_bb,
+                                    )?;
+                                    match destination {
+                                        Place::Local(loc) => {
+                                            let loc_decl = mir_fn.locals.get(loc.0).ok_or_else(|| {
+                                                MirCraneliftBackendError::CodegenError(format!(
+                                                    "Call destination local {loc:?} out of bounds"
+                                                ))
+                                            })?;
+                                            let target_ty = mir_to_clif_type(&loc_decl.ty)?;
+                                            let res_val = cast_clif_type(&mut builder, res_val, target_ty);
+                                            store_local_val(*loc, res_val, &mut builder, &local_vars, &stack_slots)?;
+                                        }
+                                        Place::Index(..) | Place::Field(..) => {
+                                            let dst_addr = lower_place_addr(
+                                                destination,
+                                                &mut builder,
+                                                &local_vars,
+                                                &stack_slots,
+                                                &mir_fn.locals,
+                                                &self.struct_layouts,
+                                                bc_ctx,
+                                            )?;
+                                            builder.ins().store(MemFlagsData::trusted(), res_val, dst_addr, 0);
+                                        }
+                                    }
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                    builder.ins().jump(succ_bb, &[]);
                                 } else {
                                     let mut is_native_mir_call = false;
                                     let (callee_func_id, param_count) = match callee.as_str() {
@@ -5298,21 +5682,6 @@ pub mod jit_engine {
                                         "math.min" | "min" => (min_callee, 2),
                                         "math.max" | "max" => (max_callee, 2),
                                         "math.clamp" | "clamp" => (clamp_callee, 3),
-                                        "table.len" | "array.len" => {
-                                            if args.len() != 1 {
-                                                return Err(MirCraneliftBackendError::CodegenError(format!(
-                                                    "Call to '{callee}' arity mismatch: got {} arguments, expected 1",
-                                                    args.len()
-                                                )));
-                                            }
-                                            let arg_ty = try_operand_type(&args[0], &mir_fn.locals, &self.struct_layouts)?;
-                                            if !matches!(arg_ty, MirType::Array(_)) {
-                                                return Err(MirCraneliftBackendError::CodegenError(format!(
-                                                    "Call to '{callee}' requires Array argument, got '{arg_ty}'"
-                                                )));
-                                            }
-                                            (len_callee, 1)
-                                        }
                                         "map.len" => (map_len_callee, 1),
                                         "map.get" => (map_get_callee, 2),
                                         "map.set" => (map_set_callee, 3),
@@ -5424,11 +5793,7 @@ pub mod jit_engine {
                                         builder.switch_to_block(call_cont_bb);
                                     }
 
-                                    let succ_bb = clif_blocks.get(success.0).copied().ok_or_else(|| {
-                                        MirCraneliftBackendError::CodegenError(format!(
-                                            "Call success block {success:?} out of bounds"
-                                        ))
-                                    })?;
+                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
                                     builder.ins().jump(succ_bb, &[]);
                                 }
                             }
@@ -5532,6 +5897,10 @@ pub mod jit_engine {
                     | "clamp"
                     | "table.len"
                     | "array.len"
+                    | "table.push"
+                    | "array.push"
+                    | "string.len"
+                    | "tostring"
                     | "map.len"
                     | "map.get"
                     | "map.set"
@@ -5822,6 +6191,7 @@ pub mod jit_engine {
         match ty {
             MirType::Unknown => true,
             MirType::Array(inner) => mir_type_contains_unknown(inner),
+            MirType::Option(inner) => mir_type_contains_unknown(inner),
             MirType::Tuple(elems) => elems.iter().any(mir_type_contains_unknown),
             MirType::Map(k, v) => mir_type_contains_unknown(k) || mir_type_contains_unknown(v),
             MirType::Function { params, return_type } => {
@@ -5840,6 +6210,9 @@ pub mod jit_engine {
             (MirType::Unknown, other) | (other, MirType::Unknown) => Some(other.clone()),
             (MirType::Array(ea), MirType::Array(eb)) => {
                 unify_mir_types(ea, eb).map(|u| MirType::Array(Box::new(u)))
+            }
+            (MirType::Option(oa), MirType::Option(ob)) => {
+                unify_mir_types(oa, ob).map(|u| MirType::Option(Box::new(u)))
             }
             (MirType::Tuple(ta), MirType::Tuple(tb)) if ta.len() == tb.len() => {
                 let mut out = Vec::with_capacity(ta.len());
@@ -6343,7 +6716,9 @@ pub mod jit_engine {
                                 let r_ty_res = try_operand_type(rhs, &inferred, struct_layouts);
                                 if let (Ok(l_ty), Ok(r_ty)) = (l_ty_res, r_ty_res) {
                                     if l_ty != MirType::Unknown && r_ty != MirType::Unknown {
-                                        let out_ty = if matches!(
+                                        let out_ty = if matches!(binop, MirBinaryOp::Concat) {
+                                            Some(MirType::String)
+                                        } else if matches!(
                                             binop,
                                             MirBinaryOp::Eq
                                                 | MirBinaryOp::NotEq
@@ -6458,6 +6833,20 @@ pub mod jit_engine {
                  }
 
                  if let Some(Terminator::Call { callee, args, destination: Place::Local(dst), .. }) = &block.terminator {
+                     if (callee == "array.push" || callee == "table.push") && args.len() == 2 {
+                         if let Operand::Copy(Place::Local(arr_loc)) | Operand::Move(Place::Local(arr_loc)) = &args[0] {
+                             if arr_loc.0 < lattice.len() && !matches!(lattice[arr_loc.0], TypeLattice::Conflict(_)) {
+                                 if let Ok(val_ty) = try_operand_type(&args[1], &inferred, struct_layouts) {
+                                     if val_ty != MirType::Unknown {
+                                         let expected_arr = MirType::Array(Box::new(val_ty));
+                                         if lattice[arr_loc.0].merge_evidence(&expected_arr, "array.push element type") {
+                                             changed = true;
+                                         }
+                                     }
+                                 }
+                             }
+                         }
+                     }
                      if dst.0 < lattice.len() && !matches!(lattice[dst.0], TypeLattice::Conflict(_)) {
                          let call_ret_ty: Option<MirType> = match callee.as_str() {
                              "math.abs" | "abs" => {
@@ -6471,10 +6860,11 @@ pub mod jit_engine {
                              "table.len" | "array.len" | "map.len" | "string.len" | "enum.tag" | "enum.payload" => {
                                  Some(MirType::Int)
                              }
+                             "tostring" => Some(MirType::String),
                              "map.get" => {
                                  Some(MirType::Enum("Option".to_string()))
                              }
-                             "map.set" => {
+                             "map.set" | "array.push" | "table.push" => {
                                  Some(MirType::Unit)
                              }
                              "map.new" => {
@@ -6633,6 +7023,12 @@ pub mod jit_engine {
             | MirType::Map(_, _)
             | MirType::Enum(_)
             | MirType::Effect { .. } => Ok(types::I64),
+            MirType::Option(inner)
+                if matches!(&**inner, MirType::Struct(name) if !name.is_empty()) =>
+            {
+                Ok(types::I64)
+            }
+            MirType::Option(_) => Err(MirCraneliftBackendError::UnsupportedType(ty.clone())),
             MirType::Unknown => Err(MirCraneliftBackendError::UnsupportedType(MirType::Unknown)),
             MirType::Function { .. } => Err(MirCraneliftBackendError::UnsupportedType(ty.clone())),
         }
@@ -6731,6 +7127,10 @@ pub mod jit_engine {
                                 | MirType::Struct(_)
                                 | MirType::Function { .. }
                                 | MirType::Unknown
+                        ) || matches!(
+                            &resolved,
+                            MirType::Option(inner)
+                                if !matches!(&**inner, MirType::Struct(n) if !n.is_empty())
                         ) {
                             return Err(MirCraneliftBackendError::UnsupportedType(resolved));
                         }
@@ -6749,6 +7149,10 @@ pub mod jit_engine {
                             | MirType::Struct(_)
                             | MirType::Function { .. }
                             | MirType::Unknown
+                    ) || matches!(
+                        &resolved,
+                        MirType::Option(inner)
+                            if !matches!(&**inner, MirType::Struct(n) if !n.is_empty())
                     ) {
                         return Err(MirCraneliftBackendError::UnsupportedType(resolved));
                     }
@@ -6881,21 +7285,53 @@ pub mod jit_engine {
                 )?;
                 let idx_val = load_local_i64(*idx, builder, local_vars, stack_slots)?;
 
-                if matches!(base_ty, MirType::Array(_) | MirType::Tuple(_)) {
+                let data_off = core::mem::size_of::<MirArrayHeader>() as i64;
+                let data_ptr = if matches!(base_ty, MirType::Array(_) | MirType::Tuple(_)) {
                     let is_null = builder.ins().icmp_imm_s(IntCC::Equal, base_ptr, 0);
                     emit_oob_branch_if_bad(is_null, builder, bc_ctx);
-                    let arr_len = builder.ins().load(types::I64, MemFlagsData::trusted(), base_ptr, 0);
+                    let len_off = core::mem::offset_of!(MirArrayHeader, len) as i32;
+                    let arr_len = builder.ins().load(types::I64, MemFlagsData::trusted(), base_ptr, len_off);
                     let idx_neg = builder.ins().icmp_imm_s(IntCC::SignedLessThan, idx_val, 0);
                     let idx_ge = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx_val, arr_len);
                     let is_oob = builder.ins().bor(idx_neg, idx_ge);
                     emit_oob_branch_if_bad(is_oob, builder, bc_ctx);
-                }
+
+                    if matches!(base_ty, MirType::Array(_)) {
+                        let cap_off = core::mem::offset_of!(MirArrayHeader, cap) as i32;
+                        let cap_raw = builder.ins().load(types::I64, MemFlagsData::trusted(), base_ptr, cap_off);
+                        let is_redir = builder.ins().icmp_imm_s(IntCC::SignedLessThan, cap_raw, 0);
+                        let redir_bb = builder.create_block();
+                        let flat_bb = builder.create_block();
+                        let data_merge_bb = builder.create_block();
+                        let data_param = builder.append_block_param(data_merge_bb, types::I64);
+                        builder.set_cold_block(redir_bb);
+                        builder.ins().brif(is_redir, redir_bb, &[], flat_bb, &[]);
+
+                        builder.switch_to_block(redir_bb);
+                        let redir_ptr = builder.ins().load(
+                            types::I64,
+                            MemFlagsData::trusted(),
+                            base_ptr,
+                            data_off as i32,
+                        );
+                        builder.ins().jump(data_merge_bb, &[BlockArg::Value(redir_ptr)]);
+
+                        builder.switch_to_block(flat_bb);
+                        let flat_ptr = builder.ins().iadd_imm_s(base_ptr, data_off);
+                        builder.ins().jump(data_merge_bb, &[BlockArg::Value(flat_ptr)]);
+
+                        builder.switch_to_block(data_merge_bb);
+                        data_param
+                    } else {
+                        builder.ins().iadd_imm_s(base_ptr, data_off)
+                    }
+                } else {
+                    builder.ins().iadd_imm_s(base_ptr, data_off)
+                };
 
                 let eight = builder.ins().iconst(types::I64, 8);
                 let byte_idx = builder.ins().imul(idx_val, eight);
-                let sixteen = builder.ins().iconst(types::I64, 16);
-                let offset = builder.ins().iadd(byte_idx, sixteen);
-                Ok(builder.ins().iadd(base_ptr, offset))
+                Ok(builder.ins().iadd(data_ptr, byte_idx))
             }
             Place::Field(base, field_idx) => {
                 let _ = try_place_type(place, locals, struct_layouts)?;
@@ -7154,8 +7590,752 @@ pub mod jit_engine {
         res_param
     }
 
+    struct ArrayLenProvenancePlan {
+        validated_in: Vec<hashbrown::HashSet<usize>>,
+        hoist_at_header_entry: hashbrown::HashMap<usize, Vec<LocalId>>,
+        loop_bodies: hashbrown::HashMap<usize, hashbrown::HashSet<usize>>,
+    }
+
+    fn compute_array_len_provenance_plan(
+        mir_fn: &MirFunction,
+        loop_headers: &hashbrown::HashSet<usize>,
+        osr_info: Option<(BlockId, &[LocalId])>,
+    ) -> ArrayLenProvenancePlan {
+        let num_blocks = mir_fn.blocks.len();
+        if num_blocks == 0 {
+            return ArrayLenProvenancePlan {
+                validated_in: Vec::new(),
+                hoist_at_header_entry: hashbrown::HashMap::new(),
+                loop_bodies: hashbrown::HashMap::new(),
+            };
+        }
+
+        let entry_idx = osr_info
+            .map(|(tb, _)| tb.0)
+            .unwrap_or(mir_fn.entry.0)
+            .min(num_blocks - 1);
+
+        // 1. Reachable blocks & predecessors from entry_idx
+        let mut reachable = hashbrown::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        reachable.insert(entry_idx);
+        queue.push_back(entry_idx);
+        while let Some(b) = queue.pop_front() {
+            if let Some(term) = &mir_fn.blocks[b].terminator {
+                for succ in term.successors() {
+                    if succ < num_blocks && reachable.insert(succ) {
+                        queue.push_back(succ);
+                    }
+                }
+            }
+        }
+
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+        for &b in &reachable {
+            if let Some(term) = &mir_fn.blocks[b].terminator {
+                for succ in term.successors() {
+                    if succ < num_blocks && reachable.contains(&succ) && !preds[succ].contains(&b) {
+                        preds[succ].push(b);
+                    }
+                }
+            }
+        }
+
+        // 2. Natural loop bodies per reachable loop header
+        let backedges = find_loop_backedges(&mir_fn.blocks);
+        let mut loop_bodies: hashbrown::HashMap<usize, hashbrown::HashSet<usize>> =
+            hashbrown::HashMap::new();
+        for &(tail, hdr) in &backedges {
+            if !loop_headers.contains(&hdr) || !reachable.contains(&hdr) || !reachable.contains(&tail)
+            {
+                continue;
+            }
+            let body = loop_bodies.entry(hdr).or_default();
+            body.insert(hdr);
+            if body.insert(tail) {
+                let mut stack = vec![tail];
+                while let Some(cur) = stack.pop() {
+                    for &p in &preds[cur] {
+                        if body.insert(p) {
+                            stack.push(p);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Per-block assigned locals and definite-initialization must-analysis
+        let mut assigned_in_block: Vec<hashbrown::HashSet<usize>> =
+            vec![hashbrown::HashSet::new(); num_blocks];
+        for (b_idx, block) in mir_fn.blocks.iter().enumerate() {
+            for stmt in &block.statements {
+                if let Statement::Assign(Place::Local(dst), _, _) = stmt {
+                    assigned_in_block[b_idx].insert(dst.0);
+                }
+            }
+            if let Some(Terminator::Call {
+                destination: Place::Local(dst),
+                ..
+            }) = &block.terminator
+            {
+                assigned_in_block[b_idx].insert(dst.0);
+            }
+        }
+
+        let init_at_entry: hashbrown::HashSet<usize> = if let Some((_, live)) = osr_info {
+            live.iter().map(|l| l.0).collect()
+        } else {
+            mir_fn.params.iter().map(|l| l.0).collect()
+        };
+        let all_locals: hashbrown::HashSet<usize> = (0..mir_fn.locals.len()).collect();
+        let mut def_in: Vec<hashbrown::HashSet<usize>> = (0..num_blocks)
+            .map(|b| {
+                if b == entry_idx {
+                    init_at_entry.clone()
+                } else {
+                    all_locals.clone()
+                }
+            })
+            .collect();
+        let mut def_out: Vec<hashbrown::HashSet<usize>> = (0..num_blocks)
+            .map(|b| {
+                if b == entry_idx {
+                    let mut s = init_at_entry.clone();
+                    s.extend(assigned_in_block[b].iter().copied());
+                    s
+                } else {
+                    all_locals.clone()
+                }
+            })
+            .collect();
+
+        loop {
+            let mut changed = false;
+            for b in 0..num_blocks {
+                if !reachable.contains(&b) {
+                    continue;
+                }
+                let new_in = if b == entry_idx {
+                    let mut s = init_at_entry.clone();
+                    for &p in &preds[b] {
+                        s.retain(|x| def_out[p].contains(x));
+                    }
+                    s
+                } else if preds[b].is_empty() {
+                    hashbrown::HashSet::new()
+                } else {
+                    let mut iter = preds[b].iter();
+                    let first = *iter.next().unwrap();
+                    let mut s = def_out[first].clone();
+                    for &p in iter {
+                        s.retain(|x| def_out[p].contains(x));
+                    }
+                    s
+                };
+                let mut new_out = new_in.clone();
+                new_out.extend(assigned_in_block[b].iter().copied());
+                if new_in != def_in[b] || new_out != def_out[b] {
+                    def_in[b] = new_in;
+                    def_out[b] = new_out;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // 4. Iterative must-validated provenance dataflow
+        let run_dataflow =
+            |hoist_map: &hashbrown::HashMap<usize, Vec<LocalId>>| -> Vec<hashbrown::HashSet<usize>> {
+                let mut val_in: Vec<hashbrown::HashSet<usize>> = (0..num_blocks)
+                    .map(|b| {
+                        if b == entry_idx {
+                            let mut s = hashbrown::HashSet::new();
+                            if let Some(hoisted) = hoist_map.get(&b) {
+                                for loc in hoisted {
+                                    s.insert(loc.0);
+                                }
+                            }
+                            s
+                        } else {
+                            all_locals.clone()
+                        }
+                    })
+                    .collect();
+                let mut val_out: Vec<hashbrown::HashSet<usize>> = vec![all_locals.clone(); num_blocks];
+
+                let transfer = |b: usize, in_set: &hashbrown::HashSet<usize>| -> hashbrown::HashSet<usize> {
+                    let mut cur = in_set.clone();
+                    let block = &mir_fn.blocks[b];
+                    for stmt in &block.statements {
+                        if let Statement::Assign(Place::Local(dst), rval, _) = stmt {
+                            if let Rvalue::UnaryOp(
+                                MirUnaryOp::Len,
+                                Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)),
+                            ) = rval
+                            {
+                                if matches!(
+                                    mir_fn.locals.get(src.0).map(|l| &l.ty),
+                                    Some(MirType::Array(_))
+                                ) {
+                                    cur.insert(src.0);
+                                }
+                            }
+                            match rval {
+                                Rvalue::Aggregate(MirType::Array(_), _) => {
+                                    cur.insert(dst.0);
+                                }
+                                Rvalue::Use(
+                                    Operand::Copy(Place::Local(src))
+                                    | Operand::Move(Place::Local(src)),
+                                ) if cur.contains(&src.0) => {
+                                    cur.insert(dst.0);
+                                }
+                                _ => {
+                                    cur.remove(&dst.0);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(Terminator::Call {
+                        callee,
+                        args,
+                        destination,
+                        ..
+                    }) = &block.terminator
+                    {
+                        if callee == "array.len" || callee == "table.len" {
+                            if let Some(
+                                Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)),
+                            ) = args.first()
+                            {
+                                if matches!(
+                                    mir_fn.locals.get(src.0).map(|l| &l.ty),
+                                    Some(MirType::Array(_))
+                                ) {
+                                    cur.insert(src.0);
+                                }
+                            }
+                        }
+                        if let Place::Local(dst) = destination {
+                            cur.remove(&dst.0);
+                        }
+                    }
+                    cur
+                };
+
+                val_out[entry_idx] = transfer(entry_idx, &val_in[entry_idx]);
+
+                loop {
+                    let mut changed = false;
+                    for b in 0..num_blocks {
+                        if !reachable.contains(&b) {
+                            continue;
+                        }
+                        let new_in = if b == entry_idx {
+                            let mut s = hashbrown::HashSet::new();
+                            if let Some(hoisted) = hoist_map.get(&b) {
+                                for loc in hoisted {
+                                    s.insert(loc.0);
+                                }
+                            }
+                            for &p in &preds[b] {
+                                s.retain(|x| val_out[p].contains(x));
+                            }
+                            s
+                        } else if preds[b].is_empty() {
+                            hashbrown::HashSet::new()
+                        } else {
+                            let mut first_set: Option<hashbrown::HashSet<usize>> = None;
+                            for &p in &preds[b] {
+                                let mut edge_out = val_out[p].clone();
+                                if let Some(hoisted) = hoist_map.get(&b) {
+                                    let is_backedge_or_internal = loop_bodies
+                                        .get(&b)
+                                        .is_some_and(|body| body.contains(&p));
+                                    if !is_backedge_or_internal {
+                                        for loc in hoisted {
+                                            edge_out.insert(loc.0);
+                                        }
+                                    }
+                                }
+                                match &mut first_set {
+                                    None => first_set = Some(edge_out),
+                                    Some(acc) => acc.retain(|x| edge_out.contains(x)),
+                                }
+                            }
+                            first_set.unwrap_or_default()
+                        };
+                        let new_out = transfer(b, &new_in);
+                        if new_in != val_in[b] || new_out != val_out[b] {
+                            val_in[b] = new_in;
+                            val_out[b] = new_out;
+                            changed = true;
+                        }
+                    }
+                    if !changed {
+                        break;
+                    }
+                }
+
+                for b in 0..num_blocks {
+                    if !reachable.contains(&b) {
+                        val_in[b].clear();
+                    }
+                }
+                val_in
+            };
+
+        let mut hoist_at_header_entry: hashbrown::HashMap<usize, Vec<LocalId>> =
+            hashbrown::HashMap::new();
+        let mut validated_in = run_dataflow(&hoist_at_header_entry);
+
+        // 5. Hoist loop-invariant array provenance checks to outermost loop preheaders
+        let mut ordered_hdrs: Vec<usize> = loop_bodies.keys().copied().collect();
+        ordered_hdrs.sort_by(|a, b| {
+            loop_bodies[b]
+                .len()
+                .cmp(&loop_bodies[a].len())
+                .then_with(|| a.cmp(b))
+        });
+
+        for hdr in ordered_hdrs {
+            let body = &loop_bodies[&hdr];
+            let mut len_used_locals: Vec<usize> = Vec::new();
+            for &b in body {
+                let block = &mir_fn.blocks[b];
+                for stmt in &block.statements {
+                    if let Statement::Assign(
+                        _,
+                        Rvalue::UnaryOp(
+                            MirUnaryOp::Len,
+                            Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)),
+                        ),
+                        _,
+                    ) = stmt
+                    {
+                        if !len_used_locals.contains(&src.0) {
+                            len_used_locals.push(src.0);
+                        }
+                    }
+                }
+                if let Some(Terminator::Call { callee, args, .. }) = &block.terminator {
+                    if callee == "array.len" || callee == "table.len" {
+                        if let Some(
+                            Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)),
+                        ) = args.first()
+                        {
+                            if !len_used_locals.contains(&src.0) {
+                                len_used_locals.push(src.0);
+                            }
+                        }
+                    }
+                }
+            }
+            len_used_locals.sort_unstable();
+
+            let mut to_hoist: Vec<LocalId> = Vec::new();
+            for loc_idx in len_used_locals {
+                let is_array = matches!(
+                    mir_fn.locals.get(loc_idx).map(|l| &l.ty),
+                    Some(MirType::Array(_))
+                );
+                if !is_array {
+                    continue;
+                }
+                if !def_in[hdr].contains(&loc_idx) {
+                    continue;
+                }
+                let reassigned_in_loop = body
+                    .iter()
+                    .any(|&b| assigned_in_block[b].contains(&loc_idx));
+                if reassigned_in_loop {
+                    continue;
+                }
+                if validated_in[hdr].contains(&loc_idx) {
+                    continue;
+                }
+                to_hoist.push(LocalId(loc_idx));
+            }
+
+            if !to_hoist.is_empty() {
+                hoist_at_header_entry.insert(hdr, to_hoist);
+                validated_in = run_dataflow(&hoist_at_header_entry);
+            }
+        }
+
+        ArrayLenProvenancePlan {
+            validated_in,
+            hoist_at_header_entry,
+            loop_bodies,
+        }
+    }
+
+    fn emit_array_len(
+        op: &Operand,
+        arr_val: ClifValue,
+        builder: &mut FunctionBuilder,
+        len_fn: FuncRef,
+        emergency_exit_bb: Block,
+        validated_arrays: &mut hashbrown::HashSet<usize>,
+    ) -> ClifValue {
+        let local_idx = match op {
+            Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => Some(loc.0),
+            _ => None,
+        };
+        if let Some(idx) = local_idx {
+            if validated_arrays.contains(&idx) {
+                let len_off = core::mem::offset_of!(MirArrayHeader, len) as i32;
+                return builder
+                    .ins()
+                    .load(types::I64, MemFlagsData::trusted(), arr_val, len_off);
+            }
+        }
+        let call = builder.ins().call(len_fn, &[arr_val]);
+        let res = builder.inst_results(call)[0];
+        let is_err = builder.ins().icmp_imm_s(IntCC::SignedLessThan, res, 0);
+        let len_ok_bb = builder.create_block();
+        builder.ins().brif(is_err, emergency_exit_bb, &[], len_ok_bb, &[]);
+        builder.switch_to_block(len_ok_bb);
+        if let Some(idx) = local_idx {
+            validated_arrays.insert(idx);
+        }
+        res
+    }
+
+    #[derive(Clone, Copy)]
+    struct StringHelperFns {
+        concat_fn: FuncRef,
+        append_inplace_fn: FuncRef,
+        eq_fn: FuncRef,
+        len_fn: FuncRef,
+        tostring_int_fn: FuncRef,
+        tostring_float_fn: FuncRef,
+        tostring_bool_fn: FuncRef,
+    }
+
+    fn operand_mentions_local(op: &Operand, target: LocalId) -> bool {
+        let mut uses = hashbrown::HashSet::new();
+        op.collect_uses(&mut uses);
+        uses.contains(&target.0)
+    }
+
+    /// Computes the set of `MirType::String` locals in `mir_fn` that are proven locally
+    /// unaliased across the entire function, making in-place COW append (`dst = dst .. rhs`)
+    /// sound against MIR `i64`-handle aliasing.
+    fn compute_unaliased_string_locals(mir_fn: &MirFunction) -> hashbrown::HashSet<usize> {
+        let n_locals = mir_fn.locals.len();
+        let mut aliased = hashbrown::HashSet::<usize>::new();
+
+        // Parameters may alias caller locals or each other.
+        for &p in &mir_fn.params {
+            aliased.insert(p.0);
+        }
+
+        // Track definition/use counts to allow a single-def, single-read, same-block fresh
+        // Concat temporary to transfer unique ownership (`tmp = a .. b; s = move tmp`)
+        // without marking `s` as aliased.
+        let mut def_counts = vec![0usize; n_locals];
+        let mut read_counts = vec![0usize; n_locals];
+        let mut single_concat_def: Vec<Option<(usize, usize)>> = vec![None; n_locals];
+        let mut used_in_term_or_proj = vec![false; n_locals];
+
+        for (b_idx, block) in mir_fn.blocks.iter().enumerate() {
+            for (s_idx, stmt) in block.statements.iter().enumerate() {
+                if let Statement::Assign(place, rval, _) = stmt {
+                    match place {
+                        Place::Local(dst) => {
+                            if dst.0 < n_locals {
+                                def_counts[dst.0] += 1;
+                                if matches!(rval, Rvalue::BinaryOp(MirBinaryOp::Concat, _, _)) {
+                                    single_concat_def[dst.0] = Some((b_idx, s_idx));
+                                }
+                            }
+                        }
+                        Place::Field(..) | Place::Index(..) => {
+                            let mut p_uses = hashbrown::HashSet::new();
+                            p_uses.insert(place.root_local().0);
+                            place.collect_uses(&mut p_uses);
+                            for u in p_uses {
+                                if u < n_locals {
+                                    read_counts[u] += 1;
+                                    used_in_term_or_proj[u] = true;
+                                }
+                            }
+                        }
+                    }
+                    let mut r_uses = hashbrown::HashSet::new();
+                    rval.collect_uses(&mut r_uses);
+                    for u in r_uses {
+                        if u < n_locals {
+                            read_counts[u] += 1;
+                        }
+                    }
+                }
+            }
+            if let Some(term) = &block.terminator {
+                match term {
+                    Terminator::Call {
+                        args, destination, ..
+                    } => {
+                        match destination {
+                            Place::Local(dst) => {
+                                if dst.0 < n_locals {
+                                    def_counts[dst.0] += 1;
+                                    used_in_term_or_proj[dst.0] = true;
+                                }
+                            }
+                            Place::Field(..) | Place::Index(..) => {
+                                let mut p_uses = hashbrown::HashSet::new();
+                                p_uses.insert(destination.root_local().0);
+                                destination.collect_uses(&mut p_uses);
+                                for u in p_uses {
+                                    if u < n_locals {
+                                        read_counts[u] += 1;
+                                        used_in_term_or_proj[u] = true;
+                                    }
+                                }
+                            }
+                        }
+                        for arg in args {
+                            let mut a_uses = hashbrown::HashSet::new();
+                            arg.collect_uses(&mut a_uses);
+                            for u in a_uses {
+                                if u < n_locals {
+                                    read_counts[u] += 1;
+                                    used_in_term_or_proj[u] = true;
+                                }
+                            }
+                        }
+                    }
+                    Terminator::Cond { cond, .. } => {
+                        let mut uses = hashbrown::HashSet::new();
+                        cond.collect_uses(&mut uses);
+                        for u in uses {
+                            if u < n_locals {
+                                read_counts[u] += 1;
+                                used_in_term_or_proj[u] = true;
+                            }
+                        }
+                    }
+                    Terminator::Switch { discr, .. } => {
+                        let mut uses = hashbrown::HashSet::new();
+                        discr.collect_uses(&mut uses);
+                        for u in uses {
+                            if u < n_locals {
+                                read_counts[u] += 1;
+                                used_in_term_or_proj[u] = true;
+                            }
+                        }
+                    }
+                    Terminator::Return(Some(op), _) | Terminator::Raise(op, _) => {
+                        let mut uses = hashbrown::HashSet::new();
+                        op.collect_uses(&mut uses);
+                        for u in uses {
+                            if u < n_locals {
+                                read_counts[u] += 1;
+                                used_in_term_or_proj[u] = true;
+                            }
+                        }
+                    }
+                    Terminator::Return(None, _)
+                    | Terminator::Goto(..)
+                    | Terminator::Unreachable(_) => {}
+                }
+            }
+        }
+
+        let mark_rval_uses = |rval: &Rvalue, aliased: &mut hashbrown::HashSet<usize>| {
+            let mut uses = hashbrown::HashSet::new();
+            rval.collect_uses(&mut uses);
+            aliased.extend(uses);
+        };
+        let mark_op_uses = |op: &Operand, aliased: &mut hashbrown::HashSet<usize>| {
+            let mut uses = hashbrown::HashSet::new();
+            op.collect_uses(&mut uses);
+            aliased.extend(uses);
+        };
+
+        for (b_idx, block) in mir_fn.blocks.iter().enumerate() {
+            for (s_idx, stmt) in block.statements.iter().enumerate() {
+                if let Statement::Assign(place, rval, _) = stmt {
+                    match place {
+                        Place::Local(dst) => match rval {
+                            Rvalue::Use(
+                                Operand::Copy(Place::Local(src))
+                                | Operand::Move(Place::Local(src)),
+                            ) => {
+                                if dst != src {
+                                    let unique_same_block_concat_transfer = src.0 < n_locals
+                                        && !aliased.contains(&src.0)
+                                        && def_counts[src.0] == 1
+                                        && read_counts[src.0] == 1
+                                        && !used_in_term_or_proj[src.0]
+                                        && matches!(
+                                            single_concat_def[src.0],
+                                            Some((def_b, def_s)) if def_b == b_idx && def_s < s_idx
+                                        );
+                                    if !unique_same_block_concat_transfer {
+                                        aliased.insert(src.0);
+                                        aliased.insert(dst.0);
+                                    }
+                                }
+                            }
+                            Rvalue::Use(
+                                Operand::Copy(Place::Field(..) | Place::Index(..))
+                                | Operand::Move(Place::Field(..) | Place::Index(..)),
+                            ) => {
+                                aliased.insert(dst.0);
+                            }
+                            Rvalue::Use(Operand::Constant(_)) => {}
+                            Rvalue::BinaryOp(
+                                MirBinaryOp::Concat
+                                | MirBinaryOp::Add
+                                | MirBinaryOp::Eq
+                                | MirBinaryOp::NotEq,
+                                _,
+                                _,
+                            ) => {}
+                            Rvalue::UnaryOp(MirUnaryOp::Len, _) => {}
+                            Rvalue::Cast(op, _) => {
+                                aliased.insert(dst.0);
+                                mark_op_uses(op, &mut aliased);
+                            }
+                            Rvalue::Aggregate(_, elems) => {
+                                aliased.insert(dst.0);
+                                for e in elems {
+                                    mark_op_uses(e, &mut aliased);
+                                }
+                            }
+                            Rvalue::BinaryOp(..) | Rvalue::UnaryOp(..) => {}
+                        },
+                        Place::Field(..) | Place::Index(..) => {
+                            mark_rval_uses(rval, &mut aliased);
+                        }
+                    }
+                }
+            }
+            if let Some(term) = &block.terminator {
+                match term {
+                    Terminator::Call {
+                        callee,
+                        args,
+                        destination,
+                        ..
+                    } => {
+                        if matches!(callee.as_str(), "string.len" | "print" | "println") {
+                            // Pure non-escaping string readers.
+                        } else if callee == "tostring" {
+                            // `tostring(string)` returns the same handle verbatim; mark any
+                            // argument local aliased, and mark destination aliased when input
+                            // is a string (or unknown).
+                            let mut input_may_be_string = false;
+                            for arg in args {
+                                mark_op_uses(arg, &mut aliased);
+                                if let Operand::Copy(Place::Local(loc))
+                                | Operand::Move(Place::Local(loc)) = arg
+                                {
+                                    if matches!(
+                                        mir_fn.locals.get(loc.0).map(|d| &d.ty),
+                                        Some(MirType::String | MirType::Unknown) | None
+                                    ) {
+                                        input_may_be_string = true;
+                                    }
+                                } else if !matches!(
+                                    arg,
+                                    Operand::Constant(
+                                        MirConstant::Int(_)
+                                            | MirConstant::Float(_)
+                                            | MirConstant::Bool(_)
+                                    )
+                                ) {
+                                    input_may_be_string = true;
+                                }
+                            }
+                            if input_may_be_string
+                                && let Place::Local(dst) = destination
+                            {
+                                aliased.insert(dst.0);
+                            }
+                        } else {
+                            for arg in args {
+                                mark_op_uses(arg, &mut aliased);
+                            }
+                            if let Place::Local(dst) = destination {
+                                aliased.insert(dst.0);
+                            }
+                        }
+                    }
+                    Terminator::Raise(op, _) => {
+                        mark_op_uses(op, &mut aliased);
+                    }
+                    Terminator::Goto(..)
+                    | Terminator::Cond { .. }
+                    | Terminator::Switch { .. }
+                    | Terminator::Return(..)
+                    | Terminator::Unreachable(_) => {}
+                }
+            }
+        }
+
+        let mut unaliased = hashbrown::HashSet::new();
+        for (idx, decl) in mir_fn.locals.iter().enumerate() {
+            if decl.ty == MirType::String && !aliased.contains(&idx) {
+                unaliased.insert(idx);
+            }
+        }
+        unaliased
+    }
+
+    fn lower_to_string_handle(
+        mir_ty: &MirType,
+        val: ClifValue,
+        builder: &mut FunctionBuilder,
+        string_helpers: StringHelperFns,
+        status_fn: FuncRef,
+        emergency_exit_bb: Block,
+    ) -> Result<ClifValue, MirCraneliftBackendError> {
+        match mir_ty {
+            MirType::String => Ok(cast_clif_type(builder, val, types::I64)),
+            MirType::Int => {
+                let v = cast_clif_type(builder, val, types::I64);
+                let call = builder.ins().call(string_helpers.tostring_int_fn, &[v]);
+                let res = builder.inst_results(call)[0];
+                emit_status_check(builder, status_fn, emergency_exit_bb);
+                Ok(res)
+            }
+            MirType::Float => {
+                let v = cast_clif_type(builder, val, types::F64);
+                let call = builder.ins().call(string_helpers.tostring_float_fn, &[v]);
+                let res = builder.inst_results(call)[0];
+                emit_status_check(builder, status_fn, emergency_exit_bb);
+                Ok(res)
+            }
+            MirType::Bool => {
+                let v_ty = builder.func.dfg.value_type(val);
+                let v = if v_ty == types::I8 {
+                    builder.ins().uextend(types::I64, val)
+                } else {
+                    cast_clif_type(builder, val, types::I64)
+                };
+                let call = builder.ins().call(string_helpers.tostring_bool_fn, &[v]);
+                let res = builder.inst_results(call)[0];
+                emit_status_check(builder, status_fn, emergency_exit_bb);
+                Ok(res)
+            }
+            other => Err(MirCraneliftBackendError::CodegenError(format!(
+                "Unsupported type '{other}' for string conversion in Cranelift backend"
+            ))),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn lower_rvalue(
         rval: &Rvalue,
+        expected_dst_ty: Option<&MirType>,
+        inplace_concat_dst: Option<LocalId>,
+        validated_arrays: &mut hashbrown::HashSet<usize>,
         builder: &mut FunctionBuilder,
         local_vars: &[Variable],
         stack_slots: &hashbrown::HashMap<usize, StackSlot>,
@@ -7171,9 +8351,7 @@ pub mod jit_engine {
         floordiv_float_fn: FuncRef,
         pow_float_fn: FuncRef,
         rem_float_fn: FuncRef,
-        string_concat_fn: FuncRef,
-        string_eq_fn: FuncRef,
-        string_len_fn: FuncRef,
+        string_helpers: StringHelperFns,
         status_fn: FuncRef,
         bc_ctx: BoundsCheckCtx,
     ) -> Result<ClifValue, MirCraneliftBackendError> {
@@ -7188,6 +8366,45 @@ pub mod jit_engine {
             Rvalue::BinaryOp(binop, lhs, rhs) => {
                 let l_ty_mir = try_operand_type(lhs, locals, struct_layouts)?;
                 let r_ty_mir = try_operand_type(rhs, locals, struct_layouts)?;
+
+                if matches!(binop, MirBinaryOp::Concat) {
+                    let l_raw = lower_operand(lhs, builder, local_vars, stack_slots, locals, struct_layouts, bc_ctx)?;
+                    let r_raw = lower_operand(rhs, builder, local_vars, stack_slots, locals, struct_layouts, bc_ctx)?;
+                    let l_str = lower_to_string_handle(
+                        &l_ty_mir,
+                        l_raw,
+                        builder,
+                        string_helpers,
+                        status_fn,
+                        emergency_exit_bb,
+                    )?;
+                    let r_str = lower_to_string_handle(
+                        &r_ty_mir,
+                        r_raw,
+                        builder,
+                        string_helpers,
+                        status_fn,
+                        emergency_exit_bb,
+                    )?;
+                    let use_inplace = l_ty_mir == MirType::String
+                        && inplace_concat_dst.is_some_and(|dst_id| {
+                            matches!(
+                                lhs,
+                                Operand::Copy(Place::Local(l)) | Operand::Move(Place::Local(l))
+                                    if *l == dst_id
+                            ) && !operand_mentions_local(rhs, dst_id)
+                        });
+                    let target_fn = if use_inplace {
+                        string_helpers.append_inplace_fn
+                    } else {
+                        string_helpers.concat_fn
+                    };
+                    let call = builder.ins().call(target_fn, &[l_str, r_str]);
+                    let res = builder.inst_results(call)[0];
+                    emit_status_check(builder, status_fn, emergency_exit_bb);
+                    return Ok(res);
+                }
+
                 let is_float = l_ty_mir == MirType::Float || r_ty_mir == MirType::Float;
                 let is_string = l_ty_mir == MirType::String && r_ty_mir == MirType::String;
 
@@ -7244,18 +8461,18 @@ pub mod jit_engine {
                     let r = lower_operand(rhs, builder, local_vars, stack_slots, locals, struct_layouts, bc_ctx)?;
                     match binop {
                         MirBinaryOp::Add => {
-                            let call = builder.ins().call(string_concat_fn, &[l, r]);
+                            let call = builder.ins().call(string_helpers.concat_fn, &[l, r]);
                             let res = builder.inst_results(call)[0];
                             emit_status_check(builder, status_fn, emergency_exit_bb);
                             return Ok(res);
                         }
                         MirBinaryOp::Eq => {
-                            let call = builder.ins().call(string_eq_fn, &[l, r]);
+                            let call = builder.ins().call(string_helpers.eq_fn, &[l, r]);
                             let res = builder.inst_results(call)[0];
                             return Ok(res);
                         }
                         MirBinaryOp::NotEq => {
-                            let call = builder.ins().call(string_eq_fn, &[l, r]);
+                            let call = builder.ins().call(string_helpers.eq_fn, &[l, r]);
                             let eq_res = builder.inst_results(call)[0];
                             let one = builder.ins().iconst(types::I8, 1);
                             return Ok(builder.ins().bxor(eq_res, one));
@@ -7320,6 +8537,9 @@ pub mod jit_engine {
                     MirBinaryOp::GtEq => builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, l, r),
                     MirBinaryOp::And => builder.ins().band(l, r),
                     MirBinaryOp::Or => builder.ins().bor(l, r),
+                    MirBinaryOp::Concat => {
+                        unreachable!("MirBinaryOp::Concat handled above")
+                    }
                 };
                 Ok(val)
             }
@@ -7332,17 +8552,18 @@ pub mod jit_engine {
                 if matches!(unop, MirUnaryOp::Len) {
                     match op_ty {
                         MirType::String => {
-                            let call = builder.ins().call(string_len_fn, &[v]);
+                            let call = builder.ins().call(string_helpers.len_fn, &[v]);
                             return Ok(builder.inst_results(call)[0]);
                         }
                         MirType::Array(_) => {
-                            let call = builder.ins().call(len_fn, &[v]);
-                            let res = builder.inst_results(call)[0];
-                            let is_err = builder.ins().icmp_imm_s(IntCC::SignedLessThan, res, 0);
-                            let len_ok_bb = builder.create_block();
-                            builder.ins().brif(is_err, emergency_exit_bb, &[], len_ok_bb, &[]);
-                            builder.switch_to_block(len_ok_bb);
-                            return Ok(res);
+                            return Ok(emit_array_len(
+                                op,
+                                v,
+                                builder,
+                                len_fn,
+                                emergency_exit_bb,
+                                validated_arrays,
+                            ));
                         }
                         other => {
                             return Err(MirCraneliftBackendError::CodegenError(format!(
@@ -7479,14 +8700,26 @@ pub mod jit_engine {
                 Ok(tuple_ptr)
             }
             Rvalue::Aggregate(MirType::Array(elem_ty), elements) => {
-                let Some(elem_tag) = mir_array_elem_tag(elem_ty) else {
-                    return Err(MirCraneliftBackendError::UnsupportedType((**elem_ty).clone()));
+                let effective_elem_ty: &MirType = if **elem_ty == MirType::Unknown {
+                    match expected_dst_ty {
+                        Some(MirType::Array(dst_elem)) if **dst_elem != MirType::Unknown => {
+                            dst_elem.as_ref()
+                        }
+                        _ => elem_ty.as_ref(),
+                    }
+                } else {
+                    elem_ty.as_ref()
+                };
+                let Some(elem_tag) = mir_array_elem_tag(effective_elem_ty) else {
+                    return Err(MirCraneliftBackendError::UnsupportedType(
+                        effective_elem_ty.clone(),
+                    ));
                 };
                 for elem in elements {
                     let actual_ty = try_operand_type(elem, locals, struct_layouts)?;
-                    if actual_ty != **elem_ty {
+                    if actual_ty != *effective_elem_ty {
                         return Err(MirCraneliftBackendError::CodegenError(format!(
-                            "Array element type mismatch: expected '{elem_ty}', got '{actual_ty}'"
+                            "Array element type mismatch: expected '{effective_elem_ty}', got '{actual_ty}'"
                         )));
                     }
                 }

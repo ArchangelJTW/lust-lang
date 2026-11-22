@@ -162,6 +162,7 @@ pub fn compile_program_with_config(program: Program, config: &LustConfig) -> cra
     compiler.set_imports_by_module(imports_map);
     compiler.set_entry_module(program_entry_module.clone());
     compiler.set_function_signatures(signatures);
+    compiler.set_struct_defs(struct_defs.clone());
     compiler.set_minimal_runtime_types(config.minimal_runtime_types());
     compiler.set_use_mir(config.use_mir());
     compiler.set_collect_mir(config.use_mir() || config.cranelift_jit());

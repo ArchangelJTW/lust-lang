@@ -510,6 +510,7 @@ pub mod zig_engine {
                     MirBinaryOp::GtEq => format!("{l} >= {r}"),
                     MirBinaryOp::And => format!("{l} and {r}"),
                     MirBinaryOp::Or => format!("{l} or {r}"),
+                    MirBinaryOp::Concat => format!("__lust_mir_str_concat({l}, {r})"),
                 };
                 Ok(s)
             }

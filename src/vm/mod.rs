@@ -339,6 +339,15 @@ pub struct VM {
         HashMap<(String, usize, crate::mir::cranelift_backend::DeoptSiteKind), CompiledDeoptRecipe>,
     #[cfg(feature = "std")]
     pub(super) cranelift_fn_cache: Vec<Option<Rc<CompiledFnEntry>>>,
+    #[cfg(feature = "std")]
+    pub(super) osr_engine: Option<crate::vm::osr::OsrEngine>,
+    #[cfg(feature = "std")]
+    pub(super) osr_backedge_counts: HashMap<(usize, usize), u32>,
+    #[cfg(feature = "std")]
+    pub(super) osr_cold_sites: hashbrown::HashSet<(usize, usize, u64, u64)>,
+    pub osr_compilation_count: u64,
+    pub(super) osr_last_cranelift_gen: u64,
+    pub(super) osr_last_struct_gen: u64,
     pub mir_functions: HashMap<String, crate::mir::ir::MirFunction>,
     pub cranelift_compiled: HashMap<String, *const u8>,
     pub(super) jit: JitState,
@@ -1082,6 +1091,26 @@ impl VM {
         }
     }
 
+    #[inline]
+    pub fn osr_compilation_count(&self) -> u64 {
+        self.osr_compilation_count
+    }
+
+    #[cfg(feature = "std")]
+    #[inline]
+    pub fn osr_cold_site_count(&self) -> usize {
+        self.osr_cold_sites.len()
+    }
+
+    pub(super) fn invalidate_osr_state(&mut self) {
+        #[cfg(feature = "std")]
+        {
+            self.osr_engine = None;
+            self.osr_backedge_counts.clear();
+            self.osr_cold_sites.clear();
+        }
+    }
+
     /// Registers a MIR candidate for Cranelift JIT compilation without overwriting the
     /// primary AST->Bytecode function in `self.functions`.
     pub fn register_mir_candidate(&mut self, mir_fn: crate::mir::ir::MirFunction) {
@@ -1097,6 +1126,7 @@ impl VM {
             self.cranelift_recipes.clear();
             self.cranelift_fn_cache.clear();
         }
+        self.invalidate_osr_state();
     }
 
     /// Loads a MIR function into the VM, automatically generating its bytecode representation
@@ -1152,6 +1182,7 @@ impl VM {
             self.cranelift_recipes.clear();
             self.cranelift_fn_cache.clear();
         }
+        self.invalidate_osr_state();
         Ok(())
     }
 
@@ -1165,6 +1196,394 @@ impl VM {
             self.load_mir_function_with_callees(mir_fn.clone(), &direct_callees)?;
         }
         Ok(())
+    }
+
+    /// Attempts production On-Stack Replacement (OSR) at a hot loop backedge in Cranelift mode.
+    ///
+    /// Enforces all 5 Hazard 6 item 3 fail-closed preconditions, caches compiled OSR entries
+    /// keyed by `(func_idx, target_block, cranelift_generation, struct_metadata_generation)`,
+    /// reuses `self.mir_context` with synced gas/memory budgets, and deducts consumed budgets
+    /// on every exit path (`Completed`, `Deoptimized`, or `Error`).
+    #[cfg(feature = "std")]
+    pub(super) fn try_enter_osr_at_backedge(
+        &mut self,
+        func_idx: usize,
+        loop_start_ip: usize,
+    ) -> Result<Option<OsrBackedgeOutcome>> {
+        use core::sync::atomic::Ordering;
+
+        // Preconditions 1-3 (fail-closed)
+        if self.backend != VmBackend::Cranelift
+            || self.quantum_fuel.is_some()
+            || crate::vm::tracing::has_trace_hook()
+        {
+            return Ok(None);
+        }
+
+        // Precondition 4: active frame exists and has no upvalues
+        let has_upvalues = match self.call_stack.last() {
+            Some(frame) if frame.function_idx == func_idx => {
+                !frame.upvalues.is_empty() || !frame.shared_upvalues.is_empty()
+            }
+            _ => return Ok(None),
+        };
+        if has_upvalues {
+            return Ok(None);
+        }
+
+        // Invalidate OSR caches/cold markers automatically whenever generations advance
+        let cur_cl_gen = self.cranelift_generation;
+        let cur_struct_gen = self.struct_metadata.generation();
+        if self.osr_last_cranelift_gen != cur_cl_gen || self.osr_last_struct_gen != cur_struct_gen {
+            self.invalidate_osr_state();
+            self.osr_last_cranelift_gen = cur_cl_gen;
+            self.osr_last_struct_gen = cur_struct_gen;
+        }
+
+        let cold_key = (func_idx, loop_start_ip, cur_cl_gen, cur_struct_gen);
+        if self.osr_cold_sites.contains(&cold_key) {
+            return Ok(None);
+        }
+
+        // Precondition 5 fast check: authoritative MIR continuation `block_entry_pcs` required
+        let has_block_pcs = self
+            .functions
+            .get(func_idx)
+            .is_some_and(|f| !f.block_entry_pcs.is_empty());
+        if !has_block_pcs {
+            self.osr_cold_sites.insert(cold_key);
+            return Ok(None);
+        }
+
+        // Hot-backedge counter threshold
+        let count = self
+            .osr_backedge_counts
+            .entry((func_idx, loop_start_ip))
+            .or_insert(0);
+        *count = count.saturating_add(1);
+        if *count < crate::vm::osr::OSR_HOT_BACKEDGE_THRESHOLD {
+            return Ok(None);
+        }
+
+        // Precondition 5 authoritative lookup: map `loop_start_ip` to unique MIR loop header
+        let (func_name, mir_fn, target_block) = {
+            let Some(func) = self.functions.get(func_idx) else {
+                self.osr_cold_sites.insert(cold_key);
+                return Ok(None);
+            };
+            let Some(mir_fn) = self.mir_functions.get(&func.name) else {
+                self.osr_cold_sites.insert(cold_key);
+                return Ok(None);
+            };
+            let loop_headers = crate::mir::cranelift_backend::find_loop_headers(&mir_fn.blocks);
+            let mut matched_header: Option<usize> = None;
+            let mut ambiguous = false;
+            for (&block_id, &entry_pc) in &func.block_entry_pcs {
+                if entry_pc == loop_start_ip && loop_headers.contains(&block_id) {
+                    if matched_header.is_some() {
+                        ambiguous = true;
+                        break;
+                    }
+                    matched_header = Some(block_id);
+                }
+            }
+            let Some(target_block) = matched_header.filter(|_| !ambiguous) else {
+                self.osr_cold_sites.insert(cold_key);
+                return Ok(None);
+            };
+            (func.name.clone(), mir_fn.clone(), target_block)
+        };
+
+        crate::vm::osr::GLOBAL_OSR_COUNTERS
+            .entry_attempts
+            .fetch_add(1, Ordering::SeqCst);
+
+        // Lazily initialize OSR engine on first eligible hot loop
+        if self.osr_engine.is_none() {
+            match crate::vm::osr::OsrEngine::new() {
+                Ok(engine) => self.osr_engine = Some(engine),
+                Err(_) => {
+                    crate::vm::osr::GLOBAL_OSR_COUNTERS
+                        .fallback_count
+                        .fetch_add(1, Ordering::SeqCst);
+                    self.osr_cold_sites.insert(cold_key);
+                    return Ok(None);
+                }
+            }
+        }
+
+        let cache_key = crate::vm::osr::OsrCacheKey {
+            func_idx,
+            target_block,
+            cranelift_generation: cur_cl_gen,
+            struct_metadata_generation: cur_struct_gen,
+        };
+        let entry = {
+            let engine = self.osr_engine.as_mut().unwrap();
+            let prev_compilations = engine.compilation_count();
+            match engine.get_or_compile_osr_entry(
+                cache_key,
+                &mir_fn,
+                &self.functions[func_idx].block_entry_pcs,
+            ) {
+                Ok(entry) => {
+                    let after_compilations = engine.compilation_count();
+                    if after_compilations > prev_compilations {
+                        self.osr_compilation_count += after_compilations - prev_compilations;
+                    }
+                    entry
+                }
+                Err(_) => {
+                    crate::vm::osr::GLOBAL_OSR_COUNTERS
+                        .fallback_count
+                        .fetch_add(1, Ordering::SeqCst);
+                    self.osr_cold_sites.insert(cold_key);
+                    return Ok(None);
+                }
+            }
+        };
+
+        let raw_args = {
+            let frame = self.call_stack.last().unwrap();
+            match crate::vm::osr::OsrEngine::validate_and_pack_frame_args(&entry, frame) {
+                Ok(args) => args,
+                Err(_) => {
+                    crate::vm::osr::GLOBAL_OSR_COUNTERS
+                        .fallback_count
+                        .fetch_add(1, Ordering::SeqCst);
+                    self.osr_cold_sites.insert(cold_key);
+                    return Ok(None);
+                }
+            }
+        };
+
+        let baseline = self.mir_context.capture_baseline();
+        let mut native_entered = false;
+        let scoped_outcome = self.execute_osr_entry_scoped(
+            func_idx,
+            &func_name,
+            &entry,
+            &raw_args,
+            cold_key,
+            &mut native_entered,
+        );
+        self.mir_context
+            .clear_to_baselines(baseline.handles, baseline.buffers);
+
+        match scoped_outcome {
+            Ok(OsrScopedOutcome::Completed(val)) => {
+                crate::vm::osr::GLOBAL_OSR_COUNTERS
+                    .entry_successes
+                    .fetch_add(1, Ordering::SeqCst);
+                let finished = self.finish_return(val)?;
+                Ok(Some(OsrBackedgeOutcome::Return(finished)))
+            }
+            Ok(OsrScopedOutcome::DeoptimizedResume) => {
+                Ok(Some(OsrBackedgeOutcome::DeoptimizedResume))
+            }
+            Err(err) => {
+                crate::mir::cranelift_backend::take_current_sticky_error();
+                crate::mir::cranelift_backend::take_deopt_payload();
+                if native_entered {
+                    if let Some(frame) = self.call_stack.pop() {
+                        self.recycle_frame(frame);
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn execute_osr_entry_scoped(
+        &mut self,
+        func_idx: usize,
+        func_name: &str,
+        entry: &crate::vm::osr::OsrCompiledEntry,
+        raw_args: &[i64],
+        cold_key: (usize, usize, u64, u64),
+        native_entered: &mut bool,
+    ) -> Result<OsrScopedOutcome> {
+        use crate::mir::cranelift_backend::{
+            MIR_STATUS_DEOPT, MIR_STATUS_ERR_DIV_BY_ZERO, MIR_STATUS_ERR_INTERRUPTED,
+            MIR_STATUS_ERR_NEG_EXPONENT, MIR_STATUS_ERR_OOM, MIR_STATUS_ERR_OUT_OF_BOUNDS,
+            MIR_STATUS_ERR_OUT_OF_GAS, MIR_STATUS_OK,
+        };
+        use core::sync::atomic::Ordering;
+
+        let _vm_guard = CurrentVmGuard::from_vm(self);
+
+        let vm_gas_budget = self.gas_remaining();
+        let vm_has_mem_budget = self.memory_budget_bytes().is_some();
+        let mem_limit = match self.memory_remaining_bytes() {
+            Some(rem_mem) => i64::try_from(rem_mem).unwrap_or(i64::MAX),
+            None => i64::MAX,
+        };
+
+        self.mir_context.set_status(MIR_STATUS_OK);
+        self.mir_context.set_memory_used(0);
+        self.mir_context.set_max_memory_limit(mem_limit);
+        if let Some(rem_gas) = vm_gas_budget {
+            self.mir_context
+                .set_gas(i64::try_from(rem_gas).unwrap_or(i64::MAX));
+        } else {
+            self.mir_context.set_gas(1_000_000_000);
+        }
+        self.sync_mir_context_struct_metadata();
+
+        let gas_entry_snapshot = self.mir_context.gas_remaining();
+
+        self.cranelift_entry_count += 1;
+        *native_entered = true;
+        let invocation_id = self.cranelift_entry_count;
+        let frame_depth = self.call_stack.len();
+        let compiled_gen = self.cranelift_compiled_generation;
+        let _inv_guard = crate::mir::cranelift_backend::push_native_invocation_with_generation(
+            func_name.to_string(),
+            frame_depth,
+            invocation_id,
+            compiled_gen,
+        );
+        let _jit_guard = self.enter_jit_scope();
+
+        let execution_val = unsafe {
+            crate::vm::osr::invoke_osr_entry(entry.fn_ptr, raw_args, &entry.return_type)
+        };
+
+        let status = crate::mir::cranelift_backend::jit_engine::lust_mir_get_status();
+        let sticky_err = crate::mir::cranelift_backend::take_current_sticky_error();
+        let deopt_payload = crate::mir::cranelift_backend::take_deopt_payload();
+        drop(_jit_guard);
+        drop(_inv_guard);
+
+        // Deduct consumed gas and memory back into `self.budgets` on EVERY exit path.
+        let gas_after = self.mir_context.gas_remaining();
+        let gas_spent = (gas_entry_snapshot.saturating_sub(gas_after)).max(0) as u64;
+        let gas_charge_res = if gas_spent > 0 {
+            self.budgets.charge_gas(gas_spent)
+        } else {
+            Ok(())
+        };
+
+        let mem_spent = usize::try_from(self.mir_context.memory_used().max(0)).unwrap_or(usize::MAX);
+        let mem_charge_res = if vm_has_mem_budget && mem_spent > 0 {
+            self.budgets.charge_mem_bytes(mem_spent)
+        } else {
+            Ok(())
+        };
+
+        if let Some(sticky) = sticky_err {
+            self.osr_cold_sites.insert(cold_key);
+            return Err(LustError::RuntimeError {
+                message: format!("Native OSR deopt helper error: {}", sticky),
+            });
+        }
+
+        if status != MIR_STATUS_OK {
+            if status == MIR_STATUS_DEOPT {
+                // Mark site cold upfront so EVERY deopt path (both clean resume and
+                // fail-closed corrupted/unmapped deopt errors) suppresses future OSR thrashing.
+                self.osr_cold_sites.insert(cold_key);
+                crate::vm::osr::GLOBAL_OSR_COUNTERS
+                    .deopt_count
+                    .fetch_add(1, Ordering::SeqCst);
+                gas_charge_res?;
+                mem_charge_res?;
+
+                let payload = deopt_payload.ok_or_else(|| LustError::RuntimeError {
+                    message: "OSR deopt status set but no deopt payload was captured".into(),
+                })?;
+
+                let p_ident = payload.frame_identity.as_ref().ok_or_else(|| {
+                    LustError::RuntimeError {
+                        message: "OSR deopt payload missing required strict frame identity".into(),
+                    }
+                })?;
+                if p_ident.func_name != func_name
+                    || p_ident.frame_depth != frame_depth
+                    || p_ident.invocation_id != invocation_id
+                    || p_ident.compilation_generation != compiled_gen
+                {
+                    return Err(LustError::RuntimeError {
+                        message: format!(
+                            "OSR deopt payload frame identity mismatch: expected ({}, depth {}, inv {}, gen {}), got ({}, depth {}, inv {}, gen {})",
+                            func_name,
+                            frame_depth,
+                            invocation_id,
+                            compiled_gen,
+                            p_ident.func_name,
+                            p_ident.frame_depth,
+                            p_ident.invocation_id,
+                            p_ident.compilation_generation
+                        ),
+                    });
+                }
+
+                let deopt_exit = crate::vm::osr::DeoptExitState::from_payload_with_mapping(
+                    payload,
+                    crate::vm::osr::DeoptReason::Safepoint,
+                    &entry.live_local_types,
+                    Some(&self.functions[func_idx].block_entry_pcs),
+                )
+                .map_err(|e| LustError::RuntimeError {
+                    message: format!("OSR deopt payload conversion error: {e}"),
+                })?;
+
+                let top_frame = self.call_stack.last_mut().ok_or_else(|| {
+                    LustError::RuntimeError {
+                        message: "Call stack empty during OSR deopt reconstruction".into(),
+                    }
+                })?;
+                deopt_exit
+                    .try_apply_authoritative(top_frame)
+                    .map_err(|e| LustError::RuntimeError {
+                        message: format!("OSR deopt authoritative frame application error: {e}"),
+                    })?;
+
+                return Ok(OsrScopedOutcome::DeoptimizedResume);
+            }
+
+            let primary_err = if status == MIR_STATUS_ERR_OUT_OF_GAS {
+                match gas_charge_res {
+                    Err(e) => e,
+                    Ok(()) => LustError::RuntimeError {
+                        message: "Out of gas during OSR execution".into(),
+                    },
+                }
+            } else if status == MIR_STATUS_ERR_OOM {
+                match mem_charge_res {
+                    Err(e) => e,
+                    Ok(()) => LustError::RuntimeError {
+                        message: "Out of memory during OSR execution".into(),
+                    },
+                }
+            } else if status == MIR_STATUS_ERR_INTERRUPTED {
+                LustError::RuntimeError {
+                    message: "Execution interrupted during OSR execution".into(),
+                }
+            } else {
+                let message = match status {
+                    MIR_STATUS_ERR_DIV_BY_ZERO => {
+                        "Division or modulo by zero during OSR execution".into()
+                    }
+                    MIR_STATUS_ERR_NEG_EXPONENT => {
+                        "Negative exponent in integer power during OSR execution".into()
+                    }
+                    MIR_STATUS_ERR_OUT_OF_BOUNDS => {
+                        "Array index or pointer out of bounds during OSR execution".into()
+                    }
+                    _ => format!("OSR native execution failed with status {}", status),
+                };
+                LustError::RuntimeError { message }
+            };
+            return Err(primary_err);
+        }
+
+        gas_charge_res?;
+        mem_charge_res?;
+
+        let val = execution_val.map_err(|msg| LustError::RuntimeError { message: msg })?;
+        Ok(OsrScopedOutcome::Completed(val))
     }
 
 
@@ -1453,6 +1872,21 @@ impl StructMetadataRegistry {
     pub(super) fn clone_map(&self) -> HashMap<String, RuntimeStructInfo> {
         self.map.clone()
     }
+}
+
+/// Outcome of a production VM OSR backedge attempt.
+#[cfg(feature = "std")]
+pub(super) enum OsrBackedgeOutcome {
+    /// OSR completed the function cleanly and delivered its return value via `finish_return`.
+    Return(Option<Value>),
+    /// OSR triggered safepoint deopt and authoritatively restored `frame.ip` + live locals.
+    DeoptimizedResume,
+}
+
+#[cfg(feature = "std")]
+enum OsrScopedOutcome {
+    Completed(Value),
+    DeoptimizedResume,
 }
 
 /// Direct `func_idx`-indexed compiled Cranelift metadata cache entry (Hazard 4 / PERF-T1-8).

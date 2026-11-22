@@ -4,7 +4,6 @@
 //! zero-leak handle ownership cleanup, and Bytecode interpreter oracle parity.
 
 use std::rc::Rc;
-use std::cell::RefCell;
 use lust::bytecode::{LustMap, Value, ValueKey};
 use lust::bytecode::compiler::Compiler;
 use lust::config::LustConfig;
@@ -264,17 +263,17 @@ fn array_marshaling_indexing_and_mutation() {
     let (mut vm_clif, mut vm_bc) = create_vms(src);
 
     // Reading array
-    let arr_val = Value::Array(Rc::new(RefCell::new(vec![Value::Int(15), Value::Int(27)])));
+    let arr_val = Value::array(vec![Value::Int(15), Value::Int(27)]);
     let sum_res = vm_clif.call("sum_int_array", vec![arr_val]).unwrap();
     assert_eq!(sum_res, Value::Int(42));
 
     // Float array
-    let float_arr = Value::Array(Rc::new(RefCell::new(vec![Value::Float(1.5), Value::Float(2.5)])));
+    let float_arr = Value::array(vec![Value::Float(1.5), Value::Float(2.5)]);
     let float_sum = vm_clif.call("sum_float_array", vec![float_arr]).unwrap();
     assert_eq!(float_sum, Value::Float(4.0));
 
     // In-place mutation
-    let orig_cell = Rc::new(RefCell::new(vec![Value::Int(1), Value::Int(2)]));
+    let orig_cell = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(1), Value::Int(2)]));
     let mut_arg = Value::Array(orig_cell.clone());
     let mut_res = vm_clif.call("mutate_first", vec![mut_arg]).unwrap();
     assert_eq!(mut_res, Value::Int(999));
@@ -283,7 +282,7 @@ fn array_marshaling_indexing_and_mutation() {
     // Returning array
     let ret_arr = vm_clif.call("make_array", vec![]).unwrap();
     let ret_arr_bc = vm_bc.call("make_array", vec![]).unwrap();
-    assert_eq!(ret_arr, Value::Array(Rc::new(RefCell::new(vec![Value::Int(10), Value::Int(20), Value::Int(30)]))));
+    assert_eq!(ret_arr, Value::array(vec![Value::Int(10), Value::Int(20), Value::Int(30)]));
     assert_eq!(ret_arr, ret_arr_bc);
 }
 

@@ -1,7 +1,9 @@
 //! Cranelift JIT dispatch, eligibility checks, and compound value marshaling for the Lust VM.
 
 use crate::ast::types::TypeKind;
-use crate::bytecode::{LustMap, StructLayout, StructObject, Value};
+use crate::bytecode::{
+    FlatArrayBuffer, FlatArrayElemTag, LustArray, LustMap, StructLayout, StructObject, Value,
+};
 use crate::error::{LustError, Result};
 #[cfg(feature = "std")]
 use crate::mir::cranelift_backend::{
@@ -23,7 +25,6 @@ use crate::vm::VM;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::cell::RefCell;
 
 #[derive(Debug, Clone, Copy)]
 pub enum RawArg {
@@ -33,7 +34,7 @@ pub enum RawArg {
 
 #[derive(Debug, Clone)]
 pub struct MarshalledArray {
-    pub rc: Rc<RefCell<Vec<Value>>>,
+    pub rc: Rc<LustArray>,
     pub ptr: *mut i64,
     pub elem_ty: MirType,
     pub param_indices: Vec<usize>,
@@ -55,7 +56,7 @@ enum CraneliftOutcome {
 
 #[derive(Debug)]
 pub struct DecodedArray {
-    pub matched_input_rc: Option<Rc<RefCell<Vec<Value>>>>,
+    pub matched_input_rc: Option<Rc<LustArray>>,
     pub _ptr: *mut i64,
     pub elements: Vec<Value>,
 }
@@ -615,7 +616,7 @@ pub fn stage_input_writebacks_with_readonly(
     mir_ctx: &crate::mir::runtime_helpers::MirContext,
     marshalled_arrays: &[MarshalledArray],
     readonly_params: &[bool],
-) -> Result<Vec<(Rc<RefCell<Vec<Value>>>, Vec<Value>)>> {
+) -> Result<Vec<(Rc<LustArray>, Vec<Value>)>> {
     let mut staged = Vec::new();
     for m in marshalled_arrays {
         if !param_indices_need_writeback(&m.param_indices, readonly_params) {
@@ -631,7 +632,7 @@ pub fn stage_input_writebacks_with_readonly(
 pub fn stage_input_writebacks(
     mir_ctx: &crate::mir::runtime_helpers::MirContext,
     marshalled_arrays: &[MarshalledArray],
-) -> Result<Vec<(Rc<RefCell<Vec<Value>>>, Vec<Value>)>> {
+) -> Result<Vec<(Rc<LustArray>, Vec<Value>)>> {
     stage_input_writebacks_with_readonly(mir_ctx, marshalled_arrays, &[])
 }
 
@@ -779,14 +780,14 @@ pub fn reset_cranelift_writeback_commit_count() {
 }
 
 pub fn commit_staged_writebacks_and_structs(
-    staged_arrays: Vec<(Rc<RefCell<Vec<Value>>>, Vec<Value>)>,
+    staged_arrays: Vec<(Rc<LustArray>, Vec<Value>)>,
     staged_structs: Vec<(Rc<StructObject>, Vec<Value>)>,
 ) -> Result<()> {
     if staged_arrays.is_empty() && staged_structs.is_empty() {
         return Ok(());
     }
     // 1. Acquire all mutable borrows for arrays and structs before publishing any changes
-    let array_rcs: Vec<Rc<RefCell<Vec<Value>>>> =
+    let array_rcs: Vec<Rc<LustArray>> =
         staged_arrays.iter().map(|(rc, _)| rc.clone()).collect();
     let mut array_guards = Vec::with_capacity(array_rcs.len());
     for rc in &array_rcs {
@@ -834,7 +835,7 @@ pub fn commit_staged_writebacks_and_structs(
 }
 
 pub fn commit_staged_writebacks(
-    staged: Vec<(Rc<RefCell<Vec<Value>>>, Vec<Value>)>,
+    staged: Vec<(Rc<LustArray>, Vec<Value>)>,
 ) -> Result<()> {
     commit_staged_writebacks_and_structs(staged, Vec::new())
 }
@@ -1229,6 +1230,260 @@ fn compute_readonly_params_with_structs(
         out.insert(f.signature.name.clone(), ro);
     }
     out
+}
+
+/// Pure Cranelift runtime builtins guaranteed to NEVER invoke host/user Rust callbacks (`PERF-T4-3`).
+/// Conservatively excludes `print`/`println` (console sink) and all effect/handler/unknown callees.
+#[cfg(feature = "std")]
+#[inline]
+fn is_host_callback_free_cranelift_builtin(callee: &str) -> bool {
+    matches!(
+        callee,
+        "math.abs"
+            | "abs"
+            | "math.min"
+            | "min"
+            | "math.max"
+            | "max"
+            | "math.clamp"
+            | "clamp"
+            | "table.len"
+            | "array.len"
+            | "array.push"
+            | "table.push"
+            | "string.len"
+            | "tostring"
+            | "map.len"
+            | "map.get"
+            | "map.set"
+            | "map.new"
+            | "enum.tag"
+            | "enum.payload"
+            | "enum.new"
+            | "enum.alloc"
+    )
+}
+
+/// Infers the exact `MirType` of a call argument operand in `func` for fail-closed
+/// signature compatibility checking in `compute_has_external_or_host_calls` (`PERF-T4-3`).
+#[cfg(feature = "std")]
+fn call_arg_mir_type(func: &MirFunction, op: &Operand) -> MirType {
+    use crate::mir::ir::Place;
+    match op {
+        Operand::Constant(MirConstant::Int(_)) => MirType::Int,
+        Operand::Constant(MirConstant::Float(_)) => MirType::Float,
+        Operand::Constant(MirConstant::Bool(_)) => MirType::Bool,
+        Operand::Constant(MirConstant::String(_)) => MirType::String,
+        Operand::Constant(MirConstant::Unit) => MirType::Unit,
+        Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => func
+            .locals
+            .get(loc.0)
+            .map(|l| l.ty.clone())
+            .unwrap_or(MirType::Unknown),
+        Operand::Copy(Place::Index(base, _)) | Operand::Move(Place::Index(base, _)) => {
+            if let Place::Local(loc) = base.as_ref()
+                && let Some(MirType::Array(elem)) = func.locals.get(loc.0).map(|l| &l.ty)
+            {
+                elem.as_ref().clone()
+            } else {
+                MirType::Unknown
+            }
+        }
+        Operand::Copy(Place::Field(..)) | Operand::Move(Place::Field(..)) => MirType::Unknown,
+    }
+}
+
+/// Computes transitive `has_external_or_host_calls` per function in `module` (`PERF-T4-3`).
+///
+/// A function is marked `false` ONLY when every `Terminator::Call` in its reachable module
+/// call graph targets either another compiled module function (with matching arity, matching
+/// known parameter/argument types, and recursively `false`) or a pure callback-free Cranelift
+/// builtin, and zero `Terminator::Raise` or effect/handler/external/unknown calls are present.
+#[cfg(feature = "std")]
+pub fn compute_has_external_or_host_calls(
+    module: &crate::mir::ir::MirModule,
+) -> hashbrown::HashMap<String, bool> {
+    let fn_count = module.functions.len();
+    let mut fn_index_by_name: hashbrown::HashMap<&str, Option<usize>> =
+        hashbrown::HashMap::with_capacity(fn_count);
+    for (fi, f) in module.functions.iter().enumerate() {
+        fn_index_by_name
+            .entry(f.signature.name.as_str())
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(fi));
+    }
+
+    let mut has_ext = vec![false; fn_count];
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); fn_count];
+
+    for (fi, f) in module.functions.iter().enumerate() {
+        for block in &f.blocks {
+            match &block.terminator {
+                Some(Terminator::Call { callee, args, .. }) => {
+                    if is_host_callback_free_cranelift_builtin(callee) {
+                        continue;
+                    }
+                    if is_effect_or_handler_callee(callee) {
+                        has_ext[fi] = true;
+                        continue;
+                    }
+                    if let Some(Some(gi)) = fn_index_by_name.get(callee.as_str()).copied() {
+                        let callee_fn = &module.functions[gi];
+                        let arity_and_types_match = callee_fn.params.len() == args.len()
+                            && callee_fn.params.iter().zip(args.iter()).all(|(&param_loc, arg)| {
+                                let Some(param_decl) = callee_fn.locals.get(param_loc.0) else {
+                                    return false;
+                                };
+                                let arg_ty = call_arg_mir_type(f, arg);
+                                param_decl.ty != MirType::Unknown && arg_ty == param_decl.ty
+                            });
+                        if arity_and_types_match {
+                            edges[fi].push(gi);
+                        } else {
+                            has_ext[fi] = true;
+                        }
+                    } else {
+                        has_ext[fi] = true;
+                    }
+                }
+                Some(Terminator::Raise(..)) => {
+                    has_ext[fi] = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    loop {
+        let mut changed = false;
+        for fi in 0..fn_count {
+            if has_ext[fi] {
+                continue;
+            }
+            if edges[fi].iter().any(|&gi| has_ext[gi]) {
+                has_ext[fi] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut out = hashbrown::HashMap::with_capacity(fn_count);
+    for (fi, f) in module.functions.iter().enumerate() {
+        out.insert(f.signature.name.clone(), has_ext[fi]);
+    }
+    out
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn flat_array_elem_tag(elem_ty: &MirType) -> Option<FlatArrayElemTag> {
+    match elem_ty {
+        MirType::Int => Some(FlatArrayElemTag::Int),
+        MirType::Float => Some(FlatArrayElemTag::Float),
+        MirType::Bool => Some(FlatArrayElemTag::Bool),
+        _ => None,
+    }
+}
+
+/// Returns a cached read-only `FlatArrayBuffer` on hit, or builds and publishes one via the
+/// exact 4-step atomic OOM-rollback protocol (`PERF-T4-3`):
+///   1. Checked `req_bytes = (len + 2) * 8` (overflow -> OOM).
+///   2. Reserve `req_bytes` against `mir_ctx.max_memory_limit` BEFORE allocating or touching
+///      `rc.flat_cache` (breach -> leave `flat_cache` unmodified, set `MIR_STATUS_ERR_OOM`, return `Err`).
+///   3. Allocate and populate a local `Vec<i64>` while validating every element matches `tag`
+///      (mismatch -> refund `req_bytes`, leave `flat_cache` untouched, return `Ok(None)` for fallback).
+///   4. Publish `Rc<FlatArrayBuffer>` into `rc.flat_cache` ONLY after full population succeeds.
+///
+/// Return values:
+/// - `Ok(Some((buf, true)))`: cache hit (zero bytes allocated/charged).
+/// - `Ok(Some((buf, false)))`: cache miss built and published atomically.
+/// - `Ok(None)`: homogeneous element type mismatch (reserved bytes refunded, cache untouched).
+/// - `Err(err)`: OOM or checked arithmetic overflow (status set to `MIR_STATUS_ERR_OOM`, cache untouched).
+#[cfg(feature = "std")]
+pub fn build_or_get_cached_flat_array(
+    mir_ctx: &crate::mir::runtime_helpers::MirContext,
+    rc: &Rc<LustArray>,
+    elements: &[Value],
+    tag: FlatArrayElemTag,
+) -> Result<Option<(Rc<FlatArrayBuffer>, bool)>> {
+    if let Some(buf) = rc.cached_flat(tag) {
+        return Ok(Some((buf, true)));
+    }
+
+    // Step 1: Checked byte calculation `(len + 2) * 8`
+    let len = elements.len();
+    let Some(word_len) = len.checked_add(2) else {
+        mir_ctx.set_status(MIR_STATUS_ERR_OOM);
+        return Err(LustError::RuntimeError {
+            message: "Out of memory: flat array cache word length overflow".into(),
+        });
+    };
+    let Some(req_bytes_u) = word_len.checked_mul(core::mem::size_of::<i64>()) else {
+        mir_ctx.set_status(MIR_STATUS_ERR_OOM);
+        return Err(LustError::RuntimeError {
+            message: "Out of memory: flat array cache byte size overflow".into(),
+        });
+    };
+    let Ok(req_bytes) = i64::try_from(req_bytes_u) else {
+        mir_ctx.set_status(MIR_STATUS_ERR_OOM);
+        return Err(LustError::RuntimeError {
+            message: "Out of memory: flat array cache byte size exceeds i64::MAX".into(),
+        });
+    };
+
+    // Step 2: Reserve `req_bytes` against `mir_ctx.max_memory_limit` BEFORE allocation or cache mutation
+    let limit = mir_ctx
+        .max_memory_limit
+        .load(core::sync::atomic::Ordering::SeqCst);
+    let prev = mir_ctx
+        .memory_used
+        .fetch_add(req_bytes, core::sync::atomic::Ordering::SeqCst);
+    if prev.saturating_add(req_bytes) > limit {
+        mir_ctx
+            .memory_used
+            .fetch_sub(req_bytes, core::sync::atomic::Ordering::SeqCst);
+        mir_ctx.set_status(MIR_STATUS_ERR_OOM);
+        return Err(LustError::RuntimeError {
+            message: "Out of memory allocating cached flat array buffer for Cranelift JIT".into(),
+        });
+    }
+
+    // Step 3: Allocate and populate local flat buffer, validating every element
+    let mut words = Vec::<i64>::new();
+    if words.try_reserve_exact(word_len).is_err() {
+        mir_ctx
+            .memory_used
+            .fetch_sub(req_bytes, core::sync::atomic::Ordering::SeqCst);
+        mir_ctx.set_status(MIR_STATUS_ERR_OOM);
+        return Err(LustError::RuntimeError {
+            message: "Out of memory reserving host buffer for cached flat array".into(),
+        });
+    }
+    words.push(len as i64);
+    words.push(len as i64);
+    for elem in elements {
+        let raw = match (elem, tag) {
+            (Value::Int(n), FlatArrayElemTag::Int) => *n,
+            (Value::Float(f), FlatArrayElemTag::Float) => f.to_bits() as i64,
+            (Value::Bool(b), FlatArrayElemTag::Bool) => i64::from(*b),
+            _ => {
+                // Element type mismatch: refund reserved bytes, leave flat_cache untouched.
+                mir_ctx
+                    .memory_used
+                    .fetch_sub(req_bytes, core::sync::atomic::Ordering::SeqCst);
+                return Ok(None);
+            }
+        };
+        words.push(raw);
+    }
+
+    // Step 4: Publish into `LustArray.flat_cache` ONLY after full population succeeds
+    let buf = Rc::new(FlatArrayBuffer::new(words));
+    rc.set_cached_flat(tag, Rc::clone(&buf));
+    Ok(Some((buf, false)))
 }
 
 impl VM {
@@ -2780,6 +3035,35 @@ impl VM {
             .map(|entry| entry.readonly_params.clone())
     }
 
+    /// Read-only inspection helper returning the compile-time `has_external_or_host_calls` flag
+    /// for a compiled Cranelift function (`PERF-T4-3`).
+    #[cfg(feature = "std")]
+    pub fn cranelift_has_external_or_host_calls(&self, func_name: &str) -> Option<bool> {
+        let func_idx = self.functions.iter().position(|f| f.name == func_name)?;
+        self.cranelift_fn_cache
+            .get(func_idx)?
+            .as_ref()
+            .map(|entry| entry.has_external_or_host_calls)
+    }
+
+    /// Read-only inspection helper returning the total Cranelift native entry count.
+    #[cfg(feature = "std")]
+    pub fn cranelift_entry_count(&self) -> u64 {
+        self.cranelift_entry_count
+    }
+
+    /// Read-only inspection helper returning the number of borrowed read-only flat-array cache hits.
+    #[cfg(feature = "std")]
+    pub fn cranelift_array_cache_hits(&self) -> u64 {
+        self.cranelift_array_cache_hits
+    }
+
+    /// Read-only inspection helper returning the number of borrowed read-only flat-array cache builds.
+    #[cfg(feature = "std")]
+    pub fn cranelift_array_cache_builds(&self) -> u64 {
+        self.cranelift_array_cache_builds
+    }
+
     /// Read-only inspection helper returning the cached `local_types.len()` for a compiled
     /// Cranelift function.
     #[cfg(feature = "std")]
@@ -2924,6 +3208,7 @@ impl VM {
             &refined_module,
             Some(self.struct_metadata.as_map()),
         );
+        let mut has_ext_calls_by_name = compute_has_external_or_host_calls(&refined_module);
 
         // Transactional publish ONLY after compile_module returns Ok
         let mut compiled_func_indices: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
@@ -2975,6 +3260,9 @@ impl VM {
                         .remove(&name)
                         .filter(|flags| flags.len() == param_types.len())
                         .unwrap_or_else(|| vec![false; param_types.len()]);
+                    let has_external_or_host_calls = has_ext_calls_by_name
+                        .remove(&name)
+                        .unwrap_or(true);
                     self.cranelift_fn_cache[func_idx] = Some(Rc::new(crate::vm::CompiledFnEntry {
                         func_name: alloc::rc::Rc::<str>::from(name.as_str()),
                         code_ptr: ptr,
@@ -2984,6 +3272,7 @@ impl VM {
                         compiled_generation: next_gen,
                         struct_metadata_generation: current_struct_gen,
                         readonly_params,
+                        has_external_or_host_calls,
                     }));
                 }
             }
@@ -3101,6 +3390,7 @@ impl VM {
             &entry.ret_type,
             &entry.local_types,
             &entry.readonly_params,
+            entry.has_external_or_host_calls,
             entry.code_ptr,
             &mut native_entered,
         );
@@ -3325,6 +3615,56 @@ impl VM {
     }
 
     #[cfg(feature = "std")]
+    fn collect_readonly_borrowable_array_rcs(
+        &self,
+        param_types: &[MirType],
+        readonly_params: &[bool],
+    ) -> (Vec<Rc<LustArray>>, hashbrown::HashMap<*const LustArray, usize>) {
+        let Some(frame) = self.call_stack.last() else {
+            return (Vec::new(), hashbrown::HashMap::new());
+        };
+        if frame.registers.len() < param_types.len() {
+            return (Vec::new(), hashbrown::HashMap::new());
+        }
+        let mut state: hashbrown::HashMap<
+            *const LustArray,
+            (Rc<LustArray>, Option<FlatArrayElemTag>, bool),
+        > = hashbrown::HashMap::new();
+        let mut order: Vec<*const LustArray> = Vec::new();
+        for (i, expected_ty) in param_types.iter().enumerate() {
+            if let Value::Array(rc) = &frame.registers[i] {
+                let key = Rc::as_ptr(rc);
+                let is_ro = readonly_params.get(i).copied() == Some(true);
+                let tag_opt = match expected_ty {
+                    MirType::Array(elem_ty) => flat_array_elem_tag(elem_ty),
+                    _ => None,
+                };
+                match state.get_mut(&key) {
+                    Some((_, existing_tag, eligible)) => {
+                        if !is_ro || tag_opt.is_none() || *existing_tag != tag_opt {
+                            *eligible = false;
+                        }
+                    }
+                    None => {
+                        order.push(key);
+                        state.insert(key, (Rc::clone(rc), tag_opt, is_ro && tag_opt.is_some()));
+                    }
+                }
+            }
+        }
+        let mut rcs = Vec::new();
+        let mut index_by_ptr = hashbrown::HashMap::new();
+        for key in order {
+            if let Some((rc, _, true)) = state.remove(&key) {
+                let idx = rcs.len();
+                rcs.push(rc);
+                index_by_ptr.insert(key, idx);
+            }
+        }
+        (rcs, index_by_ptr)
+    }
+
+    #[cfg(feature = "std")]
     #[allow(clippy::too_many_arguments)]
     fn try_run_cranelift_top_frame_scoped(
         &mut self,
@@ -3334,12 +3674,50 @@ impl VM {
         ret_type: &MirType,
         local_types: &[MirType],
         readonly_params: &[bool],
+        has_external_or_host_calls: bool,
         code_ptr: *const u8,
         native_entered: &mut bool,
     ) -> Result<CraneliftOutcome> {
         let param_count = param_types.len();
 
-        // --- INVOCATION CONTEXT ACTIVATION & RESOURCE INITIALIZATION ---
+        // Fast-path sync for specialized tracing-JIT caches (single thread-local Cell load == 0 in common case)
+        // BEFORE acquiring shared Ref guards on borrowed read-only arrays.
+        if crate::bytecode::value::specialized_cache_active_entries() > 0 {
+            let _sync_vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
+            if let Some(frame) = self.call_stack.last() {
+                for (i, expected_ty) in param_types.iter().enumerate().take(frame.registers.len()) {
+                    if let (Value::Array(rc), MirType::Array(_)) = (&frame.registers[i], expected_ty) {
+                        crate::bytecode::value::try_sync_specialized_array(rc)
+                            .map_err(|msg| LustError::RuntimeError { message: msg })?;
+                    }
+                }
+            }
+        }
+
+        // --- INVOCATION CONTEXT ACTIVATION, PINNING & DROP-ORDER INVARIANT (PERF-T4-3) ---
+        // Rust drops locals strictly in REVERSE declaration order:
+        //   Declared 1st -> Dropped 4th (LAST):  `pinned_borrowed_arrays: Vec<Rc<FlatArrayBuffer>>`
+        //   Declared 2nd -> Dropped 3rd:         `borrowed_array_rcs: Vec<Rc<LustArray>>`
+        //   Declared 3rd -> Dropped 2nd:         `_borrowed_array_guards: Vec<Ref<'_, Vec<Value>>>`
+        //   Declared 4th -> Dropped 1st (FIRST): `_vm_guard` (drops `MirContextGuard`, unregistering
+        //                                        all borrowed provenance records BEFORE buffers drop)
+        let mut pinned_borrowed_arrays: Vec<Rc<FlatArrayBuffer>> = Vec::new();
+        let (borrowed_array_rcs, borrowed_array_guard_idx) = if !has_external_or_host_calls {
+            self.collect_readonly_borrowable_array_rcs(param_types, readonly_params)
+        } else {
+            (Vec::new(), hashbrown::HashMap::new())
+        };
+        let _borrowed_array_guards: Vec<core::cell::Ref<'_, Vec<Value>>> = borrowed_array_rcs
+            .iter()
+            .map(|rc| {
+                rc.try_borrow().map_err(|_| LustError::RuntimeError {
+                    message:
+                        "Failed to acquire borrow for array parameter packing: mutable borrow active"
+                            .into(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         // Activate VM and MIR invocation context before any argument packing allocations.
         // CurrentVmGuard enters both CURRENT_VM_STACK (for console routing) and mir_context
         // once, keeping host marshaling allocations inside this scope's ownership floor.
@@ -3355,21 +3733,25 @@ impl VM {
         self.mir_context.set_status(MIR_STATUS_OK);
         self.mir_context.set_memory_used(0);
         self.mir_context.set_max_memory_limit(i64::MAX);
-        if let Some(rem_gas) = vm_gas_budget {
-            self.mir_context
-                .set_gas(i64::try_from(rem_gas).unwrap_or(i64::MAX));
-        }
+        let mut gas_guard = crate::vm::GasScopeGuard::enter(
+            Rc::clone(&self.mir_context),
+            vm_gas_budget,
+            self.active_jit_depth > 0,
+        );
 
         self.sync_mir_context_struct_metadata();
 
         // Convert parameters to RawArg with alias-preserving tracking
         let mut raw_args = Vec::with_capacity(param_count);
         let mut marshalled_arrays: Vec<MarshalledArray> = Vec::new();
-        let mut marshalled_array_by_ptr: hashbrown::HashMap<*const RefCell<Vec<Value>>, usize> =
+        let mut marshalled_array_by_ptr: hashbrown::HashMap<*const LustArray, usize> =
             hashbrown::HashMap::new();
         let mut marshalled_structs: Vec<MarshalledStruct> = Vec::new();
         let mut marshalled_struct_by_ptr: hashbrown::HashMap<*const StructObject, usize> =
             hashbrown::HashMap::new();
+        let mut borrowed_cache_bytes_used: i64 = 0;
+        let mut array_cache_hits_delta: u64 = 0;
+        let mut array_cache_builds_delta: u64 = 0;
 
         {
             let frame = self.call_stack.last().unwrap();
@@ -3390,9 +3772,6 @@ impl VM {
                         if !Self::is_cranelift_supported_array_elem_type(elem_ty) {
                             return Ok(CraneliftOutcome::Fallback);
                         }
-                        crate::bytecode::value::try_sync_specialized_array(rc).map_err(|msg| {
-                            LustError::RuntimeError { message: msg }
-                        })?;
                         let rc_key = Rc::as_ptr(rc);
                         if let Some(&existing_idx) = marshalled_array_by_ptr.get(&rc_key) {
                             let existing = &mut marshalled_arrays[existing_idx];
@@ -3402,6 +3781,63 @@ impl VM {
                             existing.param_indices.push(i);
                             raw_args.push(RawArg::Int(existing.ptr as i64));
                             continue;
+                        }
+
+                        // Borrowed read-only flat-view boundary fast-path (PERF-T4-3):
+                        // Eligible ONLY when !has_external_or_host_calls, all aliased param
+                        // positions are proven readonly, elem_ty is homogeneous Int/Float/Bool,
+                        // and a shared Ref guard is pinned for the entire invocation.
+                        if let Some(&guard_idx) = borrowed_array_guard_idx.get(&rc_key)
+                            && let Some(flat_tag) = flat_array_elem_tag(elem_ty)
+                        {
+                            let elements_slice: &[Value] = &_borrowed_array_guards[guard_idx];
+                            let saved_used = self.mir_context.memory_used();
+                            self.mir_context.set_memory_used(borrowed_cache_bytes_used);
+                            self.mir_context.set_max_memory_limit(mem_limit);
+                            let build_res = build_or_get_cached_flat_array(
+                                &self.mir_context,
+                                rc,
+                                elements_slice,
+                                flat_tag,
+                            );
+                            borrowed_cache_bytes_used = self.mir_context.memory_used();
+                            self.mir_context.set_memory_used(saved_used);
+                            self.mir_context.set_max_memory_limit(i64::MAX);
+
+                            match build_res? {
+                                Some((buf, was_hit)) => {
+                                    if was_hit {
+                                        array_cache_hits_delta += 1;
+                                    } else {
+                                        array_cache_builds_delta += 1;
+                                    }
+                                    let buf_ptr = buf.as_ptr();
+                                    self.mir_context
+                                        .register_borrowed_readonly_array(
+                                            buf_ptr,
+                                            buf.word_len(),
+                                            (**elem_ty).clone(),
+                                        )
+                                        .map_err(|message| LustError::RuntimeError { message })?;
+                                    pinned_borrowed_arrays.push(buf);
+                                    let new_idx = marshalled_arrays.len();
+                                    marshalled_arrays.push(MarshalledArray {
+                                        rc: rc.clone(),
+                                        ptr: buf_ptr as *mut i64,
+                                        elem_ty: (**elem_ty).clone(),
+                                        param_indices: vec![i],
+                                    });
+                                    marshalled_array_by_ptr.insert(rc_key, new_idx);
+                                    raw_args.push(RawArg::Int(buf_ptr as i64));
+                                    continue;
+                                }
+                                None => {
+                                    // Element type mismatch (e.g. mixed `[1, "two"]`): reserved
+                                    // bytes already refunded & flat_cache untouched; fall back
+                                    // transparently to interpreter just like standard marshalling.
+                                    return Ok(CraneliftOutcome::Fallback);
+                                }
+                            }
                         }
 
                         let elements = rc.try_borrow().map_err(|_| LustError::RuntimeError {
@@ -3555,11 +3991,13 @@ impl VM {
             }
         }
 
-        // Apply guest memory budget immediately before native entry
-        self.mir_context.set_memory_used(0);
-        self.mir_context.set_max_memory_limit(mem_limit);
+        self.cranelift_array_cache_hits += array_cache_hits_delta;
+        self.cranelift_array_cache_builds += array_cache_builds_delta;
 
-        let gas_entry_snapshot = self.mir_context.gas_remaining();
+        // Apply guest memory budget immediately before native entry, carrying forward
+        // any bytes newly allocated during borrowed read-only flat-cache builds.
+        self.mir_context.set_memory_used(borrowed_cache_bytes_used);
+        self.mir_context.set_max_memory_limit(mem_limit);
 
         self.cranelift_entry_count += 1;
         *native_entered = true;
@@ -3832,13 +4270,7 @@ impl VM {
         drop(_jit_guard);
         drop(_inv_guard);
 
-        let gas_after = self.mir_context.gas_remaining();
-        let gas_spent = (gas_entry_snapshot.saturating_sub(gas_after)).max(0) as u64;
-        let gas_charge_res = if vm_gas_budget.is_some() && gas_spent > 0 {
-            self.budgets.charge_gas(gas_spent)
-        } else {
-            Ok(())
-        };
+        let gas_charge_res = gas_guard.finish_and_charge(&mut self.budgets);
 
         let mem_spent = usize::try_from(self.mir_context.memory_used().max(0)).unwrap_or(usize::MAX);
         let mem_charge_res = if vm_has_mem_budget && mem_spent > 0 {
@@ -4016,7 +4448,7 @@ impl VM {
                 if let Some(orig_rc) = decoded.matched_input_rc {
                     Value::Array(orig_rc)
                 } else {
-                    Value::Array(Rc::new(RefCell::new(decoded.elements)))
+                    Value::Array(Rc::new(LustArray::new(decoded.elements)))
                 }
             }
             MirType::Tuple(elem_types) => {
@@ -4291,7 +4723,7 @@ impl VM {
             }
         }
 
-        let mut materialized_fresh_arrays: hashbrown::HashMap<usize, Rc<RefCell<Vec<Value>>>> =
+        let mut materialized_fresh_arrays: hashbrown::HashMap<usize, Rc<LustArray>> =
             hashbrown::HashMap::new();
         let mut materialized_fresh_structs: hashbrown::HashMap<usize, Rc<StructObject>> =
             hashbrown::HashMap::new();
@@ -4344,7 +4776,7 @@ impl VM {
                     } else {
                         let rc = materialized_fresh_arrays
                             .entry(decoded._ptr as usize)
-                            .or_insert_with(|| Rc::new(RefCell::new(decoded.elements)))
+                            .or_insert_with(|| Rc::new(LustArray::new(decoded.elements)))
                             .clone();
                         Value::Array(rc)
                     }

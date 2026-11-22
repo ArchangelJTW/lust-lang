@@ -1,12 +1,11 @@
 //! Regression suite for TASK-W4-ARRAY-FIX-PARTIAL (F1, F2, F4, F5, F6, F7).
 //! Intentionally separate from `tests/w4_jit_simd.rs` to avoid concurrent edit conflicts.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Mutex;
 
 use lust::ast::Span;
-use lust::bytecode::Value;
+use lust::bytecode::{LustArray, Value};
 use lust::config::LustConfig;
 use lust::intern::Interner;
 use lust::lexer::Lexer;
@@ -103,7 +102,7 @@ fn test_w4_partial_f1_terminal_gas_and_oom_preserve_prefix_writes() {
         vm.load_mir_function(func).expect("Load write_then_oog");
         vm.set_gas_budget(10);
 
-        let arr = Rc::new(RefCell::new(vec![Value::Int(3)]));
+        let arr = Rc::new(LustArray::new(vec![Value::Int(3)]));
         let entry_before = vm.cranelift_entry_count;
         let res = vm.call(fn_name, vec![Value::Array(arr.clone())]);
 
@@ -181,7 +180,7 @@ fn test_w4_partial_f1_terminal_gas_and_oom_preserve_prefix_writes() {
         vm.load_mir_function(func).expect("Load write_then_oom");
         vm.set_memory_budget_bytes(16).expect("Set memory budget");
 
-        let arr = Rc::new(RefCell::new(vec![Value::Int(3)]));
+        let arr = Rc::new(LustArray::new(vec![Value::Int(3)]));
         let entry_before = vm.cranelift_entry_count;
         let res = vm.call(fn_name, vec![Value::Array(arr.clone())]);
 
@@ -245,7 +244,7 @@ fn test_w4_partial_f1_terminal_gas_and_oom_preserve_prefix_writes() {
         vm.load_mir_function(func).expect("Load");
         vm.set_gas_budget(10);
 
-        let arr = Rc::new(RefCell::new(vec![Value::Int(3)]));
+        let arr = Rc::new(LustArray::new(vec![Value::Int(3)]));
         let _shared = arr.borrow();
         let err = vm
             .call(fn_name, vec![Value::Array(arr.clone())])
@@ -514,7 +513,7 @@ fn test_w4_partial_f2_deopt_fresh_and_input_array_alias_preservation() {
         vm.test_deopt_spike_hook = Some(lust::vm::TestDeoptSpikeHook::new(fn_name, bb_hdr.0));
         safepoint_request_deopt_on_poll(Some(fn_name.into()), 1);
 
-        let arr = Rc::new(RefCell::new(vec![Value::Int(3)]));
+        let arr = Rc::new(LustArray::new(vec![Value::Int(3)]));
         let entry_before = vm.cranelift_entry_count;
         let res = vm
             .call(fn_name, vec![Value::Array(arr.clone()), Value::Int(1)])
@@ -639,8 +638,8 @@ fn test_w4_partial_f4_nested_mir_context_scoped_ownership_and_isolation() {
         let outer_buf = lust_mir_alloc_array(2);
         assert!(!outer_buf.is_null());
 
-        let inner = Rc::new(RefCell::new(vec![Value::Int(42)]));
-        let outer = Rc::new(RefCell::new(vec![Value::Array(inner)]));
+        let inner = Rc::new(LustArray::new(vec![Value::Int(42)]));
+        let outer = Rc::new(LustArray::new(vec![Value::Array(inner)]));
         let _ = vm.call("nested_bail_noop", vec![Value::Array(outer)]);
 
         assert!(
@@ -683,8 +682,8 @@ fn test_w4_partial_f5_atomic_array_and_struct_rollback_and_no_leak_on_commit_err
     "#;
     let mut vm = setup_vm_from_source(source, "f5_atomic");
 
-    let arr_a = Rc::new(RefCell::new(vec![Value::Int(1)]));
-    let arr_b = Rc::new(RefCell::new(vec![Value::Int(2)]));
+    let arr_a = Rc::new(LustArray::new(vec![Value::Int(1)]));
+    let arr_b = Rc::new(LustArray::new(vec![Value::Int(2)]));
     let struct_s_val = vm
         .instantiate_struct_ordered("BoxedInt", vec![Value::Int(10)])
         .expect("Instantiate BoxedInt");
@@ -779,8 +778,8 @@ fn test_w4_partial_f6_unsupported_nested_and_mismatched_arrays_fallback_pre_entr
         vm.set_backend(VmBackend::Cranelift);
         vm.load_mir_function(func).expect("Load nested_array_noop");
 
-        let inner = Rc::new(RefCell::new(vec![Value::Int(42)]));
-        let outer = Rc::new(RefCell::new(vec![Value::Array(inner.clone())]));
+        let inner = Rc::new(LustArray::new(vec![Value::Int(42)]));
+        let outer = Rc::new(LustArray::new(vec![Value::Array(inner.clone())]));
         let entry_before = vm.cranelift_entry_count;
 
         let _ = vm.call(fn_name, vec![Value::Array(outer.clone())]);
@@ -805,7 +804,7 @@ fn test_w4_partial_f6_unsupported_nested_and_mismatched_arrays_fallback_pre_entr
         "#;
         let mut vm = setup_vm_from_source(source, "f6_mismatch");
 
-        let bad_arr = Rc::new(RefCell::new(vec![Value::string("bad")]));
+        let bad_arr = Rc::new(LustArray::new(vec![Value::string("bad")]));
         let entry_before = vm.cranelift_entry_count;
 
         let _ = vm.call("int_array_noop", vec![Value::Array(bad_arr.clone())]);
@@ -866,7 +865,7 @@ fn test_w4_partial_f7_specialized_cache_coherence_across_vm_guard_boundaries() {
 
     // Case 1: Warmed outside CurrentVmGuard (VmId(0)) -> read inside VM::call (VmId(vm.id))
     {
-        let arr = Rc::new(RefCell::new(vec![Value::Int(10)]));
+        let arr = Rc::new(LustArray::new(vec![Value::Int(10)]));
         let val = Value::Array(arr.clone());
         let mut slot = lust::bytecode::value::JitVecSlot {
             ptr: core::ptr::null_mut(),
@@ -894,7 +893,7 @@ fn test_w4_partial_f7_specialized_cache_coherence_across_vm_guard_boundaries() {
 
     // Case 2: Warmed outside CurrentVmGuard -> mutated inside VM::call -> no stale VmId(0) left
     {
-        let arr = Rc::new(RefCell::new(vec![Value::Int(10)]));
+        let arr = Rc::new(LustArray::new(vec![Value::Int(10)]));
         let val = Value::Array(arr.clone());
         let mut slot = lust::bytecode::value::JitVecSlot {
             ptr: core::ptr::null_mut(),
@@ -922,7 +921,7 @@ fn test_w4_partial_f7_specialized_cache_coherence_across_vm_guard_boundaries() {
 
     // Case 3: Warmed inside CurrentVmGuard -> read & invalidated outside CurrentVmGuard
     {
-        let arr = Rc::new(RefCell::new(vec![Value::Int(10)]));
+        let arr = Rc::new(LustArray::new(vec![Value::Int(10)]));
         let val = Value::Array(arr.clone());
         let mut slot = lust::bytecode::value::JitVecSlot {
             ptr: core::ptr::null_mut(),
@@ -954,7 +953,7 @@ fn test_w4_partial_f7_specialized_cache_coherence_across_vm_guard_boundaries() {
     // Case 4: Dirty specialized cache + active shared borrow must return Err on VM::call
     // (must not silently ignore sync error or cause unsafe RefCell aliasing UB)
     {
-        let arr = Rc::new(RefCell::new(vec![Value::Int(10)]));
+        let arr = Rc::new(LustArray::new(vec![Value::Int(10)]));
         let val = Value::Array(arr.clone());
         let mut slot = lust::bytecode::value::JitVecSlot {
             ptr: core::ptr::null_mut(),

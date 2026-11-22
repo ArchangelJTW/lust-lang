@@ -11,7 +11,8 @@ pub use jit_engine::{
     mir_array_elem_tag, MIR_ARRAY_ELEM_TAG_BOOL, MIR_ARRAY_ELEM_TAG_FLOAT,
     MIR_ARRAY_ELEM_TAG_INT, MIR_ARRAY_ELEM_TAG_STRING,
     lust_mir_charge_gas, lust_mir_clamp_int, lust_mir_div_int, lust_mir_enum_payload,
-    lust_mir_enum_tag, lust_mir_floordiv_float, lust_mir_floordiv_int, lust_mir_get_gas,
+    lust_mir_enum_tag, lust_mir_floordiv_float, lust_mir_floordiv_int, lust_mir_gas_fast_ptr,
+    lust_mir_gas_slow, lust_mir_get_gas,
     lust_mir_get_memory_used, lust_mir_get_status, lust_mir_ic_dispatch, lust_mir_ic_miss,
     lust_mir_ic_probe, lust_mir_init_deopt, lust_mir_init_deopt_at_terminator, lust_mir_map_get, lust_mir_map_len,
     lust_mir_map_set, lust_mir_max_int, lust_mir_min_int, lust_mir_pow_float,
@@ -38,13 +39,16 @@ pub use jit_engine::{
     is_vm_effect_intrinsic_callee, is_effect_or_handler_callee,
     lust_mir_enter_native_callee, lust_mir_exit_native_callee,
     NativeInvocationIdentity, NativeInvocationGuard, DeoptSiteKind,
-    CraneliftJitCompiler, DeoptPayload, IcEntry, IcSiteStats,
+    CraneliftJitCompiler, DeoptPayload, GasFastState, IcEntry, IcSiteStats,
     IcStateKind, InlineCacheSite, MirCraneliftBackendError, OsrPromotionTracker,
     SafepointFastState, SafepointRuntimeState, SafepointStatsSnapshot, SchemaDecodeError,
     SLOW_FLAG_DEOPT, SLOW_FLAG_FINALIZERS, SLOW_FLAG_GAS_BUDGET, SLOW_FLAG_INTERRUPT,
-    SLOW_FLAG_MASKED,
+    SLOW_FLAG_MASKED, UNBOUNDED_GAS_CHUNK, UnboundedGasChunkGuard,
+    reset_unbounded_gas_replenish_count, set_unbounded_gas_chunk_override,
+    unbounded_gas_chunk, unbounded_gas_replenish_count,
     CRANELIFT_NATIVE_ENTRY_COUNT, CRANELIFT_SIMD_SCALAR_COUNT, CRANELIFT_SIMD_VECTOR_COUNT,
-    DIRECT_DECODE_COUNT, DYNAMIC_LOOKUP_COUNT,
+    DIRECT_DECODE_COUNT, DYNAMIC_LOOKUP_COUNT, PROMOTED_LOOP_CFG_VERIFICATIONS,
+    promoted_loop_cfg_verifications, reset_promoted_loop_cfg_verifications,
     lust_mir_is_simd_scalar_forced, lust_mir_record_simd_scalar_op,
     lust_mir_record_simd_vector_op, MIR_STATUS_DEOPT, MIR_STATUS_ERR_DIV_BY_ZERO,
     MIR_STATUS_ERR_INTERRUPTED, MIR_STATUS_ERR_NEG_EXPONENT, MIR_STATUS_ERR_OOM,
@@ -1702,6 +1706,860 @@ pub mod jit_engine {
         builder.ins().iadd(l0, l1)
     }
 
+    /// Counter incremented each time `verify_promoted_loop_exit_completeness` mechanically
+    /// verifies a promoted loop's Cranelift CFG before finalization (`PERF-T4-2` Barrier 5).
+    pub static PROMOTED_LOOP_CFG_VERIFICATIONS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+
+    pub fn promoted_loop_cfg_verifications() -> u64 {
+        PROMOTED_LOOP_CFG_VERIFICATIONS.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn reset_promoted_loop_cfg_verifications() {
+        PROMOTED_LOOP_CFG_VERIFICATIONS.store(0, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[derive(Clone, Copy)]
+    struct PromotedLoopCounters {
+        gas: Option<(Variable, Variable)>, // (gas_ptr_var, gas_var)
+        sp: Option<(Variable, Variable)>,  // (sp_ptr_var, sp_cnt_var)
+    }
+
+    #[derive(Clone, Copy)]
+    struct HoistedArrayVars {
+        len_var: Variable,
+        data_ptr_var: Variable,
+    }
+
+    struct PromotedLoopSpec {
+        hdr: usize,
+        loop_blocks: hashbrown::HashSet<usize>,
+        promote_gas: bool,
+        promote_sp: bool,
+    }
+
+    struct HoistLoopSpec {
+        hdr: usize,
+        body_entry: usize,
+        loop_exit: usize,
+        then_is_body: bool,
+        loop_blocks: hashbrown::HashSet<usize>,
+        hoist_arrays: Vec<LocalId>,
+        hoist_structs: Vec<LocalId>,
+    }
+
+    struct LoopPromotionPlan {
+        counter_loops: Vec<PromotedLoopSpec>,
+        block_to_counter_loop: hashbrown::HashMap<usize, usize>,
+        hdr_to_counter_loop: hashbrown::HashMap<usize, usize>,
+        hoist_loops: Vec<HoistLoopSpec>,
+        hdr_to_hoist_loop: hashbrown::HashMap<usize, usize>,
+    }
+
+    struct PromotedLoopCfgRecord {
+        hdr: usize,
+        promote_gas: bool,
+        promote_sp: bool,
+        preheader_bb: Block,
+        loop_clif_blocks: hashbrown::HashSet<Block>,
+        flush_clif_blocks: hashbrown::HashSet<Block>,
+        post_flush_clif_blocks: hashbrown::HashSet<Block>,
+        reload_clif_blocks: hashbrown::HashSet<Block>,
+    }
+
+    fn emit_promoted_counters_load(
+        builder: &mut FunctionBuilder,
+        counters: PromotedLoopCounters,
+    ) {
+        const OFF_GAS_REMAINING: i32 = core::mem::offset_of!(GasFastState, gas_remaining) as i32;
+        const OFF_SAFEPOINTS_CHECKED: i32 =
+            core::mem::offset_of!(SafepointFastState, safepoints_checked) as i32;
+
+        if let Some((gas_ptr_var, gas_var)) = counters.gas {
+            let gas_ptr = builder.use_var(gas_ptr_var);
+            let g = builder
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), gas_ptr, OFF_GAS_REMAINING);
+            builder.def_var(gas_var, g);
+        }
+        if let Some((sp_ptr_var, sp_cnt_var)) = counters.sp {
+            let sp_ptr = builder.use_var(sp_ptr_var);
+            let s = builder
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), sp_ptr, OFF_SAFEPOINTS_CHECKED);
+            builder.def_var(sp_cnt_var, s);
+        }
+    }
+
+    fn emit_promoted_counters_flush(
+        builder: &mut FunctionBuilder,
+        counters: PromotedLoopCounters,
+    ) {
+        const OFF_GAS_REMAINING: i32 = core::mem::offset_of!(GasFastState, gas_remaining) as i32;
+        const OFF_SAFEPOINTS_CHECKED: i32 =
+            core::mem::offset_of!(SafepointFastState, safepoints_checked) as i32;
+
+        if let Some((gas_ptr_var, gas_var)) = counters.gas {
+            let gas_ptr = builder.use_var(gas_ptr_var);
+            let g = builder.use_var(gas_var);
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), g, gas_ptr, OFF_GAS_REMAINING);
+        }
+        if let Some((sp_ptr_var, sp_cnt_var)) = counters.sp {
+            let sp_ptr = builder.use_var(sp_ptr_var);
+            let s = builder.use_var(sp_cnt_var);
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), s, sp_ptr, OFF_SAFEPOINTS_CHECKED);
+        }
+    }
+
+    /// Barrier 5 (`PERF-T4-2`): Mechanically verifies on the emitted Cranelift IR CFG that:
+    /// 1. Every CFG edge leaving a promoted loop's interior block set routes strictly through
+    ///    an authorized flush block (and no interior block executes `return`).
+    /// 2. Every authorized flush block stores all promoted counters BEFORE any call or exit.
+    /// 3. Every reload block loads all promoted counters BEFORE re-entering the loop.
+    /// 4. Every preheader block loads all promoted counters.
+    fn verify_promoted_loop_exit_completeness(
+        func: &cranelift_codegen::ir::Function,
+        records: &[PromotedLoopCfgRecord],
+    ) -> Result<(), MirCraneliftBackendError> {
+        use cranelift_codegen::ir::InstructionData;
+
+        const OFF_GAS_REMAINING: i32 = core::mem::offset_of!(GasFastState, gas_remaining) as i32;
+        const OFF_SAFEPOINTS_CHECKED: i32 =
+            core::mem::offset_of!(SafepointFastState, safepoints_checked) as i32;
+
+        for rec in records {
+            // 1. Preheader must load all promoted counters.
+            {
+                let mut loaded_gas = !rec.promote_gas;
+                let mut loaded_sp = !rec.promote_sp;
+                for inst in func.layout.block_insts(rec.preheader_bb) {
+                    if let InstructionData::Load { offset, .. } = func.dfg.insts[inst] {
+                        let off = i32::from(offset);
+                        if off == OFF_GAS_REMAINING {
+                            loaded_gas = true;
+                        }
+                        if off == OFF_SAFEPOINTS_CHECKED {
+                            loaded_sp = true;
+                        }
+                    }
+                }
+                if !loaded_gas || !loaded_sp {
+                    return Err(MirCraneliftBackendError::CodegenError(format!(
+                        "PERF-T4-2 CFG verifier: preheader {:?} for loop hdr {} missing counter load (gas={}, sp={})",
+                        rec.preheader_bb, rec.hdr, loaded_gas, loaded_sp
+                    )));
+                }
+            }
+
+            // 2. Every interior block's outgoing edges must stay inside interior or land in flush_clif_blocks.
+            for &bb in &rec.loop_clif_blocks {
+                if !func.layout.is_block_inserted(bb) {
+                    continue;
+                }
+                for inst in func.layout.block_insts(bb) {
+                    let data = &func.dfg.insts[inst];
+                    if data.opcode().is_return() {
+                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                            "PERF-T4-2 CFG verifier: interior block {:?} of loop hdr {} executes return without flush block",
+                            bb, rec.hdr
+                        )));
+                    }
+                    for bcall in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+                        let dst = bcall.block(&func.dfg.value_lists);
+                        if !rec.loop_clif_blocks.contains(&dst) && !rec.flush_clif_blocks.contains(&dst) {
+                            return Err(MirCraneliftBackendError::CodegenError(format!(
+                                "PERF-T4-2 CFG verifier: leaked exit edge {:?} -> {:?} from promoted loop hdr {} bypassing flush blocks",
+                                bb, dst, rec.hdr
+                            )));
+                        }
+                    }
+                }
+            }
+
+            // 3. Every flush block must store all promoted counters BEFORE its first call/branch/return.
+            for &fbb in &rec.flush_clif_blocks {
+                if !func.layout.is_block_inserted(fbb) {
+                    continue;
+                }
+                let mut stored_gas = !rec.promote_gas;
+                let mut stored_sp = !rec.promote_sp;
+                for inst in func.layout.block_insts(fbb) {
+                    let data = &func.dfg.insts[inst];
+                    if data.opcode().is_call() || data.opcode().is_branch() || data.opcode().is_return() {
+                        break;
+                    }
+                    if let InstructionData::Store { offset, .. } = *data {
+                        let off = i32::from(offset);
+                        if off == OFF_GAS_REMAINING {
+                            stored_gas = true;
+                        }
+                        if off == OFF_SAFEPOINTS_CHECKED {
+                            stored_sp = true;
+                        }
+                    }
+                }
+                if !stored_gas || !stored_sp {
+                    return Err(MirCraneliftBackendError::CodegenError(format!(
+                        "PERF-T4-2 CFG verifier: flush block {:?} for loop hdr {} missing counter store before call/exit (gas={}, sp={})",
+                        fbb, rec.hdr, stored_gas, stored_sp
+                    )));
+                }
+            }
+
+            // 4. Every reload block must load all promoted counters before jumping back into loop.
+            for &rbb in &rec.reload_clif_blocks {
+                if !func.layout.is_block_inserted(rbb) {
+                    continue;
+                }
+                let mut loaded_gas = !rec.promote_gas;
+                let mut loaded_sp = !rec.promote_sp;
+                for inst in func.layout.block_insts(rbb) {
+                    if let InstructionData::Load { offset, .. } = func.dfg.insts[inst] {
+                        let off = i32::from(offset);
+                        if off == OFF_GAS_REMAINING {
+                            loaded_gas = true;
+                        }
+                        if off == OFF_SAFEPOINTS_CHECKED {
+                            loaded_sp = true;
+                        }
+                    }
+                }
+                if !loaded_gas || !loaded_sp {
+                    return Err(MirCraneliftBackendError::CodegenError(format!(
+                        "PERF-T4-2 CFG verifier: reload block {:?} for loop hdr {} missing counter reload (gas={}, sp={})",
+                        rbb, rec.hdr, loaded_gas, loaded_sp
+                    )));
+                }
+            }
+
+            PROMOTED_LOOP_CFG_VERIFICATIONS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        }
+
+        Ok(())
+    }
+
+    fn collect_place_hoist_candidates(
+        place: &Place,
+        locals: &[LocalDecl],
+        arrays: &mut Vec<usize>,
+        structs: &mut Vec<usize>,
+    ) {
+        match place {
+            Place::Local(_) => {}
+            Place::Index(base, _) => {
+                if let Place::Local(loc) = base.as_ref() {
+                    if matches!(locals.get(loc.0).map(|l| &l.ty), Some(MirType::Array(_)))
+                        && !arrays.contains(&loc.0)
+                    {
+                        arrays.push(loc.0);
+                    }
+                } else {
+                    collect_place_hoist_candidates(base, locals, arrays, structs);
+                }
+            }
+            Place::Field(base, _) => {
+                if let Place::Local(loc) = base.as_ref() {
+                    if matches!(
+                        locals.get(loc.0).map(|l| &l.ty),
+                        Some(MirType::Struct(_) | MirType::Tuple(_))
+                    ) && !structs.contains(&loc.0)
+                    {
+                        structs.push(loc.0);
+                    }
+                } else {
+                    collect_place_hoist_candidates(base, locals, arrays, structs);
+                }
+            }
+        }
+    }
+
+    fn collect_operand_hoist_candidates(
+        op: &Operand,
+        locals: &[LocalDecl],
+        arrays: &mut Vec<usize>,
+        structs: &mut Vec<usize>,
+    ) {
+        if let Operand::Copy(p) | Operand::Move(p) = op {
+            collect_place_hoist_candidates(p, locals, arrays, structs);
+        }
+    }
+
+    fn rvalue_may_fail_non_oob(
+        rval: &Rvalue,
+        locals: &[LocalDecl],
+        validated_at_hdr: &hashbrown::HashSet<usize>,
+    ) -> bool {
+        match rval {
+            Rvalue::Use(_) | Rvalue::Cast(..) => false,
+            Rvalue::BinaryOp(op, lhs, rhs) => match op {
+                MirBinaryOp::Concat | MirBinaryOp::FloorDiv | MirBinaryOp::Pow => true,
+                MirBinaryOp::Div | MirBinaryOp::Mod => {
+                    let is_float = matches!(
+                        lhs,
+                        Operand::Constant(MirConstant::Float(_))
+                    ) || matches!(
+                        rhs,
+                        Operand::Constant(MirConstant::Float(_))
+                    ) || matches!(
+                        lhs,
+                        Operand::Copy(Place::Local(l)) | Operand::Move(Place::Local(l))
+                            if locals.get(l.0).is_some_and(|d| d.ty == MirType::Float)
+                    ) || matches!(
+                        rhs,
+                        Operand::Copy(Place::Local(r)) | Operand::Move(Place::Local(r))
+                            if locals.get(r.0).is_some_and(|d| d.ty == MirType::Float)
+                    );
+                    if is_float {
+                        matches!(op, MirBinaryOp::Mod)
+                    } else {
+                        !matches!(rhs, Operand::Constant(MirConstant::Int(c)) if *c != 0)
+                    }
+                }
+                MirBinaryOp::Add => {
+                    matches!(lhs, Operand::Constant(MirConstant::String(_)))
+                        || matches!(
+                            lhs,
+                            Operand::Copy(Place::Local(l)) | Operand::Move(Place::Local(l))
+                                if locals.get(l.0).is_some_and(|d| d.ty == MirType::String)
+                        )
+                }
+                _ => false,
+            },
+            Rvalue::UnaryOp(MirUnaryOp::Len, op) => match op {
+                Operand::Copy(Place::Local(l)) | Operand::Move(Place::Local(l)) => {
+                    matches!(locals.get(l.0).map(|d| &d.ty), Some(MirType::Array(_)))
+                        && !validated_at_hdr.contains(&l.0)
+                }
+                _ => true,
+            },
+            Rvalue::UnaryOp(..) => false,
+            Rvalue::Aggregate(..) => true,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compute_loop_promotion_plan(
+        mir_fn: &MirFunction,
+        loop_headers: &hashbrown::HashSet<usize>,
+        osr_info: Option<(BlockId, &[LocalId])>,
+        vec_pre_map: &hashbrown::HashMap<usize, usize>,
+        vec_hdr_map: &hashbrown::HashMap<usize, usize>,
+        vec_loops: &[crate::mir::opt::simd::VectorizedLoopInfo],
+        prov_plan: &ArrayLenProvenancePlan,
+        stack_slots: &hashbrown::HashMap<usize, StackSlot>,
+        has_sp_ctx: bool,
+        has_gas_ctx: bool,
+    ) -> LoopPromotionPlan {
+        let empty = LoopPromotionPlan {
+            counter_loops: Vec::new(),
+            block_to_counter_loop: hashbrown::HashMap::new(),
+            hdr_to_counter_loop: hashbrown::HashMap::new(),
+            hoist_loops: Vec::new(),
+            hdr_to_hoist_loop: hashbrown::HashMap::new(),
+        };
+        let num_blocks = mir_fn.blocks.len();
+        if num_blocks == 0 {
+            return empty;
+        }
+        let entry_idx = osr_info
+            .map(|(tb, _)| tb.0)
+            .unwrap_or(mir_fn.entry.0)
+            .min(num_blocks - 1);
+
+        // 1. Reachability & predecessors over reachable blocks
+        let mut reachable = hashbrown::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        reachable.insert(entry_idx);
+        queue.push_back(entry_idx);
+        while let Some(b) = queue.pop_front() {
+            if let Some(term) = &mir_fn.blocks[b].terminator {
+                for succ in term.successors() {
+                    if succ < num_blocks && reachable.insert(succ) {
+                        queue.push_back(succ);
+                    }
+                }
+            }
+        }
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+        for &b in &reachable {
+            if let Some(term) = &mir_fn.blocks[b].terminator {
+                for succ in term.successors() {
+                    if succ < num_blocks && reachable.contains(&succ) && !preds[succ].contains(&b) {
+                        preds[succ].push(b);
+                    }
+                }
+            }
+        }
+
+        // 2. Exact Dominators over reachable blocks
+        let mut dom: Vec<hashbrown::HashSet<usize>> = (0..num_blocks)
+            .map(|b| {
+                if b == entry_idx {
+                    let mut s = hashbrown::HashSet::new();
+                    s.insert(entry_idx);
+                    s
+                } else if reachable.contains(&b) {
+                    reachable.clone()
+                } else {
+                    hashbrown::HashSet::new()
+                }
+            })
+            .collect();
+        loop {
+            let mut changed = false;
+            for b in 0..num_blocks {
+                if b == entry_idx || !reachable.contains(&b) || preds[b].is_empty() {
+                    continue;
+                }
+                let mut iter = preds[b].iter();
+                let first = *iter.next().unwrap();
+                let mut new_dom = dom[first].clone();
+                for &p in iter {
+                    new_dom.retain(|x| dom[p].contains(x));
+                }
+                new_dom.insert(b);
+                if new_dom != dom[b] {
+                    dom[b] = new_dom;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // 3. True natural loops from dominating CFG backedges (u -> hdr where hdr dom u)
+        let mut nat_loops: hashbrown::HashMap<usize, hashbrown::HashSet<usize>> =
+            hashbrown::HashMap::new();
+        for &u in &reachable {
+            if let Some(term) = &mir_fn.blocks[u].terminator {
+                for v in term.successors() {
+                    if v < num_blocks && reachable.contains(&v) && dom[u].contains(&v) {
+                        let body = nat_loops.entry(v).or_default();
+                        body.insert(v);
+                        if body.insert(u) {
+                            let mut stack = vec![u];
+                            while let Some(cur) = stack.pop() {
+                                for &p in &preds[cur] {
+                                    if body.insert(p) {
+                                        stack.push(p);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Filter for strict observer-free single-header reducible natural loops
+        let mut eligible: Vec<(usize, hashbrown::HashSet<usize>)> = Vec::new();
+        for (hdr, body) in nat_loops {
+            // (a) Single-header strict dominance & zero side entries (rejects irreducible CFGs)
+            let all_dominated = body.iter().all(|&b| dom[b].contains(&hdr));
+            if !all_dominated {
+                continue;
+            }
+            let single_entry = body
+                .iter()
+                .all(|&b| b == hdr || preds[b].iter().all(|p| body.contains(p)));
+            if !single_entry {
+                continue;
+            }
+            let has_external_entry =
+                hdr == entry_idx || preds[hdr].iter().any(|p| !body.contains(p));
+            if !has_external_entry {
+                continue;
+            }
+            // (b) ZERO Terminator::Call, ZERO Raise, ZERO Unreachable, ZERO None, ZERO vec_pre_map
+            let observer_free = body.iter().all(|&b| {
+                if vec_pre_map.contains_key(&b) {
+                    return false;
+                }
+                matches!(
+                    mir_fn.blocks[b].terminator,
+                    Some(
+                        Terminator::Goto(..)
+                            | Terminator::Cond { .. }
+                            | Terminator::Switch { .. }
+                            | Terminator::Return(..)
+                    )
+                )
+            });
+            if !observer_free {
+                continue;
+            }
+            eligible.push((hdr, body));
+        }
+
+        // Sort outermost-first (largest body first, deterministic tiebreak by hdr)
+        eligible.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+
+        // 5. Select disjoint counter-promoted loops (outermost-first)
+        let mut counter_loops: Vec<PromotedLoopSpec> = Vec::new();
+        let mut block_to_counter_loop: hashbrown::HashMap<usize, usize> =
+            hashbrown::HashMap::new();
+        let mut hdr_to_counter_loop: hashbrown::HashMap<usize, usize> =
+            hashbrown::HashMap::new();
+
+        for (hdr, body) in &eligible {
+            if body.iter().any(|b| block_to_counter_loop.contains_key(b)) {
+                continue;
+            }
+            let promote_sp = has_sp_ctx && body.iter().any(|b| loop_headers.contains(b));
+            let promote_gas = has_gas_ctx
+                && (body.iter().any(|b| {
+                    mir_fn.blocks[*b]
+                        .statements
+                        .iter()
+                        .any(|s| matches!(s, Statement::ResourceCheck(ResourceKind::Gas, ..)))
+                }) || body.iter().any(|b| {
+                    vec_hdr_map
+                        .get(b)
+                        .is_some_and(|&vl_idx| vec_loops[vl_idx].gas_check.is_some())
+                }));
+            if !promote_sp && !promote_gas {
+                continue;
+            }
+            let cl_idx = counter_loops.len();
+            for &b in body {
+                block_to_counter_loop.insert(b, cl_idx);
+            }
+            hdr_to_counter_loop.insert(*hdr, cl_idx);
+            counter_loops.push(PromotedLoopSpec {
+                hdr: *hdr,
+                loop_blocks: body.clone(),
+                promote_gas,
+                promote_sp,
+            });
+        }
+
+        // 6. Pillar 2: Non-Speculative Guarded-Preheader Array (data_ptr, len) & Struct Base Hoisting
+        // Compute per-block assignments, definite initialization, and locally allocated arrays.
+        let mut assigned_in_block: Vec<hashbrown::HashSet<usize>> =
+            vec![hashbrown::HashSet::new(); num_blocks];
+        let mut local_def_only_array_agg: Vec<bool> = vec![true; mir_fn.locals.len()];
+        let mut local_has_any_def: Vec<bool> = vec![false; mir_fn.locals.len()];
+        for &p in &mir_fn.params {
+            if p.0 < local_def_only_array_agg.len() {
+                local_def_only_array_agg[p.0] = false;
+            }
+        }
+        for (b_idx, block) in mir_fn.blocks.iter().enumerate() {
+            for stmt in &block.statements {
+                if let Statement::Assign(Place::Local(dst), rval, _) = stmt {
+                    assigned_in_block[b_idx].insert(dst.0);
+                    if dst.0 < local_def_only_array_agg.len() {
+                        local_has_any_def[dst.0] = true;
+                        if !matches!(rval, Rvalue::Aggregate(MirType::Array(_), _)) {
+                            local_def_only_array_agg[dst.0] = false;
+                        }
+                    }
+                }
+            }
+            if let Some(Terminator::Call {
+                destination: Place::Local(dst),
+                ..
+            }) = &block.terminator
+            {
+                assigned_in_block[b_idx].insert(dst.0);
+                if dst.0 < local_def_only_array_agg.len() {
+                    local_has_any_def[dst.0] = true;
+                    local_def_only_array_agg[dst.0] = false;
+                }
+            }
+        }
+        let locally_allocated_arrays: hashbrown::HashSet<usize> = (0..mir_fn.locals.len())
+            .filter(|&i| local_has_any_def[i] && local_def_only_array_agg[i])
+            .collect();
+
+        let init_at_entry: hashbrown::HashSet<usize> = if let Some((_, live)) = osr_info {
+            live.iter().map(|l| l.0).collect()
+        } else {
+            mir_fn.params.iter().map(|l| l.0).collect()
+        };
+        let all_locals: hashbrown::HashSet<usize> = (0..mir_fn.locals.len()).collect();
+        let mut def_in: Vec<hashbrown::HashSet<usize>> = (0..num_blocks)
+            .map(|b| {
+                if b == entry_idx {
+                    init_at_entry.clone()
+                } else {
+                    all_locals.clone()
+                }
+            })
+            .collect();
+        let mut def_out: Vec<hashbrown::HashSet<usize>> = (0..num_blocks)
+            .map(|b| {
+                if b == entry_idx {
+                    let mut s = init_at_entry.clone();
+                    s.extend(assigned_in_block[b].iter().copied());
+                    s
+                } else {
+                    all_locals.clone()
+                }
+            })
+            .collect();
+        loop {
+            let mut changed = false;
+            for b in 0..num_blocks {
+                if !reachable.contains(&b) {
+                    continue;
+                }
+                let new_in = if b == entry_idx {
+                    let mut s = init_at_entry.clone();
+                    for &p in &preds[b] {
+                        s.retain(|x| def_out[p].contains(x));
+                    }
+                    s
+                } else if preds[b].is_empty() {
+                    hashbrown::HashSet::new()
+                } else {
+                    let mut iter = preds[b].iter();
+                    let first = *iter.next().unwrap();
+                    let mut s = def_out[first].clone();
+                    for &p in iter {
+                        s.retain(|x| def_out[p].contains(x));
+                    }
+                    s
+                };
+                let mut new_out = new_in.clone();
+                new_out.extend(assigned_in_block[b].iter().copied());
+                if new_in != def_in[b] || new_out != def_out[b] {
+                    def_in[b] = new_in;
+                    def_out[b] = new_out;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut hoist_loops: Vec<HoistLoopSpec> = Vec::new();
+        let mut hdr_to_hoist_loop: hashbrown::HashMap<usize, usize> = hashbrown::HashMap::new();
+
+        for (hdr, body) in &eligible {
+            if vec_hdr_map.contains_key(hdr) {
+                continue;
+            }
+            // Require single-condition loop header branching to (body_entry inside loop, loop_exit outside loop)
+            let Some(Terminator::Cond {
+                then_block,
+                else_block,
+                ..
+            }) = &mir_fn.blocks[*hdr].terminator
+            else {
+                continue;
+            };
+            let (body_entry, loop_exit, then_is_body) = if body.contains(&then_block.0)
+                && then_block.0 != *hdr
+                && !body.contains(&else_block.0)
+            {
+                (then_block.0, else_block.0, true)
+            } else if body.contains(&else_block.0)
+                && else_block.0 != *hdr
+                && !body.contains(&then_block.0)
+            {
+                (else_block.0, then_block.0, false)
+            } else {
+                continue;
+            };
+
+            // Collect written index roots across the entire loop body (for shifted-RawWords alias safety)
+            let mut written_index_roots = hashbrown::HashSet::new();
+            let mut has_non_local_index_write = false;
+            let mut used_arrays_anywhere = Vec::new();
+            for &b in body {
+                for stmt in &mir_fn.blocks[b].statements {
+                    if let Statement::Assign(lhs, rval, _) = stmt {
+                        if let Place::Index(base, _) = lhs {
+                            if let Place::Local(loc) = base.as_ref() {
+                                written_index_roots.insert(loc.0);
+                            } else {
+                                has_non_local_index_write = true;
+                            }
+                        }
+                        let mut dummy_s = Vec::new();
+                        collect_place_hoist_candidates(lhs, &mir_fn.locals, &mut used_arrays_anywhere, &mut dummy_s);
+                        match rval {
+                            Rvalue::Use(op) | Rvalue::Cast(op, _) | Rvalue::UnaryOp(_, op) => {
+                                collect_operand_hoist_candidates(op, &mir_fn.locals, &mut used_arrays_anywhere, &mut dummy_s);
+                            }
+                            Rvalue::BinaryOp(_, l, r) => {
+                                collect_operand_hoist_candidates(l, &mir_fn.locals, &mut used_arrays_anywhere, &mut dummy_s);
+                                collect_operand_hoist_candidates(r, &mir_fn.locals, &mut used_arrays_anywhere, &mut dummy_s);
+                            }
+                            Rvalue::Aggregate(_, ops) => {
+                                for op in ops {
+                                    collect_operand_hoist_candidates(op, &mir_fn.locals, &mut used_arrays_anywhere, &mut dummy_s);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Walk straight-line path from body_entry to find accesses that post-dominate body_entry
+            // before any non-OOB failing statement (guarantees zero speculation and exact error ordering!).
+            let mut guaranteed_arrays: Vec<usize> = Vec::new();
+            let mut guaranteed_structs: Vec<usize> = Vec::new();
+            let mut walk_bb = body_entry;
+            let mut walk_visited = hashbrown::HashSet::new();
+            let validated_at_hdr = &prov_plan.validated_in[*hdr];
+            'walk: while walk_visited.insert(walk_bb) {
+                for stmt in &mir_fn.blocks[walk_bb].statements {
+                    match stmt {
+                        Statement::ResourceCheck(ResourceKind::Gas, ..) => break 'walk,
+                        Statement::Assign(lhs, rval, _) => {
+                            // RHS executes before LHS
+                            match rval {
+                                Rvalue::Use(op) | Rvalue::Cast(op, _) | Rvalue::UnaryOp(_, op) => {
+                                    collect_operand_hoist_candidates(
+                                        op,
+                                        &mir_fn.locals,
+                                        &mut guaranteed_arrays,
+                                        &mut guaranteed_structs,
+                                    );
+                                }
+                                Rvalue::BinaryOp(_, l, r) => {
+                                    collect_operand_hoist_candidates(
+                                        l,
+                                        &mir_fn.locals,
+                                        &mut guaranteed_arrays,
+                                        &mut guaranteed_structs,
+                                    );
+                                    collect_operand_hoist_candidates(
+                                        r,
+                                        &mir_fn.locals,
+                                        &mut guaranteed_arrays,
+                                        &mut guaranteed_structs,
+                                    );
+                                }
+                                Rvalue::Aggregate(_, ops) => {
+                                    for op in ops {
+                                        collect_operand_hoist_candidates(
+                                            op,
+                                            &mir_fn.locals,
+                                            &mut guaranteed_arrays,
+                                            &mut guaranteed_structs,
+                                        );
+                                    }
+                                }
+                            }
+                            if rvalue_may_fail_non_oob(rval, &mir_fn.locals, validated_at_hdr) {
+                                break 'walk;
+                            }
+                            collect_place_hoist_candidates(
+                                lhs,
+                                &mir_fn.locals,
+                                &mut guaranteed_arrays,
+                                &mut guaranteed_structs,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                match &mir_fn.blocks[walk_bb].terminator {
+                    Some(Terminator::Goto(next, _))
+                        if body.contains(&next.0) && next.0 != *hdr =>
+                    {
+                        walk_bb = next.0;
+                    }
+                    _ => break 'walk,
+                }
+            }
+
+            // Combine guaranteed_arrays with already-proven-valid arrays used anywhere in the loop
+            let mut candidate_arrays = guaranteed_arrays;
+            for loc_idx in used_arrays_anywhere {
+                if (validated_at_hdr.contains(&loc_idx)
+                    || locally_allocated_arrays.contains(&loc_idx))
+                    && !candidate_arrays.contains(&loc_idx)
+                {
+                    candidate_arrays.push(loc_idx);
+                }
+            }
+
+            let is_proven_mir_array = |loc_idx: usize| -> bool {
+                validated_at_hdr.contains(&loc_idx) || locally_allocated_arrays.contains(&loc_idx)
+            };
+
+            let mut hoist_arrays = Vec::new();
+            for loc_idx in candidate_arrays {
+                if !def_in[*hdr].contains(&loc_idx)
+                    || stack_slots.contains_key(&loc_idx)
+                    || body.iter().any(|b| assigned_in_block[*b].contains(&loc_idx))
+                {
+                    continue;
+                }
+                // Skip if already hoisted by an enclosing outer loop
+                if hoist_loops.iter().any(|outer| {
+                    outer.loop_blocks.contains(hdr)
+                        && outer.hoist_arrays.iter().any(|a| a.0 == loc_idx)
+                }) {
+                    continue;
+                }
+                // Shifted-overlap RawWords safety: if any OTHER array is written in this loop,
+                // require both this array and all written arrays to be proven MirAllocationKind::Array.
+                let other_array_written = has_non_local_index_write
+                    || written_index_roots.iter().any(|&w| w != loc_idx);
+                if other_array_written {
+                    let all_proven = !has_non_local_index_write
+                        && is_proven_mir_array(loc_idx)
+                        && written_index_roots.iter().all(|&w| is_proven_mir_array(w));
+                    if !all_proven {
+                        continue;
+                    }
+                }
+                hoist_arrays.push(LocalId(loc_idx));
+            }
+
+            let mut hoist_structs = Vec::new();
+            for loc_idx in guaranteed_structs {
+                if !def_in[*hdr].contains(&loc_idx)
+                    || stack_slots.contains_key(&loc_idx)
+                    || body.iter().any(|b| assigned_in_block[*b].contains(&loc_idx))
+                {
+                    continue;
+                }
+                if hoist_loops.iter().any(|outer| {
+                    outer.loop_blocks.contains(hdr)
+                        && outer.hoist_structs.iter().any(|s| s.0 == loc_idx)
+                }) {
+                    continue;
+                }
+                hoist_structs.push(LocalId(loc_idx));
+            }
+
+            if !hoist_arrays.is_empty() || !hoist_structs.is_empty() {
+                let hl_idx = hoist_loops.len();
+                hdr_to_hoist_loop.insert(*hdr, hl_idx);
+                hoist_loops.push(HoistLoopSpec {
+                    hdr: *hdr,
+                    body_entry,
+                    loop_exit,
+                    then_is_body,
+                    loop_blocks: body.clone(),
+                    hoist_arrays,
+                    hoist_structs,
+                });
+            }
+        }
+
+        LoopPromotionPlan {
+            counter_loops,
+            block_to_counter_loop,
+            hdr_to_counter_loop,
+            hoist_loops,
+            hdr_to_hoist_loop,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn emit_safepoint_check(
         builder: &mut FunctionBuilder,
         sp_ptr_var: Variable,
@@ -1713,21 +2571,29 @@ pub mod jit_engine {
         local_vars: &[Variable],
         stack_slots: &hashbrown::HashMap<usize, StackSlot>,
         locals: &[LocalDecl],
-        emergency_exit_bb: Block,
+        raw_emergency_exit_bb: Block,
         pending_vec_reduction: Option<(LocalId, Variable, Variable)>,
+        promoted: Option<PromotedLoopCounters>,
+        mut cfg_rec: Option<&mut PromotedLoopCfgRecord>,
     ) {
         const OFF_SLOW_FLAGS: i32 = core::mem::offset_of!(SafepointFastState, slow_flags) as i32;
         const OFF_SAFEPOINTS_CHECKED: i32 =
             core::mem::offset_of!(SafepointFastState, safepoints_checked) as i32;
 
         let sp_ptr = builder.use_var(sp_ptr_var);
-        let cnt = builder
-            .ins()
-            .load(types::I64, MemFlagsData::trusted(), sp_ptr, OFF_SAFEPOINTS_CHECKED);
-        let cnt1 = builder.ins().iadd_imm_s(cnt, 1);
-        builder
-            .ins()
-            .store(MemFlagsData::trusted(), cnt1, sp_ptr, OFF_SAFEPOINTS_CHECKED);
+        if let Some((_, sp_cnt_var)) = promoted.and_then(|p| p.sp) {
+            let cnt = builder.use_var(sp_cnt_var);
+            let cnt1 = builder.ins().iadd_imm_s(cnt, 1);
+            builder.def_var(sp_cnt_var, cnt1);
+        } else {
+            let cnt = builder
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), sp_ptr, OFF_SAFEPOINTS_CHECKED);
+            let cnt1 = builder.ins().iadd_imm_s(cnt, 1);
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), cnt1, sp_ptr, OFF_SAFEPOINTS_CHECKED);
+        }
         let flags = builder
             .ins()
             .load(types::I64, MemFlagsData::trusted(), sp_ptr, OFF_SLOW_FLAGS);
@@ -1744,14 +2610,35 @@ pub mod jit_engine {
         builder.ins().brif(is_slow, slow_safepoint_bb, &[], cont_bb, &[]);
 
         builder.switch_to_block(slow_safepoint_bb);
+        if let Some(p) = promoted {
+            // Barrier 1: flush BOTH promoted counters before calling lust_mir_safepoint_slow()
+            emit_promoted_counters_flush(builder, p);
+        }
         let sp_call = builder.ins().call(safepoint_slow_fn, &[]);
         let sp_res = builder.inst_results(sp_call)[0];
         let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, sp_res, 0);
-        builder.ins().brif(is_err, err_dispatch_bb, &[], cont_bb, &[]);
+        if let Some(p) = promoted {
+            let reload_bb = builder.create_block();
+            builder.set_cold_block(reload_bb);
+            if let Some(rec) = cfg_rec.as_deref_mut() {
+                rec.flush_clif_blocks.insert(slow_safepoint_bb);
+                rec.post_flush_clif_blocks.insert(err_dispatch_bb);
+                rec.post_flush_clif_blocks.insert(deopt_capture_bb);
+                rec.reload_clif_blocks.insert(reload_bb);
+            }
+            builder.ins().brif(is_err, err_dispatch_bb, &[], reload_bb, &[]);
+
+            builder.switch_to_block(reload_bb);
+            // Reload BOTH promoted counters after slow call returns 0 (continue)
+            emit_promoted_counters_load(builder, p);
+            builder.ins().jump(cont_bb, &[]);
+        } else {
+            builder.ins().brif(is_err, err_dispatch_bb, &[], cont_bb, &[]);
+        }
 
         builder.switch_to_block(err_dispatch_bb);
         let is_deopt = builder.ins().icmp_imm_s(IntCC::Equal, sp_res, MIR_STATUS_DEOPT);
-        builder.ins().brif(is_deopt, deopt_capture_bb, &[], emergency_exit_bb, &[]);
+        builder.ins().brif(is_deopt, deopt_capture_bb, &[], raw_emergency_exit_bb, &[]);
 
         builder.switch_to_block(deopt_capture_bb);
         let target_pc_val = builder.ins().iconst(types::I64, target_block_idx as i64);
@@ -1786,7 +2673,111 @@ pub mod jit_engine {
                 builder.ins().call(record_deopt_local_fn, &[target_pc_val, loc_idx_val, val_i64]);
             }
         }
-        builder.ins().jump(emergency_exit_bb, &[]);
+        builder.ins().jump(raw_emergency_exit_bb, &[]);
+
+        builder.switch_to_block(cont_bb);
+    }
+
+    fn function_has_gas_checks(
+        mir_fn: &MirFunction,
+        vec_loops: &[crate::mir::opt::simd::VectorizedLoopInfo],
+    ) -> bool {
+        if vec_loops.iter().any(|vl| vl.gas_check.is_some()) {
+            return true;
+        }
+        mir_fn.blocks.iter().any(|b| {
+            b.statements
+                .iter()
+                .any(|s| matches!(s, Statement::ResourceCheck(ResourceKind::Gas, ..)))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_inline_gas_check(
+        builder: &mut FunctionBuilder,
+        gas_ptr_var: Variable,
+        gas_slow_fn: FuncRef,
+        amt: u64,
+        raw_emergency_exit_bb: Block,
+        promoted: Option<PromotedLoopCounters>,
+        mut cfg_rec: Option<&mut PromotedLoopCfgRecord>,
+    ) {
+        const OFF_GAS_REMAINING: i32 = core::mem::offset_of!(GasFastState, gas_remaining) as i32;
+
+        let gas_slow_bb = builder.create_block();
+        let cont_bb = builder.create_block();
+        builder.set_cold_block(gas_slow_bb);
+
+        if let Some(p) = promoted
+            && let Some((_, gas_var)) = p.gas
+        {
+            if let Ok(amt_i64) = i64::try_from(amt) {
+                let rem0 = builder.use_var(gas_var);
+                let amt_val = builder.ins().iconst(types::I64, amt_i64);
+                let (rem1, overflowed) = builder.ins().ssub_overflow(rem0, amt_val);
+                let min_val = builder.ins().iconst(types::I64, i64::MIN);
+                let rem_st = builder.ins().select(overflowed, min_val, rem1);
+                builder.def_var(gas_var, rem_st);
+                let is_lt_zero = builder.ins().icmp_imm_s(IntCC::SignedLessThan, rem_st, 0);
+                let is_neg = builder.ins().bor(overflowed, is_lt_zero);
+                builder.ins().brif(is_neg, gas_slow_bb, &[], cont_bb, &[]);
+            } else {
+                let min_val = builder.ins().iconst(types::I64, i64::MIN);
+                builder.def_var(gas_var, min_val);
+                builder.ins().jump(gas_slow_bb, &[]);
+            }
+
+            builder.switch_to_block(gas_slow_bb);
+            // Barrier 2: flush BOTH promoted counters before calling lust_mir_gas_slow()
+            emit_promoted_counters_flush(builder, p);
+            let slow_call = builder.ins().call(gas_slow_fn, &[]);
+            let slow_res = builder.inst_results(slow_call)[0];
+            let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, slow_res, 0);
+            let reload_bb = builder.create_block();
+            builder.set_cold_block(reload_bb);
+            if let Some(rec) = cfg_rec.as_deref_mut() {
+                rec.flush_clif_blocks.insert(gas_slow_bb);
+                rec.reload_clif_blocks.insert(reload_bb);
+            }
+            builder.ins().brif(is_err, raw_emergency_exit_bb, &[], reload_bb, &[]);
+
+            builder.switch_to_block(reload_bb);
+            // Reload BOTH promoted counters (picks up unbounded gas replenishment!)
+            emit_promoted_counters_load(builder, p);
+            builder.ins().jump(cont_bb, &[]);
+
+            builder.switch_to_block(cont_bb);
+            return;
+        }
+
+        let gas_ptr = builder.use_var(gas_ptr_var);
+        if let Ok(amt_i64) = i64::try_from(amt) {
+            let rem0 = builder
+                .ins()
+                .load(types::I64, MemFlagsData::trusted(), gas_ptr, OFF_GAS_REMAINING);
+            let amt_val = builder.ins().iconst(types::I64, amt_i64);
+            let (rem1, overflowed) = builder.ins().ssub_overflow(rem0, amt_val);
+            let min_val = builder.ins().iconst(types::I64, i64::MIN);
+            let rem_st = builder.ins().select(overflowed, min_val, rem1);
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), rem_st, gas_ptr, OFF_GAS_REMAINING);
+            let is_lt_zero = builder.ins().icmp_imm_s(IntCC::SignedLessThan, rem_st, 0);
+            let is_neg = builder.ins().bor(overflowed, is_lt_zero);
+            builder.ins().brif(is_neg, gas_slow_bb, &[], cont_bb, &[]);
+        } else {
+            let min_val = builder.ins().iconst(types::I64, i64::MIN);
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), min_val, gas_ptr, OFF_GAS_REMAINING);
+            builder.ins().jump(gas_slow_bb, &[]);
+        }
+
+        builder.switch_to_block(gas_slow_bb);
+        let slow_call = builder.ins().call(gas_slow_fn, &[]);
+        let slow_res = builder.inst_results(slow_call)[0];
+        let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, slow_res, 0);
+        builder.ins().brif(is_err, raw_emergency_exit_bb, &[], cont_bb, &[]);
 
         builder.switch_to_block(cont_bb);
     }
@@ -1847,6 +2838,8 @@ pub mod jit_engine {
             builder.symbol("lust_mir_set_gas", lust_mir_set_gas as *const u8);
             builder.symbol("lust_mir_get_gas", lust_mir_get_gas as *const u8);
             builder.symbol("lust_mir_charge_gas", lust_mir_charge_gas as *const u8);
+            builder.symbol("lust_mir_gas_fast_ptr", lust_mir_gas_fast_ptr as *const u8);
+            builder.symbol("lust_mir_gas_slow", lust_mir_gas_slow as *const u8);
             builder.symbol("lust_mir_alloc_array", lust_mir_alloc_array as *const u8);
             builder.symbol("lust_mir_alloc_array_typed", lust_mir_alloc_array_typed as *const u8);
             builder.symbol("lust_mir_alloc_tuple", lust_mir_alloc_tuple as *const u8);
@@ -2022,6 +3015,29 @@ pub mod jit_engine {
             self.capture_ir = prev;
             compile_res?;
             Ok(self.captured_ir.clone())
+        }
+
+        pub fn dump_osr_entry_ir(
+            &mut self,
+            mir_fn: &MirFunction,
+            target_block: BlockId,
+            live_locals: &[LocalId],
+        ) -> Result<String, MirCraneliftBackendError> {
+            let prev = self.capture_ir;
+            self.captured_ir.clear();
+            self.capture_ir = true;
+            let compile_res = self.compile_osr_entry(mir_fn, target_block, live_locals);
+            self.capture_ir = prev;
+            compile_res?;
+            self.captured_ir
+                .get(&mir_fn.signature.name)
+                .cloned()
+                .ok_or_else(|| {
+                    MirCraneliftBackendError::CodegenError(format!(
+                        "No OSR IR captured for function '{}'",
+                        mir_fn.signature.name
+                    ))
+                })
         }
 
         fn format_captured_ir(&self) -> String {
@@ -3464,9 +4480,14 @@ pub mod jit_engine {
             sig1.params.push(AbiParam::new(types::I64));
             sig1.returns.push(AbiParam::new(types::I64));
 
-            let gas_callee = self
+            let gas_fast_ptr_callee = self
                 .module
-                .declare_function("lust_mir_charge_gas", Linkage::Import, &sig1)
+                .declare_function("lust_mir_gas_fast_ptr", Linkage::Import, &sig0_i64)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let gas_slow_callee = self
+                .module
+                .declare_function("lust_mir_gas_slow", Linkage::Import, &sig0_i64)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
             let mut alloc_typed_sig = self.module.make_signature();
@@ -3800,7 +4821,6 @@ pub mod jit_engine {
                 let alloc_cflat_struct_fn = self.module.declare_func_in_func(alloc_cflat_struct_callee, &mut builder.func);
                 let len_fn = self.module.declare_func_in_func(len_checked_callee, &mut builder.func);
                 let array_push_fn = self.module.declare_func_in_func(array_push_callee, &mut builder.func);
-                let gas_fn = self.module.declare_func_in_func(gas_callee, &mut builder.func);
                 let status_fn = self.module.declare_func_in_func(status_callee, &mut builder.func);
                 let status_set_fn = self.module.declare_func_in_func(status_set_callee, &mut builder.func);
                 let print_int_part_fn = self.module.declare_func_in_func(print_int_part_callee, &mut builder.func);
@@ -3844,9 +4864,15 @@ pub mod jit_engine {
                 let simd_scalar_forced_fn = self.module.declare_func_in_func(simd_scalar_forced_callee, &mut builder.func);
 
                 let emergency_exit_bb = builder.create_block();
+                let empty_hoisted_arrays: hashbrown::HashMap<usize, HoistedArrayVars> =
+                    hashbrown::HashMap::new();
+                let empty_hoisted_structs: hashbrown::HashMap<usize, Variable> =
+                    hashbrown::HashMap::new();
                 let bc_ctx = BoundsCheckCtx {
                     status_set_fn,
                     emergency_exit_bb,
+                    hoisted_arrays: &empty_hoisted_arrays,
+                    hoisted_structs: &empty_hoisted_structs,
                 };
 
                 let mut vec_acc_vars: Vec<Option<(Variable, Variable)>> = Vec::with_capacity(vec_loops.len());
@@ -3902,7 +4928,138 @@ pub mod jit_engine {
                         pre_header_blocks.insert(hdr_idx, builder.create_block());
                     }
                 }
-                let resolve_target_bb = |from_block: Option<usize>, target: usize| -> Result<Block, MirCraneliftBackendError> {
+
+                let needs_safepoint = !loop_headers.is_empty() || osr_info.is_some();
+                let safepoint_ctx: Option<(Variable, FuncRef, FuncRef)> = if needs_safepoint {
+                    let sp_ptr_fn = self
+                        .module
+                        .declare_func_in_func(safepoint_state_ptr_callee, &mut builder.func);
+                    let sp_slow_fn = self
+                        .module
+                        .declare_func_in_func(safepoint_slow_callee, &mut builder.func);
+                    let sp_ptr_var = builder.declare_var(types::I64);
+                    Some((sp_ptr_var, sp_ptr_fn, sp_slow_fn))
+                } else {
+                    None
+                };
+
+                let needs_gas_fast = function_has_gas_checks(mir_fn, &vec_loops);
+                let gas_ctx: Option<(Variable, FuncRef, FuncRef)> = if needs_gas_fast {
+                    let gas_fast_ptr_fn = self
+                        .module
+                        .declare_func_in_func(gas_fast_ptr_callee, &mut builder.func);
+                    let gas_slow_fn = self
+                        .module
+                        .declare_func_in_func(gas_slow_callee, &mut builder.func);
+                    let gas_ptr_var = builder.declare_var(types::I64);
+                    Some((gas_ptr_var, gas_fast_ptr_fn, gas_slow_fn))
+                } else {
+                    None
+                };
+
+                // PERF-T4-2: Pure inner-loop counter register promotion & non-speculative
+                // guarded-preheader array (data_ptr, len) + struct base hoisting.
+                let promo_plan = compute_loop_promotion_plan(
+                    mir_fn,
+                    &loop_headers,
+                    osr_info,
+                    &vec_pre_map,
+                    &vec_hdr_map,
+                    &vec_loops,
+                    &prov_plan,
+                    &stack_slots,
+                    safepoint_ctx.is_some(),
+                    gas_ctx.is_some(),
+                );
+
+                struct CounterLoopLoweringState {
+                    counters: PromotedLoopCounters,
+                    preheader_bb: Block,
+                    emergency_flush_bb: Block,
+                }
+                struct HoistLoopLoweringState {
+                    peeled_header_bb: Block,
+                    guarded_preheader_bb: Block,
+                    hoisted_arrays: hashbrown::HashMap<usize, HoistedArrayVars>,
+                    hoisted_structs: hashbrown::HashMap<usize, Variable>,
+                }
+
+                let mut cl_states: Vec<CounterLoopLoweringState> =
+                    Vec::with_capacity(promo_plan.counter_loops.len());
+                let mut cfg_records: Vec<PromotedLoopCfgRecord> =
+                    Vec::with_capacity(promo_plan.counter_loops.len());
+                for spec in &promo_plan.counter_loops {
+                    let gas_pair = if spec.promote_gas {
+                        let (gas_ptr_var, _, _) =
+                            gas_ctx.expect("promote_gas implies gas_ctx");
+                        let gas_var = builder.declare_var(types::I64);
+                        Some((gas_ptr_var, gas_var))
+                    } else {
+                        None
+                    };
+                    let sp_pair = if spec.promote_sp {
+                        let (sp_ptr_var, _, _) =
+                            safepoint_ctx.expect("promote_sp implies safepoint_ctx");
+                        let sp_cnt_var = builder.declare_var(types::I64);
+                        Some((sp_ptr_var, sp_cnt_var))
+                    } else {
+                        None
+                    };
+                    let preheader_bb = builder.create_block();
+                    let emergency_flush_bb = builder.create_block();
+                    builder.set_cold_block(emergency_flush_bb);
+                    let mut flush_clif_blocks = hashbrown::HashSet::new();
+                    flush_clif_blocks.insert(emergency_flush_bb);
+                    cl_states.push(CounterLoopLoweringState {
+                        counters: PromotedLoopCounters {
+                            gas: gas_pair,
+                            sp: sp_pair,
+                        },
+                        preheader_bb,
+                        emergency_flush_bb,
+                    });
+                    cfg_records.push(PromotedLoopCfgRecord {
+                        hdr: spec.hdr,
+                        promote_gas: spec.promote_gas,
+                        promote_sp: spec.promote_sp,
+                        preheader_bb,
+                        loop_clif_blocks: hashbrown::HashSet::new(),
+                        flush_clif_blocks,
+                        post_flush_clif_blocks: hashbrown::HashSet::new(),
+                        reload_clif_blocks: hashbrown::HashSet::new(),
+                    });
+                }
+
+                let mut hl_states: Vec<HoistLoopLoweringState> =
+                    Vec::with_capacity(promo_plan.hoist_loops.len());
+                for hspec in &promo_plan.hoist_loops {
+                    let peeled_header_bb = builder.create_block();
+                    let guarded_preheader_bb = builder.create_block();
+                    let mut hoisted_arrays = hashbrown::HashMap::new();
+                    for &arr_loc in &hspec.hoist_arrays {
+                        hoisted_arrays.insert(
+                            arr_loc.0,
+                            HoistedArrayVars {
+                                len_var: builder.declare_var(types::I64),
+                                data_ptr_var: builder.declare_var(types::I64),
+                            },
+                        );
+                    }
+                    let mut hoisted_structs = hashbrown::HashMap::new();
+                    for &st_loc in &hspec.hoist_structs {
+                        hoisted_structs.insert(st_loc.0, builder.declare_var(types::I64));
+                    }
+                    hl_states.push(HoistLoopLoweringState {
+                        peeled_header_bb,
+                        guarded_preheader_bb,
+                        hoisted_arrays,
+                        hoisted_structs,
+                    });
+                }
+
+                // Helper: resolve the entry Cranelift block of `target` from `from_block`
+                // BEFORE applying any outgoing exit-flush for `from_block`.
+                let resolve_dest_entry_bb = |from_block: Option<usize>, target: usize| -> Result<Block, MirCraneliftBackendError> {
                     let direct_bb = clif_blocks.get(target).copied().ok_or_else(|| {
                         MirCraneliftBackendError::CodegenError(format!(
                             "Target block BlockId({target}) out of bounds"
@@ -3919,21 +5076,77 @@ pub mod jit_engine {
                             return Ok(pre_bb);
                         }
                     }
+                    if let Some(&cl_idx) = promo_plan.hdr_to_counter_loop.get(&target) {
+                        let is_internal = from_block.is_some_and(|fb| {
+                            promo_plan.counter_loops[cl_idx].loop_blocks.contains(&fb)
+                        });
+                        if !is_internal {
+                            return Ok(cl_states[cl_idx].preheader_bb);
+                        }
+                    }
+                    if let Some(&hl_idx) = promo_plan.hdr_to_hoist_loop.get(&target) {
+                        let is_internal = from_block.is_some_and(|fb| {
+                            promo_plan.hoist_loops[hl_idx].loop_blocks.contains(&fb)
+                        });
+                        if !is_internal {
+                            return Ok(hl_states[hl_idx].peeled_header_bb);
+                        }
+                    }
                     Ok(direct_bb)
                 };
 
-                let needs_safepoint = !loop_headers.is_empty() || osr_info.is_some();
-                let safepoint_ctx: Option<(Variable, FuncRef, FuncRef)> = if needs_safepoint {
-                    let sp_ptr_fn = self
-                        .module
-                        .declare_func_in_func(safepoint_state_ptr_callee, &mut builder.func);
-                    let sp_slow_fn = self
-                        .module
-                        .declare_func_in_func(safepoint_slow_callee, &mut builder.func);
-                    let sp_ptr_var = builder.declare_var(types::I64);
-                    Some((sp_ptr_var, sp_ptr_fn, sp_slow_fn))
-                } else {
-                    None
+                // Pre-create dedicated critical-edge exit-flush blocks for every normal exit edge
+                // leaving a counter-promoted loop (Barrier 4).
+                let mut exit_flush_by_edge: hashbrown::HashMap<(usize, usize), Block> =
+                    hashbrown::HashMap::new();
+                let mut exit_flush_blocks_per_loop: Vec<Vec<(Block, Block)>> =
+                    vec![Vec::new(); promo_plan.counter_loops.len()];
+                for (cl_idx, spec) in promo_plan.counter_loops.iter().enumerate() {
+                    let mut exit_targets: Vec<usize> = Vec::new();
+                    let mut sorted_blocks: Vec<usize> = spec.loop_blocks.iter().copied().collect();
+                    sorted_blocks.sort_unstable();
+                    for b_idx in sorted_blocks {
+                        if let Some(term) = &mir_fn.blocks[b_idx].terminator {
+                            for succ in term.successors() {
+                                if !spec.loop_blocks.contains(&succ) && !exit_targets.contains(&succ) {
+                                    exit_targets.push(succ);
+                                }
+                            }
+                        }
+                        if let Some(&vl_idx) = vec_hdr_map.get(&b_idx) {
+                            let tail = vec_loops[vl_idx].tail_block.0;
+                            if !spec.loop_blocks.contains(&tail) && !exit_targets.contains(&tail) {
+                                exit_targets.push(tail);
+                            }
+                        }
+                    }
+                    exit_targets.sort_unstable();
+                    let mut by_dest_bb: hashbrown::HashMap<Block, Block> = hashbrown::HashMap::new();
+                    for target in exit_targets {
+                        let dest_bb = resolve_dest_entry_bb(Some(spec.hdr), target)?;
+                        let flush_bb = if let Some(&existing) = by_dest_bb.get(&dest_bb) {
+                            existing
+                        } else {
+                            let fbb = builder.create_block();
+                            by_dest_bb.insert(dest_bb, fbb);
+                            exit_flush_blocks_per_loop[cl_idx].push((dest_bb, fbb));
+                            cfg_records[cl_idx].flush_clif_blocks.insert(fbb);
+                            fbb
+                        };
+                        exit_flush_by_edge.insert((cl_idx, target), flush_bb);
+                    }
+                }
+
+                let resolve_target_bb = |from_block: Option<usize>, target: usize| -> Result<Block, MirCraneliftBackendError> {
+                    if let Some(fb) = from_block
+                        && let Some(&cl_idx) = promo_plan.block_to_counter_loop.get(&fb)
+                        && !promo_plan.counter_loops[cl_idx].loop_blocks.contains(&target)
+                    {
+                        if let Some(&flush_bb) = exit_flush_by_edge.get(&(cl_idx, target)) {
+                            return Ok(flush_bb);
+                        }
+                    }
+                    resolve_dest_entry_bb(from_block, target)
                 };
 
                 if let Some((target_block, live_locals)) = osr_info {
@@ -3947,6 +5160,12 @@ pub mod jit_engine {
                     let sp_ptr_call = builder.ins().call(sp_ptr_fn, &[]);
                     let sp_ptr_val = builder.inst_results(sp_ptr_call)[0];
                     builder.def_var(sp_ptr_var, sp_ptr_val);
+
+                    if let Some((gas_ptr_var, gas_fast_ptr_fn, _)) = gas_ctx {
+                        let gas_ptr_call = builder.ins().call(gas_fast_ptr_fn, &[]);
+                        let gas_ptr_val = builder.inst_results(gas_ptr_call)[0];
+                        builder.def_var(gas_ptr_var, gas_ptr_val);
+                    }
 
                     for (idx, loc_id) in live_locals.iter().enumerate() {
                         let param_val = builder.block_params(osr_entry_bb)[idx];
@@ -3991,6 +5210,8 @@ pub mod jit_engine {
                         &mir_fn.locals,
                         emergency_exit_bb,
                         None,
+                        None,
+                        None,
                     );
 
                     let osr_target_bb = resolve_target_bb(None, target_block.0)?;
@@ -4006,6 +5227,11 @@ pub mod jit_engine {
                         let sp_ptr_call = builder.ins().call(sp_ptr_fn, &[]);
                         let sp_ptr_val = builder.inst_results(sp_ptr_call)[0];
                         builder.def_var(sp_ptr_var, sp_ptr_val);
+                    }
+                    if let Some((gas_ptr_var, gas_fast_ptr_fn, _)) = gas_ctx {
+                        let gas_ptr_call = builder.ins().call(gas_fast_ptr_fn, &[]);
+                        let gas_ptr_val = builder.inst_results(gas_ptr_call)[0];
+                        builder.def_var(gas_ptr_var, gas_ptr_val);
                     }
 
                     for (idx, p_id) in mir_fn.params.iter().enumerate() {
@@ -4029,6 +5255,20 @@ pub mod jit_engine {
                 let mut hoisted_hdrs: Vec<usize> = pre_header_blocks.keys().copied().collect();
                 hoisted_hdrs.sort_unstable();
                 for hdr_idx in hoisted_hdrs {
+                    // Check whether this pre_header_block sits strictly inside an outer counter-promoted loop
+                    let enclosing_outer_cl = promo_plan
+                        .block_to_counter_loop
+                        .get(&hdr_idx)
+                        .copied()
+                        .filter(|&ci| promo_plan.counter_loops[ci].hdr != hdr_idx);
+                    let blocks_before: hashbrown::HashSet<Block> = if enclosing_outer_cl.is_some() {
+                        builder.func.layout.blocks().collect()
+                    } else {
+                        hashbrown::HashSet::new()
+                    };
+                    let pre_err_bb = enclosing_outer_cl
+                        .map(|ci| cl_states[ci].emergency_flush_bb)
+                        .unwrap_or(emergency_exit_bb);
                     let pre_bb = pre_header_blocks[&hdr_idx];
                     builder.switch_to_block(pre_bb);
                     if let Some(locs) = prov_plan.hoist_at_header_entry.get(&hdr_idx) {
@@ -4039,15 +5279,395 @@ pub mod jit_engine {
                             let res = builder.inst_results(call_inst)[0];
                             let is_err = builder.ins().icmp_imm_s(IntCC::SignedLessThan, res, 0);
                             let ok_bb = builder.create_block();
-                            builder.ins().brif(is_err, emergency_exit_bb, &[], ok_bb, &[]);
+                            builder.ins().brif(is_err, pre_err_bb, &[], ok_bb, &[]);
                             builder.switch_to_block(ok_bb);
                         }
                     }
-                    builder.ins().jump(clif_blocks[hdr_idx], &[]);
+                    let next_bb = if let Some(&cl_idx) = promo_plan.hdr_to_counter_loop.get(&hdr_idx) {
+                        cl_states[cl_idx].preheader_bb
+                    } else if let Some(&hl_idx) = promo_plan.hdr_to_hoist_loop.get(&hdr_idx) {
+                        hl_states[hl_idx].peeled_header_bb
+                    } else {
+                        clif_blocks[hdr_idx]
+                    };
+                    builder.ins().jump(next_bb, &[]);
+                    if let Some(ci) = enclosing_outer_cl {
+                        let rec = &mut cfg_records[ci];
+                        for bb in builder.func.layout.blocks() {
+                            if !blocks_before.contains(&bb)
+                                && !rec.flush_clif_blocks.contains(&bb)
+                                && !rec.post_flush_clif_blocks.contains(&bb)
+                                && !rec.reload_clif_blocks.contains(&bb)
+                            {
+                                rec.loop_clif_blocks.insert(bb);
+                            }
+                        }
+                    }
+                }
+
+                // Emit PERF-T4-2 counter-promoted loop preheaders (load gas_var & sp_cnt_var once per entry)
+                for (cl_idx, spec) in promo_plan.counter_loops.iter().enumerate() {
+                    builder.switch_to_block(cl_states[cl_idx].preheader_bb);
+                    emit_promoted_counters_load(&mut builder, cl_states[cl_idx].counters);
+                    let entry_hdr_bb = if let Some(&hl_idx) = promo_plan.hdr_to_hoist_loop.get(&spec.hdr) {
+                        hl_states[hl_idx].peeled_header_bb
+                    } else {
+                        clif_blocks[spec.hdr]
+                    };
+                    builder.ins().jump(entry_hdr_bb, &[]);
+                }
+
+                // Emit PERF-T4-2 non-speculative peeled-entry headers & guarded preheaders
+                for (hl_idx, hspec) in promo_plan.hoist_loops.iter().enumerate() {
+                    let cl_opt = promo_plan.block_to_counter_loop.get(&hspec.hdr).copied();
+                    let blocks_before: hashbrown::HashSet<Block> = if cl_opt.is_some() {
+                        builder.func.layout.blocks().collect()
+                    } else {
+                        hashbrown::HashSet::new()
+                    };
+
+                    // Hoisted vars visible inside peeled_header_bb come ONLY from strictly enclosing outer loops!
+                    let mut outer_hoisted_arrays: hashbrown::HashMap<usize, HoistedArrayVars> =
+                        hashbrown::HashMap::new();
+                    let mut outer_hoisted_structs: hashbrown::HashMap<usize, Variable> =
+                        hashbrown::HashMap::new();
+                    for (other_idx, other_h) in promo_plan.hoist_loops.iter().enumerate() {
+                        if other_idx != hl_idx && other_h.loop_blocks.contains(&hspec.hdr) {
+                            outer_hoisted_arrays.extend(hl_states[other_idx].hoisted_arrays.iter().map(|(&k, &v)| (k, v)));
+                            outer_hoisted_structs.extend(hl_states[other_idx].hoisted_structs.iter().map(|(&k, &v)| (k, v)));
+                        }
+                    }
+                    let active_emergency_bb = cl_opt
+                        .map(|ci| cl_states[ci].emergency_flush_bb)
+                        .unwrap_or(emergency_exit_bb);
+                    let peeled_bc_ctx = BoundsCheckCtx {
+                        status_set_fn,
+                        emergency_exit_bb: active_emergency_bb,
+                        hoisted_arrays: &outer_hoisted_arrays,
+                        hoisted_structs: &outer_hoisted_structs,
+                    };
+                    let active_promoted = cl_opt.map(|ci| cl_states[ci].counters);
+
+                    builder.switch_to_block(hl_states[hl_idx].peeled_header_bb);
+                    let mut cur_validated = prov_plan.validated_in[hspec.hdr].clone();
+
+                    if loop_headers.contains(&hspec.hdr) {
+                        let proven_entry_storage;
+                        let locals_to_record = if let Some((_, live_locals)) = osr_info {
+                            live_locals
+                        } else {
+                            match mir_fn.derive_proven_site_metadata_at_entry(hspec.hdr) {
+                                Ok(proven) => {
+                                    proven_entry_storage = proven.into_iter().map(LocalId).collect::<Vec<_>>();
+                                    &proven_entry_storage
+                                }
+                                Err(err) => {
+                                    return Err(MirCraneliftBackendError::CodegenError(alloc::format!(
+                                        "Cannot derive authoritative deopt metadata for peeled loop header safepoint {}: {}",
+                                        hspec.hdr, err
+                                    )));
+                                }
+                            }
+                        };
+                        let (sp_ptr_var, _, sp_slow_fn) =
+                            safepoint_ctx.expect("loop header implies needs_safepoint");
+                        emit_safepoint_check(
+                            &mut builder,
+                            sp_ptr_var,
+                            sp_slow_fn,
+                            init_deopt_fn,
+                            record_deopt_local_fn,
+                            hspec.hdr,
+                            locals_to_record,
+                            &local_vars,
+                            &stack_slots,
+                            &mir_fn.locals,
+                            emergency_exit_bb,
+                            None,
+                            active_promoted,
+                            cl_opt.map(|ci| &mut cfg_records[ci]),
+                        );
+                    }
+
+                    for stmt in &mir_fn.blocks[hspec.hdr].statements {
+                        match stmt {
+                            Statement::Assign(Place::Local(dst), rvalue, _) => {
+                                let dst_decl = mir_fn.locals.get(dst.0).ok_or_else(|| {
+                                    MirCraneliftBackendError::CodegenError(format!(
+                                        "Destination local {dst:?} out of bounds"
+                                    ))
+                                })?;
+                                let inplace_concat_dst =
+                                    if unaliased_string_locals.contains(&dst.0) {
+                                        Some(*dst)
+                                    } else {
+                                        None
+                                    };
+                                let val = lower_rvalue(
+                                    rvalue,
+                                    Some(&dst_decl.ty),
+                                    inplace_concat_dst,
+                                    &mut cur_validated,
+                                    &mut builder,
+                                    &local_vars,
+                                    &stack_slots,
+                                    &mir_fn.locals,
+                                    &self.struct_layouts,
+                                    alloc_array_typed_fn,
+                                    alloc_tuple_typed_fn,
+                                    alloc_struct_named_fn,
+                                    alloc_cflat_struct_fn,
+                                    len_fn,
+                                    floordiv_fn,
+                                    pow_fn,
+                                    floordiv_float_fn,
+                                    pow_float_fn,
+                                    rem_float_fn,
+                                    string_helpers,
+                                    status_fn,
+                                    peeled_bc_ctx,
+                                )?;
+                                let target_ty = mir_to_clif_type(&dst_decl.ty)?;
+                                let val = cast_clif_type(&mut builder, val, target_ty);
+                                store_local_val(*dst, val, &mut builder, &local_vars, &stack_slots)?;
+                                match rvalue {
+                                    Rvalue::Aggregate(MirType::Array(_), _) => {
+                                        cur_validated.insert(dst.0);
+                                    }
+                                    Rvalue::Use(
+                                        Operand::Copy(Place::Local(src))
+                                        | Operand::Move(Place::Local(src)),
+                                    ) if cur_validated.contains(&src.0) => {
+                                        cur_validated.insert(dst.0);
+                                    }
+                                    _ => {
+                                        cur_validated.remove(&dst.0);
+                                    }
+                                }
+                            }
+                            Statement::Assign(lhs_place @ Place::Index(..), rvalue, _) => {
+                                let val = lower_rvalue(
+                                    rvalue,
+                                    None,
+                                    None,
+                                    &mut cur_validated,
+                                    &mut builder,
+                                    &local_vars,
+                                    &stack_slots,
+                                    &mir_fn.locals,
+                                    &self.struct_layouts,
+                                    alloc_array_typed_fn,
+                                    alloc_tuple_typed_fn,
+                                    alloc_struct_named_fn,
+                                    alloc_cflat_struct_fn,
+                                    len_fn,
+                                    floordiv_fn,
+                                    pow_fn,
+                                    floordiv_float_fn,
+                                    pow_float_fn,
+                                    rem_float_fn,
+                                    string_helpers,
+                                    status_fn,
+                                    peeled_bc_ctx,
+                                )?;
+                                let elem_addr = lower_place_addr(
+                                    lhs_place,
+                                    &mut builder,
+                                    &local_vars,
+                                    &stack_slots,
+                                    &mir_fn.locals,
+                                    &self.struct_layouts,
+                                    peeled_bc_ctx,
+                                )?;
+                                let val_ty = builder.func.dfg.value_type(val);
+                                let val_to_store = if val_ty == types::I8 {
+                                    builder.ins().uextend(types::I64, val)
+                                } else {
+                                    val
+                                };
+                                builder.ins().store(MemFlagsData::trusted(), val_to_store, elem_addr, 0);
+                            }
+                            Statement::Assign(lhs_place @ Place::Field(..), rvalue, _) => {
+                                let val = lower_rvalue(
+                                    rvalue,
+                                    None,
+                                    None,
+                                    &mut cur_validated,
+                                    &mut builder,
+                                    &local_vars,
+                                    &stack_slots,
+                                    &mir_fn.locals,
+                                    &self.struct_layouts,
+                                    alloc_array_typed_fn,
+                                    alloc_tuple_typed_fn,
+                                    alloc_struct_named_fn,
+                                    alloc_cflat_struct_fn,
+                                    len_fn,
+                                    floordiv_fn,
+                                    pow_fn,
+                                    floordiv_float_fn,
+                                    pow_float_fn,
+                                    rem_float_fn,
+                                    string_helpers,
+                                    status_fn,
+                                    peeled_bc_ctx,
+                                )?;
+                                let field_addr = lower_place_addr(
+                                    lhs_place,
+                                    &mut builder,
+                                    &local_vars,
+                                    &stack_slots,
+                                    &mir_fn.locals,
+                                    &self.struct_layouts,
+                                    peeled_bc_ctx,
+                                )?;
+                                let val_ty = builder.func.dfg.value_type(val);
+                                let val_to_store = if val_ty == types::I8 {
+                                    builder.ins().uextend(types::I64, val)
+                                } else {
+                                    val
+                                };
+                                builder.ins().store(MemFlagsData::trusted(), val_to_store, field_addr, 0);
+                            }
+                            Statement::ResourceCheck(ResourceKind::Gas, amt, _) => {
+                                let (gas_ptr_var, _, gas_slow_fn) =
+                                    gas_ctx.expect("ResourceCheck(Gas) implies needs_gas_fast");
+                                emit_inline_gas_check(
+                                    &mut builder,
+                                    gas_ptr_var,
+                                    gas_slow_fn,
+                                    *amt,
+                                    emergency_exit_bb,
+                                    active_promoted,
+                                    cl_opt.map(|ci| &mut cfg_records[ci]),
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Peel branch: if entry condition holds -> guarded_preheader_bb; else -> exit!
+                    let Some(Terminator::Cond { cond, .. }) = &mir_fn.blocks[hspec.hdr].terminator else {
+                        unreachable!("HoistLoopSpec requires Terminator::Cond header");
+                    };
+                    let c_val = lower_operand(
+                        cond,
+                        &mut builder,
+                        &local_vars,
+                        &stack_slots,
+                        &mir_fn.locals,
+                        &self.struct_layouts,
+                        peeled_bc_ctx,
+                    )?;
+                    let exit_bb = resolve_target_bb(Some(hspec.hdr), hspec.loop_exit)?;
+                    let guard_bb = hl_states[hl_idx].guarded_preheader_bb;
+                    if hspec.then_is_body {
+                        builder.ins().brif(c_val, guard_bb, &[], exit_bb, &[]);
+                    } else {
+                        builder.ins().brif(c_val, exit_bb, &[], guard_bb, &[]);
+                    }
+
+                    // Emit guarded_preheader_bb: runs ONLY when iteration 1 is guaranteed to enter body_entry!
+                    builder.switch_to_block(guard_bb);
+                    let data_off = core::mem::size_of::<MirArrayHeader>() as i64;
+                    let len_off = core::mem::offset_of!(MirArrayHeader, len) as i32;
+                    let cap_off = core::mem::offset_of!(MirArrayHeader, cap) as i32;
+                    for &arr_loc in &hspec.hoist_arrays {
+                        let base_ptr =
+                            load_local_i64(arr_loc, &mut builder, &local_vars, &stack_slots)?;
+                        if !cur_validated.contains(&arr_loc.0) {
+                            let is_null = builder.ins().icmp_imm_s(IntCC::Equal, base_ptr, 0);
+                            emit_oob_branch_if_bad(is_null, &mut builder, peeled_bc_ctx);
+                        }
+                        let arr_len = builder
+                            .ins()
+                            .load(types::I64, MemFlagsData::trusted(), base_ptr, len_off);
+                        let len_neg = builder.ins().icmp_imm_s(IntCC::SignedLessThan, arr_len, 0);
+                        emit_oob_branch_if_bad(len_neg, &mut builder, peeled_bc_ctx);
+
+                        let cap_raw = builder
+                            .ins()
+                            .load(types::I64, MemFlagsData::trusted(), base_ptr, cap_off);
+                        let is_redir = builder.ins().icmp_imm_s(IntCC::SignedLessThan, cap_raw, 0);
+                        let redir_bb = builder.create_block();
+                        let flat_bb = builder.create_block();
+                        let data_merge_bb = builder.create_block();
+                        let data_param = builder.append_block_param(data_merge_bb, types::I64);
+                        builder.set_cold_block(redir_bb);
+                        builder.ins().brif(is_redir, redir_bb, &[], flat_bb, &[]);
+
+                        builder.switch_to_block(redir_bb);
+                        let redir_ptr = builder.ins().load(
+                            types::I64,
+                            MemFlagsData::trusted(),
+                            base_ptr,
+                            data_off as i32,
+                        );
+                        builder.ins().jump(data_merge_bb, &[BlockArg::Value(redir_ptr)]);
+
+                        builder.switch_to_block(flat_bb);
+                        let flat_ptr = builder.ins().iadd_imm_s(base_ptr, data_off);
+                        builder.ins().jump(data_merge_bb, &[BlockArg::Value(flat_ptr)]);
+
+                        builder.switch_to_block(data_merge_bb);
+                        let hvars = hl_states[hl_idx].hoisted_arrays[&arr_loc.0];
+                        builder.def_var(hvars.len_var, arr_len);
+                        builder.def_var(hvars.data_ptr_var, data_param);
+                    }
+                    for &st_loc in &hspec.hoist_structs {
+                        let base_ptr =
+                            load_local_i64(st_loc, &mut builder, &local_vars, &stack_slots)?;
+                        let is_null = builder.ins().icmp_imm_s(IntCC::Equal, base_ptr, 0);
+                        emit_oob_branch_if_bad(is_null, &mut builder, peeled_bc_ctx);
+                        let st_var = hl_states[hl_idx].hoisted_structs[&st_loc.0];
+                        builder.def_var(st_var, base_ptr);
+                    }
+                    builder.ins().jump(clif_blocks[hspec.body_entry], &[]);
+
+                    if let Some(ci) = cl_opt {
+                        let rec = &mut cfg_records[ci];
+                        for bb in builder.func.layout.blocks() {
+                            if !blocks_before.contains(&bb)
+                                && !rec.flush_clif_blocks.contains(&bb)
+                                && !rec.post_flush_clif_blocks.contains(&bb)
+                                && !rec.reload_clif_blocks.contains(&bb)
+                            {
+                                rec.loop_clif_blocks.insert(bb);
+                            }
+                        }
+                    }
                 }
 
                 // Lower each basic block
                 for (b_idx, mir_block) in mir_fn.blocks.iter().enumerate() {
+                    let cl_opt = promo_plan.block_to_counter_loop.get(&b_idx).copied();
+                    let blocks_before: hashbrown::HashSet<Block> = if cl_opt.is_some() {
+                        builder.func.layout.blocks().collect()
+                    } else {
+                        hashbrown::HashSet::new()
+                    };
+
+                    let mut active_hoisted_arrays: hashbrown::HashMap<usize, HoistedArrayVars> =
+                        hashbrown::HashMap::new();
+                    let mut active_hoisted_structs: hashbrown::HashMap<usize, Variable> =
+                        hashbrown::HashMap::new();
+                    for (hl_idx, hspec) in promo_plan.hoist_loops.iter().enumerate() {
+                        if hspec.loop_blocks.contains(&b_idx) {
+                            active_hoisted_arrays.extend(hl_states[hl_idx].hoisted_arrays.iter().map(|(&k, &v)| (k, v)));
+                            active_hoisted_structs.extend(hl_states[hl_idx].hoisted_structs.iter().map(|(&k, &v)| (k, v)));
+                        }
+                    }
+                    let active_emergency_bb = cl_opt
+                        .map(|ci| cl_states[ci].emergency_flush_bb)
+                        .unwrap_or(emergency_exit_bb);
+                    let active_bc_ctx = BoundsCheckCtx {
+                        status_set_fn,
+                        emergency_exit_bb: active_emergency_bb,
+                        hoisted_arrays: &active_hoisted_arrays,
+                        hoisted_structs: &active_hoisted_structs,
+                    };
+                    let active_promoted = cl_opt.map(|ci| cl_states[ci].counters);
+
                     let clif_bb = clif_blocks[b_idx];
                     builder.switch_to_block(clif_bb);
                     let mut cur_validated = prov_plan.validated_in[b_idx].clone();
@@ -4092,6 +5712,8 @@ pub mod jit_engine {
                             &mir_fn.locals,
                             emergency_exit_bb,
                             pending_vec_reduction,
+                            active_promoted,
+                            cl_opt.map(|ci| &mut cfg_records[ci]),
                         );
                     }
 
@@ -4099,13 +5721,17 @@ pub mod jit_engine {
                     if let Some(&vl_idx) = vec_hdr_map.get(&b_idx) {
                         let vl = &vec_loops[vl_idx];
                         if let Some(amt) = vl.gas_check {
-                            let amt_val = builder.ins().iconst(types::I64, amt as i64);
-                            let call_inst = builder.ins().call(gas_fn, &[amt_val]);
-                            let rem = builder.inst_results(call_inst)[0];
-                            let is_neg = builder.ins().icmp_imm_s(IntCC::SignedLessThan, rem, 0);
-                            let cont_bb = builder.create_block();
-                            builder.ins().brif(is_neg, emergency_exit_bb, &[], cont_bb, &[]);
-                            builder.switch_to_block(cont_bb);
+                            let (gas_ptr_var, _, gas_slow_fn) =
+                                gas_ctx.expect("SIMD vl.gas_check implies needs_gas_fast");
+                            emit_inline_gas_check(
+                                &mut builder,
+                                gas_ptr_var,
+                                gas_slow_fn,
+                                amt,
+                                emergency_exit_bb,
+                                active_promoted,
+                                cl_opt.map(|ci| &mut cfg_records[ci]),
+                            );
                         }
                         let i_val = load_local_i64(vl.idx_local, &mut builder, &local_vars, &stack_slots)?;
                         let end_val = load_local_i64(vl.end_local, &mut builder, &local_vars, &stack_slots)?;
@@ -4127,6 +5753,18 @@ pub mod jit_engine {
                             let body_target = resolve_target_bb(Some(b_idx), vl.body_block.0)?;
                             let tail_target = resolve_target_bb(Some(b_idx), vl.tail_block.0)?;
                             builder.ins().brif(cond, body_target, &[], tail_target, &[]);
+                        }
+                        if let Some(ci) = cl_opt {
+                            let rec = &mut cfg_records[ci];
+                            for bb in builder.func.layout.blocks() {
+                                if !blocks_before.contains(&bb)
+                                    && !rec.flush_clif_blocks.contains(&bb)
+                                    && !rec.post_flush_clif_blocks.contains(&bb)
+                                    && !rec.reload_clif_blocks.contains(&bb)
+                                {
+                                    rec.loop_clif_blocks.insert(bb);
+                                }
+                            }
                         }
                         continue;
                     }
@@ -4217,6 +5855,18 @@ pub mod jit_engine {
                         let next_i = builder.ins().iadd_imm_s(i_val, 4);
                         store_local_val(vl.idx_local, next_i, &mut builder, &local_vars, &stack_slots)?;
                         builder.ins().jump(clif_blocks[vl.hdr_block.0], &[]);
+                        if let Some(ci) = cl_opt {
+                            let rec = &mut cfg_records[ci];
+                            for bb in builder.func.layout.blocks() {
+                                if !blocks_before.contains(&bb)
+                                    && !rec.flush_clif_blocks.contains(&bb)
+                                    && !rec.post_flush_clif_blocks.contains(&bb)
+                                    && !rec.reload_clif_blocks.contains(&bb)
+                                {
+                                    rec.loop_clif_blocks.insert(bb);
+                                }
+                            }
+                        }
                         continue;
                     }
 
@@ -4256,7 +5906,7 @@ pub mod jit_engine {
                                     rem_float_fn,
                                     string_helpers,
                                     status_fn,
-                                    bc_ctx,
+                                    active_bc_ctx,
                                 )?;
                                 let target_ty = mir_to_clif_type(&dst_decl.ty)?;
                                 let val = cast_clif_type(&mut builder, val, target_ty);
@@ -4299,7 +5949,7 @@ pub mod jit_engine {
                                     rem_float_fn,
                                     string_helpers,
                                     status_fn,
-                                    bc_ctx,
+                                    active_bc_ctx,
                                 )?;
                                 let elem_addr = lower_place_addr(
                                     lhs_place,
@@ -4308,7 +5958,7 @@ pub mod jit_engine {
                                     &stack_slots,
                                     &mir_fn.locals,
                                     &self.struct_layouts,
-                                    bc_ctx,
+                                    active_bc_ctx,
                                 )?;
                                 let val_ty = builder.func.dfg.value_type(val);
                                 let val_to_store = if val_ty == types::I8 {
@@ -4341,7 +5991,7 @@ pub mod jit_engine {
                                     rem_float_fn,
                                     string_helpers,
                                     status_fn,
-                                    bc_ctx,
+                                    active_bc_ctx,
                                 )?;
                                 let field_addr = lower_place_addr(
                                     lhs_place,
@@ -4350,7 +6000,7 @@ pub mod jit_engine {
                                     &stack_slots,
                                     &mir_fn.locals,
                                     &self.struct_layouts,
-                                    bc_ctx,
+                                    active_bc_ctx,
                                 )?;
                                 let val_ty = builder.func.dfg.value_type(val);
                                 let val_to_store = if val_ty == types::I8 {
@@ -4361,13 +6011,17 @@ pub mod jit_engine {
                                 builder.ins().store(MemFlagsData::trusted(), val_to_store, field_addr, 0);
                             }
                             Statement::ResourceCheck(ResourceKind::Gas, amt, _) => {
-                                let amt_val = builder.ins().iconst(types::I64, *amt as i64);
-                                let call_inst = builder.ins().call(gas_fn, &[amt_val]);
-                                let rem = builder.inst_results(call_inst)[0];
-                                let is_neg = builder.ins().icmp_imm_s(IntCC::SignedLessThan, rem, 0);
-                                let cont_bb = builder.create_block();
-                                builder.ins().brif(is_neg, emergency_exit_bb, &[], cont_bb, &[]);
-                                builder.switch_to_block(cont_bb);
+                                let (gas_ptr_var, _, gas_slow_fn) =
+                                    gas_ctx.expect("ResourceCheck(Gas) implies needs_gas_fast");
+                                emit_inline_gas_check(
+                                    &mut builder,
+                                    gas_ptr_var,
+                                    gas_slow_fn,
+                                    *amt,
+                                    emergency_exit_bb,
+                                    active_promoted,
+                                    cl_opt.map(|ci| &mut cfg_records[ci]),
+                                );
                             }
                             _ => {}
                         }
@@ -4492,13 +6146,13 @@ pub mod jit_engine {
                                 builder.ins().jump(target_bb, &[]);
                             }
                             Terminator::Cond { cond, then_block, else_block, .. } => {
-                                let c_val = lower_operand(cond, &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                let c_val = lower_operand(cond, &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, active_bc_ctx)?;
                                 let then_bb = resolve_target_bb(Some(b_idx), then_block.0)?;
                                 let else_bb = resolve_target_bb(Some(b_idx), else_block.0)?;
                                 builder.ins().brif(c_val, then_bb, &[], else_bb, &[]);
                             }
                             Terminator::Switch { discr, cases, default, .. } => {
-                                let d_val = lower_operand(discr, &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                let d_val = lower_operand(discr, &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, active_bc_ctx)?;
                                 for (val, target_bb) in cases {
                                     let is_eq = builder.ins().icmp_imm_s(IntCC::Equal, d_val, *val);
                                     let next_check = builder.create_block();
@@ -5677,6 +7331,7 @@ pub mod jit_engine {
                                     builder.ins().jump(succ_bb, &[]);
                                 } else {
                                     let mut is_native_mir_call = false;
+                                    let mut is_host_callback = false;
                                     let (callee_func_id, param_count) = match callee.as_str() {
                                         "math.abs" | "abs" => (abs_callee, 1),
                                         "math.min" | "min" => (min_callee, 2),
@@ -5696,6 +7351,7 @@ pub mod jit_engine {
                                             } else if let Some((cb_params, cb_ret)) =
                                                 self.host_callbacks.get(callee)
                                             {
+                                                is_host_callback = true;
                                                 let mut cb_sig = self.module.make_signature();
                                                 for p_ty in cb_params {
                                                     cb_sig.params.push(AbiParam::new(mir_to_clif_type(p_ty)?));
@@ -5792,6 +7448,13 @@ pub mod jit_engine {
                                         builder.ins().brif(is_err, emergency_exit_bb, &[], call_cont_bb, &[]);
                                         builder.switch_to_block(call_cont_bb);
                                     }
+                                    if is_host_callback {
+                                        if let Some((gas_ptr_var, gas_fast_ptr_fn, _)) = gas_ctx {
+                                            let reload_call = builder.ins().call(gas_fast_ptr_fn, &[]);
+                                            let reloaded_ptr = builder.inst_results(reload_call)[0];
+                                            builder.def_var(gas_ptr_var, reloaded_ptr);
+                                        }
+                                    }
 
                                     let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
                                     builder.ins().jump(succ_bb, &[]);
@@ -5800,15 +7463,29 @@ pub mod jit_engine {
                             Terminator::Return(opt_op, _) => {
                                 if ret_clif_ty != types::I8 || mir_fn.signature.return_type != MirType::Unit {
                                     let ret_val = if let Some(op) = opt_op {
-                                        let v = lower_operand(op, &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, bc_ctx)?;
+                                        let v = lower_operand(op, &mut builder, &local_vars, &stack_slots, &mir_fn.locals, &self.struct_layouts, active_bc_ctx)?;
                                         cast_clif_type(&mut builder, v, ret_clif_ty)
                                     } else if ret_clif_ty == types::F64 {
                                         builder.ins().f64const(0.0)
                                     } else {
                                         builder.ins().iconst(ret_clif_ty, 0)
                                     };
+                                    if let Some(ci) = cl_opt {
+                                        let ret_flush_bb = builder.create_block();
+                                        cfg_records[ci].flush_clif_blocks.insert(ret_flush_bb);
+                                        builder.ins().jump(ret_flush_bb, &[]);
+                                        builder.switch_to_block(ret_flush_bb);
+                                        emit_promoted_counters_flush(&mut builder, cl_states[ci].counters);
+                                    }
                                     builder.ins().return_(&[ret_val]);
                                 } else {
+                                    if let Some(ci) = cl_opt {
+                                        let ret_flush_bb = builder.create_block();
+                                        cfg_records[ci].flush_clif_blocks.insert(ret_flush_bb);
+                                        builder.ins().jump(ret_flush_bb, &[]);
+                                        builder.switch_to_block(ret_flush_bb);
+                                        emit_promoted_counters_flush(&mut builder, cl_states[ci].counters);
+                                    }
                                     builder.ins().return_(&[]);
                                 }
                             }
@@ -5829,6 +7506,32 @@ pub mod jit_engine {
                             }
                         }
                     }
+
+                    if let Some(ci) = cl_opt {
+                        let rec = &mut cfg_records[ci];
+                        for bb in builder.func.layout.blocks() {
+                            if !blocks_before.contains(&bb)
+                                && !rec.flush_clif_blocks.contains(&bb)
+                                && !rec.post_flush_clif_blocks.contains(&bb)
+                                && !rec.reload_clif_blocks.contains(&bb)
+                            {
+                                rec.loop_clif_blocks.insert(bb);
+                            }
+                        }
+                    }
+                }
+
+                // Emit PERF-T4-2 Barrier 3 (`loop_emergency_flush_bb`) and Barrier 4 (`exit_flush_bb`) blocks
+                for (cl_idx, state) in cl_states.iter().enumerate() {
+                    builder.switch_to_block(state.emergency_flush_bb);
+                    emit_promoted_counters_flush(&mut builder, state.counters);
+                    builder.ins().jump(emergency_exit_bb, &[]);
+
+                    for &(dest_bb, exit_flush_bb) in &exit_flush_blocks_per_loop[cl_idx] {
+                        builder.switch_to_block(exit_flush_bb);
+                        emit_promoted_counters_flush(&mut builder, state.counters);
+                        builder.ins().jump(dest_bb, &[]);
+                    }
                 }
 
                 builder.switch_to_block(emergency_exit_bb);
@@ -5847,6 +7550,8 @@ pub mod jit_engine {
                 }
 
                 builder.seal_all_blocks();
+                // PERF-T4-2 Barrier 5: compile-time CFG exit-completeness verification
+                verify_promoted_loop_exit_completeness(&builder.func, &cfg_records)?;
                 builder.finalize(self.module.target_config());
             }
 
@@ -7166,9 +8871,11 @@ pub mod jit_engine {
     }
 
     #[derive(Clone, Copy)]
-    struct BoundsCheckCtx {
+    struct BoundsCheckCtx<'a> {
         status_set_fn: FuncRef,
         emergency_exit_bb: Block,
+        hoisted_arrays: &'a hashbrown::HashMap<usize, HoistedArrayVars>,
+        hoisted_structs: &'a hashbrown::HashMap<usize, Variable>,
     }
 
     fn load_local_i64(
@@ -7221,10 +8928,11 @@ pub mod jit_engine {
     fn emit_oob_branch_if_bad(
         is_bad: ClifValue,
         builder: &mut FunctionBuilder,
-        bc_ctx: BoundsCheckCtx,
+        bc_ctx: BoundsCheckCtx<'_>,
     ) {
         let err_bb = builder.create_block();
         let ok_bb = builder.create_block();
+        builder.set_cold_block(err_bb);
         builder.ins().brif(is_bad, err_bb, &[], ok_bb, &[]);
         builder.switch_to_block(err_bb);
         let code = builder.ins().iconst(types::I64, MIR_STATUS_ERR_OUT_OF_BOUNDS);
@@ -7255,7 +8963,7 @@ pub mod jit_engine {
         stack_slots: &hashbrown::HashMap<usize, StackSlot>,
         locals: &[LocalDecl],
         struct_layouts: &hashbrown::HashMap<String, MirStructLayout>,
-        bc_ctx: BoundsCheckCtx,
+        bc_ctx: BoundsCheckCtx<'_>,
     ) -> Result<ClifValue, MirCraneliftBackendError> {
         match place {
             Place::Local(loc) => {
@@ -7274,6 +8982,23 @@ pub mod jit_engine {
             Place::Index(base, idx) => {
                 let _ = try_place_type(place, locals, struct_layouts)?;
                 let base_ty = try_place_type(base, locals, struct_layouts)?;
+
+                // PERF-T4-2 fast path: hoisted loop-invariant array (len >= 0, resolved data_ptr)
+                if let Place::Local(arr_loc) = base.as_ref()
+                    && let Some(&hoisted) = bc_ctx.hoisted_arrays.get(&arr_loc.0)
+                {
+                    let idx_val = load_local_i64(*idx, builder, local_vars, stack_slots)?;
+                    let arr_len = builder.use_var(hoisted.len_var);
+                    // guarded_preheader_bb proved arr_len >= 0, so unsigned idx >= arr_len checks both idx < 0 and idx >= len.
+                    let is_oob = builder
+                        .ins()
+                        .icmp(IntCC::UnsignedGreaterThanOrEqual, idx_val, arr_len);
+                    emit_oob_branch_if_bad(is_oob, builder, bc_ctx);
+                    let data_ptr = builder.use_var(hoisted.data_ptr_var);
+                    let byte_idx = builder.ins().ishl_imm_s(idx_val, 3);
+                    return Ok(builder.ins().iadd(data_ptr, byte_idx));
+                }
+
                 let base_ptr = lower_place_addr(
                     base,
                     builder,
@@ -7335,17 +9060,24 @@ pub mod jit_engine {
             }
             Place::Field(base, field_idx) => {
                 let _ = try_place_type(place, locals, struct_layouts)?;
-                let base_ptr = lower_place_addr(
-                    base,
-                    builder,
-                    local_vars,
-                    stack_slots,
-                    locals,
-                    struct_layouts,
-                    bc_ctx,
-                )?;
                 let base_ty = try_place_type(base, locals, struct_layouts)?;
-                if matches!(base_ty, MirType::Tuple(_) | MirType::Struct(_)) {
+                let (base_ptr, already_non_null) = if let Place::Local(st_loc) = base.as_ref()
+                    && let Some(&hoisted_base) = bc_ctx.hoisted_structs.get(&st_loc.0)
+                {
+                    (builder.use_var(hoisted_base), true)
+                } else {
+                    let bp = lower_place_addr(
+                        base,
+                        builder,
+                        local_vars,
+                        stack_slots,
+                        locals,
+                        struct_layouts,
+                        bc_ctx,
+                    )?;
+                    (bp, false)
+                };
+                if !already_non_null && matches!(base_ty, MirType::Tuple(_) | MirType::Struct(_)) {
                     let is_null = builder.ins().icmp_imm_s(IntCC::Equal, base_ptr, 0);
                     emit_oob_branch_if_bad(is_null, builder, bc_ctx);
                 }
@@ -7383,7 +9115,7 @@ pub mod jit_engine {
         stack_slots: &hashbrown::HashMap<usize, StackSlot>,
         locals: &[LocalDecl],
         struct_layouts: &hashbrown::HashMap<String, MirStructLayout>,
-        bc_ctx: BoundsCheckCtx,
+        bc_ctx: BoundsCheckCtx<'_>,
     ) -> Result<ClifValue, MirCraneliftBackendError> {
         match place {
             Place::Local(loc) => {
@@ -7441,7 +9173,7 @@ pub mod jit_engine {
         stack_slots: &hashbrown::HashMap<usize, StackSlot>,
         locals: &[LocalDecl],
         struct_layouts: &hashbrown::HashMap<String, MirStructLayout>,
-        bc_ctx: BoundsCheckCtx,
+        bc_ctx: BoundsCheckCtx<'_>,
     ) -> Result<ClifValue, MirCraneliftBackendError> {
         match op {
             Operand::Copy(place) | Operand::Move(place) => {
@@ -7483,7 +9215,7 @@ pub mod jit_engine {
         stack_slots: &hashbrown::HashMap<usize, StackSlot>,
         locals: &[LocalDecl],
         struct_layouts: &hashbrown::HashMap<String, MirStructLayout>,
-        bc_ctx: BoundsCheckCtx,
+        bc_ctx: BoundsCheckCtx<'_>,
     ) -> Result<(), MirCraneliftBackendError> {
         for (i, elem) in elements.iter().enumerate() {
             let el_val = lower_operand(elem, builder, local_vars, stack_slots, locals, struct_layouts, bc_ctx)?;
@@ -7517,7 +9249,7 @@ pub mod jit_engine {
         r: ClifValue,
         rhs_operand: &Operand,
         builder: &mut FunctionBuilder,
-        bc_ctx: BoundsCheckCtx,
+        bc_ctx: BoundsCheckCtx<'_>,
     ) -> ClifValue {
         let emergency_exit_bb = bc_ctx.emergency_exit_bb;
         if let Operand::Constant(MirConstant::Int(c)) = rhs_operand {
@@ -8353,7 +10085,7 @@ pub mod jit_engine {
         rem_float_fn: FuncRef,
         string_helpers: StringHelperFns,
         status_fn: FuncRef,
-        bc_ctx: BoundsCheckCtx,
+        bc_ctx: BoundsCheckCtx<'_>,
     ) -> Result<ClifValue, MirCraneliftBackendError> {
         let emergency_exit_bb = bc_ctx.emergency_exit_bb;
         match rval {
@@ -8556,6 +10288,11 @@ pub mod jit_engine {
                             return Ok(builder.inst_results(call)[0]);
                         }
                         MirType::Array(_) => {
+                            if let Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) = op
+                                && let Some(&hoisted) = bc_ctx.hoisted_arrays.get(&loc.0)
+                            {
+                                return Ok(builder.use_var(hoisted.len_var));
+                            }
                             return Ok(emit_array_len(
                                 op,
                                 v,

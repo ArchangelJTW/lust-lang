@@ -23,6 +23,7 @@ use crate::effect_abi::InterruptReason;
 use crate::mir::cranelift_backend::{
     find_loop_headers, is_effect_or_handler_callee, take_deopt_payload, CraneliftJitCompiler,
     DeoptPayload, DeoptSiteKind, MIR_STATUS_DEOPT, MIR_STATUS_ERR_INTERRUPTED,
+    MIR_STATUS_ERR_OUT_OF_GAS,
 };
 use crate::mir::ir::{BlockId, LocalId, MirFunction, MirType, Statement, Terminator};
 use crate::mir::runtime_helpers::{enter_mir_context, MirContext};
@@ -860,6 +861,10 @@ impl OsrEngine {
 
         if last_status == MIR_STATUS_ERR_INTERRUPTED {
             return Ok(OsrExecutionResult::Interrupted(InterruptReason::Cancelled));
+        }
+
+        if last_status == MIR_STATUS_ERR_OUT_OF_GAS {
+            return Err("Out of gas during OSR execution".into());
         }
 
         let val = execution_val?;

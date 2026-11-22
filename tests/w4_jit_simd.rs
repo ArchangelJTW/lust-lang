@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
@@ -3283,13 +3282,15 @@ fn read_mir_int_array(ptr: *const i64) -> Vec<i64> {
         .collect()
 }
 
-fn make_vm_int_array(vals: &[i64]) -> (Rc<RefCell<Vec<Value>>>, Value) {
-    let cell = Rc::new(RefCell::new(vals.iter().copied().map(Value::Int).collect()));
+fn make_vm_int_array(vals: &[i64]) -> (Rc<lust::bytecode::LustArray>, Value) {
+    let cell = Rc::new(lust::bytecode::LustArray::new(
+        vals.iter().copied().map(Value::Int).collect(),
+    ));
     let val = Value::Array(cell.clone());
     (cell, val)
 }
 
-fn extract_vm_int_array(cell: &Rc<RefCell<Vec<Value>>>) -> Vec<i64> {
+fn extract_vm_int_array(cell: &Rc<lust::bytecode::LustArray>) -> Vec<i64> {
     cell.borrow()
         .iter()
         .map(|v| v.as_int().expect("Expected Int array element"))
@@ -7008,7 +7009,7 @@ fn test_w4_batch1_red_alias_loss_same_rc() {
     vm.set_backend(VmBackend::Cranelift);
     vm.load_mir_module(&module).expect("Load module");
 
-    let arr = Rc::new(RefCell::new(vec![Value::Int(3)]));
+    let arr = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(3)]));
     let entry_before = vm.cranelift_entry_count;
     let res = vm
         .call(
@@ -7037,7 +7038,7 @@ fn test_w4_batch1_red_returned_rc_identity() {
     vm.set_backend(VmBackend::Cranelift);
     vm.load_mir_module(&module).expect("Load module");
 
-    let arr = Rc::new(RefCell::new(vec![Value::Int(42)]));
+    let arr = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(42)]));
     let res = vm
         .call("return_same_array", vec![Value::Array(arr.clone())])
         .expect("VM::call");
@@ -7068,7 +7069,7 @@ fn test_w4_batch1_red_bool_writeback() {
     vm.set_backend(VmBackend::Cranelift);
     vm.load_mir_module(&module).expect("Load module");
 
-    let arr = Rc::new(RefCell::new(vec![Value::Bool(false)]));
+    let arr = Rc::new(lust::bytecode::LustArray::new(vec![Value::Bool(false)]));
     let res = vm
         .call("bool_array_write", vec![Value::Array(arr.clone())])
         .expect("VM::call");
@@ -7096,7 +7097,7 @@ fn test_w4_batch1_red_specialized_cache_sync() {
     vm.set_backend(VmBackend::Cranelift);
     vm.load_mir_module(&module).expect("Load module");
 
-    let arr = Rc::new(RefCell::new(vec![Value::Int(10)]));
+    let arr = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(10)]));
     // Warm specialized cache with a dirty value of 20 via JIT unbox/rebox under VM scope
     let val = Value::Array(arr.clone());
     let mut slot = lust::bytecode::value::JitVecSlot {
@@ -7148,8 +7149,8 @@ fn test_w4_batch1_distinct_arrays() {
     vm.set_backend(VmBackend::Cranelift);
     vm.load_mir_module(&module).expect("Load module");
 
-    let arr1 = Rc::new(RefCell::new(vec![Value::Int(3)]));
-    let arr2 = Rc::new(RefCell::new(vec![Value::Int(5)]));
+    let arr1 = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(3)]));
+    let arr2 = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(5)]));
 
     let res = vm
         .call(
@@ -7187,7 +7188,7 @@ fn test_w4_batch1_float_bits_preservation() {
     let subnormal = f64::from_bits(1);
     let qnan_payload = f64::from_bits(0x7ff8000000001234);
 
-    let arr = Rc::new(RefCell::new(vec![
+    let arr = Rc::new(lust::bytecode::LustArray::new(vec![
         Value::Float(neg_zero),
         Value::Float(subnormal),
         Value::Float(qnan_payload),
@@ -7325,8 +7326,8 @@ fn test_w4_batch1_provenance_and_bounds_validation() {
 fn test_w4_batch1_atomic_staged_safe_restoration() {
     let ctx = lust::mir::runtime_helpers::MirContext::new();
 
-    let arr1 = Rc::new(RefCell::new(vec![Value::Int(1), Value::Int(2)]));
-    let arr2 = Rc::new(RefCell::new(vec![Value::Int(3), Value::Int(4)]));
+    let arr1 = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(1), Value::Int(2)]));
+    let arr2 = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(3), Value::Int(4)]));
 
     // Allocate 2 buffers
     let buf1 = Box::into_raw(Box::new([2i64, 2i64, 10i64, 20i64])) as *mut i64;
@@ -7481,7 +7482,7 @@ fn test_w4_batch1_deopt_resumed_effect_observes_dead_mir_input() {
 
     let count_before = CRANELIFT_NATIVE_ENTRY_COUNT.load(Ordering::SeqCst);
 
-    let arr = Rc::new(RefCell::new(vec![Value::Int(3)]));
+    let arr = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(3)]));
     let res = vm
         .call(fn_name, vec![Value::Array(arr.clone()), Value::Int(42)])
         .expect("VM::call");

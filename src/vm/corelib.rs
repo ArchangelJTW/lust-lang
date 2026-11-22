@@ -869,8 +869,7 @@ fn create_lua_module(vm: &VM) -> Value {
                                                                                 Ok(vals) if vals.len() == 1 => Ok(crate::bytecode::value::NativeCallResult::Return(vals[0].clone())),
                                                                                 Ok(vals) if vals.is_empty() => Ok(crate::bytecode::value::NativeCallResult::Return(Value::Nil)),
                                                                                 Ok(vals) => {
-                                                                                    let arr = alloc::rc::Rc::new(core::cell::RefCell::new(vals));
-                                                                                    Ok(crate::bytecode::value::NativeCallResult::Return(Value::Array(arr)))
+                                                                                    Ok(crate::bytecode::value::NativeCallResult::Return(Value::array(vals)))
                                                                                 }
                                                                                 Err(e) => Err(e),
                                                                             }
@@ -1299,8 +1298,7 @@ fn create_lua_socket_newtry_fn() -> Value {
             if try_args.len() == 1 {
                 Ok(NativeCallResult::Return(try_args[0].clone()))
             } else {
-                let arr = Rc::new(RefCell::new(try_args.to_vec()));
-                Ok(NativeCallResult::Return(Value::Array(arr)))
+                Ok(NativeCallResult::Return(Value::array(try_args.to_vec())))
             }
         }));
 
@@ -1331,8 +1329,7 @@ fn create_lua_socket_try_fn() -> Value {
         if args.len() == 1 {
             Ok(NativeCallResult::Return(first))
         } else {
-            let arr = Rc::new(RefCell::new(args.to_vec()));
-            Ok(NativeCallResult::Return(Value::Array(arr)))
+            Ok(NativeCallResult::Return(Value::array(args.to_vec())))
         }
     }))
 }

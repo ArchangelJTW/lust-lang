@@ -26,7 +26,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::cell::RefCell;
+use core::cell::{BorrowError, BorrowMutError, Cell, Ref, RefCell, RefMut};
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::{ptr, slice, str};
@@ -719,6 +719,169 @@ impl From<Name> for String {
     }
 }
 
+/// Homogeneous primitive element tag for cached Cranelift flat-array views (`PERF-T4-3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlatArrayElemTag {
+    Int,
+    Float,
+    Bool,
+}
+
+/// Heap-backed flat Cranelift-compatible array buffer (`[len, cap, elem0, elem1, ...]`).
+/// Owned behind `Rc<FlatArrayBuffer>` so active native invocations can pin it cleanly
+/// until after `MirContextGuard::drop` unregisters its borrowed provenance record.
+#[derive(Debug)]
+pub struct FlatArrayBuffer {
+    words: Vec<i64>,
+}
+
+impl FlatArrayBuffer {
+    pub fn new(words: Vec<i64>) -> Self {
+        Self { words }
+    }
+
+    #[inline]
+    pub fn as_ptr(&self) -> *const i64 {
+        self.words.as_ptr()
+    }
+
+    #[inline]
+    pub fn word_len(&self) -> usize {
+        self.words.len()
+    }
+
+    #[inline]
+    pub fn elem_len(&self) -> usize {
+        self.words.len().saturating_sub(2)
+    }
+}
+
+/// Cached read-only flat array view validated against `LustArray::generation`.
+#[derive(Debug, Clone)]
+pub struct CachedFlatArray {
+    pub generation: u64,
+    pub elem_tag: FlatArrayElemTag,
+    pub buf: Rc<FlatArrayBuffer>,
+}
+
+/// Compiler-enforced encapsulated Lust array (`PERF-T4-3`).
+///
+/// Every mutable access (`borrow_mut` / `try_borrow_mut`) unconditionally increments
+/// `generation` and clears `flat_cache` BEFORE returning `RefMut<'_, Vec<Value>>`,
+/// eliminating stale cached flat views even across external Rust mutations outside VM opcodes.
+/// `elements` is placed first under `#[repr(C)]` so `jit::layout::rc_vec_layout` probes
+/// the `RefCell<Vec<Value>>` header deterministically at offset 0 of `LustArray`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct LustArray {
+    elements: RefCell<Vec<Value>>,
+    generation: Cell<u64>,
+    flat_cache: RefCell<Option<CachedFlatArray>>,
+}
+
+impl LustArray {
+    #[inline]
+    pub fn new(elements: Vec<Value>) -> Self {
+        Self {
+            elements: RefCell::new(elements),
+            generation: Cell::new(1),
+            flat_cache: RefCell::new(None),
+        }
+    }
+
+    #[inline]
+    pub fn with_capacity(cap: usize) -> Self {
+        Self::new(Vec::with_capacity(cap))
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
+    /// Read-only stable address identity for cache/registry keying (never exposes `*mut Vec<Value>`).
+    #[inline]
+    pub fn as_ptr(&self) -> *const Self {
+        self as *const Self
+    }
+
+    #[inline]
+    fn invalidate_flat_cache(&self) {
+        let next = self.generation.get().wrapping_add(1).max(1);
+        self.generation.set(next);
+        self.flat_cache.replace(None);
+    }
+
+    #[inline]
+    pub fn borrow(&self) -> Ref<'_, Vec<Value>> {
+        self.elements.borrow()
+    }
+
+    #[inline]
+    pub fn try_borrow(&self) -> Result<Ref<'_, Vec<Value>>, BorrowError> {
+        self.elements.try_borrow()
+    }
+
+    #[inline]
+    pub fn borrow_mut(&self) -> RefMut<'_, Vec<Value>> {
+        let guard = self.elements.borrow_mut();
+        self.invalidate_flat_cache();
+        guard
+    }
+
+    #[inline]
+    pub fn try_borrow_mut(&self) -> Result<RefMut<'_, Vec<Value>>, BorrowMutError> {
+        let guard = self.elements.try_borrow_mut()?;
+        self.invalidate_flat_cache();
+        Ok(guard)
+    }
+
+    #[inline]
+    pub fn cached_flat(&self, expected_tag: FlatArrayElemTag) -> Option<Rc<FlatArrayBuffer>> {
+        let cache = self.flat_cache.borrow();
+        match cache.as_ref() {
+            Some(c) if c.generation == self.generation.get() && c.elem_tag == expected_tag => {
+                Some(Rc::clone(&c.buf))
+            }
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn has_cached_flat(&self) -> bool {
+        self.flat_cache.borrow().is_some()
+    }
+
+    #[inline]
+    pub fn set_cached_flat(&self, elem_tag: FlatArrayElemTag, buf: Rc<FlatArrayBuffer>) {
+        self.flat_cache.replace(Some(CachedFlatArray {
+            generation: self.generation.get(),
+            elem_tag,
+            buf,
+        }));
+    }
+
+    #[inline]
+    pub fn clear_cached_flat(&self) {
+        self.flat_cache.replace(None);
+    }
+}
+
+impl Default for LustArray {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+impl PartialEq for LustArray {
+    fn eq(&self, other: &Self) -> bool {
+        if core::ptr::eq(self, other) {
+            return true;
+        }
+        *self.elements.borrow() == *other.elements.borrow()
+    }
+}
+
 // Every heap variant is one thin `Rc`, so a `Value` is a tag and an 8-byte
 // payload: the JIT lays registers out at that stride and copies values as
 // one 16-byte pair, and everything that holds nothing owned is a scalar,
@@ -733,7 +896,7 @@ pub enum Value {
     Int(LustInt),
     Float(LustFloat),
     String(Rc<String>),
-    Array(Rc<RefCell<Vec<Value>>>),
+    Array(Rc<LustArray>),
     Tuple(Rc<Vec<Value>>),
     Map(Rc<RefCell<LustMap>>),
     Struct(Rc<StructObject>),
@@ -1183,7 +1346,7 @@ impl Value {
     }
 
     pub fn array(values: Vec<Value>) -> Self {
-        Value::Array(Rc::new(RefCell::new(values)))
+        Value::Array(Rc::new(LustArray::new(values)))
     }
 
     pub fn tuple(values: Vec<Value>) -> Self {
@@ -1921,7 +2084,7 @@ impl From<Rc<String>> for Value {
 impl From<Vec<Value>> for Value {
     #[inline]
     fn from(v: Vec<Value>) -> Self {
-        Value::Array(Rc::new(RefCell::new(v)))
+        Value::Array(Rc::new(LustArray::new(v)))
     }
 }
 
@@ -2384,7 +2547,7 @@ pub unsafe extern "C" fn jit_array_push_safe(
 /// rebox publishes it back into that same array object, wherever the
 /// register that held the array has moved on to by then. Zeroed = empty.
 #[cfg(feature = "std")]
-type ArrayRef = Rc<RefCell<Vec<Value>>>;
+type ArrayRef = Rc<LustArray>;
 
 #[cfg(feature = "std")]
 #[repr(C)]
@@ -2392,7 +2555,7 @@ pub struct JitVecSlot {
     pub ptr: *mut LustInt,
     pub len: usize,
     pub cap: usize,
-    pub array: *const RefCell<Vec<Value>>,
+    pub array: *const LustArray,
 }
 
 #[cfg(feature = "std")]
@@ -2479,9 +2642,9 @@ pub type SpecializedCacheKey = (VmId, ArraySequenceId);
 
 #[cfg(feature = "std")]
 thread_local! {
-    static SPECIALIZED_BOOL_CACHE: RefCell<HashMap<SpecializedCacheKey, (Vec<u8>, bool, Weak<RefCell<Vec<Value>>>)>> = RefCell::new(HashMap::new());
-    static SPECIALIZED_INT_CACHE: RefCell<HashMap<SpecializedCacheKey, (Vec<LustInt>, bool, Weak<RefCell<Vec<Value>>>)>> = RefCell::new(HashMap::new());
-    static SPECIALIZED_FLOAT_CACHE: RefCell<HashMap<SpecializedCacheKey, (Vec<LustFloat>, bool, Weak<RefCell<Vec<Value>>>)>> = RefCell::new(HashMap::new());
+    static SPECIALIZED_BOOL_CACHE: RefCell<HashMap<SpecializedCacheKey, (Vec<u8>, bool, Weak<LustArray>)>> = RefCell::new(HashMap::new());
+    static SPECIALIZED_INT_CACHE: RefCell<HashMap<SpecializedCacheKey, (Vec<LustInt>, bool, Weak<LustArray>)>> = RefCell::new(HashMap::new());
+    static SPECIALIZED_FLOAT_CACHE: RefCell<HashMap<SpecializedCacheKey, (Vec<LustFloat>, bool, Weak<LustArray>)>> = RefCell::new(HashMap::new());
     static SPECIALIZED_ACTIVE_ENTRIES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     static FALLBACK_ARRAY_MAP: RefCell<HashMap<usize, ArraySequenceId>> = RefCell::new(HashMap::new());
     static NEXT_FALLBACK_SEQ: core::cell::Cell<u64> = const { core::cell::Cell::new(1) };
@@ -2586,7 +2749,7 @@ fn fallback_array_key_from_ptr(arr_ptr: usize) -> Option<SpecializedCacheKey> {
 
 #[cfg(feature = "std")]
 fn matching_keys_in_cache<T>(
-    cache: &HashMap<SpecializedCacheKey, (Vec<T>, bool, Weak<RefCell<Vec<Value>>>)>,
+    cache: &HashMap<SpecializedCacheKey, (Vec<T>, bool, Weak<LustArray>)>,
     arr_ptr: usize,
     primary: Option<SpecializedCacheKey>,
 ) -> Vec<SpecializedCacheKey> {
@@ -2645,7 +2808,7 @@ impl ArrayCacheKey for SpecializedCacheKey {
     }
 }
 
-impl ArrayCacheKey for &Rc<RefCell<Vec<Value>>> {
+impl ArrayCacheKey for &Rc<LustArray> {
     fn to_cache_key(&self) -> SpecializedCacheKey {
         resolve_array_key_from_ptr(self.as_ptr() as usize)
     }
@@ -2735,7 +2898,7 @@ pub fn invalidate_specialized_array_cache_by_key(key: SpecializedCacheKey) {
     specialized_cache_sub(removed);
 }
 
-pub fn get_specialized_cached_element(arr: &Rc<RefCell<Vec<Value>>>, idx: i64) -> Option<Value> {
+pub fn get_specialized_cached_element(arr: &Rc<LustArray>, idx: i64) -> Option<Value> {
     #[cfg(feature = "std")]
     {
         if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
@@ -2792,7 +2955,7 @@ pub fn get_specialized_cached_element(arr: &Rc<RefCell<Vec<Value>>>, idx: i64) -
     None
 }
 
-pub fn get_specialized_cached_len(arr: &Rc<RefCell<Vec<Value>>>) -> Option<usize> {
+pub fn get_specialized_cached_len(arr: &Rc<LustArray>) -> Option<usize> {
     #[cfg(feature = "std")]
     {
         if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
@@ -2829,7 +2992,7 @@ pub fn get_specialized_cached_len(arr: &Rc<RefCell<Vec<Value>>>) -> Option<usize
 }
 
 pub fn set_specialized_cached_element(
-    arr: &Rc<RefCell<Vec<Value>>>,
+    arr: &Rc<LustArray>,
     idx: i64,
     val: &Value,
 ) -> Option<Result<(), String>> {
@@ -2860,6 +3023,7 @@ pub fn set_specialized_cached_element(
                         }
                         vec[idx as usize] = if *b { 1 } else { 0 };
                         *dirty = true;
+                        arr.invalidate_flat_cache();
                         Some(Ok(()))
                     } else {
                         None
@@ -2891,6 +3055,7 @@ pub fn set_specialized_cached_element(
                         }
                         vec[idx as usize] = *i;
                         *dirty = true;
+                        arr.invalidate_flat_cache();
                         Some(Ok(()))
                     } else {
                         None
@@ -2922,6 +3087,7 @@ pub fn set_specialized_cached_element(
                         }
                         vec[idx as usize] = *f;
                         *dirty = true;
+                        arr.invalidate_flat_cache();
                         Some(Ok(()))
                     } else {
                         None
@@ -2939,8 +3105,8 @@ pub fn set_specialized_cached_element(
 
 #[cfg(feature = "std")]
 fn sync_cache_for_array<T: Copy, F: Fn(T) -> Value>(
-    cache_cell: &RefCell<HashMap<SpecializedCacheKey, (Vec<T>, bool, Weak<RefCell<Vec<Value>>>)>>,
-    arr: &Rc<RefCell<Vec<Value>>>,
+    cache_cell: &RefCell<HashMap<SpecializedCacheKey, (Vec<T>, bool, Weak<LustArray>)>>,
+    arr: &Rc<LustArray>,
     arr_ptr: usize,
     primary: Option<SpecializedCacheKey>,
     kind_label: &str,
@@ -2994,7 +3160,7 @@ fn sync_cache_for_array<T: Copy, F: Fn(T) -> Value>(
     Ok(())
 }
 
-pub fn try_sync_specialized_array(arr: &Rc<RefCell<Vec<Value>>>) -> Result<(), String> {
+pub fn try_sync_specialized_array(arr: &Rc<LustArray>) -> Result<(), String> {
     #[cfg(feature = "std")]
     {
         if SPECIALIZED_ACTIVE_ENTRIES.with(|c| c.get()) == 0 {
@@ -3015,7 +3181,7 @@ pub fn try_sync_specialized_array(arr: &Rc<RefCell<Vec<Value>>>) -> Result<(), S
     Ok(())
 }
 
-pub fn sync_specialized_array(arr: &Rc<RefCell<Vec<Value>>>) {
+pub fn sync_specialized_array(arr: &Rc<LustArray>) {
     let _ = try_sync_specialized_array(arr);
 }
 
@@ -3317,6 +3483,7 @@ pub unsafe extern "C" fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8 {
         let (vec, array) = (*slot).take_int();
         match (vec, array) {
             (Some(vec), Some(array)) => {
+                array.invalidate_flat_cache();
                 let arr_ptr = array.as_ptr() as usize;
                 let arr_key = resolve_array_key_from_ptr(arr_ptr);
                 let weak = Rc::downgrade(&array);
@@ -3355,6 +3522,7 @@ pub unsafe extern "C" fn jit_rebox_array_bool(slot: *mut JitVecSlot) -> u8 {
         let (vec, array) = (*slot).take_bool();
         match (vec, array) {
             (Some(vec), Some(array)) => {
+                array.invalidate_flat_cache();
                 let arr_ptr = array.as_ptr() as usize;
                 let arr_key = resolve_array_key_from_ptr(arr_ptr);
                 let weak = Rc::downgrade(&array);
@@ -3393,6 +3561,7 @@ pub unsafe extern "C" fn jit_rebox_array_float(slot: *mut JitVecSlot) -> u8 {
         let (vec, array) = (*slot).take_float();
         match (vec, array) {
             (Some(vec), Some(array)) => {
+                array.invalidate_flat_cache();
                 let arr_ptr = array.as_ptr() as usize;
                 let arr_key = resolve_array_key_from_ptr(arr_ptr);
                 let weak = Rc::downgrade(&array);
@@ -5224,7 +5393,7 @@ mod jit_replacement_tests {
         assert_eq!(Rc::strong_count(&string), 1);
         assert!(matches!(value, Value::Int(42)));
 
-        let array = Rc::new(RefCell::new(vec![Value::Int(1)]));
+        let array = Rc::new(LustArray::new(vec![Value::Int(1)]));
         value = Value::Array(array.clone());
         assert_eq!(Rc::strong_count(&array), 2);
         unsafe {
@@ -5355,9 +5524,9 @@ mod tests {
         assert_eq!(specialized_cache_active_entries(), 0);
         assert_eq!(actual_cache_len(), 0);
 
-        let arr_int = Rc::new(RefCell::new(vec![Value::Int(10), Value::Int(20)]));
-        let arr_bool = Rc::new(RefCell::new(vec![Value::Bool(true), Value::Bool(false)]));
-        let arr_float = Rc::new(RefCell::new(vec![Value::Float(1.5), Value::Float(2.5)]));
+        let arr_int = Rc::new(LustArray::new(vec![Value::Int(10), Value::Int(20)]));
+        let arr_bool = Rc::new(LustArray::new(vec![Value::Bool(true), Value::Bool(false)]));
+        let arr_float = Rc::new(LustArray::new(vec![Value::Float(1.5), Value::Float(2.5)]));
 
         // 1. Empty fast-path: all 6 functions (plus by_key) must trigger 0 HashMap probes.
         reset_probes();

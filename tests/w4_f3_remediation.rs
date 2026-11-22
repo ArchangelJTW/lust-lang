@@ -1,6 +1,5 @@
 //! Independent 1:1 RED/GREEN remediation suite for TASK-W4-F3-REMEDIATE (F3-A..F3-F).
 
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -141,10 +140,10 @@ fn test_f3_a1_dynamic_float_add_first_elem_array_parity() {
         );
         assert_eq!(
             res_clif,
-            Value::Array(Rc::new(RefCell::new(vec![
+            Value::array(vec![
                 Value::Float(4.25),
                 Value::Float(3.0)
-            ])))
+            ])
         );
         assert_eq!(res_clif, res_bc, "Oracle mismatch for {fn_name}");
     }
@@ -182,10 +181,10 @@ fn test_f3_a2_dynamic_string_concat_first_elem_array() {
     );
     assert_eq!(
         res_clif,
-        Value::Array(Rc::new(RefCell::new(vec![
+        Value::array(vec![
             Value::string("hello_world"),
             Value::string("tail")
-        ])))
+        ])
     );
     assert_eq!(res_clif, res_bc);
 }
@@ -220,10 +219,10 @@ fn test_f3_a3_dynamic_float_neg_and_call_first_elem_array() {
     assert!(vm_clif.cranelift_entry_count > e0);
     assert_eq!(
         neg_clif,
-        Value::Array(Rc::new(RefCell::new(vec![
+        Value::array(vec![
             Value::Float(-2.5),
             Value::Float(1.0)
-        ])))
+        ])
     );
     assert_eq!(neg_clif, neg_bc);
 
@@ -237,10 +236,10 @@ fn test_f3_a3_dynamic_float_neg_and_call_first_elem_array() {
     assert!(vm_clif.cranelift_entry_count > e1);
     assert_eq!(
         call_clif,
-        Value::Array(Rc::new(RefCell::new(vec![
+        Value::array(vec![
             Value::Float(5.0),
             Value::Float(1.0)
-        ])))
+        ])
     );
     assert_eq!(call_clif, call_bc);
 }
@@ -437,10 +436,10 @@ fn test_f3_a6_heterogeneous_array_int_string_fallback_parity() {
     );
     assert_eq!(
         res_clif,
-        Value::Array(Rc::new(RefCell::new(vec![
+        Value::array(vec![
             Value::Int(10),
             Value::string("hello")
-        ])))
+        ])
     );
 }
 
@@ -483,7 +482,7 @@ fn test_f3_a7_empty_array_float_and_string_annotation_and_return() {
             vm_clif.cranelift_entry_count > e0,
             "{fn_name} must execute natively via Cranelift"
         );
-        assert_eq!(res_clif, Value::Array(Rc::new(RefCell::new(vec![]))));
+        assert_eq!(res_clif, Value::array(vec![]));
         assert_eq!(res_clif, res_bc);
     }
 }

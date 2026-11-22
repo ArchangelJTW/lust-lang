@@ -241,6 +241,133 @@ impl Drop for ActiveJitGuard {
     }
 }
 
+/// RAII gas scope guard for Cranelift top-frame dispatch and production OSR entry (`PERF-T4-1`).
+///
+/// - On **unbounded** VM entry (`vm_gas_budget.is_none()`): saves `gas_unbounded`, enables
+///   `gas_unbounded = true`, replenishes `gas_remaining` to `unbounded_gas_chunk()` if non-positive
+///   or above the active chunk override (preserving positive default balances so callers checking
+///   `gas_after < gas_before` observe real decrements while `lust_mir_gas_slow()` replenishes
+///   transparently on `< 0`), and restores `saved_unbounded` unconditionally on drop/exit.
+/// - On **finite** VM entry (`vm_gas_budget.is_some()`): disables `gas_unbounded`, initializes
+///   `gas_remaining` (never refunding outer spent gas on same-VM reentrancy), deducts exact
+///   net gas spent into `BudgetState` via `finish_and_charge()`, and synchronizes `gas_remaining`
+///   so reentrant callbacks never refund inner gas or double-charge outer frames.
+#[cfg(feature = "std")]
+pub(crate) struct GasScopeGuard {
+    mir_context: Rc<crate::mir::runtime_helpers::MirContext>,
+    vm_gas_budget: Option<u64>,
+    saved_unbounded: bool,
+    saved_gas: i64,
+    entry_snapshot: i64,
+    nested_charged_before: u64,
+    is_nested_same_vm: bool,
+    finalized: bool,
+}
+
+#[cfg(feature = "std")]
+impl GasScopeGuard {
+    pub(crate) fn enter(
+        mir_context: Rc<crate::mir::runtime_helpers::MirContext>,
+        vm_gas_budget: Option<u64>,
+        is_nested_same_vm: bool,
+    ) -> Self {
+        let saved_unbounded = mir_context.gas_unbounded();
+        let saved_gas = mir_context.gas_remaining();
+        let nested_charged_before = mir_context.nested_vm_gas_charged();
+
+        let entry_snapshot = match vm_gas_budget {
+            Some(rem_gas) => {
+                mir_context.set_gas_unbounded(false);
+                let vm_rem_i64 = i64::try_from(rem_gas).unwrap_or(i64::MAX);
+                let effective = if is_nested_same_vm {
+                    vm_rem_i64.min(saved_gas.max(0))
+                } else {
+                    vm_rem_i64
+                };
+                mir_context.set_gas(effective);
+                effective
+            }
+            None => {
+                mir_context.set_gas_unbounded(true);
+                let chunk = crate::mir::runtime_helpers::unbounded_gas_chunk();
+                if saved_gas <= 0 || saved_gas > chunk {
+                    mir_context.set_gas(chunk);
+                    chunk
+                } else {
+                    saved_gas
+                }
+            }
+        };
+
+        Self {
+            mir_context,
+            vm_gas_budget,
+            saved_unbounded,
+            saved_gas,
+            entry_snapshot,
+            nested_charged_before,
+            is_nested_same_vm,
+            finalized: false,
+        }
+    }
+
+    pub(crate) fn finish_and_charge(&mut self, budgets: &mut BudgetState) -> Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        self.finalized = true;
+        self.mir_context.set_gas_unbounded(self.saved_unbounded);
+
+        let gas_after = self.mir_context.gas_remaining();
+        let nested_delta = self
+            .mir_context
+            .nested_vm_gas_charged()
+            .saturating_sub(self.nested_charged_before);
+
+        match self.vm_gas_budget {
+            Some(_) => {
+                let total_drop = (self.entry_snapshot.saturating_sub(gas_after)).max(0) as u64;
+                let own_spent = total_drop.saturating_sub(nested_delta);
+                let charge_res = if own_spent > 0 {
+                    budgets.charge_gas(own_spent)
+                } else {
+                    Ok(())
+                };
+                if self.is_nested_same_vm && own_spent > 0 {
+                    self.mir_context.add_nested_vm_gas_charged(own_spent);
+                }
+                let updated_vm_rem = i64::try_from(
+                    budgets
+                        .gas
+                        .limit
+                        .map(|limit| limit.saturating_sub(budgets.gas.used))
+                        .unwrap_or(0),
+                )
+                .unwrap_or(i64::MAX);
+                if self.is_nested_same_vm {
+                    self.mir_context.set_gas(updated_vm_rem.min(gas_after));
+                } else {
+                    self.mir_context.set_gas(updated_vm_rem);
+                }
+                charge_res
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl Drop for GasScopeGuard {
+    fn drop(&mut self) {
+        if !self.finalized {
+            self.mir_context.set_gas_unbounded(self.saved_unbounded);
+            if self.vm_gas_budget.is_some() && !self.is_nested_same_vm {
+                self.mir_context.set_gas(self.saved_gas);
+            }
+        }
+    }
+}
+
 pub(super) const TO_STRING_TRAIT: &str = "ToString";
 pub(super) const TO_STRING_METHOD: &str = "to_string";
 pub(super) const HASH_KEY_TRAIT: &str = "HashKey";
@@ -337,6 +464,8 @@ pub struct VM {
     pub last_deopt_source: Option<DeoptPayloadSource>,
     pub cranelift_entry_count: u64,
     pub cranelift_compilation_count: u64,
+    pub cranelift_array_cache_hits: u64,
+    pub cranelift_array_cache_builds: u64,
     pub(super) cranelift_dispatch_refine_count: u64,
     pub(super) cranelift_struct_sync_count: u64,
     pub(crate) cranelift_generation: u64,
@@ -430,7 +559,7 @@ pub struct VM {
     pub next_array_sequence_id: core::sync::atomic::AtomicU64,
     pub array_id_map: core::cell::RefCell<HashMap<usize, crate::bytecode::value::ArraySequenceId>>,
     pub lua_context: Rc<crate::lua_compat::LuaCompatContext>,
-    pub mir_context: alloc::sync::Arc<crate::mir::runtime_helpers::MirContext>,
+    pub mir_context: Rc<crate::mir::runtime_helpers::MirContext>,
     pub clock: alloc::sync::Arc<crate::sim::clock::LustClock>,
     #[cfg(feature = "std")]
     pub vfs: alloc::sync::Arc<dyn crate::vfs::VirtualFileSystem>,
@@ -1465,15 +1594,12 @@ impl VM {
         self.mir_context.set_status(MIR_STATUS_OK);
         self.mir_context.set_memory_used(0);
         self.mir_context.set_max_memory_limit(mem_limit);
-        if let Some(rem_gas) = vm_gas_budget {
-            self.mir_context
-                .set_gas(i64::try_from(rem_gas).unwrap_or(i64::MAX));
-        } else {
-            self.mir_context.set_gas(1_000_000_000);
-        }
+        let mut gas_guard = GasScopeGuard::enter(
+            Rc::clone(&self.mir_context),
+            vm_gas_budget,
+            self.active_jit_depth > 0,
+        );
         self.sync_mir_context_struct_metadata();
-
-        let gas_entry_snapshot = self.mir_context.gas_remaining();
 
         self.cranelift_entry_count += 1;
         *native_entered = true;
@@ -1499,13 +1625,7 @@ impl VM {
         drop(_inv_guard);
 
         // Deduct consumed gas and memory back into `self.budgets` on EVERY exit path.
-        let gas_after = self.mir_context.gas_remaining();
-        let gas_spent = (gas_entry_snapshot.saturating_sub(gas_after)).max(0) as u64;
-        let gas_charge_res = if gas_spent > 0 {
-            self.budgets.charge_gas(gas_spent)
-        } else {
-            Ok(())
-        };
+        let gas_charge_res = gas_guard.finish_and_charge(&mut self.budgets);
 
         let mem_spent = usize::try_from(self.mir_context.memory_used().max(0)).unwrap_or(usize::MAX);
         let mem_charge_res = if vm_has_mem_budget && mem_spent > 0 {
@@ -1942,8 +2062,8 @@ pub(crate) struct CompiledFnEntry {
     pub local_types: Vec<crate::mir::ir::MirType>,
     pub compiled_generation: u64,
     pub struct_metadata_generation: u64,
-    #[allow(dead_code)] // Populated in PERF-T2-4
     pub readonly_params: Vec<bool>,
+    pub has_external_or_host_calls: bool,
 }
 
 #[derive(Debug, Clone)]

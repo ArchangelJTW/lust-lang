@@ -1,11 +1,10 @@
 #![cfg(feature = "std")]
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Mutex;
 
-use lust::bytecode::Value;
+use lust::bytecode::{LustArray, Value};
 use lust::mir::cranelift_backend::{
     safepoint_reset, take_current_sticky_error, take_deopt_payload,
 };
@@ -110,7 +109,7 @@ end
     let bump_point_name = find_fn_name(&vm, "bump_point");
     let make_point_name = find_fn_name(&vm, "make_point");
 
-    let arr_rc = Rc::new(RefCell::new(vec![
+    let arr_rc = Rc::new(LustArray::new(vec![
         Value::Int(2),
         Value::Int(3),
         Value::Int(4),
@@ -276,7 +275,7 @@ end
     let make_point_fn = find_fn_name(&vm, "make_point");
 
     // 1. Aliased array f(a, a): param 0 is read-only, param 1 mutates a[0] = 42 -> MUST write back 42!
-    let a_rc = Rc::new(RefCell::new(vec![Value::Int(5), Value::Int(9)]));
+    let a_rc = Rc::new(LustArray::new(vec![Value::Int(5), Value::Int(9)]));
     reset_cranelift_writeback_commit_count();
     let res = vm
         .call(&arr_fn, vec![Value::Array(a_rc.clone()), Value::Array(a_rc.clone())])
@@ -298,8 +297,8 @@ end
     );
 
     // Non-aliased f(a2, b2): only b2 is mutated; a2 stays untouched.
-    let a2_rc = Rc::new(RefCell::new(vec![Value::Int(3), Value::Int(8)]));
-    let b2_rc = Rc::new(RefCell::new(vec![Value::Int(7), Value::Int(1)]));
+    let a2_rc = Rc::new(LustArray::new(vec![Value::Int(3), Value::Int(8)]));
+    let b2_rc = Rc::new(LustArray::new(vec![Value::Int(7), Value::Int(1)]));
     let res_distinct = vm
         .call(&arr_fn, vec![Value::Array(a2_rc.clone()), Value::Array(b2_rc.clone())])
         .expect("distinct f(a2, b2)");
@@ -379,7 +378,7 @@ end
     let id_fn = find_fn_name(&vm, "id_loop");
     let alias_ret_fn = find_fn_name(&vm, "mutate_via_returned_alias");
 
-    let a_rc = Rc::new(RefCell::new(vec![Value::Int(1), Value::Int(2)]));
+    let a_rc = Rc::new(LustArray::new(vec![Value::Int(1), Value::Int(2)]));
     reset_cranelift_writeback_commit_count();
     let r1 = vm
         .call(&caller_fn, vec![Value::Array(a_rc.clone())])
@@ -397,7 +396,7 @@ end
         "transitive helper mutation must write back to caller array"
     );
 
-    let b_rc = Rc::new(RefCell::new(vec![Value::Int(10), Value::Int(20)]));
+    let b_rc = Rc::new(LustArray::new(vec![Value::Int(10), Value::Int(20)]));
     reset_cranelift_writeback_commit_count();
     let r2 = vm
         .call(&alias_ret_fn, vec![Value::Array(b_rc.clone())])
@@ -440,7 +439,7 @@ end
     let mut vm = compile_embedded_vm(src, true);
     let push_fn = find_fn_name(&vm, "push_many");
 
-    let arr_rc = Rc::new(RefCell::new(vec![Value::Int(1)]));
+    let arr_rc = Rc::new(LustArray::new(vec![Value::Int(1)]));
     reset_cranelift_writeback_commit_count();
     let new_len = vm
         .call(&push_fn, vec![Value::Array(arr_rc.clone()), Value::Int(8)])
@@ -495,7 +494,7 @@ end
 
     let mut vm = compile_embedded_vm(src, true);
     let sum_fn = find_fn_name(&vm, "sum_ro_loop");
-    let arr_rc = Rc::new(RefCell::new(vec![
+    let arr_rc = Rc::new(LustArray::new(vec![
         Value::Int(10),
         Value::Int(20),
         Value::Int(30),

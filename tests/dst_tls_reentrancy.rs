@@ -15,7 +15,6 @@ use lust::lua_compat::{
     LuaCompatContext, enter_lua_compat_context, lookup_lust_function, register_lust_function,
 };
 use lust::vm::{self, VM};
-use std::cell::RefCell;
 use std::rc::Rc;
 
 #[test]
@@ -65,8 +64,8 @@ fn test_specialized_cache_vmid_qualification_no_collisions() {
 
     assert_ne!(vm1.id, vm2.id, "VMs must have distinct VmId");
 
-    let arr1 = Rc::new(RefCell::new(vec![Value::Int(10), Value::Int(20), Value::Int(30)]));
-    let arr2 = Rc::new(RefCell::new(vec![Value::Int(100), Value::Int(200), Value::Int(300)]));
+    let arr1 = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(10), Value::Int(20), Value::Int(30)]));
+    let arr2 = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(100), Value::Int(200), Value::Int(300)]));
 
     let ptr1 = arr1.as_ptr() as usize;
     let ptr2 = arr2.as_ptr() as usize;

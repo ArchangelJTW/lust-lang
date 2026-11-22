@@ -437,7 +437,9 @@ pub extern "C" fn lust_array_new(
         (0, Weak::new())
     };
 
-    let arr = Value::Array(Rc::new(RefCell::new(Vec::with_capacity(initial_capacity))));
+    let arr = Value::Array(Rc::new(crate::bytecode::LustArray::with_capacity(
+        initial_capacity,
+    )));
     let handle = Box::new(LustHandle {
         magic: LUST_HANDLE_MAGIC,
         program_id,

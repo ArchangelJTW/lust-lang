@@ -1,6 +1,5 @@
 //! Regression and adversarial provenance suite for TASK-W4-ARRAY-TYPED-PROVENANCE-F3.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -746,11 +745,11 @@ fn test_w4_f3_legitimate_native_aggregates_and_raw_abi_preserved() {
         let r_arr = vm.call("make_int_arr", vec![]).unwrap();
         assert_eq!(
             r_arr,
-            Value::Array(Rc::new(RefCell::new(vec![
+            Value::array(vec![
                 Value::Int(10),
                 Value::Int(20),
                 Value::Int(30)
-            ])))
+            ])
         );
 
         let r_tup = vm.call("make_tuple", vec![]).unwrap();
@@ -814,17 +813,17 @@ fn test_w4_f3_legitimate_native_aggregates_and_raw_abi_preserved() {
 
         assert_eq!(
             vm.call("make_bool_arr", vec![]).unwrap(),
-            Value::Array(Rc::new(RefCell::new(vec![
+            Value::array(vec![
                 Value::Bool(true),
                 Value::Bool(false)
-            ])))
+            ])
         );
         assert_eq!(
             vm.call("make_str_arr", vec![]).unwrap(),
-            Value::Array(Rc::new(RefCell::new(vec![
+            Value::array(vec![
                 Value::string("hello"),
                 Value::string("world")
-            ])))
+            ])
         );
         assert_eq!(vm.mir_context.buffer_count(), 0);
         assert_eq!(vm.call_stack_depth(), 0);
@@ -942,7 +941,7 @@ fn test_w4_f3_lust_source_typed_arrays_preserved() {
     assert_eq!(vm.cranelift_entry_count, e0 + 1);
     assert_eq!(
         floats,
-        Value::Array(Rc::new(RefCell::new(vec![Value::Float(1.5), Value::Float(2.5)])))
+        Value::array(vec![Value::Float(1.5), Value::Float(2.5)])
     );
 
     let e1 = vm.cranelift_entry_count;
@@ -950,7 +949,7 @@ fn test_w4_f3_lust_source_typed_arrays_preserved() {
     assert_eq!(vm.cranelift_entry_count, e1 + 1);
     assert_eq!(
         bools,
-        Value::Array(Rc::new(RefCell::new(vec![Value::Bool(true), Value::Bool(false)])))
+        Value::array(vec![Value::Bool(true), Value::Bool(false)])
     );
 
     let e2 = vm.cranelift_entry_count;
@@ -958,10 +957,10 @@ fn test_w4_f3_lust_source_typed_arrays_preserved() {
     assert_eq!(vm.cranelift_entry_count, e2 + 1);
     assert_eq!(
         strs,
-        Value::Array(Rc::new(RefCell::new(vec![
+        Value::array(vec![
             Value::string("alpha"),
             Value::string("beta")
-        ])))
+        ])
     );
     assert_eq!(vm.mir_context.buffer_count(), 0);
 }

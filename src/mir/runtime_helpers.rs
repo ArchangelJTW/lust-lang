@@ -14,6 +14,93 @@ pub const MIR_STATUS_ERR_DIV_BY_ZERO: i64 = 5;
 pub const MIR_STATUS_ERR_NEG_EXPONENT: i64 = 6;
 pub const MIR_STATUS_ERR_OUT_OF_BOUNDS: i64 = 7;
 
+/// Chunk size replenished by `lust_mir_gas_slow()` during unbounded VM execution.
+pub const UNBOUNDED_GAS_CHUNK: i64 = i64::MAX / 2;
+
+/// Thread-confined inline gas fast-path state (`PERF-T4-1`, Hazard 7 item 1).
+///
+/// `Cell<i64>` / `Cell<u64>` are `#[repr(transparent)]` over `UnsafeCell` and NEVER
+/// expose `&mut i64` or `&i64` references, making same-thread JIT raw-pointer loads/stores
+/// and Rust `Cell::get`/`Cell::set` structurally free of Stacked-Borrows aliasing conflicts.
+#[repr(C)]
+#[derive(Debug)]
+pub struct GasFastState {
+    /// Single authoritative gas counter for this thread-confined `MirContext`.
+    pub gas_remaining: core::cell::Cell<i64>,
+    /// `0` = finite budget (OOG on `< 0`); `1` = unbounded VM execution (replenish on `< 0`).
+    pub gas_unbounded: core::cell::Cell<u64>,
+}
+
+impl GasFastState {
+    pub const fn new(gas: i64) -> Self {
+        Self {
+            gas_remaining: core::cell::Cell::new(gas),
+            gas_unbounded: core::cell::Cell::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+    static UNBOUNDED_GAS_CHUNK_OVERRIDE: core::cell::Cell<Option<i64>> =
+        const { core::cell::Cell::new(None) };
+    static UNBOUNDED_GAS_REPLENISH_COUNT: core::cell::Cell<u64> =
+        const { core::cell::Cell::new(0) };
+}
+
+/// Returns the active unbounded replenishment chunk size for the current thread.
+#[cfg(feature = "std")]
+#[inline]
+pub fn unbounded_gas_chunk() -> i64 {
+    UNBOUNDED_GAS_CHUNK_OVERRIDE
+        .with(|c| c.get())
+        .unwrap_or(UNBOUNDED_GAS_CHUNK)
+}
+
+#[cfg(not(feature = "std"))]
+#[inline]
+pub const fn unbounded_gas_chunk() -> i64 {
+    UNBOUNDED_GAS_CHUNK
+}
+
+/// RAII guard restoring the previous thread-local unbounded gas chunk override on drop.
+#[cfg(feature = "std")]
+pub struct UnboundedGasChunkGuard {
+    prev: Option<i64>,
+}
+
+#[cfg(feature = "std")]
+impl Drop for UnboundedGasChunkGuard {
+    fn drop(&mut self) {
+        UNBOUNDED_GAS_CHUNK_OVERRIDE.with(|c| c.set(self.prev));
+    }
+}
+
+/// Sets a thread-local override for the unbounded gas replenishment chunk size (clamped to `>= 1`).
+/// Used by integration tests to deterministically exercise `lust_mir_gas_slow()` replenishment.
+#[cfg(feature = "std")]
+pub fn set_unbounded_gas_chunk_override(chunk: Option<i64>) -> UnboundedGasChunkGuard {
+    let normalized = chunk.map(|v| v.max(1));
+    let prev = UNBOUNDED_GAS_CHUNK_OVERRIDE.with(|c| {
+        let old = c.get();
+        c.set(normalized);
+        old
+    });
+    UnboundedGasChunkGuard { prev }
+}
+
+/// Returns the number of unbounded gas replenishments performed on the current thread.
+#[cfg(feature = "std")]
+pub fn unbounded_gas_replenish_count() -> u64 {
+    UNBOUNDED_GAS_REPLENISH_COUNT.with(|c| c.get())
+}
+
+/// Resets the thread-local unbounded gas replenishment counter to `0`.
+#[cfg(feature = "std")]
+pub fn reset_unbounded_gas_replenish_count() {
+    UNBOUNDED_GAS_REPLENISH_COUNT.with(|c| c.set(0));
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MirArrayHeader {
@@ -40,6 +127,7 @@ pub struct MirAllocationRecord {
     pub handle_epoch: usize,
     pub alloc_seq: usize,
     pub is_ctx_owned: bool,
+    pub read_only_borrowed: bool,
     pub registered_scope_depth: usize,
 }
 
@@ -51,7 +139,12 @@ pub struct MirContextBaseline {
 
 #[derive(Debug)]
 pub struct MirContext {
-    pub gas_remaining: AtomicI64,
+    #[cfg(feature = "std")]
+    gas_fast: GasFastState,
+    #[cfg(feature = "std")]
+    nested_vm_gas_charged: core::cell::Cell<u64>,
+    #[cfg(not(feature = "std"))]
+    gas_remaining: AtomicI64,
     pub memory_used: AtomicI64,
     pub last_status: AtomicI64,
     pub max_memory_limit: AtomicI64,
@@ -66,6 +159,12 @@ pub struct MirContext {
     pub scope_baselines: Mutex<Vec<MirContextBaseline>>,
     #[cfg(feature = "std")]
     pub scope_alloc_floors: Mutex<Vec<usize>>,
+    /// Scope-bound undo log for borrowed read-only flat array provenance (`PERF-T4-3`).
+    /// Never frees the underlying `FlatArrayBuffer` (owned by `Rc<FlatArrayBuffer>`).
+    #[cfg(feature = "std")]
+    pub borrowed_readonly_stack: Mutex<Vec<(usize, Option<MirAllocationRecord>)>>,
+    #[cfg(feature = "std")]
+    pub borrowed_scope_floors: Mutex<Vec<usize>>,
     #[cfg(feature = "std")]
     pub interned_strings: Mutex<hashbrown::HashMap<alloc::string::String, i64>>,
     #[cfg(feature = "std")]
@@ -74,6 +173,10 @@ pub struct MirContext {
     pub small_digit_handles: [AtomicI64; 10],
     #[cfg(feature = "std")]
     pub struct_fields: Mutex<hashbrown::HashMap<alloc::string::String, Vec<crate::mir::ir::MirType>>>,
+    /// Compiler-enforced thread confinement under `std`: makes both `MirContext`
+    /// and `Arc<MirContext>` statically `!Send + !Sync` (`PERF-T4-1`, Hazard 7 item 1).
+    #[cfg(feature = "std")]
+    _not_send_sync: core::marker::PhantomData<*const ()>,
 }
 
 impl Default for MirContext {
@@ -90,37 +193,45 @@ impl Drop for MirContext {
 }
 
 impl MirContext {
+    #[cfg(feature = "std")]
     pub fn new() -> Self {
+        Self {
+            gas_fast: GasFastState::new(1_000_000_000),
+            nested_vm_gas_charged: core::cell::Cell::new(0),
+            memory_used: AtomicI64::new(0),
+            last_status: AtomicI64::new(0),
+            max_memory_limit: AtomicI64::new(i64::MAX),
+            next_alloc_seq: AtomicUsize::new(1),
+            heap_values: Mutex::new(Vec::new()),
+            allocated_buffers: Mutex::new(Vec::new()),
+            allocation_records: Mutex::new(hashbrown::HashMap::new()),
+            scope_baselines: Mutex::new(Vec::new()),
+            scope_alloc_floors: Mutex::new(Vec::new()),
+            borrowed_readonly_stack: Mutex::new(Vec::new()),
+            borrowed_scope_floors: Mutex::new(Vec::new()),
+            interned_strings: Mutex::new(hashbrown::HashMap::new()),
+            interned_list: Mutex::new(Vec::new()),
+            small_digit_handles: core::array::from_fn(|_| AtomicI64::new(0)),
+            struct_fields: Mutex::new(hashbrown::HashMap::new()),
+            _not_send_sync: core::marker::PhantomData,
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub const fn new() -> Self {
         Self {
             gas_remaining: AtomicI64::new(1_000_000_000),
             memory_used: AtomicI64::new(0),
             last_status: AtomicI64::new(0),
             max_memory_limit: AtomicI64::new(i64::MAX),
             next_alloc_seq: AtomicUsize::new(1),
-            #[cfg(feature = "std")]
-            heap_values: Mutex::new(Vec::new()),
-            #[cfg(feature = "std")]
-            allocated_buffers: Mutex::new(Vec::new()),
-            #[cfg(feature = "std")]
-            allocation_records: Mutex::new(hashbrown::HashMap::new()),
-            #[cfg(feature = "std")]
-            scope_baselines: Mutex::new(Vec::new()),
-            #[cfg(feature = "std")]
-            scope_alloc_floors: Mutex::new(Vec::new()),
-            #[cfg(feature = "std")]
-            interned_strings: Mutex::new(hashbrown::HashMap::new()),
-            #[cfg(feature = "std")]
-            interned_list: Mutex::new(Vec::new()),
-            #[cfg(feature = "std")]
-            small_digit_handles: core::array::from_fn(|_| AtomicI64::new(0)),
-            #[cfg(feature = "std")]
-            struct_fields: Mutex::new(hashbrown::HashMap::new()),
         }
     }
 
     pub fn with_gas(gas: i64) -> Self {
         let ctx = Self::new();
-        ctx.gas_remaining.store(gas, Ordering::SeqCst);
+        ctx.set_gas_unbounded(false);
+        ctx.set_gas(gas);
         ctx
     }
 
@@ -128,8 +239,28 @@ impl MirContext {
         enter_mir_context(self)
     }
 
+    #[inline]
     pub fn gas_remaining(&self) -> i64 {
-        self.gas_remaining.load(Ordering::SeqCst)
+        #[cfg(feature = "std")]
+        {
+            self.gas_fast.gas_remaining.get()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            self.gas_remaining.load(Ordering::SeqCst)
+        }
+    }
+
+    #[inline]
+    pub fn gas_unbounded(&self) -> bool {
+        #[cfg(feature = "std")]
+        {
+            self.gas_fast.gas_unbounded.get() != 0
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            false
+        }
     }
 
     pub fn memory_used(&self) -> i64 {
@@ -148,8 +279,91 @@ impl MirContext {
         self.last_status.store(status, Ordering::SeqCst);
     }
 
+    #[inline]
     pub fn set_gas(&self, gas: i64) {
-        self.gas_remaining.store(gas, Ordering::SeqCst);
+        #[cfg(feature = "std")]
+        {
+            self.gas_fast.gas_remaining.set(gas);
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            self.gas_remaining.store(gas, Ordering::SeqCst);
+        }
+    }
+
+    #[inline]
+    pub fn set_gas_unbounded(&self, unbounded: bool) {
+        #[cfg(feature = "std")]
+        {
+            self.gas_fast.gas_unbounded.set(u64::from(unbounded));
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = unbounded;
+        }
+    }
+
+    /// Overflow-safe gas debit matching the inline Cranelift fast/slow-path contract.
+    #[inline]
+    pub fn charge_gas(&self, amt: i64) -> i64 {
+        #[cfg(feature = "std")]
+        {
+            let cur = self.gas_fast.gas_remaining.get();
+            let (rem, overflowed) = cur.overflowing_sub(amt);
+            let rem_st = if overflowed { i64::MIN } else { rem };
+            self.gas_fast.gas_remaining.set(rem_st);
+            if overflowed || rem_st < 0 {
+                if self.gas_fast.gas_unbounded.get() != 0 {
+                    let chunk = unbounded_gas_chunk();
+                    self.gas_fast.gas_remaining.set(chunk);
+                    UNBOUNDED_GAS_REPLENISH_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+                    return chunk;
+                }
+                self.last_status
+                    .store(MIR_STATUS_ERR_OUT_OF_GAS, Ordering::SeqCst);
+            }
+            rem_st
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            loop {
+                let cur = self.gas_remaining.load(Ordering::SeqCst);
+                let (rem, overflowed) = cur.overflowing_sub(amt);
+                let rem_st = if overflowed { i64::MIN } else { rem };
+                if self
+                    .gas_remaining
+                    .compare_exchange(cur, rem_st, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    if overflowed || rem_st < 0 {
+                        self.last_status
+                            .store(MIR_STATUS_ERR_OUT_OF_GAS, Ordering::SeqCst);
+                    }
+                    return rem_st;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn gas_fast_ptr(&self) -> *mut GasFastState {
+        // SAFETY: Every field of `GasFastState` is wrapped in `Cell` (`UnsafeCell`),
+        // and Rust never forms `&mut GasFastState` or `&mut i64` references.
+        core::ptr::addr_of!(self.gas_fast) as *mut GasFastState
+    }
+
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn nested_vm_gas_charged(&self) -> u64 {
+        self.nested_vm_gas_charged.get()
+    }
+
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn add_nested_vm_gas_charged(&self, delta: u64) {
+        self.nested_vm_gas_charged
+            .set(self.nested_vm_gas_charged.get().saturating_add(delta));
     }
 
     pub fn set_memory_used(&self, bytes: i64) {
@@ -341,6 +555,7 @@ impl MirContext {
                     handle_epoch,
                     alloc_seq: seq,
                     is_ctx_owned: true,
+                    read_only_borrowed: false,
                     registered_scope_depth: scope_depth,
                 },
             );
@@ -361,6 +576,9 @@ impl MirContext {
             let bufs_match = bufs.iter().rposition(|(p, _)| *p == ptr);
             let mut records = self.allocation_records.lock().unwrap();
             if let Some(existing) = records.get_mut(&(ptr as usize)) {
+                if existing.read_only_borrowed {
+                    return;
+                }
                 existing.base_ptr = ptr;
                 existing.word_capacity = words;
                 existing.kind = kind;
@@ -384,6 +602,7 @@ impl MirContext {
                         handle_epoch,
                         alloc_seq: seq,
                         is_ctx_owned,
+                        read_only_borrowed: false,
                         registered_scope_depth: scope_depth,
                     },
                 );
@@ -436,11 +655,75 @@ impl MirContext {
         }
     }
 
+    /// Registers a scope-bound borrowed read-only flat array provenance record (`PERF-T4-3`).
+    ///
+    /// The underlying memory is owned by `Rc<FlatArrayBuffer>` pinned by the caller and is NEVER
+    /// pushed to `allocated_buffers` or freed by `clear_to_baselines`. Unregistered automatically
+    /// in reverse order when `MirContextGuard::drop` exits the current scope.
+    pub fn register_borrowed_readonly_array(
+        &self,
+        ptr: *const i64,
+        word_capacity: usize,
+        elem_type: crate::mir::ir::MirType,
+    ) -> core::result::Result<(), alloc::string::String> {
+        if ptr.is_null() {
+            return Err("Cannot register null pointer as borrowed read-only array".into());
+        }
+        if word_capacity < 2 {
+            return Err(alloc::format!(
+                "Cannot register borrowed read-only array with word_capacity ({word_capacity}) < 2"
+            ));
+        }
+        #[cfg(feature = "std")]
+        {
+            let handle_epoch = self.handle_count();
+            let seq = self.next_alloc_seq.fetch_add(1, Ordering::SeqCst);
+            let scope_depth = self.scope_alloc_floors.lock().unwrap().len();
+            let addr = ptr as usize;
+            let mut records = self.allocation_records.lock().unwrap();
+            if let Some(existing) = records.get(&addr)
+                && existing.is_ctx_owned
+            {
+                return Err(alloc::format!(
+                    "Cannot register borrowed read-only array over context-owned allocation at {addr:#x}"
+                ));
+            }
+            let prev = records.get(&addr).cloned();
+            records.insert(
+                addr,
+                MirAllocationRecord {
+                    base_ptr: ptr as *mut i64,
+                    word_capacity,
+                    kind: MirAllocationKind::Array(elem_type),
+                    buffer_index: usize::MAX,
+                    handle_epoch,
+                    alloc_seq: seq,
+                    is_ctx_owned: false,
+                    read_only_borrowed: true,
+                    registered_scope_depth: scope_depth,
+                },
+            );
+            self.borrowed_readonly_stack
+                .lock()
+                .unwrap()
+                .push((addr, prev));
+            Ok(())
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = elem_type;
+            Err("Borrowed read-only arrays require std feature".into())
+        }
+    }
+
     pub fn set_allocation_kind(&self, ptr_usize: usize, kind: MirAllocationKind) -> bool {
         #[cfg(feature = "std")]
         {
             let mut records = self.allocation_records.lock().unwrap();
             if let Some(rec) = records.get_mut(&ptr_usize) {
+                if rec.read_only_borrowed {
+                    return false;
+                }
                 rec.kind = kind;
                 true
             } else {
@@ -493,12 +776,14 @@ impl MirContext {
                 }
                 if effective_handles == 0 && start == 0 && scope_depth == 0 {
                     records.clear();
+                    self.borrowed_readonly_stack.lock().unwrap().clear();
                 } else if scope_depth > 0
                     && baseline_handles <= handle_floor
                     && baseline_buffers <= buf_floor
                 {
                     records.retain(|_, rec| {
                         rec.is_ctx_owned
+                            || rec.read_only_borrowed
                             || !(rec.registered_scope_depth >= scope_depth
                                 && rec.alloc_seq >= seq_floor)
                     });
@@ -578,6 +863,22 @@ impl Drop for MirContextGuard {
         {
             if !self.0.is_null() {
                 let ctx = unsafe { &*self.0 };
+                let borrowed_floor = ctx.borrowed_scope_floors.lock().unwrap().pop().unwrap_or(0);
+                {
+                    let mut stack = ctx.borrowed_readonly_stack.lock().unwrap();
+                    let start = borrowed_floor.min(stack.len());
+                    let mut records = ctx.allocation_records.lock().unwrap();
+                    for (addr, prev_opt) in stack.drain(start..).rev() {
+                        match prev_opt {
+                            Some(prev) => {
+                                records.insert(addr, prev);
+                            }
+                            None => {
+                                records.remove(&addr);
+                            }
+                        }
+                    }
+                }
                 ctx.scope_baselines.lock().unwrap().pop();
                 ctx.scope_alloc_floors.lock().unwrap().pop();
             }
@@ -603,8 +904,10 @@ pub fn enter_mir_context(ctx: &MirContext) -> MirContextGuard {
     {
         let baseline = ctx.capture_baseline();
         let seq_floor = ctx.next_alloc_seq.load(Ordering::SeqCst);
+        let borrowed_floor = ctx.borrowed_readonly_stack.lock().unwrap().len();
         ctx.scope_baselines.lock().unwrap().push(baseline);
         ctx.scope_alloc_floors.lock().unwrap().push(seq_floor);
+        ctx.borrowed_scope_floors.lock().unwrap().push(borrowed_floor);
         CURRENT_MIR_STACK.with(|stack| {
             stack.borrow_mut().push(ptr);
         });
@@ -646,9 +949,39 @@ where
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_gas_fast_ptr() -> *mut GasFastState {
+    #[cfg(feature = "std")]
+    {
+        with_current_mir_context(|ctx| ctx.gas_fast_ptr())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        core::ptr::null_mut()
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_gas_slow() -> i64 {
+    with_current_mir_context(|ctx| {
+        #[cfg(feature = "std")]
+        {
+            if ctx.gas_fast.gas_unbounded.get() != 0 {
+                ctx.gas_fast.gas_remaining.set(unbounded_gas_chunk());
+                UNBOUNDED_GAS_REPLENISH_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+                return MIR_STATUS_OK;
+            }
+        }
+        ctx.last_status
+            .store(MIR_STATUS_ERR_OUT_OF_GAS, Ordering::SeqCst);
+        MIR_STATUS_ERR_OUT_OF_GAS
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_set_gas(gas: i64) {
     with_current_mir_context(|ctx| {
-        ctx.gas_remaining.store(gas, Ordering::SeqCst);
+        ctx.set_gas_unbounded(false);
+        ctx.set_gas(gas);
         if gas >= 0 {
             ctx.last_status.store(0, Ordering::SeqCst);
         }
@@ -657,19 +990,12 @@ pub extern "C" fn lust_mir_set_gas(gas: i64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_get_gas() -> i64 {
-    with_current_mir_context(|ctx| ctx.gas_remaining.load(Ordering::SeqCst))
+    with_current_mir_context(|ctx| ctx.gas_remaining())
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_charge_gas(amt: i64) -> i64 {
-    with_current_mir_context(|ctx| {
-        let cur = ctx.gas_remaining.fetch_sub(amt, Ordering::SeqCst);
-        let rem = cur - amt;
-        if rem < 0 {
-            ctx.last_status.store(crate::effect_abi::LUST_STATUS_ERR_OUT_OF_GAS as i64, Ordering::SeqCst);
-        }
-        rem
-    })
+    with_current_mir_context(|ctx| ctx.charge_gas(amt))
 }
 
 #[unsafe(no_mangle)]
@@ -798,6 +1124,7 @@ fn alloc_mir_buffer_with_kind(len: i64, kind: MirAllocationKind) -> *mut i64 {
                     handle_epoch,
                     alloc_seq: seq,
                     is_ctx_owned: true,
+                    read_only_borrowed: false,
                     registered_scope_depth: scope_depth,
                 },
             );
@@ -1001,6 +1328,10 @@ fn validate_active_array_inner(ctx: &MirContext, ptr: *const i64) -> Option<Vali
                 backing_rec: None,
             })
         } else {
+            // Borrowed read-only flat buffers are strictly flat (`cap >= 0`), never redirected.
+            if rec.read_only_borrowed {
+                return None;
+            }
             // Bit 63 set: redirected backing buffer stored at word[2]
             if rec.word_capacity < 3 {
                 return None;
@@ -1089,6 +1420,17 @@ pub extern "C" fn lust_mir_array_set(ptr: *mut i64, idx: i64, val: i64) {
         let Some(v) = validate_active_array_ptr(ctx, ptr) else {
             return;
         };
+        #[cfg(feature = "std")]
+        if v.header_rec.read_only_borrowed {
+            ctx.last_status.store(
+                crate::effect_abi::LUST_STATUS_ERR_GENERIC as i64,
+                Ordering::SeqCst,
+            );
+            crate::mir::cranelift_backend::set_current_sticky_error(
+                "Attempted to mutate borrowed read-only array".into(),
+            );
+            return;
+        }
         if idx < 0 || (idx as usize) >= v.len {
             ctx.last_status
                 .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
@@ -1108,6 +1450,16 @@ pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
             let Some(v) = validate_active_array_ptr(ctx, ptr) else {
                 return MIR_STATUS_ERR_OUT_OF_BOUNDS;
             };
+            if v.header_rec.read_only_borrowed {
+                ctx.last_status.store(
+                    crate::effect_abi::LUST_STATUS_ERR_GENERIC as i64,
+                    Ordering::SeqCst,
+                );
+                crate::mir::cranelift_backend::set_current_sticky_error(
+                    "Attempted to mutate borrowed read-only array".into(),
+                );
+                return crate::effect_abi::LUST_STATUS_ERR_GENERIC as i64;
+            }
             if v.header_rec.word_capacity < 3 {
                 ctx.last_status
                     .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
@@ -1182,6 +1534,7 @@ pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
                                 handle_epoch: v.header_rec.handle_epoch,
                                 alloc_seq: seq,
                                 is_ctx_owned: true,
+                                read_only_borrowed: false,
                                 registered_scope_depth: scope_depth,
                             },
                         );
@@ -1199,6 +1552,7 @@ pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
                                 handle_epoch: v.header_rec.handle_epoch,
                                 alloc_seq: seq,
                                 is_ctx_owned: true,
+                                read_only_borrowed: false,
                                 registered_scope_depth: scope_depth,
                             },
                         );
@@ -1217,6 +1571,7 @@ pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
                             handle_epoch: v.header_rec.handle_epoch,
                             alloc_seq: seq,
                             is_ctx_owned: true,
+                            read_only_borrowed: false,
                             registered_scope_depth: scope_depth,
                         },
                     );

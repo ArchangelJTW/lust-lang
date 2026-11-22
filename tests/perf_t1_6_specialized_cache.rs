@@ -9,9 +9,8 @@ use lust::bytecode::value::{
     jit_unbox_array_int, set_specialized_cached_element, specialized_cache_active_entries,
     sync_all_specialized_arrays, try_sync_specialized_array,
 };
-use lust::bytecode::Value;
+use lust::bytecode::{LustArray, Value};
 use lust::vm::{CurrentVmGuard, VM};
-use std::cell::RefCell;
 use std::rc::Rc;
 
 fn empty_slot() -> JitVecSlot {
@@ -28,7 +27,7 @@ fn test_perf_t1_6_empty_cache_default_and_noops() {
     sync_all_specialized_arrays();
     assert_eq!(specialized_cache_active_entries(), 0);
 
-    let arr = Rc::new(RefCell::new(vec![Value::Int(1), Value::Int(2), Value::Int(3)]));
+    let arr = Rc::new(LustArray::new(vec![Value::Int(1), Value::Int(2), Value::Int(3)]));
 
     assert_eq!(get_specialized_cached_element(&arr, 0), None);
     assert_eq!(get_specialized_cached_len(&arr), None);
@@ -50,9 +49,9 @@ fn test_perf_t1_6_exact_accounting_across_bool_int_float_and_reinsert() {
     sync_all_specialized_arrays();
     assert_eq!(specialized_cache_active_entries(), 0);
 
-    let arr_int = Rc::new(RefCell::new(vec![Value::Int(10), Value::Int(20)]));
-    let arr_bool = Rc::new(RefCell::new(vec![Value::Bool(true), Value::Bool(false)]));
-    let arr_float = Rc::new(RefCell::new(vec![Value::Float(1.25), Value::Float(2.5)]));
+    let arr_int = Rc::new(LustArray::new(vec![Value::Int(10), Value::Int(20)]));
+    let arr_bool = Rc::new(LustArray::new(vec![Value::Bool(true), Value::Bool(false)]));
+    let arr_float = Rc::new(LustArray::new(vec![Value::Float(1.25), Value::Float(2.5)]));
 
     let val_int = Value::Array(Rc::clone(&arr_int));
     let val_bool = Value::Array(Rc::clone(&arr_bool));
@@ -172,7 +171,7 @@ fn test_perf_t1_6_dead_weak_pruning_and_vm_guard_transition() {
 
     // 2. Fallback VmId(0) entry synced inside an active CurrentVmGuard must remove stale non-primary key and decrement count.
     let mut vm = VM::new();
-    let arr = Rc::new(RefCell::new(vec![Value::Int(5), Value::Int(6)]));
+    let arr = Rc::new(LustArray::new(vec![Value::Int(5), Value::Int(6)]));
     let val = Value::Array(Rc::clone(&arr));
     let mut slot = empty_slot();
     unsafe {
@@ -217,7 +216,7 @@ fn test_perf_t1_6_rebox_overwrite_stale_key_and_length_mismatch_eviction() {
     assert_eq!(specialized_cache_active_entries(), 0);
 
     // 1. Overwriting an existing key in jit_rebox_array_{int,bool,float} must not double-count.
-    let arr_int = Rc::new(RefCell::new(vec![Value::Int(1), Value::Int(2)]));
+    let arr_int = Rc::new(LustArray::new(vec![Value::Int(1), Value::Int(2)]));
     let val_int = Value::Array(Rc::clone(&arr_int));
     let mut slot1 = empty_slot();
     let mut slot2 = empty_slot();

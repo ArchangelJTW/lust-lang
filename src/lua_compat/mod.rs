@@ -678,9 +678,8 @@ fn register_lua_closure(
                                             ))
                                         }
                                         Ok(vals) => {
-                                            let arr = Rc::new(RefCell::new(vals));
                                             Ok(crate::bytecode::value::NativeCallResult::Return(
-                                                Value::Array(arr),
+                                                Value::array(vals),
                                             ))
                                         }
                                         Err(e) => Err(e),

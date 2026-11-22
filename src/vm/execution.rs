@@ -3662,10 +3662,11 @@ impl VM {
             TypeKind::Named(expected) => self.value_is_type(value, expected),
             TypeKind::GenericInstance { name, .. } => self.value_is_type(value, name),
             TypeKind::Array(element_type) => match value {
-                Value::Array(values) => values
-                    .borrow()
-                    .iter()
-                    .all(|value| self.value_matches_type(value, element_type)),
+                Value::Array(values) => values.try_borrow().is_ok_and(|items| {
+                    items
+                        .iter()
+                        .all(|value| self.value_matches_type(value, element_type))
+                }),
                 _ => false,
             },
             TypeKind::Map(key_type, value_type) => match value {
@@ -4140,6 +4141,15 @@ impl VM {
                     ArgCheck::Shallow => Self::value_matches_type_shallow(value, ty),
                 };
                 if !ok {
+                    if matches!(value, Value::Array(arr) if arr.try_borrow().is_err()) {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Failed to acquire borrow for argument {} of function {}: mutable borrow active",
+                                index + 1,
+                                function.name
+                            ),
+                        });
+                    }
                     return Err(LustError::RuntimeError {
                         message: format!(
                             "Function {} argument {} expects {}, got {:?}",
@@ -4218,6 +4228,15 @@ impl VM {
                     ArgCheck::Shallow => Self::value_matches_type_shallow(value, ty),
                 };
                 if !ok {
+                    if matches!(value, Value::Array(arr) if arr.try_borrow().is_err()) {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Failed to acquire borrow for argument {} of function {}: mutable borrow active",
+                                index + 1,
+                                function.name
+                            ),
+                        });
+                    }
                     return Err(LustError::RuntimeError {
                         message: format!(
                             "Function {} argument {} expects {}, got {:?}",

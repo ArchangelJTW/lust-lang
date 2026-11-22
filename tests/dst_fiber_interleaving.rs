@@ -8,9 +8,6 @@
 //! 5. Captures the exact failing seed and re-runs the scheduler with that seed.
 //! 6. Proves deterministic reproducibility: the re-run with the failing seed produces the exact identical race condition output and execution trace.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use lust::bytecode::{Function, Instruction, Value};
 use lust::sim::PreemptiveExplorationScheduler;
 use lust::vm::TaskState;
@@ -65,7 +62,7 @@ fn test_sequential_execution_has_no_race_condition() {
     let func = create_counter_incrementer_function(5);
     scheduler.vm.load_functions(vec![func]);
 
-    let shared_array = Value::Array(Rc::new(RefCell::new(vec![Value::Int(0)])));
+    let shared_array = Value::array(vec![Value::Int(0)]);
     let func_val = Value::Function(0);
 
     // Fiber 1 runs to completion first
@@ -117,7 +114,7 @@ fn test_preemptive_interleaving_detects_race_condition_within_500_seeds_and_repr
         let func = create_counter_incrementer_function(increments_per_fiber);
         scheduler.vm.load_functions(vec![func]);
 
-        let shared_array = Value::Array(Rc::new(RefCell::new(vec![Value::Int(0)])));
+        let shared_array = Value::array(vec![Value::Int(0)]);
         let func_val = Value::Function(0);
 
         let _h1 = scheduler
@@ -168,7 +165,7 @@ fn test_preemptive_interleaving_detects_race_condition_within_500_seeds_and_repr
     let func = create_counter_incrementer_function(increments_per_fiber);
     replay_scheduler.vm.load_functions(vec![func]);
 
-    let replay_shared_array = Value::Array(Rc::new(RefCell::new(vec![Value::Int(0)])));
+    let replay_shared_array = Value::array(vec![Value::Int(0)]);
     let func_val = Value::Function(0);
 
     let _h1 = replay_scheduler

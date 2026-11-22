@@ -228,6 +228,8 @@ impl VM {
             #[cfg(feature = "test-deopt")]
             last_deopt_source: None,
             cranelift_compilation_count: 0,
+            cranelift_array_cache_hits: 0,
+            cranelift_array_cache_builds: 0,
             cranelift_dispatch_refine_count: 0,
             cranelift_struct_sync_count: 0,
             cranelift_generation: 0,
@@ -298,7 +300,7 @@ impl VM {
             next_array_sequence_id: core::sync::atomic::AtomicU64::new(0),
             array_id_map: core::cell::RefCell::new(HashMap::new()),
             lua_context: Rc::new(crate::lua_compat::LuaCompatContext::new()),
-            mir_context: alloc::sync::Arc::new(crate::mir::runtime_helpers::MirContext::new()),
+            mir_context: Rc::new(crate::mir::runtime_helpers::MirContext::new()),
             clock: alloc::sync::Arc::new(crate::sim::clock::LustClock::system()),
             #[cfg(feature = "std")]
             vfs: alloc::sync::Arc::new(crate::vfs::OsFs::new()),

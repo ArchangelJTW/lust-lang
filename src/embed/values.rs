@@ -655,11 +655,11 @@ impl<'a> Deref for StringRef<'a> {
 
 #[derive(Clone)]
 pub struct ArrayHandle {
-    inner: Rc<RefCell<Vec<Value>>>,
+    inner: Rc<crate::bytecode::LustArray>,
 }
 
 impl ArrayHandle {
-    pub(crate) fn from_rc(inner: Rc<RefCell<Vec<Value>>>) -> Self {
+    pub(crate) fn from_rc(inner: Rc<crate::bytecode::LustArray>) -> Self {
         Self { inner }
     }
 

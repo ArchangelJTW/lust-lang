@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -213,7 +212,7 @@ fn test_b1_production_perform_resume_continues_once() {
     vm_bc.set_backend(VmBackend::Bytecode);
     vm_bc.load_functions(bc_funcs.clone());
     vm_bc.load_mir_function(helper.clone()).expect("load_mir_function bc");
-    let log_bc = Rc::new(RefCell::new(vec![Value::Int(0), Value::Int(0)]));
+    let log_bc = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(0), Value::Int(0)]));
     let res_bc = vm_bc
         .call("main", vec![Value::Array(log_bc.clone())])
         .expect("bc call");
@@ -223,7 +222,7 @@ fn test_b1_production_perform_resume_continues_once() {
     vm_clif.set_backend(VmBackend::Cranelift);
     vm_clif.load_functions(bc_funcs);
     vm_clif.load_mir_function(helper).expect("load_mir_function clif");
-    let log_clif = Rc::new(RefCell::new(vec![Value::Int(0), Value::Int(0)]));
+    let log_clif = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(0), Value::Int(0)]));
     let entries_before = vm_clif.cranelift_entry_count;
     let res_clif = vm_clif
         .call("main", vec![Value::Array(log_clif.clone())])
@@ -533,8 +532,8 @@ fn test_b2_all_seven_vm_intrinsics_and_fail_closed_closures() {
         "run_resume",
         "run_lust_resume",
     ] {
-        let arr_bc = Rc::new(RefCell::new(vec![Value::Int(10)]));
-        let arr_clif = Rc::new(RefCell::new(vec![Value::Int(10)]));
+        let arr_bc = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(10)]));
+        let arr_clif = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(10)]));
         let e0 = vm_clif.cranelift_entry_count;
         let r_bc = vm_bc
             .call(entry, vec![Value::Array(arr_bc.clone())])
@@ -1649,7 +1648,7 @@ fn test_b13_production_simd_sum_deopt_without_spike_hook() {
             poll_ordinal,
         );
 
-        let arr_rc = Rc::new(RefCell::new(a_vals.iter().copied().map(Value::Int).collect()));
+        let arr_rc = Rc::new(lust::bytecode::LustArray::new(a_vals.iter().copied().map(Value::Int).collect()));
         let res = vm
             .call(fn_name, vec![Value::Array(arr_rc.clone()), Value::Int(len_val)])
             .expect("production SIMD Sum deopt without spike hook must succeed");
@@ -1829,8 +1828,8 @@ fn test_b14_production_simd_dot_deopt_without_spike_hook() {
             poll_ordinal,
         );
 
-        let arr_a = Rc::new(RefCell::new(a_vals.iter().copied().map(Value::Int).collect()));
-        let arr_b = Rc::new(RefCell::new(b_vals.iter().copied().map(Value::Int).collect()));
+        let arr_a = Rc::new(lust::bytecode::LustArray::new(a_vals.iter().copied().map(Value::Int).collect()));
+        let arr_b = Rc::new(lust::bytecode::LustArray::new(b_vals.iter().copied().map(Value::Int).collect()));
         let res = vm
             .call(
                 fn_name,
@@ -2080,8 +2079,8 @@ fn test_b6_caller_of_deopt_callee_and_self_recursion_safe() {
         "callers of effect-deopt callees and self-recursive effect functions must not compile natively"
     );
 
-    let log_bc = Rc::new(RefCell::new(vec![Value::Int(0)]));
-    let log_clif = Rc::new(RefCell::new(vec![Value::Int(0)]));
+    let log_bc = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(0)]));
+    let log_clif = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(0)]));
     let c_bc = vm_bc.call("main_chain", vec![Value::Array(log_bc.clone())]).expect("bc chain");
     let c_clif = vm_clif.call("main_chain", vec![Value::Array(log_clif.clone())]).expect("clif chain");
     assert_eq!(c_clif, c_bc);
@@ -2244,7 +2243,7 @@ fn test_b11_stale_generation_wrong_invocation_and_reentrant_native() {
         hook.injected_payload = Some(bad_payload);
         vm.test_deopt_spike_hook = Some(hook);
 
-        let arr = Rc::new(RefCell::new(vec![Value::Int(5)]));
+        let arr = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(5)]));
         let err = vm
             .call(fn_name, vec![Value::Array(arr.clone())])
             .expect_err("wrong invocation_id must fail");
@@ -2272,7 +2271,7 @@ fn test_b11_stale_generation_wrong_invocation_and_reentrant_native() {
         hook.injected_payload = Some(stale_payload);
         vm.test_deopt_spike_hook = Some(hook);
 
-        let arr = Rc::new(RefCell::new(vec![Value::Int(9)]));
+        let arr = Rc::new(lust::bytecode::LustArray::new(vec![Value::Int(9)]));
         let err = vm
             .call(fn_name, vec![Value::Array(arr.clone())])
             .expect_err("stale compilation_generation must fail");

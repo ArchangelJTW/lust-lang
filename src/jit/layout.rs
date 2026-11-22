@@ -124,7 +124,7 @@ fn probe_ownership() -> Option<OwnershipLayout> {
         (unique_position(&value_words(value), inner)? * 8 == single_rc_offset)
             .then(|| tag_of(value))
     };
-    let array = Rc::new(RefCell::new(alloc::vec![Value::Int(1)]));
+    let array = Rc::new(crate::bytecode::LustArray::new(alloc::vec![Value::Int(1)]));
     same_word(&Value::Array(Rc::clone(&array)), inner_of(&array))?;
     let tuple = Rc::new(alloc::vec![Value::Int(1)]);
     same_word(&Value::Tuple(Rc::clone(&tuple)), inner_of(&tuple))?;
@@ -318,7 +318,7 @@ fn probe() -> Option<RcVecLayout> {
     vec.push(Value::Int(0x5151));
     vec.push(Value::Int(0x5252));
     let elements = vec.as_ptr() as usize;
-    let rc = Rc::new(RefCell::new(vec));
+    let rc = Rc::new(crate::bytecode::LustArray::new(vec));
     let cell_ptr = Rc::as_ptr(&rc) as *const u8;
 
     // `RcInner` is `{ strong, weak, value }`: the value sits 16 bytes in.
@@ -437,7 +437,7 @@ mod tests {
         // Read an element through the measured offsets.
         let vec = alloc::vec![Value::Int(7), Value::Int(9)];
         let elements = vec.as_ptr() as usize;
-        let value = Value::Array(Rc::new(RefCell::new(vec)));
+        let value = Value::Array(Rc::new(crate::bytecode::LustArray::new(vec)));
         let base = &value as *const Value as *const u8;
         let rc = unsafe { core::ptr::read(base.add(layout.array_rc_offset) as *const usize) };
         let ptr = unsafe { core::ptr::read((rc + layout.ptr_offset) as *const usize) };

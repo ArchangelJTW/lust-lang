@@ -69,7 +69,7 @@ impl Default for CycleCollector {
 }
 
 enum ContainerKind {
-    Array(Weak<RefCell<Vec<Value>>>),
+    Array(Weak<crate::bytecode::LustArray>),
     Map(Weak<RefCell<LustMap>>),
     Struct(Weak<StructObject>),
     Iterator(Weak<RefCell<IteratorState>>),
@@ -77,7 +77,7 @@ enum ContainerKind {
 
 #[derive(Clone)]
 enum NodeKind {
-    Array(Weak<RefCell<Vec<Value>>>),
+    Array(Weak<crate::bytecode::LustArray>),
     Map(Weak<RefCell<LustMap>>),
     Struct(Weak<StructObject>),
     Iterator(Weak<RefCell<IteratorState>>),
@@ -771,7 +771,7 @@ impl CycleCollector {
         nodes.get_mut(&child).unwrap().internal_incoming += 1;
     }
 
-    fn register_array(&mut self, rc: &Rc<RefCell<Vec<Value>>>) -> bool {
+    fn register_array(&mut self, rc: &Rc<crate::bytecode::LustArray>) -> bool {
         self.register_container((NODE_ARRAY, Rc::as_ptr(rc) as usize), || {
             ContainerKind::Array(Rc::downgrade(rc))
         })
@@ -936,7 +936,7 @@ mod tests {
     #[test]
     fn repeated_registration_reuses_the_weak_handle() {
         let mut collector = CycleCollector::new();
-        let array = Rc::new(RefCell::new(Vec::new()));
+        let array = Rc::new(crate::bytecode::LustArray::new(Vec::new()));
         let key = (NODE_ARRAY, Rc::as_ptr(&array) as usize);
         assert!(collector.register_array(&array));
         assert_eq!(Rc::weak_count(&array), 1);

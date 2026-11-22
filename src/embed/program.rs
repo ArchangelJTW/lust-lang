@@ -3050,9 +3050,9 @@ mod tests {
         let err = program
             .call_preflight_spike(
                 "test_mod.array_fn",
-                vec![Value::Array(Rc::new(RefCell::new(vec![Value::String(
+                vec![Value::array(vec![Value::String(
                     Rc::new("bad".into()),
-                )])))],
+                )])],
                 &limits,
             )
             .expect_err("wrong nested type must fail");
@@ -3100,7 +3100,7 @@ mod tests {
             ))),
             Span::new(0, 0, 0, 0),
         );
-        let empty_array = Value::Array(Rc::new(RefCell::new(Vec::new())));
+        let empty_array = Value::array(Vec::new());
         let mut empty_budget = WorkBudget::new(limits.max_work, limits.max_depth);
         let err = program
             .validate_argument_value(&empty_array, &empty_bad_type, 0, &mut empty_budget)
@@ -3110,8 +3110,8 @@ mod tests {
 
         // Category 12: Depth limit exceeded
         // Array<Array<int>> has depth 2, while tight_limits allows max_depth: 1
-        let depth1 = Value::Array(Rc::new(RefCell::new(vec![Value::Int(1)])));
-        let depth2 = Value::Array(Rc::new(RefCell::new(vec![depth1])));
+        let depth1 = Value::array(vec![Value::Int(1)]);
+        let depth2 = Value::array(vec![depth1]);
         let tight_limits = PreflightLimits {
             max_depth: 1,
             max_work: 100,
@@ -3125,7 +3125,7 @@ mod tests {
         // Category 13: Work budget limit exceeded
         // Array with 30 items while max_work is 5
         let large_items: Vec<Value> = (0..30).map(Value::Int).collect();
-        let large_array = Value::Array(Rc::new(RefCell::new(large_items)));
+        let large_array = Value::array(large_items);
         let work_limits = PreflightLimits {
             max_depth: 64,
             max_work: 5,
@@ -3522,7 +3522,7 @@ mod tests {
         assert_eq!(valid_res, Value::Int(42));
 
         // Recursive schema rejection on empty containers via validate_argument_value
-        let empty_arr = Value::Array(Rc::new(RefCell::new(Vec::new())));
+        let empty_arr = Value::array(Vec::new());
         let empty_map = Value::Map(Rc::new(RefCell::new(crate::bytecode::LustMap::default())));
 
         // 1. Empty array with Option schema
@@ -3602,7 +3602,7 @@ mod tests {
             ))),
             Span::new(0, 0, 0, 0),
         );
-        let nested_empty = Value::Array(Rc::new(RefCell::new(vec![empty_arr])));
+        let nested_empty = Value::array(vec![empty_arr]);
         let mut budget = WorkBudget::new(limits.max_work, limits.max_depth);
         let err = program1
             .validate_argument_value(&nested_empty, &type_nested_empty, 0, &mut budget)
@@ -3973,7 +3973,7 @@ mod tests {
 
         let host_counter = Arc::new(AtomicUsize::new(0));
 
-        let shared_array = Rc::new(RefCell::new(vec![Value::Int(10), Value::Int(20)]));
+        let shared_array = Rc::new(crate::bytecode::LustArray::new(vec![Value::Int(10), Value::Int(20)]));
         let shared_array_cb = shared_array.clone();
 
         let mut base_map = LustMap::default();
@@ -4057,18 +4057,18 @@ mod tests {
         });
 
         program.register_native_fn("get_nested_array", move |_args: &[Value]| {
-            let inner1 = Rc::new(RefCell::new(vec![Value::Int(1), Value::Int(2)]));
-            let inner2 = Rc::new(RefCell::new(vec![Value::Int(3)]));
-            let outer = Rc::new(RefCell::new(vec![
+            let inner1 = Rc::new(crate::bytecode::LustArray::new(vec![Value::Int(1), Value::Int(2)]));
+            let inner2 = Rc::new(crate::bytecode::LustArray::new(vec![Value::Int(3)]));
+            let outer = Rc::new(crate::bytecode::LustArray::new(vec![
                 Value::Array(inner1),
                 Value::Array(inner2),
             ]));
             Ok(NativeCallResult::Return(Value::Array(outer)))
         });
         program.register_native_fn("borrow_pkg.get_nested_array", move |_args: &[Value]| {
-            let inner1 = Rc::new(RefCell::new(vec![Value::Int(1), Value::Int(2)]));
-            let inner2 = Rc::new(RefCell::new(vec![Value::Int(3)]));
-            let outer = Rc::new(RefCell::new(vec![
+            let inner1 = Rc::new(crate::bytecode::LustArray::new(vec![Value::Int(1), Value::Int(2)]));
+            let inner2 = Rc::new(crate::bytecode::LustArray::new(vec![Value::Int(3)]));
+            let outer = Rc::new(crate::bytecode::LustArray::new(vec![
                 Value::Array(inner1),
                 Value::Array(inner2),
             ]));
@@ -4290,21 +4290,21 @@ mod tests {
 
         // Shared containers for returning
         // Self-cyclic array: [cyclic_arr]
-        let cyclic_arr = Rc::new(RefCell::new(Vec::new()));
+        let cyclic_arr = Rc::new(crate::bytecode::LustArray::new(Vec::new()));
         cyclic_arr
             .borrow_mut()
             .push(Value::Array(Rc::clone(&cyclic_arr)));
 
         // Two-container cyclic array: A -> [B], B -> [A]
-        let two_node_a = Rc::new(RefCell::new(Vec::new()));
-        let two_node_b = Rc::new(RefCell::new(vec![Value::Array(Rc::clone(&two_node_a))]));
+        let two_node_a = Rc::new(crate::bytecode::LustArray::new(Vec::new()));
+        let two_node_b = Rc::new(crate::bytecode::LustArray::new(vec![Value::Array(Rc::clone(&two_node_a))]));
         two_node_a
             .borrow_mut()
             .push(Value::Array(Rc::clone(&two_node_b)));
 
-        let acyclic_leaf = Rc::new(RefCell::new(vec![Value::Int(42)]));
+        let acyclic_leaf = Rc::new(crate::bytecode::LustArray::new(vec![Value::Int(42)]));
         // Array containing two references to the same acyclic leaf (DAG / diamond alias)
-        let acyclic_diamond_arr = Rc::new(RefCell::new(vec![
+        let acyclic_diamond_arr = Rc::new(crate::bytecode::LustArray::new(vec![
             Value::Array(Rc::clone(&acyclic_leaf)),
             Value::Array(Rc::clone(&acyclic_leaf)),
         ]));

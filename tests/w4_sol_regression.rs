@@ -335,16 +335,19 @@ fn test_w4_red_mir_block_id_vs_bytecode_pc_real_osr_continuation() {
     let bytecode_fn = MirToBytecodeCompiler::compile(&func)
         .expect("compiling MIR function to bytecode must succeed");
 
-    // Block 0 emits LoadConst (0), LoadConst (1), Jump (2).
-    // Block 1 (bb_hdr) entry begins at instruction 3.
-    let actual_block_entry_pc = 3;
+    // Block 0 emits LoadConst (0), LoadConst (1) and falls through to Block 1 (bb_hdr).
+    // Derive the authoritative block-entry PC for Block 1 (bb_hdr).
+    let actual_block_entry_pc = *bytecode_fn
+        .block_entry_pcs
+        .get(&bb_hdr.0)
+        .expect("bytecode function must contain block-entry PC for loop header block 1");
     let terminator_pc = *bytecode_fn
         .terminator_pcs
         .get(&bb_hdr.0)
         .expect("bytecode function must contain terminator PC for loop header block 1");
 
-    // Observable source fact: actual block-entry PC (3) differs from raw MIR BlockId (1)
-    // and is distinguished from terminator PC (4).
+    // Observable source fact: actual block-entry PC differs from raw MIR BlockId (1)
+    // and is distinguished from terminator PC.
     assert_ne!(
         actual_block_entry_pc, bb_hdr.0,
         "Actual block-entry PC ({}) must differ from raw MIR BlockId ({})",

@@ -157,10 +157,12 @@ impl VM {
             self.invalidate_jit_code();
         }
         self.budgets.gas.limit = Some(limit);
+        self.sync_slow_path_flags();
     }
 
     pub fn clear_gas_budget(&mut self) {
         self.budgets.gas.limit = None;
+        self.sync_slow_path_flags();
     }
 
     /// Whether compiled code must charge gas at loop back-edges.

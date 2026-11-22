@@ -4478,6 +4478,7 @@ impl VM {
                 && let Some(return_value) = self.pending_return_value.take()
             {
                 self.call_until_depth = None;
+                self.sync_slow_path_flags();
                 return Ok(return_value);
             }
         }

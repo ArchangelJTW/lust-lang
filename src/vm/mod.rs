@@ -246,6 +246,17 @@ pub(super) const TO_STRING_METHOD: &str = "to_string";
 pub(super) const HASH_KEY_TRAIT: &str = "HashKey";
 pub(super) const HASH_KEY_METHOD: &str = "to_hashkey";
 
+/// Bitmask constants for `VM::slow_path_flags`.
+///
+/// When `slow_path_flags == 0`, the interpreter dispatch loop skips all cold
+/// per-instruction preamble and gas-limit checks in a single branch.
+pub const SLOW_PATH_CURRENT_TASK: u8 = 1 << 0;
+pub const SLOW_PATH_PENDING_RETURN: u8 = 1 << 1;
+pub const SLOW_PATH_GAS_LIMIT: u8 = 1 << 2;
+pub const SLOW_PATH_QUANTUM_FUEL: u8 = 1 << 3;
+pub(crate) const SLOW_PATH_PREAMBLE_MASK: u8 =
+    SLOW_PATH_CURRENT_TASK | SLOW_PATH_PENDING_RETURN | SLOW_PATH_QUANTUM_FUEL;
+
 /// Execution backend selection for VM runtime dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VmBackend {
@@ -428,6 +439,7 @@ pub struct VM {
     #[cfg(feature = "std")]
     pub console: crate::vfs::VirtualConsole,
     pub quantum_fuel: Option<u64>,
+    pub(crate) slow_path_flags: u8,
     pub config: crate::config::LustConfig,
 }
 
@@ -538,6 +550,34 @@ impl TrustedHostResourceLedger {
 }
 
 impl VM {
+    #[inline(always)]
+    pub fn slow_path_flags(&self) -> u8 {
+        self.slow_path_flags
+    }
+
+    #[inline]
+    pub(crate) fn compute_slow_path_flags(&self) -> u8 {
+        let mut flags = 0u8;
+        if self.current_task.is_some() {
+            flags |= SLOW_PATH_CURRENT_TASK;
+        }
+        if self.pending_return_value.is_some() {
+            flags |= SLOW_PATH_PENDING_RETURN;
+        }
+        if self.budgets.gas.limit.is_some() {
+            flags |= SLOW_PATH_GAS_LIMIT;
+        }
+        if self.quantum_fuel.is_some() {
+            flags |= SLOW_PATH_QUANTUM_FUEL;
+        }
+        flags
+    }
+
+    #[inline]
+    pub(crate) fn sync_slow_path_flags(&mut self) {
+        self.slow_path_flags = self.compute_slow_path_flags();
+    }
+
     #[inline]
     pub fn call_stack_depth(&self) -> usize {
         self.call_stack.len()
@@ -1944,6 +1984,7 @@ impl Drop for VM {
         self.pending_return_value = None;
         self.pending_task_signal = None;
         self.last_task_signal = None;
+        self.sync_slow_path_flags();
         self.trace_recorder = None;
         self.nested_loop_exit_ip = None;
         self.task_manager = TaskManager::new();

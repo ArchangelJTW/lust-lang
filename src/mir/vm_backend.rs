@@ -1,11 +1,12 @@
-use crate::bytecode::{Chunk, Function, Instruction, Register, Value};
+use crate::bytecode::{Chunk, Function, Instruction, Register, StructLayout, Value};
 use crate::bytecode::value::{native_fn, NativeCallResult};
 use crate::data::layout::CanonicalTypeTag;
 use crate::data::materialize::{
     decode_json_into_contiguous, ContiguousDecodeOptions, ContiguousStruct, LayoutPerfCounters,
 };
 use crate::mir::ir::*;
-use crate::number::{LustFloat, LustInt};
+use crate::number::{LustFloat, LustInt, NumericType};
+use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -17,8 +18,48 @@ pub enum MirVmBackendError {
     UnsupportedBinaryOp(MirBinaryOp),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VmTypeLattice {
+    Bottom,
+    Known(MirType),
+    Top,
+}
+
+impl VmTypeLattice {
+    fn join(&mut self, incoming: VmTypeLattice) -> bool {
+        let next = match (&*self, incoming) {
+            (_, VmTypeLattice::Bottom) => return false,
+            (VmTypeLattice::Top, _) => return false,
+            (_, VmTypeLattice::Top) => VmTypeLattice::Top,
+            (VmTypeLattice::Bottom, VmTypeLattice::Known(ty)) => VmTypeLattice::Known(ty),
+            (VmTypeLattice::Known(a), VmTypeLattice::Known(b)) if a == &b => return false,
+            (
+                VmTypeLattice::Known(MirType::Array(a)),
+                VmTypeLattice::Known(MirType::Array(b)),
+            ) => {
+                if **a == MirType::Unknown {
+                    return false;
+                }
+                if *b == MirType::Unknown || *a != b {
+                    VmTypeLattice::Known(MirType::Array(Box::new(MirType::Unknown)))
+                } else {
+                    return false;
+                }
+            }
+            _ => VmTypeLattice::Top,
+        };
+        if *self != next {
+            *self = next;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 pub struct MirToBytecodeCompiler<'a> {
     func: &'a MirFunction,
+    local_types: Vec<MirType>,
     chunk: Chunk,
     scratch_start: usize,
     scratch_count: usize,
@@ -28,25 +69,26 @@ pub struct MirToBytecodeCompiler<'a> {
     pending_jumps: Vec<(usize, BlockId)>,
     direct_callees: Option<&'a HashSet<String>>,
     direct_callee_indices: Option<&'a HashMap<String, usize>>,
+    struct_layouts: Option<&'a HashMap<String, Rc<StructLayout>>>,
 }
 
 impl<'a> MirToBytecodeCompiler<'a> {
     pub fn compile(func: &'a MirFunction) -> Result<Function, MirVmBackendError> {
-        Self::compile_inner(func, None, None)
+        Self::compile_inner(func, None, None, None)
     }
 
     pub fn compile_with_direct_callees(
         func: &'a MirFunction,
         direct_callees: &'a HashSet<String>,
     ) -> Result<Function, MirVmBackendError> {
-        Self::compile_inner(func, Some(direct_callees), None)
+        Self::compile_inner(func, Some(direct_callees), None, None)
     }
 
     pub fn compile_with_direct_callee_indices(
         func: &'a MirFunction,
         direct_callee_indices: &'a HashMap<String, usize>,
     ) -> Result<Function, MirVmBackendError> {
-        Self::compile_inner(func, None, Some(direct_callee_indices))
+        Self::compile_inner(func, None, Some(direct_callee_indices), None)
     }
 
     pub fn compile_with_direct_callees_and_indices(
@@ -54,19 +96,38 @@ impl<'a> MirToBytecodeCompiler<'a> {
         direct_callees: &'a HashSet<String>,
         direct_callee_indices: &'a HashMap<String, usize>,
     ) -> Result<Function, MirVmBackendError> {
-        Self::compile_inner(func, Some(direct_callees), Some(direct_callee_indices))
+        Self::compile_inner(func, Some(direct_callees), Some(direct_callee_indices), None)
+    }
+
+    pub fn compile_with_struct_layouts(
+        func: &'a MirFunction,
+        struct_layouts: &'a HashMap<String, Rc<StructLayout>>,
+    ) -> Result<Function, MirVmBackendError> {
+        Self::compile_inner(func, None, None, Some(struct_layouts))
+    }
+
+    pub fn compile_with_options(
+        func: &'a MirFunction,
+        direct_callees: Option<&'a HashSet<String>>,
+        direct_callee_indices: Option<&'a HashMap<String, usize>>,
+        struct_layouts: Option<&'a HashMap<String, Rc<StructLayout>>>,
+    ) -> Result<Function, MirVmBackendError> {
+        Self::compile_inner(func, direct_callees, direct_callee_indices, struct_layouts)
     }
 
     fn compile_inner(
         func: &'a MirFunction,
         direct_callees: Option<&'a HashSet<String>>,
         direct_callee_indices: Option<&'a HashMap<String, usize>>,
+        struct_layouts: Option<&'a HashMap<String, Rc<StructLayout>>>,
     ) -> Result<Function, MirVmBackendError> {
         let param_count = func.params.len() as u8;
         let mut bytecode_fn = Function::new(func.signature.name.clone(), param_count, false);
+        let local_types = Self::infer_local_types(func);
 
         let mut compiler = MirToBytecodeCompiler {
             func,
+            local_types,
             chunk: Chunk::new(),
             scratch_start: func.locals.len(),
             scratch_count: 0,
@@ -76,6 +137,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
             pending_jumps: Vec::new(),
             direct_callees,
             direct_callee_indices,
+            struct_layouts,
         };
 
         compiler.compile_blocks()?;
@@ -105,8 +167,554 @@ impl<'a> MirToBytecodeCompiler<'a> {
         self.scratch_count = 0;
     }
 
+    fn eval_place_lattice(place: &Place, lattice: &[VmTypeLattice]) -> VmTypeLattice {
+        match place {
+            Place::Local(loc) => lattice
+                .get(loc.0)
+                .cloned()
+                .unwrap_or(VmTypeLattice::Top),
+            // Arrays are aliased mutable `Rc<RefCell<Vec<Value>>>` containers: fail closed.
+            Place::Index(_, _) => VmTypeLattice::Top,
+            Place::Field(base, field_idx) => match Self::eval_place_lattice(base, lattice) {
+                VmTypeLattice::Bottom => VmTypeLattice::Bottom,
+                // Tuples are immutable value containers.
+                VmTypeLattice::Known(MirType::Tuple(elems)) => match elems.get(*field_idx) {
+                    Some(ty) if *ty != MirType::Unknown => VmTypeLattice::Known(ty.clone()),
+                    _ => VmTypeLattice::Top,
+                },
+                // Struct fields are mutable via `SetField` without runtime type enforcement: fail closed.
+                _ => VmTypeLattice::Top,
+            },
+        }
+    }
+
+    fn eval_operand_lattice(op: &Operand, lattice: &[VmTypeLattice]) -> VmTypeLattice {
+        match op {
+            Operand::Constant(c) => VmTypeLattice::Known(match c {
+                MirConstant::Int(_) => MirType::Int,
+                MirConstant::Float(_) => MirType::Float,
+                MirConstant::Bool(_) => MirType::Bool,
+                MirConstant::String(_) => MirType::String,
+                MirConstant::Unit => MirType::Unit,
+            }),
+            Operand::Copy(place) | Operand::Move(place) => Self::eval_place_lattice(place, lattice),
+        }
+    }
+
+    fn eval_rvalue_lattice(
+        func: &MirFunction,
+        rvalue: &Rvalue,
+        lattice: &[VmTypeLattice],
+    ) -> VmTypeLattice {
+        match rvalue {
+            Rvalue::Use(op) => Self::eval_operand_lattice(op, lattice),
+            Rvalue::Cast(op, target_ty) => match target_ty {
+                MirType::Float => VmTypeLattice::Known(MirType::Float),
+                // `Cast(_, Int)` compiles via dynamic `LoadGlobal("math") -> GetField("floor") -> Call`
+                // which can return any value if `math` is shadowed: fail closed.
+                MirType::Int => VmTypeLattice::Top,
+                MirType::Option(_) => VmTypeLattice::Known(target_ty.clone()),
+                MirType::Struct(_) => {
+                    let is_opt = matches!(
+                        op,
+                        Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc))
+                            if matches!(func.locals.get(loc.0).map(|l| &l.ty), Some(MirType::Option(_)))
+                    );
+                    if is_opt {
+                        VmTypeLattice::Known(target_ty.clone())
+                    } else {
+                        Self::eval_operand_lattice(op, lattice)
+                    }
+                }
+                _ => Self::eval_operand_lattice(op, lattice),
+            },
+            Rvalue::BinaryOp(binop, lhs, rhs) => {
+                if matches!(binop, MirBinaryOp::Eq | MirBinaryOp::NotEq) {
+                    let is_opt = |op: &Operand| {
+                        matches!(
+                            op,
+                            Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc))
+                                if matches!(func.locals.get(loc.0).map(|l| &l.ty), Some(MirType::Option(_)))
+                        )
+                    };
+                    if (is_opt(lhs) && matches!(rhs, Operand::Constant(MirConstant::Int(0))))
+                        || (is_opt(rhs) && matches!(lhs, Operand::Constant(MirConstant::Int(0))))
+                    {
+                        return VmTypeLattice::Known(MirType::Bool);
+                    }
+                }
+                match binop {
+                    MirBinaryOp::Concat => VmTypeLattice::Known(MirType::String),
+                    MirBinaryOp::And
+                    | MirBinaryOp::Or
+                    | MirBinaryOp::Eq
+                    | MirBinaryOp::NotEq
+                    | MirBinaryOp::Lt
+                    | MirBinaryOp::LtEq
+                    | MirBinaryOp::Gt
+                    | MirBinaryOp::GtEq => VmTypeLattice::Known(MirType::Bool),
+                    MirBinaryOp::BitAnd
+                    | MirBinaryOp::BitOr
+                    | MirBinaryOp::BitXor
+                    | MirBinaryOp::Shl
+                    | MirBinaryOp::Shr => VmTypeLattice::Known(MirType::Int),
+                    MirBinaryOp::Add
+                    | MirBinaryOp::Sub
+                    | MirBinaryOp::Mul
+                    | MirBinaryOp::Div
+                    | MirBinaryOp::Mod
+                    | MirBinaryOp::FloorDiv
+                    | MirBinaryOp::Pow => {
+                        let lt = Self::eval_operand_lattice(lhs, lattice);
+                        let rt = Self::eval_operand_lattice(rhs, lattice);
+                        match (lt, rt) {
+                            (VmTypeLattice::Known(MirType::Int), VmTypeLattice::Known(MirType::Int)) => {
+                                VmTypeLattice::Known(MirType::Int)
+                            }
+                            (
+                                VmTypeLattice::Known(MirType::Float),
+                                VmTypeLattice::Known(MirType::Float | MirType::Int),
+                            )
+                            | (
+                                VmTypeLattice::Known(MirType::Int),
+                                VmTypeLattice::Known(MirType::Float),
+                            ) => VmTypeLattice::Known(MirType::Float),
+                            (
+                                VmTypeLattice::Known(MirType::String),
+                                VmTypeLattice::Known(MirType::String),
+                            ) if *binop == MirBinaryOp::Add => VmTypeLattice::Known(MirType::String),
+                            (VmTypeLattice::Bottom, _) | (_, VmTypeLattice::Bottom) => {
+                                VmTypeLattice::Bottom
+                            }
+                            _ => VmTypeLattice::Top,
+                        }
+                    }
+                }
+            }
+            Rvalue::UnaryOp(unop, op) => match unop {
+                MirUnaryOp::Not => VmTypeLattice::Known(MirType::Bool),
+                MirUnaryOp::BitNot | MirUnaryOp::Len => VmTypeLattice::Known(MirType::Int),
+                MirUnaryOp::Neg => match Self::eval_operand_lattice(op, lattice) {
+                    VmTypeLattice::Known(MirType::Int) => VmTypeLattice::Known(MirType::Int),
+                    VmTypeLattice::Known(MirType::Float) => VmTypeLattice::Known(MirType::Float),
+                    VmTypeLattice::Bottom => VmTypeLattice::Bottom,
+                    _ => VmTypeLattice::Top,
+                },
+            },
+            Rvalue::Aggregate(agg_ty, elems) => match agg_ty {
+                MirType::Array(_) => {
+                    VmTypeLattice::Known(MirType::Array(Box::new(MirType::Unknown)))
+                }
+                MirType::Tuple(_) => {
+                    let mut elem_tys = Vec::with_capacity(elems.len());
+                    for elem in elems {
+                        match Self::eval_operand_lattice(elem, lattice) {
+                            VmTypeLattice::Bottom => return VmTypeLattice::Bottom,
+                            VmTypeLattice::Known(ty) => elem_tys.push(ty),
+                            VmTypeLattice::Top => elem_tys.push(MirType::Unknown),
+                        }
+                    }
+                    VmTypeLattice::Known(MirType::Tuple(elem_tys))
+                }
+                _ => VmTypeLattice::Known(agg_ty.clone()),
+            },
+        }
+    }
+
+    /// Computes sound, fail-closed refined runtime types for all locals in `func`.
+    ///
+    /// 1. Computes CFG reachability from entry block `0` (index `0` in `func.blocks`, resolved via
+    ///    `BlockId -> idx` so non-dense or reordered `BlockId`s work cleanly). Unreachable blocks
+    ///    never contribute type facts or uninit widening.
+    /// 2. Computes forward must-init dataflow over reachable blocks (`func.params` initialized at
+    ///    entry; intersection across reachable predecessors) and widens any local that may be read
+    ///    before initialization (`Value::Nil`) to `Top` (`MirType::Unknown`).
+    /// 3. Initializes all `func.params` to `Top` (fail-closed, because VM calls do not enforce
+    ///    `MirFunction` parameter types at runtime) and runs forward fixed-point type refinement
+    ///    over reachable blocks only.
+    fn infer_local_types(func: &MirFunction) -> Vec<MirType> {
+        let num_locals = func.locals.len();
+        let num_blocks = func.blocks.len();
+        if num_locals == 0 {
+            return Vec::new();
+        }
+        if num_blocks == 0 {
+            return vec![MirType::Unknown; num_locals];
+        }
+
+        // 1. Map BlockId -> index in func.blocks and compute CFG successors.
+        let mut block_id_to_idx: HashMap<BlockId, usize> = HashMap::with_capacity(num_blocks);
+        for (idx, block) in func.blocks.iter().enumerate() {
+            block_id_to_idx.insert(block.id, idx);
+        }
+
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+        for (idx, block) in func.blocks.iter().enumerate() {
+            let out = &mut succs[idx];
+            match &block.terminator {
+                Some(Terminator::Goto(target, _)) => {
+                    if let Some(&t_idx) = block_id_to_idx.get(target) {
+                        out.push(t_idx);
+                    }
+                }
+                Some(Terminator::Cond {
+                    then_block,
+                    else_block,
+                    ..
+                }) => {
+                    if let Some(&t_idx) = block_id_to_idx.get(then_block) {
+                        out.push(t_idx);
+                    }
+                    if let Some(&e_idx) = block_id_to_idx.get(else_block) {
+                        out.push(e_idx);
+                    }
+                }
+                Some(Terminator::Switch { cases, default, .. }) => {
+                    for (_, target_bb) in cases {
+                        if let Some(&c_idx) = block_id_to_idx.get(target_bb) {
+                            out.push(c_idx);
+                        }
+                    }
+                    if let Some(&d_idx) = block_id_to_idx.get(default) {
+                        out.push(d_idx);
+                    }
+                }
+                Some(Terminator::Call { success, error, .. }) => {
+                    if let Some(&s_idx) = block_id_to_idx.get(success) {
+                        out.push(s_idx);
+                    }
+                    if let Some(err_bb) = error
+                        && let Some(&e_idx) = block_id_to_idx.get(err_bb)
+                    {
+                        out.push(e_idx);
+                    }
+                }
+                Some(Terminator::Return(..) | Terminator::Unreachable(..)) => {}
+                Some(Terminator::Raise(..)) | None => {
+                    if idx + 1 < num_blocks {
+                        out.push(idx + 1);
+                    }
+                }
+            }
+        }
+
+        // Reachability starting from entry block index 0.
+        let entry_idx = 0usize;
+        let mut reachable = vec![false; num_blocks];
+        let mut worklist = Vec::with_capacity(num_blocks);
+        reachable[entry_idx] = true;
+        worklist.push(entry_idx);
+        while let Some(b) = worklist.pop() {
+            for &s in &succs[b] {
+                if !reachable[s] {
+                    reachable[s] = true;
+                    worklist.push(s);
+                }
+            }
+        }
+
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+        for b in 0..num_blocks {
+            if !reachable[b] {
+                continue;
+            }
+            for &s in &succs[b] {
+                if reachable[s] {
+                    preds[s].push(b);
+                }
+            }
+        }
+
+        // 2. Forward must-init dataflow over reachable blocks.
+        let mut entry_init = vec![false; num_locals];
+        for param in &func.params {
+            if param.0 < num_locals {
+                entry_init[param.0] = true;
+            }
+        }
+
+        let mut stmt_gen = vec![vec![false; num_locals]; num_blocks];
+        let mut call_gen: Vec<Option<(usize, Option<usize>)>> = vec![None; num_blocks];
+        for b in 0..num_blocks {
+            if !reachable[b] {
+                continue;
+            }
+            let block = &func.blocks[b];
+            for stmt in &block.statements {
+                if let Statement::Assign(Place::Local(dst), _, _) = stmt
+                    && dst.0 < num_locals
+                {
+                    stmt_gen[b][dst.0] = true;
+                }
+            }
+            if let Some(Terminator::Call {
+                destination: Place::Local(dst),
+                success,
+                ..
+            }) = &block.terminator
+                && dst.0 < num_locals
+            {
+                call_gen[b] = Some((dst.0, block_id_to_idx.get(success).copied()));
+            }
+        }
+
+        let mut must_init_in = vec![vec![true; num_locals]; num_blocks];
+        let mut must_init_after_stmts = vec![vec![true; num_locals]; num_blocks];
+        let mut must_init_out = vec![vec![true; num_locals]; num_blocks];
+        must_init_in[entry_idx] = entry_init;
+        for l in 0..num_locals {
+            must_init_after_stmts[entry_idx][l] =
+                must_init_in[entry_idx][l] || stmt_gen[entry_idx][l];
+            must_init_out[entry_idx][l] = must_init_after_stmts[entry_idx][l];
+        }
+        if let Some((dst, _)) = call_gen[entry_idx] {
+            must_init_out[entry_idx][dst] = true;
+        }
+
+        loop {
+            let mut changed = false;
+            for b in 0..num_blocks {
+                if !reachable[b] || b == entry_idx {
+                    continue;
+                }
+                let mut new_in = vec![true; num_locals];
+                for &p in &preds[b] {
+                    // On Call unwind edges (`error != success`), Call's `destination` is not initialized.
+                    let p_out = match call_gen[p] {
+                        Some((_, Some(succ_idx))) if succ_idx != b => &must_init_after_stmts[p],
+                        _ => &must_init_out[p],
+                    };
+                    for l in 0..num_locals {
+                        new_in[l] &= p_out[l];
+                    }
+                }
+                let mut new_after_stmts = new_in.clone();
+                for l in 0..num_locals {
+                    new_after_stmts[l] |= stmt_gen[b][l];
+                }
+                let mut new_out = new_after_stmts.clone();
+                if let Some((dst, _)) = call_gen[b] {
+                    new_out[dst] = true;
+                }
+                if new_in != must_init_in[b]
+                    || new_after_stmts != must_init_after_stmts[b]
+                    || new_out != must_init_out[b]
+                {
+                    must_init_in[b] = new_in;
+                    must_init_after_stmts[b] = new_after_stmts;
+                    must_init_out[b] = new_out;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Walk reachable blocks to detect any read of a potentially uninitialized local.
+        let mut may_be_uninit = vec![false; num_locals];
+        let mut uses = HashSet::new();
+        for b in 0..num_blocks {
+            if !reachable[b] {
+                continue;
+            }
+            let block = &func.blocks[b];
+            let mut cur_init = must_init_in[b].clone();
+            for stmt in &block.statements {
+                uses.clear();
+                stmt.collect_uses(&mut uses);
+                for &u in &uses {
+                    if u < num_locals && !cur_init[u] {
+                        may_be_uninit[u] = true;
+                    }
+                }
+                if let Statement::Assign(Place::Local(dst), _, _) = stmt
+                    && dst.0 < num_locals
+                {
+                    cur_init[dst.0] = true;
+                }
+            }
+            if let Some(term) = &block.terminator {
+                uses.clear();
+                term.collect_uses(&mut uses);
+                for &u in &uses {
+                    if u < num_locals && !cur_init[u] {
+                        may_be_uninit[u] = true;
+                    }
+                }
+                if let Terminator::Call {
+                    destination: Place::Local(dst),
+                    ..
+                } = term
+                    && dst.0 < num_locals
+                {
+                    cur_init[dst.0] = true;
+                }
+            }
+        }
+
+        // 3. Forward fixed-point type lattice over reachable blocks only.
+        //    - All parameters start at `Top` (unchecked at runtime).
+        //    - All potentially uninitialized locals start at `Top` so transitive uses also widen.
+        let mut lattice = vec![VmTypeLattice::Bottom; num_locals];
+        for param in &func.params {
+            if param.0 < num_locals {
+                lattice[param.0] = VmTypeLattice::Top;
+            }
+        }
+        for l in 0..num_locals {
+            if may_be_uninit[l] {
+                lattice[l] = VmTypeLattice::Top;
+            }
+        }
+
+        let max_iters = num_locals.saturating_mul(4).saturating_add(32);
+        let mut converged = false;
+        for _ in 0..max_iters {
+            let mut changed = false;
+            for (b_idx, block) in func.blocks.iter().enumerate() {
+                if !reachable[b_idx] {
+                    continue;
+                }
+                for stmt in &block.statements {
+                    if let Statement::Assign(Place::Local(dst), rvalue, _) = stmt
+                        && dst.0 < num_locals
+                    {
+                        let rhs_lat = Self::eval_rvalue_lattice(func, rvalue, &lattice);
+                        if lattice[dst.0].join(rhs_lat) {
+                            changed = true;
+                        }
+                    }
+                }
+                if let Some(Terminator::Call {
+                    callee,
+                    destination: Place::Local(dst),
+                    ..
+                }) = &block.terminator
+                    && dst.0 < num_locals
+                {
+                    let ret_lat = match callee.as_str() {
+                        "array.len" | "table.len" | "map.len" | "string.len" => {
+                            VmTypeLattice::Known(MirType::Int)
+                        }
+                        "tostring" => VmTypeLattice::Known(MirType::String),
+                        _ => VmTypeLattice::Top,
+                    };
+                    if lattice[dst.0].join(ret_lat) {
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                converged = true;
+                break;
+            }
+        }
+
+        if !converged {
+            return vec![MirType::Unknown; num_locals];
+        }
+
+        lattice
+            .into_iter()
+            .map(|lat| match lat {
+                VmTypeLattice::Known(ty) => ty,
+                VmTypeLattice::Bottom | VmTypeLattice::Top => MirType::Unknown,
+            })
+            .collect()
+    }
+
+    fn lookup_struct_layout(&self, name: &str) -> Option<&'a Rc<StructLayout>> {
+        if name.is_empty() {
+            return None;
+        }
+        self.struct_layouts.and_then(|layouts| layouts.get(name))
+    }
+
+    fn place_type(&self, place: &Place) -> MirType {
+        match place {
+            Place::Local(loc) => self
+                .local_types
+                .get(loc.0)
+                .cloned()
+                .unwrap_or(MirType::Unknown),
+            // Arrays are aliased mutable containers: fail closed.
+            Place::Index(_, _) => MirType::Unknown,
+            Place::Field(base, field_idx) => match self.place_type(base) {
+                // Tuples are immutable.
+                MirType::Tuple(elems) => elems.get(*field_idx).cloned().unwrap_or(MirType::Unknown),
+                // Struct fields are mutable without runtime type enforcement: fail closed.
+                _ => MirType::Unknown,
+            },
+        }
+    }
+
+    fn operand_type(&self, op: &Operand) -> MirType {
+        match op {
+            Operand::Constant(c) => match c {
+                MirConstant::Int(_) => MirType::Int,
+                MirConstant::Float(_) => MirType::Float,
+                MirConstant::Bool(_) => MirType::Bool,
+                MirConstant::String(_) => MirType::String,
+                MirConstant::Unit => MirType::Unit,
+            },
+            Operand::Copy(place) | Operand::Move(place) => self.place_type(place),
+        }
+    }
+
+    fn lookup_struct_field_name(&self, base: &Place, field_idx: usize) -> Option<Rc<String>> {
+        let struct_name = match self.place_type(base) {
+            MirType::Struct(name) => Some(name),
+            _ => match base {
+                Place::Local(loc) => match self.func.locals.get(loc.0).map(|l| &l.ty) {
+                    Some(MirType::Struct(name)) => Some(name.clone()),
+                    _ => None,
+                },
+                _ => None,
+            },
+        }?;
+        let layout = self.lookup_struct_layout(&struct_name)?;
+        layout.field_names().get(field_idx).cloned()
+    }
+
+    fn emit_get_field(&mut self, dst: Register, base: &Place, field_idx: usize, line: usize) {
+        let base_reg = self.place_to_reg(base);
+        if let Some(fname) = self.lookup_struct_field_name(base, field_idx) {
+            let fname_val = Value::String(fname);
+            let exists = self.chunk.constants.iter().any(|v| v == &fname_val);
+            if exists || self.chunk.constants.len() < u16::MAX as usize {
+                let field_const_idx = self.chunk.add_constant(fname_val);
+                self.chunk
+                    .emit(Instruction::GetField(dst, base_reg, field_const_idx), line);
+                return;
+            }
+        }
+        let idx_reg = self.next_scratch();
+        self.load_constant_into_reg(&MirConstant::Int(field_idx as i64), idx_reg, line);
+        self.chunk
+            .emit(Instruction::GetIndex(dst, base_reg, idx_reg), line);
+    }
+
+    fn emit_set_field(&mut self, base: &Place, field_idx: usize, val_reg: Register, line: usize) {
+        let base_reg = self.place_to_reg(base);
+        if let Some(fname) = self.lookup_struct_field_name(base, field_idx) {
+            let fname_val = Value::String(fname);
+            let exists = self.chunk.constants.iter().any(|v| v == &fname_val);
+            if exists || self.chunk.constants.len() < u16::MAX as usize {
+                let field_const_idx = self.chunk.add_constant(fname_val);
+                self.chunk
+                    .emit(Instruction::SetField(base_reg, field_const_idx, val_reg), line);
+                return;
+            }
+        }
+        let idx_reg = self.next_scratch();
+        self.load_constant_into_reg(&MirConstant::Int(field_idx as i64), idx_reg, line);
+        self.chunk
+            .emit(Instruction::SetIndex(base_reg, idx_reg, val_reg), line);
+    }
+
     fn compile_blocks(&mut self) -> Result<(), MirVmBackendError> {
-        for block in &self.func.blocks {
+        for (idx, block) in self.func.blocks.iter().enumerate() {
             let pc = self.chunk.instructions.len();
             self.block_pcs.insert(block.id, pc);
 
@@ -118,8 +726,9 @@ impl<'a> MirToBytecodeCompiler<'a> {
             self.reset_scratch();
             let term_pc = self.chunk.instructions.len();
             self.terminator_pcs.insert(block.id.0, term_pc);
+            let next_block_id = self.func.blocks.get(idx + 1).map(|b| b.id);
             if let Some(term) = &block.terminator {
-                self.compile_terminator(term);
+                self.compile_terminator(term, block.id, next_block_id);
             }
         }
         Ok(())
@@ -137,10 +746,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
             }
             Operand::Copy(Place::Field(base, f)) | Operand::Move(Place::Field(base, f)) => {
                 let reg = self.next_scratch();
-                let base_reg = self.place_to_reg(base);
-                let idx_reg = self.next_scratch();
-                self.load_constant_into_reg(&MirConstant::Int(*f as i64), idx_reg, line);
-                self.chunk.emit(Instruction::GetIndex(reg, base_reg, idx_reg), line);
+                self.emit_get_field(reg, base, *f, line);
                 reg
             }
             Operand::Constant(c) => {
@@ -209,10 +815,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
                         self.chunk.emit(Instruction::GetIndex(dst_reg, base_reg, idx_reg), line);
                     }
                     Operand::Copy(Place::Field(base, f)) | Operand::Move(Place::Field(base, f)) => {
-                        let base_reg = self.place_to_reg(base);
-                        let idx_reg = self.next_scratch();
-                        self.load_constant_into_reg(&MirConstant::Int(*f as i64), idx_reg, line);
-                        self.chunk.emit(Instruction::GetIndex(dst_reg, base_reg, idx_reg), line);
+                        self.emit_get_field(dst_reg, base, *f, line);
                     }
                     Operand::Constant(c) => {
                         self.load_constant_into_reg(c, dst_reg, line);
@@ -297,25 +900,29 @@ impl<'a> MirToBytecodeCompiler<'a> {
                         return Ok(());
                     }
                 }
-                let is_string = match (lhs, rhs) {
-                    (Operand::Constant(MirConstant::String(_)), _) | (_, Operand::Constant(MirConstant::String(_))) => true,
-                    (Operand::Copy(Place::Local(l)) | Operand::Move(Place::Local(l)), _) if self.func.locals[l.0].ty == MirType::String => true,
-                    (_, Operand::Copy(Place::Local(r)) | Operand::Move(Place::Local(r))) if self.func.locals[r.0].ty == MirType::String => true,
-                    _ => false,
-                };
+                let lhs_ty = self.operand_type(lhs);
+                let rhs_ty = self.operand_type(rhs);
+                let is_string = lhs_ty == MirType::String || rhs_ty == MirType::String;
                 let r_lhs = self.operand_to_reg(lhs, line);
                 let r_rhs = self.operand_to_reg(rhs, line);
                 if is_string && *binop == MirBinaryOp::Add {
                     self.chunk.emit(Instruction::Concat(dst_reg, r_lhs, r_rhs), line);
                 } else {
-                    self.compile_binop(*binop, dst_reg, r_lhs, r_rhs, line)?;
+                    self.compile_binop(*binop, dst_reg, r_lhs, r_rhs, &lhs_ty, &rhs_ty, line)?;
                 }
             }
             Rvalue::UnaryOp(unop, op) => {
+                let op_ty = self.operand_type(op);
                 let r_op = self.operand_to_reg(op, line);
                 match unop {
                     MirUnaryOp::Neg => {
-                        self.chunk.emit(Instruction::Neg(dst_reg, r_op), line);
+                        let base = Instruction::Neg(dst_reg, r_op);
+                        let instr = match op_ty {
+                            MirType::Int => base.specialize_numeric(NumericType::Int),
+                            MirType::Float => base.specialize_numeric(NumericType::Float),
+                            _ => base,
+                        };
+                        self.chunk.emit(instr, line);
                     }
                     MirUnaryOp::Not => {
                         self.chunk.emit(Instruction::Not(dst_reg, r_op), line);
@@ -350,10 +957,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
                                 self.chunk.emit(Instruction::GetIndex(target_reg, base_reg, idx_reg), line);
                             }
                             Operand::Copy(Place::Field(base, f)) | Operand::Move(Place::Field(base, f)) => {
-                                let base_reg = self.place_to_reg(base);
-                                let idx_reg = self.next_scratch();
-                                self.load_constant_into_reg(&MirConstant::Int(*f as i64), idx_reg, line);
-                                self.chunk.emit(Instruction::GetIndex(target_reg, base_reg, idx_reg), line);
+                                self.emit_get_field(target_reg, base, *f, line);
                             }
                             Operand::Constant(c) => {
                                 self.load_constant_into_reg(c, target_reg, line);
@@ -365,6 +969,49 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 match agg_ty {
                     MirType::Tuple(_) => {
                         self.chunk.emit(Instruction::TupleNew(dst_reg, scratch_base, count), line);
+                    }
+                    MirType::Struct(struct_name) => {
+                        if let Some(layout) = self.lookup_struct_layout(struct_name)
+                            && layout.field_names().len() == elements.len()
+                        {
+                            let field_names = layout.field_names();
+                            let name_val = Value::string(struct_name.clone());
+                            let name_extra =
+                                usize::from(!self.chunk.constants.iter().any(|v| v == &name_val));
+                            if self
+                                .chunk
+                                .constants
+                                .len()
+                                .checked_add(name_extra)
+                                .and_then(|n| n.checked_add(field_names.len()))
+                                .is_some_and(|end| end <= u16::MAX as usize)
+                            {
+                                let name_idx = self.chunk.add_constant(name_val);
+                                let first_field_name_idx = if count == 0 {
+                                    0u16
+                                } else {
+                                    let start = self.chunk.constants.len();
+                                    for fname in field_names {
+                                        self.chunk
+                                            .constants
+                                            .push(Value::String(Rc::clone(fname)));
+                                    }
+                                    start as u16
+                                };
+                                self.chunk.emit(
+                                    Instruction::NewStruct(
+                                        dst_reg,
+                                        name_idx,
+                                        first_field_name_idx,
+                                        scratch_base,
+                                        count,
+                                    ),
+                                    line,
+                                );
+                                return Ok(());
+                            }
+                        }
+                        self.chunk.emit(Instruction::NewArray(dst_reg, scratch_base, count), line);
                     }
                     _ => {
                         self.chunk.emit(Instruction::NewArray(dst_reg, scratch_base, count), line);
@@ -410,18 +1057,24 @@ impl<'a> MirToBytecodeCompiler<'a> {
                         temp_reg
                     }
                 };
-                let base_reg = self.place_to_reg(base);
-                let idx_reg = self.next_scratch();
-                self.load_constant_into_reg(&MirConstant::Int(*f as i64), idx_reg, line);
-                self.chunk.emit(Instruction::SetIndex(base_reg, idx_reg, val_reg), line);
+                self.emit_set_field(base, *f, val_reg, line);
             }
             Statement::StorageLive(_, _) | Statement::StorageDead(_, _) | Statement::ResourceCheck(_, _, _) => {}
         }
         Ok(())
     }
 
-    fn compile_binop(&mut self, op: MirBinaryOp, dst: Register, lhs: Register, rhs: Register, line: usize) -> Result<(), MirVmBackendError> {
-        let instr = match op {
+    fn compile_binop(
+        &mut self,
+        op: MirBinaryOp,
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+        lhs_ty: &MirType,
+        rhs_ty: &MirType,
+        line: usize,
+    ) -> Result<(), MirVmBackendError> {
+        let base_instr = match op {
             MirBinaryOp::Add => Instruction::Add(dst, lhs, rhs),
             MirBinaryOp::Sub => Instruction::Sub(dst, lhs, rhs),
             MirBinaryOp::Mul => Instruction::Mul(dst, lhs, rhs),
@@ -444,40 +1097,73 @@ impl<'a> MirToBytecodeCompiler<'a> {
             MirBinaryOp::Or => Instruction::Or(dst, lhs, rhs),
             MirBinaryOp::Concat => Instruction::Concat(dst, lhs, rhs),
         };
+        let instr = match (lhs_ty, rhs_ty) {
+            (MirType::Int, MirType::Int) => base_instr.specialize_numeric(NumericType::Int),
+            (MirType::Float, MirType::Float) => base_instr.specialize_numeric(NumericType::Float),
+            _ => base_instr,
+        };
         self.chunk.emit(instr, line);
         Ok(())
     }
 
-    fn compile_terminator(&mut self, term: &Terminator) {
+    fn compile_terminator(
+        &mut self,
+        term: &Terminator,
+        current_block_id: BlockId,
+        next_block_id: Option<BlockId>,
+    ) {
+        let is_fallthrough = |target: BlockId| {
+            next_block_id == Some(target) && target != current_block_id
+        };
         match term {
             Terminator::Goto(target, span) => {
-                let jump_idx = self.chunk.emit(Instruction::Jump(0), span.start_line);
-                self.pending_jumps.push((jump_idx, *target));
+                if !is_fallthrough(*target) {
+                    let jump_idx = self.chunk.emit(Instruction::Jump(0), span.start_line);
+                    self.pending_jumps.push((jump_idx, *target));
+                }
             }
             Terminator::Cond { cond, then_block, else_block, span } => {
-                let r_cond = self.operand_to_reg(cond, span.start_line);
-                let jump_if_not = self.chunk.emit(Instruction::JumpIfNot(r_cond, 0), span.start_line);
-                self.pending_jumps.push((jump_if_not, *else_block));
+                let line = span.start_line;
+                if then_block == else_block {
+                    let _ = self.operand_to_reg(cond, line);
+                    if !is_fallthrough(*then_block) {
+                        let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
+                        self.pending_jumps.push((jump_idx, *then_block));
+                    }
+                } else if is_fallthrough(*then_block) {
+                    let r_cond = self.operand_to_reg(cond, line);
+                    let jump_if_not = self.chunk.emit(Instruction::JumpIfNot(r_cond, 0), line);
+                    self.pending_jumps.push((jump_if_not, *else_block));
+                } else if is_fallthrough(*else_block) {
+                    let r_cond = self.operand_to_reg(cond, line);
+                    let jump_if = self.chunk.emit(Instruction::JumpIf(r_cond, 0), line);
+                    self.pending_jumps.push((jump_if, *then_block));
+                } else {
+                    let r_cond = self.operand_to_reg(cond, line);
+                    let jump_if_not = self.chunk.emit(Instruction::JumpIfNot(r_cond, 0), line);
+                    self.pending_jumps.push((jump_if_not, *else_block));
 
-                let jump_then = self.chunk.emit(Instruction::Jump(0), span.start_line);
-                self.pending_jumps.push((jump_then, *then_block));
+                    let jump_then = self.chunk.emit(Instruction::Jump(0), line);
+                    self.pending_jumps.push((jump_then, *then_block));
+                }
             }
             Terminator::Switch { discr, cases, default, span } => {
                 let line = span.start_line;
                 let discr_reg = self.operand_to_reg(discr, line);
+                let case_scratch = self.scratch_count;
                 for (val, target_bb) in cases {
+                    self.scratch_count = case_scratch;
                     let val_reg = self.next_scratch();
                     self.load_constant_into_reg(&MirConstant::Int(*val), val_reg, line);
                     let cmp_reg = self.next_scratch();
                     self.chunk.emit(Instruction::EqInt(cmp_reg, discr_reg, val_reg), line);
-                    let jump_next_case = self.chunk.emit(Instruction::JumpIfNot(cmp_reg, 0), line);
-                    let jump_target = self.chunk.emit(Instruction::Jump(0), line);
+                    let jump_target = self.chunk.emit(Instruction::JumpIf(cmp_reg, 0), line);
                     self.pending_jumps.push((jump_target, *target_bb));
-                    let next_pc = self.chunk.instructions.len();
-                    self.chunk.patch_jump(jump_next_case, next_pc);
                 }
-                let default_jump = self.chunk.emit(Instruction::Jump(0), line);
-                self.pending_jumps.push((default_jump, *default));
+                if !is_fallthrough(*default) {
+                    let default_jump = self.chunk.emit(Instruction::Jump(0), line);
+                    self.pending_jumps.push((default_jump, *default));
+                }
             }
             Terminator::Return(opt_op, span) => {
                 let r_ret = if let Some(op) = opt_op {
@@ -507,10 +1193,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
                                 self.chunk.emit(Instruction::GetIndex(target_reg, base_reg, idx_reg), line);
                             }
                             Operand::Copy(Place::Field(base, f)) | Operand::Move(Place::Field(base, f)) => {
-                                let base_reg = self.place_to_reg(base);
-                                let idx_reg = self.next_scratch();
-                                self.load_constant_into_reg(&MirConstant::Int(*f as i64), idx_reg, line);
-                                self.chunk.emit(Instruction::GetIndex(target_reg, base_reg, idx_reg), line);
+                                self.emit_get_field(target_reg, base, *f, line);
                             }
                             Operand::Constant(c) => {
                                 self.load_constant_into_reg(c, target_reg, line);
@@ -549,8 +1232,10 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 let dest_reg = self.place_to_reg(destination);
                 self.chunk.emit(Instruction::Call(func_reg, first_arg_reg, arg_count, dest_reg), line);
 
-                let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
-                self.pending_jumps.push((jump_idx, *success));
+                if !is_fallthrough(*success) {
+                    let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
+                    self.pending_jumps.push((jump_idx, *success));
+                }
             }
             Terminator::Unreachable(span) => {
                 self.chunk.emit(Instruction::Return(0), span.start_line);

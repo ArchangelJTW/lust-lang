@@ -307,6 +307,7 @@ impl VM {
             #[cfg(feature = "std")]
             console: crate::vfs::VirtualConsole::new(),
             quantum_fuel: None,
+            slow_path_flags: 0,
             config: config.clone(),
         };
         vm.cycle_collector.set_enabled(config.gc_enabled());
@@ -1159,6 +1160,7 @@ impl VM {
                         && let Some(return_value) = self.pending_return_value.take()
                     {
                         self.call_until_depth = None;
+                        self.sync_slow_path_flags();
                         Ok(return_value)
                     } else {
                         self.run()
@@ -1186,6 +1188,7 @@ impl VM {
                 self.pending_return_dest = saved_pending_return_dest;
                 self.pending_task_signal = saved_pending_task_signal;
                 self.last_task_signal = saved_last_task_signal;
+                self.sync_slow_path_flags();
                 Err(annotated)
             }
         }

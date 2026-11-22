@@ -57,6 +57,7 @@ impl VM {
 
     pub fn set_current_task_id(&mut self, id: Option<TaskId>) {
         self.current_task = id;
+        self.sync_slow_path_flags();
     }
 
     pub fn task_manager(&self) -> &crate::vm::task::TaskManager {
@@ -207,10 +208,12 @@ impl VM {
         self.active_scope_tasks.push(task_id);
         self.task_manager.attach(task);
         self.last_task_signal = None;
+        self.sync_slow_path_flags();
         let run_result = self.run();
         let signal = self.last_task_signal.take();
         self.current_task = parent_task;
         self.active_scope_tasks.pop();
+        self.sync_slow_path_flags();
         let mut task = self
             .task_manager
             .detach(task_id)
@@ -258,6 +261,7 @@ impl VM {
                             }
                             self.pending_return_value = None;
                             self.pending_return_dest = None;
+                            self.sync_slow_path_flags();
                         }
                     }
                 } else {
@@ -300,6 +304,7 @@ impl VM {
             &mut task.pending_return_value,
         );
         mem::swap(&mut self.pending_return_dest, &mut task.pending_return_dest);
+        self.sync_slow_path_flags();
         task.fiber_context.state = match task.state {
             TaskState::Completed => crate::effect_abi::FiberExecutionState::Completed,
             TaskState::Failed => crate::effect_abi::FiberExecutionState::Failed,
@@ -546,8 +551,10 @@ impl VM {
         let _vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
         let task_id = self.task_id_from_handle(handle)?;
         self.quantum_fuel = Some(quantum);
+        self.sync_slow_path_flags();
         let res = self.run_task_internal(task_id, resume_value);
         self.quantum_fuel = None;
+        self.sync_slow_path_flags();
         match res {
             Ok(()) => {
                 let task = self.get_task_instance(handle)?;
@@ -1407,7 +1414,7 @@ mod scope_fiber_tests {
         task.request_interrupt(InterruptReason::Timeout);
         assert_eq!(task.state, TaskState::Running);
         vm.task_manager.insert(task);
-        vm.current_task = Some(id);
+        vm.set_current_task_id(Some(id));
         assert!(vm.run().is_err());
         assert_eq!(vm.task_manager.get(id).unwrap().state, TaskState::Stopped);
     }

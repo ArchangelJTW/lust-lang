@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(feature = "std")]
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 #[cfg(feature = "std")]
 pub struct TraceHooks {
@@ -12,15 +12,37 @@ pub struct TraceHooks {
 }
 
 #[cfg(feature = "std")]
-thread_local! {
-    static ACTIVE_TRACE_HOOKS: RefCell<Option<TraceHooks>> = const { RefCell::new(None) };
+impl TraceHooks {
+    #[inline]
+    fn has_any(&self) -> bool {
+        self.instruction_hook.is_some()
+            || self.call_hook.is_some()
+            || self.return_hook.is_some()
+            || self.error_hook.is_some()
+    }
 }
 
+#[cfg(feature = "std")]
+thread_local! {
+    static ACTIVE_TRACE_HOOKS: RefCell<Option<TraceHooks>> = const { RefCell::new(None) };
+    static HAS_ANY_TRACE_HOOK: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(feature = "std")]
 #[inline]
+fn sync_trace_hook_flag(opt: &mut Option<TraceHooks>) {
+    let any = opt.as_ref().is_some_and(TraceHooks::has_any);
+    if !any {
+        *opt = None;
+    }
+    HAS_ANY_TRACE_HOOK.with(|flag| flag.set(any));
+}
+
+#[inline(always)]
 pub(crate) fn has_trace_hook() -> bool {
     #[cfg(feature = "std")]
     {
-        ACTIVE_TRACE_HOOKS.with(|cell| cell.borrow().is_some())
+        HAS_ANY_TRACE_HOOK.with(|flag| flag.get())
     }
     #[cfg(not(feature = "std"))]
     {
@@ -90,6 +112,11 @@ impl VM {
         frames
     }
 
+    #[inline(always)]
+    pub fn has_trace_hook(&self) -> bool {
+        has_trace_hook()
+    }
+
     #[cfg(feature = "std")]
     pub fn set_instruction_hook(
         &mut self,
@@ -107,6 +134,7 @@ impl VM {
                     error_hook: None,
                 });
             }
+            sync_trace_hook_flag(&mut opt);
         });
     }
 
@@ -127,6 +155,7 @@ impl VM {
                     error_hook: None,
                 });
             }
+            sync_trace_hook_flag(&mut opt);
         });
     }
 
@@ -147,6 +176,7 @@ impl VM {
                     error_hook: None,
                 });
             }
+            sync_trace_hook_flag(&mut opt);
         });
     }
 
@@ -167,13 +197,16 @@ impl VM {
                     error_hook: hook,
                 });
             }
+            sync_trace_hook_flag(&mut opt);
         });
     }
 
     #[cfg(feature = "std")]
     pub fn clear_trace_hooks(&mut self) {
         ACTIVE_TRACE_HOOKS.with(|cell| {
-            *cell.borrow_mut() = None;
+            let mut opt = cell.borrow_mut();
+            *opt = None;
+            sync_trace_hook_flag(&mut opt);
         });
     }
 

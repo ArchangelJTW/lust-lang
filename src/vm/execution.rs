@@ -6,6 +6,151 @@ use core::ptr;
 pub static MUTATION_M1_SKIP_GAS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 pub static MUTATION_M1_EXECUTION_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+#[cfg(all(feature = "std", debug_assertions))]
+std::thread_local! {
+    static FRAME_HOIST_RELOAD_COUNT: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+#[inline(always)]
+fn record_frame_hoist_reload() {
+    #[cfg(all(feature = "std", debug_assertions))]
+    FRAME_HOIST_RELOAD_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+#[inline(always)]
+fn write_frame_reg_fast(
+    frame: &mut CallFrame,
+    cycle_collector: &mut cycle::CycleCollector,
+    reg: Register,
+    value: Value,
+) -> bool {
+    if cycle_collector.is_enabled() {
+        cycle_collector.register_value(&value);
+    }
+    let slot = &mut frame.registers[reg as usize];
+    if slot.is_plain() {
+        // SAFETY: the old value owns nothing, so it needs no drop.
+        unsafe { core::ptr::write(slot, value) };
+    } else {
+        *slot = value;
+    }
+    cycle_collector.is_enabled() && cycle_collector.should_collect()
+}
+
+#[inline(always)]
+fn frame_int_binary_op<F>(
+    frame: &mut CallFrame,
+    cycle_collector: &mut cycle::CycleCollector,
+    dest: Register,
+    lhs: Register,
+    rhs: Register,
+    op: F,
+) -> Result<bool>
+where
+    F: FnOnce(LustInt, LustInt) -> Result<Value>,
+{
+    let left = &frame.registers[lhs as usize];
+    let right = &frame.registers[rhs as usize];
+    let (Value::Int(a), Value::Int(b)) = (left, right) else {
+        return Err(LustError::RuntimeError {
+            message: format!(
+                "Typed numeric instruction expected int operands, got {:?} and {:?}",
+                left, right
+            ),
+        });
+    };
+    let result = op(*a, *b)?;
+    Ok(write_frame_reg_fast(frame, cycle_collector, dest, result))
+}
+
+#[inline(always)]
+fn frame_float_binary_op<F>(
+    frame: &mut CallFrame,
+    cycle_collector: &mut cycle::CycleCollector,
+    dest: Register,
+    lhs: Register,
+    rhs: Register,
+    op: F,
+) -> Result<bool>
+where
+    F: FnOnce(LustFloat, LustFloat) -> Result<Value>,
+{
+    let left = &frame.registers[lhs as usize];
+    let right = &frame.registers[rhs as usize];
+    let (Value::Float(a), Value::Float(b)) = (left, right) else {
+        return Err(LustError::RuntimeError {
+            message: format!(
+                "Typed numeric instruction expected float operands, got {:?} and {:?}",
+                left, right
+            ),
+        });
+    };
+    let result = op(*a, *b)?;
+    Ok(write_frame_reg_fast(frame, cycle_collector, dest, result))
+}
+
+#[inline(always)]
+fn frame_binary_op<F>(
+    frame: &mut CallFrame,
+    cycle_collector: &mut cycle::CycleCollector,
+    dest: Register,
+    lhs: Register,
+    rhs: Register,
+    op: F,
+) -> Result<bool>
+where
+    F: FnOnce(&Value, &Value) -> Result<Value>,
+{
+    let left = &frame.registers[lhs as usize];
+    let right = &frame.registers[rhs as usize];
+    let result = op(left, right)?;
+    Ok(write_frame_reg_fast(frame, cycle_collector, dest, result))
+}
+
+#[inline(always)]
+fn frame_comparison_op<I, F>(
+    frame: &mut CallFrame,
+    cycle_collector: &mut cycle::CycleCollector,
+    dest: Register,
+    lhs: Register,
+    rhs: Register,
+    int_op: I,
+    op: F,
+) -> Result<bool>
+where
+    I: FnOnce(LustInt, LustInt) -> bool,
+    F: FnOnce(LustFloat, LustFloat) -> bool,
+{
+    let left = &frame.registers[lhs as usize];
+    let right = &frame.registers[rhs as usize];
+    let result = match (left, right) {
+        (Value::Int(a), Value::Int(b)) => int_op(*a, *b),
+        (Value::Float(a), Value::Float(b)) => op(*a, *b),
+        (Value::Int(a), Value::Float(b)) => op(float_from_int(*a), *b),
+        (Value::Float(a), Value::Int(b)) => op(*a, float_from_int(*b)),
+        _ => {
+            return Err(LustError::RuntimeError {
+                message: format!("Cannot compare {:?} and {:?}", left, right),
+            });
+        }
+    };
+    Ok(write_frame_reg_fast(
+        frame,
+        cycle_collector,
+        dest,
+        Value::Bool(result),
+    ))
+}
+
+enum FrameExit {
+    EndOfChunk,
+    CollectCycles,
+    OutOfGas(u64),
+    #[cfg(feature = "std")]
+    TryOsr(usize),
+    Slow(Instruction, usize),
+}
+
 pub struct MutationM1Guard;
 
 impl MutationM1Guard {
@@ -70,6 +215,26 @@ fn floor_div_i64(a: i64, b: i64) -> Result<i64> {
 }
 
 impl VM {
+    /// Reports whether PERF-T3-2 frame/chunk cache hoisting with reload barriers is active.
+    #[inline]
+    pub const fn frame_cache_hoisting_enabled() -> bool {
+        true
+    }
+
+    /// Returns the per-thread count of frame-cache reloads performed in `run_inner`
+    /// (tracked in debug/test builds; returns 0 in release builds for zero overhead).
+    #[inline]
+    pub fn frame_hoist_reload_count() -> u64 {
+        #[cfg(all(feature = "std", debug_assertions))]
+        {
+            FRAME_HOIST_RELOAD_COUNT.with(|c| c.get())
+        }
+        #[cfg(not(all(feature = "std", debug_assertions)))]
+        {
+            0
+        }
+    }
+
     fn is_loop_in_hierarchy(
         &self,
         function_idx: usize,
@@ -162,419 +327,1563 @@ impl VM {
         result
     }
 
-    pub(super) fn run_inner<const JIT_ENABLED: bool>(&mut self) -> Result<Value> {
-        'dispatch: loop {
-            if let Some(task) = self.current_task.and_then(|id| self.task_manager.get_mut(id)) {
-                if task.poll_interrupt().is_some() {
-                    return Err(task.error.clone().expect("interrupt error"));
-                }
+    #[cold]
+    #[inline(never)]
+    fn run_dispatch_preamble_slow(&mut self) -> Result<Option<Value>> {
+        if let Some(task) = self.current_task.and_then(|id| self.task_manager.get_mut(id)) {
+            if task.poll_interrupt().is_some() {
+                return Err(task.error.clone().expect("interrupt error"));
             }
-            if let Some(target_depth) = self.call_until_depth
-                && self.call_stack.len() == target_depth
-                && let Some(return_value) = self.pending_return_value.take()
-            {
-                self.call_until_depth = None;
-                return Ok(return_value);
-            }
+        }
+        if let Some(target_depth) = self.call_until_depth
+            && self.call_stack.len() == target_depth
+            && let Some(return_value) = self.pending_return_value.take()
+        {
+            self.call_until_depth = None;
+            self.sync_slow_path_flags();
+            return Ok(Some(return_value));
+        }
 
-            if self.pending_return_value.is_some()
-                && let Some(return_value) = self.pending_return_value.take()
-                && let Some(dest_reg) = self.pending_return_dest.take()
-            {
+        if self.pending_return_value.is_some()
+            && let Some(return_value) = self.pending_return_value.take()
+        {
+            self.sync_slow_path_flags();
+            if let Some(dest_reg) = self.pending_return_dest.take() {
                 self.set_register(dest_reg, return_value)?;
             }
+        }
 
-            if self.current_task.is_some()
-                && let Some(signal) = self.pending_task_signal.take()
-            {
-                self.last_task_signal = Some(signal);
-                return Ok(Value::Nil);
-            }
+        if self.current_task.is_some()
+            && let Some(signal) = self.pending_task_signal.take()
+        {
+            self.last_task_signal = Some(signal);
+            return Ok(Some(Value::Nil));
+        }
 
-            if self.current_task.is_some() {
-                if let Some(fuel) = self.quantum_fuel.as_mut() {
-                    if *fuel == 0 {
-                        self.last_task_signal = Some(TaskSignal::QuantumExhausted);
-                        return Ok(Value::Nil);
-                    }
-                    *fuel -= 1;
+        if self.current_task.is_some() {
+            if let Some(fuel) = self.quantum_fuel.as_mut() {
+                if *fuel == 0 {
+                    self.last_task_signal = Some(TaskSignal::QuantumExhausted);
+                    return Ok(Some(Value::Nil));
                 }
+                *fuel -= 1;
+            }
+        }
+        Ok(None)
+    }
+
+    #[cfg(feature = "std")]
+    #[cold]
+    #[inline(never)]
+    fn dispatch_instruction_hook_slow(&self, func_idx: usize, ip_before_execution: usize) {
+        let func = &self.functions[func_idx];
+        let line = func.chunk.lines.get(ip_before_execution).copied().unwrap_or(0);
+        self.dispatch_instruction_hook(&func.name, line, ip_before_execution);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_mutation_m1_skip_gas() {
+        MUTATION_M1_EXECUTION_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn handle_out_of_gas_slow(&mut self, limit: u64) -> LustError {
+        let e = LustError::RuntimeError {
+            message: format!(
+                "Out of gas (limit: {}, used: {})",
+                limit, self.budgets.gas.used
+            ),
+        };
+        if let Some(task) = self.current_task.and_then(|id| self.task_manager.get_mut(id)) {
+            task.request_interrupt(crate::effect_abi::InterruptReason::OutOfGas);
+            if let Some(err) = task.error.clone() {
+                return err;
+            }
+        }
+        e
+    }
+
+    pub(super) fn run_inner<const JIT_ENABLED: bool>(&mut self) -> Result<Value> {
+        self.sync_slow_path_flags();
+        let mut frame_dirty = true;
+        let mut cur_frame_idx: usize = 0;
+        let mut cur_func_idx: usize = 0;
+        let mut cur_chunk_len: usize = 0;
+        #[cfg(feature = "std")]
+        let mut cur_has_osr_entries: bool = false;
+
+        'dispatch: loop {
+            debug_assert_eq!(self.slow_path_flags, self.compute_slow_path_flags());
+            if self.slow_path_flags & SLOW_PATH_PREAMBLE_MASK != 0 {
+                if let Some(return_value) = self.run_dispatch_preamble_slow()? {
+                    return Ok(return_value);
+                }
+                frame_dirty = true;
             }
 
-            let executing_frame_index =
-                self.call_stack
+            if frame_dirty {
+                cur_frame_idx = self
+                    .call_stack
                     .len()
                     .checked_sub(1)
                     .ok_or_else(|| LustError::RuntimeError {
                         message: "Empty call stack".to_string(),
                     })?;
-            let frame = self
-                .call_stack
-                .last_mut()
-                .ok_or_else(|| LustError::RuntimeError {
-                    message: "Empty call stack".to_string(),
-                })?;
-            let (instruction, ip_before_execution, func_idx) = {
-                let func = &self.functions[frame.function_idx];
-                if frame.ip >= func.chunk.instructions.len() {
-                    if let Some(frame) = self.call_stack.pop() {
-                        self.recycle_frame(frame);
-                    }
-                    if self.call_stack.is_empty() {
-                        return Ok(Value::Nil);
-                    }
-
-                    continue;
-                }
-
-                let instruction = func.chunk.instructions[frame.ip];
-                frame.ip += 1;
-                let ip_before_execution = frame.ip;
-                let func_idx = frame.function_idx;
-                (instruction, ip_before_execution, func_idx)
-            };
-            let (should_check_jit, loop_start_ip) = if let Instruction::Jump(offset) = instruction {
-                if offset < 0 {
-                    let current_frame = self.call_stack.last().unwrap();
-                    let jump_target = (current_frame.ip as isize + offset as isize) as usize;
-                    (true, jump_target)
-                } else {
-                    (false, 0)
-                }
-            } else {
-                (false, 0)
-            };
-            if should_check_jit && JIT_ENABLED && self.quantum_fuel.is_none() {
-                let count = self.jit.profiler.record_backedge(func_idx, loop_start_ip);
-                let backedge_ip = ip_before_execution.saturating_sub(1);
-                if self
-                    .trace_recorder
-                    .as_ref()
-                    .is_some_and(|recorder| !recorder.is_recording())
+                cur_func_idx = self.call_stack[cur_frame_idx].function_idx;
+                let func = &self.functions[cur_func_idx];
+                cur_chunk_len = func.chunk.instructions.len();
+                #[cfg(feature = "std")]
                 {
-                    self.abandon_trace_recording();
+                    cur_has_osr_entries = !func.block_entry_pcs.is_empty();
                 }
-                // No trace runs while one is being recorded, except the
-                // root trace of a nested loop the recording is skipping:
-                // that loop's iterations are not part of the trace, and
-                // interpreting them (a million, for a big array) would be
-                // what the recording costs.
-                let skipped_nested = self.trace_recorder.as_ref().is_some_and(|recorder| {
-                    recorder.skipped_loop() == Some((func_idx, loop_start_ip))
-                });
-                let root_trace_id = if self.trace_recorder.is_none() || skipped_nested {
-                    self.jit
-                        .root_traces
-                        .get(&(func_idx, loop_start_ip))
-                        .copied()
-                } else {
-                    None
-                };
-                if let Some(trace_id) = root_trace_id {
-                    let frame = self.call_stack.last_mut().unwrap();
-                    let registers_ptr = frame.registers.as_mut_ptr();
-                    if let Some(trace) = self.jit.trace_handle(trace_id) {
-                        self.jit.record_native_entry();
-                        crate::jit::log(|| {
-                            format!(
-                                "▶️  JIT: Executing trace #{} at func {} ip {}",
-                                trace_id.0, func_idx, loop_start_ip
-                            )
-                        });
-
-                        let trace_gas_cost = {
-                            let cost = trace.trace.ops.len()
-                                + trace.trace.preamble.len()
-                                + trace.trace.postamble.len();
-                            core::cmp::max(1, cost) as u64
-                        };
-                        self.budgets.charge_gas(trace_gas_cost)?;
-                        self.publish_gas_to_cells();
-                        self.pending_jit_error = None;
-
-                        // Capture RSP before and after to detect stack leaks (x86_64 only)
-                        #[cfg(target_arch = "x86_64")]
-                        let rsp_before: usize;
-                        #[cfg(target_arch = "x86_64")]
-                        unsafe {
-                            core::arch::asm!("mov {}, rsp", out(reg) rsp_before)
-                        };
-
-                        let vm_ptr = self as *mut VM;
-                        let _jit_guard = self.enter_jit_scope();
-                        let result = trace.execute(registers_ptr, vm_ptr, ptr::null());
-                        drop(_jit_guard);
-                        drop(trace);
-                        self.sync_gas_from_cells();
-
-                        #[cfg(target_arch = "x86_64")]
-                        let rsp_after: usize;
-                        #[cfg(target_arch = "x86_64")]
-                        unsafe {
-                            core::arch::asm!("mov {}, rsp", out(reg) rsp_after)
-                        };
-
-                        #[cfg(target_arch = "x86_64")]
-                        let rsp_diff = rsp_after as isize - rsp_before as isize;
-                        crate::jit::log(|| {
-                            #[cfg(target_arch = "x86_64")]
-                            return format!(
-                                "🎯 JIT: Trace #{} execution result: {} (RSP before: {:x}, after: {:x}, diff: {})",
-                                trace_id.0, result, rsp_before, rsp_after, rsp_diff
-                            );
-                            #[cfg(not(target_arch = "x86_64"))]
-                            return format!(
-                                "🎯 JIT: Trace #{} execution result: {}",
-                                trace_id.0, result
-                            );
-                        });
-
-                        if result == 0 {
-                            if self.current_task.is_some() && self.pending_task_signal.is_some() {
-                                if let Some(frame) = self.call_stack.last_mut() {
-                                    frame.ip = ip_before_execution.saturating_sub(1);
-                                }
-                                continue;
-                            }
-
-                            if let Some(frame) = self.call_stack.last_mut() {
-                                frame.ip = loop_start_ip;
-                            }
-
-                            continue;
-                        } else if result > 0 {
-                            self.jit.record_guard_exit();
-                            let guard_index = (result - 1) as usize;
-                            let bailout_ip = self
-                                .jit
-                                .get_trace(trace_id)
-                                .and_then(|trace| trace.guards.get(guard_index))
-                                .map(|guard| guard.bailout_ip);
-
-                            crate::jit::log(|| {
-                                let kind = self
-                                    .jit
-                                    .get_trace(trace_id)
-                                    .and_then(|trace| trace.guards.get(guard_index))
-                                    .map(|guard| format!("{:?}", guard.kind));
-                                format!(
-                                    "↩️  JIT: guard #{guard_index} exit {kind:?} → ip {bailout_ip:?}"
-                                )
-                            });
-                            // A nested loop's trace may have bailed out
-                            // somewhere other than the guard's own ip.
-                            let bailout_ip = self.nested_loop_exit_ip.take().or(bailout_ip);
-                            if let Some(bailout_ip) = bailout_ip
-                                && let Some(frame) = self.call_stack.last_mut()
-                            {
-                                frame.ip = bailout_ip;
-                            }
-                            if let Some(error) = self.pending_jit_error.take() {
-                                return Err(error);
-                            }
-
-                            self.handle_guard_failure(trace_id, guard_index, func_idx)?;
-                            // A loop-condition exit is how a trace normally
-                            // ends, and a nested-loop exit is where an outer
-                            // trace hands the inner loop to its own trace;
-                            // both resume at a known ip with the registers
-                            // written back, so the trace stays valid for the
-                            // next entry. Any other guard failure means the
-                            // trace assumed something that no longer holds.
-                            let reusable_exit = self
-                                .jit
-                                .get_trace(trace_id)
-                                .and_then(|trace| trace.guards.get(guard_index))
-                                .is_some_and(|guard| {
-                                    matches!(
-                                        guard.kind,
-                                        crate::jit::GuardKind::Truthy { .. }
-                                            | crate::jit::GuardKind::Falsy { .. }
-                                            | crate::jit::GuardKind::NestedLoop { .. }
-                                            | crate::jit::GuardKind::Plain { .. }
-                                    )
-                                });
-                            if !reusable_exit {
-                                self.jit.evict_root_trace(func_idx, loop_start_ip);
-                            }
-                            continue;
-                        } else {
-                            self.jit.record_execution_failure();
-                            if let Some(error) = self.pending_jit_error.take() {
-                                return Err(error);
-                            }
-                            // A result of -(k + 2) names the failing op's
-                            // instruction: resume there, so the interpreter
-                            // re-executes it (raising its error) with the
-                            // trace's earlier side effects intact. A bare -1
-                            // has no site and restarts the iteration.
-                            let resume_ip = if result <= -2 {
-                                self.jit
-                                    .get_trace(trace_id)
-                                    .and_then(|trace| trace.fail_sites.get((-result - 2) as usize))
-                                    .copied()
-                            } else {
-                                None
-                            };
-                            crate::jit::log(|| {
-                                format!(
-                                    "⚠️  JIT: Trace execution failed (result {result}), resuming at ip {:?}",
-                                    resume_ip
-                                )
-                            });
-                            if let Some(frame) = self.call_stack.last_mut() {
-                                frame.ip = resume_ip.unwrap_or(loop_start_ip);
-                            }
-
-                            self.jit.evict_root_trace(func_idx, loop_start_ip);
-                            // Re-dispatch from the loop header we just installed.
-                            //
-                            // Falling through instead would let the interpreter
-                            // go on to execute the backward `Jump` that got us
-                            // here, applying its offset on top of the rewritten
-                            // ip.  That sends ip out of range, pops the frame and
-                            // empties the call stack, so the program simply stops
-                            // — exit status 0, nothing printed, no error.
-                            continue;
-                        }
-                    }
-                } else {
-                    if let Some(recorder) = &mut self.trace_recorder {
-                        // Only finalise the recording when *this* loop is the
-                        // one being recorded.  With a nested loop the inner
-                        // back-edge reaches this handler while the recorder is
-                        // still part-way through the outer loop's body; taking
-                        // that partial body and installing it under the inner
-                        // loop's key produced a trace that re-initialised the
-                        // inner induction variable, never advanced the outer
-                        // one, and therefore never terminated.
-                        let recording_this_loop = recorder.trace.function_idx == func_idx
-                            && recorder.trace.start_ip == loop_start_ip;
-                        if recorder.is_recording() && recording_this_loop {
-                            crate::jit::log(|| {
-                                format!(
-                                    "📝 JIT: Trace recording complete - {} ops recorded",
-                                    recorder.trace.ops.len()
-                                )
-                            });
-                            let mut recorder = self.trace_recorder.take().unwrap();
-                            recorder.complete_nested_skip_at(backedge_ip);
-                            if !recorder.is_recording() {
-                                self.jit.recording_aborted(func_idx, loop_start_ip);
-                                continue;
-                            }
-                            let mut trace = recorder.finish();
-                            let mut optimizer = TraceOptimizer::new();
-                            let hoisted_constants = optimizer.optimize(&mut trace);
-                            crate::jit::log(|| "⚙️  JIT: Compiling root trace...".to_string());
-                            let trace_id = self.jit.alloc_trace_id();
-                            match JitCompiler::new()
-                                .with_gas_checks(self.gas_checked())
-                                .compile_trace(&trace, trace_id, hoisted_constants.clone())
-                            {
-                                Ok(compiled_trace) => {
-                                    crate::jit::log(|| {
-                                        format!(
-                                            "✅ JIT: Trace #{} compiled successfully!",
-                                            trace_id.0
-                                        )
-                                    });
-                                    crate::jit::log(|| {
-                                        "🚀 JIT: Future iterations will use native code!"
-                                            .to_string()
-                                    });
-                                    self.jit.store_root_trace(
-                                        func_idx,
-                                        loop_start_ip,
-                                        compiled_trace,
-                                    );
-                                }
-
-                                Err(e) => {
-                                    crate::jit::log(|| {
-                                        format!("❌ JIT: Trace compilation failed: {}", e)
-                                    });
-                                    self.jit.recording_aborted(func_idx, loop_start_ip);
-                                }
-                            }
-                        }
-                    }
-
-                    if self.trace_recorder.is_none()
-                        && !self
-                            .jit
-                            .root_traces
-                            .contains_key(&(func_idx, loop_start_ip))
-                    {
-                        let loop_in_hierarchy = match self
-                            .jit
-                            .profiler
-                            .get_cached_loop_hierarchy(func_idx, loop_start_ip)
-                        {
-                            Some(cached) => cached,
-                            None => {
-                                let calculated =
-                                    self.is_loop_in_hierarchy(func_idx, loop_start_ip, backedge_ip);
-                                self.jit.profiler.set_cached_loop_hierarchy(
-                                    func_idx,
-                                    loop_start_ip,
-                                    calculated,
-                                );
-                                calculated
-                            }
-                        };
-                        if self.jit.should_record_root(
-                            func_idx,
-                            loop_start_ip,
-                            count,
-                            crate::jit::HOT_THRESHOLD + u32::from(loop_in_hierarchy),
-                        ) {
-                            crate::jit::log(|| {
-                                format!(
-                                    "🔥 JIT: Hot loop detected at func {} ip {} - starting trace recording!",
-                                    func_idx, loop_start_ip
-                                )
-                            });
-                            let mut recorder =
-                                TraceRecorder::new(func_idx, loop_start_ip, MAX_TRACE_LENGTH);
-                            recorder.set_root_frame_index(self.call_stack.len().saturating_sub(1));
-                            recorder.set_intrinsics(&self.jit.intrinsics);
-                            // Specialize loop-invariant values at trace entry
-                            if !self
-                                .jit
-                                .no_specialize_sites
-                                .contains(&(func_idx, loop_start_ip))
-                            {
-                                let frame = self.call_stack.last().unwrap();
-                                let func = &self.functions[func_idx];
-                                recorder.specialize_trace_inputs(&frame.registers, func);
-                            }
-                            self.trace_recorder = Some(recorder);
-                            self.jit.recording_started();
-                            self.skip_next_trace_record = true;
-                        }
-                    }
-                }
+                record_frame_hoist_reload();
+                frame_dirty = false;
             }
+
+            debug_assert!(!self.call_stack.is_empty());
+            debug_assert_eq!(cur_frame_idx, self.call_stack.len() - 1);
+            debug_assert_eq!(cur_func_idx, self.call_stack.last().unwrap().function_idx);
+            debug_assert_eq!(
+                cur_chunk_len,
+                self.functions[cur_func_idx].chunk.instructions.len()
+            );
+            #[cfg(feature = "std")]
+            debug_assert_eq!(
+                cur_has_osr_entries,
+                !self.functions[cur_func_idx].block_entry_pcs.is_empty()
+            );
+
+            let executing_frame_index = cur_frame_idx;
+            let func_idx = cur_func_idx;
 
             #[cfg(feature = "std")]
-            if crate::vm::tracing::has_trace_hook() {
-                let func = &self.functions[func_idx];
-                let line = func.chunk.lines.get(ip_before_execution).copied().unwrap_or(0);
-                self.dispatch_instruction_hook(&func.name, line, ip_before_execution);
-            }
+            let can_enter_fast = !JIT_ENABLED
+                && (self.slow_path_flags & SLOW_PATH_PREAMBLE_MASK) == 0
+                && !crate::vm::tracing::has_trace_hook();
+            #[cfg(not(feature = "std"))]
+            let can_enter_fast =
+                !JIT_ENABLED && (self.slow_path_flags & SLOW_PATH_PREAMBLE_MASK) == 0;
 
-            if MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed) {
-                MUTATION_M1_EXECUTION_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            } else if let Err(e) = self.budgets.charge_gas(1) {
-                if let Some(task) = self.current_task.and_then(|id| self.task_manager.get_mut(id)) {
-                    task.request_interrupt(crate::effect_abi::InterruptReason::OutOfGas);
-                    if let Some(err) = task.error.clone() {
-                        return Err(err);
+            let (instruction, ip_before_execution) = if can_enter_fast {
+                let has_gas_limit = (self.slow_path_flags & SLOW_PATH_GAS_LIMIT) != 0;
+                #[cfg(feature = "std")]
+                let can_osr =
+                    self.backend == crate::vm::VmBackend::Cranelift && cur_has_osr_entries;
+                // Safe disjoint-field borrows scoped strictly to pure intra-frame opcodes.
+                // Rust's borrow checker statically forbids any call_stack/functions-mutating
+                // `&mut self` call while `frame`, `instructions`, and `constants` are live.
+                let exit = {
+                    let frame: &mut CallFrame = &mut self.call_stack[cur_frame_idx];
+                    let func = &self.functions[cur_func_idx];
+                    let instructions = &func.chunk.instructions;
+                    let constants = &func.chunk.constants;
+                    let budgets = &mut self.budgets;
+                    let cycle_collector = &mut self.cycle_collector;
+                    let struct_tostring_cache = &mut self.struct_tostring_cache;
+
+                    'frame_fast: loop {
+                        debug_assert_eq!(cur_func_idx, frame.function_idx);
+                        debug_assert_eq!(cur_chunk_len, instructions.len());
+
+                        let ip = frame.ip;
+                        let Some(&instruction) = instructions.get(ip) else {
+                            break 'frame_fast FrameExit::EndOfChunk;
+                        };
+                        let ip_before_execution = ip + 1;
+                        frame.ip = ip_before_execution;
+
+                        if MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed) {
+                            Self::record_mutation_m1_skip_gas();
+                        } else {
+                            budgets.gas.used = budgets.gas.used.saturating_add(1);
+                            if has_gas_limit
+                                && let Some(limit) = budgets.gas.limit
+                                && budgets.gas.used > limit
+                            {
+                                break 'frame_fast FrameExit::OutOfGas(limit);
+                            }
+                        }
+
+                        let needs_collect = match instruction {
+                            Instruction::LoadNil(dest) => {
+                                write_frame_reg_fast(frame, cycle_collector, dest, Value::Nil)
+                            }
+                            Instruction::LoadBool(dest, value) => {
+                                write_frame_reg_fast(frame, cycle_collector, dest, Value::Bool(value))
+                            }
+                            Instruction::LoadConst(dest, const_idx) => {
+                                let constant = constants[const_idx as usize].fast_clone();
+                                write_frame_reg_fast(frame, cycle_collector, dest, constant)
+                            }
+                            Instruction::Move(dest, src) => {
+                                let value = frame.registers[src as usize].fast_clone();
+                                write_frame_reg_fast(frame, cycle_collector, dest, value)
+                            }
+
+                            Instruction::AddInt(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Int(a.wrapping_add(b)))
+                                })?
+                            }
+                            Instruction::SubInt(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Int(a.wrapping_sub(b)))
+                                })?
+                            }
+                            Instruction::MulInt(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Int(a.wrapping_mul(b)))
+                                })?
+                            }
+                            Instruction::DivInt(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    if b == 0 {
+                                        Err(LustError::RuntimeError {
+                                            message: "Division by zero".to_string(),
+                                        })
+                                    } else {
+                                        Ok(Value::Int(a.wrapping_div(b)))
+                                    }
+                                })?
+                            }
+                            Instruction::ModInt(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    if b == 0 {
+                                        Err(LustError::RuntimeError {
+                                            message: "Modulo by zero".to_string(),
+                                        })
+                                    } else {
+                                        Ok(Value::Int(a.wrapping_rem(b)))
+                                    }
+                                })?
+                            }
+                            Instruction::PowInt(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    int_pow(a, b)
+                                })?
+                            }
+                            Instruction::FloorDivInt(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    floor_div_i64(a, b).map(Value::Int)
+                                })?
+                            }
+                            Instruction::NegInt(dest, src) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, src, src, |a, _| {
+                                    Ok(Value::Int(a.wrapping_neg()))
+                                })?
+                            }
+                            Instruction::EqInt(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Bool(a == b))
+                                })?
+                            }
+                            Instruction::NeInt(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Bool(a != b))
+                                })?
+                            }
+                            Instruction::LtInt(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Bool(a < b))
+                                })?
+                            }
+                            Instruction::LeInt(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Bool(a <= b))
+                                })?
+                            }
+                            Instruction::GtInt(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Bool(a > b))
+                                })?
+                            }
+                            Instruction::GeInt(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Bool(a >= b))
+                                })?
+                            }
+
+                            Instruction::AddFloat(dest, lhs, rhs) => {
+                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Float(a + b))
+                                })?
+                            }
+                            Instruction::SubFloat(dest, lhs, rhs) => {
+                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Float(a - b))
+                                })?
+                            }
+                            Instruction::MulFloat(dest, lhs, rhs) => {
+                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Float(a * b))
+                                })?
+                            }
+                            Instruction::DivFloat(dest, lhs, rhs) => {
+                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Float(a / b))
+                                })?
+                            }
+                            Instruction::ModFloat(dest, lhs, rhs) => {
+                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    if b == 0.0 {
+                                        Err(LustError::RuntimeError {
+                                            message: "Modulo by zero".to_string(),
+                                        })
+                                    } else {
+                                        Ok(Value::Float(a % b))
+                                    }
+                                })?
+                            }
+                            Instruction::PowFloat(dest, lhs, rhs) => {
+                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Float(a.powf(b)))
+                                })?
+                            }
+                            Instruction::FloorDivFloat(dest, lhs, rhs) => {
+                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    if b == 0.0 {
+                                        Err(LustError::RuntimeError {
+                                            message: "Division by zero".to_string(),
+                                        })
+                                    } else {
+                                        Ok(Value::Float((a / b).floor()))
+                                    }
+                                })?
+                            }
+                            Instruction::NegFloat(dest, src) => {
+                                frame_float_binary_op(frame, cycle_collector, dest, src, src, |a, _| {
+                                    Ok(Value::Float(-a))
+                                })?
+                            }
+                            Instruction::EqFloat(dest, lhs, rhs) => {
+                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Bool(a == b))
+                                })?
+                            }
+                            Instruction::NeFloat(dest, lhs, rhs) => {
+                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Bool(a != b))
+                                })?
+                            }
+                            Instruction::LtFloat(dest, lhs, rhs) => {
+                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Bool(a < b))
+                                })?
+                            }
+                            Instruction::LeFloat(dest, lhs, rhs) => {
+                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Bool(a <= b))
+                                })?
+                            }
+                            Instruction::GtFloat(dest, lhs, rhs) => {
+                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Bool(a > b))
+                                })?
+                            }
+                            Instruction::GeFloat(dest, lhs, rhs) => {
+                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Bool(a >= b))
+                                })?
+                            }
+
+                            Instruction::Add(dest, lhs, rhs) => {
+                                frame_binary_op(frame, cycle_collector, dest, lhs, rhs, |l, r| {
+                                    match (l, r) {
+                                        (Value::Int(a), Value::Int(b)) => {
+                                            Ok(Value::Int(a.wrapping_add(*b)))
+                                        }
+                                        (Value::Float(a), Value::Float(b)) => {
+                                            Ok(Value::Float(a + b))
+                                        }
+                                        (Value::Int(a), Value::Float(b)) => {
+                                            Ok(Value::Float(float_from_int(*a) + *b))
+                                        }
+                                        (Value::Float(a), Value::Int(b)) => {
+                                            Ok(Value::Float(*a + float_from_int(*b)))
+                                        }
+                                        (Value::String(a), Value::String(b)) => {
+                                            Ok(Value::string(format!("{}{}", a, b)))
+                                        }
+                                        _ => Err(LustError::RuntimeError {
+                                            message: format!("Cannot add {:?} and {:?}", l, r),
+                                        }),
+                                    }
+                                })?
+                            }
+                            Instruction::Sub(dest, lhs, rhs) => {
+                                frame_binary_op(frame, cycle_collector, dest, lhs, rhs, |l, r| {
+                                    match (l, r) {
+                                        (Value::Int(a), Value::Int(b)) => {
+                                            Ok(Value::Int(a.wrapping_sub(*b)))
+                                        }
+                                        (Value::Float(a), Value::Float(b)) => {
+                                            Ok(Value::Float(a - b))
+                                        }
+                                        (Value::Int(a), Value::Float(b)) => {
+                                            Ok(Value::Float(float_from_int(*a) - *b))
+                                        }
+                                        (Value::Float(a), Value::Int(b)) => {
+                                            Ok(Value::Float(*a - float_from_int(*b)))
+                                        }
+                                        _ => Err(LustError::RuntimeError {
+                                            message: format!("Cannot subtract {:?} and {:?}", l, r),
+                                        }),
+                                    }
+                                })?
+                            }
+                            Instruction::Mul(dest, lhs, rhs) => {
+                                frame_binary_op(frame, cycle_collector, dest, lhs, rhs, |l, r| {
+                                    match (l, r) {
+                                        (Value::Int(a), Value::Int(b)) => {
+                                            Ok(Value::Int(a.wrapping_mul(*b)))
+                                        }
+                                        (Value::Float(a), Value::Float(b)) => {
+                                            Ok(Value::Float(a * b))
+                                        }
+                                        (Value::Int(a), Value::Float(b)) => {
+                                            Ok(Value::Float(float_from_int(*a) * *b))
+                                        }
+                                        (Value::Float(a), Value::Int(b)) => {
+                                            Ok(Value::Float(*a * float_from_int(*b)))
+                                        }
+                                        _ => Err(LustError::RuntimeError {
+                                            message: format!("Cannot multiply {:?} and {:?}", l, r),
+                                        }),
+                                    }
+                                })?
+                            }
+                            Instruction::Div(dest, lhs, rhs) => {
+                                frame_binary_op(frame, cycle_collector, dest, lhs, rhs, |l, r| {
+                                    match (l, r) {
+                                        (Value::Int(a), Value::Int(b)) => {
+                                            if *b == 0 {
+                                                Err(LustError::RuntimeError {
+                                                    message: "Division by zero".to_string(),
+                                                })
+                                            } else {
+                                                Ok(Value::Int(a.wrapping_div(*b)))
+                                            }
+                                        }
+                                        (Value::Float(a), Value::Float(b)) => {
+                                            Ok(Value::Float(*a / *b))
+                                        }
+                                        (Value::Int(a), Value::Float(b)) => {
+                                            Ok(Value::Float(float_from_int(*a) / *b))
+                                        }
+                                        (Value::Float(a), Value::Int(b)) => {
+                                            Ok(Value::Float(*a / float_from_int(*b)))
+                                        }
+                                        _ => Err(LustError::RuntimeError {
+                                            message: format!("Cannot divide {:?} and {:?}", l, r),
+                                        }),
+                                    }
+                                })?
+                            }
+                            Instruction::Mod(dest, lhs, rhs) => {
+                                frame_binary_op(frame, cycle_collector, dest, lhs, rhs, |l, r| {
+                                    match (l, r) {
+                                        (Value::Int(a), Value::Int(b)) => {
+                                            if *b == 0 {
+                                                Err(LustError::RuntimeError {
+                                                    message: "Modulo by zero".to_string(),
+                                                })
+                                            } else {
+                                                Ok(Value::Int(a.wrapping_rem(*b)))
+                                            }
+                                        }
+                                        (Value::Float(a), Value::Float(b)) => {
+                                            if *b == 0.0 {
+                                                Err(LustError::RuntimeError {
+                                                    message: "Modulo by zero".to_string(),
+                                                })
+                                            } else {
+                                                Ok(Value::Float(a % b))
+                                            }
+                                        }
+                                        (Value::Int(a), Value::Float(b)) => {
+                                            if *b == 0.0 {
+                                                Err(LustError::RuntimeError {
+                                                    message: "Modulo by zero".to_string(),
+                                                })
+                                            } else {
+                                                Ok(Value::Float(float_from_int(*a) % *b))
+                                            }
+                                        }
+                                        (Value::Float(a), Value::Int(b)) => {
+                                            if *b == 0 {
+                                                Err(LustError::RuntimeError {
+                                                    message: "Modulo by zero".to_string(),
+                                                })
+                                            } else {
+                                                Ok(Value::Float(*a % float_from_int(*b)))
+                                            }
+                                        }
+                                        _ => Err(LustError::RuntimeError {
+                                            message: format!("Cannot modulo {:?} and {:?}", l, r),
+                                        }),
+                                    }
+                                })?
+                            }
+                            Instruction::Pow(dest, lhs, rhs) => {
+                                frame_binary_op(frame, cycle_collector, dest, lhs, rhs, |l, r| {
+                                    match (l, r) {
+                                        (Value::Int(a), Value::Int(b)) => int_pow(*a, *b),
+                                        (Value::Float(a), Value::Float(b)) => {
+                                            Ok(Value::Float(a.powf(*b)))
+                                        }
+                                        (Value::Int(a), Value::Float(b)) => {
+                                            Ok(Value::Float(float_from_int(*a).powf(*b)))
+                                        }
+                                        (Value::Float(a), Value::Int(b)) => {
+                                            Ok(Value::Float(a.powf(float_from_int(*b))))
+                                        }
+                                        _ => Err(LustError::RuntimeError {
+                                            message: format!(
+                                                "Cannot raise {:?} to power {:?}",
+                                                l, r
+                                            ),
+                                        }),
+                                    }
+                                })?
+                            }
+                            Instruction::FloorDiv(dest, lhs, rhs) => {
+                                frame_binary_op(frame, cycle_collector, dest, lhs, rhs, |l, r| {
+                                    match (l, r) {
+                                        (Value::Int(a), Value::Int(b)) => {
+                                            floor_div_i64(*a, *b).map(Value::Int)
+                                        }
+                                        (Value::Float(a), Value::Float(b)) => {
+                                            if *b == 0.0 {
+                                                Err(LustError::RuntimeError {
+                                                    message: "Division by zero".to_string(),
+                                                })
+                                            } else {
+                                                Ok(Value::Float((a / b).floor()))
+                                            }
+                                        }
+                                        (Value::Int(a), Value::Float(b)) => {
+                                            if *b == 0.0 {
+                                                Err(LustError::RuntimeError {
+                                                    message: "Division by zero".to_string(),
+                                                })
+                                            } else {
+                                                Ok(Value::Float((float_from_int(*a) / b).floor()))
+                                            }
+                                        }
+                                        (Value::Float(a), Value::Int(b)) => {
+                                            if *b == 0 {
+                                                Err(LustError::RuntimeError {
+                                                    message: "Division by zero".to_string(),
+                                                })
+                                            } else {
+                                                Ok(Value::Float((a / float_from_int(*b)).floor()))
+                                            }
+                                        }
+                                        _ => Err(LustError::RuntimeError {
+                                            message: format!(
+                                                "Cannot floor divide {:?} and {:?}",
+                                                l, r
+                                            ),
+                                        }),
+                                    }
+                                })?
+                            }
+                            Instruction::Neg(dest, src) => {
+                                let result = match &frame.registers[src as usize] {
+                                    Value::Int(i) => Value::Int(i.wrapping_neg()),
+                                    Value::Float(f) => Value::Float(-f),
+                                    other => {
+                                        return Err(LustError::RuntimeError {
+                                            message: format!("Cannot negate {:?}", other),
+                                        });
+                                    }
+                                };
+                                write_frame_reg_fast(frame, cycle_collector, dest, result)
+                            }
+                            Instruction::Eq(dest, lhs, rhs) => {
+                                let eq = frame.registers[lhs as usize] == frame.registers[rhs as usize];
+                                write_frame_reg_fast(frame, cycle_collector, dest, Value::Bool(eq))
+                            }
+                            Instruction::Ne(dest, lhs, rhs) => {
+                                let ne = frame.registers[lhs as usize] != frame.registers[rhs as usize];
+                                write_frame_reg_fast(frame, cycle_collector, dest, Value::Bool(ne))
+                            }
+                            Instruction::Lt(dest, lhs, rhs) => {
+                                frame_comparison_op(
+                                    frame,
+                                    cycle_collector,
+                                    dest,
+                                    lhs,
+                                    rhs,
+                                    |l, r| l < r,
+                                    |l, r| l < r,
+                                )?
+                            }
+                            Instruction::Le(dest, lhs, rhs) => {
+                                frame_comparison_op(
+                                    frame,
+                                    cycle_collector,
+                                    dest,
+                                    lhs,
+                                    rhs,
+                                    |l, r| l <= r,
+                                    |l, r| l <= r,
+                                )?
+                            }
+                            Instruction::Gt(dest, lhs, rhs) => {
+                                frame_comparison_op(
+                                    frame,
+                                    cycle_collector,
+                                    dest,
+                                    lhs,
+                                    rhs,
+                                    |l, r| l > r,
+                                    |l, r| l > r,
+                                )?
+                            }
+                            Instruction::Ge(dest, lhs, rhs) => {
+                                frame_comparison_op(
+                                    frame,
+                                    cycle_collector,
+                                    dest,
+                                    lhs,
+                                    rhs,
+                                    |l, r| l >= r,
+                                    |l, r| l >= r,
+                                )?
+                            }
+                            Instruction::And(dest, lhs, rhs) => {
+                                let res = frame.registers[lhs as usize].is_truthy()
+                                    && frame.registers[rhs as usize].is_truthy();
+                                write_frame_reg_fast(frame, cycle_collector, dest, Value::Bool(res))
+                            }
+                            Instruction::Or(dest, lhs, rhs) => {
+                                let res = frame.registers[lhs as usize].is_truthy()
+                                    || frame.registers[rhs as usize].is_truthy();
+                                write_frame_reg_fast(frame, cycle_collector, dest, Value::Bool(res))
+                            }
+                            Instruction::Not(dest, src) => {
+                                let res = !frame.registers[src as usize].is_truthy();
+                                write_frame_reg_fast(frame, cycle_collector, dest, Value::Bool(res))
+                            }
+                            Instruction::BitAnd(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Int(a & b))
+                                })?
+                            }
+                            Instruction::BitOr(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Int(a | b))
+                                })?
+                            }
+                            Instruction::BitXor(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Int(a ^ b))
+                                })?
+                            }
+                            Instruction::Shl(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Int(a.wrapping_shl((b & 63) as u32)))
+                                })?
+                            }
+                            Instruction::Shr(dest, lhs, rhs) => {
+                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                    Ok(Value::Int(a.wrapping_shr((b & 63) as u32)))
+                                })?
+                            }
+                            Instruction::BitNot(dest, src) => {
+                                let res = match &frame.registers[src as usize] {
+                                    Value::Int(a) => Value::Int(!a),
+                                    other => {
+                                        return Err(LustError::RuntimeError {
+                                            message: format!(
+                                                "Cannot perform bitwise NOT on {:?}",
+                                                other
+                                            ),
+                                        });
+                                    }
+                                };
+                                write_frame_reg_fast(frame, cycle_collector, dest, res)
+                            }
+
+                            Instruction::Jump(offset) => {
+                                let target_ip = (frame.ip as isize + offset as isize) as usize;
+                                frame.ip = target_ip;
+                                #[cfg(feature = "std")]
+                                if offset < 0 && can_osr {
+                                    break 'frame_fast FrameExit::TryOsr(target_ip);
+                                }
+                                false
+                            }
+                            Instruction::JumpIf(cond, offset) => {
+                                let truthy = match &frame.registers[cond as usize] {
+                                    Value::Bool(b) => *b,
+                                    other => other.is_truthy(),
+                                };
+                                if truthy {
+                                    frame.ip = (frame.ip as isize + offset as isize) as usize;
+                                }
+                                false
+                            }
+                            Instruction::JumpIfNot(cond, offset) => {
+                                let truthy = match &frame.registers[cond as usize] {
+                                    Value::Bool(b) => *b,
+                                    other => other.is_truthy(),
+                                };
+                                if !truthy {
+                                    frame.ip = (frame.ip as isize + offset as isize) as usize;
+                                }
+                                false
+                            }
+
+                            Instruction::NewArray(dest, first_elem, count) => {
+                                let element_count = count as usize;
+                                budgets.charge_value_vec(element_count)?;
+                                let mut elements = Vec::with_capacity(element_count);
+                                for i in 0..count {
+                                    elements.push(
+                                        frame.registers[(first_elem + i) as usize].fast_clone(),
+                                    );
+                                }
+                                write_frame_reg_fast(
+                                    frame,
+                                    cycle_collector,
+                                    dest,
+                                    Value::array(elements),
+                                )
+                            }
+                            Instruction::TupleNew(dest, first_elem, count) => {
+                                let mut parts = Vec::with_capacity(count as usize);
+                                let mut total_elements: usize = 0;
+                                for offset in 0..(count as usize) {
+                                    let value =
+                                        frame.registers[(first_elem + offset as u8) as usize]
+                                            .clone();
+                                    total_elements = total_elements.saturating_add(match &value {
+                                        Value::Tuple(existing) => existing.len(),
+                                        _ => 1,
+                                    });
+                                    parts.push(value);
+                                }
+                                budgets.charge_value_vec(total_elements)?;
+                                let mut elements = Vec::with_capacity(total_elements);
+                                for value in parts {
+                                    if let Value::Tuple(existing) = value {
+                                        elements.extend(existing.iter().cloned());
+                                    } else {
+                                        elements.push(value);
+                                    }
+                                }
+                                write_frame_reg_fast(
+                                    frame,
+                                    cycle_collector,
+                                    dest,
+                                    Value::tuple(elements),
+                                )
+                            }
+                            Instruction::TupleGet(dest, tuple_reg, index) => {
+                                let value = match &frame.registers[tuple_reg as usize] {
+                                    Value::Tuple(values) => {
+                                        let idx = index as usize;
+                                        if idx >= values.len() {
+                                            return Err(LustError::RuntimeError {
+                                                message: format!(
+                                                    "Tuple index {} out of bounds (len {})",
+                                                    idx,
+                                                    values.len()
+                                                ),
+                                            });
+                                        }
+                                        values[idx].fast_clone()
+                                    }
+                                    _ => {
+                                        return Err(LustError::RuntimeError {
+                                            message: "Attempted to destructure non-tuple value"
+                                                .to_string(),
+                                        });
+                                    }
+                                };
+                                write_frame_reg_fast(frame, cycle_collector, dest, value)
+                            }
+                            Instruction::IsEnumVariant(
+                                dest,
+                                value_reg,
+                                enum_name_idx,
+                                variant_idx,
+                            ) => {
+                                let enum_name = constants[enum_name_idx as usize]
+                                    .as_string()
+                                    .ok_or_else(|| LustError::RuntimeError {
+                                        message: "Enum name must be a string".to_string(),
+                                    })?;
+                                let variant_name = constants[variant_idx as usize]
+                                    .as_string()
+                                    .ok_or_else(|| LustError::RuntimeError {
+                                        message: "Variant name must be a string".to_string(),
+                                    })?;
+                                let is_variant = frame.registers[value_reg as usize]
+                                    .is_enum_variant(enum_name, variant_name);
+                                write_frame_reg_fast(
+                                    frame,
+                                    cycle_collector,
+                                    dest,
+                                    Value::Bool(is_variant),
+                                )
+                            }
+                            Instruction::GetEnumValue(dest, enum_reg, index) => {
+                                let value = if let Some((_, _, Some(values))) =
+                                    frame.registers[enum_reg as usize].as_enum()
+                                {
+                                    if (index as usize) < values.len() {
+                                        values[index as usize].fast_clone()
+                                    } else {
+                                        return Err(LustError::RuntimeError {
+                                            message: format!(
+                                                "Enum value index {} out of bounds (has {} values)",
+                                                index,
+                                                values.len()
+                                            ),
+                                        });
+                                    }
+                                } else {
+                                    return Err(LustError::RuntimeError {
+                                        message:
+                                            "GetEnumValue requires an enum variant with values"
+                                                .to_string(),
+                                    });
+                                };
+                                write_frame_reg_fast(frame, cycle_collector, dest, value)
+                            }
+                            Instruction::GetField(dest, obj, field_idx) => {
+                                let val = match &frame.registers[obj as usize] {
+                                    Value::Struct(s) if s.name != "LuaTable" => {
+                                        let field_name = constants[field_idx as usize]
+                                            .as_string_rc()
+                                            .ok_or_else(|| LustError::RuntimeError {
+                                                message: "Field name must be a string".to_string(),
+                                            })?;
+                                        frame.registers[obj as usize]
+                                            .struct_get_field_rc(&field_name)
+                                            .unwrap_or(Value::Nil)
+                                    }
+                                    Value::Map(map) => {
+                                        let field_name = constants[field_idx as usize]
+                                            .as_string_rc()
+                                            .ok_or_else(|| LustError::RuntimeError {
+                                                message: "Field name must be a string".to_string(),
+                                            })?;
+                                        let key = ValueKey::from(field_name);
+                                        map.borrow().get(&key).cloned().unwrap_or(Value::Nil)
+                                    }
+                                    _ => {
+                                        break 'frame_fast FrameExit::Slow(
+                                            instruction,
+                                            ip_before_execution,
+                                        );
+                                    }
+                                };
+                                write_frame_reg_fast(frame, cycle_collector, dest, val)
+                            }
+                            Instruction::SetField(obj_reg, field_idx, value_reg) => {
+                                let is_fast_target = match &frame.registers[obj_reg as usize] {
+                                    Value::Struct(s) => s.name != "LuaTable",
+                                    Value::Map(_) => true,
+                                    _ => false,
+                                };
+                                if !is_fast_target {
+                                    break 'frame_fast FrameExit::Slow(
+                                        instruction,
+                                        ip_before_execution,
+                                    );
+                                }
+                                let field_name = constants[field_idx as usize]
+                                    .as_string_rc()
+                                    .ok_or_else(|| LustError::RuntimeError {
+                                        message: "Field name must be a string".to_string(),
+                                    })?;
+                                let value = frame.registers[value_reg as usize].fast_clone();
+                                match &frame.registers[obj_reg as usize] {
+                                    Value::Struct(_) => {
+                                        let invalidate_key =
+                                            Self::struct_cache_key(&frame.registers[obj_reg as usize]);
+                                        frame.registers[obj_reg as usize]
+                                            .struct_set_field_rc(&field_name, value)
+                                            .map_err(|message| LustError::RuntimeError { message })?;
+                                        if let Some(key) = invalidate_key {
+                                            struct_tostring_cache.remove(&key);
+                                        }
+                                    }
+                                    Value::Map(map) => {
+                                        let key = ValueKey::from(field_name);
+                                        if budgets.mem_budget_enabled()
+                                            && !map.borrow().contains_key(&key)
+                                        {
+                                            budgets.charge_map_entry_estimate()?;
+                                        }
+                                        map.borrow_mut().insert(key, value);
+                                    }
+                                    _ => unreachable!(),
+                                }
+                                false
+                            }
+                            Instruction::Concat(dest, lhs, rhs) => {
+                                let both_strings = matches!(
+                                    (
+                                        &frame.registers[lhs as usize],
+                                        &frame.registers[rhs as usize]
+                                    ),
+                                    (Value::String(_), Value::String(_))
+                                );
+                                if !both_strings {
+                                    break 'frame_fast FrameExit::Slow(
+                                        instruction,
+                                        ip_before_execution,
+                                    );
+                                }
+                                let mut in_place_done = false;
+                                if dest == lhs {
+                                    let right_rc = match &frame.registers[rhs as usize] {
+                                        Value::String(s) => Rc::clone(s),
+                                        _ => unreachable!(),
+                                    };
+                                    let right_len = right_rc.len();
+                                    if let Value::String(ref mut rc) =
+                                        frame.registers[dest as usize]
+                                    {
+                                        if let Some(s_mut) = Rc::get_mut(rc) {
+                                            budgets.charge_mem_bytes(right_len)?;
+                                            s_mut.push_str(right_rc.as_str());
+                                            in_place_done = true;
+                                        }
+                                    }
+                                }
+                                if !in_place_done {
+                                    let (left_rc, right_rc) = match (
+                                        &frame.registers[lhs as usize],
+                                        &frame.registers[rhs as usize],
+                                    ) {
+                                        (Value::String(l), Value::String(r)) => {
+                                            (Rc::clone(l), Rc::clone(r))
+                                        }
+                                        _ => unreachable!(),
+                                    };
+                                    let cap = left_rc.len().saturating_add(right_rc.len());
+                                    budgets.charge_mem_bytes(cap)?;
+                                    let mut combined = String::with_capacity(if dest == lhs {
+                                        cap.max(left_rc.len() * 2)
+                                    } else {
+                                        cap
+                                    });
+                                    combined.push_str(left_rc.as_str());
+                                    combined.push_str(right_rc.as_str());
+                                    write_frame_reg_fast(
+                                        frame,
+                                        cycle_collector,
+                                        dest,
+                                        Value::string(combined),
+                                    )
+                                } else {
+                                    false
+                                }
+                            }
+                            Instruction::GetIndex(dest, array_reg, index_reg) => {
+                                let Value::Array(arr) = &frame.registers[array_reg as usize] else {
+                                    break 'frame_fast FrameExit::Slow(
+                                        instruction,
+                                        ip_before_execution,
+                                    );
+                                };
+                                let idx = frame.registers[index_reg as usize]
+                                    .as_int()
+                                    .ok_or_else(|| LustError::RuntimeError {
+                                        message: "Array index must be an integer".to_string(),
+                                    })?;
+                                let result = if let Some(val) =
+                                    crate::bytecode::value::get_specialized_cached_element(arr, idx)
+                                {
+                                    val
+                                } else {
+                                    let borrowed = arr.borrow();
+                                    if idx < 0 || idx as usize >= borrowed.len() {
+                                        return Err(LustError::RuntimeError {
+                                            message: format!(
+                                                "Array index {} out of bounds (length: {})",
+                                                idx,
+                                                borrowed.len()
+                                            ),
+                                        });
+                                    }
+                                    borrowed[idx as usize].fast_clone()
+                                };
+                                write_frame_reg_fast(frame, cycle_collector, dest, result)
+                            }
+                            Instruction::SetIndex(collection_reg, index_reg, value_reg) => {
+                                let Value::Array(arr) = &frame.registers[collection_reg as usize]
+                                else {
+                                    break 'frame_fast FrameExit::Slow(
+                                        instruction,
+                                        ip_before_execution,
+                                    );
+                                };
+                                let idx = frame.registers[index_reg as usize]
+                                    .as_int()
+                                    .ok_or_else(|| LustError::RuntimeError {
+                                        message: "Array index must be an integer".to_string(),
+                                    })?;
+                                let value = frame.registers[value_reg as usize].fast_clone();
+                                if let Some(res) =
+                                    crate::bytecode::value::set_specialized_cached_element(
+                                        arr, idx, &value,
+                                    )
+                                {
+                                    res.map_err(|message| LustError::RuntimeError { message })?;
+                                } else {
+                                    let mut borrowed = arr.borrow_mut();
+                                    if idx < 0 || idx as usize >= borrowed.len() {
+                                        return Err(LustError::RuntimeError {
+                                            message: format!(
+                                                "Array index {} out of bounds (length: {})",
+                                                idx,
+                                                borrowed.len()
+                                            ),
+                                        });
+                                    }
+                                    borrowed[idx as usize] = value;
+                                    crate::bytecode::value::invalidate_specialized_array_cache(
+                                        arr.as_ptr() as usize,
+                                    );
+                                }
+                                false
+                            }
+                            Instruction::ArrayIndexOk(val_dest, cond_dest, array_reg, idx_reg) => {
+                                let Value::Array(arr) = &frame.registers[array_reg as usize] else {
+                                    let ty = frame.registers[array_reg as usize].type_of();
+                                    return Err(LustError::RuntimeError {
+                                        message: format!("Cannot index {:?}", ty),
+                                    });
+                                };
+                                let idx = frame.registers[idx_reg as usize]
+                                    .as_int()
+                                    .ok_or_else(|| LustError::RuntimeError {
+                                        message: "Array index must be an integer".to_string(),
+                                    })?;
+                                let found = if let Some(val) =
+                                    crate::bytecode::value::get_specialized_cached_element(arr, idx)
+                                {
+                                    Some(val)
+                                } else if let Some(len) =
+                                    crate::bytecode::value::get_specialized_cached_len(arr)
+                                {
+                                    if idx >= 0 && (idx as usize) < len {
+                                        let borrowed = arr.borrow();
+                                        if (idx as usize) < borrowed.len() {
+                                            Some(borrowed[idx as usize].fast_clone())
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    let borrowed = arr.borrow();
+                                    if idx >= 0 && (idx as usize) < borrowed.len() {
+                                        Some(borrowed[idx as usize].fast_clone())
+                                    } else {
+                                        None
+                                    }
+                                };
+                                if let Some(val) = found {
+                                    let c1 =
+                                        write_frame_reg_fast(frame, cycle_collector, val_dest, val);
+                                    let c2 = write_frame_reg_fast(
+                                        frame,
+                                        cycle_collector,
+                                        cond_dest,
+                                        Value::Bool(true),
+                                    );
+                                    c1 || c2
+                                } else {
+                                    write_frame_reg_fast(
+                                        frame,
+                                        cycle_collector,
+                                        cond_dest,
+                                        Value::Bool(false),
+                                    )
+                                }
+                            }
+                            Instruction::ArrayLen(dest, array_reg) => {
+                                let len = match &frame.registers[array_reg as usize] {
+                                    Value::Array(arr) => {
+                                        crate::bytecode::value::get_specialized_cached_len(arr)
+                                            .unwrap_or_else(|| arr.borrow().len())
+                                    }
+                                    other => {
+                                        return Err(LustError::RuntimeError {
+                                            message: format!(
+                                                "ArrayLen requires array, got {:?}",
+                                                other.type_of()
+                                            ),
+                                        });
+                                    }
+                                };
+                                write_frame_reg_fast(
+                                    frame,
+                                    cycle_collector,
+                                    dest,
+                                    Value::Int(int_from_usize(len)),
+                                )
+                            }
+                            Instruction::LoadUpvalue(dest, upvalue_idx) => {
+                                if (upvalue_idx as usize) < frame.upvalues.len() {
+                                    let value = frame.upvalues[upvalue_idx as usize].clone();
+                                    write_frame_reg_fast(frame, cycle_collector, dest, value)
+                                } else {
+                                    return Err(LustError::RuntimeError {
+                                        message: format!(
+                                            "Upvalue index {} out of bounds (have {} upvalues)",
+                                            upvalue_idx,
+                                            frame.upvalues.len()
+                                        ),
+                                    });
+                                }
+                            }
+                            Instruction::StoreUpvalue(upvalue_idx, src) => {
+                                let value = frame.registers[src as usize].clone();
+                                let idx = upvalue_idx as usize;
+                                if idx < frame.upvalues.len() {
+                                    frame.upvalues[idx] = value.clone();
+                                    if idx < frame.shared_upvalues.len() {
+                                        frame.shared_upvalues[idx].set(value);
+                                    }
+                                    false
+                                } else {
+                                    return Err(LustError::RuntimeError {
+                                        message: format!(
+                                            "Upvalue index {} out of bounds (have {} upvalues)",
+                                            upvalue_idx,
+                                            frame.upvalues.len()
+                                        ),
+                                    });
+                                }
+                            }
+
+                            _ => {
+                                break 'frame_fast FrameExit::Slow(instruction, ip_before_execution);
+                            }
+                        };
+
+                        if needs_collect {
+                            break 'frame_fast FrameExit::CollectCycles;
+                        }
+                    }
+                };
+
+                match exit {
+                    FrameExit::EndOfChunk => {
+                        if let Some(frame) = self.call_stack.pop() {
+                            self.recycle_frame(frame);
+                        }
+                        if self.call_stack.is_empty() {
+                            return Ok(Value::Nil);
+                        }
+                        frame_dirty = true;
+                        continue 'dispatch;
+                    }
+                    FrameExit::CollectCycles => {
+                        self.maybe_collect_cycles();
+                        frame_dirty = true;
+                        continue 'dispatch;
+                    }
+                    FrameExit::OutOfGas(limit) => {
+                        return Err(self.handle_out_of_gas_slow(limit));
+                    }
+                    #[cfg(feature = "std")]
+                    FrameExit::TryOsr(target_ip) => {
+                        frame_dirty = true;
+                        if let Some(outcome) =
+                            self.try_enter_osr_at_backedge(cur_func_idx, target_ip)?
+                        {
+                            match outcome {
+                                crate::vm::OsrBackedgeOutcome::Return(Some(val)) => {
+                                    return Ok(val);
+                                }
+                                crate::vm::OsrBackedgeOutcome::Return(None)
+                                | crate::vm::OsrBackedgeOutcome::DeoptimizedResume => {
+                                    continue 'dispatch;
+                                }
+                            }
+                        }
+                        continue 'dispatch;
+                    }
+                    FrameExit::Slow(instruction, ip_before_execution) => {
+                        frame_dirty = true;
+                        (instruction, ip_before_execution)
                     }
                 }
-                return Err(e);
-            }
+            } else {
+                let (instruction, ip_before_execution) = {
+                    let frame = &mut self.call_stack[cur_frame_idx];
+                    let ip = frame.ip;
+                    if ip >= cur_chunk_len {
+                        if let Some(frame) = self.call_stack.pop() {
+                            self.recycle_frame(frame);
+                        }
+                        if self.call_stack.is_empty() {
+                            return Ok(Value::Nil);
+                        }
+                        frame_dirty = true;
+                        continue 'dispatch;
+                    }
+                    let instruction = self.functions[cur_func_idx].chunk.instructions[ip];
+                    frame.ip = ip + 1;
+                    (instruction, ip + 1)
+                };
+
+                if JIT_ENABLED {
+                    let (should_check_jit, loop_start_ip) =
+                        if let Instruction::Jump(offset) = instruction {
+                            if offset < 0 {
+                                let jump_target =
+                                    (ip_before_execution as isize + offset as isize) as usize;
+                                (true, jump_target)
+                            } else {
+                                (false, 0)
+                            }
+                        } else {
+                            (false, 0)
+                        };
+                    if should_check_jit && self.quantum_fuel.is_none() {
+                        let count = self.jit.profiler.record_backedge(func_idx, loop_start_ip);
+                        let backedge_ip = ip_before_execution.saturating_sub(1);
+                        if self
+                            .trace_recorder
+                            .as_ref()
+                            .is_some_and(|recorder| !recorder.is_recording())
+                        {
+                            self.abandon_trace_recording();
+                        }
+                        // No trace runs while one is being recorded, except the
+                        // root trace of a nested loop the recording is skipping:
+                        // that loop's iterations are not part of the trace, and
+                        // interpreting them (a million, for a big array) would be
+                        // what the recording costs.
+                        let skipped_nested = self.trace_recorder.as_ref().is_some_and(|recorder| {
+                            recorder.skipped_loop() == Some((func_idx, loop_start_ip))
+                        });
+                        let root_trace_id = if self.trace_recorder.is_none() || skipped_nested {
+                            self.jit
+                                .root_traces
+                                .get(&(func_idx, loop_start_ip))
+                                .copied()
+                        } else {
+                            None
+                        };
+                        if let Some(trace_id) = root_trace_id {
+                            let frame = self.call_stack.last_mut().unwrap();
+                            let registers_ptr = frame.registers.as_mut_ptr();
+                            if let Some(trace) = self.jit.trace_handle(trace_id) {
+                                frame_dirty = true;
+                                self.jit.record_native_entry();
+                                crate::jit::log(|| {
+                                    format!(
+                                        "▶️  JIT: Executing trace #{} at func {} ip {}",
+                                        trace_id.0, func_idx, loop_start_ip
+                                    )
+                                });
+
+                                let trace_gas_cost = {
+                                    let cost = trace.trace.ops.len()
+                                        + trace.trace.preamble.len()
+                                        + trace.trace.postamble.len();
+                                    core::cmp::max(1, cost) as u64
+                                };
+                                self.budgets.charge_gas(trace_gas_cost)?;
+                                self.publish_gas_to_cells();
+                                self.pending_jit_error = None;
+
+                                // Capture RSP before and after to detect stack leaks (x86_64 only)
+                                #[cfg(target_arch = "x86_64")]
+                                let rsp_before: usize;
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    core::arch::asm!("mov {}, rsp", out(reg) rsp_before)
+                                };
+
+                                let vm_ptr = self as *mut VM;
+                                let _jit_guard = self.enter_jit_scope();
+                                let result = trace.execute(registers_ptr, vm_ptr, ptr::null());
+                                drop(_jit_guard);
+                                drop(trace);
+                                self.sync_gas_from_cells();
+
+                                #[cfg(target_arch = "x86_64")]
+                                let rsp_after: usize;
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    core::arch::asm!("mov {}, rsp", out(reg) rsp_after)
+                                };
+
+                                #[cfg(target_arch = "x86_64")]
+                                let rsp_diff = rsp_after as isize - rsp_before as isize;
+                                crate::jit::log(|| {
+                                    #[cfg(target_arch = "x86_64")]
+                                    return format!(
+                                        "🎯 JIT: Trace #{} execution result: {} (RSP before: {:x}, after: {:x}, diff: {})",
+                                        trace_id.0, result, rsp_before, rsp_after, rsp_diff
+                                    );
+                                    #[cfg(not(target_arch = "x86_64"))]
+                                    return format!(
+                                        "🎯 JIT: Trace #{} execution result: {}",
+                                        trace_id.0, result
+                                    );
+                                });
+
+                                if result == 0 {
+                                    if self.current_task.is_some()
+                                        && self.pending_task_signal.is_some()
+                                    {
+                                        if let Some(frame) = self.call_stack.last_mut() {
+                                            frame.ip = ip_before_execution.saturating_sub(1);
+                                        }
+                                        continue 'dispatch;
+                                    }
+
+                                    if let Some(frame) = self.call_stack.last_mut() {
+                                        frame.ip = loop_start_ip;
+                                    }
+
+                                    continue 'dispatch;
+                                } else if result > 0 {
+                                    self.jit.record_guard_exit();
+                                    let guard_index = (result - 1) as usize;
+                                    let bailout_ip = self
+                                        .jit
+                                        .get_trace(trace_id)
+                                        .and_then(|trace| trace.guards.get(guard_index))
+                                        .map(|guard| guard.bailout_ip);
+
+                                    crate::jit::log(|| {
+                                        let kind = self
+                                            .jit
+                                            .get_trace(trace_id)
+                                            .and_then(|trace| trace.guards.get(guard_index))
+                                            .map(|guard| format!("{:?}", guard.kind));
+                                        format!(
+                                            "↩️  JIT: guard #{guard_index} exit {kind:?} → ip {bailout_ip:?}"
+                                        )
+                                    });
+                                    // A nested loop's trace may have bailed out
+                                    // somewhere other than the guard's own ip.
+                                    let bailout_ip =
+                                        self.nested_loop_exit_ip.take().or(bailout_ip);
+                                    if let Some(bailout_ip) = bailout_ip
+                                        && let Some(frame) = self.call_stack.last_mut()
+                                    {
+                                        frame.ip = bailout_ip;
+                                    }
+                                    if let Some(error) = self.pending_jit_error.take() {
+                                        return Err(error);
+                                    }
+
+                                    self.handle_guard_failure(trace_id, guard_index, func_idx)?;
+                                    let reusable_exit = self
+                                        .jit
+                                        .get_trace(trace_id)
+                                        .and_then(|trace| trace.guards.get(guard_index))
+                                        .is_some_and(|guard| {
+                                            matches!(
+                                                guard.kind,
+                                                crate::jit::GuardKind::Truthy { .. }
+                                                    | crate::jit::GuardKind::Falsy { .. }
+                                                    | crate::jit::GuardKind::NestedLoop { .. }
+                                                    | crate::jit::GuardKind::Plain { .. }
+                                            )
+                                        });
+                                    if !reusable_exit {
+                                        self.jit.evict_root_trace(func_idx, loop_start_ip);
+                                    }
+                                    continue 'dispatch;
+                                } else {
+                                    self.jit.record_execution_failure();
+                                    if let Some(error) = self.pending_jit_error.take() {
+                                        return Err(error);
+                                    }
+                                    let resume_ip = if result <= -2 {
+                                        self.jit
+                                            .get_trace(trace_id)
+                                            .and_then(|trace| {
+                                                trace.fail_sites.get((-result - 2) as usize)
+                                            })
+                                            .copied()
+                                    } else {
+                                        None
+                                    };
+                                    crate::jit::log(|| {
+                                        format!(
+                                            "⚠️  JIT: Trace execution failed (result {result}), resuming at ip {:?}",
+                                            resume_ip
+                                        )
+                                    });
+                                    if let Some(frame) = self.call_stack.last_mut() {
+                                        frame.ip = resume_ip.unwrap_or(loop_start_ip);
+                                    }
+
+                                    self.jit.evict_root_trace(func_idx, loop_start_ip);
+                                    continue 'dispatch;
+                                }
+                            }
+                        } else {
+                            if let Some(recorder) = &mut self.trace_recorder {
+                                let recording_this_loop = recorder.trace.function_idx == func_idx
+                                    && recorder.trace.start_ip == loop_start_ip;
+                                if recorder.is_recording() && recording_this_loop {
+                                    crate::jit::log(|| {
+                                        format!(
+                                            "📝 JIT: Trace recording complete - {} ops recorded",
+                                            recorder.trace.ops.len()
+                                        )
+                                    });
+                                    let mut recorder = self.trace_recorder.take().unwrap();
+                                    recorder.complete_nested_skip_at(backedge_ip);
+                                    if !recorder.is_recording() {
+                                        self.jit.recording_aborted(func_idx, loop_start_ip);
+                                        frame_dirty = true;
+                                        continue 'dispatch;
+                                    }
+                                    let mut trace = recorder.finish();
+                                    let mut optimizer = TraceOptimizer::new();
+                                    let hoisted_constants = optimizer.optimize(&mut trace);
+                                    crate::jit::log(|| {
+                                        "⚙️  JIT: Compiling root trace...".to_string()
+                                    });
+                                    let trace_id = self.jit.alloc_trace_id();
+                                    match JitCompiler::new()
+                                        .with_gas_checks(self.gas_checked())
+                                        .compile_trace(
+                                            &trace,
+                                            trace_id,
+                                            hoisted_constants.clone(),
+                                        )
+                                    {
+                                        Ok(compiled_trace) => {
+                                            crate::jit::log(|| {
+                                                format!(
+                                                    "✅ JIT: Trace #{} compiled successfully!",
+                                                    trace_id.0
+                                                )
+                                            });
+                                            crate::jit::log(|| {
+                                                "🚀 JIT: Future iterations will use native code!"
+                                                    .to_string()
+                                            });
+                                            self.jit.store_root_trace(
+                                                func_idx,
+                                                loop_start_ip,
+                                                compiled_trace,
+                                            );
+                                        }
+
+                                        Err(e) => {
+                                            crate::jit::log(|| {
+                                                format!("❌ JIT: Trace compilation failed: {}", e)
+                                            });
+                                            self.jit.recording_aborted(func_idx, loop_start_ip);
+                                        }
+                                    }
+                                }
+                            }
+
+                            if self.trace_recorder.is_none()
+                                && !self
+                                    .jit
+                                    .root_traces
+                                    .contains_key(&(func_idx, loop_start_ip))
+                            {
+                                let loop_in_hierarchy = match self
+                                    .jit
+                                    .profiler
+                                    .get_cached_loop_hierarchy(func_idx, loop_start_ip)
+                                {
+                                    Some(cached) => cached,
+                                    None => {
+                                        let calculated = self.is_loop_in_hierarchy(
+                                            func_idx,
+                                            loop_start_ip,
+                                            backedge_ip,
+                                        );
+                                        self.jit.profiler.set_cached_loop_hierarchy(
+                                            func_idx,
+                                            loop_start_ip,
+                                            calculated,
+                                        );
+                                        calculated
+                                    }
+                                };
+                                if self.jit.should_record_root(
+                                    func_idx,
+                                    loop_start_ip,
+                                    count,
+                                    crate::jit::HOT_THRESHOLD + u32::from(loop_in_hierarchy),
+                                ) {
+                                    crate::jit::log(|| {
+                                        format!(
+                                            "🔥 JIT: Hot loop detected at func {} ip {} - starting trace recording!",
+                                            func_idx, loop_start_ip
+                                        )
+                                    });
+                                    let mut recorder = TraceRecorder::new(
+                                        func_idx,
+                                        loop_start_ip,
+                                        MAX_TRACE_LENGTH,
+                                    );
+                                    recorder.set_root_frame_index(
+                                        self.call_stack.len().saturating_sub(1),
+                                    );
+                                    recorder.set_intrinsics(&self.jit.intrinsics);
+                                    // Specialize loop-invariant values at trace entry
+                                    if !self
+                                        .jit
+                                        .no_specialize_sites
+                                        .contains(&(func_idx, loop_start_ip))
+                                    {
+                                        let frame = self.call_stack.last().unwrap();
+                                        let func = &self.functions[func_idx];
+                                        recorder.specialize_trace_inputs(&frame.registers, func);
+                                    }
+                                    self.trace_recorder = Some(recorder);
+                                    self.jit.recording_started();
+                                    self.skip_next_trace_record = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                #[cfg(feature = "std")]
+                if crate::vm::tracing::has_trace_hook() {
+                    self.dispatch_instruction_hook_slow(func_idx, ip_before_execution);
+                    frame_dirty = true;
+                }
+
+                if MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed) {
+                    Self::record_mutation_m1_skip_gas();
+                } else {
+                    self.budgets.gas.used = self.budgets.gas.used.saturating_add(1);
+                    if self.slow_path_flags & SLOW_PATH_GAS_LIMIT != 0
+                        && let Some(limit) = self.budgets.gas.limit
+                        && self.budgets.gas.used > limit
+                    {
+                        return Err(self.handle_out_of_gas_slow(limit));
+                    }
+                }
+
+                // Structurally guarantee every outer-dispatch instruction reloads
+                // cached frame metadata on the next iteration (zero cost on `'frame_fast`).
+                frame_dirty = true;
+                (instruction, ip_before_execution)
+            };
             match instruction {
                 Instruction::LoadNil(dest) => {
                     self.set_register(dest, Value::Nil)?;
@@ -593,7 +1902,7 @@ impl VM {
                 }
 
                 Instruction::LoadGlobal(dest, name_idx) => {
-                    let func = &self.functions[self.call_stack.last().unwrap().function_idx];
+                    let func = &self.functions[func_idx];
                     let name = func.chunk.constants[name_idx as usize]
                         .as_string()
                         .ok_or_else(|| LustError::RuntimeError {
@@ -633,7 +1942,7 @@ impl VM {
                 }
 
                 Instruction::StoreGlobal(name_idx, src) => {
-                    let func = &self.functions[self.call_stack.last().unwrap().function_idx];
+                    let func = &self.functions[func_idx];
                     let name = func.chunk.constants[name_idx as usize]
                         .as_string()
                         .ok_or_else(|| LustError::RuntimeError {
@@ -1043,8 +2352,9 @@ impl VM {
                     #[cfg(feature = "std")]
                     if offset < 0
                         && self.backend == crate::vm::VmBackend::Cranelift
-                        && !self.functions[func_idx].block_entry_pcs.is_empty()
+                        && cur_has_osr_entries
                     {
+                        frame_dirty = true;
                         if let Some(outcome) =
                             self.try_enter_osr_at_backedge(func_idx, target_ip)?
                         {
@@ -1088,6 +2398,7 @@ impl VM {
                 Instruction::Call(func_reg, first_arg, arg_count, dest_reg)
                     if self.plain_function_callee(func_reg) =>
                 {
+                    frame_dirty = true;
                     let frame =
                         self.bytecode_call_frame(func_reg, first_arg, arg_count, dest_reg)?;
                     let callee_idx = frame.function_idx;
@@ -1117,6 +2428,7 @@ impl VM {
                 }
 
                 Instruction::Call(func_reg, first_arg, arg_count, dest_reg) => {
+                    frame_dirty = true;
                     let func_value = self.get_register(func_reg)?.clone();
                     if let Some(intrinsic_name) = Self::get_effect_intrinsic_name(&func_value) {
                         let mut args = Vec::with_capacity(arg_count as usize);
@@ -1270,6 +2582,7 @@ impl VM {
                 }
 
                 Instruction::Return(value_reg) => {
+                    frame_dirty = true;
                     let return_value = if value_reg == 255 {
                         Value::Nil
                     } else {
@@ -1351,7 +2664,7 @@ impl VM {
                     field_count,
                 ) => {
                     self.budgets.charge_value_vec(field_count as usize)?;
-                    let func = &self.functions[self.call_stack.last().unwrap().function_idx];
+                    let func = &self.functions[func_idx];
                     let struct_name = func.chunk.constants[name_idx as usize]
                         .as_string()
                         .ok_or_else(|| LustError::RuntimeError {
@@ -1375,7 +2688,7 @@ impl VM {
                 }
 
                 Instruction::NewEnumUnit(dest, enum_name_idx, variant_idx) => {
-                    let func = &self.functions[self.call_stack.last().unwrap().function_idx];
+                    let func = &self.functions[func_idx];
                     let enum_name = func.chunk.constants[enum_name_idx as usize]
                         .as_string_rc()
                         .ok_or_else(|| LustError::RuntimeError {
@@ -1398,7 +2711,7 @@ impl VM {
                     value_count,
                 ) => {
                     self.budgets.charge_value_vec(value_count as usize)?;
-                    let func = &self.functions[self.call_stack.last().unwrap().function_idx];
+                    let func = &self.functions[func_idx];
                     let enum_name = func.chunk.constants[enum_name_idx as usize]
                         .as_string()
                         .ok_or_else(|| LustError::RuntimeError {
@@ -1421,7 +2734,7 @@ impl VM {
 
                 Instruction::IsEnumVariant(dest, value_reg, enum_name_idx, variant_idx) => {
                     let value = self.get_register(value_reg)?;
-                    let func = &self.functions[self.call_stack.last().unwrap().function_idx];
+                    let func = &self.functions[func_idx];
                     let enum_name = func.chunk.constants[enum_name_idx as usize]
                         .as_string()
                         .ok_or_else(|| LustError::RuntimeError {
@@ -1460,13 +2773,14 @@ impl VM {
 
                 Instruction::GetField(dest, obj, field_idx) => {
                     let object = self.get_register(obj)?;
-                    let func = &self.functions[self.call_stack.last().unwrap().function_idx];
+                    let func = &self.functions[func_idx];
                     let field_name = func.chunk.constants[field_idx as usize]
                         .as_string_rc()
                         .ok_or_else(|| LustError::RuntimeError {
                             message: "Field name must be a string".to_string(),
                         })?;
                     let value = if let Some(map_val) = Self::lua_table_map(object) {
+                        frame_dirty = true;
                         if let Value::Map(map) = map_val {
                             let raw_key_value = Value::String(field_name.clone());
                             let key =
@@ -1503,7 +2817,7 @@ impl VM {
                 Instruction::SetField(obj_reg, field_idx, value_reg) => {
                     let object = self.get_register(obj_reg)?.clone();
                     let value = self.get_register(value_reg)?.clone();
-                    let func = &self.functions[self.call_stack.last().unwrap().function_idx];
+                    let func = &self.functions[func_idx];
                     let field_name = func.chunk.constants[field_idx as usize]
                         .as_string_rc()
                         .ok_or_else(|| LustError::RuntimeError {
@@ -1511,6 +2825,7 @@ impl VM {
                         })?;
                     let mut invalidate_key: Option<usize> = None;
                     if let Some(map_val) = Self::lua_table_map(&object) {
+                        frame_dirty = true;
                         if let Value::Map(map) = map_val {
                             let raw_key_value = Value::String(field_name.clone());
                             let key =
@@ -1574,6 +2889,9 @@ impl VM {
                             })?;
                             frame.registers[rhs as usize].clone()
                         };
+                        if matches!(right, Value::Struct(_) | Value::Enum(_)) {
+                            frame_dirty = true;
+                        }
                         let right_str = self.value_to_string_for_concat(&right)?;
                         let right_len = right_str.len();
 
@@ -1601,6 +2919,11 @@ impl VM {
                             let right = frame.registers[rhs as usize].clone();
                             (left, right)
                         };
+                        if matches!(left, Value::Struct(_) | Value::Enum(_))
+                            || matches!(right, Value::Struct(_) | Value::Enum(_))
+                        {
+                            frame_dirty = true;
+                        }
                         let left_str = self.value_to_string_for_concat(&left)?;
                         let right_str = self.value_to_string_for_concat(&right)?;
                         let cap = left_str.len().saturating_add(right_str.len());
@@ -1617,6 +2940,7 @@ impl VM {
                     let collection = self.get_register(array_reg)?.clone();
                     let index = self.get_register(index_reg)?.clone();
                     let result = if let Some(map_val) = Self::lua_table_map(&collection) {
+                        frame_dirty = true;
                         if let Value::Map(map) = map_val {
                             let raw_key = self.make_hash_key(&Self::lua_table_key_value(&index))?;
                             let borrowed = map.borrow();
@@ -1652,6 +2976,7 @@ impl VM {
                             }
 
                             Value::Map(map) => {
+                                frame_dirty = true;
                                 let key = self.make_hash_key(&index)?;
                                 map.borrow().get(&key).cloned().unwrap_or(Value::Nil)
                             }
@@ -1670,6 +2995,7 @@ impl VM {
                     let collection = self.get_register(collection_reg)?.clone();
                     let index = self.get_register(index_reg)?.clone();
                     let result = if let Some(map_val) = Self::lua_table_map(&collection) {
+                        frame_dirty = true;
                         if let Value::Map(map) = map_val {
                             let raw_key = self.make_hash_key(&Self::lua_table_key_value(&index))?;
                             let borrowed = map.borrow();
@@ -1689,6 +3015,7 @@ impl VM {
                                 self.array_index_result(&collection, index)?
                             }
                             Value::Map(map) => {
+                                frame_dirty = true;
                                 let key = self.make_hash_key(&index)?;
                                 map.borrow().get(&key).cloned().unwrap_or(Value::Nil)
                             }
@@ -1773,6 +3100,7 @@ impl VM {
                     arg_count,
                     dest_reg,
                 ) => 'method: {
+                    frame_dirty = true;
                     let object = self.get_register(obj_reg)?.clone();
                     // Fast path: a user-defined struct method already resolved
                     // at this call site.
@@ -1818,7 +3146,7 @@ impl VM {
                         }
                     }
                     let method_name = {
-                        let func = &self.functions[self.call_stack.last().unwrap().function_idx];
+                        let func = &self.functions[func_idx];
                         func.chunk.constants[method_name_idx as usize]
                             .as_string()
                             .ok_or_else(|| LustError::RuntimeError {
@@ -2018,6 +3346,7 @@ impl VM {
                     let index = self.get_register(index_reg)?.clone();
                     let value = self.get_register(value_reg)?.clone();
                     if let Some(map_val) = Self::lua_table_map(&collection) {
+                        frame_dirty = true;
                         if let Value::Map(map) = map_val {
                             let key = self.make_hash_key(&Self::lua_table_key_value(&index))?;
                             if self.budgets.mem_budget_enabled() && !map.borrow().contains_key(&key)
@@ -2059,6 +3388,7 @@ impl VM {
                             }
 
                             Value::Map(map) => {
+                                frame_dirty = true;
                                 let key = self.make_hash_key(&index)?;
                                 if self.budgets.mem_budget_enabled()
                                     && !map.borrow().contains_key(&key)
@@ -2079,7 +3409,7 @@ impl VM {
 
                 Instruction::TypeIs(dest, value_reg, type_name_idx) => {
                     let value = self.get_register(value_reg)?.clone();
-                    let func = &self.functions[self.call_stack.last().unwrap().function_idx];
+                    let func = &self.functions[func_idx];
                     let type_name = func.chunk.constants[type_name_idx as usize]
                         .as_string()
                         .ok_or_else(|| LustError::RuntimeError {
@@ -2092,7 +3422,7 @@ impl VM {
 
                 Instruction::TryCast(dest, value_reg, type_name_idx) => {
                     let value = self.get_register(value_reg)?.clone();
-                    let func = &self.functions[self.call_stack.last().unwrap().function_idx];
+                    let func = &self.functions[func_idx];
                     let type_name = func.chunk.constants[type_name_idx as usize]
                         .as_string()
                         .ok_or_else(|| LustError::RuntimeError {
@@ -2454,6 +3784,7 @@ impl VM {
         if self.call_until_depth == Some(self.call_stack.len()) {
             self.pending_return_value = Some(return_value);
             self.pending_return_dest = return_dest;
+            self.sync_slow_path_flags();
         } else if let Some(dest) = return_dest {
             self.set_register(dest, return_value)?;
         }
@@ -3370,6 +4701,7 @@ impl VM {
                         self.pending_return_dest = saved_pending_return_dest;
                         self.pending_task_signal = saved_pending_task_signal;
                         self.last_task_signal = saved_last_task_signal;
+                        self.sync_slow_path_flags();
                         Err(annotated)
                     }
                 }
@@ -3408,6 +4740,7 @@ impl VM {
                         self.pending_return_dest = saved_pending_return_dest;
                         self.pending_task_signal = saved_pending_task_signal;
                         self.last_task_signal = saved_last_task_signal;
+                        self.sync_slow_path_flags();
                         Err(annotated)
                     }
                 }

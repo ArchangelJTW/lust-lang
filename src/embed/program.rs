@@ -371,6 +371,111 @@ impl<'a> AsyncDriver<'a> {
     }
 }
 
+/// Trait for converting host callback outputs into an embed callback result (`Result<T, String>`).
+/// Seamlessly supports:
+/// - `Result<T, String>`
+/// - `Result<T, core::convert::Infallible>` / `Result<T, !>`
+/// - `Result<T, &'static str>`
+/// - `PureExit<T>` / `Exit<T, core::convert::Infallible>`
+/// - `Exit<T, String>`
+/// - Infallible primitive types (`i64`, `f64`, `bool`, `String`, `()`, `Value`, `Rc<String>`)
+pub trait IntoEmbedCallbackResult<T> {
+    fn into_embed_callback_result(self) -> std::result::Result<T, String>;
+}
+
+impl<T> IntoEmbedCallbackResult<T> for std::result::Result<T, String> {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<T, String> {
+        self
+    }
+}
+
+impl<T> IntoEmbedCallbackResult<T> for std::result::Result<T, core::convert::Infallible> {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<T, String> {
+        match self {
+            Ok(v) => Ok(v),
+            Err(infallible) => match infallible {},
+        }
+    }
+}
+
+impl<T> IntoEmbedCallbackResult<T> for std::result::Result<T, &'static str> {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<T, String> {
+        self.map_err(|s| s.to_string())
+    }
+}
+
+impl<T> IntoEmbedCallbackResult<T> for crate::effect_abi::Exit<T, core::convert::Infallible> {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<T, String> {
+        match self.into_ok_or_defect() {
+            Ok(v) => Ok(v),
+            Err(defect) => Err(defect.to_string()),
+        }
+    }
+}
+
+impl<T> IntoEmbedCallbackResult<T> for crate::effect_abi::Exit<T, String> {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<T, String> {
+        match self {
+            crate::effect_abi::Exit::Success(v) => Ok(v),
+            crate::effect_abi::Exit::Failure(cause) => Err(format!("{cause:?}")),
+        }
+    }
+}
+
+impl IntoEmbedCallbackResult<i64> for i64 {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<i64, String> {
+        Ok(self)
+    }
+}
+
+impl IntoEmbedCallbackResult<f64> for f64 {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<f64, String> {
+        Ok(self)
+    }
+}
+
+impl IntoEmbedCallbackResult<bool> for bool {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<bool, String> {
+        Ok(self)
+    }
+}
+
+impl IntoEmbedCallbackResult<String> for String {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<String, String> {
+        Ok(self)
+    }
+}
+
+impl IntoEmbedCallbackResult<()> for () {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<(), String> {
+        Ok(())
+    }
+}
+
+impl IntoEmbedCallbackResult<Value> for Value {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<Value, String> {
+        Ok(self)
+    }
+}
+
+impl IntoEmbedCallbackResult<Rc<String>> for Rc<String> {
+    #[inline]
+    fn into_embed_callback_result(self) -> std::result::Result<Rc<String>, String> {
+        Ok(self)
+    }
+}
+
 impl EmbeddedProgram {
     pub fn builder() -> EmbeddedBuilder {
         EmbeddedBuilder::default()
@@ -942,11 +1047,12 @@ impl EmbeddedProgram {
         Ok(())
     }
 
-    pub fn register_typed_native<Args, R, F>(&mut self, name: &str, func: F) -> Result<()>
+    pub fn register_typed_native<Args, R, F, Res>(&mut self, name: &str, func: F) -> Result<()>
     where
         Args: FromLustArgs,
         R: IntoLustValue + FromLustValue,
-        F: Fn(Args) -> std::result::Result<R, String> + 'static,
+        Res: IntoEmbedCallbackResult<R>,
+        F: Fn(Args) -> Res + 'static,
     {
         let (canonical, signature) = self.resolve_signature(name)?;
         if !Args::matches_signature(&signature.params) {
@@ -965,7 +1071,7 @@ impl EmbeddedProgram {
         let native_name = name.to_string();
         let handler = move |values: &[Value]| -> std::result::Result<NativeCallResult, String> {
             let args = Args::from_values(values)?;
-            let result = func(args)?;
+            let result = func(args).into_embed_callback_result()?;
             let value = result.into_value();
             VM::with_current(|vm| {
                 if vm.value_matches_type(&value, &return_type) {
@@ -982,6 +1088,21 @@ impl EmbeddedProgram {
         };
         self.register_native_with_aliases(name, canonical, handler);
         Ok(())
+    }
+
+    /// Register an infallible typed native callback without requiring Result wrapping.
+    pub fn register_infallible_typed_native<Args, R, F>(&mut self, name: &str, func: F) -> Result<()>
+    where
+        Args: FromLustArgs,
+        R: IntoLustValue + FromLustValue,
+        F: Fn(Args) -> R + 'static,
+    {
+        self.register_typed_native(
+            name,
+            move |args: Args| -> std::result::Result<R, core::convert::Infallible> {
+                Ok(func(args))
+            },
+        )
     }
 
     pub fn register_async_typed_native<Args, R, F, Fut>(

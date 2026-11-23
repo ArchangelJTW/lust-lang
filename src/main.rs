@@ -317,6 +317,7 @@ fn main() {
     }
 
     let mut is_zig_aot = false;
+    let mut is_rust_aot = false;
     if let Some(mode) = backend_mode {
         match mode.to_ascii_lowercase().as_str() {
             "vm" => {
@@ -332,12 +333,15 @@ fn main() {
             "zig" | "aot" => {
                 is_zig_aot = true;
             }
+            "rust" => {
+                is_rust_aot = true;
+            }
             "auto" => {
                 // Auto: default VM with JIT/MIR
             }
             other => {
                 eprintln!(
-                    "Error: unknown backend '{}'. Supported backends for run: vm, mir, cranelift, zig, auto",
+                    "Error: unknown backend '{}'. Supported backends for run: vm, mir, cranelift, zig, rust, auto",
                     other
                 );
                 process::exit(1);
@@ -368,7 +372,9 @@ fn main() {
     }
 
     if let Some(file) = script_file {
-        if is_zig_aot {
+        if is_rust_aot {
+            run_file_rust_aot(&file, pure_core);
+        } else if is_zig_aot {
             run_file_zig_aot(&file);
         } else {
             run_file_with_options(
@@ -1572,12 +1578,15 @@ fn build_command(args: &[String]) {
         eprintln!("       lust build [options] <entry.lust>");
         eprintln!();
         eprintln!("OPTIONS:");
-        eprintln!("    --backend <name>          Backend compiler: zig (default), mir-zig, mir");
+        eprintln!("    --backend <name>          Backend compiler: zig (default), rust, mir-zig, mir");
         eprintln!("    -o, --output <path>       Specify output binary or library path");
         eprintln!("    --cdylib, --dylib         Build dynamic shared library (.dylib, .so, .dll)");
         eprintln!("    --staticlib               Build static library (.a, .lib)");
         eprintln!("    --emit-h [path]           Generate C header file (.h)");
         eprintln!("    --emit-zig                Generate Zig source file without compiling");
+        eprintln!("    --emit-rs                 Generate Rust source file without compiling (--backend rust)");
+        eprintln!("    --gas-metering <mode>     Gas metering for Rust AOT: none (default), loop-chunked, exact");
+        eprintln!("    --gas-limit <units>       Gas limit for Rust AOT execution");
         eprintln!("    --release-fast            Optimize for speed (default)");
         eprintln!("    --release-safe            Optimize for speed with safety checks");
         eprintln!("    --release-small           Optimize for binary size");
@@ -1596,6 +1605,9 @@ fn build_command(args: &[String]) {
     let mut output_bin = None;
     let mut emit_zig = false;
     let mut emit_c = false;
+    let mut emit_rs = false;
+    let mut gas_metering = lust::codegen_zig::aot::GasMetering::None;
+    let mut gas_limit: Option<u64> = None;
     let mut emit_header_requested = false;
     let mut opts = lust::codegen_zig::CompileOptions::default();
     let mut link_libraries: Vec<PathBuf> = Vec::new();
@@ -1643,7 +1655,7 @@ fn build_command(args: &[String]) {
             "--backend" => {
                 index += 1;
                 let Some(val) = args.get(index) else {
-                    eprintln!("Error: --backend requires a backend name (zig, mir-zig, mir)");
+                    eprintln!("Error: --backend requires a backend name (zig, rust, mir-zig, mir)");
                     process::exit(1);
                 };
                 backend = val.clone();
@@ -1718,6 +1730,77 @@ fn build_command(args: &[String]) {
             "--emit-c" => {
                 emit_c = true;
             }
+            "--emit-rs" => {
+                emit_rs = true;
+            }
+            "--gas-metering" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --gas-metering requires a mode (none, loop-chunked, exact)");
+                    process::exit(1);
+                };
+                gas_metering = match val.to_ascii_lowercase().as_str() {
+                    "none" | "off" => lust::codegen_zig::aot::GasMetering::None,
+                    "loop-chunked" | "loop" => lust::codegen_zig::aot::GasMetering::LoopChunked,
+                    "exact" => lust::codegen_zig::aot::GasMetering::Exact,
+                    other => {
+                        eprintln!(
+                            "Error: unknown --gas-metering mode '{}'. Supported: none, loop-chunked, exact",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                };
+            }
+            opt if opt.starts_with("--gas-metering=") => {
+                let val = opt.strip_prefix("--gas-metering=").unwrap();
+                gas_metering = match val.to_ascii_lowercase().as_str() {
+                    "none" | "off" => lust::codegen_zig::aot::GasMetering::None,
+                    "loop-chunked" | "loop" => lust::codegen_zig::aot::GasMetering::LoopChunked,
+                    "exact" => lust::codegen_zig::aot::GasMetering::Exact,
+                    other => {
+                        eprintln!(
+                            "Error: unknown --gas-metering mode '{}'. Supported: none, loop-chunked, exact",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                };
+            }
+            "--gas-limit" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --gas-limit requires a positive integer argument");
+                    process::exit(1);
+                };
+                match val.parse::<u64>() {
+                    Ok(v) => {
+                        gas_limit = Some(v);
+                        if gas_metering == lust::codegen_zig::aot::GasMetering::None {
+                            gas_metering = lust::codegen_zig::aot::GasMetering::Exact;
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!("Error: invalid --gas-limit '{}'", val);
+                        process::exit(1);
+                    }
+                }
+            }
+            opt if opt.starts_with("--gas-limit=") => {
+                let val = opt.strip_prefix("--gas-limit=").unwrap();
+                match val.parse::<u64>() {
+                    Ok(v) => {
+                        gas_limit = Some(v);
+                        if gas_metering == lust::codegen_zig::aot::GasMetering::None {
+                            gas_metering = lust::codegen_zig::aot::GasMetering::Exact;
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!("Error: invalid --gas-limit '{}'", val);
+                        process::exit(1);
+                    }
+                }
+            }
             "--deny-ffi" | "--pure" => {
                 allow_ffi = false;
             }
@@ -1791,10 +1874,10 @@ fn build_command(args: &[String]) {
     }
 
     match backend.to_ascii_lowercase().as_str() {
-        "zig" | "mir-zig" | "mir" => {}
+        "zig" | "rust" | "mir-zig" | "mir" => {}
         other => {
             eprintln!(
-                "Error: unknown backend '{}'. Supported backends for build: zig, mir-zig, mir",
+                "Error: unknown backend '{}'. Supported backends for build: zig, rust, mir-zig, mir",
                 other
             );
             process::exit(1);
@@ -1931,6 +2014,113 @@ fn build_command(args: &[String]) {
             parent.join(format!("{}.{}", stem, default_extension))
         }
     });
+
+    if backend.to_ascii_lowercase() == "rust" {
+        // Mandatory NG-W12-4A frontend pipeline:
+        // TypeChecker::check_program -> prepare_items_for_mir -> AstLowering -> MirOptimizer + SROA
+        // -> refine_mir_function_with_layouts -> EscapeAnalysis -> cfg_structurer -> Rust emitter
+        let mut imports_map = lust::hashbrown::HashMap::new();
+        for m in &program.modules {
+            imports_map.insert(m.path.clone(), m.imports.clone());
+        }
+        let mut typechecker = TypeChecker::with_config(&config);
+        typechecker.set_imports_by_module(imports_map);
+        if let Err(e) = typechecker.check_program(&program.modules) {
+            if json_diag {
+                eprint!(
+                    "{}",
+                    cli::diag::json(format!("Type error: {e}"), "error", None, None)
+                );
+            } else {
+                eprintln!("Type error: {}", e);
+            }
+            process::exit(1);
+        }
+
+        let prepared_items = lust::codegen_zig::aot::prepare_items_for_mir(&filtered_items);
+        let mir_module =
+            match lust::mir::lowering::AstLowering::lower_module_items("main_module", &prepared_items)
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("MIR lowering error: {}", e);
+                    process::exit(1);
+                }
+            };
+
+        let rust_opts = lust::codegen_zig::aot::RustCompileOptions {
+            aot: lust::codegen_zig::aot::AotCompileOptions {
+                target_kind: match opts.target_kind {
+                    lust::codegen_zig::BuildTargetKind::Executable => {
+                        lust::codegen_zig::aot::AotTargetKind::Executable
+                    }
+                    lust::codegen_zig::BuildTargetKind::SharedLibrary => {
+                        lust::codegen_zig::aot::AotTargetKind::SharedLibrary
+                    }
+                    lust::codegen_zig::BuildTargetKind::StaticLibrary => {
+                        lust::codegen_zig::aot::AotTargetKind::StaticLibrary
+                    }
+                },
+                release_mode: opts.release_mode.clone(),
+                strip: opts.strip,
+                max_memory_bytes: opts.max_memory_bytes,
+                target_triple: opts.target_triple.clone(),
+            },
+            gas_metering,
+            gas_limit,
+            pure_core: !allow_ffi,
+            no_std: false,
+            cache_dir: opts.cache_dir.clone(),
+        };
+
+        if emit_rs {
+            let rust_source =
+                match lust::codegen_zig::aot::AotCompiler::emit_rust_module(&mir_module, &rust_opts)
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Rust AOT codegen error: {}", e);
+                        process::exit(1);
+                    }
+                };
+            let rs_file = if target_bin.extension().and_then(|e| e.to_str()) == Some("rs") {
+                target_bin
+            } else {
+                entry_path.with_extension("rs")
+            };
+            if let Some(parent) = rs_file.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if let Err(e) = fs::write(&rs_file, &rust_source) {
+                eprintln!("Failed to write {}: {}", rs_file.display(), e);
+                process::exit(1);
+            }
+            println!("Generated Rust source: {}", rs_file.display());
+            return;
+        }
+
+        let aot_links = lust::codegen_zig::aot::AotLinkOptions {
+            link_libraries: link_libraries.clone(),
+            link_dirs: link_dirs.clone(),
+            allow_ffi,
+        };
+
+        match lust::codegen_zig::aot::AotCompiler::compile_module_rust_with_links(
+            &mir_module,
+            &target_bin,
+            &rust_opts,
+            &aot_links,
+        ) {
+            Ok(bin) => {
+                println!("Successfully built AOT artifact: {}", bin.display());
+                return;
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        }
+    }
 
     if backend.to_ascii_lowercase() == "mir" {
         let prepared_items = lust::codegen_zig::aot::prepare_items_for_mir(&filtered_items);
@@ -2431,6 +2621,113 @@ fn run_file_with_options(
             "Cranelift stats: entries={} compilations={}",
             vm.cranelift_entry_count, vm.cranelift_compilation_count
         );
+    }
+}
+
+fn run_file_rust_aot(filename: &str, pure_core: bool) {
+    let entry_path = Path::new(filename);
+    let parent = entry_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut loader = ModuleLoader::new(parent);
+    let program = match loader.load_program_from_entry(filename) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error loading program: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let mut config = lust::config::LustConfig::load_for_entry(entry_path).unwrap_or_default();
+    if pure_core {
+        config.capability_mask_mut().allow_ffi = false;
+    }
+    let mut imports_map = lust::hashbrown::HashMap::new();
+    for m in &program.modules {
+        imports_map.insert(m.path.clone(), m.imports.clone());
+    }
+    let mut typechecker = TypeChecker::with_config(&config);
+    typechecker.set_imports_by_module(imports_map);
+    if let Err(e) = typechecker.check_program(&program.modules) {
+        eprintln!("Type error: {}", e);
+        process::exit(1);
+    }
+
+    let mut all_items = Vec::new();
+    for module in &program.modules {
+        all_items.extend(module.items.clone());
+    }
+    let filtered_items = lust::codegen_zig::tree_shake_items(&all_items, false);
+    let prepared_items = lust::codegen_zig::aot::prepare_items_for_mir(&filtered_items);
+    let mir_module =
+        match lust::mir::lowering::AstLowering::lower_module_items("main_module", &prepared_items) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("MIR lowering error: {}", e);
+                process::exit(1);
+            }
+        };
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = process::id();
+    let temp_dir = env::temp_dir().join(format!("lust_run_rust_{}_{}", pid, nanos));
+    if let Err(e) = fs::create_dir_all(&temp_dir) {
+        eprintln!("Failed to create temporary directory: {}", e);
+        process::exit(1);
+    }
+
+    let stem = entry_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("script");
+    let target_bin = temp_dir.join(if cfg!(target_os = "windows") {
+        format!("{}.exe", stem)
+    } else {
+        stem.to_string()
+    });
+
+    let rust_opts = lust::codegen_zig::aot::RustCompileOptions {
+        aot: lust::codegen_zig::aot::AotCompileOptions::default(),
+        gas_metering: lust::codegen_zig::aot::GasMetering::None,
+        gas_limit: None,
+        pure_core,
+        no_std: false,
+        cache_dir: None,
+    };
+
+    let compiled_bin =
+        match lust::codegen_zig::aot::AotCompiler::compile_module_rust(&mir_module, &target_bin, &rust_opts) {
+            Ok(bin) => bin,
+            Err(e) => {
+                eprintln!("{}", e);
+                let _ = fs::remove_dir_all(&temp_dir);
+                process::exit(1);
+            }
+        };
+
+    let status = Command::new(&compiled_bin).status();
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    match status {
+        Ok(s) => {
+            if let Some(code) = s.code() {
+                process::exit(code);
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    if let Some(sig) = s.signal() {
+                        process::exit(128 + sig);
+                    }
+                }
+                process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to execute compiled binary: {}", e);
+            process::exit(1);
+        }
     }
 }
 

@@ -150,7 +150,7 @@ impl HttpService {
                                                     .header("x-lust-runtime", "hyper-1.12-loopback")
                                                     .body(Full::new(Bytes::from(resp_bytes)))
                                                     .unwrap();
-                                                Ok::<_, std::convert::Infallible>(resp)
+                                                Ok::<_, !>(resp)
                                             }
                                         });
                                         let _ = http1::Builder::new().serve_connection(io, svc).await;

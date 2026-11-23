@@ -1022,6 +1022,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lust-aot-rt"
+version = "0.1.0"
+
+[[package]]
 name = "lust-fuzz"
 version = "0.1.0"
 dependencies = [

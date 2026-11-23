@@ -101,7 +101,115 @@ impl<E> Cause<E> {
     pub fn is_interrupt(&self) -> bool {
         matches!(self, Cause::Interrupt | Cause::Interrupted(_))
     }
+
+    /// Maps the failure type using the provided closure.
+    #[inline]
+    pub fn map_err<E2, F: FnOnce(E) -> E2>(self, f: F) -> Cause<E2> {
+        match self {
+            Cause::Fail(e) => Cause::Fail(f(e)),
+            Cause::Die(d) => Cause::Die(d),
+            Cause::Interrupt => Cause::Interrupt,
+            Cause::Interrupted(r) => Cause::Interrupted(r),
+        }
+    }
 }
+
+impl Cause<core::convert::Infallible> {
+    /// Extracts defect or interruption from an infallible failure cause.
+    #[inline]
+    pub fn into_defect_or_interrupt(self) -> DefectOrInterrupt {
+        match self {
+            Cause::Die(msg) => DefectOrInterrupt::Die(msg),
+            Cause::Interrupt => DefectOrInterrupt::Interrupt,
+            Cause::Interrupted(reason) => DefectOrInterrupt::Interrupted(reason),
+            Cause::Fail(infallible) => match infallible {},
+        }
+    }
+
+    /// Upcasts an infallible failure cause into any failure cause `Cause<E2>`.
+    /// Because `Cause::Fail` is uninhabited for `Infallible = !`, this conversion is unconditionally valid.
+    #[inline]
+    pub fn upcast_infallible<E2>(self) -> Cause<E2> {
+        match self {
+            Cause::Die(d) => Cause::Die(d),
+            Cause::Interrupt => Cause::Interrupt,
+            Cause::Interrupted(r) => Cause::Interrupted(r),
+            Cause::Fail(infallible) => match infallible {},
+        }
+    }
+}
+
+/// Typed terminal defect or interruption without typed user failures (statically proven uninhabited Cause::Fail).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefectOrInterrupt {
+    /// Unchecked defect / fatal panic.
+    Die(String),
+    /// Terminal interruption (generic).
+    Interrupt,
+    /// Terminal interruption with typed reason.
+    Interrupted(InterruptReason),
+}
+
+impl DefectOrInterrupt {
+    #[inline]
+    pub fn is_interrupt(&self) -> bool {
+        matches!(self, DefectOrInterrupt::Interrupt | DefectOrInterrupt::Interrupted(_))
+    }
+
+    #[inline]
+    pub fn interrupt_reason(&self) -> Option<InterruptReason> {
+        match self {
+            DefectOrInterrupt::Interrupted(r) => Some(*r),
+            DefectOrInterrupt::Interrupt => Some(InterruptReason::Cancelled),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn status_code(&self) -> LustStatus {
+        match self {
+            DefectOrInterrupt::Interrupted(r) => r.status_code(),
+            DefectOrInterrupt::Interrupt => LUST_STATUS_ERR_INTERRUPTED,
+            DefectOrInterrupt::Die(_) => LUST_STATUS_ERR_GENERIC,
+        }
+    }
+
+    /// Converts defect/interrupt into a full `Cause<E>` for any failure type `E`.
+    #[inline]
+    pub fn into_cause<E>(self) -> Cause<E> {
+        match self {
+            DefectOrInterrupt::Die(msg) => Cause::Die(msg),
+            DefectOrInterrupt::Interrupt => Cause::Interrupt,
+            DefectOrInterrupt::Interrupted(r) => Cause::Interrupted(r),
+        }
+    }
+}
+
+impl core::fmt::Display for DefectOrInterrupt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DefectOrInterrupt::Die(msg) => write!(f, "defect: {msg}"),
+            DefectOrInterrupt::Interrupt => write!(f, "interrupted"),
+            DefectOrInterrupt::Interrupted(r) => write!(f, "interrupted ({r:?})"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for DefectOrInterrupt {}
+
+impl<E> From<DefectOrInterrupt> for Cause<E> {
+    #[inline]
+    fn from(defect: DefectOrInterrupt) -> Self {
+        defect.into_cause()
+    }
+}
+
+/// Pure exit status of executing an infallible effect where typed failure is impossible (`E = Infallible = !`).
+pub type PureExit<A> = Exit<A, core::convert::Infallible>;
+
+/// Pure failure cause for an infallible effect (`E = Infallible = !`).
+pub type PureCause = Cause<core::convert::Infallible>;
 
 /// Disjoint result of executing an Effect<A, E, R>.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +276,37 @@ impl<A, E> Exit<A, E> {
             Exit::Failure(Cause::Interrupt) => LUST_STATUS_ERR_INTERRUPTED,
             Exit::Failure(Cause::Die(_)) => LUST_STATUS_ERR_GENERIC,
             Exit::Failure(Cause::Fail(_)) => LUST_STATUS_ERR_GENERIC,
+        }
+    }
+
+    /// Maps the failure type using the provided closure.
+    #[inline]
+    pub fn map_err<E2, F: FnOnce(E) -> E2>(self, f: F) -> Exit<A, E2> {
+        match self {
+            Exit::Success(a) => Exit::Success(a),
+            Exit::Failure(cause) => Exit::Failure(cause.map_err(f)),
+        }
+    }
+}
+
+impl<A> Exit<A, core::convert::Infallible> {
+    /// Extracts the successful value or returns the unhandled defect or interruption.
+    /// Because `E = Infallible`, typed failures (`Cause::Fail`) are statically impossible.
+    #[inline]
+    pub fn into_ok_or_defect(self) -> Result<A, DefectOrInterrupt> {
+        match self {
+            Exit::Success(a) => Ok(a),
+            Exit::Failure(cause) => Err(cause.into_defect_or_interrupt()),
+        }
+    }
+
+    /// Upcasts an infallible exit into any `Exit<A, E2>`.
+    /// Because `Cause::Fail` is uninhabited for `Infallible = !`, this conversion is unconditionally valid for any `E2`.
+    #[inline]
+    pub fn upcast_infallible<E2>(self) -> Exit<A, E2> {
+        match self {
+            Exit::Success(a) => Exit::Success(a),
+            Exit::Failure(cause) => Exit::Failure(cause.upcast_infallible()),
         }
     }
 }

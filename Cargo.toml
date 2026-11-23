@@ -10,6 +10,7 @@ members = [
   "crates/lust-telemetry-prometheus",
   "crates/lust-telemetry-tracing",
   "crates/lust-napi",
+  "crates/lust-aot-rt",
 ]
 exclude = ["examples/rust-extension/extensions/**", "tree-sitter-lust", "tests/compile_fail/fs_gate"]
 

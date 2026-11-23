@@ -1,0 +1,12 @@
+[package]
+name = "lust-aot-rt"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Lightweight no_std + alloc runtime crate for Lust Rust-based AOT compilation"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]

@@ -1551,45 +1551,41 @@ thread_local! {
 }
 
 #[cfg(feature = "std")]
-struct DebugCycleGuard(usize);
-#[cfg(feature = "std")]
-impl Drop for DebugCycleGuard {
-    fn drop(&mut self) {
+fn debug_cycle_guard(ptr: usize) -> core::mem::DropGuard<usize, fn(usize)> {
+    core::mem::DropGuard::new(ptr, |ptr| {
         VISITED_DEBUG.with(|cell| {
             let mut v = cell.borrow_mut();
-            if let Some(pos) = v.iter().rposition(|p| *p == self.0) {
+            if let Some(pos) = v.iter().rposition(|p| *p == ptr) {
                 v.remove(pos);
             }
         });
-    }
+    })
 }
 
 #[cfg(feature = "std")]
-struct DisplayCycleGuard(usize);
-#[cfg(feature = "std")]
-impl Drop for DisplayCycleGuard {
-    fn drop(&mut self) {
+fn display_cycle_guard(ptr: usize) -> core::mem::DropGuard<usize, fn(usize)> {
+    core::mem::DropGuard::new(ptr, |ptr| {
         VISITED_DISPLAY.with(|cell| {
             let mut v = cell.borrow_mut();
-            if let Some(pos) = v.iter().rposition(|p| *p == self.0) {
+            if let Some(pos) = v.iter().rposition(|p| *p == ptr) {
                 v.remove(pos);
             }
         });
-    }
+    })
 }
 
 #[cfg(feature = "std")]
-struct EqCycleGuard((usize, usize));
-#[cfg(feature = "std")]
-impl Drop for EqCycleGuard {
-    fn drop(&mut self) {
+fn eq_cycle_guard(
+    pair: (usize, usize),
+) -> core::mem::DropGuard<(usize, usize), fn((usize, usize))> {
+    core::mem::DropGuard::new(pair, |pair| {
         VISITED_EQ_PAIRS.with(|cell| {
             let mut v = cell.borrow_mut();
-            if let Some(pos) = v.iter().rposition(|p| *p == self.0) {
+            if let Some(pos) = v.iter().rposition(|p| *p == pair) {
                 v.remove(pos);
             }
         });
-    }
+    })
 }
 
 impl fmt::Debug for Value {
@@ -1611,7 +1607,7 @@ impl fmt::Debug for Value {
                 #[cfg(feature = "std")]
                 VISITED_DEBUG.with(|c| c.borrow_mut().push(ptr));
                 #[cfg(feature = "std")]
-                let _guard = DebugCycleGuard(ptr);
+                let _guard = debug_cycle_guard(ptr);
 
                 write!(f, "Array([")?;
                 let borrowed = arr.borrow();
@@ -1632,7 +1628,7 @@ impl fmt::Debug for Value {
                 #[cfg(feature = "std")]
                 VISITED_DEBUG.with(|c| c.borrow_mut().push(ptr));
                 #[cfg(feature = "std")]
-                let _guard = DebugCycleGuard(ptr);
+                let _guard = debug_cycle_guard(ptr);
 
                 write!(f, "Tuple([")?;
                 for (i, val) in values.iter().enumerate() {
@@ -1652,7 +1648,7 @@ impl fmt::Debug for Value {
                 #[cfg(feature = "std")]
                 VISITED_DEBUG.with(|c| c.borrow_mut().push(ptr));
                 #[cfg(feature = "std")]
-                let _guard = DebugCycleGuard(ptr);
+                let _guard = debug_cycle_guard(ptr);
 
                 write!(f, "Map({{")?;
                 let borrowed = map.borrow();
@@ -1677,7 +1673,7 @@ impl fmt::Debug for Value {
                 #[cfg(feature = "std")]
                 VISITED_DEBUG.with(|c| c.borrow_mut().push(ptr));
                 #[cfg(feature = "std")]
-                let _guard = DebugCycleGuard(ptr);
+                let _guard = debug_cycle_guard(ptr);
 
                 let StructObject {
                     name,
@@ -1758,7 +1754,7 @@ impl fmt::Display for Value {
                 #[cfg(feature = "std")]
                 VISITED_DISPLAY.with(|c| c.borrow_mut().push(ptr));
                 #[cfg(feature = "std")]
-                let _guard = DisplayCycleGuard(ptr);
+                let _guard = display_cycle_guard(ptr);
 
                 write!(f, "[")?;
                 let borrowed = arr.borrow();
@@ -1782,7 +1778,7 @@ impl fmt::Display for Value {
                 #[cfg(feature = "std")]
                 VISITED_DISPLAY.with(|c| c.borrow_mut().push(ptr));
                 #[cfg(feature = "std")]
-                let _guard = DisplayCycleGuard(ptr);
+                let _guard = display_cycle_guard(ptr);
 
                 write!(f, "(")?;
                 for (i, val) in values.iter().enumerate() {
@@ -1805,7 +1801,7 @@ impl fmt::Display for Value {
                 #[cfg(feature = "std")]
                 VISITED_DISPLAY.with(|c| c.borrow_mut().push(ptr));
                 #[cfg(feature = "std")]
-                let _guard = DisplayCycleGuard(ptr);
+                let _guard = display_cycle_guard(ptr);
 
                 write!(f, "{{")?;
                 let borrowed = map.borrow();
@@ -1829,7 +1825,7 @@ impl fmt::Display for Value {
                 #[cfg(feature = "std")]
                 VISITED_DISPLAY.with(|c| c.borrow_mut().push(ptr));
                 #[cfg(feature = "std")]
-                let _guard = DisplayCycleGuard(ptr);
+                let _guard = display_cycle_guard(ptr);
 
                 let StructObject {
                     name,
@@ -1911,7 +1907,7 @@ impl PartialEq for Value {
                     VISITED_EQ_PAIRS.with(|c| c.borrow_mut().push(pair));
                 }
                 #[cfg(feature = "std")]
-                let _guard = EqCycleGuard(pair);
+                let _guard = eq_cycle_guard(pair);
                 let b_a = a.borrow();
                 let b_b = b.borrow();
                 if b_a.len() != b_b.len() {
@@ -1932,7 +1928,7 @@ impl PartialEq for Value {
                     VISITED_EQ_PAIRS.with(|c| c.borrow_mut().push(pair));
                 }
                 #[cfg(feature = "std")]
-                let _guard = EqCycleGuard(pair);
+                let _guard = eq_cycle_guard(pair);
                 if a.len() != b.len() {
                     return false;
                 }
@@ -1951,7 +1947,7 @@ impl PartialEq for Value {
                     VISITED_EQ_PAIRS.with(|c| c.borrow_mut().push(pair));
                 }
                 #[cfg(feature = "std")]
-                let _guard = EqCycleGuard(pair);
+                let _guard = eq_cycle_guard(pair);
                 let b_a = a.borrow();
                 let b_b = b.borrow();
                 if b_a.len() != b_b.len() {
@@ -1978,7 +1974,7 @@ impl PartialEq for Value {
                     VISITED_EQ_PAIRS.with(|c| c.borrow_mut().push(pair));
                 }
                 #[cfg(feature = "std")]
-                let _guard = EqCycleGuard(pair);
+                let _guard = eq_cycle_guard(pair);
                 let (n1, l1, f1) = (&a.name, &a.layout, &a.fields);
                 let (n2, l2, f2) = (&b.name, &b.layout, &b.fields);
                 if n1 != n2 {

@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+pub mod alloc_budget;
 pub mod ast;
 #[cfg(feature = "bindgen")]
 pub mod bindgen;

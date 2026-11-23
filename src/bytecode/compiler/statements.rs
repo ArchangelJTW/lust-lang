@@ -352,30 +352,45 @@ impl Compiler {
                     _ => false,
                 };
 
-                let ret_reg = if values.is_empty() {
-                    255
+                let has_cleanups = self.scopes.iter().any(|s| !s.cleanups.is_empty());
+
+                let (ret_reg, should_free_ret) = if values.is_empty() {
+                    (255, false)
                 } else if values.len() == 1 {
                     let expr_reg = self.compile_expr(&values[0])?;
-                    let dedicated_reg = self.next_local_slot();
-                    if let Some(scope) = self.scopes.first_mut() {
-                        scope.locals.insert(format!("(return_{})", dedicated_reg), (dedicated_reg, false));
+                    if !has_cleanups {
+                        (expr_reg, true)
+                    } else {
+                        let dedicated_reg = self.next_local_slot();
+                        if let Some(scope) = self.scopes.first_mut() {
+                            scope.locals.insert(format!("(return_{})", dedicated_reg), (dedicated_reg, false));
+                        }
+                        self.emit(Instruction::Move(dedicated_reg, expr_reg), 0);
+                        self.free_register(expr_reg);
+                        (dedicated_reg, false)
                     }
-                    self.emit(Instruction::Move(dedicated_reg, expr_reg), 0);
-                    self.free_register(expr_reg);
-                    dedicated_reg
                 } else {
                     let tuple_reg = self.compile_exprs_to_tuple(values)?;
-                    let dedicated_reg = self.next_local_slot();
-                    if let Some(scope) = self.scopes.first_mut() {
-                        scope.locals.insert(format!("(return_{})", dedicated_reg), (dedicated_reg, false));
+                    if !has_cleanups {
+                        (tuple_reg, true)
+                    } else {
+                        let dedicated_reg = self.next_local_slot();
+                        if let Some(scope) = self.scopes.first_mut() {
+                            scope.locals.insert(format!("(return_{})", dedicated_reg), (dedicated_reg, false));
+                        }
+                        self.emit(Instruction::Move(dedicated_reg, tuple_reg), 0);
+                        self.free_register(tuple_reg);
+                        (dedicated_reg, false)
                     }
-                    self.emit(Instruction::Move(dedicated_reg, tuple_reg), 0);
-                    self.free_register(tuple_reg);
-                    dedicated_reg
                 };
 
-                self.emit_defers_for_return(ret_reg, is_static_err)?;
+                if has_cleanups {
+                    self.emit_defers_for_return(ret_reg, is_static_err)?;
+                }
                 self.emit(Instruction::Return(ret_reg), 0);
+                if should_free_ret {
+                    self.free_register(ret_reg);
+                }
             }
 
             StmtKind::Block(stmts) => {
@@ -526,11 +541,14 @@ impl Compiler {
         }
 
         self.end_scope()?;
-        let mut jumps_to_end = vec![self.emit(Instruction::Jump(0), 0)];
+        let mut jumps_to_end = Vec::new();
+        if !elseif_branches.is_empty() || else_block.is_some() {
+            jumps_to_end.push(self.emit(Instruction::Jump(0), 0));
+        }
         let next_branch_start = self.current_chunk().instructions.len();
         self.current_chunk_mut()
             .patch_jump(jump_to_else, next_branch_start);
-        for (elseif_cond, elseif_body) in elseif_branches {
+        for (idx, (elseif_cond, elseif_body)) in elseif_branches.iter().enumerate() {
             self.begin_scope();
             let mut tested_scrutinee = None;
             let elseif_cond_reg = if let Some((obj_expr, idx_expr, binding_name)) =
@@ -579,7 +597,10 @@ impl Compiler {
             }
 
             self.end_scope()?;
-            jumps_to_end.push(self.emit(Instruction::Jump(0), 0));
+            let is_last_elseif = idx + 1 == elseif_branches.len();
+            if !is_last_elseif || else_block.is_some() {
+                jumps_to_end.push(self.emit(Instruction::Jump(0), 0));
+            }
             let next_start = self.current_chunk().instructions.len();
             self.current_chunk_mut()
                 .patch_jump(jump_to_next, next_start);

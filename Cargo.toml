@@ -53,7 +53,8 @@ name = "lust"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["std", "packages", "bindgen", "net-services"]
+default = ["std", "packages", "bindgen", "net-services", "cli-mimalloc"]
+cli-mimalloc = ["dep:mimalloc"]
 bindgen = ["std"]
 net-services = [
   "std",
@@ -79,6 +80,7 @@ std = [
   "dep:cranelift-module",
   "dep:cranelift-native",
   "dep:serde_json",
+  "dep:tempfile",
 ]
 # JIT for riscv32 targets. Enables `std` because dynasmrt requires it
 # (memmap2, std::sync). Requires a std-capable runtime (e.g. Linux/RISC-V).
@@ -89,8 +91,8 @@ libloading = ["std", "dep:libloading"]
 dirs = ["std", "dep:dirs"]
 packages = ["std", "libloading", "dirs", "dep:object"]
 lua_transpile = ["std", "dep:full_moon"]
-# ESP32 debugging support - adds logging via esp-println
-esp32c6-logging = ["dep:esp-println", "dep:log"]
+# ESP32 debugging support - adds logging
+esp32c6-logging = ["dep:log"]
 # JSONC optional CST support - off by default (WBS 12C-02)
 jsonc_cst = []
 
@@ -223,14 +225,9 @@ cranelift-frontend = { version = "0.137.1", optional = true }
 cranelift-jit = { version = "0.137.1", optional = true }
 cranelift-module = { version = "0.137.1", optional = true }
 cranelift-native = { version = "0.137.1", optional = true }
-esp-println = { version = "0.18.0", optional = true, features = [
-  "esp32c6",
-  "auto",
-  "log-04",
-] }
 log = { version = "0.4", optional = true }
-tempfile = "3.27.0"
-mimalloc = { version = "0.1.52", default-features = false }
+tempfile = { version = "3.27.0", optional = true }
+mimalloc = { version = "0.1.52", default-features = false, optional = true }
 tokio = { version = "1.53.1", optional = true, features = ["net", "io-util", "rt", "rt-multi-thread", "sync", "time", "macros"] }
 hyper = { version = "1.12.0", optional = true, features = ["http1", "client", "server"] }
 hyper-util = { version = "0.1.21", optional = true, features = ["tokio", "http1", "client-legacy", "server"] }
@@ -272,4 +269,7 @@ panic = "abort"
 
 [lints.clippy]
 approx_constant = "allow"
+
+[lints.cargo]
+unused_dependencies = "warn"
 

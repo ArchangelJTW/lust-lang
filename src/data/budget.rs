@@ -8,6 +8,15 @@ pub enum BudgetError {
     Interrupted,
 }
 
+impl From<crate::alloc_budget::BudgetAllocError> for BudgetError {
+    fn from(err: crate::alloc_budget::BudgetAllocError) -> Self {
+        BudgetError::BytesExceeded {
+            limit: err.limit,
+            requested: err.requested,
+        }
+    }
+}
+
 impl fmt::Display for BudgetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -91,6 +100,31 @@ impl BudgetTracker {
 
     pub fn release_bytes(&mut self, bytes: usize) {
         self.allocated_bytes = self.allocated_bytes.saturating_sub(bytes);
+    }
+
+    /// Synchronously charges `bytes` in both `BudgetTracker` and `LustBudgetAlloc`.
+    /// Rolls back `BudgetTracker` if `alloc.try_charge(bytes)` fails so both stay in sync.
+    pub fn charge_bytes_with_alloc(
+        &mut self,
+        alloc: &crate::alloc_budget::LustBudgetAlloc,
+        bytes: usize,
+    ) -> Result<(), BudgetError> {
+        self.charge_bytes(bytes)?;
+        if let Err(err) = alloc.try_charge(bytes) {
+            self.release_bytes(bytes);
+            return Err(err.into());
+        }
+        Ok(())
+    }
+
+    /// Synchronously releases `bytes` in both `BudgetTracker` and `LustBudgetAlloc`.
+    pub fn release_bytes_with_alloc(
+        &mut self,
+        alloc: &crate::alloc_budget::LustBudgetAlloc,
+        bytes: usize,
+    ) {
+        self.release_bytes(bytes);
+        alloc.refund(bytes);
     }
 
     pub fn charge_work(&mut self, units: usize) -> Result<bool, BudgetError> {

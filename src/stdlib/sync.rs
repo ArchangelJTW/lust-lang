@@ -531,17 +531,10 @@ impl Semaphore {
         if !self.try_acquire(n) {
             return None;
         }
-        struct PermitGuard<'a> {
-            sem: &'a mut Semaphore,
-            n: usize,
-        }
-        impl<'a> Drop for PermitGuard<'a> {
-            fn drop(&mut self) {
-                self.sem.release(self.n);
-            }
-        }
-        let guard = PermitGuard { sem: self, n };
-        let res = f(guard.sem);
+        let guard = core::mem::DropGuard::new(self, move |sem| {
+            sem.release(n);
+        });
+        let res = f(&**guard);
         drop(guard);
         Some(res)
     }

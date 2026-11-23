@@ -352,6 +352,7 @@ pub struct LayoutPerfCounters {
 pub struct AlignedStorage {
     ptr: std::ptr::NonNull<u8>,
     layout: std::alloc::Layout,
+    budget: Option<crate::alloc_budget::VmAllocHandle>,
 }
 
 impl AlignedStorage {
@@ -364,7 +365,61 @@ impl AlignedStorage {
         // SAFETY: `alloc_size >= 1` and `alloc_align` is a power of two.
         let raw = unsafe { std::alloc::alloc_zeroed(layout) };
         let ptr = std::ptr::NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
-        Self { ptr, layout }
+        Self {
+            ptr,
+            layout,
+            budget: None,
+        }
+    }
+
+    /// Allocates a zero-initialized contiguous buffer charged against `alloc`.
+    /// Charges `size` bytes via `alloc.0.try_charge(size)` before allocation and refunds
+    /// `size` bytes in `Drop::drop` (or immediately on OS allocation failure).
+    pub fn new_zeroed_in(
+        size: usize,
+        align: usize,
+        alloc: crate::alloc_budget::VmAllocHandle,
+    ) -> Result<Self, MaterializeError> {
+        let alloc_align = align
+            .max(1)
+            .checked_next_power_of_two()
+            .ok_or(MaterializeError::UnalignedBuffer {
+                required_align: align,
+                ptr_addr: 0,
+            })?;
+        let layout = std::alloc::Layout::from_size_align(size, alloc_align).map_err(|_| {
+            MaterializeError::BufferTooSmall {
+                required: size,
+                actual: 0,
+            }
+        })?;
+        if size == 0 {
+            return Ok(Self {
+                ptr: layout.dangling_ptr(),
+                layout,
+                budget: Some(alloc),
+            });
+        }
+        alloc.0.try_charge(size).map_err(|err| {
+            MaterializeError::BufferTooSmall {
+                required: err.requested,
+                actual: err.limit,
+            }
+        })?;
+        // SAFETY: `size > 0` and `alloc_align` is a power of two.
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        let Some(ptr) = std::ptr::NonNull::new(raw) else {
+            alloc.0.refund(size);
+            return Err(MaterializeError::BufferTooSmall {
+                required: size,
+                actual: 0,
+            });
+        };
+        Ok(Self {
+            ptr,
+            layout,
+            budget: Some(alloc),
+        })
     }
 
     #[inline(always)]
@@ -389,21 +444,28 @@ impl AlignedStorage {
 
     #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: `self.ptr` is valid for `self.layout.size()` bytes for the lifetime of `self`.
+        // SAFETY: `self.ptr` is valid (or aligned dangling for len == 0) for `self.layout.size()` bytes.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.layout.size()) }
     }
 
     #[inline(always)]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: `self.ptr` is uniquely owned and valid for `self.layout.size()` bytes.
+        // SAFETY: `self.ptr` is uniquely owned (or aligned dangling for len == 0) for `self.layout.size()` bytes.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
     }
 }
 
 impl Drop for AlignedStorage {
     fn drop(&mut self) {
-        // SAFETY: `self.ptr` was allocated with `std::alloc::alloc_zeroed(self.layout)`.
-        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+        let size = self.layout.size();
+        if size != 0 {
+            // SAFETY: `self.ptr` was allocated with `std::alloc::alloc_zeroed(self.layout)`
+            // and `size != 0`.
+            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+            if let Some(ref budget) = self.budget {
+                budget.0.refund(size);
+            }
+        }
     }
 }
 
@@ -432,10 +494,7 @@ impl ContiguousStruct {
     pub fn new_uninit(layout: LogicalLayoutV1) -> Self {
         let n = layout.fields.len();
         let storage = AlignedStorage::new(layout.size_bytes, layout.align_bytes);
-        let mut owned_slots = Vec::with_capacity(n);
-        for _ in 0..n {
-            owned_slots.push(None);
-        }
+        let owned_slots = Vec::from_fn(n, |_| None);
         Self {
             layout,
             storage,

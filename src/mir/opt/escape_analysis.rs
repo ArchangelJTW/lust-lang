@@ -189,6 +189,26 @@ impl EscapeAnalysis {
     }
 }
 
+/// Returns `true` only if a stack-promoted local actually requires an explicit
+/// Cranelift `StackSlot`. Locals of `Int`, `Float`, `Bool`, `Unit`, `String`,
+/// `Option(_)`, `Struct(_)`, and `Array(_)` are stored directly in Cranelift
+/// SSA registers (`I64`, `F64`, `I8`).
+#[inline]
+pub fn requires_explicit_stack_slot(local: &crate::mir::ir::LocalDecl) -> bool {
+    local.is_stack_promoted
+        && !matches!(
+            local.ty,
+            crate::mir::ir::MirType::Int
+                | crate::mir::ir::MirType::Float
+                | crate::mir::ir::MirType::Bool
+                | crate::mir::ir::MirType::Unit
+                | crate::mir::ir::MirType::String
+                | crate::mir::ir::MirType::Option(_)
+                | crate::mir::ir::MirType::Struct(_)
+                | crate::mir::ir::MirType::Array(_)
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

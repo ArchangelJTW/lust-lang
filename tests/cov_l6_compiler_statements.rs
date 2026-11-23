@@ -157,7 +157,7 @@ end
         source,
         "f_single",
         &fn_single.chunk.instructions,
-        &[OpCode::LoadConst, OpCode::Move, OpCode::Return],
+        &[OpCode::LoadConst, OpCode::Return],
     );
 
     let fn_multi = get_function(&functions, "f_multi");
@@ -165,7 +165,7 @@ end
         source,
         "f_multi",
         &fn_multi.chunk.instructions,
-        &[OpCode::TupleNew, OpCode::Move, OpCode::Return],
+        &[OpCode::TupleNew, OpCode::Return],
     );
 }
 
@@ -187,7 +187,7 @@ end
         source,
         "make_err",
         &f1.chunk.instructions,
-        &[OpCode::NewEnumVariant, OpCode::Move, OpCode::Return],
+        &[OpCode::NewEnumVariant, OpCode::Return],
     );
 
     let f2 = get_function(&functions, "make_res_err");
@@ -195,7 +195,7 @@ end
         source,
         "make_res_err",
         &f2.chunk.instructions,
-        &[OpCode::NewEnumVariant, OpCode::Move, OpCode::Return],
+        &[OpCode::NewEnumVariant, OpCode::Return],
     );
 }
 

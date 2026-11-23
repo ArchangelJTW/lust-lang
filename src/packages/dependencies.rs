@@ -24,7 +24,7 @@ pub struct Semver {
 
 impl Semver {
     pub fn parse(s: &str) -> Option<Self> {
-        let s = s.trim().trim_start_matches('v');
+        let s = s.trim().trim_prefix('v');
         let clean = s.split(['-', '+']).next().unwrap_or(s);
         let parts: Vec<&str> = clean.split('.').collect();
         if parts.is_empty() || parts.len() > 3 {

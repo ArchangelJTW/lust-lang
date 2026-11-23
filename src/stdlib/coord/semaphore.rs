@@ -200,19 +200,10 @@ impl Semaphore {
             return Err(SemaphoreError::Unavailable);
         }
 
-        struct PermitGuard<'a> {
-            sem: &'a mut Semaphore,
-            n: usize,
-        }
-
-        impl<'a> Drop for PermitGuard<'a> {
-            fn drop(&mut self) {
-                // Direct permit return without TM (since no TM is passed in pure Rust guard)
-                self.sem.permits = self.sem.permits.saturating_add(self.n);
-            }
-        }
-
-        let guard = PermitGuard { sem: self, n };
+        let guard = core::mem::DropGuard::new(self, move |sem| {
+            // Direct permit return without TM (since no TM is passed in pure Rust guard)
+            sem.permits = sem.permits.saturating_add(n);
+        });
         let res = f();
         drop(guard);
         Ok(res)

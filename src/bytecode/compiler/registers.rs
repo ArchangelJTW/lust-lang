@@ -307,23 +307,46 @@ impl Compiler {
         });
         if straight_line
             && i32::from(src) > self.max_local_register_index()
-            && let Some((instruction, ty, _, _)) = expression
-                .last()
-                .and_then(|instruction| instruction.numeric_specialization())
-            && instruction.defined_register() == Some(src)
+            && let Some(&last_instr) = expression.last()
+            && last_instr.defined_register() == Some(src)
         {
-            let replacement = match instruction {
-                Instruction::Add(_, l, r) => Some(Instruction::Add(dest, l, r)),
-                Instruction::Sub(_, l, r) => Some(Instruction::Sub(dest, l, r)),
-                Instruction::Mul(_, l, r) => Some(Instruction::Mul(dest, l, r)),
-                Instruction::Div(_, l, r) => Some(Instruction::Div(dest, l, r)),
-                Instruction::Mod(_, l, r) => Some(Instruction::Mod(dest, l, r)),
-                Instruction::Neg(_, s) => Some(Instruction::Neg(dest, s)),
-                _ => None,
+            let replacement = if let Some((instruction, ty, _, _)) = last_instr.numeric_specialization() {
+                match instruction {
+                    Instruction::Add(_, l, r) => Some(Instruction::Add(dest, l, r)),
+                    Instruction::Sub(_, l, r) => Some(Instruction::Sub(dest, l, r)),
+                    Instruction::Mul(_, l, r) => Some(Instruction::Mul(dest, l, r)),
+                    Instruction::Div(_, l, r) => Some(Instruction::Div(dest, l, r)),
+                    Instruction::Mod(_, l, r) => Some(Instruction::Mod(dest, l, r)),
+                    Instruction::Neg(_, s) => Some(Instruction::Neg(dest, s)),
+                    _ => None,
+                }
+                .map(|r| r.specialize_numeric(ty))
+            } else {
+                match last_instr {
+                    Instruction::LoadConst(_, c) => Some(Instruction::LoadConst(dest, c)),
+                    Instruction::LoadBool(_, b) => Some(Instruction::LoadBool(dest, b)),
+                    Instruction::LoadNil(_) => Some(Instruction::LoadNil(dest)),
+                    Instruction::GetField(_, obj, f) => Some(Instruction::GetField(dest, obj, f)),
+                    Instruction::GetIndex(_, obj, idx) => Some(Instruction::GetIndex(dest, obj, idx)),
+                    Instruction::ArrayLen(_, obj) => Some(Instruction::ArrayLen(dest, obj)),
+                    Instruction::Call(f, args, argc, _) => Some(Instruction::Call(f, args, argc, dest)),
+                    Instruction::CallMethod(obj, m, args, argc, _) => {
+                        Some(Instruction::CallMethod(obj, m, args, argc, dest))
+                    }
+                    Instruction::FloorDiv(_, l, r) => Some(Instruction::FloorDiv(dest, l, r)),
+                    Instruction::FloorDivInt(_, l, r) => Some(Instruction::FloorDivInt(dest, l, r)),
+                    Instruction::FloorDivFloat(_, l, r) => {
+                        Some(Instruction::FloorDivFloat(dest, l, r))
+                    }
+                    Instruction::Pow(_, l, r) => Some(Instruction::Pow(dest, l, r)),
+                    Instruction::PowInt(_, l, r) => Some(Instruction::PowInt(dest, l, r)),
+                    Instruction::PowFloat(_, l, r) => Some(Instruction::PowFloat(dest, l, r)),
+                    Instruction::Concat(_, l, r) => Some(Instruction::Concat(dest, l, r)),
+                    _ => None,
+                }
             };
             if let Some(replacement) = replacement {
-                *self.current_chunk_mut().instructions.last_mut().unwrap() =
-                    replacement.specialize_numeric(ty);
+                *self.current_chunk_mut().instructions.last_mut().unwrap() = replacement;
                 return;
             }
         }

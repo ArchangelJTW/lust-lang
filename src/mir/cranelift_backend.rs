@@ -4897,14 +4897,14 @@ pub mod jit_engine {
                     clif_blocks.push(builder.create_block());
                 }
 
-                // Declare SSA variables and Cranelift StackSlots for is_stack_promoted locals
+                // Declare SSA variables and Cranelift StackSlots for locals requiring explicit slots
                 let mut local_vars = Vec::with_capacity(mir_fn.locals.len());
                 let mut stack_slots: hashbrown::HashMap<usize, StackSlot> = hashbrown::HashMap::new();
                 for local in &mir_fn.locals {
                     let clif_ty = mir_to_clif_type(&local.ty)?;
                     let var = builder.declare_var(clif_ty);
                     local_vars.push(var);
-                    if local.is_stack_promoted {
+                    if crate::mir::opt::escape_analysis::requires_explicit_stack_slot(local) {
                         let size = if let MirType::Struct(name) = &local.ty {
                             self.struct_layouts.get(name).map(|l| l.size_bytes as u32).unwrap_or(8)
                         } else {

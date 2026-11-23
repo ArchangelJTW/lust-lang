@@ -2,10 +2,92 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+#[cfg(not(feature = "std"))]
+use core::sync::atomic::{AtomicI64, AtomicUsize};
+use core::sync::atomic::Ordering;
 
-#[cfg(feature = "std")]
-use std::sync::Mutex;
+/// Zero-cost single-threaded replacement for atomic integer fields in thread-confined `MirContext`.
+/// Preserves `.load(Ordering)` / `.store(val, Ordering)` / `.fetch_add` / `.fetch_sub` API compatibility
+/// without hardware atomic RMW (`lock xadd` / `ldadd`) instructions.
+#[repr(transparent)]
+#[derive(Debug, Default)]
+pub struct LocalCell<T: Copy>(core::cell::Cell<T>);
+
+impl<T: Copy> LocalCell<T> {
+    pub const fn new(val: T) -> Self {
+        Self(core::cell::Cell::new(val))
+    }
+    #[inline(always)]
+    pub fn get(&self) -> T {
+        self.0.get()
+    }
+    #[inline(always)]
+    pub fn set(&self, val: T) {
+        self.0.set(val);
+    }
+    #[inline(always)]
+    pub fn load(&self, _order: core::sync::atomic::Ordering) -> T {
+        self.0.get()
+    }
+    #[inline(always)]
+    pub fn store(&self, val: T, _order: core::sync::atomic::Ordering) {
+        self.0.set(val);
+    }
+}
+
+impl LocalCell<i64> {
+    #[inline(always)]
+    pub fn fetch_add(&self, val: i64, _order: core::sync::atomic::Ordering) -> i64 {
+        let old = self.0.get();
+        self.0.set(old.wrapping_add(val));
+        old
+    }
+    #[inline(always)]
+    pub fn fetch_sub(&self, val: i64, _order: core::sync::atomic::Ordering) -> i64 {
+        let old = self.0.get();
+        self.0.set(old.wrapping_sub(val));
+        old
+    }
+}
+
+impl LocalCell<usize> {
+    #[inline(always)]
+    pub fn fetch_add(&self, val: usize, _order: core::sync::atomic::Ordering) -> usize {
+        let old = self.0.get();
+        self.0.set(old.wrapping_add(val));
+        old
+    }
+    #[inline(always)]
+    pub fn fetch_sub(&self, val: usize, _order: core::sync::atomic::Ordering) -> usize {
+        let old = self.0.get();
+        self.0.set(old.wrapping_sub(val));
+        old
+    }
+}
+
+/// Zero-cost single-threaded replacement for `std::sync::Mutex` fields in thread-confined `MirContext`.
+/// Preserves `.lock().unwrap()` compatibility while also offering direct `.borrow()` / `.borrow_mut()`.
+#[repr(transparent)]
+#[derive(Debug, Default)]
+pub struct LocalLock<T>(core::cell::RefCell<T>);
+
+impl<T> LocalLock<T> {
+    pub const fn new(val: T) -> Self {
+        Self(core::cell::RefCell::new(val))
+    }
+    #[inline(always)]
+    pub fn borrow(&self) -> core::cell::Ref<'_, T> {
+        self.0.borrow()
+    }
+    #[inline(always)]
+    pub fn borrow_mut(&self) -> core::cell::RefMut<'_, T> {
+        self.0.borrow_mut()
+    }
+    #[inline(always)]
+    pub fn lock(&self) -> Result<core::cell::RefMut<'_, T>, core::convert::Infallible> {
+        Ok(self.0.borrow_mut())
+    }
+}
 
 pub const MIR_STATUS_OK: i64 = crate::effect_abi::LUST_STATUS_SUCCESS as i64;
 pub const MIR_STATUS_ERR_OUT_OF_GAS: i64 = crate::effect_abi::LUST_STATUS_ERR_OUT_OF_GAS as i64;
@@ -63,17 +145,15 @@ pub const fn unbounded_gas_chunk() -> i64 {
     UNBOUNDED_GAS_CHUNK
 }
 
+#[cfg(feature = "std")]
+fn restore_unbounded_gas_chunk(prev: Option<i64>) {
+    UNBOUNDED_GAS_CHUNK_OVERRIDE.with(|c| c.set(prev));
+}
+
 /// RAII guard restoring the previous thread-local unbounded gas chunk override on drop.
 #[cfg(feature = "std")]
 pub struct UnboundedGasChunkGuard {
-    prev: Option<i64>,
-}
-
-#[cfg(feature = "std")]
-impl Drop for UnboundedGasChunkGuard {
-    fn drop(&mut self) {
-        UNBOUNDED_GAS_CHUNK_OVERRIDE.with(|c| c.set(self.prev));
-    }
+    _guard: core::mem::DropGuard<Option<i64>, fn(Option<i64>)>,
 }
 
 /// Sets a thread-local override for the unbounded gas replenishment chunk size (clamped to `>= 1`).
@@ -86,7 +166,9 @@ pub fn set_unbounded_gas_chunk_override(chunk: Option<i64>) -> UnboundedGasChunk
         c.set(normalized);
         old
     });
-    UnboundedGasChunkGuard { prev }
+    UnboundedGasChunkGuard {
+        _guard: core::mem::DropGuard::new(prev, restore_unbounded_gas_chunk),
+    }
 }
 
 /// Returns the number of unbounded gas replenishments performed on the current thread.
@@ -145,34 +227,50 @@ pub struct MirContext {
     nested_vm_gas_charged: core::cell::Cell<u64>,
     #[cfg(not(feature = "std"))]
     gas_remaining: AtomicI64,
+    #[cfg(feature = "std")]
+    pub memory_used: LocalCell<i64>,
+    #[cfg(not(feature = "std"))]
     pub memory_used: AtomicI64,
+    #[cfg(feature = "std")]
+    pub last_status: LocalCell<i64>,
+    #[cfg(not(feature = "std"))]
     pub last_status: AtomicI64,
+    #[cfg(feature = "std")]
+    pub max_memory_limit: LocalCell<i64>,
+    #[cfg(not(feature = "std"))]
     pub max_memory_limit: AtomicI64,
+    #[cfg(feature = "std")]
+    pub next_alloc_seq: LocalCell<usize>,
+    #[cfg(not(feature = "std"))]
     pub next_alloc_seq: AtomicUsize,
     #[cfg(feature = "std")]
-    pub heap_values: Mutex<Vec<Option<crate::bytecode::Value>>>,
+    pub heap_values: LocalLock<Vec<Option<crate::bytecode::Value>>>,
     #[cfg(feature = "std")]
-    pub allocated_buffers: Mutex<Vec<(*mut i64, usize)>>,
+    pub allocated_buffers: LocalLock<Vec<(*mut i64, usize)>>,
     #[cfg(feature = "std")]
-    pub allocation_records: Mutex<hashbrown::HashMap<usize, MirAllocationRecord>>,
+    pub allocation_records: LocalLock<hashbrown::HashMap<usize, MirAllocationRecord>>,
     #[cfg(feature = "std")]
-    pub scope_baselines: Mutex<Vec<MirContextBaseline>>,
+    pub scope_baselines: LocalLock<Vec<MirContextBaseline>>,
     #[cfg(feature = "std")]
-    pub scope_alloc_floors: Mutex<Vec<usize>>,
+    pub scope_alloc_floors: LocalLock<Vec<usize>>,
     /// Scope-bound undo log for borrowed read-only flat array provenance (`PERF-T4-3`).
     /// Never frees the underlying `FlatArrayBuffer` (owned by `Rc<FlatArrayBuffer>`).
     #[cfg(feature = "std")]
-    pub borrowed_readonly_stack: Mutex<Vec<(usize, Option<MirAllocationRecord>)>>,
+    pub borrowed_readonly_stack: LocalLock<Vec<(usize, Option<MirAllocationRecord>)>>,
     #[cfg(feature = "std")]
-    pub borrowed_scope_floors: Mutex<Vec<usize>>,
+    pub borrowed_scope_floors: LocalLock<Vec<usize>>,
     #[cfg(feature = "std")]
-    pub interned_strings: Mutex<hashbrown::HashMap<alloc::string::String, i64>>,
+    pub interned_strings: LocalLock<hashbrown::HashMap<alloc::string::String, i64>>,
     #[cfg(feature = "std")]
-    pub interned_list: Mutex<Vec<alloc::string::String>>,
+    pub interned_list: LocalLock<Vec<alloc::string::String>>,
     #[cfg(feature = "std")]
-    pub small_digit_handles: [AtomicI64; 10],
+    pub small_digit_handles: [LocalCell<i64>; 10],
     #[cfg(feature = "std")]
-    pub struct_fields: Mutex<hashbrown::HashMap<alloc::string::String, Vec<crate::mir::ir::MirType>>>,
+    pub struct_fields: LocalLock<hashbrown::HashMap<alloc::string::String, Vec<crate::mir::ir::MirType>>>,
+    #[cfg(feature = "std")]
+    dirty_allocations: core::cell::Cell<bool>,
+    #[cfg(feature = "std")]
+    dirty_allocations_count: core::cell::Cell<u64>,
     /// Compiler-enforced thread confinement under `std`: makes both `MirContext`
     /// and `Arc<MirContext>` statically `!Send + !Sync` (`PERF-T4-1`, Hazard 7 item 1).
     #[cfg(feature = "std")]
@@ -198,21 +296,23 @@ impl MirContext {
         Self {
             gas_fast: GasFastState::new(1_000_000_000),
             nested_vm_gas_charged: core::cell::Cell::new(0),
-            memory_used: AtomicI64::new(0),
-            last_status: AtomicI64::new(0),
-            max_memory_limit: AtomicI64::new(i64::MAX),
-            next_alloc_seq: AtomicUsize::new(1),
-            heap_values: Mutex::new(Vec::new()),
-            allocated_buffers: Mutex::new(Vec::new()),
-            allocation_records: Mutex::new(hashbrown::HashMap::new()),
-            scope_baselines: Mutex::new(Vec::new()),
-            scope_alloc_floors: Mutex::new(Vec::new()),
-            borrowed_readonly_stack: Mutex::new(Vec::new()),
-            borrowed_scope_floors: Mutex::new(Vec::new()),
-            interned_strings: Mutex::new(hashbrown::HashMap::new()),
-            interned_list: Mutex::new(Vec::new()),
-            small_digit_handles: core::array::from_fn(|_| AtomicI64::new(0)),
-            struct_fields: Mutex::new(hashbrown::HashMap::new()),
+            memory_used: LocalCell::new(0),
+            last_status: LocalCell::new(0),
+            max_memory_limit: LocalCell::new(i64::MAX),
+            next_alloc_seq: LocalCell::new(1),
+            heap_values: LocalLock::new(Vec::new()),
+            allocated_buffers: LocalLock::new(Vec::new()),
+            allocation_records: LocalLock::new(hashbrown::HashMap::new()),
+            scope_baselines: LocalLock::new(Vec::new()),
+            scope_alloc_floors: LocalLock::new(Vec::new()),
+            borrowed_readonly_stack: LocalLock::new(Vec::new()),
+            borrowed_scope_floors: LocalLock::new(Vec::new()),
+            interned_strings: LocalLock::new(hashbrown::HashMap::new()),
+            interned_list: LocalLock::new(Vec::new()),
+            small_digit_handles: core::array::from_fn(|_| LocalCell::new(0)),
+            struct_fields: LocalLock::new(hashbrown::HashMap::new()),
+            dirty_allocations: core::cell::Cell::new(false),
+            dirty_allocations_count: core::cell::Cell::new(0),
             _not_send_sync: core::marker::PhantomData,
         }
     }
@@ -226,6 +326,38 @@ impl MirContext {
             max_memory_limit: AtomicI64::new(i64::MAX),
             next_alloc_seq: AtomicUsize::new(1),
         }
+    }
+
+    #[inline]
+    pub fn dirty_allocations(&self) -> bool {
+        #[cfg(feature = "std")]
+        {
+            self.dirty_allocations.get()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            false
+        }
+    }
+
+    #[inline]
+    pub fn dirty_allocations_count(&self) -> u64 {
+        #[cfg(feature = "std")]
+        {
+            self.dirty_allocations_count.get()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            0
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[inline(always)]
+    fn mark_dirty_allocation(&self) {
+        self.dirty_allocations.set(true);
+        self.dirty_allocations_count
+            .set(self.dirty_allocations_count.get().saturating_add(1));
     }
 
     pub fn with_gas(gas: i64) -> Self {
@@ -377,7 +509,7 @@ impl MirContext {
     pub fn handle_count(&self) -> usize {
         #[cfg(feature = "std")]
         {
-            self.heap_values.lock().unwrap().len()
+            self.heap_values.borrow().len()
         }
         #[cfg(not(feature = "std"))]
         {
@@ -388,9 +520,13 @@ impl MirContext {
     pub fn register_handle(&self, val: crate::bytecode::Value) -> i64 {
         #[cfg(feature = "std")]
         {
-            let mut hv = self.heap_values.lock().unwrap();
-            hv.push(Some(val));
-            hv.len() as i64
+            let handle = {
+                let mut hv = self.heap_values.borrow_mut();
+                hv.push(Some(val));
+                hv.len() as i64
+            };
+            self.mark_dirty_allocation();
+            handle
         }
         #[cfg(not(feature = "std"))]
         {
@@ -404,27 +540,27 @@ impl MirContext {
         {
             if handle < 0 {
                 let idx = ((-handle) - 1) as usize;
-                let list = self.interned_list.lock().unwrap();
+                let list = self.interned_list.borrow();
                 if let Some(s) = list.get(idx) {
                     return Some(crate::bytecode::Value::string(s.clone()));
                 }
                 drop(list);
                 return DEFAULT_MIR_CONTEXT.with(|d| {
-                    let d_list = d.interned_list.lock().unwrap();
+                    let d_list = d.interned_list.borrow();
                     d_list.get(idx).map(|s| crate::bytecode::Value::string(s.clone()))
                 });
             }
             if handle <= 0 {
                 return None;
             }
-            let hv = self.heap_values.lock().unwrap();
+            let hv = self.heap_values.borrow();
             let idx = (handle - 1) as usize;
             if let Some(v) = hv.get(idx).and_then(|opt| opt.clone()) {
                 return Some(v);
             }
             drop(hv);
             DEFAULT_MIR_CONTEXT.with(|d| {
-                let d_hv = d.heap_values.lock().unwrap();
+                let d_hv = d.heap_values.borrow();
                 d_hv.get(idx).and_then(|opt| opt.clone())
             })
         }
@@ -438,11 +574,11 @@ impl MirContext {
     pub fn intern_string(&self, s: &str) -> i64 {
         #[cfg(feature = "std")]
         {
-            let mut map = self.interned_strings.lock().unwrap();
+            let mut map = self.interned_strings.borrow_mut();
             if let Some(&h) = map.get(s) {
                 return h;
             }
-            let mut list = self.interned_list.lock().unwrap();
+            let mut list = self.interned_list.borrow_mut();
             list.push(alloc::string::ToString::to_string(s));
             let h = -(list.len() as i64);
             map.insert(alloc::string::ToString::to_string(s), h);
@@ -458,7 +594,7 @@ impl MirContext {
     pub fn register_struct_field_types(&self, name: &str, field_types: Vec<crate::mir::ir::MirType>) {
         #[cfg(feature = "std")]
         {
-            let mut sf = self.struct_fields.lock().unwrap();
+            let mut sf = self.struct_fields.borrow_mut();
             sf.insert(alloc::string::ToString::to_string(name), field_types);
         }
         #[cfg(not(feature = "std"))]
@@ -470,13 +606,13 @@ impl MirContext {
     pub fn get_struct_field_type(&self, name: &str, idx: usize) -> Option<crate::mir::ir::MirType> {
         #[cfg(feature = "std")]
         {
-            let sf = self.struct_fields.lock().unwrap();
+            let sf = self.struct_fields.borrow();
             if let Some(types) = sf.get(name) {
                 return types.get(idx).cloned();
             }
             drop(sf);
             DEFAULT_MIR_CONTEXT.with(|d| {
-                let d_sf = d.struct_fields.lock().unwrap();
+                let d_sf = d.struct_fields.borrow();
                 d_sf.get(name).and_then(|t| t.get(idx).cloned())
             })
         }
@@ -490,7 +626,7 @@ impl MirContext {
     pub fn buffer_count(&self) -> usize {
         #[cfg(feature = "std")]
         {
-            self.allocated_buffers.lock().unwrap().len()
+            self.allocated_buffers.borrow().len()
         }
         #[cfg(not(feature = "std"))]
         {
@@ -499,6 +635,13 @@ impl MirContext {
     }
 
     pub fn capture_baseline(&self) -> MirContextBaseline {
+        #[cfg(feature = "std")]
+        if !self.dirty_allocations.get() {
+            return MirContextBaseline {
+                handles: 0,
+                buffers: 0,
+            };
+        }
         MirContextBaseline {
             handles: self.handle_count(),
             buffers: self.buffer_count(),
@@ -509,8 +652,7 @@ impl MirContext {
         #[cfg(feature = "std")]
         {
             self.scope_baselines
-                .lock()
-                .unwrap()
+                .borrow()
                 .last()
                 .map_or(0, |b| b.buffers)
         }
@@ -524,8 +666,7 @@ impl MirContext {
         #[cfg(feature = "std")]
         {
             self.scope_baselines
-                .lock()
-                .unwrap()
+                .borrow()
                 .last()
                 .map_or(0, |b| b.handles)
         }
@@ -540,25 +681,28 @@ impl MirContext {
         {
             let handle_epoch = self.handle_count();
             let seq = self.next_alloc_seq.fetch_add(1, Ordering::SeqCst);
-            let scope_depth = self.scope_alloc_floors.lock().unwrap().len();
-            let mut bufs = self.allocated_buffers.lock().unwrap();
-            let mut records = self.allocation_records.lock().unwrap();
-            let buffer_index = bufs.len();
-            bufs.push((ptr, words));
-            records.insert(
-                ptr as usize,
-                MirAllocationRecord {
-                    base_ptr: ptr,
-                    word_capacity: words,
-                    kind,
-                    buffer_index,
-                    handle_epoch,
-                    alloc_seq: seq,
-                    is_ctx_owned: true,
-                    read_only_borrowed: false,
-                    registered_scope_depth: scope_depth,
-                },
-            );
+            let scope_depth = self.scope_alloc_floors.borrow().len();
+            {
+                let mut bufs = self.allocated_buffers.borrow_mut();
+                let mut records = self.allocation_records.borrow_mut();
+                let buffer_index = bufs.len();
+                bufs.push((ptr, words));
+                records.insert(
+                    ptr as usize,
+                    MirAllocationRecord {
+                        base_ptr: ptr,
+                        word_capacity: words,
+                        kind,
+                        buffer_index,
+                        handle_epoch,
+                        alloc_seq: seq,
+                        is_ctx_owned: true,
+                        read_only_borrowed: false,
+                        registered_scope_depth: scope_depth,
+                    },
+                );
+            }
+            self.mark_dirty_allocation();
         }
         #[cfg(not(feature = "std"))]
         {
@@ -571,41 +715,52 @@ impl MirContext {
         {
             let handle_epoch = self.handle_count();
             let seq = self.next_alloc_seq.fetch_add(1, Ordering::SeqCst);
-            let scope_depth = self.scope_alloc_floors.lock().unwrap().len();
-            let bufs = self.allocated_buffers.lock().unwrap();
-            let bufs_match = bufs.iter().rposition(|(p, _)| *p == ptr);
-            let mut records = self.allocation_records.lock().unwrap();
-            if let Some(existing) = records.get_mut(&(ptr as usize)) {
-                if existing.read_only_borrowed {
-                    return;
+            let scope_depth = self.scope_alloc_floors.borrow().len();
+            let bufs_match = self
+                .allocated_buffers
+                .borrow()
+                .iter()
+                .rposition(|(p, _)| *p == ptr);
+            let updated = {
+                let mut records = self.allocation_records.borrow_mut();
+                if let Some(existing) = records.get_mut(&(ptr as usize)) {
+                    if existing.read_only_borrowed {
+                        false
+                    } else {
+                        existing.base_ptr = ptr;
+                        existing.word_capacity = words;
+                        existing.kind = kind;
+                        existing.alloc_seq = seq;
+                        existing.registered_scope_depth = scope_depth;
+                        existing.handle_epoch = handle_epoch;
+                        if let Some(idx) = bufs_match {
+                            existing.is_ctx_owned = true;
+                            existing.buffer_index = idx;
+                        }
+                        true
+                    }
+                } else {
+                    let is_ctx_owned = bufs_match.is_some();
+                    let buffer_index = bufs_match.unwrap_or(usize::MAX);
+                    records.insert(
+                        ptr as usize,
+                        MirAllocationRecord {
+                            base_ptr: ptr,
+                            word_capacity: words,
+                            kind,
+                            buffer_index,
+                            handle_epoch,
+                            alloc_seq: seq,
+                            is_ctx_owned,
+                            read_only_borrowed: false,
+                            registered_scope_depth: scope_depth,
+                        },
+                    );
+                    true
                 }
-                existing.base_ptr = ptr;
-                existing.word_capacity = words;
-                existing.kind = kind;
-                existing.alloc_seq = seq;
-                existing.registered_scope_depth = scope_depth;
-                existing.handle_epoch = handle_epoch;
-                if let Some(idx) = bufs_match {
-                    existing.is_ctx_owned = true;
-                    existing.buffer_index = idx;
-                }
-            } else {
-                let is_ctx_owned = bufs_match.is_some();
-                let buffer_index = bufs_match.unwrap_or(usize::MAX);
-                records.insert(
-                    ptr as usize,
-                    MirAllocationRecord {
-                        base_ptr: ptr,
-                        word_capacity: words,
-                        kind,
-                        buffer_index,
-                        handle_epoch,
-                        alloc_seq: seq,
-                        is_ctx_owned,
-                        read_only_borrowed: false,
-                        registered_scope_depth: scope_depth,
-                    },
-                );
+            };
+            if updated {
+                self.mark_dirty_allocation();
             }
         }
         #[cfg(not(feature = "std"))]
@@ -617,7 +772,7 @@ impl MirContext {
     pub fn get_allocation_record(&self, ptr_usize: usize) -> Option<MirAllocationRecord> {
         #[cfg(feature = "std")]
         {
-            let records = self.allocation_records.lock().unwrap();
+            let records = self.allocation_records.borrow();
             records.get(&ptr_usize).cloned()
         }
         #[cfg(not(feature = "std"))]
@@ -632,13 +787,12 @@ impl MirContext {
         {
             let seq_floor = self
                 .scope_alloc_floors
-                .lock()
-                .unwrap()
+                .borrow()
                 .last()
                 .copied()
                 .unwrap_or(0);
             let buf_floor = self.active_buffer_baseline();
-            let records = self.allocation_records.lock().unwrap();
+            let records = self.allocation_records.borrow();
             records
                 .get(&ptr_usize)
                 .filter(|rec| {
@@ -678,35 +832,35 @@ impl MirContext {
         {
             let handle_epoch = self.handle_count();
             let seq = self.next_alloc_seq.fetch_add(1, Ordering::SeqCst);
-            let scope_depth = self.scope_alloc_floors.lock().unwrap().len();
+            let scope_depth = self.scope_alloc_floors.borrow().len();
             let addr = ptr as usize;
-            let mut records = self.allocation_records.lock().unwrap();
-            if let Some(existing) = records.get(&addr)
-                && existing.is_ctx_owned
             {
-                return Err(alloc::format!(
-                    "Cannot register borrowed read-only array over context-owned allocation at {addr:#x}"
-                ));
+                let mut records = self.allocation_records.borrow_mut();
+                if let Some(existing) = records.get(&addr)
+                    && existing.is_ctx_owned
+                {
+                    return Err(alloc::format!(
+                        "Cannot register borrowed read-only array over context-owned allocation at {addr:#x}"
+                    ));
+                }
+                let prev = records.get(&addr).cloned();
+                records.insert(
+                    addr,
+                    MirAllocationRecord {
+                        base_ptr: ptr as *mut i64,
+                        word_capacity,
+                        kind: MirAllocationKind::Array(elem_type),
+                        buffer_index: usize::MAX,
+                        handle_epoch,
+                        alloc_seq: seq,
+                        is_ctx_owned: false,
+                        read_only_borrowed: true,
+                        registered_scope_depth: scope_depth,
+                    },
+                );
+                self.borrowed_readonly_stack.borrow_mut().push((addr, prev));
             }
-            let prev = records.get(&addr).cloned();
-            records.insert(
-                addr,
-                MirAllocationRecord {
-                    base_ptr: ptr as *mut i64,
-                    word_capacity,
-                    kind: MirAllocationKind::Array(elem_type),
-                    buffer_index: usize::MAX,
-                    handle_epoch,
-                    alloc_seq: seq,
-                    is_ctx_owned: false,
-                    read_only_borrowed: true,
-                    registered_scope_depth: scope_depth,
-                },
-            );
-            self.borrowed_readonly_stack
-                .lock()
-                .unwrap()
-                .push((addr, prev));
+            self.mark_dirty_allocation();
             Ok(())
         }
         #[cfg(not(feature = "std"))]
@@ -719,16 +873,23 @@ impl MirContext {
     pub fn set_allocation_kind(&self, ptr_usize: usize, kind: MirAllocationKind) -> bool {
         #[cfg(feature = "std")]
         {
-            let mut records = self.allocation_records.lock().unwrap();
-            if let Some(rec) = records.get_mut(&ptr_usize) {
-                if rec.read_only_borrowed {
-                    return false;
+            let updated = {
+                let mut records = self.allocation_records.borrow_mut();
+                if let Some(rec) = records.get_mut(&ptr_usize) {
+                    if rec.read_only_borrowed {
+                        false
+                    } else {
+                        rec.kind = kind;
+                        true
+                    }
+                } else {
+                    false
                 }
-                rec.kind = kind;
-                true
-            } else {
-                false
+            };
+            if updated {
+                self.mark_dirty_allocation();
             }
+            updated
         }
         #[cfg(not(feature = "std"))]
         {
@@ -740,12 +901,15 @@ impl MirContext {
     pub fn clear_to_baselines(&self, baseline_handles: usize, baseline_buffers: usize) {
         #[cfg(feature = "std")]
         {
+            if !self.dirty_allocations.get() && baseline_handles == 0 && baseline_buffers == 0 {
+                return;
+            }
             let (scope_depth, seq_floor) = {
-                let floors = self.scope_alloc_floors.lock().unwrap();
+                let floors = self.scope_alloc_floors.borrow();
                 (floors.len(), floors.last().copied().unwrap_or(0))
             };
             let (handle_floor, buf_floor) = {
-                let scopes = self.scope_baselines.lock().unwrap();
+                let scopes = self.scope_baselines.borrow();
                 scopes
                     .last()
                     .map_or((0, 0), |b| (b.handles, b.buffers))
@@ -760,13 +924,14 @@ impl MirContext {
             } else {
                 baseline_buffers
             };
-            {
-                let mut hv = self.heap_values.lock().unwrap();
+            let hv_empty = {
+                let mut hv = self.heap_values.borrow_mut();
                 hv.truncate(effective_handles);
-            }
+                hv.is_empty()
+            };
             let drained: Vec<(*mut i64, usize)> = {
-                let mut bufs = self.allocated_buffers.lock().unwrap();
-                let mut records = self.allocation_records.lock().unwrap();
+                let mut bufs = self.allocated_buffers.borrow_mut();
+                let mut records = self.allocation_records.borrow_mut();
                 let start = effective_buffers.min(bufs.len());
                 let items: Vec<(*mut i64, usize)> = bufs.drain(start..).collect();
                 for &(ptr, _) in &items {
@@ -776,17 +941,27 @@ impl MirContext {
                 }
                 if effective_handles == 0 && start == 0 && scope_depth == 0 {
                     records.clear();
-                    self.borrowed_readonly_stack.lock().unwrap().clear();
-                } else if scope_depth > 0
-                    && baseline_handles <= handle_floor
-                    && baseline_buffers <= buf_floor
-                {
-                    records.retain(|_, rec| {
-                        rec.is_ctx_owned
-                            || rec.read_only_borrowed
-                            || !(rec.registered_scope_depth >= scope_depth
-                                && rec.alloc_seq >= seq_floor)
-                    });
+                    self.borrowed_readonly_stack.borrow_mut().clear();
+                    self.dirty_allocations.set(false);
+                } else {
+                    if scope_depth > 0
+                        && baseline_handles <= handle_floor
+                        && baseline_buffers <= buf_floor
+                    {
+                        records.retain(|_, rec| {
+                            rec.is_ctx_owned
+                                || rec.read_only_borrowed
+                                || !(rec.registered_scope_depth >= scope_depth
+                                    && rec.alloc_seq >= seq_floor)
+                        });
+                    }
+                    if hv_empty
+                        && bufs.is_empty()
+                        && records.is_empty()
+                        && self.borrowed_readonly_stack.borrow().is_empty()
+                    {
+                        self.dirty_allocations.set(false);
+                    }
                 }
                 items
             };
@@ -818,14 +993,17 @@ impl MirContext {
     pub fn clear_to_baseline(&self, baseline_handles: usize) {
         #[cfg(feature = "std")]
         {
+            if !self.dirty_allocations.get() && baseline_handles == 0 {
+                return;
+            }
             let scope_buf_floor = self.active_buffer_baseline();
             let buf_baseline = {
-                let bufs = self.allocated_buffers.lock().unwrap();
+                let bufs = self.allocated_buffers.borrow();
                 let floor = scope_buf_floor.min(bufs.len());
                 if baseline_handles == 0 && floor == 0 {
                     0
                 } else {
-                    let records = self.allocation_records.lock().unwrap();
+                    let records = self.allocation_records.borrow();
                     let first_after = (floor..bufs.len()).find(|&idx| {
                         let ptr = bufs[idx].0;
                         if ptr.is_null() {
@@ -863,24 +1041,26 @@ impl Drop for MirContextGuard {
         {
             if !self.0.is_null() {
                 let ctx = unsafe { &*self.0 };
-                let borrowed_floor = ctx.borrowed_scope_floors.lock().unwrap().pop().unwrap_or(0);
-                {
-                    let mut stack = ctx.borrowed_readonly_stack.lock().unwrap();
+                let borrowed_floor = ctx.borrowed_scope_floors.borrow_mut().pop().unwrap_or(0);
+                if ctx.dirty_allocations.get() {
+                    let mut stack = ctx.borrowed_readonly_stack.borrow_mut();
                     let start = borrowed_floor.min(stack.len());
-                    let mut records = ctx.allocation_records.lock().unwrap();
-                    for (addr, prev_opt) in stack.drain(start..).rev() {
-                        match prev_opt {
-                            Some(prev) => {
-                                records.insert(addr, prev);
-                            }
-                            None => {
-                                records.remove(&addr);
+                    if start < stack.len() {
+                        let mut records = ctx.allocation_records.borrow_mut();
+                        for (addr, prev_opt) in stack.drain(start..).rev() {
+                            match prev_opt {
+                                Some(prev) => {
+                                    records.insert(addr, prev);
+                                }
+                                None => {
+                                    records.remove(&addr);
+                                }
                             }
                         }
                     }
                 }
-                ctx.scope_baselines.lock().unwrap().pop();
-                ctx.scope_alloc_floors.lock().unwrap().pop();
+                ctx.scope_baselines.borrow_mut().pop();
+                ctx.scope_alloc_floors.borrow_mut().pop();
             }
             CURRENT_MIR_STACK.with(|stack| {
                 let mut stack = stack.borrow_mut();
@@ -902,12 +1082,24 @@ pub fn enter_mir_context(ctx: &MirContext) -> MirContextGuard {
     let ptr = ctx as *const MirContext;
     #[cfg(feature = "std")]
     {
-        let baseline = ctx.capture_baseline();
+        let (baseline, borrowed_floor) = if !ctx.dirty_allocations.get() {
+            (
+                MirContextBaseline {
+                    handles: 0,
+                    buffers: 0,
+                },
+                0,
+            )
+        } else {
+            (
+                ctx.capture_baseline(),
+                ctx.borrowed_readonly_stack.borrow().len(),
+            )
+        };
         let seq_floor = ctx.next_alloc_seq.load(Ordering::SeqCst);
-        let borrowed_floor = ctx.borrowed_readonly_stack.lock().unwrap().len();
-        ctx.scope_baselines.lock().unwrap().push(baseline);
-        ctx.scope_alloc_floors.lock().unwrap().push(seq_floor);
-        ctx.borrowed_scope_floors.lock().unwrap().push(borrowed_floor);
+        ctx.scope_baselines.borrow_mut().push(baseline);
+        ctx.scope_alloc_floors.borrow_mut().push(seq_floor);
+        ctx.borrowed_scope_floors.borrow_mut().push(borrowed_floor);
         CURRENT_MIR_STACK.with(|stack| {
             stack.borrow_mut().push(ptr);
         });
@@ -923,7 +1115,7 @@ thread_local! {
 
 #[cfg(feature = "std")]
 pub fn default_mir_context_allocated_buffer_count() -> usize {
-    DEFAULT_MIR_CONTEXT.with(|ctx| ctx.allocated_buffers.lock().unwrap().len())
+    DEFAULT_MIR_CONTEXT.with(|ctx| ctx.allocated_buffers.borrow().len())
 }
 
 pub fn with_current_mir_context<F, R>(f: F) -> R
@@ -932,14 +1124,13 @@ where
 {
     #[cfg(feature = "std")]
     {
-        CURRENT_MIR_STACK.with(|stack| {
-            if let Some(&top) = stack.borrow().last() {
-                let ctx = unsafe { &*top };
-                f(ctx)
-            } else {
-                DEFAULT_MIR_CONTEXT.with(|default_ctx| f(default_ctx))
-            }
-        })
+        let top = CURRENT_MIR_STACK.with(|stack| stack.borrow().last().copied());
+        if let Some(top) = top {
+            let ctx = unsafe { &*top };
+            f(ctx)
+        } else {
+            DEFAULT_MIR_CONTEXT.with(|default_ctx| f(default_ctx))
+        }
     }
     #[cfg(not(feature = "std"))]
     {
@@ -1109,25 +1300,28 @@ fn alloc_mir_buffer_with_kind(len: i64, kind: MirAllocationKind) -> *mut i64 {
         {
             let handle_epoch = ctx.handle_count();
             let seq = ctx.next_alloc_seq.fetch_add(1, Ordering::SeqCst);
-            let scope_depth = ctx.scope_alloc_floors.lock().unwrap().len();
-            let mut bufs = ctx.allocated_buffers.lock().unwrap();
-            let mut records = ctx.allocation_records.lock().unwrap();
-            let buffer_index = bufs.len();
-            bufs.push((ptr, size));
-            records.insert(
-                ptr as usize,
-                MirAllocationRecord {
-                    base_ptr: ptr,
-                    word_capacity: size,
-                    kind,
-                    buffer_index,
-                    handle_epoch,
-                    alloc_seq: seq,
-                    is_ctx_owned: true,
-                    read_only_borrowed: false,
-                    registered_scope_depth: scope_depth,
-                },
-            );
+            let scope_depth = ctx.scope_alloc_floors.borrow().len();
+            {
+                let mut bufs = ctx.allocated_buffers.borrow_mut();
+                let mut records = ctx.allocation_records.borrow_mut();
+                let buffer_index = bufs.len();
+                bufs.push((ptr, size));
+                records.insert(
+                    ptr as usize,
+                    MirAllocationRecord {
+                        base_ptr: ptr,
+                        word_capacity: size,
+                        kind,
+                        buffer_index,
+                        handle_epoch,
+                        alloc_seq: seq,
+                        is_ctx_owned: true,
+                        read_only_borrowed: false,
+                        registered_scope_depth: scope_depth,
+                    },
+                );
+            }
+            ctx.mark_dirty_allocation();
         }
         #[cfg(not(feature = "std"))]
         {
@@ -1515,30 +1709,50 @@ pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
 
             let old_to_free: Option<(*mut i64, usize)> = {
                 let seq = ctx.next_alloc_seq.fetch_add(1, Ordering::SeqCst);
-                let scope_depth = ctx.scope_alloc_floors.lock().unwrap().len();
-                let mut bufs = ctx.allocated_buffers.lock().unwrap();
-                let mut records = ctx.allocation_records.lock().unwrap();
-                if let Some(old_backing) = v.backing_rec {
-                    let old_idx = old_backing.buffer_index;
-                    let old_words = old_backing.word_capacity;
-                    records.remove(&(old_backing.base_ptr as usize));
-                    if old_idx < bufs.len() && bufs[old_idx].0 == old_backing.base_ptr {
-                        bufs[old_idx] = (new_data_ptr, new_cap);
-                        records.insert(
-                            new_data_ptr as usize,
-                            MirAllocationRecord {
-                                base_ptr: new_data_ptr,
-                                word_capacity: new_cap,
-                                kind: MirAllocationKind::ArrayBacking,
-                                buffer_index: old_idx,
-                                handle_epoch: v.header_rec.handle_epoch,
-                                alloc_seq: seq,
-                                is_ctx_owned: true,
-                                read_only_borrowed: false,
-                                registered_scope_depth: scope_depth,
-                            },
-                        );
-                        Some((old_backing.base_ptr, old_words))
+                let scope_depth = ctx.scope_alloc_floors.borrow().len();
+                let res = {
+                    let mut bufs = ctx.allocated_buffers.borrow_mut();
+                    let mut records = ctx.allocation_records.borrow_mut();
+                    if let Some(old_backing) = v.backing_rec {
+                        let old_idx = old_backing.buffer_index;
+                        let old_words = old_backing.word_capacity;
+                        records.remove(&(old_backing.base_ptr as usize));
+                        if old_idx < bufs.len() && bufs[old_idx].0 == old_backing.base_ptr {
+                            bufs[old_idx] = (new_data_ptr, new_cap);
+                            records.insert(
+                                new_data_ptr as usize,
+                                MirAllocationRecord {
+                                    base_ptr: new_data_ptr,
+                                    word_capacity: new_cap,
+                                    kind: MirAllocationKind::ArrayBacking,
+                                    buffer_index: old_idx,
+                                    handle_epoch: v.header_rec.handle_epoch,
+                                    alloc_seq: seq,
+                                    is_ctx_owned: true,
+                                    read_only_borrowed: false,
+                                    registered_scope_depth: scope_depth,
+                                },
+                            );
+                            Some((old_backing.base_ptr, old_words))
+                        } else {
+                            let buffer_index = bufs.len();
+                            bufs.push((new_data_ptr, new_cap));
+                            records.insert(
+                                new_data_ptr as usize,
+                                MirAllocationRecord {
+                                    base_ptr: new_data_ptr,
+                                    word_capacity: new_cap,
+                                    kind: MirAllocationKind::ArrayBacking,
+                                    buffer_index,
+                                    handle_epoch: v.header_rec.handle_epoch,
+                                    alloc_seq: seq,
+                                    is_ctx_owned: true,
+                                    read_only_borrowed: false,
+                                    registered_scope_depth: scope_depth,
+                                },
+                            );
+                            None
+                        }
                     } else {
                         let buffer_index = bufs.len();
                         bufs.push((new_data_ptr, new_cap));
@@ -1558,25 +1772,9 @@ pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
                         );
                         None
                     }
-                } else {
-                    let buffer_index = bufs.len();
-                    bufs.push((new_data_ptr, new_cap));
-                    records.insert(
-                        new_data_ptr as usize,
-                        MirAllocationRecord {
-                            base_ptr: new_data_ptr,
-                            word_capacity: new_cap,
-                            kind: MirAllocationKind::ArrayBacking,
-                            buffer_index,
-                            handle_epoch: v.header_rec.handle_epoch,
-                            alloc_seq: seq,
-                            is_ctx_owned: true,
-                            read_only_borrowed: false,
-                            registered_scope_depth: scope_depth,
-                        },
-                    );
-                    None
-                }
+                };
+                ctx.mark_dirty_allocation();
+                res
             };
 
             // Commit header update: base_ptr never moves, keeping all aliases valid.
@@ -1855,7 +2053,7 @@ pub extern "C" fn lust_mir_string_append_inplace(lhs_handle: i64, rhs_handle: i6
                 let idx = ((-rhs_handle) - 1) as usize;
                 let mut found: Option<RhsBuf> = None;
                 {
-                    let list = ctx.interned_list.lock().unwrap();
+                    let list = ctx.interned_list.borrow();
                     if let Some(s) = list.get(idx) {
                         let b = s.as_bytes();
                         if b.len() <= 64 {
@@ -1869,7 +2067,7 @@ pub extern "C" fn lust_mir_string_append_inplace(lhs_handle: i64, rhs_handle: i6
                 }
                 if found.is_none() {
                     DEFAULT_MIR_CONTEXT.with(|d| {
-                        let d_list = d.interned_list.lock().unwrap();
+                        let d_list = d.interned_list.borrow();
                         if let Some(s) = d_list.get(idx) {
                             let b = s.as_bytes();
                             if b.len() <= 64 {
@@ -1895,7 +2093,7 @@ pub extern "C" fn lust_mir_string_append_inplace(lhs_handle: i64, rhs_handle: i6
 
             let rhs_str = rhs_buf.as_str();
             let lhs_idx = (lhs_handle - 1) as usize;
-            let mut hv = ctx.heap_values.lock().unwrap();
+            let mut hv = ctx.heap_values.borrow_mut();
             if let Some(Some(crate::bytecode::Value::String(lhs_rc))) = hv.get_mut(lhs_idx) {
                 if alloc::rc::Rc::strong_count(lhs_rc) == 1 {
                     if let Some(lhs_str) = alloc::rc::Rc::get_mut(lhs_rc) {
@@ -1916,6 +2114,7 @@ pub extern "C" fn lust_mir_string_append_inplace(lhs_handle: i64, rhs_handle: i6
                             return Some(0);
                         }
                         lhs_str.push_str(rhs_str);
+                        ctx.mark_dirty_allocation();
                         return Some(lhs_handle);
                     }
                 }

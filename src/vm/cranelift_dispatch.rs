@@ -1441,10 +1441,12 @@ pub fn build_or_get_cached_flat_array(
     let prev = mir_ctx
         .memory_used
         .fetch_add(req_bytes, core::sync::atomic::Ordering::SeqCst);
-    if prev.saturating_add(req_bytes) > limit {
+    let mem_rollback = core::mem::DropGuard::new(req_bytes, |bytes| {
         mir_ctx
             .memory_used
-            .fetch_sub(req_bytes, core::sync::atomic::Ordering::SeqCst);
+            .fetch_sub(bytes, core::sync::atomic::Ordering::SeqCst);
+    });
+    if prev.saturating_add(req_bytes) > limit {
         mir_ctx.set_status(MIR_STATUS_ERR_OOM);
         return Err(LustError::RuntimeError {
             message: "Out of memory allocating cached flat array buffer for Cranelift JIT".into(),
@@ -1454,9 +1456,6 @@ pub fn build_or_get_cached_flat_array(
     // Step 3: Allocate and populate local flat buffer, validating every element
     let mut words = Vec::<i64>::new();
     if words.try_reserve_exact(word_len).is_err() {
-        mir_ctx
-            .memory_used
-            .fetch_sub(req_bytes, core::sync::atomic::Ordering::SeqCst);
         mir_ctx.set_status(MIR_STATUS_ERR_OOM);
         return Err(LustError::RuntimeError {
             message: "Out of memory reserving host buffer for cached flat array".into(),
@@ -1470,10 +1469,7 @@ pub fn build_or_get_cached_flat_array(
             (Value::Float(f), FlatArrayElemTag::Float) => f.to_bits() as i64,
             (Value::Bool(b), FlatArrayElemTag::Bool) => i64::from(*b),
             _ => {
-                // Element type mismatch: refund reserved bytes, leave flat_cache untouched.
-                mir_ctx
-                    .memory_used
-                    .fetch_sub(req_bytes, core::sync::atomic::Ordering::SeqCst);
+                // Element type mismatch: `mem_rollback` refunds reserved bytes, leave flat_cache untouched.
                 return Ok(None);
             }
         };
@@ -1483,6 +1479,7 @@ pub fn build_or_get_cached_flat_array(
     // Step 4: Publish into `LustArray.flat_cache` ONLY after full population succeeds
     let buf = Rc::new(FlatArrayBuffer::new(words));
     rc.set_cached_flat(tag, Rc::clone(&buf));
+    core::mem::DropGuard::dismiss(mem_rollback);
     Ok(Some((buf, false)))
 }
 
@@ -2649,7 +2646,7 @@ impl VM {
             return;
         }
         {
-            let mut sf = self.mir_context.struct_fields.lock().unwrap();
+            let mut sf = self.mir_context.struct_fields.borrow_mut();
             sf.clear();
             let meta_map = self.struct_metadata.as_map();
             for (name, info) in self.struct_metadata.iter() {
@@ -3407,7 +3404,7 @@ impl VM {
                 crate::mir::cranelift_backend::take_current_sticky_error();
                 crate::mir::cranelift_backend::take_deopt_payload();
                 if native_entered {
-                    if let Some(frame) = self.call_stack.pop() {
+                    if let Some(frame) = self.pop_call_frame() {
                         self.recycle_frame(frame);
                     }
                 }
@@ -3702,7 +3699,9 @@ impl VM {
         //   Declared 4th -> Dropped 1st (FIRST): `_vm_guard` (drops `MirContextGuard`, unregistering
         //                                        all borrowed provenance records BEFORE buffers drop)
         let mut pinned_borrowed_arrays: Vec<Rc<FlatArrayBuffer>> = Vec::new();
-        let (borrowed_array_rcs, borrowed_array_guard_idx) = if !has_external_or_host_calls {
+        let (borrowed_array_rcs, borrowed_array_guard_idx) = if !has_external_or_host_calls
+            && param_types.iter().any(|t| matches!(t, MirType::Array(_)))
+        {
             self.collect_readonly_borrowable_array_rcs(param_types, readonly_params)
         } else {
             (Vec::new(), hashbrown::HashMap::new())

@@ -381,6 +381,7 @@ pub const SLOW_PATH_CURRENT_TASK: u8 = 1 << 0;
 pub const SLOW_PATH_PENDING_RETURN: u8 = 1 << 1;
 pub const SLOW_PATH_GAS_LIMIT: u8 = 1 << 2;
 pub const SLOW_PATH_QUANTUM_FUEL: u8 = 1 << 3;
+pub const SLOW_PATH_SKIP_GAS: u8 = 1 << 4;
 pub(crate) const SLOW_PATH_PREAMBLE_MASK: u8 =
     SLOW_PATH_CURRENT_TASK | SLOW_PATH_PENDING_RETURN | SLOW_PATH_QUANTUM_FUEL;
 
@@ -569,6 +570,8 @@ pub struct VM {
     pub console: crate::vfs::VirtualConsole,
     pub quantum_fuel: Option<u64>,
     pub(crate) slow_path_flags: u8,
+    pub(crate) has_active_finalizers: bool,
+    pub(crate) cycle_collections_count: u64,
     pub config: crate::config::LustConfig,
 }
 
@@ -699,12 +702,47 @@ impl VM {
         if self.quantum_fuel.is_some() {
             flags |= SLOW_PATH_QUANTUM_FUEL;
         }
+        if MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed) {
+            flags |= SLOW_PATH_SKIP_GAS;
+        }
         flags
     }
 
     #[inline]
     pub(crate) fn sync_slow_path_flags(&mut self) {
         self.slow_path_flags = self.compute_slow_path_flags();
+    }
+
+    #[inline]
+    pub fn cycle_collections_count(&self) -> u64 {
+        self.cycle_collections_count
+    }
+
+    #[inline]
+    pub(super) fn push_call_frame(&mut self, frame: Box<CallFrame>) {
+        let func_idx = frame.function_idx;
+        if let Some(meta) = self.call_meta.get_mut(func_idx) {
+            meta.active_depth = meta.active_depth.saturating_add(1);
+        }
+        self.call_stack.push(frame);
+    }
+
+    #[inline]
+    pub(super) fn pop_call_frame(&mut self) -> Option<Box<CallFrame>> {
+        let frame = self.call_stack.pop()?;
+        if let Some(meta) = self.call_meta.get_mut(frame.function_idx) {
+            meta.active_depth = meta.active_depth.saturating_sub(1);
+        }
+        Some(frame)
+    }
+
+    #[inline]
+    pub(super) fn truncate_call_stack(&mut self, new_len: usize) {
+        while self.call_stack.len() > new_len {
+            if let Some(frame) = self.pop_call_frame() {
+                self.recycle_frame(frame);
+            }
+        }
     }
 
     #[inline]
@@ -715,7 +753,7 @@ impl VM {
     #[doc(hidden)]
     #[cfg(feature = "test-deopt")]
     pub fn push_call_frame_for_test(&mut self, frame: CallFrame) {
-        self.call_stack.push(Box::new(frame));
+        self.push_call_frame(Box::new(frame));
     }
 
     #[inline]
@@ -1556,7 +1594,7 @@ impl VM {
                 crate::mir::cranelift_backend::take_current_sticky_error();
                 crate::mir::cranelift_backend::take_deopt_payload();
                 if native_entered {
-                    if let Some(frame) = self.call_stack.pop() {
+                    if let Some(frame) = self.pop_call_frame() {
                         self.recycle_frame(frame);
                     }
                 }
@@ -1806,6 +1844,9 @@ pub(super) struct CallMeta {
     pub(super) return_kind: ShallowKind,
     /// A Lua multi-return function may return Nil for "nothing".
     pub(super) lua_multi_return: bool,
+    /// Number of currently active call frames for this function on `call_stack`,
+    /// enabling O(1) recursion detection without scanning `call_stack`.
+    pub(super) active_depth: u16,
 }
 
 /// The O(1) argument/return check for calls the typechecker validated:
@@ -1904,6 +1945,7 @@ impl CallMeta {
             params,
             return_kind: ShallowKind::of(&signature.return_type),
             lua_multi_return,
+            active_depth: 0,
         }
     }
 }

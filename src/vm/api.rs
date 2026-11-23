@@ -310,6 +310,8 @@ impl VM {
             console: crate::vfs::VirtualConsole::new(),
             quantum_fuel: None,
             slow_path_flags: 0,
+            has_active_finalizers: false,
+            cycle_collections_count: 0,
             config: config.clone(),
         };
         vm.cycle_collector.set_enabled(config.gc_enabled());
@@ -558,6 +560,7 @@ impl VM {
         if !self.cycle_collector.is_enabled() {
             return;
         }
+        self.cycle_collections_count = self.cycle_collections_count.saturating_add(1);
         let enabled = self.cycle_collector.is_enabled();
         let mut collector = mem::take(&mut self.cycle_collector);
         collector.set_enabled(enabled);
@@ -1139,7 +1142,6 @@ impl VM {
     }
 
     fn execute_call_frame(&mut self, frame: Box<CallFrame>) -> Result<Value> {
-        let _vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
         let stack_depth_before = self.call_stack.len();
         let saved_pending_return_value = self.pending_return_value.clone();
         let saved_pending_return_dest = self.pending_return_dest;
@@ -1151,7 +1153,7 @@ impl VM {
         self.skip_next_trace_record = false;
         self.call_until_depth = Some(stack_depth_before);
         let func_idx = frame.function_idx;
-        self.call_stack.push(frame);
+        self.push_call_frame(frame);
         #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
         let result = if self.jit.enabled && saved_trace_recorder.is_none() {
             match self.run_compiled_function(func_idx) {
@@ -1185,7 +1187,7 @@ impl VM {
             Ok(v) => Ok(v),
             Err(e) => {
                 let annotated = self.annotate_runtime_error(e);
-                self.call_stack.truncate(stack_depth_before);
+                self.truncate_call_stack(stack_depth_before);
                 self.pending_return_value = saved_pending_return_value;
                 self.pending_return_dest = saved_pending_return_dest;
                 self.pending_task_signal = saved_pending_task_signal;
@@ -1211,7 +1213,9 @@ impl VM {
                 message: format!("Function not found: {}", function_name),
             })
         };
-        let _ = self.run_finalizers_down_to(0);
+        if self.has_active_finalizers || super::execution::get_effect_finalizer_count() > 0 {
+            let _ = self.run_finalizers_down_to(0);
+        }
         res
     }
 
@@ -1225,7 +1229,9 @@ impl VM {
                 message: format!("Function not found: {}", function_name),
             })
         };
-        let _ = self.run_finalizers_down_to(0);
+        if self.has_active_finalizers || super::execution::get_effect_finalizer_count() > 0 {
+            let _ = self.run_finalizers_down_to(0);
+        }
         res
     }
 

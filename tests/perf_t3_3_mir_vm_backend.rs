@@ -276,10 +276,10 @@ fn test_perf_t3_3_mir_vm_typed_opcodes_and_no_fallthrough_jump0() {
             insns.len()
         );
     }
-    // bb0 has 4 LoadConst and elided Goto -> bb1 entry is PC 4 and equals bb0 terminator PC.
+    // bb0 has 4 LoadConst (plus any NG-W9-5 LICM-hoisted loop constants) and elided Goto -> bb1 entry equals bb0 terminator PC.
     assert_eq!(bc.block_entry_pcs[&0], 0);
-    assert_eq!(bc.terminator_pcs[&0], 4);
-    assert_eq!(bc.block_entry_pcs[&bb_hdr.0], 4);
+    assert!(bc.terminator_pcs[&0] >= 4);
+    assert_eq!(bc.block_entry_pcs[&bb_hdr.0], bc.terminator_pcs[&0]);
     assert!(matches!(insns[bc.block_entry_pcs[&bb_hdr.0]], Instruction::LeInt(..)));
     assert!(matches!(
         insns[bc.terminator_pcs[&bb_hdr.0]],

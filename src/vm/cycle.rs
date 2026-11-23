@@ -231,18 +231,23 @@ impl CycleCollector {
     /// the traversal stack).
     #[inline]
     pub(crate) fn is_leaf(value: &Value) -> bool {
-        matches!(
-            value,
+        match value {
             Value::Nil
-                | Value::Bool(_)
-                | Value::Int(_)
-                | Value::Float(_)
-                | Value::String(_)
-                | Value::Function(_)
-                | Value::NativeFunction(_)
-                | Value::WeakStruct(_)
-                | Value::Task(_)
-        ) || matches!(value, Value::Enum(object) if object.values.is_none())
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::String(_)
+            | Value::Function(_)
+            | Value::NativeFunction(_)
+            | Value::WeakStruct(_)
+            | Value::Task(_) => true,
+            Value::Enum(obj) => obj
+                .values
+                .as_ref()
+                .is_none_or(|vals| vals.iter().all(Value::is_plain)),
+            Value::Tuple(items) => items.iter().all(Value::is_plain),
+            _ => false,
+        }
     }
 
     fn discover_vm_roots(&mut self, vm: &VM) {

@@ -57,6 +57,29 @@ impl VmTypeLattice {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum HoistConstKey {
+    Int(i64),
+    Float(u64),
+}
+
+impl HoistConstKey {
+    fn from_mir_const(c: &MirConstant) -> Option<Self> {
+        match c {
+            MirConstant::Int(i) => Some(Self::Int(*i)),
+            MirConstant::Float(f) => Some(Self::Float(f.to_bits())),
+            _ => None,
+        }
+    }
+
+    fn to_value(self) -> Value {
+        match self {
+            Self::Int(i) => Value::Int(i as LustInt),
+            Self::Float(bits) => Value::Float(f64::from_bits(bits) as LustFloat),
+        }
+    }
+}
+
 pub struct MirToBytecodeCompiler<'a> {
     func: &'a MirFunction,
     local_types: Vec<MirType>,
@@ -70,6 +93,9 @@ pub struct MirToBytecodeCompiler<'a> {
     direct_callees: Option<&'a HashSet<String>>,
     direct_callee_indices: Option<&'a HashMap<String, usize>>,
     struct_layouts: Option<&'a HashMap<String, Rc<StructLayout>>>,
+    loop_headers: HashSet<BlockId>,
+    hoisted_consts_map: HashMap<HoistConstKey, Register>,
+    hoisted_consts_order: Vec<(HoistConstKey, Register)>,
 }
 
 impl<'a> MirToBytecodeCompiler<'a> {
@@ -125,11 +151,18 @@ impl<'a> MirToBytecodeCompiler<'a> {
         let mut bytecode_fn = Function::new(func.signature.name.clone(), param_count, false);
         let local_types = Self::infer_local_types(func);
 
+        let (loop_headers, hoisted_consts_map, hoisted_consts_order, scratch_start) =
+            if direct_callees.is_none() {
+                Self::plan_loop_invariant_consts(func)
+            } else {
+                (HashSet::new(), HashMap::new(), Vec::new(), func.locals.len())
+            };
+
         let mut compiler = MirToBytecodeCompiler {
             func,
             local_types,
             chunk: Chunk::new(),
-            scratch_start: func.locals.len(),
+            scratch_start,
             scratch_count: 0,
             max_scratch: 0,
             block_pcs: HashMap::new(),
@@ -138,13 +171,16 @@ impl<'a> MirToBytecodeCompiler<'a> {
             direct_callees,
             direct_callee_indices,
             struct_layouts,
+            loop_headers,
+            hoisted_consts_map,
+            hoisted_consts_order,
         };
 
         compiler.compile_blocks()?;
         compiler.patch_all_jumps();
 
         bytecode_fn.chunk = compiler.chunk;
-        bytecode_fn.register_count = (func.locals.len() + compiler.max_scratch) as u8;
+        bytecode_fn.register_count = (compiler.scratch_start + compiler.max_scratch) as u8;
         bytecode_fn.terminator_pcs = compiler.terminator_pcs;
         bytecode_fn.block_entry_pcs = compiler
             .block_pcs
@@ -152,6 +188,158 @@ impl<'a> MirToBytecodeCompiler<'a> {
             .map(|(bid, pc)| (bid.0, pc))
             .collect();
         Ok(bytecode_fn)
+    }
+
+    fn plan_loop_invariant_consts(
+        func: &MirFunction,
+    ) -> (
+        HashSet<BlockId>,
+        HashMap<HoistConstKey, Register>,
+        Vec<(HoistConstKey, Register)>,
+        usize,
+    ) {
+        let mut next_reg = func.locals.len();
+        if func.blocks.is_empty() || next_reg >= 250 {
+            return (HashSet::new(), HashMap::new(), Vec::new(), next_reg);
+        }
+
+        let loop_headers = crate::mir::opt::Safepoints::find_loop_headers(&func.blocks);
+        if loop_headers.is_empty() {
+            return (loop_headers, HashMap::new(), Vec::new(), next_reg);
+        }
+
+        let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::with_capacity(func.blocks.len());
+        for block in &func.blocks {
+            if let Some(term) = &block.terminator {
+                for succ in crate::mir::opt::Safepoints::terminator_successors(term) {
+                    preds.entry(succ).or_default().push(block.id);
+                }
+            }
+        }
+
+        let backedges = crate::mir::opt::Safepoints::find_loop_backedges(&func.blocks);
+        let mut in_loop_blocks: HashSet<BlockId> = HashSet::new();
+        for (latch, header) in backedges {
+            in_loop_blocks.insert(header);
+            if latch != header && in_loop_blocks.insert(latch) {
+                let mut worklist = alloc::vec![latch];
+                while let Some(b) = worklist.pop() {
+                    if let Some(ps) = preds.get(&b) {
+                        for &p in ps {
+                            if p != header && in_loop_blocks.insert(p) {
+                                worklist.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut hoisted_map: HashMap<HoistConstKey, Register> = HashMap::new();
+        let mut hoisted_order: Vec<(HoistConstKey, Register)> = Vec::new();
+        let mut record_const = |c: &MirConstant| {
+            if next_reg >= 250 {
+                return;
+            }
+            if let Some(key) = HoistConstKey::from_mir_const(c)
+                && !hoisted_map.contains_key(&key)
+            {
+                let reg = next_reg as Register;
+                next_reg += 1;
+                hoisted_map.insert(key, reg);
+                hoisted_order.push((key, reg));
+            }
+        };
+
+        for block in &func.blocks {
+            if !in_loop_blocks.contains(&block.id) {
+                continue;
+            }
+            for stmt in &block.statements {
+                if let Statement::Assign(_, rvalue, _) = stmt {
+                    match rvalue {
+                        Rvalue::Use(op) => {
+                            if let Operand::Constant(c) = op {
+                                record_const(c);
+                            }
+                        }
+                        Rvalue::Cast(op, target_ty) => {
+                            if let Operand::Constant(c) = op {
+                                record_const(c);
+                            }
+                            if matches!(target_ty, MirType::Float) {
+                                record_const(&MirConstant::Float(0.0));
+                            }
+                        }
+                        Rvalue::BinaryOp(_, lhs, rhs) => {
+                            if let Operand::Constant(c) = lhs {
+                                record_const(c);
+                            }
+                            if let Operand::Constant(c) = rhs {
+                                record_const(c);
+                            }
+                        }
+                        Rvalue::UnaryOp(_, op) => {
+                            if let Operand::Constant(c) = op {
+                                record_const(c);
+                            }
+                        }
+                        Rvalue::Aggregate(_, elems) => {
+                            for elem in elems {
+                                if let Operand::Constant(c) = elem {
+                                    record_const(c);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(term) = &block.terminator {
+                match term {
+                    Terminator::Cond { cond, .. } => {
+                        if let Operand::Constant(c) = cond {
+                            record_const(c);
+                        }
+                    }
+                    Terminator::Switch { discr, cases, .. } => {
+                        if let Operand::Constant(c) = discr {
+                            record_const(c);
+                        }
+                        for (val, _) in cases {
+                            record_const(&MirConstant::Int(*val));
+                        }
+                    }
+                    Terminator::Return(Some(op), _) => {
+                        if let Operand::Constant(c) = op {
+                            record_const(c);
+                        }
+                    }
+                    Terminator::Call { args, .. } => {
+                        for arg in args {
+                            if let Operand::Constant(c) = arg {
+                                record_const(c);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        (loop_headers, hoisted_map, hoisted_order, next_reg)
+    }
+
+    fn lookup_hoisted_const(&self, c: &MirConstant) -> Option<Register> {
+        let key = HoistConstKey::from_mir_const(c)?;
+        self.hoisted_consts_map.get(&key).copied()
+    }
+
+    fn emit_hoisted_consts(&mut self) {
+        let line = 0usize;
+        for &(key, reg) in &self.hoisted_consts_order {
+            let const_idx = self.chunk.add_constant(key.to_value());
+            self.chunk.emit(Instruction::LoadConst(reg, const_idx), line);
+        }
     }
 
     fn next_scratch(&mut self) -> Register {
@@ -714,9 +902,23 @@ impl<'a> MirToBytecodeCompiler<'a> {
     }
 
     fn compile_blocks(&mut self) -> Result<(), MirVmBackendError> {
+        let entry_is_loop_header = self
+            .func
+            .blocks
+            .first()
+            .is_some_and(|b| self.loop_headers.contains(&b.id));
+
+        if entry_is_loop_header && !self.hoisted_consts_order.is_empty() {
+            self.emit_hoisted_consts();
+        }
+
         for (idx, block) in self.func.blocks.iter().enumerate() {
             let pc = self.chunk.instructions.len();
             self.block_pcs.insert(block.id, pc);
+
+            if idx == 0 && !entry_is_loop_header && !self.hoisted_consts_order.is_empty() {
+                self.emit_hoisted_consts();
+            }
 
             for stmt in &block.statements {
                 self.reset_scratch();
@@ -750,6 +952,9 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 reg
             }
             Operand::Constant(c) => {
+                if let Some(hoisted_reg) = self.lookup_hoisted_const(c) {
+                    return hoisted_reg;
+                }
                 let reg = self.next_scratch();
                 self.load_constant_into_reg(c, reg, line);
                 reg
@@ -818,7 +1023,13 @@ impl<'a> MirToBytecodeCompiler<'a> {
                         self.emit_get_field(dst_reg, base, *f, line);
                     }
                     Operand::Constant(c) => {
-                        self.load_constant_into_reg(c, dst_reg, line);
+                        if let Some(hoisted_reg) = self.lookup_hoisted_const(c) {
+                            if dst_reg != hoisted_reg {
+                                self.chunk.emit(Instruction::Move(dst_reg, hoisted_reg), line);
+                            }
+                        } else {
+                            self.load_constant_into_reg(c, dst_reg, line);
+                        }
                     }
                 }
             }
@@ -852,8 +1063,15 @@ impl<'a> MirToBytecodeCompiler<'a> {
                     }
                     MirType::Float => {
                         let r_op = self.operand_to_reg(op, line);
-                        let zero_f_reg = self.next_scratch();
-                        self.load_constant_into_reg(&MirConstant::Float(0.0), zero_f_reg, line);
+                        let zero_f_reg = if let Some(hoisted_reg) =
+                            self.lookup_hoisted_const(&MirConstant::Float(0.0))
+                        {
+                            hoisted_reg
+                        } else {
+                            let reg = self.next_scratch();
+                            self.load_constant_into_reg(&MirConstant::Float(0.0), reg, line);
+                            reg
+                        };
                         self.chunk.emit(Instruction::Add(dst_reg, r_op, zero_f_reg), line);
                     }
                     MirType::Int => {
@@ -1153,8 +1371,15 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 let case_scratch = self.scratch_count;
                 for (val, target_bb) in cases {
                     self.scratch_count = case_scratch;
-                    let val_reg = self.next_scratch();
-                    self.load_constant_into_reg(&MirConstant::Int(*val), val_reg, line);
+                    let val_reg = if let Some(hoisted_reg) =
+                        self.lookup_hoisted_const(&MirConstant::Int(*val))
+                    {
+                        hoisted_reg
+                    } else {
+                        let reg = self.next_scratch();
+                        self.load_constant_into_reg(&MirConstant::Int(*val), reg, line);
+                        reg
+                    };
                     let cmp_reg = self.next_scratch();
                     self.chunk.emit(Instruction::EqInt(cmp_reg, discr_reg, val_reg), line);
                     let jump_target = self.chunk.emit(Instruction::JumpIf(cmp_reg, 0), line);

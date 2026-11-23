@@ -18,6 +18,18 @@ fn record_frame_hoist_reload() {
 }
 
 #[inline(always)]
+fn write_frame_reg_scalar(frame: &mut CallFrame, reg: Register, value: Value) -> bool {
+    let slot = &mut frame.registers[reg as usize];
+    if slot.is_plain() {
+        // SAFETY: the old value owns nothing, so it needs no drop.
+        unsafe { core::ptr::write(slot, value) };
+    } else {
+        *slot = value;
+    }
+    false
+}
+
+#[inline(always)]
 fn write_frame_reg_fast(
     frame: &mut CallFrame,
     cycle_collector: &mut cycle::CycleCollector,
@@ -40,7 +52,6 @@ fn write_frame_reg_fast(
 #[inline(always)]
 fn frame_int_binary_op<F>(
     frame: &mut CallFrame,
-    cycle_collector: &mut cycle::CycleCollector,
     dest: Register,
     lhs: Register,
     rhs: Register,
@@ -60,13 +71,12 @@ where
         });
     };
     let result = op(*a, *b)?;
-    Ok(write_frame_reg_fast(frame, cycle_collector, dest, result))
+    Ok(write_frame_reg_scalar(frame, dest, result))
 }
 
 #[inline(always)]
 fn frame_float_binary_op<F>(
     frame: &mut CallFrame,
-    cycle_collector: &mut cycle::CycleCollector,
     dest: Register,
     lhs: Register,
     rhs: Register,
@@ -86,7 +96,7 @@ where
         });
     };
     let result = op(*a, *b)?;
-    Ok(write_frame_reg_fast(frame, cycle_collector, dest, result))
+    Ok(write_frame_reg_scalar(frame, dest, result))
 }
 
 #[inline(always)]
@@ -110,7 +120,6 @@ where
 #[inline(always)]
 fn frame_comparison_op<I, F>(
     frame: &mut CallFrame,
-    cycle_collector: &mut cycle::CycleCollector,
     dest: Register,
     lhs: Register,
     rhs: Register,
@@ -134,12 +143,7 @@ where
             });
         }
     };
-    Ok(write_frame_reg_fast(
-        frame,
-        cycle_collector,
-        dest,
-        Value::Bool(result),
-    ))
+    Ok(write_frame_reg_scalar(frame, dest, Value::Bool(result)))
 }
 
 enum FrameExit {
@@ -415,7 +419,10 @@ impl VM {
         let mut cur_has_osr_entries: bool = false;
 
         'dispatch: loop {
-            debug_assert_eq!(self.slow_path_flags, self.compute_slow_path_flags());
+            debug_assert_eq!(
+                self.slow_path_flags & !SLOW_PATH_SKIP_GAS,
+                self.compute_slow_path_flags() & !SLOW_PATH_SKIP_GAS
+            );
             if self.slow_path_flags & SLOW_PATH_PREAMBLE_MASK != 0 {
                 if let Some(return_value) = self.run_dispatch_preamble_slow()? {
                     return Ok(return_value);
@@ -468,6 +475,7 @@ impl VM {
 
             let (instruction, ip_before_execution) = if can_enter_fast {
                 let has_gas_limit = (self.slow_path_flags & SLOW_PATH_GAS_LIMIT) != 0;
+                let skip_gas = (self.slow_path_flags & SLOW_PATH_SKIP_GAS) != 0;
                 #[cfg(feature = "std")]
                 let can_osr =
                     self.backend == crate::vm::VmBackend::Cranelift && cur_has_osr_entries;
@@ -494,7 +502,7 @@ impl VM {
                         let ip_before_execution = ip + 1;
                         frame.ip = ip_before_execution;
 
-                        if MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed) {
+                        if skip_gas {
                             Self::record_mutation_m1_skip_gas();
                         } else {
                             budgets.gas.used = budgets.gas.used.saturating_add(1);
@@ -508,10 +516,10 @@ impl VM {
 
                         let needs_collect = match instruction {
                             Instruction::LoadNil(dest) => {
-                                write_frame_reg_fast(frame, cycle_collector, dest, Value::Nil)
+                                write_frame_reg_scalar(frame, dest, Value::Nil)
                             }
                             Instruction::LoadBool(dest, value) => {
-                                write_frame_reg_fast(frame, cycle_collector, dest, Value::Bool(value))
+                                write_frame_reg_scalar(frame, dest, Value::Bool(value))
                             }
                             Instruction::LoadConst(dest, const_idx) => {
                                 let constant = constants[const_idx as usize].fast_clone();
@@ -523,22 +531,22 @@ impl VM {
                             }
 
                             Instruction::AddInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Int(a.wrapping_add(b)))
                                 })?
                             }
                             Instruction::SubInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Int(a.wrapping_sub(b)))
                                 })?
                             }
                             Instruction::MulInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Int(a.wrapping_mul(b)))
                                 })?
                             }
                             Instruction::DivInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     if b == 0 {
                                         Err(LustError::RuntimeError {
                                             message: "Division by zero".to_string(),
@@ -549,7 +557,7 @@ impl VM {
                                 })?
                             }
                             Instruction::ModInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     if b == 0 {
                                         Err(LustError::RuntimeError {
                                             message: "Modulo by zero".to_string(),
@@ -560,73 +568,73 @@ impl VM {
                                 })?
                             }
                             Instruction::PowInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     int_pow(a, b)
                                 })?
                             }
                             Instruction::FloorDivInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     floor_div_i64(a, b).map(Value::Int)
                                 })?
                             }
                             Instruction::NegInt(dest, src) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, src, src, |a, _| {
+                                frame_int_binary_op(frame, dest, src, src, |a, _| {
                                     Ok(Value::Int(a.wrapping_neg()))
                                 })?
                             }
                             Instruction::EqInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Bool(a == b))
                                 })?
                             }
                             Instruction::NeInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Bool(a != b))
                                 })?
                             }
                             Instruction::LtInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Bool(a < b))
                                 })?
                             }
                             Instruction::LeInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Bool(a <= b))
                                 })?
                             }
                             Instruction::GtInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Bool(a > b))
                                 })?
                             }
                             Instruction::GeInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Bool(a >= b))
                                 })?
                             }
 
                             Instruction::AddFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Float(a + b))
                                 })?
                             }
                             Instruction::SubFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Float(a - b))
                                 })?
                             }
                             Instruction::MulFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Float(a * b))
                                 })?
                             }
                             Instruction::DivFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Float(a / b))
                                 })?
                             }
                             Instruction::ModFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     if b == 0.0 {
                                         Err(LustError::RuntimeError {
                                             message: "Modulo by zero".to_string(),
@@ -637,12 +645,12 @@ impl VM {
                                 })?
                             }
                             Instruction::PowFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Float(a.powf(b)))
                                 })?
                             }
                             Instruction::FloorDivFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     if b == 0.0 {
                                         Err(LustError::RuntimeError {
                                             message: "Division by zero".to_string(),
@@ -653,37 +661,37 @@ impl VM {
                                 })?
                             }
                             Instruction::NegFloat(dest, src) => {
-                                frame_float_binary_op(frame, cycle_collector, dest, src, src, |a, _| {
+                                frame_float_binary_op(frame, dest, src, src, |a, _| {
                                     Ok(Value::Float(-a))
                                 })?
                             }
                             Instruction::EqFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Bool(a == b))
                                 })?
                             }
                             Instruction::NeFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Bool(a != b))
                                 })?
                             }
                             Instruction::LtFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Bool(a < b))
                                 })?
                             }
                             Instruction::LeFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Bool(a <= b))
                                 })?
                             }
                             Instruction::GtFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Bool(a > b))
                                 })?
                             }
                             Instruction::GeFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Bool(a >= b))
                                 })?
                             }
@@ -900,20 +908,19 @@ impl VM {
                                         });
                                     }
                                 };
-                                write_frame_reg_fast(frame, cycle_collector, dest, result)
+                                write_frame_reg_scalar(frame, dest, result)
                             }
                             Instruction::Eq(dest, lhs, rhs) => {
                                 let eq = frame.registers[lhs as usize] == frame.registers[rhs as usize];
-                                write_frame_reg_fast(frame, cycle_collector, dest, Value::Bool(eq))
+                                write_frame_reg_scalar(frame, dest, Value::Bool(eq))
                             }
                             Instruction::Ne(dest, lhs, rhs) => {
                                 let ne = frame.registers[lhs as usize] != frame.registers[rhs as usize];
-                                write_frame_reg_fast(frame, cycle_collector, dest, Value::Bool(ne))
+                                write_frame_reg_scalar(frame, dest, Value::Bool(ne))
                             }
                             Instruction::Lt(dest, lhs, rhs) => {
                                 frame_comparison_op(
                                     frame,
-                                    cycle_collector,
                                     dest,
                                     lhs,
                                     rhs,
@@ -924,7 +931,6 @@ impl VM {
                             Instruction::Le(dest, lhs, rhs) => {
                                 frame_comparison_op(
                                     frame,
-                                    cycle_collector,
                                     dest,
                                     lhs,
                                     rhs,
@@ -935,7 +941,6 @@ impl VM {
                             Instruction::Gt(dest, lhs, rhs) => {
                                 frame_comparison_op(
                                     frame,
-                                    cycle_collector,
                                     dest,
                                     lhs,
                                     rhs,
@@ -946,7 +951,6 @@ impl VM {
                             Instruction::Ge(dest, lhs, rhs) => {
                                 frame_comparison_op(
                                     frame,
-                                    cycle_collector,
                                     dest,
                                     lhs,
                                     rhs,
@@ -957,39 +961,39 @@ impl VM {
                             Instruction::And(dest, lhs, rhs) => {
                                 let res = frame.registers[lhs as usize].is_truthy()
                                     && frame.registers[rhs as usize].is_truthy();
-                                write_frame_reg_fast(frame, cycle_collector, dest, Value::Bool(res))
+                                write_frame_reg_scalar(frame, dest, Value::Bool(res))
                             }
                             Instruction::Or(dest, lhs, rhs) => {
                                 let res = frame.registers[lhs as usize].is_truthy()
                                     || frame.registers[rhs as usize].is_truthy();
-                                write_frame_reg_fast(frame, cycle_collector, dest, Value::Bool(res))
+                                write_frame_reg_scalar(frame, dest, Value::Bool(res))
                             }
                             Instruction::Not(dest, src) => {
                                 let res = !frame.registers[src as usize].is_truthy();
-                                write_frame_reg_fast(frame, cycle_collector, dest, Value::Bool(res))
+                                write_frame_reg_scalar(frame, dest, Value::Bool(res))
                             }
                             Instruction::BitAnd(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Int(a & b))
                                 })?
                             }
                             Instruction::BitOr(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Int(a | b))
                                 })?
                             }
                             Instruction::BitXor(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Int(a ^ b))
                                 })?
                             }
                             Instruction::Shl(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Int(a.wrapping_shl((b & 63) as u32)))
                                 })?
                             }
                             Instruction::Shr(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, cycle_collector, dest, lhs, rhs, |a, b| {
+                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
                                     Ok(Value::Int(a.wrapping_shr((b & 63) as u32)))
                                 })?
                             }
@@ -1005,7 +1009,7 @@ impl VM {
                                         });
                                     }
                                 };
-                                write_frame_reg_fast(frame, cycle_collector, dest, res)
+                                write_frame_reg_scalar(frame, dest, res)
                             }
 
                             Instruction::Jump(offset) => {
@@ -1125,12 +1129,7 @@ impl VM {
                                     })?;
                                 let is_variant = frame.registers[value_reg as usize]
                                     .is_enum_variant(enum_name, variant_name);
-                                write_frame_reg_fast(
-                                    frame,
-                                    cycle_collector,
-                                    dest,
-                                    Value::Bool(is_variant),
-                                )
+                                write_frame_reg_scalar(frame, dest, Value::Bool(is_variant))
                             }
                             Instruction::GetEnumValue(dest, enum_reg, index) => {
                                 let value = if let Some((_, _, Some(values))) =
@@ -1397,20 +1396,14 @@ impl VM {
                                 if let Some(val) = found {
                                     let c1 =
                                         write_frame_reg_fast(frame, cycle_collector, val_dest, val);
-                                    let c2 = write_frame_reg_fast(
+                                    let c2 = write_frame_reg_scalar(
                                         frame,
-                                        cycle_collector,
                                         cond_dest,
                                         Value::Bool(true),
                                     );
                                     c1 || c2
                                 } else {
-                                    write_frame_reg_fast(
-                                        frame,
-                                        cycle_collector,
-                                        cond_dest,
-                                        Value::Bool(false),
-                                    )
+                                    write_frame_reg_scalar(frame, cond_dest, Value::Bool(false))
                                 }
                             }
                             Instruction::ArrayLen(dest, array_reg) => {
@@ -1428,9 +1421,8 @@ impl VM {
                                         });
                                     }
                                 };
-                                write_frame_reg_fast(
+                                write_frame_reg_scalar(
                                     frame,
-                                    cycle_collector,
                                     dest,
                                     Value::Int(int_from_usize(len)),
                                 )
@@ -1482,7 +1474,7 @@ impl VM {
 
                 match exit {
                     FrameExit::EndOfChunk => {
-                        if let Some(frame) = self.call_stack.pop() {
+                        if let Some(frame) = self.pop_call_frame() {
                             self.recycle_frame(frame);
                         }
                         if self.call_stack.is_empty() {
@@ -1527,7 +1519,7 @@ impl VM {
                     let frame = &mut self.call_stack[cur_frame_idx];
                     let ip = frame.ip;
                     if ip >= cur_chunk_len {
-                        if let Some(frame) = self.call_stack.pop() {
+                        if let Some(frame) = self.pop_call_frame() {
                             self.recycle_frame(frame);
                         }
                         if self.call_stack.is_empty() {
@@ -1867,7 +1859,7 @@ impl VM {
                     frame_dirty = true;
                 }
 
-                if MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed) {
+                if (self.slow_path_flags & SLOW_PATH_SKIP_GAS) != 0 {
                     Self::record_mutation_m1_skip_gas();
                 } else {
                     self.budgets.gas.used = self.budgets.gas.used.saturating_add(1);
@@ -2402,7 +2394,7 @@ impl VM {
                     let frame =
                         self.bytecode_call_frame(func_reg, first_arg, arg_count, dest_reg)?;
                     let callee_idx = frame.function_idx;
-                    self.call_stack.push(frame);
+                    self.push_call_frame(frame);
                     #[cfg(feature = "std")]
                     if crate::vm::tracing::has_trace_hook() {
                         let callee = &self.functions[callee_idx];
@@ -2530,7 +2522,7 @@ impl VM {
                                 args,
                                 Vec::new(),
                             )?;
-                            self.call_stack.push(frame);
+                            self.push_call_frame(frame);
                         }
 
                         Value::Closure(closure) => {
@@ -2551,7 +2543,7 @@ impl VM {
                                 upvalue_values,
                             )?;
                             frame.shared_upvalues = upvalues.clone();
-                            self.call_stack.push(frame);
+                            self.push_call_frame(frame);
                         }
 
                         Value::NativeFunction(native_fn) => {
@@ -3125,7 +3117,7 @@ impl VM {
                             )?;
                             // Fall through to the trace recorder below: it
                             // inlines user-defined struct methods like calls.
-                            self.call_stack.push(frame);
+                            self.push_call_frame(frame);
                             #[cfg(feature = "std")]
                             if self.backend == crate::vm::VmBackend::Cranelift
                                 && self.trace_recorder.is_none()
@@ -3212,7 +3204,7 @@ impl VM {
                             }
                             let frame =
                                 self.make_call_frame(func_idx, Some(dest_reg), args, Vec::new())?;
-                            self.call_stack.push(frame);
+                            self.push_call_frame(frame);
                             #[cfg(feature = "std")]
                             if self.backend == crate::vm::VmBackend::Cranelift
                                 && self.trace_recorder.is_none()
@@ -3772,7 +3764,7 @@ impl VM {
             let line = func.chunk.lines.get(ip_index).copied().unwrap_or(0);
             self.dispatch_return_hook(&func.name, line, self.call_stack.len());
         }
-        if let Some(frame) = self.call_stack.pop() {
+        if let Some(frame) = self.pop_call_frame() {
             self.recycle_frame(frame);
         }
         if self.call_stack.is_empty() {
@@ -4078,11 +4070,13 @@ impl VM {
             }
             frame.registers[index] = value.fast_clone();
         }
-        let recursive = self
-            .call_stack
-            .iter()
-            .any(|existing| existing.function_idx == function_idx);
-        self.jit.record_function_call(recursive);
+        if self.jit.enabled {
+            let recursive = self
+                .call_meta
+                .get(function_idx)
+                .is_some_and(|meta| meta.active_depth > 0);
+            self.jit.record_function_call(recursive);
+        }
         Ok(frame)
     }
 
@@ -4165,11 +4159,13 @@ impl VM {
 
         let register_count = function.register_count;
         let mut frame = self.take_frame(function_idx, return_dest, register_count)?;
-        let recursive = self
-            .call_stack
-            .iter()
-            .any(|existing| existing.function_idx == function_idx);
-        self.jit.record_function_call(recursive);
+        if self.jit.enabled {
+            let recursive = self
+                .call_meta
+                .get(function_idx)
+                .is_some_and(|meta| meta.active_depth > 0);
+            self.jit.record_function_call(recursive);
+        }
         frame.upvalues.clear();
         frame.shared_upvalues.clear();
         for (index, arg) in args.iter().enumerate() {
@@ -4252,11 +4248,13 @@ impl VM {
 
         let register_count = function.register_count;
         let mut frame = self.take_frame(function_idx, return_dest, register_count)?;
-        let recursive = self
-            .call_stack
-            .iter()
-            .any(|existing| existing.function_idx == function_idx);
-        self.jit.record_function_call(recursive);
+        if self.jit.enabled {
+            let recursive = self
+                .call_meta
+                .get(function_idx)
+                .is_some_and(|meta| meta.active_depth > 0);
+            self.jit.record_function_call(recursive);
+        }
         frame.upvalues = upvalues;
         frame.shared_upvalues.clear();
         for (index, arg) in args.drain(..).enumerate() {
@@ -4694,7 +4692,7 @@ impl VM {
                 let frame = self.make_checked_call_frame(*func_idx, None, args, Vec::new())?;
 
                 let stack_depth_before = self.call_stack.len();
-                self.call_stack.push(frame);
+                self.push_call_frame(frame);
                 let previous_target = self.call_until_depth;
                 self.call_until_depth = Some(stack_depth_before);
                 // Compiled code for the function runs it now; `run` then
@@ -4711,11 +4709,7 @@ impl VM {
                     Ok(value) => Ok(value),
                     Err(err) => {
                         let annotated = self.annotate_runtime_error(err);
-                        while self.call_stack.len() > stack_depth_before {
-                            if let Some(frame) = self.call_stack.pop() {
-                                self.recycle_frame(frame);
-                            }
-                        }
+                        self.truncate_call_stack(stack_depth_before);
                         self.pending_return_value = saved_pending_return_value;
                         self.pending_return_dest = saved_pending_return_dest;
                         self.pending_task_signal = saved_pending_task_signal;
@@ -4741,7 +4735,7 @@ impl VM {
                 frame.shared_upvalues = upvalues.clone();
 
                 let stack_depth_before = self.call_stack.len();
-                self.call_stack.push(frame);
+                self.push_call_frame(frame);
                 let previous_target = self.call_until_depth;
                 self.call_until_depth = Some(stack_depth_before);
                 let run_result = self.run();
@@ -4750,11 +4744,7 @@ impl VM {
                     Ok(value) => Ok(value),
                     Err(err) => {
                         let annotated = self.annotate_runtime_error(err);
-                        while self.call_stack.len() > stack_depth_before {
-                            if let Some(frame) = self.call_stack.pop() {
-                                self.recycle_frame(frame);
-                            }
-                        }
+                        self.truncate_call_stack(stack_depth_before);
                         self.pending_return_value = saved_pending_return_value;
                         self.pending_return_dest = saved_pending_return_dest;
                         self.pending_task_signal = saved_pending_task_signal;
@@ -4894,6 +4884,11 @@ pub fn register_effect_finalizer(f: impl FnOnce() + Send + 'static) {
     EFFECT_FINALIZERS.with(|fins| {
         fins.borrow_mut().push(EffectFinalizer::Rust(Box::new(f)));
     });
+    if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+        unsafe {
+            (*vm_ptr).has_active_finalizers = true;
+        }
+    }
 }
 
 pub fn get_effect_finalizer_count() -> usize {
@@ -4914,6 +4909,11 @@ pub fn reset_effect_handler_state() {
         EFFECT_RESUMPTION_STACK.with(|s| s.borrow_mut().clear());
         EFFECT_ABORT_PAYLOAD.with(|s| *s.borrow_mut() = None);
         EFFECT_FINALIZERS.with(|s| s.borrow_mut().clear());
+    }
+    if let Some(vm_ptr) = crate::vm::current_vm_ptr() {
+        unsafe {
+            (*vm_ptr).has_active_finalizers = false;
+        }
     }
 }
 
@@ -4940,6 +4940,7 @@ impl VM {
                     }
                 }
             }
+            self.has_active_finalizers = get_effect_finalizer_count() > 0;
         }
         Ok(())
     }
@@ -5061,9 +5062,12 @@ impl VM {
                     });
                 }
                 #[cfg(feature = "std")]
-                EFFECT_FINALIZERS.with(|fins| {
-                    fins.borrow_mut().push(EffectFinalizer::Lust(args[0].clone()));
-                });
+                {
+                    EFFECT_FINALIZERS.with(|fins| {
+                        fins.borrow_mut().push(EffectFinalizer::Lust(args[0].clone()));
+                    });
+                    self.has_active_finalizers = true;
+                }
                 Ok(Value::Nil)
             }
             other => Err(LustError::RuntimeError {

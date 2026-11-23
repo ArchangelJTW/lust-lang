@@ -151,7 +151,7 @@ pub fn ext_stubs(dir: &Path) -> Result<String, String> {
             if line.trim().starts_with("pub fn ") {
                 let sig = line.trim();
                 stub.push_str(&format!("--- {}\n", sig));
-                stub.push_str(&format!("extern function {};\n\n", sig.trim_start_matches("pub fn ")));
+                stub.push_str(&format!("extern function {};\n\n", sig.trim_prefix("pub fn ")));
             }
         }
     }

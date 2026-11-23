@@ -1350,6 +1350,254 @@ pub fn build_and_prepare_external_crate(
     })
 }
 
+/// Resolved external Rust crate `.rlib` artifact for Zero-FFI Rust AOT linking (`NG-W13-1C`).
+#[derive(Debug, Clone)]
+pub struct LinkedRustRlib {
+    /// Sanitized Rust crate identifier (e.g. `my_ext`), suitable for `extern crate my_ext;`
+    /// and `rustc --extern my_ext=<rlib_path>`.
+    pub crate_name: String,
+    /// Path to the compiled `.rlib` artifact.
+    pub rlib_path: PathBuf,
+    /// Additional dependency search directories passed to `rustc` via `-L dependency=<dir>`.
+    pub dependency_dirs: Vec<PathBuf>,
+}
+
+/// Reads the Rust library crate name from `Cargo.toml` (`[lib].name` if present, otherwise
+/// `[package].name`), sanitized with hyphens replaced by underscores.
+pub fn read_crate_lib_name(module_dir: &Path) -> Result<String, LocalModuleError> {
+    let manifest_path = module_dir.join("Cargo.toml");
+    let manifest_str = fs::read_to_string(&manifest_path)?;
+    #[derive(Deserialize)]
+    struct LibSection {
+        name: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct PackageSection {
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct Manifest {
+        package: PackageSection,
+        lib: Option<LibSection>,
+    }
+    let manifest: Manifest =
+        toml::from_str(&manifest_str).map_err(|source| LocalModuleError::Manifest {
+            path: manifest_path,
+            source,
+        })?;
+    let raw = manifest
+        .lib
+        .and_then(|l| l.name)
+        .unwrap_or(manifest.package.name);
+    Ok(sanitized_crate_name(&raw))
+}
+
+/// Derives a sanitized Rust crate identifier from a `.rlib` file path such as
+/// `libmy_ext.rlib`, `libmy_ext-0123456789abcdef.rlib`, or `my_ext.rlib`.
+pub fn derive_crate_name_from_rlib_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let without_lib = stem.strip_prefix("lib").unwrap_or(stem);
+    let base = match without_lib.rsplit_once('-') {
+        Some((prefix, suffix))
+            if !prefix.is_empty()
+                && suffix.len() >= 8
+                && suffix.chars().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            prefix
+        }
+        _ => without_lib,
+    };
+    let sanitized = sanitized_crate_name(base);
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+/// Builds or resolves an external Rust crate directory or prebuilt `.rlib` for Zero-FFI
+/// direct `rlib` linking in Rust AOT (`--backend rust --link-crate <dir_or_rlib>`, `NG-W13-1C`).
+///
+/// Unlike C-ABI dynamic plugins (`build_and_prepare_external_crate`), this path produces a native
+/// Rust `.rlib` compiled with `-C panic=abort` so `rustc` can link it directly with
+/// `-C lto=thin --extern <crate>=<rlib>` and zero `LustExtVal` marshaling.
+pub fn prepare_external_rlib(
+    crate_dir_or_rlib: &Path,
+    allow_ffi: bool,
+    target_triple: Option<&str>,
+    is_release: bool,
+) -> Result<LinkedRustRlib, LocalModuleError> {
+    if !allow_ffi {
+        return Err(LocalModuleError::CapabilityDenied(
+            "external crate linking requires 'ffi' capability".to_string(),
+        ));
+    }
+    if !crate_dir_or_rlib.exists() {
+        return Err(LocalModuleError::MissingExternalLibrary(
+            crate_dir_or_rlib.to_path_buf(),
+        ));
+    }
+
+    if crate_dir_or_rlib.is_file() {
+        let ext = crate_dir_or_rlib
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if ext != "rlib" {
+            return Err(LocalModuleError::BadSymbols {
+                path: crate_dir_or_rlib.to_path_buf(),
+                message: format!(
+                    "expected a '.rlib' artifact or Cargo crate directory for Rust AOT --link-crate, got '.{ext}'"
+                ),
+            });
+        }
+        let meta = fs::metadata(crate_dir_or_rlib)?;
+        if meta.len() == 0 {
+            return Err(LocalModuleError::BadSymbols {
+                path: crate_dir_or_rlib.to_path_buf(),
+                message: "external .rlib file is empty".to_string(),
+            });
+        }
+        let crate_name = derive_crate_name_from_rlib_path(crate_dir_or_rlib).ok_or_else(|| {
+            LocalModuleError::BadSymbols {
+                path: crate_dir_or_rlib.to_path_buf(),
+                message: "could not derive valid Rust crate name from .rlib filename".to_string(),
+            }
+        })?;
+        let mut dependency_dirs = Vec::new();
+        if let Some(parent) = crate_dir_or_rlib.parent() {
+            let deps_dir = parent.join("deps");
+            if deps_dir.is_dir() {
+                dependency_dirs.push(deps_dir);
+            }
+        }
+        return Ok(LinkedRustRlib {
+            crate_name,
+            rlib_path: crate_dir_or_rlib.to_path_buf(),
+            dependency_dirs,
+        });
+    }
+
+    if !crate_dir_or_rlib.join("Cargo.toml").exists() {
+        return Err(LocalModuleError::MissingExternalLibrary(
+            crate_dir_or_rlib.to_path_buf(),
+        ));
+    }
+
+    let crate_name = read_crate_lib_name(crate_dir_or_rlib)?;
+    let target_dir = crate_dir_or_rlib.join("target");
+    let mut cmd = Command::new("cargo");
+    if let Ok(rustup) = env::var("RUSTUP_HOME") {
+        cmd.env("RUSTUP_HOME", rustup);
+    }
+    if let Ok(cargo_home) = env::var("CARGO_HOME") {
+        cmd.env("CARGO_HOME", cargo_home);
+    }
+
+    // Ensure the linked rlib and all its transitive dependencies use `-C panic=abort`
+    // and embed LLVM bitcode (`-C embed-bitcode=yes`) so `rustc -C lto=thin` can inline across crates.
+    let existing_rustflags = env::var("RUSTFLAGS").unwrap_or_default();
+    let mut rustflags = existing_rustflags;
+    if !rustflags.contains("panic=abort") {
+        if !rustflags.trim().is_empty() {
+            rustflags.push(' ');
+        }
+        rustflags.push_str("-C panic=abort");
+    }
+    if !rustflags.contains("embed-bitcode=") {
+        if !rustflags.trim().is_empty() {
+            rustflags.push(' ');
+        }
+        rustflags.push_str("-C embed-bitcode=yes");
+    }
+    cmd.env("RUSTFLAGS", rustflags);
+
+    cmd.arg("rustc")
+        .arg("--offline")
+        .arg("--lib")
+        .arg("--target-dir")
+        .arg(&target_dir);
+    if is_release {
+        cmd.arg("--release");
+    }
+    if let Some(target) = target_triple {
+        cmd.arg("--target").arg(target);
+    }
+    cmd.arg("--")
+        .arg("--crate-type=rlib")
+        .arg("-C")
+        .arg("embed-bitcode=yes");
+    cmd.current_dir(crate_dir_or_rlib);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let output = cmd.output()?;
+    if !output.status.success() {
+        let mut msg = String::new();
+        if !output.stdout.is_empty() {
+            msg.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+        if !output.stderr.is_empty() {
+            if !msg.is_empty() {
+                msg.push('\n');
+            }
+            msg.push_str(&String::from_utf8_lossy(&output.stderr));
+        }
+        return Err(LocalModuleError::CargoBuild {
+            module: crate_name,
+            status: output.status,
+            output: msg,
+        });
+    }
+
+    let profile = if is_release { "release" } else { "debug" };
+    let profile_dir = if let Some(target) = target_triple {
+        target_dir.join(target).join(profile)
+    } else {
+        target_dir.join(profile)
+    };
+    let deps_dir = profile_dir.join("deps");
+
+    let direct_rlib = profile_dir.join(format!("lib{crate_name}.rlib"));
+    let rlib_path = if direct_rlib.exists() {
+        direct_rlib
+    } else {
+        let prefix = format!("lib{crate_name}-");
+        let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&deps_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Some(fname) = p.file_name().and_then(|s| s.to_str())
+                    && fname.starts_with(&prefix)
+                    && fname.ends_with(".rlib")
+                {
+                    let mtime = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    candidates.push((mtime, p));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        candidates
+            .into_iter()
+            .next()
+            .map(|(_, p)| p)
+            .ok_or(LocalModuleError::LibraryMissing(direct_rlib))?
+    };
+
+    let mut dependency_dirs = Vec::new();
+    if deps_dir.is_dir() {
+        dependency_dirs.push(deps_dir);
+    }
+
+    Ok(LinkedRustRlib {
+        crate_name,
+        rlib_path,
+        dependency_dirs,
+    })
+}
+
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 pub fn collect_rust_dependency_artifacts(
     dep: &ResolvedRustDependency,

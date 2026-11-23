@@ -291,6 +291,237 @@ impl GeneratedRustBindings {
     }
 }
 
+/// Generated `include!()`-ready Rust AOT module source and tracked input files (`NG-W13-1C`).
+#[derive(Clone, Debug)]
+pub struct GeneratedRustAot {
+    /// Complete, `include!()`-compatible Rust AOT module source (zero `unsafe`, panic-free).
+    pub source: String,
+    /// Entry, imported module, and config paths for `cargo:rerun-if-changed`.
+    pub input_files: Vec<PathBuf>,
+}
+
+impl GeneratedRustAot {
+    pub fn input_files(&self) -> &[PathBuf] {
+        &self.input_files
+    }
+
+    pub fn write_to(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let vfs = crate::vfs::current_vfs();
+        let path = path.as_ref();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            vfs.create_dir_all(parent)?;
+        }
+        vfs.write(path, self.source.as_bytes())
+    }
+}
+
+/// `build.rs` generator that compiles a `.lust` module into an `include!()`-ready Rust AOT
+/// module backed by `lust-aot-rt` without embedding the Lust VM at runtime (`NG-W13-1C`).
+///
+/// # Example (`build.rs`)
+/// ```ignore
+/// fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     lust::bindgen::RustAotBuilder::new("scripts/router.lust")
+///         .gas_metering(lust::codegen_zig::aot::GasMetering::LoopChunked)
+///         .emit_to_out_dir("router_aot.rs")?;
+///     Ok(())
+/// }
+/// ```
+///
+/// And in `src/lib.rs` or `src/main.rs`:
+/// ```ignore
+/// pub mod router_aot {
+///     include!(concat!(env!("OUT_DIR"), "/router_aot.rs"));
+/// }
+/// ```
+#[derive(Clone, Debug)]
+pub struct RustAotBuilder {
+    entry_file: PathBuf,
+    gas_metering: crate::codegen_zig::aot::GasMetering,
+    gas_limit: Option<u64>,
+    max_memory_bytes: Option<usize>,
+    pure_core: bool,
+    no_std: bool,
+    linked_crates: Vec<String>,
+    emit_cargo_rerun_directives: bool,
+}
+
+impl RustAotBuilder {
+    /// Create a new Rust AOT module builder for the given `.lust` entry file.
+    pub fn new(entry_file: impl Into<PathBuf>) -> Self {
+        Self {
+            entry_file: entry_file.into(),
+            gas_metering: crate::codegen_zig::aot::GasMetering::None,
+            gas_limit: None,
+            max_memory_bytes: None,
+            pure_core: false,
+            no_std: false,
+            linked_crates: Vec::new(),
+            emit_cargo_rerun_directives: true,
+        }
+    }
+
+    /// Configure gas metering mode (`None`, `LoopChunked`, or `Exact`).
+    pub fn gas_metering(mut self, mode: crate::codegen_zig::aot::GasMetering) -> Self {
+        self.gas_metering = mode;
+        self
+    }
+
+    /// Configure default gas limit for generated standalone entrypoints.
+    pub fn gas_limit(mut self, limit: u64) -> Self {
+        self.gas_limit = Some(limit);
+        if self.gas_metering == crate::codegen_zig::aot::GasMetering::None {
+            self.gas_metering = crate::codegen_zig::aot::GasMetering::Exact;
+        }
+        self
+    }
+
+    /// Configure maximum allocation budget in bytes for generated AOT allocators.
+    pub fn max_memory_bytes(mut self, bytes: usize) -> Self {
+        self.max_memory_bytes = Some(bytes);
+        self
+    }
+
+    /// Enable `PureCore` execution mode (disables ambient FFI in `AotCtx`).
+    pub fn pure_core(mut self, pure_core: bool) -> Self {
+        self.pure_core = pure_core;
+        self
+    }
+
+    /// Emit `#![no_std]`-compatible code (requires `lust-aot-rt` without `std`).
+    pub fn no_std(mut self, no_std: bool) -> Self {
+        self.no_std = no_std;
+        self
+    }
+
+    /// Register an external Rust crate name for direct Zero-FFI calls (`extern crate <name>;`).
+    pub fn link_crate(mut self, crate_name: impl Into<String>) -> Self {
+        let sanitized = crate_name.into().replace('-', "_");
+        if !sanitized.is_empty() && !self.linked_crates.contains(&sanitized) {
+            self.linked_crates.push(sanitized);
+        }
+        self
+    }
+
+    /// Control whether `emit_to_out_dir` prints `cargo:rerun-if-changed=...` lines to stdout.
+    pub fn cargo_rerun_if_changed(mut self, enabled: bool) -> Self {
+        self.emit_cargo_rerun_directives = enabled;
+        self
+    }
+
+    /// Load, typecheck, MIR-lower, and emit the `include!()`-ready Rust AOT module.
+    pub fn generate(&self) -> Result<GeneratedRustAot> {
+        let vfs = crate::vfs::current_vfs();
+        let entry_file = vfs.canonicalize(&self.entry_file).map_err(|err| {
+            LustError::Unknown(format!(
+                "failed to resolve Lust entry '{}': {err}",
+                self.entry_file.display()
+            ))
+        })?;
+        let entry_text = entry_file.to_str().ok_or_else(|| {
+            LustError::Unknown(format!(
+                "Lust entry path '{}' is not valid UTF-8",
+                entry_file.display()
+            ))
+        })?;
+        let config = LustConfig::load_for_entry(&entry_file)
+            .map_err(|err| LustError::Unknown(format!("failed to load Lust config: {err}")))?;
+
+        let mut loader = ModuleLoader::new(entry_file.parent().unwrap_or_else(|| Path::new(".")))
+            .with_vfs(vfs.clone());
+        let program = loader.load_program_from_entry(entry_text)?;
+
+        let mut imports = HashMap::new();
+        for module in &program.modules {
+            imports.insert(module.path.clone(), module.imports.clone());
+        }
+
+        let mut typechecker = TypeChecker::with_config(&config);
+        typechecker.set_imports_by_module(imports);
+        typechecker.check_program(&program.modules)?;
+
+        let mut all_items = Vec::new();
+        for module in &program.modules {
+            all_items.extend(module.items.clone());
+        }
+
+        let mir_module =
+            crate::codegen_zig::aot::compiler::prepare_and_lower_items_for_rust_aot(&all_items)?;
+
+        let compile_opts = crate::codegen_zig::aot::RustCompileOptions {
+            aot: crate::codegen_zig::aot::AotCompileOptions {
+                target_kind: crate::codegen_zig::aot::AotTargetKind::StaticLibrary,
+                max_memory_bytes: self.max_memory_bytes,
+                ..crate::codegen_zig::aot::AotCompileOptions::default()
+            },
+            gas_metering: self.gas_metering,
+            gas_limit: self.gas_limit,
+            pure_core: self.pure_core,
+            no_std: self.no_std,
+            cache_dir: None,
+        };
+
+        let source = crate::codegen_zig::aot::AotCompiler::emit_rust_include_module_from_items(
+            &mir_module,
+            &all_items,
+            &compile_opts,
+            &self.linked_crates,
+        )?;
+
+        let mut input_files = vec![entry_file.clone()];
+        input_files.extend(program.modules.iter().map(|module| {
+            vfs.canonicalize(&module.source_path)
+                .unwrap_or_else(|_| module.source_path.clone())
+        }));
+        input_files.push(
+            entry_file
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("lust-config.toml"),
+        );
+        input_files.sort();
+        input_files.dedup();
+
+        Ok(GeneratedRustAot {
+            source,
+            input_files,
+        })
+    }
+
+    /// Generate the Rust AOT module and write it to `out_path`.
+    pub fn write_to(&self, out_path: impl AsRef<Path>) -> Result<GeneratedRustAot> {
+        let generated = self.generate()?;
+        generated.write_to(out_path.as_ref()).map_err(|err| {
+            LustError::Unknown(format!(
+                "failed to write Rust AOT module '{}': {err}",
+                out_path.as_ref().display()
+            ))
+        })?;
+        Ok(generated)
+    }
+
+    /// Compile the `.lust` file and write the `include!()`-ready `.rs` module into Cargo's
+    /// `OUT_DIR` at `PathBuf::from(env!("OUT_DIR")).join(out_file)`.
+    pub fn emit_to_out_dir(&self, out_file: impl AsRef<Path>) -> Result<PathBuf> {
+        let out_dir = std::env::var_os("OUT_DIR").ok_or_else(|| {
+            LustError::Unknown(
+                "OUT_DIR environment variable is not set; call RustAotBuilder::emit_to_out_dir from build.rs or use write_to"
+                    .to_string(),
+            )
+        })?;
+        let out_path = PathBuf::from(out_dir).join(out_file.as_ref());
+        let generated = self.write_to(&out_path)?;
+        if self.emit_cargo_rerun_directives {
+            for input in generated.input_files() {
+                println!("cargo:rerun-if-changed={}", input.display());
+            }
+        }
+        Ok(out_path)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BoundFunction {
     lust_name: String,

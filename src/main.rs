@@ -1585,6 +1585,8 @@ fn build_command(args: &[String]) {
         eprintln!("    --emit-h [path]           Generate C header file (.h)");
         eprintln!("    --emit-zig                Generate Zig source file without compiling");
         eprintln!("    --emit-rs                 Generate Rust source file without compiling (--backend rust)");
+        eprintln!("    --emit=rust-crate         Generate Cargo library crate (Cargo.toml + src/lib.rs) depending on lust-aot-rt");
+        eprintln!("    --link-crate <dir|rlib>   Link external Rust crate (Zero-FFI rlib + ThinLTO for --backend rust; C-ABI for zig)");
         eprintln!("    --gas-metering <mode>     Gas metering for Rust AOT: none (default), loop-chunked, exact");
         eprintln!("    --gas-limit <units>       Gas limit for Rust AOT execution");
         eprintln!("    --release-fast            Optimize for speed (default)");
@@ -1596,16 +1598,20 @@ fn build_command(args: &[String]) {
         eprintln!("    --tree-shake              Enable dead code elimination (default: true)");
         eprintln!("    --no-tree-shake           Disable dead code elimination");
         eprintln!("    --target <triple>         Cross-compile target triple");
-        eprintln!("    --cache-dir <dir>         Zig compilation cache directory");
+        eprintln!("    --no-std                  Emit #![no_std] Rust AOT code (StaticSlabAllocator<65536> preamble)");
+        eprintln!("    --cache-dir <dir>         AOT compilation cache directory");
         return;
     }
 
     let mut entry_file: Option<String> = None;
     let mut backend = "zig".to_string();
+    let mut backend_explicit = false;
     let mut output_bin = None;
     let mut emit_zig = false;
     let mut emit_c = false;
     let mut emit_rs = false;
+    let mut emit_rust_crate = false;
+    let mut no_std = false;
     let mut gas_metering = lust::codegen_zig::aot::GasMetering::None;
     let mut gas_limit: Option<u64> = None;
     let mut emit_header_requested = false;
@@ -1659,9 +1665,11 @@ fn build_command(args: &[String]) {
                     process::exit(1);
                 };
                 backend = val.clone();
+                backend_explicit = true;
             }
             opt if opt.starts_with("--backend=") => {
                 backend = opt.strip_prefix("--backend=").unwrap().to_string();
+                backend_explicit = true;
             }
             "-o" | "--output" => {
                 index += 1;
@@ -1719,6 +1727,13 @@ fn build_command(args: &[String]) {
                 };
                 opts.target_triple = Some(val.clone());
             }
+            opt if opt.starts_with("--target=") => {
+                let val = opt.strip_prefix("--target=").unwrap();
+                opts.target_triple = Some(val.to_string());
+            }
+            "--no-std" | "--nostd" => {
+                no_std = true;
+            }
             "--cache-dir" => {
                 index += 1;
                 let Some(val) = args.get(index) else {
@@ -1732,6 +1747,47 @@ fn build_command(args: &[String]) {
             }
             "--emit-rs" => {
                 emit_rs = true;
+            }
+            "--emit-rust-crate" => {
+                emit_rust_crate = true;
+            }
+            "--emit" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!(
+                        "Error: --emit requires a kind (rust-crate, rs, zig, c)"
+                    );
+                    process::exit(1);
+                };
+                match val.to_ascii_lowercase().as_str() {
+                    "rust-crate" | "rust_crate" => emit_rust_crate = true,
+                    "rs" | "rust" => emit_rs = true,
+                    "zig" => emit_zig = true,
+                    "c" => emit_c = true,
+                    other => {
+                        eprintln!(
+                            "Error: unknown --emit kind '{}'. Supported: rust-crate, rs, zig, c",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                }
+            }
+            opt if opt.starts_with("--emit=") => {
+                let val = opt.strip_prefix("--emit=").unwrap();
+                match val.to_ascii_lowercase().as_str() {
+                    "rust-crate" | "rust_crate" => emit_rust_crate = true,
+                    "rs" | "rust" => emit_rs = true,
+                    "zig" => emit_zig = true,
+                    "c" => emit_c = true,
+                    other => {
+                        eprintln!(
+                            "Error: unknown --emit kind '{}'. Supported: rust-crate, rs, zig, c",
+                            other
+                        );
+                        process::exit(1);
+                    }
+                }
             }
             "--gas-metering" => {
                 index += 1;
@@ -1868,20 +1924,30 @@ fn build_command(args: &[String]) {
         process::exit(1);
     };
 
-    if opts.target_triple.as_deref() == Some("wasm32-wasip2") {
-        eprintln!("offline-blocked: target 'wasm32-wasip2' is not installed offline");
-        process::exit(1);
+    if emit_rust_crate && !backend_explicit {
+        backend = "rust".to_string();
     }
 
     match backend.to_ascii_lowercase().as_str() {
-        "zig" | "rust" | "mir-zig" | "mir" => {}
+        "zig" | "rust" | "mir-zig" | "mir" | "cranelift-aot" => {}
         other => {
             eprintln!(
-                "Error: unknown backend '{}'. Supported backends for build: zig, rust, mir-zig, mir",
+                "Error: unknown backend '{}'. Supported backends for build: zig, rust, mir-zig, mir, cranelift-aot",
                 other
             );
             process::exit(1);
         }
+    }
+
+    let is_rust_backend = backend.eq_ignore_ascii_case("rust");
+    let is_cranelift_aot_backend = backend.eq_ignore_ascii_case("cranelift-aot");
+
+    // Preserve legacy Zig/WASI-P2 offline-blocked rejection while lifting the hardcoded ban
+    // for `--backend rust` (which performs real `rustc --print target-libdir` detection and
+    // emits full `#![no_std]` `.rs` with `TargetStdlibNotInstalledOffline`, `NG-W13-2` / `F-11`).
+    if !is_rust_backend && !is_cranelift_aot_backend && opts.target_triple.as_deref() == Some("wasm32-wasip2") {
+        eprintln!("offline-blocked: target 'wasm32-wasip2' is not installed offline");
+        process::exit(1);
     }
 
     let entry_path = PathBuf::from(&entry_arg);
@@ -1911,21 +1977,78 @@ fn build_command(args: &[String]) {
         process::exit(1);
     }
 
+    let mut linked_rust_crates: Vec<lust::codegen_zig::aot::compiler::RustLinkedCrate> = Vec::new();
+    let mut rust_crate_deps: Vec<lust::codegen_zig::aot::compiler::RustCrateDependency> = Vec::new();
+
     #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
     {
-        for crate_dir in &link_crates {
-            match lust::packages::build_and_prepare_external_crate(
-                crate_dir,
-                allow_ffi,
-                opts.target_triple.as_deref(),
-                opts.release_mode.starts_with("Release"),
-            ) {
-                Ok(out) => {
-                    link_libraries.push(out.library_path);
+        if is_rust_backend {
+            for crate_path in &link_crates {
+                if emit_rust_crate && crate_path.is_dir() {
+                    if !crate_path.join("Cargo.toml").exists() {
+                        eprintln!(
+                            "Error: missing external library at '{}'",
+                            crate_path.display()
+                        );
+                        process::exit(1);
+                    }
+                    let package_name = match lust::packages::read_crate_name(crate_path) {
+                        Ok(name) => name,
+                        Err(err) => {
+                            eprintln!("Error: {}", err);
+                            process::exit(1);
+                        }
+                    };
+                    let crate_name = match lust::packages::read_crate_lib_name(crate_path) {
+                        Ok(name) => name,
+                        Err(err) => {
+                            eprintln!("Error: {}", err);
+                            process::exit(1);
+                        }
+                    };
+                    rust_crate_deps.push(lust::codegen_zig::aot::compiler::RustCrateDependency {
+                        package_name,
+                        crate_name,
+                        path: crate_path.clone(),
+                    });
+                } else {
+                    match lust::packages::prepare_external_rlib(
+                        crate_path,
+                        allow_ffi,
+                        opts.target_triple.as_deref(),
+                        opts.release_mode.starts_with("Release"),
+                    ) {
+                        Ok(rlib) => {
+                            linked_rust_crates.push(
+                                lust::codegen_zig::aot::compiler::RustLinkedCrate {
+                                    crate_name: rlib.crate_name,
+                                    rlib_path: rlib.rlib_path,
+                                    dependency_dirs: rlib.dependency_dirs,
+                                },
+                            );
+                        }
+                        Err(err) => {
+                            eprintln!("Error: {}", err);
+                            process::exit(1);
+                        }
+                    }
                 }
-                Err(err) => {
-                    eprintln!("Error: {}", err);
-                    process::exit(1);
+            }
+        } else {
+            for crate_dir in &link_crates {
+                match lust::packages::build_and_prepare_external_crate(
+                    crate_dir,
+                    allow_ffi,
+                    opts.target_triple.as_deref(),
+                    opts.release_mode.starts_with("Release"),
+                ) {
+                    Ok(out) => {
+                        link_libraries.push(out.library_path);
+                    }
+                    Err(err) => {
+                        eprintln!("Error: {}", err);
+                        process::exit(1);
+                    }
                 }
             }
         }
@@ -1959,16 +2082,17 @@ fn build_command(args: &[String]) {
         all_items.extend(module.items.clone());
     }
 
-    let is_library = matches!(
-        opts.target_kind,
-        lust::codegen_zig::BuildTargetKind::SharedLibrary
-            | lust::codegen_zig::BuildTargetKind::StaticLibrary
-    );
+    let is_library = emit_rust_crate
+        || matches!(
+            opts.target_kind,
+            lust::codegen_zig::BuildTargetKind::SharedLibrary
+                | lust::codegen_zig::BuildTargetKind::StaticLibrary
+        );
 
     let filtered_items = if opts.tree_shake {
         lust::codegen_zig::tree_shake_items(&all_items, is_library)
     } else {
-        all_items
+        all_items.clone()
     };
 
     let stem = entry_path
@@ -2006,7 +2130,7 @@ fn build_command(args: &[String]) {
         }
     };
 
-    let target_bin = output_bin.unwrap_or_else(|| {
+    let target_bin = output_bin.clone().unwrap_or_else(|| {
         let parent = entry_path.parent().unwrap_or_else(|| Path::new("."));
         if default_extension.is_empty() {
             parent.join(stem)
@@ -2015,10 +2139,7 @@ fn build_command(args: &[String]) {
         }
     });
 
-    if backend.to_ascii_lowercase() == "rust" {
-        // Mandatory NG-W12-4A frontend pipeline:
-        // TypeChecker::check_program -> prepare_items_for_mir -> AstLowering -> MirOptimizer + SROA
-        // -> refine_mir_function_with_layouts -> EscapeAnalysis -> cfg_structurer -> Rust emitter
+    if is_cranelift_aot_backend {
         let mut imports_map = lust::hashbrown::HashMap::new();
         for m in &program.modules {
             imports_map.insert(m.path.clone(), m.imports.clone());
@@ -2039,14 +2160,69 @@ fn build_command(args: &[String]) {
 
         let prepared_items = lust::codegen_zig::aot::prepare_items_for_mir(&filtered_items);
         let mir_module =
-            match lust::mir::lowering::AstLowering::lower_module_items("main_module", &prepared_items)
-            {
+            match lust::mir::lowering::AstLowering::lower_module_items("main_module", &prepared_items) {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("MIR lowering error: {}", e);
                     process::exit(1);
                 }
             };
+
+        match lust::codegen_zig::aot::compile_mir_to_object_file(
+            &mir_module,
+            &target_bin,
+            opts.target_triple.as_deref(),
+        ) {
+            Ok(obj) => {
+                println!("Successfully built Cranelift AOT object: {}", obj.display());
+                return;
+            }
+            Err(e) => {
+                eprintln!("{}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    if is_rust_backend {
+        // Mandatory NG-W12-4A + NG-W13-1C + NG-W13-2 frontend pipeline:
+        // TypeChecker::check_program -> prepare_items_for_mir -> desugar_effects_for_rust_aot
+        // -> AstLowering -> MirOptimizer + SROA -> refine_mir_function_with_layouts
+        // -> EscapeAnalysis -> cfg_structurer -> Rust emitter
+        let mut imports_map = lust::hashbrown::HashMap::new();
+        for m in &program.modules {
+            imports_map.insert(m.path.clone(), m.imports.clone());
+        }
+        let mut typechecker = TypeChecker::with_config(&config);
+        typechecker.set_imports_by_module(imports_map);
+        if let Err(e) = typechecker.check_program(&program.modules) {
+            if json_diag {
+                eprint!(
+                    "{}",
+                    cli::diag::json(format!("Type error: {e}"), "error", None, None)
+                );
+            } else {
+                eprintln!("Type error: {}", e);
+            }
+            process::exit(1);
+        }
+
+        let mir_module =
+            match lust::codegen_zig::aot::compiler::prepare_and_lower_items_for_rust_aot(
+                &filtered_items,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("MIR lowering error: {}", e);
+                    process::exit(1);
+                }
+            };
+
+        let effective_no_std = no_std
+            || opts
+                .target_triple
+                .as_deref()
+                .is_some_and(lust::codegen_zig::aot::is_nostd_target);
 
         let rust_opts = lust::codegen_zig::aot::RustCompileOptions {
             aot: lust::codegen_zig::aot::AotCompileOptions {
@@ -2069,20 +2245,66 @@ fn build_command(args: &[String]) {
             gas_metering,
             gas_limit,
             pure_core: !allow_ffi,
-            no_std: false,
+            no_std: effective_no_std,
             cache_dir: opts.cache_dir.clone(),
         };
 
+        if emit_rust_crate {
+            let crate_out_dir = output_bin.unwrap_or_else(|| {
+                let parent = entry_path.parent().unwrap_or_else(|| Path::new("."));
+                parent.join(format!("{stem}_crate"))
+            });
+            let pkg_name = crate_out_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(stem);
+            match lust::codegen_zig::aot::AotCompiler::emit_rust_crate(
+                &mir_module,
+                &all_items,
+                &crate_out_dir,
+                pkg_name,
+                &rust_opts,
+                &rust_crate_deps,
+            ) {
+                Ok(emitted) => {
+                    println!(
+                        "Generated Rust Cargo crate '{}' at {} ({} + {})",
+                        emitted.package_name,
+                        emitted.crate_dir.display(),
+                        emitted.manifest_path.display(),
+                        emitted.lib_rs_path.display()
+                    );
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("Rust Cargo crate emission error: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+
         if emit_rs {
-            let rust_source =
-                match lust::codegen_zig::aot::AotCompiler::emit_rust_module(&mir_module, &rust_opts)
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("Rust AOT codegen error: {}", e);
-                        process::exit(1);
-                    }
-                };
+            let interop = lust::codegen_zig::aot::rust_emitter::RustInteropOptions {
+                linked_crates: linked_rust_crates
+                    .iter()
+                    .map(|c| c.crate_name.clone())
+                    .collect(),
+                emit_as_include_module: false,
+                export_public_api: is_library,
+            };
+            let rust_source = match lust::codegen_zig::aot::AotCompiler::emit_rust_module_with_interop(
+                &mir_module,
+                &all_items,
+                &rust_opts,
+                &interop,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Rust AOT codegen error: {}", e);
+                    process::exit(1);
+                }
+            };
             let rs_file = if target_bin.extension().and_then(|e| e.to_str()) == Some("rs") {
                 target_bin
             } else {
@@ -2104,16 +2326,33 @@ fn build_command(args: &[String]) {
             link_dirs: link_dirs.clone(),
             allow_ffi,
         };
+        let lto_thin = !linked_rust_crates.is_empty();
+        let rust_links = lust::codegen_zig::aot::compiler::RustLinkOptions {
+            aot_links,
+            linked_crates: linked_rust_crates,
+            lto_thin,
+        };
 
-        match lust::codegen_zig::aot::AotCompiler::compile_module_rust_with_links(
+        match lust::codegen_zig::aot::AotCompiler::compile_module_rust_cross(
             &mir_module,
+            &all_items,
             &target_bin,
             &rust_opts,
-            &aot_links,
+            &rust_links,
         ) {
-            Ok(bin) => {
-                println!("Successfully built AOT artifact: {}", bin.display());
+            Ok(lust::codegen_zig::aot::RustAotBuildOutcome::Compiled { artifact_path, .. }) => {
+                println!("Successfully built AOT artifact: {}", artifact_path.display());
                 return;
+            }
+            Ok(lust::codegen_zig::aot::RustAotBuildOutcome::TargetStdlibNotInstalledOffline {
+                target,
+                generated_rs_path,
+            }) => {
+                eprintln!(
+                    "TargetStdlibNotInstalledOffline {{ target: \"{target}\", generated_rs_path: \"{}\" }}",
+                    generated_rs_path.display()
+                );
+                process::exit(2);
             }
             Err(e) => {
                 eprintln!("{}", e);

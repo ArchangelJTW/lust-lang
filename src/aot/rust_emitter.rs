@@ -90,9 +90,27 @@ impl Default for RustEmitterOptions {
     }
 }
 
+/// Extended Cargo & Zero-FFI interop options for Rust AOT emission (`NG-W13-1C`).
+#[derive(Debug, Clone, Default)]
+pub struct RustInteropOptions {
+    /// Sanitized Rust crate identifiers linked directly as `rlib` (emitted as `extern crate <ext>;`).
+    pub linked_crates: Vec<String>,
+    /// Emit as an `include!()`-compatible module (no crate-level `#![...]` inner attributes and no `fn main()`).
+    pub emit_as_include_module: bool,
+    /// Emit ergonomic `pub fn` wrapper APIs for user-defined Lust functions (`--emit=rust-crate` and `RustAotBuilder`).
+    pub export_public_api: bool,
+}
+
 /// Runs the mandatory MIR optimization, SROA, type refinement, and escape-analysis pipeline
 /// required before Rust AOT codegen (`NG-W12-4A` + `NG-W12-4B`).
 pub fn prepare_mir_module_for_rust_aot(module: &MirModule) -> MirModule {
+    prepare_mir_module_for_rust_aot_with_extern_rets(module, &HashMap::new())
+}
+
+fn prepare_mir_module_for_rust_aot_with_extern_rets(
+    module: &MirModule,
+    extern_ret_types: &HashMap<String, MirType>,
+) -> MirModule {
     let mut opt_module = module.clone();
 
     // 0. Canonicalize unqualified callee names against module-qualified function names
@@ -100,6 +118,11 @@ pub fn prepare_mir_module_for_rust_aot(module: &MirModule) -> MirModule {
     //    Doing this before MirOptimizer enables MirInliner, SROA, apply_module_callee_return_types,
     //    compute_readonly_params, and analyze_module_call_effects to match every intra-module call.
     canonicalize_module_callees(&mut opt_module);
+
+    // 0b. Pre-populate return types for `extern` calls (AstLowering defaults unknown callees to Int).
+    if !extern_ret_types.is_empty() {
+        apply_extern_callee_return_types(&mut opt_module, extern_ret_types);
+    }
 
     // 1. Run MirOptimizer while preserving `cleanup_blocks` (DCE only walks from `entry`,
     //    and inlining a cleanup-bearing function would lose its `cleanup_blocks`).
@@ -157,11 +180,14 @@ pub fn prepare_mir_module_for_rust_aot(module: &MirModule) -> MirModule {
     }
 
     // 3. Apply module callee return types and refine local/aggregate types with struct layouts
-    let callee_rets: HashMap<String, MirType> = opt_module
+    let mut callee_rets: HashMap<String, MirType> = opt_module
         .functions
         .iter()
         .map(|f| (f.signature.name.clone(), f.signature.return_type.clone()))
         .collect();
+    for (k, v) in extern_ret_types {
+        callee_rets.entry(k.clone()).or_insert_with(|| v.clone());
+    }
     // Snapshot concrete declared types of `enum.payload` destinations before Cranelift's
     // lattice refiner (which hardcodes `enum.payload -> Int` and can conflict Float payloads into Unknown).
     let pre_refine_enum_payload_tys: Vec<Vec<(LocalId, MirType)>> = opt_module
@@ -190,6 +216,10 @@ pub fn prepare_mir_module_for_rust_aot(module: &MirModule) -> MirModule {
     for func in &mut opt_module.functions {
         apply_module_callee_return_types(func, &callee_rets);
         *func = refine_mir_function_with_layouts(func, &struct_layouts);
+    }
+
+    if !extern_ret_types.is_empty() {
+        apply_extern_callee_return_types(&mut opt_module, extern_ret_types);
     }
 
     for (func, saved) in opt_module
@@ -338,6 +368,12 @@ fn refine_tier4_types(module: &mut MirModule) {
         .map(|e| (e.name.clone(), e.clone()))
         .collect();
 
+    // 0b. Pre-refine `__lust_resume`/`resume` and `__lust_perform`/`perform` destinations
+    //     so lifted handler arms and handle bodies infer their exact return types below.
+    for func in &mut module.functions {
+        refine_effect_call_local_types_in_fn(func);
+    }
+
     // 1. Propagate MirType::Function across copies (including Int placeholders from `mir_type_from_ast`)
     //    and infer concrete return types for lifted lambdas (Unknown) or closure-returning functions (Int).
     let mut lambda_ret_updates: HashMap<String, MirType> = HashMap::new();
@@ -409,6 +445,9 @@ fn refine_tier4_types(module: &mut MirModule) {
         .collect();
 
     for func in &mut module.functions {
+        // 2a-effect. Propagate concrete return types for `__lust_handle`, `__lust_provide`, `__lust_run_sync`.
+        refine_effect_handle_and_provide_types_in_fn(func, &module_fn_rets);
+
         // 2a-pre. Restore MirType::Function / MirType::Map / MirType::Enum / StructDecode call return types
         //         from module callees if Cranelift's refiner conflicted them with Int placeholders.
         for block in &func.blocks {
@@ -425,7 +464,10 @@ fn refine_tier4_types(module: &mut MirModule) {
                 } else if let Some(ret_ty) = module_fn_rets.get(callee)
                     && matches!(
                         ret_ty,
-                        MirType::Function { .. } | MirType::Map(_, _) | MirType::Enum(_)
+                        MirType::Function { .. }
+                            | MirType::Map(_, _)
+                            | MirType::Enum(_)
+                            | MirType::Unit
                     )
                 {
                     func.locals[dst.0].ty = ret_ty.clone();
@@ -472,7 +514,26 @@ fn refine_tier4_types(module: &mut MirModule) {
                             func.locals[dst.0].ty = st.clone();
                             changed = true;
                         } else if matches!(dt, MirType::Int)
-                            && matches!(st, MirType::Function { .. } | MirType::Map(_, _))
+                            && matches!(
+                                st,
+                                MirType::Function { .. } | MirType::Map(_, _) | MirType::Unit
+                            )
+                        {
+                            func.locals[dst.0].ty = st.clone();
+                            changed = true;
+                        } else if let (
+                            MirType::Function {
+                                params: sp,
+                                return_type: sr,
+                            },
+                            MirType::Function {
+                                params: dp,
+                                return_type: dr,
+                            },
+                        ) = (st, dt)
+                            && sp == dp
+                            && **dr == MirType::Unknown
+                            && **sr != MirType::Unknown
                         {
                             func.locals[dst.0].ty = st.clone();
                             changed = true;
@@ -746,6 +807,632 @@ fn refine_tier4_types(module: &mut MirModule) {
             }
         }
     }
+
+    // 3. Re-check lifted lambda return types in case a body lambda contained a nested `__lust_handle`
+    //    or `__lust_run_sync` whose return type was just resolved in pass 2.
+    let mut second_pass_rets: HashMap<String, MirType> = HashMap::new();
+    for func in &mut module.functions {
+        if matches!(func.signature.return_type, MirType::Unknown | MirType::Int) {
+            let mut inferred: Option<MirType> = None;
+            let mut conflict = false;
+            for block in &func.blocks {
+                if block.is_cleanup {
+                    continue;
+                }
+                if let Some(Terminator::Return(Some(op), _)) = &block.terminator {
+                    let ty = operand_mir_type(op, func);
+                    if ty != MirType::Unknown {
+                        match &inferred {
+                            None => inferred = Some(ty),
+                            Some(prev) if *prev == ty => {}
+                            Some(_) => {
+                                conflict = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if !conflict
+                && let Some(rt) = inferred
+                && (func.signature.return_type == MirType::Unknown
+                    || matches!(rt, MirType::Unit | MirType::Function { .. }))
+            {
+                func.signature.return_type = rt.clone();
+                if let Some(rl) = func.locals.get_mut(func.return_local.0) {
+                    rl.ty = rt.clone();
+                }
+                second_pass_rets.insert(func.signature.name.clone(), rt);
+            }
+        }
+    }
+    if !second_pass_rets.is_empty() {
+        let updated_rets: HashMap<String, MirType> = module
+            .functions
+            .iter()
+            .map(|f| (f.signature.name.clone(), f.signature.return_type.clone()))
+            .collect();
+        for func in &mut module.functions {
+            refine_effect_handle_and_provide_types_in_fn(func, &updated_rets);
+        }
+    }
+
+    // 4. NG-W13-1B: Refine parameterized `EffectYield<OpArg, ResumeVal, BodyRet>` types
+    //    and 3-phase `AotScope` builtin destinations across nested continuations & arms.
+    refine_nontail_and_scope_types(module);
+}
+
+fn trace_mir_closure_and_caps(
+    func: &MirFunction,
+    op: &Operand,
+) -> Option<(String, Vec<(String, Operand, MirType)>)> {
+    let mut def_loc: HashMap<LocalId, (BlockId, usize)> = HashMap::new();
+    for block in &func.blocks {
+        if block.is_cleanup {
+            continue;
+        }
+        for (sidx, stmt) in block.statements.iter().enumerate() {
+            if let Statement::Assign(Place::Local(dst), _, _) = stmt {
+                def_loc.insert(*dst, (block.id, sidx));
+            }
+        }
+    }
+    let mut cur = operand_exact_local(op)?;
+    let mut seen = HashSet::new();
+    while seen.insert(cur) {
+        let &(bb, sidx) = def_loc.get(&cur)?;
+        let Statement::Assign(_, rval, _) = &func.blocks[bb.0].statements[sidx] else {
+            return None;
+        };
+        match rval {
+            Rvalue::Closure {
+                func_name,
+                captures,
+            } => return Some((func_name.clone(), captures.clone())),
+            Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))) => {
+                cur = *src;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn trace_mir_nontail_handle_site(
+    func: &MirFunction,
+    args: &[Operand],
+) -> Option<(String, Vec<(String, String, usize)>)> {
+    if args.len() != 2 {
+        return None;
+    }
+    let (body_fn_name, _) = trace_mir_closure_and_caps(func, &args[0])?;
+    let arms_loc = operand_exact_local(&args[1])?;
+
+    let mut def_loc: HashMap<LocalId, (BlockId, usize)> = HashMap::new();
+    for block in &func.blocks {
+        if block.is_cleanup {
+            continue;
+        }
+        for (sidx, stmt) in block.statements.iter().enumerate() {
+            if let Statement::Assign(Place::Local(dst), _, _) = stmt {
+                def_loc.insert(*dst, (block.id, sidx));
+            }
+        }
+    }
+    let &(arms_bb, arms_sidx) = def_loc.get(&arms_loc)?;
+    let Statement::Assign(_, Rvalue::Aggregate(MirType::Array(_), tup_ops), _) =
+        &func.blocks[arms_bb.0].statements[arms_sidx]
+    else {
+        return None;
+    };
+
+    let mut arms = Vec::with_capacity(tup_ops.len());
+    for tup_op in tup_ops {
+        let tup_loc = operand_exact_local(tup_op)?;
+        let &(tup_bb, tup_sidx) = def_loc.get(&tup_loc)?;
+        let Statement::Assign(_, Rvalue::Aggregate(MirType::Tuple(_), elems), _) =
+            &func.blocks[tup_bb.0].statements[tup_sidx]
+        else {
+            return None;
+        };
+        if elems.len() < 2 {
+            return None;
+        }
+        let op_name = match &elems[0] {
+            Operand::Constant(MirConstant::String(s)) => s.clone(),
+            _ => return None,
+        };
+        let (arm_fn_name, arm_caps) = trace_mir_closure_and_caps(func, &elems[1])?;
+        arms.push((op_name, arm_fn_name, arm_caps.len()));
+    }
+    Some((body_fn_name, arms))
+}
+
+fn trace_mir_array_elems(func: &MirFunction, op: &Operand) -> Option<Vec<Operand>> {
+    let arr_loc = operand_exact_local(op)?;
+    for block in &func.blocks {
+        if block.is_cleanup {
+            continue;
+        }
+        for stmt in &block.statements {
+            if let Statement::Assign(
+                Place::Local(dst),
+                Rvalue::Aggregate(MirType::Array(_), elems),
+                _,
+            ) = stmt
+                && *dst == arr_loc
+            {
+                return Some(elems.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Refines `OpArg`, `ResumeVal`, `BodyRet`, and scope builtin destination types across
+/// `__lust_nontail_handle` / `__lust_yield_op` / `__lust_yield_completed` / `__lust_nontail_resume`
+/// / `__lust_scoped` (`NG-W13-1B`).
+fn refine_nontail_and_scope_types(module: &mut MirModule) {
+    let has_nontail_or_scope = module.functions.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            matches!(
+                &b.terminator,
+                Some(Terminator::Call { callee, .. })
+                    if matches!(
+                        callee.as_str(),
+                        "__lust_nontail_handle"
+                            | "__lust_yield_op"
+                            | "__lust_yield_completed"
+                            | "__lust_nontail_resume"
+                            | "__lust_scoped"
+                            | "__lust_scope_finalizer"
+                            | "__lust_scope_spawn"
+                    )
+            )
+        })
+    });
+    if !has_nontail_or_scope {
+        return;
+    }
+
+    // Set scope builtin call destinations to Unit
+    for func in &mut module.functions {
+        for block in &func.blocks {
+            if let Some(Terminator::Call {
+                callee,
+                destination: Place::Local(dst),
+                ..
+            }) = &block.terminator
+                && matches!(
+                    callee.as_str(),
+                    "__lust_scoped" | "__lust_scope_finalizer" | "__lust_scope_spawn"
+                )
+            {
+                func.locals[dst.0].ty = MirType::Unit;
+            }
+        }
+    }
+
+    // Multi-pass fixed-point inference so nested sequential continuations propagate `BodyRet`
+    // and `ResumeVal` from innermost continuation back to outer handle sites.
+    for _ in 0..4 {
+        let mut fn_index: HashMap<String, usize> = HashMap::new();
+        for (idx, f) in module.functions.iter().enumerate() {
+            fn_index.insert(f.signature.name.clone(), idx);
+        }
+
+        // Collect all `__lust_nontail_handle` sites: (caller_idx, dst_local, body_fn, arms)
+        let mut sites: Vec<(usize, Option<LocalId>, String, Vec<(String, String, usize)>)> =
+            Vec::new();
+        for (fi, func) in module.functions.iter().enumerate() {
+            for block in &func.blocks {
+                if let Some(Terminator::Call {
+                    callee,
+                    args,
+                    destination,
+                    ..
+                }) = &block.terminator
+                    && callee == "__lust_nontail_handle"
+                    && let Some((body_fn, arms)) = trace_mir_nontail_handle_site(func, args)
+                {
+                    let dst_loc = match destination {
+                        Place::Local(l) => Some(*l),
+                        _ => None,
+                    };
+                    sites.push((fi, dst_loc, body_fn, arms));
+                }
+            }
+        }
+
+        let mut changed = false;
+        for (caller_idx, dst_loc, body_fn_name, arms) in sites {
+            let Some(&body_idx) = fn_index.get(&body_fn_name) else {
+                continue;
+            };
+
+            // Inspect body function for `__lust_yield_completed` and `__lust_yield_op`
+            let mut body_ret_cand: Option<MirType> = None;
+            let mut body_ret_conflict = false;
+            let mut resume_val_cand: Option<MirType> = None;
+            let mut resume_val_conflict = false;
+            let mut op_arg_hints: HashMap<String, Vec<MirType>> = HashMap::new();
+            let mut cont_fn_infos: Vec<(String, usize)> = Vec::new();
+
+            let record_ty = |slot: &mut Option<MirType>, conflict: &mut bool, ty: MirType| {
+                if ty == MirType::Unknown {
+                    return;
+                }
+                match slot {
+                    None => *slot = Some(ty),
+                    Some(prev) if *prev == ty => {}
+                    Some(_) => *conflict = true,
+                }
+            };
+
+            {
+                let body_fn = &module.functions[body_idx];
+                for block in &body_fn.blocks {
+                    if let Some(Terminator::Call { callee, args, .. }) = &block.terminator {
+                        if callee == "__lust_yield_completed"
+                            && let Some(arg0) = args.first()
+                        {
+                            let t = operand_mir_type(arg0, body_fn);
+                            record_ty(&mut body_ret_cand, &mut body_ret_conflict, t);
+                        } else if callee == "__lust_yield_op" && args.len() >= 3 {
+                            if let Operand::Constant(MirConstant::String(op_name)) = &args[0]
+                                && let Some(arg_elems) = trace_mir_array_elems(body_fn, &args[1])
+                            {
+                                let tys: Vec<MirType> = arg_elems
+                                    .iter()
+                                    .map(|e| operand_mir_type(e, body_fn))
+                                    .collect();
+                                op_arg_hints.entry(op_name.clone()).or_insert(tys);
+                            }
+                            if let Some((cont_name, cont_caps)) =
+                                trace_mir_closure_and_caps(body_fn, &args[2])
+                            {
+                                cont_fn_infos.push((cont_name, cont_caps.len()));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Pull BodyRet and ResumeVal from continuation functions
+            for (cont_name, n_caps) in &cont_fn_infos {
+                if let Some(&ci) = fn_index.get(cont_name) {
+                    let cf = &module.functions[ci];
+                    if cf.signature.return_type != MirType::Unknown {
+                        record_ty(
+                            &mut body_ret_cand,
+                            &mut body_ret_conflict,
+                            cf.signature.return_type.clone(),
+                        );
+                    }
+                    if let Some(&pid) = cf.params.get(*n_caps) {
+                        let pty = cf.locals[pid.0].ty.clone();
+                        let used = count_local_uses(cf).get(&pid).copied().unwrap_or(0) > 0;
+                        if pty != MirType::Unknown && (used || pty != MirType::Int) {
+                            record_ty(&mut resume_val_cand, &mut resume_val_conflict, pty);
+                        }
+                    }
+                }
+            }
+
+            // Propagate OpArg hints into arm params and pull ResumeVal from `__lust_nontail_resume(v)`
+            for (op_name, arm_fn_name, n_caps) in &arms {
+                let Some(&arm_idx) = fn_index.get(arm_fn_name) else {
+                    continue;
+                };
+                if let Some(arg_tys) = op_arg_hints.get(op_name) {
+                    let arm_fn = &mut module.functions[arm_idx];
+                    for (pi, aty) in arg_tys.iter().enumerate() {
+                        if *aty != MirType::Unknown
+                            && let Some(&pid) = arm_fn.params.get(*n_caps + pi)
+                            && matches!(arm_fn.locals[pid.0].ty, MirType::Unknown | MirType::Int)
+                            && arm_fn.locals[pid.0].ty != *aty
+                        {
+                            arm_fn.locals[pid.0].ty = aty.clone();
+                            if let Some(sig_p) = arm_fn.signature.param_types.get_mut(*n_caps + pi) {
+                                *sig_p = aty.clone();
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+                let arm_fn = &module.functions[arm_idx];
+                for block in &arm_fn.blocks {
+                    if let Some(Terminator::Call { callee, args, .. }) = &block.terminator
+                        && callee == "__lust_nontail_resume"
+                        && let Some(arg0) = args.first()
+                    {
+                        let t = operand_mir_type(arg0, arm_fn);
+                        record_ty(&mut resume_val_cand, &mut resume_val_conflict, t);
+                    }
+                }
+            }
+
+            let resolved_body_ret = if body_ret_conflict {
+                MirType::Unknown
+            } else {
+                body_ret_cand.unwrap_or(MirType::Unit)
+            };
+            let resolved_resume_val = if resume_val_conflict {
+                MirType::Unknown
+            } else {
+                resume_val_cand.unwrap_or(MirType::Unit)
+            };
+
+            // Propagate resolved BodyRet into every `__lust_nontail_resume` destination and arm return
+            for (_, arm_fn_name, _) in &arms {
+                let Some(&arm_idx) = fn_index.get(arm_fn_name) else {
+                    continue;
+                };
+                let arm_fn = &mut module.functions[arm_idx];
+                let mut resume_dsts: HashSet<LocalId> = HashSet::new();
+                for block in &arm_fn.blocks {
+                    if let Some(Terminator::Call {
+                        callee,
+                        destination: Place::Local(dst),
+                        ..
+                    }) = &block.terminator
+                        && callee == "__lust_nontail_resume"
+                    {
+                        resume_dsts.insert(*dst);
+                        if arm_fn.locals[dst.0].ty != resolved_body_ret {
+                            arm_fn.locals[dst.0].ty = resolved_body_ret.clone();
+                            changed = true;
+                        }
+                    }
+                }
+                if !resume_dsts.is_empty() {
+                    // Propagate copy of resume destination into local bindings (e.g. `let r = resume(v)`)
+                    for block in &arm_fn.blocks {
+                        for stmt in &block.statements {
+                            if let Statement::Assign(
+                                Place::Local(dst),
+                                Rvalue::Use(
+                                    Operand::Copy(Place::Local(src))
+                                    | Operand::Move(Place::Local(src)),
+                                ),
+                                _,
+                            ) = stmt
+                                && resume_dsts.contains(src)
+                                && matches!(
+                                    arm_fn.locals[dst.0].ty,
+                                    MirType::Unknown | MirType::Unit
+                                )
+                                && resolved_body_ret != MirType::Unknown
+                                && arm_fn.locals[dst.0].ty != resolved_body_ret
+                            {
+                                arm_fn.locals[dst.0].ty = resolved_body_ret.clone();
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if matches!(arm_fn.signature.return_type, MirType::Unknown)
+                    && resolved_body_ret != MirType::Unknown
+                {
+                    arm_fn.signature.return_type = resolved_body_ret.clone();
+                    if let Some(rl) = arm_fn.locals.get_mut(arm_fn.return_local.0) {
+                        rl.ty = resolved_body_ret.clone();
+                    }
+                    changed = true;
+                }
+            }
+
+            // Propagate resolved ResumeVal into continuation explicit param if Unknown or unused Int placeholder
+            for (cont_name, n_caps) in &cont_fn_infos {
+                if let Some(&ci) = fn_index.get(cont_name) {
+                    let cf = &mut module.functions[ci];
+                    if let Some(&pid) = cf.params.get(*n_caps) {
+                        let unused_placeholder = cf.locals[pid.0].ty == MirType::Int
+                            && count_local_uses(cf).get(&pid).copied().unwrap_or(0) == 0;
+                        if (matches!(cf.locals[pid.0].ty, MirType::Unknown) || unused_placeholder)
+                            && resolved_resume_val != MirType::Unknown
+                            && cf.locals[pid.0].ty != resolved_resume_val
+                        {
+                            cf.locals[pid.0].ty = resolved_resume_val.clone();
+                            if let Some(sig_p) = cf.signature.param_types.get_mut(*n_caps) {
+                                *sig_p = resolved_resume_val.clone();
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            // Propagate resolved BodyRet into caller's `__lust_nontail_handle` destination & caller return
+            if let Some(dst) = dst_loc {
+                let caller = &mut module.functions[caller_idx];
+                if caller.locals[dst.0].ty != resolved_body_ret
+                    && (matches!(caller.locals[dst.0].ty, MirType::Unknown | MirType::Int)
+                        || resolved_body_ret != MirType::Unknown)
+                {
+                    caller.locals[dst.0].ty = resolved_body_ret.clone();
+                    changed = true;
+                }
+                // Re-infer caller return type if caller is a lifted continuation/lambda with Unknown return
+                if matches!(caller.signature.return_type, MirType::Unknown) {
+                    for block in &caller.blocks {
+                        if let Some(Terminator::Return(Some(op), _)) = &block.terminator
+                            && operand_exact_local(op) == Some(dst)
+                            && resolved_body_ret != MirType::Unknown
+                        {
+                            caller.signature.return_type = resolved_body_ret.clone();
+                            if let Some(rl) = caller.locals.get_mut(caller.return_local.0) {
+                                rl.ty = resolved_body_ret.clone();
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Refines `__lust_resume`/`resume` and `__lust_perform`/`perform` call destination types inside `func`.
+fn refine_effect_call_local_types_in_fn(func: &mut MirFunction) {
+    let mut perform_dsts: Vec<LocalId> = Vec::new();
+    for block in &func.blocks {
+        if let Some(Terminator::Call {
+            callee,
+            args,
+            destination: Place::Local(dst),
+            ..
+        }) = &block.terminator
+        {
+            match callee.as_str() {
+                "__lust_resume" | "resume" => {
+                    if let Some(arg0) = args.first() {
+                        let aty = operand_mir_type(arg0, func);
+                        if aty != MirType::Unknown {
+                            func.locals[dst.0].ty = aty;
+                        }
+                    }
+                }
+                "__lust_perform" | "perform" => {
+                    perform_dsts.push(*dst);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if perform_dsts.is_empty() {
+        return;
+    }
+
+    let perf_set: HashSet<LocalId> = perform_dsts.iter().copied().collect();
+    let mut inferred_perf_ty: HashMap<LocalId, MirType> = HashMap::new();
+    for block in &func.blocks {
+        for stmt in &block.statements {
+            match stmt {
+                Statement::Assign(
+                    Place::Local(dst),
+                    Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))),
+                    _,
+                ) if perf_set.contains(src) => {
+                    let dst_ty = &func.locals[dst.0].ty;
+                    if !matches!(dst_ty, MirType::Unknown | MirType::Int) {
+                        inferred_perf_ty.insert(*src, dst_ty.clone());
+                    }
+                }
+                Statement::Assign(_, Rvalue::BinaryOp(MirBinaryOp::Concat, lhs, rhs), _) => {
+                    if let Some(l) = operand_exact_local(lhs)
+                        && perf_set.contains(&l)
+                    {
+                        inferred_perf_ty.insert(l, MirType::String);
+                    }
+                    if let Some(r) = operand_exact_local(rhs)
+                        && perf_set.contains(&r)
+                    {
+                        inferred_perf_ty.insert(r, MirType::String);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(Terminator::Return(Some(op), _)) = &block.terminator
+            && let Some(l) = operand_exact_local(op)
+            && perf_set.contains(&l)
+            && !matches!(func.signature.return_type, MirType::Unknown)
+        {
+            inferred_perf_ty
+                .entry(l)
+                .or_insert_with(|| func.signature.return_type.clone());
+        }
+    }
+
+    for (loc, ty) in inferred_perf_ty {
+        func.locals[loc.0].ty = ty;
+    }
+}
+
+/// Propagates concrete lifted-thunk return types into `__lust_handle`, `__lust_provide`, and `__lust_run_sync` destinations.
+fn refine_effect_handle_and_provide_types_in_fn(
+    func: &mut MirFunction,
+    module_fn_rets: &HashMap<String, MirType>,
+) {
+    let mut closure_fn_of: HashMap<LocalId, String> = HashMap::new();
+    for block in &func.blocks {
+        for stmt in &block.statements {
+            if let Statement::Assign(Place::Local(dst), rval, _) = stmt {
+                match rval {
+                    Rvalue::Closure { func_name, .. } => {
+                        closure_fn_of.insert(*dst, func_name.clone());
+                    }
+                    Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))) => {
+                        if let Some(fname) = closure_fn_of.get(src).cloned() {
+                            closure_fn_of.insert(*dst, fname);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(Terminator::Call {
+            callee,
+            args,
+            destination: Place::Local(dst),
+            ..
+        }) = &block.terminator
+            && callee == "__lust_provide"
+            && let Some(src) = args.first().and_then(operand_exact_local)
+            && let Some(fname) = closure_fn_of.get(&src).cloned()
+        {
+            closure_fn_of.insert(*dst, fname);
+        }
+    }
+
+    for block in &func.blocks {
+        if let Some(Terminator::Call {
+            callee,
+            args,
+            destination: Place::Local(dst),
+            ..
+        }) = &block.terminator
+        {
+            match callee.as_str() {
+                "__lust_handle" | "__lust_run_sync" => {
+                    if let Some(arg0) = args.first() {
+                        if let Some(src) = operand_exact_local(arg0)
+                            && let Some(fname) = closure_fn_of.get(&src)
+                            && let Some(ret_ty) = module_fn_rets.get(fname)
+                            && *ret_ty != MirType::Unknown
+                        {
+                            func.locals[dst.0].ty = ret_ty.clone();
+                            continue;
+                        }
+                        match operand_mir_type(arg0, func) {
+                            MirType::Function { return_type, .. }
+                            | MirType::Effect { return_type, .. }
+                                if *return_type != MirType::Unknown =>
+                            {
+                                func.locals[dst.0].ty = (*return_type).clone();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "__lust_provide" => {
+                    if let Some(arg0) = args.first() {
+                        let aty = operand_mir_type(arg0, func);
+                        if aty != MirType::Unknown {
+                            func.locals[dst.0].ty = aty;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn canonicalize_module_callees(module: &mut MirModule) {
@@ -778,19 +1465,50 @@ fn canonicalize_module_callees(module: &mut MirModule) {
 
 /// Generates idiomatic, panic-free, `unsafe`-free Rust source code from a `MirModule`.
 pub fn emit_rust_from_mir(module: &MirModule, opts: &RustEmitterOptions) -> Result<String> {
-    let prepared = prepare_mir_module_for_rust_aot(module);
-    let ctx = ModuleEmitContext::analyze(&prepared, opts);
+    emit_rust_from_mir_with_ast(module, &[], opts)
+}
+
+/// Generates idiomatic, panic-free, `unsafe`-free Rust source code from a `MirModule`
+/// together with direct AST items (`ServiceDef`, `TraitDef`, `ImplBlock`, `FunctionDef.effects`,
+/// and desugared `__lust_handle`/`__lust_perform`/`__lust_resume` calls) without modifying
+/// `src/mir/ir.rs` (`NG-W13-1A`, `F-19`).
+pub fn emit_rust_from_mir_with_ast(
+    module: &MirModule,
+    ast_items: &[crate::ast::Item],
+    opts: &RustEmitterOptions,
+) -> Result<String> {
+    emit_rust_from_mir_with_interop(module, ast_items, opts, &RustInteropOptions::default())
+}
+
+/// Generates idiomatic, panic-free, `unsafe`-free Rust source code from a `MirModule` + AST items
+/// with Cargo/Zero-FFI interop options (`--emit=rust-crate`, `--link-crate`, `RustAotBuilder`,
+/// `NG-W13-1C`).
+pub fn emit_rust_from_mir_with_interop(
+    module: &MirModule,
+    ast_items: &[crate::ast::Item],
+    opts: &RustEmitterOptions,
+    interop: &RustInteropOptions,
+) -> Result<String> {
+    let ast_meta = AstEffectsMetadata::extract(ast_items);
+    let extern_ret_types = build_extern_return_type_map(module, &ast_meta);
+    let prepared = prepare_mir_module_for_rust_aot_with_extern_rets(module, &extern_ret_types);
+    let ctx = ModuleEmitContext::analyze(&prepared, opts, interop, ast_meta);
 
     let mut out = String::with_capacity(8192);
-    emit_file_header(&mut out, opts);
+    emit_file_header(&mut out, opts, interop);
     emit_struct_definitions(&mut out, &ctx);
     emit_enum_definitions(&mut out, &ctx);
+    emit_trait_and_service_definitions(&mut out, &ctx);
 
     for func in &prepared.functions {
         emit_function(&mut out, func, &ctx)?;
     }
 
-    if !opts.is_library {
+    if interop.export_public_api {
+        emit_public_api_wrappers(&mut out, &prepared, &ctx);
+    }
+
+    if !opts.is_library && !interop.emit_as_include_module {
         emit_entrypoint(&mut out, &prepared, &ctx);
     }
 
@@ -881,19 +1599,53 @@ struct FnMeta {
     return_type: MirType,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NonTailOpArgMode {
+    /// Single arm with 0 explicit parameters -> `OpArg = ()`.
+    Unit,
+    /// Single arm with 1 explicit typed parameter -> `OpArg = T` (`i64`, `f64`, `bool`, `String`, `()`, `AotValue`).
+    Single(MirType),
+    /// Multiple arms or multi-arg operation -> `OpArg = (&'static str, alloc::vec::Vec<lust_aot_rt::AotValue>)`.
+    TaggedVec,
+}
+
+#[derive(Debug, Clone)]
+struct NonTailYieldSig {
+    op_arg_mode: NonTailOpArgMode,
+    resume_val_ty: MirType,
+    body_ret_ty: MirType,
+}
+
+#[derive(Debug, Clone)]
+struct NonTailArmMeta {
+    resume_val_ty: MirType,
+    body_ret_ty: MirType,
+}
+
 struct ModuleEmitContext<'m> {
     module: &'m MirModule,
     opts: &'m RustEmitterOptions,
+    interop: &'m RustInteropOptions,
+    ast_meta: AstEffectsMetadata,
     structs: BTreeMap<String, StructMeta>,
     enums: BTreeMap<String, EnumMeta>,
     fn_metas: HashMap<String, FnMeta>,
+    /// Lifted body thunks of non-tail `handle..with` returning `EffectYield<OpArg, ResumeVal, BodyRet>` (`NG-W13-1B`).
+    nontail_body_metas: HashMap<String, NonTailYieldSig>,
+    /// Lifted handler arms of non-tail `handle..with` receiving `&mut OneShotResume<ResumeVal, BodyRet>` (`NG-W13-1B`).
+    nontail_arm_metas: HashMap<String, NonTailArmMeta>,
     module_uses_arena: bool,
     /// Whether any closure in the module captures a type requiring `'a`.
     closures_need_lt: bool,
 }
 
 impl<'m> ModuleEmitContext<'m> {
-    fn analyze(module: &'m MirModule, opts: &'m RustEmitterOptions) -> Self {
+    fn analyze(
+        module: &'m MirModule,
+        opts: &'m RustEmitterOptions,
+        interop: &'m RustInteropOptions,
+        ast_meta: AstEffectsMetadata,
+    ) -> Self {
         let structs = analyze_structs(module);
         let enums = analyze_enums(module, &structs);
         let module_uses_arena = structs.values().any(|s| s.is_cyclic);
@@ -1024,6 +1776,171 @@ impl<'m> ModuleEmitContext<'m> {
             }
         }
 
+        // 2a-effect. For functions containing effect/scope constructs (`__lust_handle`,
+        //            `__lust_nontail_handle`, `__lust_yield_op`, `__lust_scoped`,
+        //            `__lust_scope_finalizer`, `__lust_scope_spawn`, `__lust_run_sync`),
+        //            transitively share mutated scalar locals as `Rc<Cell<T>>` and mutated
+        //            non-Copy locals (e.g. `String`) as `Rc<RefCell<T>>` across enclosing
+        //            functions and nested/sibling closures (`NG-W13-1A` + `NG-W13-1B`).
+        for _ in 0..4 {
+            let mut effect_cap_changed = false;
+            for func in &module.functions {
+                let has_effect_or_scope = func.blocks.iter().any(|b| {
+                    matches!(
+                        &b.terminator,
+                        Some(Terminator::Call { callee, .. })
+                            if matches!(
+                                callee.as_str(),
+                                "__lust_handle"
+                                    | "__lust_nontail_handle"
+                                    | "__lust_yield_op"
+                                    | "__lust_scoped"
+                                    | "__lust_scope_finalizer"
+                                    | "__lust_scope_spawn"
+                                    | "__lust_run_sync"
+                            )
+                    )
+                });
+                if !has_effect_or_scope {
+                    continue;
+                }
+                let enclosing_name = func.signature.name.clone();
+                let mut mutated_scalar_caps: HashSet<LocalId> = HashSet::new();
+                let mut mutated_noncopy_caps: HashSet<LocalId> = HashSet::new();
+                let mut all_closure_caps: Vec<(String, usize, LocalId, MirType)> = Vec::new();
+                for block in &func.blocks {
+                    for stmt in &block.statements {
+                        if let Statement::Assign(
+                            _,
+                            Rvalue::Closure {
+                                func_name,
+                                captures,
+                            },
+                            _,
+                        ) = stmt
+                        {
+                            let lifted_fn = fn_by_name.get(func_name.as_str()).copied();
+                            for (ci, (_, cap_op, cap_ty)) in captures.iter().enumerate() {
+                                let is_scalar =
+                                    matches!(cap_ty, MirType::Int | MirType::Float | MirType::Bool);
+                                let is_mut_noncopy = matches!(
+                                    cap_ty,
+                                    MirType::String | MirType::Unknown | MirType::Enum(_)
+                                );
+                                if !is_scalar && !is_mut_noncopy {
+                                    continue;
+                                }
+                                if let Some(loc) = operand_exact_local(cap_op) {
+                                    all_closure_caps.push((
+                                        func_name.clone(),
+                                        ci,
+                                        loc,
+                                        cap_ty.clone(),
+                                    ));
+                                    let lifted_mutates = lifted_fn.is_some_and(|lf| {
+                                        lf.params.get(ci).is_some_and(|&pid| {
+                                            local_is_mutated_in_fn(lf, pid)
+                                                || local_storage_map
+                                                    .get(func_name.as_str())
+                                                    .and_then(|v| v.get(pid.0))
+                                                    .is_some_and(|s| *s != LocalStorage::Direct)
+                                        })
+                                    });
+                                    let enclosing_already_shared = local_storage_map
+                                        .get(&enclosing_name)
+                                        .and_then(|v| v.get(loc.0))
+                                        .is_some_and(|s| *s != LocalStorage::Direct);
+                                    let enclosing_mutates = local_is_mutated_in_fn(func, loc);
+                                    if lifted_mutates || enclosing_mutates || enclosing_already_shared
+                                    {
+                                        if is_scalar {
+                                            mutated_scalar_caps.insert(loc);
+                                        } else {
+                                            mutated_noncopy_caps.insert(loc);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for loc in &mutated_scalar_caps {
+                    if let Some(vec_st) = local_storage_map.get_mut(&enclosing_name)
+                        && loc.0 < vec_st.len()
+                        && vec_st[loc.0] != LocalStorage::RcCell
+                    {
+                        vec_st[loc.0] = LocalStorage::RcCell;
+                        effect_cap_changed = true;
+                    }
+                    if let Some(pi) = func.params.iter().position(|&p| p == *loc)
+                        && let Some(pms) = param_modes_map.get_mut(&enclosing_name)
+                        && pi < pms.len()
+                        && pms[pi] != ParamMode::RcCell
+                    {
+                        pms[pi] = ParamMode::RcCell;
+                        effect_cap_changed = true;
+                    }
+                }
+                for loc in &mutated_noncopy_caps {
+                    if let Some(vec_st) = local_storage_map.get_mut(&enclosing_name)
+                        && loc.0 < vec_st.len()
+                        && vec_st[loc.0] != LocalStorage::RcRefCell
+                    {
+                        vec_st[loc.0] = LocalStorage::RcRefCell;
+                        effect_cap_changed = true;
+                    }
+                    if let Some(pi) = func.params.iter().position(|&p| p == *loc)
+                        && let Some(pms) = param_modes_map.get_mut(&enclosing_name)
+                        && pi < pms.len()
+                        && pms[pi] != ParamMode::RcRefCell
+                    {
+                        pms[pi] = ParamMode::RcRefCell;
+                        effect_cap_changed = true;
+                    }
+                }
+                for (func_name, ci, loc, _) in all_closure_caps {
+                    if mutated_scalar_caps.contains(&loc) {
+                        if let Some(lmodes) = param_modes_map.get_mut(&func_name)
+                            && ci < lmodes.len()
+                            && lmodes[ci] != ParamMode::RcCell
+                        {
+                            lmodes[ci] = ParamMode::RcCell;
+                            effect_cap_changed = true;
+                        }
+                        if let Some(lf) = fn_by_name.get(func_name.as_str()).copied()
+                            && let Some(&pid) = lf.params.get(ci)
+                            && let Some(lvec) = local_storage_map.get_mut(&func_name)
+                            && pid.0 < lvec.len()
+                            && lvec[pid.0] != LocalStorage::RcCell
+                        {
+                            lvec[pid.0] = LocalStorage::RcCell;
+                            effect_cap_changed = true;
+                        }
+                    } else if mutated_noncopy_caps.contains(&loc) {
+                        if let Some(lmodes) = param_modes_map.get_mut(&func_name)
+                            && ci < lmodes.len()
+                            && lmodes[ci] != ParamMode::RcRefCell
+                        {
+                            lmodes[ci] = ParamMode::RcRefCell;
+                            effect_cap_changed = true;
+                        }
+                        if let Some(lf) = fn_by_name.get(func_name.as_str()).copied()
+                            && let Some(&pid) = lf.params.get(ci)
+                            && let Some(lvec) = local_storage_map.get_mut(&func_name)
+                            && pid.0 < lvec.len()
+                            && lvec[pid.0] != LocalStorage::RcRefCell
+                        {
+                            lvec[pid.0] = LocalStorage::RcRefCell;
+                            effect_cap_changed = true;
+                        }
+                    }
+                }
+            }
+            if !effect_cap_changed {
+                break;
+            }
+        }
+
         // 2b. Cleanup block (`defer` / `errdefer`) capture analysis
         for func in &module.functions {
             if func.cleanup_blocks.is_empty() {
@@ -1095,16 +2012,24 @@ impl<'m> ModuleEmitContext<'m> {
                     if let Some(Terminator::Call { callee, args, .. }) = &block.terminator
                         && let Some(callee_fn) = fn_by_name.get(callee.as_str())
                     {
-                        // Count RcRefCell args by MirType
+                        // Count RcRefCell args and check whether any sibling arg is a Closure/Effect
+                        // (which could re-entrantly borrow the same RcRefCell during the call).
                         let mut rc_arg_indices: Vec<usize> = Vec::new();
+                        let mut has_callable_arg = false;
                         for (ai, arg) in args.iter().enumerate() {
                             if let Some(loc) = operand_exact_local(arg)
                                 && caller_st.get(loc.0).copied() == Some(LocalStorage::RcRefCell)
                             {
                                 rc_arg_indices.push(ai);
                             }
+                            if matches!(
+                                operand_mir_type(arg, func),
+                                MirType::Function { .. } | MirType::Effect { .. } | MirType::Unknown
+                            ) {
+                                has_callable_arg = true;
+                            }
                         }
-                        if rc_arg_indices.len() >= 2 {
+                        if rc_arg_indices.len() >= 2 || (!rc_arg_indices.is_empty() && has_callable_arg) {
                             for &ai in &rc_arg_indices {
                                 if let Some(pms) = param_modes_map.get_mut(callee)
                                     && ai < pms.len()
@@ -1238,6 +2163,8 @@ impl<'m> ModuleEmitContext<'m> {
             }
         }
 
+        let (nontail_body_metas, nontail_arm_metas) = analyze_nontail_effect_metas(module);
+
         let mut fn_metas = HashMap::new();
         for func in &module.functions {
             let name = func.signature.name.clone();
@@ -1245,12 +2172,14 @@ impl<'m> ModuleEmitContext<'m> {
             let param_modes = param_modes_map.remove(&name).unwrap_or_default();
             let local_storage = local_storage_map.remove(&name).unwrap_or_default();
             let cleanup_captured = cleanup_captured_map.remove(&name).unwrap_or_default();
+            let is_nontail_fn =
+                nontail_body_metas.contains_key(&name) || nontail_arm_metas.contains_key(&name);
             fn_metas.insert(
                 name.clone(),
                 FnMeta {
                     rust_name,
-                    can_fail: can_fail_map[&name],
-                    needs_ctx: needs_ctx_map[&name],
+                    can_fail: can_fail_map[&name] || is_nontail_fn,
+                    needs_ctx: needs_ctx_map[&name] || is_nontail_fn,
                     needs_alloc: needs_alloc_map[&name],
                     needs_arena: needs_arena_map[&name],
                     param_modes,
@@ -1264,11 +2193,99 @@ impl<'m> ModuleEmitContext<'m> {
         Self {
             module,
             opts,
+            interop,
+            ast_meta,
             structs,
             enums,
             fn_metas,
+            nontail_body_metas,
+            nontail_arm_metas,
             module_uses_arena,
             closures_need_lt,
+        }
+    }
+
+    /// Resolves a MIR callee name to a direct Zero-FFI external Rust crate function call
+    /// (`extern crate <ext>; <ext>::<fn>(...)`) when `--link-crate` is active (`NG-W13-1C`).
+    fn resolve_extern_crate_call(&self, callee: &str) -> Option<ResolvedExternCrateCall> {
+        if self.interop.linked_crates.is_empty() {
+            return None;
+        }
+        let linked_set: HashSet<String> = self
+            .interop
+            .linked_crates
+            .iter()
+            .map(|c| sanitize_ident(c))
+            .collect();
+
+        let extern_sig = self.ast_meta.extern_fns.iter().find(|e| {
+            e.name == callee
+                || e.name.rsplit('.').next() == Some(callee)
+                || callee.rsplit('.').next() == Some(e.name.as_str())
+        });
+
+        let (crate_ident, fn_path) = if let Some((prefix, rest)) =
+            callee.split_once("::").or_else(|| callee.split_once('.'))
+            && linked_set.contains(&sanitize_ident(prefix))
+        {
+            (sanitize_ident(prefix), rest.replace('.', "::"))
+        } else if let Some(sig) = extern_sig
+            && let Some((prefix, rest)) =
+                sig.name.split_once("::").or_else(|| sig.name.split_once('.'))
+            && linked_set.contains(&sanitize_ident(prefix))
+        {
+            (sanitize_ident(prefix), rest.replace('.', "::"))
+        } else if let Some(sig) = extern_sig
+            && linked_set.contains(&sanitize_ident(&sig.abi))
+        {
+            let simple = sig
+                .name
+                .rsplit(['.', ':'])
+                .next()
+                .unwrap_or(&sig.name)
+                .to_string();
+            (sanitize_ident(&sig.abi), simple)
+        } else if let Some(sig) = extern_sig
+            && self.interop.linked_crates.len() == 1
+        {
+            let simple = sig
+                .name
+                .rsplit(['.', ':'])
+                .next()
+                .unwrap_or(&sig.name)
+                .to_string();
+            (sanitize_ident(&self.interop.linked_crates[0]), simple)
+        } else {
+            return None;
+        };
+
+        let param_types: Vec<MirType> = extern_sig
+            .map(|sig| {
+                sig.params
+                    .iter()
+                    .map(|(_, ty)| ast_type_to_mir_for_service(ty, self))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let return_type = extern_sig
+            .and_then(|sig| sig.return_type.as_ref())
+            .map(|ty| ast_type_to_mir_for_service(ty, self))
+            .unwrap_or(MirType::Unit);
+
+        Some(ResolvedExternCrateCall {
+            rust_path: format!("{crate_ident}::{fn_path}"),
+            param_types,
+            return_type,
+        })
+    }
+
+    fn nontail_op_arg_rust_type(&self, mode: &NonTailOpArgMode) -> String {
+        match mode {
+            NonTailOpArgMode::Unit => "()".to_string(),
+            NonTailOpArgMode::Single(ty) => self.rust_type(ty, "'static"),
+            NonTailOpArgMode::TaggedVec => {
+                "(&'static str, alloc::vec::Vec<lust_aot_rt::AotValue>)".to_string()
+            }
         }
     }
 
@@ -2741,6 +3758,26 @@ fn scan_function_local_requirements(
                                     req.can_fail = true;
                                 }
                             }
+                            "__lust_handle" | "__lust_nontail_handle" | "__lust_perform"
+                            | "perform" | "__lust_resume" | "resume" | "__lust_nontail_resume"
+                            | "__lust_yield_op" | "__lust_yield_completed" | "__lust_provide"
+                            | "__lust_run_sync" | "__lust_scoped" | "__lust_scope_finalizer"
+                            | "__lust_scope_spawn" => {
+                                req.needs_ctx = true;
+                                req.can_fail = true;
+                                // Propagate body thunk requirements directly into enclosing function
+                                if matches!(
+                                    callee.as_str(),
+                                    "__lust_handle"
+                                        | "__lust_nontail_handle"
+                                        | "__lust_run_sync"
+                                        | "__lust_scoped"
+                                ) && let Some(arg0) = args.first()
+                                    && let Some(body_fn) = trace_closure_fn_name_in_mir(func, arg0)
+                                {
+                                    req.user_callees.push(body_fn);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -2826,14 +3863,48 @@ fn leading_block_of(node: &StructuredNode) -> Option<BlockId> {
 // File Header, Structs, and Main Entrypoint
 // ---------------------------------------------------------------------------
 
-fn emit_file_header(out: &mut String, opts: &RustEmitterOptions) {
-    out.push_str("// Generated by Lust Next-Gen Rust AOT Compiler (NG-W12-4A + NG-W12-4B + NG-W12-4C)\n");
-    if opts.no_std {
-        out.push_str("#![no_std]\n");
+const INCLUDE_ALLOW_ATTR: &str = "#[allow(unused_variables, unused_mut, unused_assignments, dead_code, non_camel_case_types, non_snake_case, unreachable_code, clippy::all)]\n";
+
+fn emit_file_header(out: &mut String, opts: &RustEmitterOptions, interop: &RustInteropOptions) {
+    out.push_str("// Generated by Lust Next-Gen Rust AOT Compiler (NG-W12-4A + NG-W12-4B + NG-W12-4C + NG-W13-1C + NG-W13-2)\n");
+    if !interop.emit_as_include_module {
+        if opts.no_std {
+            out.push_str("#![no_std]\n");
+        }
+        out.push_str("#![allow(unused_variables, unused_mut, unused_assignments, dead_code, non_camel_case_types, non_snake_case, unreachable_code, clippy::all)]\n\n");
     }
-    out.push_str("#![allow(unused_variables, unused_mut, unused_assignments, dead_code, non_camel_case_types, non_snake_case, unreachable_code, clippy::all)]\n\n");
     out.push_str("extern crate alloc;\n");
-    out.push_str("extern crate lust_aot_rt;\n\n");
+    out.push_str("extern crate lust_aot_rt;\n");
+    if opts.no_std && !interop.emit_as_include_module {
+        // On `wasm32-unknown-unknown` `cdylib` builds, link `std` privately to supply the
+        // target global allocator and panic handler without introducing any custom allocator glue.
+        // Bare-metal MCU targets (`target_os = "none"`) and host `#![no_std]` `rlib` crates never
+        // link `std`.
+        out.push_str("#[cfg(all(target_arch = \"wasm32\", target_os = \"unknown\"))]\n");
+        out.push_str("extern crate std as __lust_wasm_runtime;\n");
+    }
+    let mut emitted_crates: HashSet<String> = HashSet::new();
+    for ext_crate in &interop.linked_crates {
+        let ident = sanitize_ident(ext_crate);
+        if !ident.is_empty() && emitted_crates.insert(ident.clone()) {
+            let _ = writeln!(out, "extern crate {ident};");
+        }
+    }
+    if opts.no_std && !interop.emit_as_include_module {
+        out.push_str("\n// `#![no_std]` Embedded / MCU Preamble with `StaticSlabAllocator<65536>` (`NG-W13-2`)\n");
+        out.push_str("pub const LUST_STATIC_SLAB_BYTES: usize = 65536;\n");
+        out.push_str("pub type LustStaticSlab = lust_aot_rt::StaticSlabAllocator<65536>;\n\n");
+        out.push_str("#[inline]\n");
+        out.push_str("pub const fn lust_static_slab_new() -> lust_aot_rt::StaticSlabAllocator<65536> {\n");
+        out.push_str("    lust_aot_rt::StaticSlabAllocator::<65536>::new()\n");
+        out.push_str("}\n\n");
+        out.push_str("#[cfg(all(not(test), target_os = \"none\"))]\n");
+        out.push_str("#[panic_handler]\n");
+        out.push_str("fn __lust_nostd_panic(_info: &core::panic::PanicInfo<'_>) -> ! {\n");
+        out.push_str("    loop {}\n");
+        out.push_str("}\n");
+    }
+    out.push('\n');
 }
 
 fn emit_struct_definitions(out: &mut String, ctx: &ModuleEmitContext<'_>) {
@@ -2843,6 +3914,9 @@ fn emit_struct_definitions(out: &mut String, ctx: &ModuleEmitContext<'_>) {
     out.push_str("// Struct & Schema Definitions (Tiers 2-3 + NG-W12-4C #[repr(C)] Layout Assertions & Decoders)\n");
     for meta in ctx.structs.values() {
         let sname = rust_struct_name(&meta.name);
+        if ctx.interop.emit_as_include_module {
+            out.push_str(INCLUDE_ALLOW_ATTR);
+        }
         if !meta.is_cyclic {
             out.push_str("#[repr(C)]\n");
         }
@@ -2872,21 +3946,31 @@ fn emit_struct_definitions(out: &mut String, ctx: &ModuleEmitContext<'_>) {
                 .resolved_layout
                 .as_ref()
                 .unwrap_or(&meta.logical_layout);
+            let needs_64bit_cfg = !layout.is_c_flat
+                || layout
+                    .fields
+                    .iter()
+                    .any(|f| matches!(f.tag, CanonicalTypeTag::Decimal128));
+            let cfg_prefix = if needs_64bit_cfg {
+                "#[cfg(target_pointer_width = \"64\")]\n"
+            } else {
+                ""
+            };
             for (i, f) in layout.fields.iter().enumerate() {
                 let _ = writeln!(
                     out,
-                    "const _: () = assert!(core::mem::offset_of!({sname}, field_{i}) == {});",
+                    "{cfg_prefix}const _: () = assert!(core::mem::offset_of!({sname}, field_{i}) == {});",
                     f.byte_offset
                 );
             }
             let _ = writeln!(
                 out,
-                "const _: () = assert!(core::mem::size_of::<{sname}>() == {});",
+                "{cfg_prefix}const _: () = assert!(core::mem::size_of::<{sname}>() == {});",
                 layout.size_bytes
             );
             let _ = writeln!(
                 out,
-                "const _: () = assert!(core::mem::align_of::<{sname}>() == {});\n",
+                "{cfg_prefix}const _: () = assert!(core::mem::align_of::<{sname}>() == {});\n",
                 layout.align_bytes
             );
         }
@@ -3171,6 +4255,9 @@ fn emit_enum_definitions(out: &mut String, ctx: &ModuleEmitContext<'_>) {
     for meta in ctx.enums.values() {
         let ename = rust_enum_name(&meta.name);
         let lt_decl = if meta.needs_arena_lt { "<'a>" } else { "" };
+        if ctx.interop.emit_as_include_module {
+            out.push_str(INCLUDE_ALLOW_ATTR);
+        }
         if meta.is_copy {
             out.push_str("#[derive(Clone, Copy, Debug, PartialEq)]\n");
         } else {
@@ -3271,11 +4358,1545 @@ fn emit_enum_definitions(out: &mut String, ctx: &ModuleEmitContext<'_>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Direct AST Extraction & Nominal Services / Tail-Resumptive Analysis (NG-W13-1A)
+// ---------------------------------------------------------------------------
+
+/// Classification of a single `handle .. with` handler arm body extracted directly from AST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandlerArmTailKind {
+    /// Every `__lust_resume(...)` call in this arm is in tail position (single call per path).
+    TailResumptive,
+    /// Arm never calls `__lust_resume(...)` (aborts / returns directly).
+    Abortive,
+    /// Arm calls `__lust_resume(...)` in non-tail position or more than once on a path.
+    NonTailOrMultiShot,
+}
+
+#[derive(Debug, Clone)]
+struct HandleAstSite {
+    #[allow(dead_code)]
+    arm_kinds: Vec<(String, HandlerArmTailKind)>,
+    all_tail_or_abortive: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AstExternFnMeta {
+    abi: String,
+    name: String,
+    params: Vec<(Option<String>, crate::ast::Type)>,
+    return_type: Option<crate::ast::Type>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedExternCrateCall {
+    rust_path: String,
+    param_types: Vec<MirType>,
+    return_type: MirType,
+}
+
+#[derive(Debug, Default, Clone)]
+struct AstEffectsMetadata {
+    services: Vec<crate::ast::ServiceDef>,
+    traits: BTreeMap<String, crate::ast::TraitDef>,
+    trait_impls: Vec<crate::ast::ImplBlock>,
+    inherent_impls: BTreeMap<String, Vec<crate::ast::FunctionDef>>,
+    fn_effects: BTreeMap<String, crate::ast::ReturnSpec>,
+    handle_sites: Vec<HandleAstSite>,
+    extern_fns: Vec<AstExternFnMeta>,
+}
+
+impl AstEffectsMetadata {
+    fn extract(items: &[crate::ast::Item]) -> Self {
+        let mut meta = Self::default();
+        meta.collect_items(items);
+        meta
+    }
+
+    fn collect_items(&mut self, items: &[crate::ast::Item]) {
+        for item in items {
+            match &item.kind {
+                crate::ast::ItemKind::Extern { abi, items: ext_items } => {
+                    for ext_item in ext_items {
+                        if let crate::ast::ExternItem::Function {
+                            name,
+                            params,
+                            return_type,
+                            ..
+                        } = ext_item
+                        {
+                            self.extern_fns.push(AstExternFnMeta {
+                                abi: abi.clone(),
+                                name: name.clone(),
+                                params: params
+                                    .iter()
+                                    .map(|p| (p.name.clone(), p.ty.clone()))
+                                    .collect(),
+                                return_type: return_type.clone(),
+                            });
+                        }
+                    }
+                }
+                crate::ast::ItemKind::Service(s) => {
+                    self.services.push(s.clone());
+                }
+                crate::ast::ItemKind::Trait(t) => {
+                    self.traits.insert(t.name.clone(), t.clone());
+                }
+                crate::ast::ItemKind::Impl(imp) => {
+                    for m in &imp.methods {
+                        self.scan_stmts_for_handles(&m.body);
+                        if let Some(eff) = &m.effects {
+                            let target = ast_type_target_name(&imp.target_type);
+                            self.fn_effects
+                                .insert(format!("{target}:{}", m.name), eff.clone());
+                        }
+                    }
+                    if imp.trait_name.is_some() {
+                        self.trait_impls.push(imp.clone());
+                    } else {
+                        let target = ast_type_target_name(&imp.target_type);
+                        self.inherent_impls
+                            .entry(target)
+                            .or_default()
+                            .extend(imp.methods.clone());
+                    }
+                }
+                crate::ast::ItemKind::Function(f) => {
+                    if let Some(eff) = &f.effects {
+                        self.fn_effects.insert(f.name.clone(), eff.clone());
+                    }
+                    self.scan_stmts_for_handles(&f.body);
+                }
+                crate::ast::ItemKind::Script(stmts) => {
+                    self.scan_stmts_for_handles(stmts);
+                }
+                crate::ast::ItemKind::Module { items: sub, .. } => {
+                    self.collect_items(sub);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn scan_stmts_for_handles(&mut self, stmts: &[crate::ast::Stmt]) {
+        for stmt in stmts {
+            match &stmt.kind {
+                crate::ast::StmtKind::Local {
+                    initializer: Some(exprs),
+                    ..
+                }
+                | crate::ast::StmtKind::Return(exprs) => {
+                    for e in exprs {
+                        self.scan_expr_for_handles(e);
+                    }
+                }
+                crate::ast::StmtKind::Assign { targets, values } => {
+                    for e in targets.iter().chain(values.iter()) {
+                        self.scan_expr_for_handles(e);
+                    }
+                }
+                crate::ast::StmtKind::CompoundAssign { target, value, .. } => {
+                    self.scan_expr_for_handles(target);
+                    self.scan_expr_for_handles(value);
+                }
+                crate::ast::StmtKind::Expr(e) => self.scan_expr_for_handles(e),
+                crate::ast::StmtKind::If {
+                    condition,
+                    then_block,
+                    elseif_branches,
+                    else_block,
+                } => {
+                    self.scan_expr_for_handles(condition);
+                    self.scan_stmts_for_handles(then_block);
+                    for (ec, eb) in elseif_branches {
+                        self.scan_expr_for_handles(ec);
+                        self.scan_stmts_for_handles(eb);
+                    }
+                    if let Some(eb) = else_block {
+                        self.scan_stmts_for_handles(eb);
+                    }
+                }
+                crate::ast::StmtKind::While { condition, body } => {
+                    self.scan_expr_for_handles(condition);
+                    self.scan_stmts_for_handles(body);
+                }
+                crate::ast::StmtKind::ForNumeric {
+                    start,
+                    end,
+                    step,
+                    body,
+                    ..
+                } => {
+                    self.scan_expr_for_handles(start);
+                    self.scan_expr_for_handles(end);
+                    if let Some(st) = step {
+                        self.scan_expr_for_handles(st);
+                    }
+                    self.scan_stmts_for_handles(body);
+                }
+                crate::ast::StmtKind::ForIn { iterator, body, .. } => {
+                    self.scan_expr_for_handles(iterator);
+                    self.scan_stmts_for_handles(body);
+                }
+                crate::ast::StmtKind::Block(b) | crate::ast::StmtKind::Scoped(b) => {
+                    self.scan_stmts_for_handles(b);
+                }
+                crate::ast::StmtKind::Defer(inner) | crate::ast::StmtKind::ErrDefer(inner) => {
+                    self.scan_stmts_for_handles(core::slice::from_ref(inner.as_ref()));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn scan_expr_for_handles(&mut self, expr: &crate::ast::Expr) {
+        match &expr.kind {
+            crate::ast::ExprKind::Call { callee, args, .. } => {
+                if matches!(&callee.kind, crate::ast::ExprKind::Identifier(n) if n == "__lust_handle")
+                    && args.len() == 2
+                {
+                    let mut arm_kinds = Vec::new();
+                    if let crate::ast::ExprKind::Array(tuples) = &args[1].kind {
+                        for tup in tuples {
+                            if let crate::ast::ExprKind::Tuple(elems) = &tup.kind
+                                && elems.len() == 2
+                            {
+                                let eff_name = match &elems[0].kind {
+                                    crate::ast::ExprKind::Literal(crate::ast::Literal::String(s)) => {
+                                        s.clone()
+                                    }
+                                    _ => String::new(),
+                                };
+                                let kind = match &elems[1].kind {
+                                    crate::ast::ExprKind::Lambda { body, .. } => {
+                                        classify_handler_arm_expr(body)
+                                    }
+                                    _ => HandlerArmTailKind::NonTailOrMultiShot,
+                                };
+                                arm_kinds.push((eff_name, kind));
+                            }
+                        }
+                    }
+                    let all_tail_or_abortive = arm_kinds.iter().all(|(_, k)| {
+                        matches!(
+                            k,
+                            HandlerArmTailKind::TailResumptive | HandlerArmTailKind::Abortive
+                        )
+                    });
+                    self.handle_sites.push(HandleAstSite {
+                        arm_kinds,
+                        all_tail_or_abortive,
+                    });
+                }
+                self.scan_expr_for_handles(callee);
+                for a in args {
+                    self.scan_expr_for_handles(a);
+                }
+            }
+            crate::ast::ExprKind::Binary { left, right, .. }
+            | crate::ast::ExprKind::Range {
+                start: left,
+                end: right,
+                ..
+            } => {
+                self.scan_expr_for_handles(left);
+                self.scan_expr_for_handles(right);
+            }
+            crate::ast::ExprKind::Unary { operand: inner, .. }
+            | crate::ast::ExprKind::FieldAccess { object: inner, .. }
+            | crate::ast::ExprKind::Paren(inner)
+            | crate::ast::ExprKind::Cast { expr: inner, .. }
+            | crate::ast::ExprKind::TypeCheck { expr: inner, .. }
+            | crate::ast::ExprKind::IsPattern { expr: inner, .. }
+            | crate::ast::ExprKind::Lambda { body: inner, .. } => {
+                self.scan_expr_for_handles(inner);
+            }
+            crate::ast::ExprKind::Index { object, index } => {
+                self.scan_expr_for_handles(object);
+                self.scan_expr_for_handles(index);
+            }
+            crate::ast::ExprKind::MethodCall { receiver, args, .. } => {
+                self.scan_expr_for_handles(receiver);
+                for a in args {
+                    self.scan_expr_for_handles(a);
+                }
+            }
+            crate::ast::ExprKind::Array(elems)
+            | crate::ast::ExprKind::Tuple(elems)
+            | crate::ast::ExprKind::EnumConstructor { args: elems, .. }
+            | crate::ast::ExprKind::Return(elems) => {
+                for e in elems {
+                    self.scan_expr_for_handles(e);
+                }
+            }
+            crate::ast::ExprKind::Map(pairs) => {
+                for (k, v) in pairs {
+                    self.scan_expr_for_handles(k);
+                    self.scan_expr_for_handles(v);
+                }
+            }
+            crate::ast::ExprKind::StructLiteral { fields, .. } => {
+                for f in fields {
+                    self.scan_expr_for_handles(&f.value);
+                }
+            }
+            crate::ast::ExprKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.scan_expr_for_handles(condition);
+                self.scan_expr_for_handles(then_branch);
+                if let Some(eb) = else_branch {
+                    self.scan_expr_for_handles(eb);
+                }
+            }
+            crate::ast::ExprKind::Block(stmts) | crate::ast::ExprKind::EffectBlock(stmts) => {
+                self.scan_stmts_for_handles(stmts);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Classifies whether an effect handler arm body uses `__lust_resume` only in tail position,
+/// never uses `__lust_resume` (abortive), or uses it in non-tail / multi-shot position.
+pub fn classify_handler_arm_expr(expr: &crate::ast::Expr) -> HandlerArmTailKind {
+    match &expr.kind {
+        crate::ast::ExprKind::Paren(inner) => classify_handler_arm_expr(inner),
+        crate::ast::ExprKind::Call { callee, args, .. }
+            if matches!(&callee.kind, crate::ast::ExprKind::Identifier(n) if n == "__lust_resume" || n == "resume") =>
+        {
+            if args.iter().any(expr_contains_resume) {
+                HandlerArmTailKind::NonTailOrMultiShot
+            } else {
+                HandlerArmTailKind::TailResumptive
+            }
+        }
+        crate::ast::ExprKind::Block(stmts) => classify_handler_arm_stmts(stmts),
+        crate::ast::ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            if expr_contains_resume(condition) {
+                return HandlerArmTailKind::NonTailOrMultiShot;
+            }
+            let tk = classify_handler_arm_expr(then_branch);
+            let ek = else_branch
+                .as_deref()
+                .map(classify_handler_arm_expr)
+                .unwrap_or(HandlerArmTailKind::Abortive);
+            combine_branch_tail_kinds(tk, ek)
+        }
+        crate::ast::ExprKind::Return(vals) => {
+            if vals.len() == 1 {
+                classify_handler_arm_expr(&vals[0])
+            } else if vals.iter().any(expr_contains_resume) {
+                HandlerArmTailKind::NonTailOrMultiShot
+            } else {
+                HandlerArmTailKind::Abortive
+            }
+        }
+        _ => {
+            if expr_contains_resume(expr) {
+                HandlerArmTailKind::NonTailOrMultiShot
+            } else {
+                HandlerArmTailKind::Abortive
+            }
+        }
+    }
+}
+
+fn classify_handler_arm_stmts(stmts: &[crate::ast::Stmt]) -> HandlerArmTailKind {
+    if stmts.is_empty() {
+        return HandlerArmTailKind::Abortive;
+    }
+    let last_idx = stmts.len() - 1;
+    let mut saw_tail_resume = false;
+    for (idx, stmt) in stmts.iter().enumerate() {
+        let is_last = idx == last_idx;
+        match &stmt.kind {
+            crate::ast::StmtKind::Return(vals) => {
+                let k = if vals.len() == 1 {
+                    classify_handler_arm_expr(&vals[0])
+                } else if vals.iter().any(expr_contains_resume) {
+                    HandlerArmTailKind::NonTailOrMultiShot
+                } else {
+                    HandlerArmTailKind::Abortive
+                };
+                match k {
+                    HandlerArmTailKind::NonTailOrMultiShot => {
+                        return HandlerArmTailKind::NonTailOrMultiShot;
+                    }
+                    HandlerArmTailKind::TailResumptive => saw_tail_resume = true,
+                    HandlerArmTailKind::Abortive => {}
+                }
+            }
+            crate::ast::StmtKind::Expr(e) if is_last => {
+                let k = classify_handler_arm_expr(e);
+                match k {
+                    HandlerArmTailKind::NonTailOrMultiShot => {
+                        return HandlerArmTailKind::NonTailOrMultiShot;
+                    }
+                    HandlerArmTailKind::TailResumptive => saw_tail_resume = true,
+                    HandlerArmTailKind::Abortive => {}
+                }
+            }
+            crate::ast::StmtKind::If {
+                condition,
+                then_block,
+                elseif_branches,
+                else_block,
+            } if is_last => {
+                if expr_contains_resume(condition) {
+                    return HandlerArmTailKind::NonTailOrMultiShot;
+                }
+                let mut acc = classify_handler_arm_stmts(then_block);
+                for (ec, eb) in elseif_branches {
+                    if expr_contains_resume(ec) {
+                        return HandlerArmTailKind::NonTailOrMultiShot;
+                    }
+                    acc = combine_branch_tail_kinds(acc, classify_handler_arm_stmts(eb));
+                }
+                if let Some(eb) = else_block {
+                    acc = combine_branch_tail_kinds(acc, classify_handler_arm_stmts(eb));
+                }
+                match acc {
+                    HandlerArmTailKind::NonTailOrMultiShot => {
+                        return HandlerArmTailKind::NonTailOrMultiShot;
+                    }
+                    HandlerArmTailKind::TailResumptive => saw_tail_resume = true,
+                    HandlerArmTailKind::Abortive => {}
+                }
+            }
+            crate::ast::StmtKind::Block(inner) if is_last => {
+                let k = classify_handler_arm_stmts(inner);
+                match k {
+                    HandlerArmTailKind::NonTailOrMultiShot => {
+                        return HandlerArmTailKind::NonTailOrMultiShot;
+                    }
+                    HandlerArmTailKind::TailResumptive => saw_tail_resume = true,
+                    HandlerArmTailKind::Abortive => {}
+                }
+            }
+            _ => {
+                if stmt_contains_resume(stmt) {
+                    return HandlerArmTailKind::NonTailOrMultiShot;
+                }
+            }
+        }
+    }
+    if saw_tail_resume {
+        HandlerArmTailKind::TailResumptive
+    } else {
+        HandlerArmTailKind::Abortive
+    }
+}
+
+fn combine_branch_tail_kinds(a: HandlerArmTailKind, b: HandlerArmTailKind) -> HandlerArmTailKind {
+    if matches!(a, HandlerArmTailKind::NonTailOrMultiShot)
+        || matches!(b, HandlerArmTailKind::NonTailOrMultiShot)
+    {
+        HandlerArmTailKind::NonTailOrMultiShot
+    } else if matches!(a, HandlerArmTailKind::TailResumptive)
+        || matches!(b, HandlerArmTailKind::TailResumptive)
+    {
+        HandlerArmTailKind::TailResumptive
+    } else {
+        HandlerArmTailKind::Abortive
+    }
+}
+
+fn expr_contains_resume(expr: &crate::ast::Expr) -> bool {
+    match &expr.kind {
+        crate::ast::ExprKind::Call { callee, args, .. } => {
+            if matches!(&callee.kind, crate::ast::ExprKind::Identifier(n) if n == "__lust_resume" || n == "resume")
+            {
+                return true;
+            }
+            expr_contains_resume(callee) || args.iter().any(expr_contains_resume)
+        }
+        crate::ast::ExprKind::Binary { left, right, .. }
+        | crate::ast::ExprKind::Range {
+            start: left,
+            end: right,
+            ..
+        } => expr_contains_resume(left) || expr_contains_resume(right),
+        crate::ast::ExprKind::Unary { operand: inner, .. }
+        | crate::ast::ExprKind::FieldAccess { object: inner, .. }
+        | crate::ast::ExprKind::Paren(inner)
+        | crate::ast::ExprKind::Cast { expr: inner, .. }
+        | crate::ast::ExprKind::TypeCheck { expr: inner, .. }
+        | crate::ast::ExprKind::IsPattern { expr: inner, .. }
+        | crate::ast::ExprKind::Lambda { body: inner, .. } => expr_contains_resume(inner),
+        crate::ast::ExprKind::Index { object, index } => {
+            expr_contains_resume(object) || expr_contains_resume(index)
+        }
+        crate::ast::ExprKind::MethodCall { receiver, args, .. } => {
+            expr_contains_resume(receiver) || args.iter().any(expr_contains_resume)
+        }
+        crate::ast::ExprKind::Array(es)
+        | crate::ast::ExprKind::Tuple(es)
+        | crate::ast::ExprKind::EnumConstructor { args: es, .. }
+        | crate::ast::ExprKind::Return(es) => es.iter().any(expr_contains_resume),
+        crate::ast::ExprKind::Map(pairs) => pairs
+            .iter()
+            .any(|(k, v)| expr_contains_resume(k) || expr_contains_resume(v)),
+        crate::ast::ExprKind::StructLiteral { fields, .. } => {
+            fields.iter().any(|f| expr_contains_resume(&f.value))
+        }
+        crate::ast::ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            expr_contains_resume(condition)
+                || expr_contains_resume(then_branch)
+                || else_branch.as_deref().is_some_and(expr_contains_resume)
+        }
+        crate::ast::ExprKind::Block(stmts) | crate::ast::ExprKind::EffectBlock(stmts) => {
+            stmts.iter().any(stmt_contains_resume)
+        }
+        _ => false,
+    }
+}
+
+fn stmt_contains_resume(stmt: &crate::ast::Stmt) -> bool {
+    match &stmt.kind {
+        crate::ast::StmtKind::Local {
+            initializer: Some(es),
+            ..
+        }
+        | crate::ast::StmtKind::Return(es) => es.iter().any(expr_contains_resume),
+        crate::ast::StmtKind::Assign { targets, values } => {
+            targets.iter().any(expr_contains_resume) || values.iter().any(expr_contains_resume)
+        }
+        crate::ast::StmtKind::CompoundAssign { target, value, .. } => {
+            expr_contains_resume(target) || expr_contains_resume(value)
+        }
+        crate::ast::StmtKind::Expr(e) => expr_contains_resume(e),
+        crate::ast::StmtKind::If {
+            condition,
+            then_block,
+            elseif_branches,
+            else_block,
+        } => {
+            expr_contains_resume(condition)
+                || then_block.iter().any(stmt_contains_resume)
+                || elseif_branches
+                    .iter()
+                    .any(|(ec, eb)| expr_contains_resume(ec) || eb.iter().any(stmt_contains_resume))
+                || else_block
+                    .as_ref()
+                    .is_some_and(|eb| eb.iter().any(stmt_contains_resume))
+        }
+        crate::ast::StmtKind::While { condition, body } => {
+            expr_contains_resume(condition) || body.iter().any(stmt_contains_resume)
+        }
+        crate::ast::StmtKind::ForNumeric {
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            expr_contains_resume(start)
+                || expr_contains_resume(end)
+                || step.as_ref().is_some_and(expr_contains_resume)
+                || body.iter().any(stmt_contains_resume)
+        }
+        crate::ast::StmtKind::ForIn { iterator, body, .. } => {
+            expr_contains_resume(iterator) || body.iter().any(stmt_contains_resume)
+        }
+        crate::ast::StmtKind::Block(b) | crate::ast::StmtKind::Scoped(b) => {
+            b.iter().any(stmt_contains_resume)
+        }
+        crate::ast::StmtKind::Defer(inner) | crate::ast::StmtKind::ErrDefer(inner) => {
+            stmt_contains_resume(inner)
+        }
+        _ => false,
+    }
+}
+
+fn ast_type_target_name(ty: &crate::ast::Type) -> String {
+    match &ty.kind {
+        crate::ast::TypeKind::Named(name)
+        | crate::ast::TypeKind::GenericInstance { name, .. }
+        | crate::ast::TypeKind::Trait(name) => name.clone(),
+        _ => format!("{ty}"),
+    }
+}
+
+fn ast_type_to_mir_raw(
+    ty: &crate::ast::Type,
+    struct_names: &HashSet<String>,
+    enum_names: &HashSet<String>,
+) -> MirType {
+    match &ty.kind {
+        crate::ast::TypeKind::Int => MirType::Int,
+        crate::ast::TypeKind::Float => MirType::Float,
+        crate::ast::TypeKind::Bool => MirType::Bool,
+        crate::ast::TypeKind::String => MirType::String,
+        crate::ast::TypeKind::Unit => MirType::Unit,
+        crate::ast::TypeKind::Array(inner) => {
+            MirType::Array(Box::new(ast_type_to_mir_raw(inner, struct_names, enum_names)))
+        }
+        crate::ast::TypeKind::Named(name) => {
+            if struct_names.contains(name) {
+                MirType::Struct(name.clone())
+            } else if enum_names.contains(name) {
+                MirType::Enum(name.clone())
+            } else {
+                MirType::Unknown
+            }
+        }
+        crate::ast::TypeKind::Effect { success, .. } => {
+            ast_type_to_mir_raw(success, struct_names, enum_names)
+        }
+        crate::ast::TypeKind::Option(inner) => {
+            MirType::Option(Box::new(ast_type_to_mir_raw(inner, struct_names, enum_names)))
+        }
+        crate::ast::TypeKind::Tuple(elems) => MirType::Tuple(
+            elems
+                .iter()
+                .map(|e| ast_type_to_mir_raw(e, struct_names, enum_names))
+                .collect(),
+        ),
+        _ => MirType::Unknown,
+    }
+}
+
+fn build_extern_return_type_map(
+    module: &MirModule,
+    ast_meta: &AstEffectsMetadata,
+) -> HashMap<String, MirType> {
+    let mut map = HashMap::new();
+    if ast_meta.extern_fns.is_empty() {
+        return map;
+    }
+    let struct_names: HashSet<String> = module
+        .struct_layouts
+        .iter()
+        .map(|s| s.type_name.clone())
+        .collect();
+    let enum_names: HashSet<String> = module.enum_defs.iter().map(|e| e.name.clone()).collect();
+    for ext in &ast_meta.extern_fns {
+        let ret_ty = ext
+            .return_type
+            .as_ref()
+            .map(|ty| ast_type_to_mir_raw(ty, &struct_names, &enum_names))
+            .unwrap_or(MirType::Unit);
+        map.insert(ext.name.clone(), ret_ty.clone());
+        if let Some((_, short)) = ext.name.rsplit_once('.') {
+            map.entry(short.to_string()).or_insert(ret_ty);
+        }
+    }
+    map
+}
+
+fn apply_extern_callee_return_types(
+    module: &mut MirModule,
+    extern_ret_types: &HashMap<String, MirType>,
+) {
+    for func in &mut module.functions {
+        let mut updated_temps: HashMap<LocalId, MirType> = HashMap::new();
+        for block in &func.blocks {
+            if let Some(Terminator::Call {
+                callee,
+                destination: Place::Local(dst),
+                ..
+            }) = &block.terminator
+                && let Some(ret_ty) = extern_ret_types
+                    .get(callee)
+                    .or_else(|| callee.rsplit_once('.').and_then(|(_, s)| extern_ret_types.get(s)))
+                && *ret_ty != MirType::Unknown
+            {
+                func.locals[dst.0].ty = ret_ty.clone();
+                updated_temps.insert(*dst, ret_ty.clone());
+            }
+        }
+        if !updated_temps.is_empty() {
+            for block in &func.blocks {
+                for stmt in &block.statements {
+                    if let Statement::Assign(
+                        Place::Local(dst),
+                        Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))),
+                        _,
+                    ) = stmt
+                        && let Some(ret_ty) = updated_temps.get(src)
+                        && matches!(func.locals[dst.0].ty, MirType::Unknown | MirType::Int)
+                        && *ret_ty != MirType::Int
+                    {
+                        func.locals[dst.0].ty = ret_ty.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn ast_type_to_mir_for_service(ty: &crate::ast::Type, ctx: &ModuleEmitContext<'_>) -> MirType {
+    match &ty.kind {
+        crate::ast::TypeKind::Int => MirType::Int,
+        crate::ast::TypeKind::Float => MirType::Float,
+        crate::ast::TypeKind::Bool => MirType::Bool,
+        crate::ast::TypeKind::String => MirType::String,
+        crate::ast::TypeKind::Unit => MirType::Unit,
+        crate::ast::TypeKind::Array(inner) => {
+            MirType::Array(Box::new(ast_type_to_mir_for_service(inner, ctx)))
+        }
+        crate::ast::TypeKind::Named(name) => {
+            if ctx.structs.contains_key(name) {
+                MirType::Struct(name.clone())
+            } else if ctx.enums.contains_key(name) {
+                MirType::Enum(name.clone())
+            } else {
+                MirType::Unknown
+            }
+        }
+        crate::ast::TypeKind::Effect { success, .. } => ast_type_to_mir_for_service(success, ctx),
+        crate::ast::TypeKind::Option(inner) => {
+            MirType::Option(Box::new(ast_type_to_mir_for_service(inner, ctx)))
+        }
+        crate::ast::TypeKind::Tuple(elems) => MirType::Tuple(
+            elems
+                .iter()
+                .map(|e| ast_type_to_mir_for_service(e, ctx))
+                .collect(),
+        ),
+        _ => MirType::Unknown,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ServiceMethodSig {
+    name: String,
+    params: Vec<(String, MirType)>,
+    return_type: MirType,
+}
+
+fn extract_trait_method_sigs(
+    tdef: &crate::ast::TraitDef,
+    ctx: &ModuleEmitContext<'_>,
+) -> Vec<ServiceMethodSig> {
+    let mut out = Vec::with_capacity(tdef.methods.len());
+    for m in &tdef.methods {
+        let params: Vec<(String, MirType)> = m
+            .params
+            .iter()
+            .filter(|p| !(p.is_self || p.name == "self"))
+            .map(|p| (p.name.clone(), ast_type_to_mir_for_service(&p.ty, ctx)))
+            .collect();
+        let ret_spec = m.return_spec();
+        let ret_ty = ret_spec
+            .return_type
+            .as_ref()
+            .map(|t| ast_type_to_mir_for_service(t, ctx))
+            .unwrap_or(MirType::Unit);
+        out.push(ServiceMethodSig {
+            name: m.name.clone(),
+            params,
+            return_type: ret_ty,
+        });
+    }
+    out
+}
+
+fn extract_fn_method_sigs(
+    fns: &[crate::ast::FunctionDef],
+    ctx: &ModuleEmitContext<'_>,
+) -> Vec<ServiceMethodSig> {
+    let mut out = Vec::with_capacity(fns.len());
+    for f in fns {
+        let params: Vec<(String, MirType)> = f
+            .params
+            .iter()
+            .filter(|p| !(p.is_self || p.name == "self"))
+            .map(|p| (p.name.clone(), ast_type_to_mir_for_service(&p.ty, ctx)))
+            .collect();
+        let ret_spec = f.return_spec();
+        let ret_ty = ret_spec
+            .return_type
+            .as_ref()
+            .map(|t| ast_type_to_mir_for_service(t, ctx))
+            .unwrap_or(MirType::Unit);
+        out.push(ServiceMethodSig {
+            name: f.name.clone(),
+            params,
+            return_type: ret_ty,
+        });
+    }
+    out
+}
+
+fn emit_service_method_delegation(
+    out: &mut String,
+    target_struct_name: &str,
+    sig: &ServiceMethodSig,
+    ctx: &ModuleEmitContext<'_>,
+) {
+    let mir_method_name = format!("{target_struct_name}:{}", sig.name);
+    let Some(fmeta) = ctx.fn_metas.get(&mir_method_name) else {
+        let def_ret = ctx.rust_default_expr(&sig.return_type);
+        let _ = writeln!(out, "        let _ = __ctx;");
+        let _ = writeln!(out, "        Ok({def_ret})");
+        return;
+    };
+    let mir_fn = ctx
+        .module
+        .functions
+        .iter()
+        .find(|f| f.signature.name == mir_method_name);
+
+    let mut args = Vec::new();
+    if fmeta.needs_ctx {
+        args.push("__ctx".to_string());
+    }
+    if fmeta.needs_alloc {
+        if fmeta.needs_ctx {
+            out.push_str(
+                "        let __svc_alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__ctx.budget_alloc.limit_bytes());\n",
+            );
+            args.push("&__svc_alloc".to_string());
+        } else {
+            args.push("&__ctx.budget_alloc".to_string());
+        }
+    }
+    if fmeta.needs_arena {
+        out.push_str("        let __svc_arena_alloc = lust_aot_rt::LustBudgetAlloc::unbounded();\n");
+        out.push_str(
+            "        let __svc_arena = lust_aot_rt::LustChunkArena::new(&__svc_arena_alloc);\n",
+        );
+        args.push("&__svc_arena".to_string());
+    }
+
+    // Check if the MIR method takes `self` as its first parameter
+    let takes_self = mir_fn.is_some_and(|mf| {
+        mf.params.first().is_some_and(|pid| {
+            mf.locals
+                .get(pid.0)
+                .is_some_and(|d| d.name.as_deref() == Some("self") || matches!(&d.ty, MirType::Struct(sn) if sn == target_struct_name))
+        })
+    });
+    let mut param_offset = 0usize;
+    if takes_self {
+        let mode = fmeta.param_modes.first().copied().unwrap_or(ParamMode::ByValue);
+        let is_copy = ctx
+            .structs
+            .get(target_struct_name)
+            .is_some_and(|s| s.is_copy);
+        let self_expr = match mode {
+            ParamMode::ByValue => {
+                if is_copy {
+                    "*self".to_string()
+                } else {
+                    "self.clone()".to_string()
+                }
+            }
+            ParamMode::RefStruct => "&*self".to_string(),
+            ParamMode::MutRefStruct => "self".to_string(),
+            ParamMode::RcRefCell => {
+                if is_copy {
+                    "alloc::rc::Rc::new(core::cell::RefCell::new(*self))".to_string()
+                } else {
+                    "alloc::rc::Rc::new(core::cell::RefCell::new(self.clone()))".to_string()
+                }
+            }
+            _ => "&*self".to_string(),
+        };
+        args.push(self_expr);
+        param_offset = 1;
+    }
+
+    for (idx, (pname, _)) in sig.params.iter().enumerate() {
+        let p_ident = format!("__p_{}", sanitize_ident(pname));
+        let mode = fmeta
+            .param_modes
+            .get(param_offset + idx)
+            .copied()
+            .unwrap_or(ParamMode::ByValue);
+        let a_expr = match mode {
+            ParamMode::RefStr => format!("{p_ident}.as_str()"),
+            ParamMode::RefStruct => format!("&{p_ident}"),
+            ParamMode::MutRefStruct => format!("&mut {p_ident}"),
+            ParamMode::RefSlice => format!("&{p_ident}[..]"),
+            ParamMode::MutVec => format!("&mut {p_ident}"),
+            ParamMode::RcCell => format!("alloc::rc::Rc::new(core::cell::Cell::new({p_ident}))"),
+            ParamMode::RcRefCell => {
+                format!("alloc::rc::Rc::new(core::cell::RefCell::new({p_ident}))")
+            }
+            ParamMode::ByValue => p_ident,
+        };
+        args.push(a_expr);
+    }
+
+    let raw_call = format!("{}({})", fmeta.rust_name, args.join(", "));
+    if fmeta.can_fail {
+        let _ = writeln!(out, "        {raw_call}");
+    } else {
+        let _ = writeln!(
+            out,
+            "        {raw_call}.map_err(lust_aot_rt::AotError::from)"
+        );
+    }
+}
+
+fn emit_trait_and_service_definitions(out: &mut String, ctx: &ModuleEmitContext<'_>) {
+    // 1. Emit Rust traits for AST `ItemKind::Trait` declarations
+    if !ctx.ast_meta.traits.is_empty() {
+        out.push_str("// Trait Definitions Extracted from AST (NG-W13-1A)\n");
+        for (tname, tdef) in &ctx.ast_meta.traits {
+            let rust_tname = format!("LustTrait_{}", sanitize_ident(tname));
+            let sigs = extract_trait_method_sigs(tdef, ctx);
+            if sigs.iter().any(|s| {
+                ctx.type_needs_lifetime(&s.return_type)
+                    || s.params.iter().any(|(_, pt)| ctx.type_needs_lifetime(pt))
+            }) {
+                continue;
+            }
+            let _ = writeln!(out, "pub trait {rust_tname} {{");
+            for sig in &sigs {
+                let m_ident = sanitize_ident(&sig.name);
+                let mut p_strs = vec![
+                    "&mut self".to_string(),
+                    "__ctx: &mut lust_aot_rt::AotCtx".to_string(),
+                ];
+                for (pname, pty) in &sig.params {
+                    p_strs.push(format!(
+                        "__p_{}: {}",
+                        sanitize_ident(pname),
+                        ctx.rust_type(pty, "'static")
+                    ));
+                }
+                let ret_r = ctx.rust_type(&sig.return_type, "'static");
+                let _ = writeln!(
+                    out,
+                    "    fn {m_ident}({}) -> Result<{ret_r}, lust_aot_rt::AotError>;",
+                    p_strs.join(", ")
+                );
+            }
+            out.push_str("}\n\n");
+
+            // Emit `impl LustTrait_<T> for LustStruct_<Target>` for matching impl blocks
+            for imp in &ctx.ast_meta.trait_impls {
+                if imp.trait_name.as_deref() != Some(tname.as_str()) {
+                    continue;
+                }
+                let target_name = ast_type_target_name(&imp.target_type);
+                let Some(smeta) = ctx.structs.get(&target_name) else {
+                    continue;
+                };
+                if smeta.needs_arena_lt {
+                    continue;
+                }
+                let rust_sname = rust_struct_name(&target_name);
+                let _ = writeln!(out, "impl {rust_tname} for {rust_sname} {{");
+                for sig in &sigs {
+                    let m_ident = sanitize_ident(&sig.name);
+                    let mut p_strs = vec![
+                        "&mut self".to_string(),
+                        "__ctx: &mut lust_aot_rt::AotCtx".to_string(),
+                    ];
+                    for (pname, pty) in &sig.params {
+                        p_strs.push(format!(
+                            "mut __p_{}: {}",
+                            sanitize_ident(pname),
+                            ctx.rust_type(pty, "'static")
+                        ));
+                    }
+                    let ret_r = ctx.rust_type(&sig.return_type, "'static");
+                    let _ = writeln!(
+                        out,
+                        "    fn {m_ident}({}) -> Result<{ret_r}, lust_aot_rt::AotError> {{",
+                        p_strs.join(", ")
+                    );
+                    emit_service_method_delegation(out, &target_name, sig, ctx);
+                    out.push_str("    }\n");
+                }
+                out.push_str("}\n\n");
+            }
+        }
+    }
+
+    // 2. Emit Nominal Service traits & safe ZST default providers (`NG-W13-1A`, `F-11`)
+    if ctx.ast_meta.services.is_empty() {
+        return;
+    }
+    out.push_str("// Nominal Service Traits & Safe Default::default() ZST Providers (NG-W13-1A, F-11)\n");
+    for svc in &ctx.ast_meta.services {
+        let s_ident = sanitize_ident(&svc.name);
+        let trait_name = format!("LustService_{s_ident}");
+        let provider_name = format!("LustDefaultProvider_{s_ident}");
+
+        let target_name_opt = svc.target_type.as_ref().map(ast_type_target_name);
+        let mut method_sigs: Vec<ServiceMethodSig> = Vec::new();
+        let mut impl_struct_targets: Vec<String> = Vec::new();
+
+        if let Some(ref target_name) = target_name_opt {
+            if let Some(tdef) = ctx.ast_meta.traits.get(target_name) {
+                method_sigs = extract_trait_method_sigs(tdef, ctx);
+                for imp in &ctx.ast_meta.trait_impls {
+                    if imp.trait_name.as_deref() == Some(target_name.as_str()) {
+                        let st = ast_type_target_name(&imp.target_type);
+                        if ctx.structs.contains_key(&st) && !impl_struct_targets.contains(&st) {
+                            impl_struct_targets.push(st);
+                        }
+                    }
+                }
+            } else {
+                if let Some(fns) = ctx.ast_meta.inherent_impls.get(target_name) {
+                    method_sigs = extract_fn_method_sigs(fns, ctx);
+                }
+                if ctx.structs.contains_key(target_name) {
+                    impl_struct_targets.push(target_name.clone());
+                }
+            }
+        } else if let Some(tdef) = ctx.ast_meta.traits.get(&svc.name) {
+            method_sigs = extract_trait_method_sigs(tdef, ctx);
+        } else if let Some(fns) = ctx.ast_meta.inherent_impls.get(&svc.name) {
+            method_sigs = extract_fn_method_sigs(fns, ctx);
+        }
+
+        // Keep service method signatures lifetime-free so `LustService_<S>` is object/ZST-friendly
+        method_sigs.retain(|s| {
+            !ctx.type_needs_lifetime(&s.return_type)
+                && !s.params.iter().any(|(_, pt)| ctx.type_needs_lifetime(pt))
+        });
+
+        let _ = writeln!(out, "pub trait {trait_name} {{");
+        let _ = writeln!(
+            out,
+            "    const SERVICE_NAME: &'static str = {:?};",
+            svc.name
+        );
+        out.push_str("    #[inline]\n");
+        out.push_str(
+            "    fn service_id(&self, __ctx: &mut lust_aot_rt::AotCtx) -> Result<&'static str, lust_aot_rt::AotError> {\n",
+        );
+        out.push_str("        let _ = __ctx;\n");
+        out.push_str("        Ok(Self::SERVICE_NAME)\n");
+        out.push_str("    }\n");
+        for sig in &method_sigs {
+            let m_ident = sanitize_ident(&sig.name);
+            let mut p_strs = vec![
+                "&mut self".to_string(),
+                "__ctx: &mut lust_aot_rt::AotCtx".to_string(),
+            ];
+            for (pname, pty) in &sig.params {
+                p_strs.push(format!(
+                    "__p_{}: {}",
+                    sanitize_ident(pname),
+                    ctx.rust_type(pty, "'static")
+                ));
+            }
+            let ret_r = ctx.rust_type(&sig.return_type, "'static");
+            let _ = writeln!(
+                out,
+                "    fn {m_ident}({}) -> Result<{ret_r}, lust_aot_rt::AotError>;",
+                p_strs.join(", ")
+            );
+        }
+        out.push_str("}\n\n");
+
+        // Safe zero-sized default provider instantiated via `Default::default()` (NO unsafe conjure_zst!)
+        out.push_str("#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]\n");
+        let _ = writeln!(out, "pub struct {provider_name};");
+        let _ = writeln!(
+            out,
+            "const _: () = assert!(core::mem::size_of::<{provider_name}>() == 0);"
+        );
+        let _ = writeln!(out, "impl {provider_name} {{");
+        out.push_str("    #[inline(always)]\n");
+        out.push_str("    pub fn instantiate() -> Self {\n");
+        out.push_str("        lust_aot_rt::default_zst_provider::<Self>()\n");
+        out.push_str("    }\n");
+        out.push_str("}\n\n");
+
+        // Implement `LustService_<S>` for every matching concrete struct target
+        for st_name in &impl_struct_targets {
+            let Some(smeta) = ctx.structs.get(st_name) else {
+                continue;
+            };
+            if smeta.needs_arena_lt {
+                continue;
+            }
+            let rust_sname = rust_struct_name(st_name);
+            let _ = writeln!(out, "impl {trait_name} for {rust_sname} {{");
+            for sig in &method_sigs {
+                let m_ident = sanitize_ident(&sig.name);
+                let mut p_strs = vec![
+                    "&mut self".to_string(),
+                    "__ctx: &mut lust_aot_rt::AotCtx".to_string(),
+                ];
+                for (pname, pty) in &sig.params {
+                    p_strs.push(format!(
+                        "mut __p_{}: {}",
+                        sanitize_ident(pname),
+                        ctx.rust_type(pty, "'static")
+                    ));
+                }
+                let ret_r = ctx.rust_type(&sig.return_type, "'static");
+                let _ = writeln!(
+                    out,
+                    "    fn {m_ident}({}) -> Result<{ret_r}, lust_aot_rt::AotError> {{",
+                    p_strs.join(", ")
+                );
+                emit_service_method_delegation(out, st_name, sig, ctx);
+                out.push_str("    }\n");
+            }
+            out.push_str("}\n\n");
+        }
+
+        // Choose a default-constructible target struct (preferring a 0-field ZST struct first)
+        let default_delegate_struct = impl_struct_targets
+            .iter()
+            .find(|st| {
+                ctx.structs.get(*st).is_some_and(|m| {
+                    !m.needs_arena_lt && m.derives_default && m.fields.is_empty()
+                })
+            })
+            .or_else(|| {
+                impl_struct_targets.iter().find(|st| {
+                    ctx.structs
+                        .get(*st)
+                        .is_some_and(|m| !m.needs_arena_lt && m.derives_default)
+                })
+            });
+
+        let _ = writeln!(out, "impl {trait_name} for {provider_name} {{");
+        for sig in &method_sigs {
+            let m_ident = sanitize_ident(&sig.name);
+            let mut p_strs = vec![
+                "&mut self".to_string(),
+                "__ctx: &mut lust_aot_rt::AotCtx".to_string(),
+            ];
+            let mut fwd_args = vec!["__ctx".to_string()];
+            for (pname, pty) in &sig.params {
+                let p_ident = format!("__p_{}", sanitize_ident(pname));
+                p_strs.push(format!("{p_ident}: {}", ctx.rust_type(pty, "'static")));
+                fwd_args.push(p_ident);
+            }
+            let ret_r = ctx.rust_type(&sig.return_type, "'static");
+            let _ = writeln!(
+                out,
+                "    fn {m_ident}({}) -> Result<{ret_r}, lust_aot_rt::AotError> {{",
+                p_strs.join(", ")
+            );
+            if let Some(target_st) = default_delegate_struct {
+                let rust_sname = rust_struct_name(target_st);
+                let _ = writeln!(out, "        let mut __target = {rust_sname}::default();");
+                let _ = writeln!(
+                    out,
+                    "        <{rust_sname} as {trait_name}>::{m_ident}(&mut __target, {})",
+                    fwd_args.join(", ")
+                );
+            } else {
+                let def_ret = ctx.rust_default_expr(&sig.return_type);
+                out.push_str("        let _ = __ctx;\n");
+                let _ = writeln!(out, "        Ok({def_ret})");
+            }
+            out.push_str("    }\n");
+        }
+        out.push_str("}\n\n");
+    }
+}
+
+/// Traces an operand back to a local `Rvalue::Closure { func_name, .. }` (including through
+/// single-copy assignments and `__lust_provide` chains) in `func`.
+fn trace_closure_fn_name_in_mir(func: &MirFunction, op: &Operand) -> Option<String> {
+    let mut cur = operand_exact_local(op)?;
+    let mut visited = HashSet::new();
+    while visited.insert(cur) {
+        let mut found_next: Option<LocalId> = None;
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if let Statement::Assign(Place::Local(dst), rval, _) = stmt
+                    && *dst == cur
+                {
+                    match rval {
+                        Rvalue::Closure { func_name, .. } => return Some(func_name.clone()),
+                        Rvalue::Use(
+                            Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)),
+                        ) => {
+                            found_next = Some(*src);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(Terminator::Call {
+                callee,
+                args,
+                destination: Place::Local(dst),
+                ..
+            }) = &block.terminator
+                && *dst == cur
+                && callee == "__lust_provide"
+                && let Some(src) = args.first().and_then(operand_exact_local)
+            {
+                found_next = Some(src);
+            }
+        }
+        cur = found_next?;
+    }
+    None
+}
+
+fn emit_public_api_wrappers(out: &mut String, module: &MirModule, ctx: &ModuleEmitContext<'_>) {
+    let mut used_names: HashSet<String> = HashSet::new();
+    let mut header_emitted = false;
+
+    for func in &module.functions {
+        let raw_name = &func.signature.name;
+        if raw_name.starts_with("__")
+            || raw_name.contains("__lambda_")
+            || raw_name.contains(':')
+            || ctx.nontail_body_metas.contains_key(raw_name)
+            || ctx.nontail_arm_metas.contains_key(raw_name)
+        {
+            continue;
+        }
+        let Some(meta) = ctx.fn_metas.get(raw_name) else {
+            continue;
+        };
+        if ctx.type_needs_lifetime(&meta.return_type) {
+            continue;
+        }
+        if meta.param_modes.iter().any(|m| {
+            matches!(
+                m,
+                ParamMode::MutVec | ParamMode::RcCell | ParamMode::RcRefCell
+            )
+        }) {
+            continue;
+        }
+        let mut param_has_lt = false;
+        for &pid in &func.params {
+            let pty = &func.locals[pid.0].ty;
+            if matches!(pty, MirType::Array(_)) {
+                // Allowed only when passed as `&[T]` (RefSlice), handled below
+                continue;
+            }
+            if ctx.type_needs_lifetime(pty) {
+                param_has_lt = true;
+                break;
+            }
+        }
+        if param_has_lt {
+            continue;
+        }
+
+        let short_raw = raw_name.rsplit('.').next().unwrap_or(raw_name);
+        let mut pub_name = if short_raw == "main" {
+            "lust_main".to_string()
+        } else {
+            sanitize_ident(short_raw)
+        };
+        if pub_name.is_empty() || !used_names.insert(pub_name.clone()) {
+            let qualified = sanitize_ident(raw_name);
+            if qualified.is_empty() || !used_names.insert(qualified.clone()) {
+                continue;
+            }
+            pub_name = qualified;
+        }
+
+        if !header_emitted {
+            out.push_str("// Public Ergonomic Rust API Wrappers (NG-W13-1C)\n");
+            header_emitted = true;
+        }
+
+        let mut sig_params: Vec<String> = Vec::with_capacity(func.params.len());
+        let mut call_args_base: Vec<String> = Vec::with_capacity(func.params.len());
+        for (pi, &pid) in func.params.iter().enumerate() {
+            let ty = &func.locals[pid.0].ty;
+            let mode = meta.param_modes.get(pi).copied().unwrap_or(ParamMode::ByValue);
+            let pname = format!("arg_{pi}");
+            match mode {
+                ParamMode::ByValue => {
+                    let rty = ctx.rust_type(ty, "'static");
+                    sig_params.push(format!("{pname}: {rty}"));
+                    call_args_base.push(pname);
+                }
+                ParamMode::RefStruct => {
+                    let rty = ctx.rust_type(ty, "'static");
+                    sig_params.push(format!("{pname}: &{rty}"));
+                    call_args_base.push(pname);
+                }
+                ParamMode::MutRefStruct => {
+                    let rty = ctx.rust_type(ty, "'static");
+                    sig_params.push(format!("{pname}: &mut {rty}"));
+                    call_args_base.push(pname);
+                }
+                ParamMode::RefSlice => {
+                    let elem = match ty {
+                        MirType::Array(inner) => ctx.rust_type(inner, "'static"),
+                        _ => "i64".to_string(),
+                    };
+                    sig_params.push(format!("{pname}: &[{elem}]"));
+                    call_args_base.push(pname);
+                }
+                ParamMode::RefStr => {
+                    sig_params.push(format!("{pname}: &str"));
+                    call_args_base.push(pname);
+                }
+                ParamMode::MutVec | ParamMode::RcCell | ParamMode::RcRefCell => {}
+            }
+        }
+
+        let ret_ty = ctx.rust_type(&meta.return_type, "'static");
+        let gas_limit_expr = match ctx.opts.gas_limit {
+            Some(limit) => format!("Some({limit}_u64)"),
+            None => "None".to_string(),
+        };
+        let mem_limit_expr = match ctx.opts.max_memory_bytes {
+            Some(limit) => format!("Some({limit}_usize)"),
+            None => "None".to_string(),
+        };
+        let alloc_expr = match ctx.opts.max_memory_bytes {
+            Some(limit) => format!("lust_aot_rt::LustBudgetAlloc::with_limit({limit}_usize)"),
+            None => "lust_aot_rt::LustBudgetAlloc::unbounded()".to_string(),
+        };
+
+        // 1. Primary ergonomic `pub fn <name>(...)`
+        if ctx.interop.emit_as_include_module {
+            out.push_str(INCLUDE_ALLOW_ATTR);
+        }
+        out.push_str("#[inline]\n");
+        let mut full_call_args: Vec<String> = Vec::new();
+        if meta.needs_ctx {
+            full_call_args.push("&mut __ctx".to_string());
+        }
+        if meta.needs_alloc {
+            full_call_args.push("&__alloc".to_string());
+        }
+        if meta.needs_arena {
+            full_call_args.push("&__arena".to_string());
+        }
+        full_call_args.extend(call_args_base.iter().cloned());
+
+        if !meta.can_fail {
+            let _ = writeln!(
+                out,
+                "pub fn {pub_name}({}) -> {ret_ty} {{",
+                sig_params.join(", ")
+            );
+            if meta.needs_ctx {
+                if ctx.opts.pure_core {
+                    out.push_str("    let mut __ctx = lust_aot_rt::AotCtx::pure_core();\n");
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "    let mut __ctx = lust_aot_rt::AotCtx::with_limits({gas_limit_expr}, {mem_limit_expr});"
+                    );
+                }
+            }
+            if meta.needs_alloc || meta.needs_arena {
+                let _ = writeln!(out, "    let __alloc = {alloc_expr};");
+            }
+            if meta.needs_arena {
+                out.push_str("    let __arena = lust_aot_rt::LustChunkArena::new(&__alloc);\n");
+            }
+            let _ = writeln!(
+                out,
+                "    let Ok(__v) = {}({});",
+                meta.rust_name,
+                full_call_args.join(", ")
+            );
+            out.push_str("    __v\n");
+            out.push_str("}\n\n");
+        } else {
+            let _ = writeln!(
+                out,
+                "pub fn {pub_name}({}) -> Result<{ret_ty}, lust_aot_rt::AotError> {{",
+                sig_params.join(", ")
+            );
+            if meta.needs_ctx {
+                if ctx.opts.pure_core {
+                    out.push_str("    let mut __ctx = lust_aot_rt::AotCtx::pure_core();\n");
+                    if let Some(limit) = ctx.opts.gas_limit {
+                        let _ = writeln!(out, "    __ctx.gas_limit = Some({limit}_u64);");
+                        let _ = writeln!(
+                            out,
+                            "    __ctx.gas_remaining = {};",
+                            limit.min(i64::MAX as u64)
+                        );
+                    }
+                    if let Some(limit) = ctx.opts.max_memory_bytes {
+                        let _ = writeln!(
+                            out,
+                            "    __ctx.budget_alloc = lust_aot_rt::LustBudgetAlloc::with_limit({limit}_usize);"
+                        );
+                    }
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "    let mut __ctx = lust_aot_rt::AotCtx::with_limits({gas_limit_expr}, {mem_limit_expr});"
+                    );
+                }
+            }
+            if meta.needs_alloc || meta.needs_arena {
+                let _ = writeln!(out, "    let __alloc = {alloc_expr};");
+            }
+            if meta.needs_arena {
+                out.push_str("    let __arena = lust_aot_rt::LustChunkArena::new(&__alloc);\n");
+            }
+            let _ = writeln!(
+                out,
+                "    {}({})",
+                meta.rust_name,
+                full_call_args.join(", ")
+            );
+            out.push_str("}\n\n");
+        }
+
+        // 2. Context-threaded variant `pub fn <name>_with_ctx(ctx: &mut AotCtx, ...)` when ctx or fallibility is used
+        if meta.needs_ctx || meta.can_fail {
+            let ctx_fn_name = format!("{pub_name}_with_ctx");
+            if used_names.insert(ctx_fn_name.clone()) {
+                if ctx.interop.emit_as_include_module {
+                    out.push_str(INCLUDE_ALLOW_ATTR);
+                }
+                out.push_str("#[inline]\n");
+                let mut ctx_sig_params = vec!["__ctx: &mut lust_aot_rt::AotCtx".to_string()];
+                ctx_sig_params.extend(sig_params.iter().cloned());
+                let _ = writeln!(
+                    out,
+                    "pub fn {ctx_fn_name}({}) -> Result<{ret_ty}, lust_aot_rt::AotError> {{",
+                    ctx_sig_params.join(", ")
+                );
+                let mut ctx_call_args = Vec::new();
+                if meta.needs_ctx {
+                    ctx_call_args.push("__ctx".to_string());
+                }
+                if meta.needs_alloc || meta.needs_arena {
+                    out.push_str(
+                        "    let __alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__ctx.budget_alloc.limit_bytes());\n",
+                    );
+                }
+                if meta.needs_alloc {
+                    ctx_call_args.push("&__alloc".to_string());
+                }
+                if meta.needs_arena {
+                    out.push_str("    let __arena = lust_aot_rt::LustChunkArena::new(&__alloc);\n");
+                    ctx_call_args.push("&__arena".to_string());
+                }
+                ctx_call_args.extend(call_args_base.iter().cloned());
+                if meta.can_fail {
+                    let _ = writeln!(
+                        out,
+                        "    {}({})",
+                        meta.rust_name,
+                        ctx_call_args.join(", ")
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "    {}({}).map_err(lust_aot_rt::AotError::from)",
+                        meta.rust_name,
+                        ctx_call_args.join(", ")
+                    );
+                }
+                out.push_str("}\n\n");
+            }
+        }
+    }
+}
+
 fn emit_entrypoint(out: &mut String, module: &MirModule, ctx: &ModuleEmitContext<'_>) {
     let main_fn = module
         .functions
         .iter()
         .find(|f| f.signature.name == "main" || f.signature.name.ends_with(".main"));
+
+    if ctx.opts.no_std {
+        out.push_str("pub fn lust_nostd_main() -> i32 {\n");
+        out.push_str("    let _slab = lust_static_slab_new();\n");
+        let Some(main) = main_fn else {
+            out.push_str("    0\n}\n");
+            return;
+        };
+        let meta = &ctx.fn_metas[&main.signature.name];
+        let gas_limit_expr = match ctx.opts.gas_limit {
+            Some(limit) => format!("Some({limit}_u64)"),
+            None => "None".to_string(),
+        };
+        let mem_limit_expr = match ctx.opts.max_memory_bytes {
+            Some(limit) => format!("Some({limit}_usize)"),
+            None => "None".to_string(),
+        };
+        let alloc_expr = match ctx.opts.max_memory_bytes {
+            Some(limit) => format!("lust_aot_rt::LustBudgetAlloc::with_limit({limit}_usize)"),
+            None => "lust_aot_rt::LustBudgetAlloc::unbounded()".to_string(),
+        };
+        if meta.needs_ctx {
+            if ctx.opts.pure_core {
+                let _ = writeln!(out, "    let mut __ctx = lust_aot_rt::AotCtx::pure_core();");
+                if let Some(limit) = ctx.opts.gas_limit {
+                    let _ = writeln!(out, "    __ctx.gas_limit = Some({limit}_u64);");
+                    let _ = writeln!(
+                        out,
+                        "    __ctx.gas_remaining = {};",
+                        limit.min(i64::MAX as u64)
+                    );
+                }
+                if let Some(limit) = ctx.opts.max_memory_bytes {
+                    let _ = writeln!(
+                        out,
+                        "    __ctx.budget_alloc = lust_aot_rt::LustBudgetAlloc::with_limit({limit}_usize);"
+                    );
+                }
+            } else {
+                let _ = writeln!(
+                    out,
+                    "    let mut __ctx = lust_aot_rt::AotCtx::with_limits({gas_limit_expr}, {mem_limit_expr});"
+                );
+            }
+        }
+        if meta.needs_alloc || meta.needs_arena || ctx.module_uses_arena {
+            let _ = writeln!(out, "    let __alloc = {alloc_expr};");
+        }
+        if meta.needs_arena {
+            let _ = writeln!(
+                out,
+                "    let __arena = lust_aot_rt::LustChunkArena::new(&__alloc);"
+            );
+        }
+        let mut call_args = Vec::new();
+        if meta.needs_ctx {
+            call_args.push("&mut __ctx");
+        }
+        if meta.needs_alloc {
+            call_args.push("&__alloc");
+        }
+        if meta.needs_arena {
+            call_args.push("&__arena");
+        }
+        let call_expr = format!("{}({})", meta.rust_name, call_args.join(", "));
+        if meta.can_fail {
+            let _ = writeln!(out, "    match {call_expr} {{");
+            match main.signature.return_type {
+                MirType::Int => out.push_str("        Ok(__code) => __code as i32,\n"),
+                _ => out.push_str("        Ok(_) => 0,\n"),
+            }
+            out.push_str("        Err(_) => 1,\n");
+            out.push_str("    }\n");
+        } else {
+            match main.signature.return_type {
+                MirType::Int => {
+                    let _ = writeln!(out, "    let Ok(__code) = {call_expr};");
+                    out.push_str("    __code as i32\n");
+                }
+                _ => {
+                    let _ = writeln!(out, "    let Ok(_) = {call_expr};");
+                    out.push_str("    0\n");
+                }
+            }
+        }
+        out.push_str("}\n");
+        return;
+    }
 
     out.push_str("fn main() {\n");
     let Some(main) = main_fn else {
@@ -3422,6 +6043,223 @@ struct FnEmitter<'a, 'm> {
     active_enum_variant: HashMap<LocalId, usize>,
     /// Maps local variable source name -> LocalId (for calling local closure variables).
     local_name_to_id: HashMap<String, LocalId>,
+    /// Pre-analyzed tail-resumptive `__lust_handle(body_thunk, arms_array)` call sites (`NG-W13-1A`).
+    handle_plans: HashMap<BlockId, HandleCallPlan>,
+    /// Pre-analyzed one-shot non-tail `__lust_nontail_handle(body_thunk, arms_array)` call sites (`NG-W13-1B`).
+    nontail_handle_plans: HashMap<BlockId, HandleCallPlan>,
+    /// Pre-analyzed `__lust_yield_op(op_name, args_arr, cont_closure)` call sites (`NG-W13-1B`).
+    nontail_yield_op_plans: HashMap<BlockId, NonTailYieldOpPlan>,
+    /// Pre-analyzed `__lust_perform(name, [a0, a1, ...])` inline argument lists (`NG-W13-1A`).
+    perform_arg_plans: HashMap<BlockId, Vec<Operand>>,
+    /// Pre-analyzed `__lust_run_sync(__lust_provide*(thunk, p))` direct-stack plans (`NG-W13-1A`).
+    provide_plans: HashMap<BlockId, ProvideRunPlan>,
+    /// Pre-analyzed `__lust_scoped(thunk)` call sites (`NG-W13-1B`).
+    scoped_plans: HashMap<BlockId, (String, Vec<(String, Operand, MirType)>)>,
+    /// Pre-analyzed `__lust_scope_finalizer` / `__lust_scope_spawn` callback plans (`NG-W13-1B`).
+    scope_callback_plans: HashMap<BlockId, (String, Vec<(String, Operand, MirType)>)>,
+    /// Destination locals of `__lust_yield_op` / `__lust_yield_completed` (returned directly, omitted from decls).
+    yield_return_locals: HashSet<LocalId>,
+}
+
+#[derive(Debug, Clone)]
+struct NonTailYieldOpPlan {
+    op_name: String,
+    arg_ops: Vec<Operand>,
+    cont_fn_name: String,
+    cont_captures: Vec<(String, Operand, MirType)>,
+}
+
+/// Scans all `__lust_nontail_handle` sites in `module` and computes exact parameterized
+/// `EffectYield<OpArg, ResumeVal, BodyRet>` signatures for every lifted non-tail body and arm (`NG-W13-1B`).
+fn analyze_nontail_effect_metas(
+    module: &MirModule,
+) -> (
+    HashMap<String, NonTailYieldSig>,
+    HashMap<String, NonTailArmMeta>,
+) {
+    let mut body_metas: HashMap<String, NonTailYieldSig> = HashMap::new();
+    let mut arm_metas: HashMap<String, NonTailArmMeta> = HashMap::new();
+
+    let fn_by_name: HashMap<&str, &MirFunction> = module
+        .functions
+        .iter()
+        .map(|f| (f.signature.name.as_str(), f))
+        .collect();
+
+    for func in &module.functions {
+        for block in &func.blocks {
+            let Some(Terminator::Call {
+                callee,
+                args,
+                destination,
+                ..
+            }) = &block.terminator
+            else {
+                continue;
+            };
+            if callee != "__lust_nontail_handle" {
+                continue;
+            }
+            let Some((body_fn_name, arms)) = trace_mir_nontail_handle_site(func, args) else {
+                continue;
+            };
+            let Some(&body_fn) = fn_by_name.get(body_fn_name.as_str()) else {
+                continue;
+            };
+
+            let mut body_ret_cand: Option<MirType> = None;
+            let mut body_ret_conflict = false;
+            let mut resume_val_cand: Option<MirType> = None;
+            let mut resume_val_conflict = false;
+            let record = |slot: &mut Option<MirType>, conflict: &mut bool, ty: MirType| {
+                if ty == MirType::Unknown {
+                    return;
+                }
+                match slot {
+                    None => *slot = Some(ty),
+                    Some(prev) if *prev == ty => {}
+                    Some(_) => *conflict = true,
+                }
+            };
+
+            for b in &body_fn.blocks {
+                if let Some(Terminator::Call {
+                    callee: bc,
+                    args: bargs,
+                    ..
+                }) = &b.terminator
+                {
+                    if bc == "__lust_yield_completed"
+                        && let Some(a0) = bargs.first()
+                    {
+                        record(
+                            &mut body_ret_cand,
+                            &mut body_ret_conflict,
+                            operand_mir_type(a0, body_fn),
+                        );
+                    } else if bc == "__lust_yield_op"
+                        && bargs.len() >= 3
+                        && let Some((cont_name, cont_caps)) =
+                            trace_mir_closure_and_caps(body_fn, &bargs[2])
+                        && let Some(&cf) = fn_by_name.get(cont_name.as_str())
+                    {
+                        record(
+                            &mut body_ret_cand,
+                            &mut body_ret_conflict,
+                            cf.signature.return_type.clone(),
+                        );
+                        if let Some(&pid) = cf.params.get(cont_caps.len()) {
+                            let pty = cf.locals[pid.0].ty.clone();
+                            let used = count_local_uses(cf).get(&pid).copied().unwrap_or(0) > 0;
+                            if used || pty != MirType::Int {
+                                record(&mut resume_val_cand, &mut resume_val_conflict, pty);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Place::Local(dst) = destination {
+                let dst_ty = func.locals[dst.0].ty.clone();
+                if body_ret_cand.is_none() && dst_ty != MirType::Unknown {
+                    body_ret_cand = Some(dst_ty);
+                }
+            }
+
+            for (_, arm_fn_name, _) in &arms {
+                if let Some(&af) = fn_by_name.get(arm_fn_name.as_str()) {
+                    for b in &af.blocks {
+                        if let Some(Terminator::Call {
+                            callee: ac,
+                            args: aargs,
+                            ..
+                        }) = &b.terminator
+                            && ac == "__lust_nontail_resume"
+                            && let Some(a0) = aargs.first()
+                        {
+                            record(
+                                &mut resume_val_cand,
+                                &mut resume_val_conflict,
+                                operand_mir_type(a0, af),
+                            );
+                        }
+                    }
+                }
+            }
+
+            let body_ret_ty = if body_ret_conflict {
+                MirType::Unknown
+            } else {
+                body_ret_cand.unwrap_or(MirType::Unit)
+            };
+            let resume_val_ty = if resume_val_conflict {
+                MirType::Unknown
+            } else {
+                resume_val_cand.unwrap_or(MirType::Unit)
+            };
+
+            let op_arg_mode = if arms.len() == 1 {
+                let (_, ref arm_fn_name, n_caps) = arms[0];
+                if let Some(&af) = fn_by_name.get(arm_fn_name.as_str()) {
+                    let explicit_count = af.params.len().saturating_sub(n_caps);
+                    match explicit_count {
+                        0 => NonTailOpArgMode::Unit,
+                        1 => {
+                            let pty = af.locals[af.params[n_caps].0].ty.clone();
+                            NonTailOpArgMode::Single(pty)
+                        }
+                        _ => NonTailOpArgMode::TaggedVec,
+                    }
+                } else {
+                    NonTailOpArgMode::TaggedVec
+                }
+            } else {
+                NonTailOpArgMode::TaggedVec
+            };
+
+            body_metas.insert(
+                body_fn_name,
+                NonTailYieldSig {
+                    op_arg_mode,
+                    resume_val_ty: resume_val_ty.clone(),
+                    body_ret_ty: body_ret_ty.clone(),
+                },
+            );
+            for (_, arm_fn_name, _) in arms {
+                arm_metas.insert(
+                    arm_fn_name,
+                    NonTailArmMeta {
+                        resume_val_ty: resume_val_ty.clone(),
+                        body_ret_ty: body_ret_ty.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    (body_metas, arm_metas)
+}
+
+#[derive(Debug, Clone)]
+struct HandleArmPlan {
+    effect_name: String,
+    arm_fn_name: String,
+    captures: Vec<(String, Operand, MirType)>,
+}
+
+#[derive(Debug, Clone)]
+struct HandleCallPlan {
+    body_fn_name: String,
+    body_captures: Vec<(String, Operand, MirType)>,
+    arms: Vec<HandleArmPlan>,
+}
+
+#[derive(Debug, Clone)]
+struct ProvideRunPlan {
+    thunk_fn_name: String,
+    thunk_captures: Vec<(String, Operand, MirType)>,
+    /// Provided `(service_key, provider_operand)` pairs ordered outer -> inner.
+    providers: Vec<(String, Operand)>,
 }
 
 #[derive(Debug, Clone)]
@@ -3495,9 +6333,21 @@ fn emit_function(
         switch_tag_source,
         active_enum_variant: HashMap::new(),
         local_name_to_id,
+        handle_plans: HashMap::new(),
+        nontail_handle_plans: HashMap::new(),
+        nontail_yield_op_plans: HashMap::new(),
+        perform_arg_plans: HashMap::new(),
+        provide_plans: HashMap::new(),
+        scoped_plans: HashMap::new(),
+        scope_callback_plans: HashMap::new(),
+        yield_return_locals: HashSet::new(),
     };
 
     // Pre-passes on the structured function
+    fe.analyze_effect_handles();
+    fe.analyze_nontail_yields_and_scopes();
+    fe.analyze_effect_performs();
+    fe.analyze_effect_provides();
     fe.analyze_single_def_aliases();
     fe.analyze_tostring_concat_fusion();
     fe.analyze_structured_folds(&tree);
@@ -3515,9 +6365,14 @@ fn emit_function(
     // Emit structured body
     fe.emit_node(&tree, 1)?;
 
-    // Safety trailing return in case of empty trailing fallthrough on Unit/Int functions
+    // Safety trailing return in case of empty trailing fallthrough on Unit/Int/EffectYield functions
     if !node_always_returns(&tree) {
-        let def_ret = fe.ctx.rust_default_expr(&func.signature.return_type);
+        let def_ret = if let Some(ysig) = fe.ctx.nontail_body_metas.get(&func.signature.name) {
+            let inner_def = fe.ctx.rust_default_expr(&ysig.body_ret_ty);
+            format!("lust_aot_rt::EffectYield::Completed({inner_def})")
+        } else {
+            fe.ctx.rust_default_expr(&func.signature.return_type)
+        };
         if !fe.errdefer_guards.is_empty() {
             let _ = writeln!(fe.out, "    let __ret = {def_ret};");
             for g in fe.errdefer_guards.clone().iter().rev() {
@@ -3636,6 +6491,13 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
         if self.meta.needs_arena {
             params.push("__arena: &'a lust_aot_rt::LustChunkArena<'a>".to_string());
         }
+        if let Some(arm_meta) = self.ctx.nontail_arm_metas.get(&self.func.signature.name) {
+            let res_ty = self.ctx.rust_type(&arm_meta.resume_val_ty, "'static");
+            let ret_ty = self.ctx.rust_type(&arm_meta.body_ret_ty, "'static");
+            params.push(format!(
+                "__k: &mut lust_aot_rt::OneShotResume<{res_ty}, {ret_ty}>"
+            ));
+        }
 
         for (pi, &pid) in self.func.params.iter().enumerate() {
             let ty = &self.func.locals[pid.0].ty;
@@ -3680,13 +6542,39 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             params.push(p_str);
         }
 
-        let ret_ok_ty = self.ctx.rust_type(&self.func.signature.return_type, "'a");
+        let ret_ok_ty = if let Some(ysig) = self.ctx.nontail_body_metas.get(&self.func.signature.name)
+        {
+            let op_ty = self.ctx.nontail_op_arg_rust_type(&ysig.op_arg_mode);
+            let res_ty = self.ctx.rust_type(&ysig.resume_val_ty, "'static");
+            let body_ty = self.ctx.rust_type(&ysig.body_ret_ty, "'static");
+            format!("lust_aot_rt::EffectYield<{op_ty}, {res_ty}, {body_ty}>")
+        } else {
+            self.ctx.rust_type(&self.func.signature.return_type, "'a")
+        };
         let err_ty = if self.meta.can_fail {
             "lust_aot_rt::AotError"
         } else {
             "core::convert::Infallible"
         };
 
+        if let Some(eff_spec) = self.ctx.ast_meta.fn_effects.get(&self.func.signature.name)
+            && !eff_spec.requirements.is_empty()
+        {
+            let req_names: Vec<String> = eff_spec
+                .requirements
+                .iter()
+                .map(|r| format!("LustService_{}", sanitize_ident(&ast_type_target_name(r))))
+                .collect();
+            let _ = writeln!(
+                self.out,
+                "// Nominal service requirements (NG-W13-1A): {}",
+                req_names.join(" + ")
+            );
+        }
+
+        if self.ctx.interop.emit_as_include_module {
+            self.out.push_str(INCLUDE_ALLOW_ATTR);
+        }
         let _ = writeln!(
             self.out,
             "fn {}{lt_str}({}) -> Result<{ret_ok_ty}, {err_ty}> {{",
@@ -3982,6 +6870,492 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             self.out.push_str("    });\n");
         }
         Ok(())
+    }
+
+    /// Pre-pass (`NG-W13-1A`): traces `__lust_handle(body_thunk, arms_array)` back to its
+    /// lifted body closure and `(effect_name, arm_closure)` pairs, skipping the intermediate
+    /// heterogeneous tuple/array temps so zero closure-tuple allocations are emitted.
+    fn analyze_effect_handles(&mut self) {
+        let mut def_loc: HashMap<LocalId, (BlockId, usize)> = HashMap::new();
+        for block in &self.func.blocks {
+            if block.is_cleanup {
+                continue;
+            }
+            for (sidx, stmt) in block.statements.iter().enumerate() {
+                if let Statement::Assign(Place::Local(dst), _, _) = stmt {
+                    def_loc.insert(*dst, (block.id, sidx));
+                }
+            }
+        }
+
+        let resolve_closure = |op: &Operand| -> Option<(
+            String,
+            Vec<(String, Operand, MirType)>,
+            Vec<(LocalId, BlockId, usize)>,
+        )> {
+            let mut cur = operand_exact_local(op)?;
+            let mut chain = Vec::new();
+            let mut seen = HashSet::new();
+            while seen.insert(cur) {
+                let &(bb, sidx) = def_loc.get(&cur)?;
+                if let Statement::Assign(_, rval, _) = &self.func.blocks[bb.0].statements[sidx] {
+                    match rval {
+                        Rvalue::Closure {
+                            func_name,
+                            captures,
+                        } => {
+                            chain.push((cur, bb, sidx));
+                            return Some((func_name.clone(), captures.clone(), chain));
+                        }
+                        Rvalue::Use(
+                            Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)),
+                        ) => {
+                            chain.push((cur, bb, sidx));
+                            cur = *src;
+                        }
+                        _ => return None,
+                    }
+                } else {
+                    return None;
+                }
+            }
+            None
+        };
+
+        for block in &self.func.blocks {
+            if block.is_cleanup {
+                continue;
+            }
+            let Some(Terminator::Call { callee, args, .. }) = &block.terminator else {
+                continue;
+            };
+            if !matches!(callee.as_str(), "__lust_handle" | "__lust_nontail_handle")
+                || args.len() != 2
+            {
+                continue;
+            }
+            let is_nontail = callee == "__lust_nontail_handle";
+
+            let Some((body_fn_name, body_captures, body_chain)) = resolve_closure(&args[0]) else {
+                continue;
+            };
+            let Some(arms_loc) = operand_exact_local(&args[1]) else {
+                continue;
+            };
+            let Some(&(arms_bb, arms_sidx)) = def_loc.get(&arms_loc) else {
+                continue;
+            };
+            let Statement::Assign(_, Rvalue::Aggregate(MirType::Array(_), tup_ops), _) =
+                &self.func.blocks[arms_bb.0].statements[arms_sidx]
+            else {
+                continue;
+            };
+
+            let mut arms = Vec::with_capacity(tup_ops.len());
+            let mut temps_to_skip: Vec<(LocalId, BlockId, usize)> = Vec::new();
+            temps_to_skip.extend(body_chain);
+            temps_to_skip.push((arms_loc, arms_bb, arms_sidx));
+
+            let mut all_ok = true;
+            for tup_op in tup_ops {
+                let Some(tup_loc) = operand_exact_local(tup_op) else {
+                    all_ok = false;
+                    break;
+                };
+                let Some(&(tup_bb, tup_sidx)) = def_loc.get(&tup_loc) else {
+                    all_ok = false;
+                    break;
+                };
+                let Statement::Assign(_, Rvalue::Aggregate(MirType::Tuple(_), elems), _) =
+                    &self.func.blocks[tup_bb.0].statements[tup_sidx]
+                else {
+                    all_ok = false;
+                    break;
+                };
+                if elems.len() < 2 {
+                    all_ok = false;
+                    break;
+                }
+                let effect_name = match &elems[0] {
+                    Operand::Constant(MirConstant::String(s)) => s.clone(),
+                    _ => {
+                        all_ok = false;
+                        break;
+                    }
+                };
+                let Some((arm_fn_name, arm_captures, arm_chain)) = resolve_closure(&elems[1])
+                else {
+                    all_ok = false;
+                    break;
+                };
+                temps_to_skip.push((tup_loc, tup_bb, tup_sidx));
+                temps_to_skip.extend(arm_chain);
+                arms.push(HandleArmPlan {
+                    effect_name,
+                    arm_fn_name,
+                    captures: arm_captures,
+                });
+            }
+
+            if all_ok {
+                for (loc, bb, sidx) in temps_to_skip {
+                    if self.local_use_counts.get(&loc).copied().unwrap_or(0) <= 1
+                        && self.local_def_counts.get(&loc).copied().unwrap_or(0) <= 1
+                    {
+                        self.skip_stmts.insert((bb, sidx));
+                        self.omitted_locals.insert(loc);
+                    }
+                }
+                let plan = HandleCallPlan {
+                    body_fn_name,
+                    body_captures,
+                    arms,
+                };
+                if is_nontail {
+                    self.nontail_handle_plans.insert(block.id, plan);
+                } else {
+                    self.handle_plans.insert(block.id, plan);
+                }
+            }
+        }
+    }
+
+    /// Pre-pass (`NG-W13-1B`): traces `__lust_yield_op`, `__lust_yield_completed`,
+    /// `__lust_scoped`, `__lust_scope_finalizer`, and `__lust_scope_spawn` back to their
+    /// lifted closures and inline argument lists so zero intermediate temps leak into Rust.
+    fn analyze_nontail_yields_and_scopes(&mut self) {
+        let mut def_loc: HashMap<LocalId, (BlockId, usize)> = HashMap::new();
+        for block in &self.func.blocks {
+            if block.is_cleanup {
+                continue;
+            }
+            for (sidx, stmt) in block.statements.iter().enumerate() {
+                if let Statement::Assign(Place::Local(dst), _, _) = stmt {
+                    def_loc.insert(*dst, (block.id, sidx));
+                }
+            }
+        }
+
+        let resolve_closure = |op: &Operand| -> Option<(
+            String,
+            Vec<(String, Operand, MirType)>,
+            Vec<(LocalId, BlockId, usize)>,
+        )> {
+            let mut cur = operand_exact_local(op)?;
+            let mut chain = Vec::new();
+            let mut seen = HashSet::new();
+            while seen.insert(cur) {
+                let &(bb, sidx) = def_loc.get(&cur)?;
+                if let Statement::Assign(_, rval, _) = &self.func.blocks[bb.0].statements[sidx] {
+                    match rval {
+                        Rvalue::Closure {
+                            func_name,
+                            captures,
+                        } => {
+                            chain.push((cur, bb, sidx));
+                            return Some((func_name.clone(), captures.clone(), chain));
+                        }
+                        Rvalue::Use(
+                            Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)),
+                        ) => {
+                            chain.push((cur, bb, sidx));
+                            cur = *src;
+                        }
+                        _ => return None,
+                    }
+                } else {
+                    return None;
+                }
+            }
+            None
+        };
+
+        for block in &self.func.blocks {
+            if block.is_cleanup {
+                continue;
+            }
+            let Some(Terminator::Call {
+                callee,
+                args,
+                destination,
+                ..
+            }) = &block.terminator
+            else {
+                continue;
+            };
+            match callee.as_str() {
+                "__lust_yield_completed" => {
+                    if let Place::Local(dst) = destination {
+                        self.yield_return_locals.insert(*dst);
+                    }
+                }
+                "__lust_yield_op" if args.len() >= 3 => {
+                    if let Place::Local(dst) = destination {
+                        self.yield_return_locals.insert(*dst);
+                    }
+                    let op_name = match &args[0] {
+                        Operand::Constant(MirConstant::String(s)) => s.clone(),
+                        _ => continue,
+                    };
+                    let Some((cont_fn_name, cont_captures, cont_chain)) =
+                        resolve_closure(&args[2])
+                    else {
+                        continue;
+                    };
+                    let mut temps_to_skip = cont_chain;
+                    let arg_ops = if let Some(arr_loc) = operand_exact_local(&args[1])
+                        && let Some(&(arr_bb, arr_sidx)) = def_loc.get(&arr_loc)
+                        && let Statement::Assign(_, Rvalue::Aggregate(MirType::Array(_), elems), _) =
+                            &self.func.blocks[arr_bb.0].statements[arr_sidx]
+                    {
+                        temps_to_skip.push((arr_loc, arr_bb, arr_sidx));
+                        elems.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    for (loc, bb, sidx) in temps_to_skip {
+                        if self.local_use_counts.get(&loc).copied().unwrap_or(0) <= 1
+                            && self.local_def_counts.get(&loc).copied().unwrap_or(0) <= 1
+                        {
+                            self.skip_stmts.insert((bb, sidx));
+                            self.omitted_locals.insert(loc);
+                        }
+                    }
+                    self.nontail_yield_op_plans.insert(
+                        block.id,
+                        NonTailYieldOpPlan {
+                            op_name,
+                            arg_ops,
+                            cont_fn_name,
+                            cont_captures,
+                        },
+                    );
+                }
+                "__lust_scoped" if args.len() == 1 => {
+                    if let Some((fn_name, caps, chain)) = resolve_closure(&args[0]) {
+                        for (loc, bb, sidx) in chain {
+                            if self.local_use_counts.get(&loc).copied().unwrap_or(0) <= 1
+                                && self.local_def_counts.get(&loc).copied().unwrap_or(0) <= 1
+                            {
+                                self.skip_stmts.insert((bb, sidx));
+                                self.omitted_locals.insert(loc);
+                            }
+                        }
+                        self.scoped_plans.insert(block.id, (fn_name, caps));
+                    }
+                }
+                "__lust_scope_finalizer" | "__lust_scope_spawn" if args.len() == 1 => {
+                    if let Some((fn_name, caps, chain)) = resolve_closure(&args[0]) {
+                        for (loc, bb, sidx) in chain {
+                            if self.local_use_counts.get(&loc).copied().unwrap_or(0) <= 1
+                                && self.local_def_counts.get(&loc).copied().unwrap_or(0) <= 1
+                            {
+                                self.skip_stmts.insert((bb, sidx));
+                                self.omitted_locals.insert(loc);
+                            }
+                        }
+                        self.scope_callback_plans.insert(block.id, (fn_name, caps));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Propagate `yield_return_locals` across simple local copy temps (e.g. `_4 = _3; return _4;`)
+        // so dead post-yield return blocks never emit a mismatched `Completed(_4)` fallback.
+        if !self.yield_return_locals.is_empty() {
+            for _ in 0..4 {
+                let mut changed = false;
+                for block in &self.func.blocks {
+                    if block.is_cleanup {
+                        continue;
+                    }
+                    for stmt in &block.statements {
+                        if let Statement::Assign(
+                            Place::Local(dst),
+                            Rvalue::Use(
+                                Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)),
+                            ),
+                            _,
+                        ) = stmt
+                            && self.yield_return_locals.contains(src)
+                            && self.yield_return_locals.insert(*dst)
+                        {
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Pre-pass (`NG-W13-1A`): traces `__lust_perform(name, [a0, a1, ...])` so argument arrays
+    /// are passed on the stack as `&[AotValue]` with zero heap `Vec` allocation.
+    fn analyze_effect_performs(&mut self) {
+        let mut def_loc: HashMap<LocalId, (BlockId, usize)> = HashMap::new();
+        for block in &self.func.blocks {
+            if block.is_cleanup {
+                continue;
+            }
+            for (sidx, stmt) in block.statements.iter().enumerate() {
+                if let Statement::Assign(Place::Local(dst), _, _) = stmt {
+                    def_loc.insert(*dst, (block.id, sidx));
+                }
+            }
+        }
+
+        for block in &self.func.blocks {
+            if block.is_cleanup {
+                continue;
+            }
+            let Some(Terminator::Call { callee, args, .. }) = &block.terminator else {
+                continue;
+            };
+            if !matches!(callee.as_str(), "__lust_perform" | "perform") || args.len() < 2 {
+                continue;
+            }
+            let Some(arr_loc) = operand_exact_local(&args[1]) else {
+                continue;
+            };
+            if self.local_use_counts.get(&arr_loc).copied().unwrap_or(0) > 1
+                || self.local_def_counts.get(&arr_loc).copied().unwrap_or(0) > 1
+            {
+                continue;
+            }
+            let Some(&(arr_bb, arr_sidx)) = def_loc.get(&arr_loc) else {
+                continue;
+            };
+            if let Statement::Assign(_, Rvalue::Aggregate(MirType::Array(_), elems), _) =
+                &self.func.blocks[arr_bb.0].statements[arr_sidx]
+            {
+                self.perform_arg_plans.insert(block.id, elems.clone());
+                self.skip_stmts.insert((arr_bb, arr_sidx));
+                self.omitted_locals.insert(arr_loc);
+            }
+        }
+    }
+
+    /// Pre-pass (`NG-W13-1A`): traces `__lust_run_sync(__lust_provide*(thunk, p))` chains back
+    /// to a lifted effect thunk closure so `provide + run_sync` executes directly on the stack
+    /// with scoped `with_provided_service` `DropGuard`s and zero `Rc` closure allocation.
+    fn analyze_effect_provides(&mut self) {
+        let mut assign_def: HashMap<LocalId, (BlockId, usize)> = HashMap::new();
+        let mut provide_call_def: HashMap<LocalId, (BlockId, Operand, Operand)> = HashMap::new();
+        for block in &self.func.blocks {
+            if block.is_cleanup {
+                continue;
+            }
+            for (sidx, stmt) in block.statements.iter().enumerate() {
+                if let Statement::Assign(Place::Local(dst), _, _) = stmt {
+                    assign_def.insert(*dst, (block.id, sidx));
+                }
+            }
+            if let Some(Terminator::Call {
+                callee,
+                args,
+                destination: Place::Local(dst),
+                ..
+            }) = &block.terminator
+                && callee == "__lust_provide"
+                && args.len() == 2
+            {
+                provide_call_def.insert(*dst, (block.id, args[0].clone(), args[1].clone()));
+            }
+        }
+
+        for block in &self.func.blocks {
+            if block.is_cleanup {
+                continue;
+            }
+            let Some(Terminator::Call { callee, args, .. }) = &block.terminator else {
+                continue;
+            };
+            if callee != "__lust_run_sync" || args.len() != 1 {
+                continue;
+            }
+
+            let mut cur_loc = match operand_exact_local(&args[0]) {
+                Some(l) => l,
+                None => continue,
+            };
+            let mut providers_rev: Vec<(String, Operand)> = Vec::new();
+            let mut skip_provide_calls: Vec<(LocalId, BlockId)> = Vec::new();
+            let mut skip_assigns: Vec<(LocalId, BlockId, usize)> = Vec::new();
+            let mut seen = HashSet::new();
+            let mut resolved_thunk: Option<(String, Vec<(String, Operand, MirType)>)> = None;
+
+            while seen.insert(cur_loc) {
+                if let Some((p_bb, recv_op, prov_op)) = provide_call_def.get(&cur_loc).cloned() {
+                    let svc_key = match operand_mir_type(&prov_op, self.func) {
+                        MirType::Struct(sn) => sn,
+                        other => format!("{other}"),
+                    };
+                    providers_rev.push((svc_key, prov_op));
+                    skip_provide_calls.push((cur_loc, p_bb));
+                    if let Some(next_loc) = operand_exact_local(&recv_op) {
+                        cur_loc = next_loc;
+                        continue;
+                    }
+                    break;
+                }
+                if let Some(&(a_bb, a_sidx)) = assign_def.get(&cur_loc) {
+                    if let Statement::Assign(_, rval, _) =
+                        &self.func.blocks[a_bb.0].statements[a_sidx]
+                    {
+                        match rval {
+                            Rvalue::Closure {
+                                func_name,
+                                captures,
+                            } => {
+                                skip_assigns.push((cur_loc, a_bb, a_sidx));
+                                resolved_thunk = Some((func_name.clone(), captures.clone()));
+                                break;
+                            }
+                            Rvalue::Use(
+                                Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)),
+                            ) => {
+                                skip_assigns.push((cur_loc, a_bb, a_sidx));
+                                cur_loc = *src;
+                                continue;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                break;
+            }
+
+            if let Some((thunk_fn_name, thunk_captures)) = resolved_thunk {
+                providers_rev.reverse();
+                for (loc, p_bb) in skip_provide_calls {
+                    if self.local_use_counts.get(&loc).copied().unwrap_or(0) <= 1
+                        && self.local_def_counts.get(&loc).copied().unwrap_or(0) <= 1
+                    {
+                        self.skip_calls.insert(p_bb);
+                        self.omitted_locals.insert(loc);
+                    }
+                }
+                for (loc, a_bb, a_sidx) in skip_assigns {
+                    if self.local_use_counts.get(&loc).copied().unwrap_or(0) <= 1
+                        && self.local_def_counts.get(&loc).copied().unwrap_or(0) <= 1
+                    {
+                        self.skip_stmts.insert((a_bb, a_sidx));
+                        self.omitted_locals.insert(loc);
+                    }
+                }
+                self.provide_plans.insert(
+                    block.id,
+                    ProvideRunPlan {
+                        thunk_fn_name,
+                        thunk_captures,
+                        providers: providers_rev,
+                    },
+                );
+            }
+        }
     }
 
     /// Detects single-definition local aliases (`dst = Copy/Move(src)`) of Arrays or Structs
@@ -4408,7 +7782,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                             {
                                 self.emit_fused_string_append(dst_s, &int_op, &arg_ty, indent)?;
                             } else {
-                                self.emit_call(callee, args, destination, indent)?;
+                                self.emit_call(*bb, callee, args, destination, indent)?;
                             }
                         }
                         Terminator::Raise(err_op, _) => {
@@ -4674,7 +8048,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                         success,
                         ..
                     } => {
-                        self.emit_call(callee, args, destination, indent + 3)?;
+                        self.emit_call(bb, callee, args, destination, indent + 3)?;
                         if Some(*success) == exit {
                             let _ = writeln!(self.out, "{pad}            break '__sm_loop;");
                         } else {
@@ -5324,7 +8698,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
         }
 
         // Dynamic AotValue::Closure target
-        if matches!(expected_ty, Some(MirType::Unknown)) {
+        if matches!(expected_ty, Some(MirType::Unknown | MirType::Effect { .. })) {
             let mut call_args = Vec::new();
             if lifted_meta.needs_ctx {
                 call_args.push("__c_ctx".to_string());
@@ -5711,6 +9085,7 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
 
     fn emit_call(
         &mut self,
+        bb: BlockId,
         callee: &str,
         args: &[Operand],
         destination: &Place,
@@ -6185,6 +9560,54 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 }
                 return Ok(());
             }
+            "__lust_handle" => {
+                self.emit_effect_handle_call(bb, args, destination, indent)?;
+                return Ok(());
+            }
+            "__lust_nontail_handle" => {
+                self.emit_nontail_handle_call(bb, args, destination, indent)?;
+                return Ok(());
+            }
+            "__lust_yield_completed" => {
+                self.emit_nontail_yield_completed_call(args, indent)?;
+                return Ok(());
+            }
+            "__lust_yield_op" => {
+                self.emit_nontail_yield_op_call(bb, indent)?;
+                return Ok(());
+            }
+            "__lust_nontail_resume" => {
+                self.emit_nontail_resume_call(args, destination, indent)?;
+                return Ok(());
+            }
+            "__lust_perform" | "perform" => {
+                self.emit_effect_perform_call(bb, args, destination, indent)?;
+                return Ok(());
+            }
+            "__lust_resume" | "resume" => {
+                self.emit_effect_resume_call(args, destination, indent)?;
+                return Ok(());
+            }
+            "__lust_provide" => {
+                self.emit_effect_provide_call(args, destination, indent)?;
+                return Ok(());
+            }
+            "__lust_run_sync" => {
+                self.emit_effect_run_sync_call(bb, args, destination, indent)?;
+                return Ok(());
+            }
+            "__lust_scoped" => {
+                self.emit_scoped_call(bb, indent)?;
+                return Ok(());
+            }
+            "__lust_scope_finalizer" => {
+                self.emit_scope_finalizer_call(bb, indent)?;
+                return Ok(());
+            }
+            "__lust_scope_spawn" => {
+                self.emit_scope_spawn_call(bb, indent)?;
+                return Ok(());
+            }
             _ => {}
         }
 
@@ -6269,6 +9692,36 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 }
                 _ => {}
             }
+        }
+
+        // Direct Zero-FFI external Rust crate call (`--backend rust --link-crate`, NG-W13-1C)
+        if !self.ctx.fn_metas.contains_key(callee)
+            && let Some(ext_call) = self.ctx.resolve_extern_crate_call(callee)
+        {
+            let mut ext_args: Vec<String> = Vec::with_capacity(args.len());
+            for (i, arg) in args.iter().enumerate() {
+                let expected = ext_call
+                    .param_types
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| operand_mir_type(arg, self.func));
+                let a_expr = match expected {
+                    MirType::String => self.emit_operand_str_ref(arg),
+                    MirType::Array(_) => self.emit_operand_slice_ref(arg),
+                    _ => self.emit_operand_owned(arg, &expected),
+                };
+                ext_args.push(a_expr);
+            }
+            let call_expr = format!("{}({})", ext_call.rust_path, ext_args.join(", "));
+            if self.dest_is_omitted(destination) || ext_call.return_type == MirType::Unit {
+                let _ = writeln!(self.out, "{pad}let _ = {call_expr};");
+            } else {
+                let dst_ty = self.place_mir_type(destination);
+                let final_expr =
+                    self.coerce_expr_to_type(&call_expr, &ext_call.return_type, &dst_ty);
+                self.emit_assign_place_val(destination, &final_expr, indent);
+            }
+            return Ok(());
         }
 
         // User-defined function call within the module
@@ -6427,6 +9880,1187 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
             let final_expr =
                 self.coerce_expr_to_type(&call_expr, &callee_meta.return_type, &dst_ty);
             self.emit_assign_place_val(destination, &final_expr, indent);
+        }
+        Ok(())
+    }
+
+    fn build_lifted_capture_bindings(
+        &self,
+        func_name: &str,
+        captures: &[(String, Operand, MirType)],
+        prefix: &str,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let Some(lifted_meta) = self.ctx.fn_metas.get(func_name) else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing lifted effect function '{func_name}'"
+            )));
+        };
+        let mut bindings = Vec::with_capacity(captures.len());
+        let mut call_exprs = Vec::with_capacity(captures.len());
+        for (ci, (_, cap_op, cap_ty)) in captures.iter().enumerate() {
+            let lmode = lifted_meta
+                .param_modes
+                .get(ci)
+                .copied()
+                .unwrap_or(ParamMode::ByValue);
+            let var_name = format!("{prefix}_{ci}");
+            match lmode {
+                ParamMode::RcCell | ParamMode::RcRefCell => {
+                    if let Some(loc) = operand_exact_local(cap_op)
+                        && self.local_storage(loc) != LocalStorage::Direct
+                    {
+                        let src_var = self.local_var_name(loc);
+                        bindings.push(format!("let {var_name} = alloc::rc::Rc::clone(&{src_var});"));
+                    } else {
+                        let v = self.emit_operand_owned(cap_op, cap_ty);
+                        if lmode == ParamMode::RcCell {
+                            bindings.push(format!(
+                                "let {var_name} = alloc::rc::Rc::new(core::cell::Cell::new({v}));"
+                            ));
+                        } else {
+                            bindings.push(format!(
+                                "let {var_name} = alloc::rc::Rc::new(core::cell::RefCell::new({v}));"
+                            ));
+                        }
+                    }
+                    call_exprs.push(format!("alloc::rc::Rc::clone(&{var_name})"));
+                }
+                ParamMode::RefStruct => {
+                    let v = self.emit_operand_owned(cap_op, cap_ty);
+                    bindings.push(format!("let {var_name} = {v};"));
+                    call_exprs.push(format!("&{var_name}"));
+                }
+                ParamMode::MutRefStruct => {
+                    let v = self.emit_operand_owned(cap_op, cap_ty);
+                    bindings.push(format!("let mut {var_name} = {v};"));
+                    call_exprs.push(format!("&mut {var_name}"));
+                }
+                ParamMode::RefSlice => {
+                    let v = self.emit_operand_owned(cap_op, cap_ty);
+                    bindings.push(format!("let {var_name} = {v};"));
+                    call_exprs.push(format!("&{var_name}[..]"));
+                }
+                ParamMode::MutVec => {
+                    let v = self.emit_operand_owned(cap_op, cap_ty);
+                    bindings.push(format!("let mut {var_name} = {v};"));
+                    call_exprs.push(format!("&mut {var_name}"));
+                }
+                ParamMode::RefStr => {
+                    let v = self.emit_operand_owned(cap_op, cap_ty);
+                    bindings.push(format!("let {var_name} = {v};"));
+                    call_exprs.push(format!("{var_name}.as_str()"));
+                }
+                ParamMode::ByValue => {
+                    let v = self.emit_operand_owned(cap_op, cap_ty);
+                    bindings.push(format!("let {var_name} = {v};"));
+                    if self.ctx.is_copy_type(cap_ty) {
+                        call_exprs.push(var_name);
+                    } else {
+                        call_exprs.push(format!("{var_name}.clone()"));
+                    }
+                }
+            }
+        }
+        Ok((bindings, call_exprs))
+    }
+
+    fn emit_effect_handle_call(
+        &mut self,
+        bb: BlockId,
+        args: &[Operand],
+        destination: &Place,
+        indent: usize,
+    ) -> Result<()> {
+        let pad = "    ".repeat(indent);
+        let Some(plan) = self.handle_plans.get(&bb).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: unsupported dynamic __lust_handle call at block {bb:?} (args: {})",
+                args.len()
+            )));
+        };
+
+        let Some(body_meta) = self.ctx.fn_metas.get(&plan.body_fn_name).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing lifted handle body '{}'",
+                plan.body_fn_name
+            )));
+        };
+
+        let all_ast_tail = self
+            .ctx
+            .ast_meta
+            .handle_sites
+            .iter()
+            .all(|s| s.all_tail_or_abortive);
+        let _ = writeln!(
+            self.out,
+            "{pad}// Tail-resumptive handle..with (ast_tail_verified={all_ast_tail}) -> stack EffectHandlerFrame + DropGuard (NG-W13-1A)"
+        );
+        let _ = writeln!(self.out, "{pad}let __handle_res = {{");
+        let _ = writeln!(
+            self.out,
+            "{pad}    let mut __eff_arms: alloc::vec::Vec<lust_aot_rt::EffectHandlerArm> = alloc::vec::Vec::with_capacity({});",
+            plan.arms.len()
+        );
+
+        for (ai, arm) in plan.arms.iter().enumerate() {
+            let Some(arm_meta) = self.ctx.fn_metas.get(&arm.arm_fn_name).cloned() else {
+                return Err(LustError::Unknown(format!(
+                    "Rust AOT emitter: missing lifted handler arm '{}'",
+                    arm.arm_fn_name
+                )));
+            };
+            let Some(arm_fn) = self
+                .ctx
+                .module
+                .functions
+                .iter()
+                .find(|f| f.signature.name == arm.arm_fn_name)
+            else {
+                return Err(LustError::Unknown(format!(
+                    "Rust AOT emitter: missing lifted handler arm MirFunction '{}'",
+                    arm.arm_fn_name
+                )));
+            };
+
+            let (cap_bindings, cap_call_exprs) = self.build_lifted_capture_bindings(
+                &arm.arm_fn_name,
+                &arm.captures,
+                &format!("__arm_{ai}_cap"),
+            )?;
+            let n_caps = arm.captures.len();
+            let explicit_params: Vec<MirType> = arm_fn
+                .params
+                .iter()
+                .skip(n_caps)
+                .map(|pid| arm_fn.locals[pid.0].ty.clone())
+                .collect();
+
+            let mut arm_call_args = Vec::new();
+            if arm_meta.needs_ctx {
+                arm_call_args.push("__e_ctx".to_string());
+            }
+            if arm_meta.needs_alloc {
+                arm_call_args.push("&__e_alloc".to_string());
+            }
+            if arm_meta.needs_arena {
+                arm_call_args.push("&__e_arena".to_string());
+            }
+            arm_call_args.extend(cap_call_exprs);
+
+            let mut arg_bindings = Vec::new();
+            for (pi, pty) in explicit_params.iter().enumerate() {
+                let raw_a = format!(
+                    "__e_args.get({pi}).cloned().unwrap_or(lust_aot_rt::AotValue::Nil)"
+                );
+                let coerced = self.coerce_expr_to_type(&raw_a, &MirType::Unknown, pty);
+                let pmode = arm_meta
+                    .param_modes
+                    .get(n_caps + pi)
+                    .copied()
+                    .unwrap_or(ParamMode::ByValue);
+                match pmode {
+                    ParamMode::RefStr => {
+                        arg_bindings.push(format!("let __ea_{pi} = {coerced};"));
+                        arm_call_args.push(format!("__ea_{pi}.as_str()"));
+                    }
+                    ParamMode::RefStruct => {
+                        arg_bindings.push(format!("let __ea_{pi} = {coerced};"));
+                        arm_call_args.push(format!("&__ea_{pi}"));
+                    }
+                    ParamMode::MutRefStruct => {
+                        arg_bindings.push(format!("let mut __ea_{pi} = {coerced};"));
+                        arm_call_args.push(format!("&mut __ea_{pi}"));
+                    }
+                    ParamMode::RcCell => {
+                        arm_call_args.push(format!(
+                            "alloc::rc::Rc::new(core::cell::Cell::new({coerced}))"
+                        ));
+                    }
+                    ParamMode::RcRefCell => {
+                        arm_call_args.push(format!(
+                            "alloc::rc::Rc::new(core::cell::RefCell::new({coerced}))"
+                        ));
+                    }
+                    _ => {
+                        arm_call_args.push(coerced);
+                    }
+                }
+            }
+
+            let raw_arm_call = format!("{}({})", arm_meta.rust_name, arm_call_args.join(", "));
+            let arm_ret_aot =
+                self.coerce_expr_to_type("__arm_out", &arm_meta.return_type, &MirType::Unknown);
+
+            let _ = writeln!(self.out, "{pad}    {{");
+            for b in &cap_bindings {
+                let _ = writeln!(self.out, "{pad}        {b}");
+            }
+            let _ = writeln!(
+                self.out,
+                "{pad}        __eff_arms.push(lust_aot_rt::EffectHandlerArm::from_fn({:?}, move |__e_ctx: &mut lust_aot_rt::AotCtx, __e_args: &[lust_aot_rt::AotValue]| -> Result<lust_aot_rt::AotValue, lust_aot_rt::AotError> {{",
+                arm.effect_name
+            );
+            if arm_meta.needs_alloc || arm_meta.needs_arena {
+                let _ = writeln!(
+                    self.out,
+                    "{pad}            let __e_alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__e_ctx.budget_alloc.limit_bytes());"
+                );
+            }
+            if arm_meta.needs_arena {
+                let _ = writeln!(
+                    self.out,
+                    "{pad}            let __e_arena = lust_aot_rt::LustChunkArena::new(&__e_alloc);"
+                );
+            }
+            for ab in &arg_bindings {
+                let _ = writeln!(self.out, "{pad}            {ab}");
+            }
+            let _ = writeln!(
+                self.out,
+                "{pad}            let __arm_out = {raw_arm_call}.map_err(lust_aot_rt::AotError::from)?;"
+            );
+            let _ = writeln!(self.out, "{pad}            Ok({arm_ret_aot})");
+            let _ = writeln!(self.out, "{pad}        }}));");
+            let _ = writeln!(self.out, "{pad}    }}");
+        }
+
+        let (body_cap_bindings, body_cap_exprs) = self.build_lifted_capture_bindings(
+            &plan.body_fn_name,
+            &plan.body_captures,
+            "__body_cap",
+        )?;
+        for b in &body_cap_bindings {
+            let _ = writeln!(self.out, "{pad}    {b}");
+        }
+
+        let mut body_call_args = Vec::new();
+        if body_meta.needs_ctx {
+            body_call_args.push("__h_ctx".to_string());
+        }
+        if body_meta.needs_alloc {
+            body_call_args.push("__alloc".to_string());
+        }
+        if body_meta.needs_arena {
+            body_call_args.push("__arena".to_string());
+        }
+        body_call_args.extend(body_cap_exprs);
+
+        let body_ret_ty = body_meta.return_type.clone();
+        let body_ret_rust = self.ctx.rust_type(&body_ret_ty, "'a");
+        let raw_body_call = format!("{}({})", body_meta.rust_name, body_call_args.join(", "));
+        let abort_conv = self.coerce_expr_to_type("__abort_val", &MirType::Unknown, &body_ret_ty);
+
+        let _ = writeln!(
+            self.out,
+            "{pad}    lust_aot_rt::handle_tail_resumptive_typed("
+        );
+        let _ = writeln!(self.out, "{pad}        __ctx,");
+        let _ = writeln!(self.out, "{pad}        __eff_arms,");
+        let _ = writeln!(
+            self.out,
+            "{pad}        |__h_ctx: &mut lust_aot_rt::AotCtx| -> Result<{body_ret_rust}, lust_aot_rt::AotError> {{"
+        );
+        let _ = writeln!(
+            self.out,
+            "{pad}            {raw_body_call}.map_err(lust_aot_rt::AotError::from)"
+        );
+        let _ = writeln!(self.out, "{pad}        }},");
+        let _ = writeln!(
+            self.out,
+            "{pad}        |__abort_val: lust_aot_rt::AotValue| -> Result<{body_ret_rust}, lust_aot_rt::AotError> {{"
+        );
+        let _ = writeln!(self.out, "{pad}            Ok({abort_conv})");
+        let _ = writeln!(self.out, "{pad}        }},");
+        let _ = writeln!(self.out, "{pad}    )?");
+        let _ = writeln!(self.out, "{pad}}};");
+
+        if !self.dest_is_omitted(destination) && !matches!(self.place_mir_type(destination), MirType::Unit) {
+            let dst_ty = self.place_mir_type(destination);
+            let final_expr = self.coerce_expr_to_type("__handle_res", &body_ret_ty, &dst_ty);
+            self.emit_assign_place_val(destination, &final_expr, indent);
+        }
+        Ok(())
+    }
+
+    fn emit_nontail_handle_call(
+        &mut self,
+        bb: BlockId,
+        args: &[Operand],
+        destination: &Place,
+        indent: usize,
+    ) -> Result<()> {
+        let pad = "    ".repeat(indent);
+        let Some(plan) = self.nontail_handle_plans.get(&bb).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: unsupported dynamic __lust_nontail_handle call at block {bb:?} (args: {})",
+                args.len()
+            )));
+        };
+        let Some(body_meta) = self.ctx.fn_metas.get(&plan.body_fn_name).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing lifted non-tail handle body '{}'",
+                plan.body_fn_name
+            )));
+        };
+        let Some(ysig) = self.ctx.nontail_body_metas.get(&plan.body_fn_name).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing NonTailYieldSig for '{}'",
+                plan.body_fn_name
+            )));
+        };
+
+        let op_arg_rust = self.ctx.nontail_op_arg_rust_type(&ysig.op_arg_mode);
+        let resume_rust = self.ctx.rust_type(&ysig.resume_val_ty, "'static");
+        let body_ret_rust = self.ctx.rust_type(&ysig.body_ret_ty, "'static");
+
+        let _ = writeln!(
+            self.out,
+            "{pad}// One-shot non-tail handle..with -> EffectYield<{op_arg_rust}, {resume_rust}, {body_ret_rust}> state-machine (NG-W13-1B)"
+        );
+        let _ = writeln!(self.out, "{pad}let __handle_res: {body_ret_rust} = {{");
+
+        let (body_cap_bindings, body_cap_exprs) = self.build_lifted_capture_bindings(
+            &plan.body_fn_name,
+            &plan.body_captures,
+            "__nt_body_cap",
+        )?;
+        for b in &body_cap_bindings {
+            let _ = writeln!(self.out, "{pad}    {b}");
+        }
+
+        let mut arm_cap_sets: Vec<(Vec<String>, Vec<String>)> = Vec::with_capacity(plan.arms.len());
+        for (ai, arm) in plan.arms.iter().enumerate() {
+            let (cb, ce) = self.build_lifted_capture_bindings(
+                &arm.arm_fn_name,
+                &arm.captures,
+                &format!("__nt_arm_{ai}_cap"),
+            )?;
+            for b in &cb {
+                let _ = writeln!(self.out, "{pad}    {b}");
+            }
+            arm_cap_sets.push((cb, ce));
+        }
+
+        let mut body_call_args = Vec::new();
+        if body_meta.needs_ctx {
+            body_call_args.push("__nt_ctx".to_string());
+        }
+        if body_meta.needs_alloc {
+            body_call_args.push("__alloc".to_string());
+        }
+        if body_meta.needs_arena {
+            body_call_args.push("__arena".to_string());
+        }
+        body_call_args.extend(body_cap_exprs);
+        let raw_body_call = format!("{}({})", body_meta.rust_name, body_call_args.join(", "));
+
+        let _ = writeln!(
+            self.out,
+            "{pad}    lust_aot_rt::handle_non_tail_oneshot::<{op_arg_rust}, {resume_rust}, {body_ret_rust}, _, _>("
+        );
+        let _ = writeln!(self.out, "{pad}        __ctx,");
+        let _ = writeln!(
+            self.out,
+            "{pad}        |__nt_ctx: &mut lust_aot_rt::AotCtx| -> Result<lust_aot_rt::EffectYield<{op_arg_rust}, {resume_rust}, {body_ret_rust}>, lust_aot_rt::AotError> {{"
+        );
+        let _ = writeln!(
+            self.out,
+            "{pad}            {raw_body_call}.map_err(lust_aot_rt::AotError::from)"
+        );
+        let _ = writeln!(self.out, "{pad}        }},");
+        let _ = writeln!(
+            self.out,
+            "{pad}        |__h_ctx: &mut lust_aot_rt::AotCtx, __op_arg: {op_arg_rust}, __resume_fn: alloc::boxed::Box<dyn FnOnce(&mut lust_aot_rt::AotCtx, {resume_rust}) -> Result<{body_ret_rust}, lust_aot_rt::AotError>>| -> Result<{body_ret_rust}, lust_aot_rt::AotError> {{"
+        );
+        let _ = writeln!(
+            self.out,
+            "{pad}            let mut __k = lust_aot_rt::OneShotResume::new(__resume_fn);"
+        );
+
+        if matches!(ysig.op_arg_mode, NonTailOpArgMode::TaggedVec) {
+            let _ = writeln!(self.out, "{pad}            match __op_arg.0 {{");
+            for (ai, arm) in plan.arms.iter().enumerate() {
+                let _ = writeln!(self.out, "{pad}                {:?} => {{", arm.effect_name);
+                self.emit_nontail_arm_invoke(
+                    arm,
+                    &arm_cap_sets[ai].1,
+                    &ysig,
+                    &format!("{pad}                    "),
+                )?;
+                let _ = writeln!(self.out, "{pad}                }}");
+            }
+            let _ = writeln!(
+                self.out,
+                "{pad}                __unknown_op => Err(lust_aot_rt::AotError::UnhandledEffect(alloc::string::String::from(__unknown_op))),"
+            );
+            let _ = writeln!(self.out, "{pad}            }}");
+        } else if let Some(arm) = plan.arms.first() {
+            self.emit_nontail_arm_invoke(
+                arm,
+                &arm_cap_sets[0].1,
+                &ysig,
+                &format!("{pad}            "),
+            )?;
+        }
+
+        let _ = writeln!(self.out, "{pad}        }},");
+        let _ = writeln!(self.out, "{pad}    )?");
+        let _ = writeln!(self.out, "{pad}}};");
+
+        if !self.dest_is_omitted(destination)
+            && !matches!(self.place_mir_type(destination), MirType::Unit)
+        {
+            let dst_ty = self.place_mir_type(destination);
+            let final_expr = self.coerce_expr_to_type("__handle_res", &ysig.body_ret_ty, &dst_ty);
+            self.emit_assign_place_val(destination, &final_expr, indent);
+        }
+        Ok(())
+    }
+
+    fn emit_nontail_arm_invoke(
+        &mut self,
+        arm: &HandleArmPlan,
+        cap_exprs: &[String],
+        ysig: &NonTailYieldSig,
+        arm_pad: &str,
+    ) -> Result<()> {
+        let Some(arm_meta) = self.ctx.fn_metas.get(&arm.arm_fn_name).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing lifted non-tail arm '{}'",
+                arm.arm_fn_name
+            )));
+        };
+        let Some(arm_fn) = self
+            .ctx
+            .module
+            .functions
+            .iter()
+            .find(|f| f.signature.name == arm.arm_fn_name)
+        else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing lifted non-tail arm MirFunction '{}'",
+                arm.arm_fn_name
+            )));
+        };
+
+        let n_caps = arm.captures.len();
+        let explicit_params: Vec<MirType> = arm_fn
+            .params
+            .iter()
+            .skip(n_caps)
+            .map(|pid| arm_fn.locals[pid.0].ty.clone())
+            .collect();
+
+        if arm_meta.needs_alloc || arm_meta.needs_arena {
+            let _ = writeln!(
+                self.out,
+                "{arm_pad}let __h_alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__h_ctx.budget_alloc.limit_bytes());"
+            );
+        }
+        if arm_meta.needs_arena {
+            let _ = writeln!(
+                self.out,
+                "{arm_pad}let __h_arena = lust_aot_rt::LustChunkArena::new(&__h_alloc);"
+            );
+        }
+
+        let mut arm_call_args = Vec::new();
+        if arm_meta.needs_ctx {
+            arm_call_args.push("__h_ctx".to_string());
+        }
+        if arm_meta.needs_alloc {
+            arm_call_args.push("&__h_alloc".to_string());
+        }
+        if arm_meta.needs_arena {
+            arm_call_args.push("&__h_arena".to_string());
+        }
+        arm_call_args.push("&mut __k".to_string());
+        arm_call_args.extend(cap_exprs.iter().cloned());
+
+        match &ysig.op_arg_mode {
+            NonTailOpArgMode::Unit => {}
+            NonTailOpArgMode::Single(arg_ty) => {
+                if let Some(pty) = explicit_params.first() {
+                    let coerced = self.coerce_expr_to_type("__op_arg", arg_ty, pty);
+                    let pmode = arm_meta
+                        .param_modes
+                        .get(n_caps)
+                        .copied()
+                        .unwrap_or(ParamMode::ByValue);
+                    match pmode {
+                        ParamMode::RefStr => {
+                            let _ = writeln!(self.out, "{arm_pad}let __ea_0 = {coerced};");
+                            arm_call_args.push("__ea_0.as_str()".to_string());
+                        }
+                        ParamMode::RefStruct => {
+                            let _ = writeln!(self.out, "{arm_pad}let __ea_0 = {coerced};");
+                            arm_call_args.push("&__ea_0".to_string());
+                        }
+                        ParamMode::MutRefStruct => {
+                            let _ = writeln!(self.out, "{arm_pad}let mut __ea_0 = {coerced};");
+                            arm_call_args.push("&mut __ea_0".to_string());
+                        }
+                        ParamMode::RcCell => {
+                            arm_call_args.push(format!(
+                                "alloc::rc::Rc::new(core::cell::Cell::new({coerced}))"
+                            ));
+                        }
+                        ParamMode::RcRefCell => {
+                            arm_call_args.push(format!(
+                                "alloc::rc::Rc::new(core::cell::RefCell::new({coerced}))"
+                            ));
+                        }
+                        _ => arm_call_args.push(coerced),
+                    }
+                }
+            }
+            NonTailOpArgMode::TaggedVec => {
+                for (pi, pty) in explicit_params.iter().enumerate() {
+                    let raw_a = format!(
+                        "__op_arg.1.get({pi}).cloned().unwrap_or(lust_aot_rt::AotValue::Nil)"
+                    );
+                    let coerced = self.coerce_expr_to_type(&raw_a, &MirType::Unknown, pty);
+                    let pmode = arm_meta
+                        .param_modes
+                        .get(n_caps + pi)
+                        .copied()
+                        .unwrap_or(ParamMode::ByValue);
+                    match pmode {
+                        ParamMode::RefStr => {
+                            let _ = writeln!(self.out, "{arm_pad}let __ea_{pi} = {coerced};");
+                            arm_call_args.push(format!("__ea_{pi}.as_str()"));
+                        }
+                        ParamMode::RefStruct => {
+                            let _ = writeln!(self.out, "{arm_pad}let __ea_{pi} = {coerced};");
+                            arm_call_args.push(format!("&__ea_{pi}"));
+                        }
+                        ParamMode::MutRefStruct => {
+                            let _ = writeln!(self.out, "{arm_pad}let mut __ea_{pi} = {coerced};");
+                            arm_call_args.push(format!("&mut __ea_{pi}"));
+                        }
+                        ParamMode::RcCell => {
+                            arm_call_args.push(format!(
+                                "alloc::rc::Rc::new(core::cell::Cell::new({coerced}))"
+                            ));
+                        }
+                        ParamMode::RcRefCell => {
+                            arm_call_args.push(format!(
+                                "alloc::rc::Rc::new(core::cell::RefCell::new({coerced}))"
+                            ));
+                        }
+                        _ => arm_call_args.push(coerced),
+                    }
+                }
+            }
+        }
+
+        let raw_arm_call = format!("{}({})", arm_meta.rust_name, arm_call_args.join(", "));
+        let ret_coerced =
+            self.coerce_expr_to_type("__arm_out", &arm_meta.return_type, &ysig.body_ret_ty);
+        let _ = writeln!(
+            self.out,
+            "{arm_pad}let __arm_out = {raw_arm_call}.map_err(lust_aot_rt::AotError::from)?;"
+        );
+        let _ = writeln!(self.out, "{arm_pad}Ok({ret_coerced})");
+        Ok(())
+    }
+
+    fn emit_nontail_yield_completed_call(&mut self, args: &[Operand], indent: usize) -> Result<()> {
+        let pad = "    ".repeat(indent);
+        let Some(ysig) = self.ctx.nontail_body_metas.get(&self.func.signature.name).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: __lust_yield_completed outside non-tail body '{}'",
+                self.func.signature.name
+            )));
+        };
+        let val_expr = match args.first() {
+            Some(op) => self.emit_operand_owned(op, &ysig.body_ret_ty),
+            None => self.ctx.rust_default_expr(&ysig.body_ret_ty),
+        };
+        if !self.errdefer_guards.is_empty() {
+            let _ = writeln!(self.out, "{pad}let __yc_ret = {val_expr};");
+            for g in self.errdefer_guards.clone().iter().rev() {
+                let _ = writeln!(self.out, "{pad}core::mem::DropGuard::dismiss({g});");
+            }
+            let _ = writeln!(
+                self.out,
+                "{pad}return Ok(lust_aot_rt::EffectYield::Completed(__yc_ret));"
+            );
+        } else {
+            let _ = writeln!(
+                self.out,
+                "{pad}return Ok(lust_aot_rt::EffectYield::Completed({val_expr}));"
+            );
+        }
+        Ok(())
+    }
+
+    fn emit_nontail_yield_op_call(&mut self, bb: BlockId, indent: usize) -> Result<()> {
+        let pad = "    ".repeat(indent);
+        let Some(ysig) = self.ctx.nontail_body_metas.get(&self.func.signature.name).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: __lust_yield_op outside non-tail body '{}'",
+                self.func.signature.name
+            )));
+        };
+        let Some(plan) = self.nontail_yield_op_plans.get(&bb).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing NonTailYieldOpPlan at block {bb:?}"
+            )));
+        };
+        let Some(cont_meta) = self.ctx.fn_metas.get(&plan.cont_fn_name).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing lifted continuation '{}'",
+                plan.cont_fn_name
+            )));
+        };
+        let Some(cont_fn) = self
+            .ctx
+            .module
+            .functions
+            .iter()
+            .find(|f| f.signature.name == plan.cont_fn_name)
+        else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing lifted continuation MirFunction '{}'",
+                plan.cont_fn_name
+            )));
+        };
+
+        let arg_expr = match &ysig.op_arg_mode {
+            NonTailOpArgMode::Unit => "()".to_string(),
+            NonTailOpArgMode::Single(arg_ty) => match plan.arg_ops.first() {
+                Some(op) => self.emit_operand_owned(op, arg_ty),
+                None => self.ctx.rust_default_expr(arg_ty),
+            },
+            NonTailOpArgMode::TaggedVec => {
+                if plan.arg_ops.is_empty() {
+                    format!("({:?}, alloc::vec::Vec::new())", plan.op_name)
+                } else {
+                    let elems: Vec<String> = plan
+                        .arg_ops
+                        .iter()
+                        .map(|op| self.emit_operand_as_aot_value(op))
+                        .collect();
+                    format!("({:?}, alloc::vec![{}])", plan.op_name, elems.join(", "))
+                }
+            }
+        };
+
+        let (cap_bindings, cap_call_exprs) = self.build_lifted_capture_bindings(
+            &plan.cont_fn_name,
+            &plan.cont_captures,
+            "__k_cap",
+        )?;
+
+        let n_caps = plan.cont_captures.len();
+        let resume_rust = self.ctx.rust_type(&ysig.resume_val_ty, "'static");
+        let body_ret_rust = self.ctx.rust_type(&ysig.body_ret_ty, "'static");
+
+        let mut cont_call_args = Vec::new();
+        if cont_meta.needs_ctx {
+            cont_call_args.push("__k_ctx".to_string());
+        }
+        if cont_meta.needs_alloc {
+            cont_call_args.push("&__k_alloc".to_string());
+        }
+        if cont_meta.needs_arena {
+            cont_call_args.push("&__k_arena".to_string());
+        }
+        cont_call_args.extend(cap_call_exprs);
+
+        let mut resumed_param_binding = None;
+        if let Some(&pid) = cont_fn.params.get(n_caps) {
+            let cont_pty = &cont_fn.locals[pid.0].ty;
+            let coerced = self.coerce_expr_to_type("__resumed_val", &ysig.resume_val_ty, cont_pty);
+            let pmode = cont_meta
+                .param_modes
+                .get(n_caps)
+                .copied()
+                .unwrap_or(ParamMode::ByValue);
+            match pmode {
+                ParamMode::RefStr => {
+                    resumed_param_binding = Some(format!("let __k_res_arg = {coerced};"));
+                    cont_call_args.push("__k_res_arg.as_str()".to_string());
+                }
+                ParamMode::RefStruct => {
+                    resumed_param_binding = Some(format!("let __k_res_arg = {coerced};"));
+                    cont_call_args.push("&__k_res_arg".to_string());
+                }
+                ParamMode::MutRefStruct => {
+                    resumed_param_binding = Some(format!("let mut __k_res_arg = {coerced};"));
+                    cont_call_args.push("&mut __k_res_arg".to_string());
+                }
+                ParamMode::RcCell => {
+                    cont_call_args.push(format!(
+                        "alloc::rc::Rc::new(core::cell::Cell::new({coerced}))"
+                    ));
+                }
+                ParamMode::RcRefCell => {
+                    cont_call_args.push(format!(
+                        "alloc::rc::Rc::new(core::cell::RefCell::new({coerced}))"
+                    ));
+                }
+                _ => cont_call_args.push(coerced),
+            }
+        }
+
+        let raw_cont_call = format!("{}({})", cont_meta.rust_name, cont_call_args.join(", "));
+        let ret_coerced =
+            self.coerce_expr_to_type("__k_out", &cont_meta.return_type, &ysig.body_ret_ty);
+
+        let _ = writeln!(self.out, "{pad}{{");
+        let _ = writeln!(self.out, "{pad}    let __y_arg = {arg_expr};");
+        for b in &cap_bindings {
+            let _ = writeln!(self.out, "{pad}    {b}");
+        }
+        for g in self.errdefer_guards.clone().iter().rev() {
+            let _ = writeln!(self.out, "{pad}    core::mem::DropGuard::dismiss({g});");
+        }
+        let _ = writeln!(
+            self.out,
+            "{pad}    return Ok(lust_aot_rt::EffectYield::Yielded {{"
+        );
+        let _ = writeln!(self.out, "{pad}        arg: __y_arg,");
+        let _ = writeln!(
+            self.out,
+            "{pad}        resume_fn: alloc::boxed::Box::new(move |__k_ctx: &mut lust_aot_rt::AotCtx, __resumed_val: {resume_rust}| -> Result<{body_ret_rust}, lust_aot_rt::AotError> {{"
+        );
+        if cont_meta.needs_alloc || cont_meta.needs_arena {
+            let _ = writeln!(
+                self.out,
+                "{pad}            let __k_alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__k_ctx.budget_alloc.limit_bytes());"
+            );
+        }
+        if cont_meta.needs_arena {
+            let _ = writeln!(
+                self.out,
+                "{pad}            let __k_arena = lust_aot_rt::LustChunkArena::new(&__k_alloc);"
+            );
+        }
+        if let Some(rb) = resumed_param_binding {
+            let _ = writeln!(self.out, "{pad}            {rb}");
+        }
+        let _ = writeln!(
+            self.out,
+            "{pad}            let __k_out = {raw_cont_call}.map_err(lust_aot_rt::AotError::from)?;"
+        );
+        let _ = writeln!(self.out, "{pad}            Ok({ret_coerced})");
+        let _ = writeln!(self.out, "{pad}        }}),");
+        let _ = writeln!(self.out, "{pad}    }});");
+        let _ = writeln!(self.out, "{pad}}}");
+        Ok(())
+    }
+
+    fn emit_nontail_resume_call(
+        &mut self,
+        args: &[Operand],
+        destination: &Place,
+        indent: usize,
+    ) -> Result<()> {
+        let pad = "    ".repeat(indent);
+        let Some(arm_meta) = self.ctx.nontail_arm_metas.get(&self.func.signature.name).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: __lust_nontail_resume outside non-tail handler arm '{}'",
+                self.func.signature.name
+            )));
+        };
+        let val_expr = match args.first() {
+            Some(op) => self.emit_operand_owned(op, &arm_meta.resume_val_ty),
+            None => self.ctx.rust_default_expr(&arm_meta.resume_val_ty),
+        };
+        let _ = writeln!(
+            self.out,
+            "{pad}let __nt_resumed_out = __k.resume(__ctx, {val_expr})?;"
+        );
+        if !self.dest_is_omitted(destination) {
+            let dst_ty = self.place_mir_type(destination);
+            if !matches!(dst_ty, MirType::Unit) {
+                let coerced =
+                    self.coerce_expr_to_type("__nt_resumed_out", &arm_meta.body_ret_ty, &dst_ty);
+                self.emit_assign_place_val(destination, &coerced, indent);
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_scoped_call(&mut self, bb: BlockId, indent: usize) -> Result<()> {
+        let pad = "    ".repeat(indent);
+        let Some((thunk_fn_name, thunk_caps)) = self.scoped_plans.get(&bb).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing scoped block plan at block {bb:?}"
+            )));
+        };
+        let Some(thunk_meta) = self.ctx.fn_metas.get(&thunk_fn_name).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing lifted scoped thunk '{thunk_fn_name}'"
+            )));
+        };
+        let (cap_bindings, cap_call_exprs) =
+            self.build_lifted_capture_bindings(&thunk_fn_name, &thunk_caps, "__sc_cap")?;
+        let mut call_args = Vec::new();
+        if thunk_meta.needs_ctx {
+            call_args.push("__sc_ctx".to_string());
+        }
+        if thunk_meta.needs_alloc {
+            call_args.push("__alloc".to_string());
+        }
+        if thunk_meta.needs_arena {
+            call_args.push("__arena".to_string());
+        }
+        call_args.extend(cap_call_exprs);
+        let raw_call = format!("{}({})", thunk_meta.rust_name, call_args.join(", "));
+
+        let _ = writeln!(
+            self.out,
+            "{pad}// 3-phase LIFO AotScope (Cancelling -> Joining -> Finalizing) for StmtKind::Scoped (NG-W13-1B)"
+        );
+        let _ = writeln!(self.out, "{pad}{{");
+        for b in &cap_bindings {
+            let _ = writeln!(self.out, "{pad}    {b}");
+        }
+        let _ = writeln!(
+            self.out,
+            "{pad}    lust_aot_rt::with_aot_scope(__ctx, |__sc_ctx: &mut lust_aot_rt::AotCtx| -> Result<(), lust_aot_rt::AotError> {{"
+        );
+        let _ = writeln!(
+            self.out,
+            "{pad}        let _ = {raw_call}.map_err(lust_aot_rt::AotError::from)?;"
+        );
+        let _ = writeln!(self.out, "{pad}        Ok(())");
+        let _ = writeln!(self.out, "{pad}    }})?;");
+        let _ = writeln!(self.out, "{pad}}}");
+        Ok(())
+    }
+
+    fn emit_scope_finalizer_call(&mut self, bb: BlockId, indent: usize) -> Result<()> {
+        let pad = "    ".repeat(indent);
+        let Some((fin_fn_name, fin_caps)) = self.scope_callback_plans.get(&bb).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing scope finalizer plan at block {bb:?}"
+            )));
+        };
+        let Some(fin_meta) = self.ctx.fn_metas.get(&fin_fn_name).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing lifted scope finalizer '{fin_fn_name}'"
+            )));
+        };
+        let (cap_bindings, cap_call_exprs) =
+            self.build_lifted_capture_bindings(&fin_fn_name, &fin_caps, "__fin_cap")?;
+        let mut call_args = Vec::new();
+        if fin_meta.needs_ctx {
+            call_args.push("__fin_ctx".to_string());
+        }
+        if fin_meta.needs_alloc {
+            call_args.push("&__fin_alloc".to_string());
+        }
+        if fin_meta.needs_arena {
+            call_args.push("&__fin_arena".to_string());
+        }
+        call_args.extend(cap_call_exprs);
+        let raw_call = format!("{}({})", fin_meta.rust_name, call_args.join(", "));
+
+        let _ = writeln!(self.out, "{pad}{{");
+        for b in &cap_bindings {
+            let _ = writeln!(self.out, "{pad}    {b}");
+        }
+        let _ = writeln!(
+            self.out,
+            "{pad}    lust_aot_rt::scope_register_finalizer(__ctx, move |__fin_ctx: &mut lust_aot_rt::AotCtx| -> Result<(), lust_aot_rt::AotError> {{"
+        );
+        if fin_meta.needs_alloc || fin_meta.needs_arena {
+            let _ = writeln!(
+                self.out,
+                "{pad}        let __fin_alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__fin_ctx.budget_alloc.limit_bytes());"
+            );
+        }
+        if fin_meta.needs_arena {
+            let _ = writeln!(
+                self.out,
+                "{pad}        let __fin_arena = lust_aot_rt::LustChunkArena::new(&__fin_alloc);"
+            );
+        }
+        let _ = writeln!(
+            self.out,
+            "{pad}        let _ = {raw_call}.map_err(lust_aot_rt::AotError::from)?;"
+        );
+        let _ = writeln!(self.out, "{pad}        Ok(())");
+        let _ = writeln!(self.out, "{pad}    }})?;");
+        let _ = writeln!(self.out, "{pad}}}");
+        Ok(())
+    }
+
+    fn emit_scope_spawn_call(&mut self, bb: BlockId, indent: usize) -> Result<()> {
+        let pad = "    ".repeat(indent);
+        let Some((child_fn_name, child_caps)) = self.scope_callback_plans.get(&bb).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing scope spawn plan at block {bb:?}"
+            )));
+        };
+        let Some(child_meta) = self.ctx.fn_metas.get(&child_fn_name).cloned() else {
+            return Err(LustError::Unknown(format!(
+                "Rust AOT emitter: missing lifted scope child '{child_fn_name}'"
+            )));
+        };
+        let (cap_bindings, cap_call_exprs) =
+            self.build_lifted_capture_bindings(&child_fn_name, &child_caps, "__sp_cap")?;
+        let mut call_args = Vec::new();
+        if child_meta.needs_ctx {
+            call_args.push("__sp_ctx".to_string());
+        }
+        if child_meta.needs_alloc {
+            call_args.push("&__sp_alloc".to_string());
+        }
+        if child_meta.needs_arena {
+            call_args.push("&__sp_arena".to_string());
+        }
+        call_args.extend(cap_call_exprs);
+        let raw_call = format!("{}({})", child_meta.rust_name, call_args.join(", "));
+
+        let _ = writeln!(self.out, "{pad}{{");
+        for b in &cap_bindings {
+            let _ = writeln!(self.out, "{pad}    {b}");
+        }
+        let _ = writeln!(
+            self.out,
+            "{pad}    let _ = lust_aot_rt::scope_spawn_child(__ctx, move |__sp_ctx: &mut lust_aot_rt::AotCtx, _cancelled: bool| -> Result<bool, lust_aot_rt::AotError> {{"
+        );
+        if child_meta.needs_alloc || child_meta.needs_arena {
+            let _ = writeln!(
+                self.out,
+                "{pad}        let __sp_alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__sp_ctx.budget_alloc.limit_bytes());"
+            );
+        }
+        if child_meta.needs_arena {
+            let _ = writeln!(
+                self.out,
+                "{pad}        let __sp_arena = lust_aot_rt::LustChunkArena::new(&__sp_alloc);"
+            );
+        }
+        let _ = writeln!(
+            self.out,
+            "{pad}        let _ = {raw_call}.map_err(lust_aot_rt::AotError::from)?;"
+        );
+        let _ = writeln!(self.out, "{pad}        Ok(true)");
+        let _ = writeln!(self.out, "{pad}    }})?;");
+        let _ = writeln!(self.out, "{pad}}}");
+        Ok(())
+    }
+
+    fn emit_effect_perform_call(
+        &mut self,
+        bb: BlockId,
+        args: &[Operand],
+        destination: &Place,
+        indent: usize,
+    ) -> Result<()> {
+        let pad = "    ".repeat(indent);
+        let eff_name_expr = args
+            .first()
+            .map(|a| self.emit_operand_str_ref(a))
+            .unwrap_or_else(|| "\"\"".to_string());
+
+        let slice_expr = if let Some(inline_ops) = self.perform_arg_plans.get(&bb).cloned() {
+            if inline_ops.is_empty() {
+                "&[]".to_string()
+            } else {
+                let elems: Vec<String> = inline_ops
+                    .iter()
+                    .map(|op| self.emit_operand_as_aot_value(op))
+                    .collect();
+                format!("&[{}]", elems.join(", "))
+            }
+        } else if let Some(arg1) = args.get(1) {
+            match operand_mir_type(arg1, self.func) {
+                MirType::Array(inner) => {
+                    let arr_ref = self.emit_operand_slice_ref(arg1);
+                    let elem_conv = self.coerce_expr_to_type("__el.clone()", &inner, &MirType::Unknown);
+                    format!(
+                        "&({arr_ref}.iter().map(|__el| {elem_conv}).collect::<alloc::vec::Vec<lust_aot_rt::AotValue>>())[..]"
+                    )
+                }
+                _ => format!("&[{}]", self.emit_operand_as_aot_value(arg1)),
+            }
+        } else {
+            "&[]".to_string()
+        };
+
+        let _ = writeln!(
+            self.out,
+            "{pad}let __perf_val = lust_aot_rt::perform_effect(__ctx, {eff_name_expr}, {slice_expr})?;"
+        );
+        if !self.dest_is_omitted(destination) {
+            let dst_ty = self.place_mir_type(destination);
+            if !matches!(dst_ty, MirType::Unit) {
+                let coerced = self.coerce_expr_to_type("__perf_val", &MirType::Unknown, &dst_ty);
+                self.emit_assign_place_val(destination, &coerced, indent);
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_effect_resume_call(
+        &mut self,
+        args: &[Operand],
+        destination: &Place,
+        indent: usize,
+    ) -> Result<()> {
+        let pad = "    ".repeat(indent);
+        let val_expr = args
+            .first()
+            .map(|a| self.emit_operand_as_aot_value(a))
+            .unwrap_or_else(|| "lust_aot_rt::AotValue::Nil".to_string());
+        let _ = writeln!(
+            self.out,
+            "{pad}let __resume_val = lust_aot_rt::resume_effect(__ctx, {val_expr})?;"
+        );
+        if !self.dest_is_omitted(destination) {
+            let dst_ty = self.place_mir_type(destination);
+            if !matches!(dst_ty, MirType::Unit) {
+                let coerced = self.coerce_expr_to_type("__resume_val", &MirType::Unknown, &dst_ty);
+                self.emit_assign_place_val(destination, &coerced, indent);
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_effect_provide_call(
+        &mut self,
+        args: &[Operand],
+        destination: &Place,
+        indent: usize,
+    ) -> Result<()> {
+        let pad = "    ".repeat(indent);
+        if args.len() < 2 {
+            return Err(LustError::Unknown(
+                "Rust AOT emitter: __lust_provide expects (effect, provider)".to_string(),
+            ));
+        }
+        let eff_expr = self.emit_operand_as_aot_value(&args[0]);
+        let prov_expr = self.emit_operand_as_aot_value(&args[1]);
+        let svc_key = match operand_mir_type(&args[1], self.func) {
+            MirType::Struct(sn) => sn,
+            other => format!("{other}"),
+        };
+        let wrapped = format!(
+            "{{ let __eff_v = {eff_expr}; let __prov_v = {prov_expr}; lust_aot_rt::AotValue::closure(move |__p_ctx: &mut lust_aot_rt::AotCtx, __p_args: &[lust_aot_rt::AotValue]| -> Result<lust_aot_rt::AotValue, lust_aot_rt::AotError> {{ lust_aot_rt::with_provided_service(__p_ctx, {svc_key:?}, __prov_v.clone(), |__inner_ctx| __eff_v.call(__inner_ctx, __p_args)) }}) }}"
+        );
+        if self.dest_is_omitted(destination) {
+            let _ = writeln!(self.out, "{pad}let _ = {wrapped};");
+        } else {
+            let dst_ty = self.place_mir_type(destination);
+            let final_expr = self.coerce_expr_to_type(&wrapped, &MirType::Unknown, &dst_ty);
+            self.emit_assign_place_val(destination, &final_expr, indent);
+        }
+        Ok(())
+    }
+
+    fn emit_effect_run_sync_call(
+        &mut self,
+        bb: BlockId,
+        args: &[Operand],
+        destination: &Place,
+        indent: usize,
+    ) -> Result<()> {
+        let pad = "    ".repeat(indent);
+        if let Some(plan) = self.provide_plans.get(&bb).cloned() {
+            let Some(thunk_meta) = self.ctx.fn_metas.get(&plan.thunk_fn_name).cloned() else {
+                return Err(LustError::Unknown(format!(
+                    "Rust AOT emitter: missing lifted effect thunk '{}'",
+                    plan.thunk_fn_name
+                )));
+            };
+            let (cap_bindings, cap_call_exprs) = self.build_lifted_capture_bindings(
+                &plan.thunk_fn_name,
+                &plan.thunk_captures,
+                "__eff_cap",
+            )?;
+            let mut thunk_args = Vec::new();
+            let final_ctx_var = if plan.providers.is_empty() {
+                "__ctx".to_string()
+            } else {
+                format!("__p_ctx_{}", plan.providers.len())
+            };
+            if thunk_meta.needs_ctx {
+                thunk_args.push("__eff_scope_ctx".to_string());
+            }
+            if thunk_meta.needs_alloc {
+                thunk_args.push("__alloc".to_string());
+            }
+            if thunk_meta.needs_arena {
+                thunk_args.push("__arena".to_string());
+            }
+            thunk_args.extend(cap_call_exprs);
+
+            let raw_call = format!("{}({})", thunk_meta.rust_name, thunk_args.join(", "));
+            let ret_rust = self.ctx.rust_type(&thunk_meta.return_type, "'a");
+
+            let _ = writeln!(self.out, "{pad}let __sync_res = {{");
+            for b in &cap_bindings {
+                let _ = writeln!(self.out, "{pad}    {b}");
+            }
+            for (pi, (svc_key, prov_op)) in plan.providers.iter().enumerate() {
+                let in_ctx = if pi == 0 {
+                    "__ctx".to_string()
+                } else {
+                    format!("__p_ctx_{pi}")
+                };
+                let out_ctx = format!("__p_ctx_{}", pi + 1);
+                let prov_val = self.emit_operand_as_aot_value(prov_op);
+                let inner_pad = "    ".repeat(indent + 1 + pi);
+                let _ = writeln!(
+                    self.out,
+                    "{inner_pad}lust_aot_rt::with_provided_service({in_ctx}, {svc_key:?}, {prov_val}, |{out_ctx}: &mut lust_aot_rt::AotCtx| -> Result<{ret_rust}, lust_aot_rt::AotError> {{"
+                );
+            }
+            let body_pad = "    ".repeat(indent + 1 + plan.providers.len());
+            let scope_suffix = if plan.providers.is_empty() { "?" } else { "" };
+            let _ = writeln!(
+                self.out,
+                "{body_pad}lust_aot_rt::with_aot_scope({final_ctx_var}, |__eff_scope_ctx: &mut lust_aot_rt::AotCtx| -> Result<{ret_rust}, lust_aot_rt::AotError> {{"
+            );
+            let _ = writeln!(
+                self.out,
+                "{body_pad}    {raw_call}.map_err(lust_aot_rt::AotError::from)"
+            );
+            let _ = writeln!(self.out, "{body_pad}}}){scope_suffix}");
+            for pi in (0..plan.providers.len()).rev() {
+                let inner_pad = "    ".repeat(indent + 1 + pi);
+                if pi == 0 {
+                    let _ = writeln!(self.out, "{inner_pad}}})?");
+                } else {
+                    let _ = writeln!(self.out, "{inner_pad}}})");
+                }
+            }
+            let _ = writeln!(self.out, "{pad}}};");
+
+            if !self.dest_is_omitted(destination) {
+                let dst_ty = self.place_mir_type(destination);
+                if !matches!(dst_ty, MirType::Unit) {
+                    let coerced =
+                        self.coerce_expr_to_type("__sync_res", &thunk_meta.return_type, &dst_ty);
+                    self.emit_assign_place_val(destination, &coerced, indent);
+                }
+            }
+            return Ok(());
+        }
+
+        // Fallback: runtime `AotValue::Closure` effect value wrapped in 3-phase LIFO `AotScope`
+        let eff_expr = args
+            .first()
+            .map(|a| self.emit_operand_as_aot_value(a))
+            .unwrap_or_else(|| "lust_aot_rt::AotValue::Nil".to_string());
+        let _ = writeln!(
+            self.out,
+            "{pad}let __sync_val = lust_aot_rt::with_aot_scope(__ctx, |__eff_scope_ctx| ({eff_expr}).call(__eff_scope_ctx, &[]))?;"
+        );
+        if !self.dest_is_omitted(destination) {
+            let dst_ty = self.place_mir_type(destination);
+            if !matches!(dst_ty, MirType::Unit) {
+                let coerced = self.coerce_expr_to_type("__sync_val", &MirType::Unknown, &dst_ty);
+                self.emit_assign_place_val(destination, &coerced, indent);
+            }
         }
         Ok(())
     }
@@ -6599,6 +11233,37 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
         let pad = "    ".repeat(indent);
         if self.in_cleanup_closure.is_some() {
             let _ = writeln!(self.out, "{pad}return Ok(());");
+            return;
+        }
+        if let Some(ysig) = self.ctx.nontail_body_metas.get(&self.func.signature.name) {
+            if let Some(op) = opt
+                && operand_exact_local(op).is_some_and(|l| self.yield_return_locals.contains(&l))
+            {
+                let _ = writeln!(
+                    self.out,
+                    "{pad}return Err(lust_aot_rt::AotError::UserError(alloc::string::String::from(\"unreachable yield return\")));"
+                );
+                return;
+            }
+            let inner = match opt {
+                Some(op) => self.emit_operand_owned(op, &ysig.body_ret_ty),
+                None => self.ctx.rust_default_expr(&ysig.body_ret_ty),
+            };
+            if !self.errdefer_guards.is_empty() {
+                let _ = writeln!(self.out, "{pad}let __ret = {inner};");
+                for g in self.errdefer_guards.clone().iter().rev() {
+                    let _ = writeln!(self.out, "{pad}core::mem::DropGuard::dismiss({g});");
+                }
+                let _ = writeln!(
+                    self.out,
+                    "{pad}return Ok(lust_aot_rt::EffectYield::Completed(__ret));"
+                );
+            } else {
+                let _ = writeln!(
+                    self.out,
+                    "{pad}return Ok(lust_aot_rt::EffectYield::Completed({inner}));"
+                );
+            }
             return;
         }
         let expr = match opt {
@@ -6778,18 +11443,44 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
         if src_ty == dst_ty {
             return expr.to_string();
         }
-        if matches!(dst_ty, MirType::Unknown) {
+        let src_is_aot_val = matches!(src_ty, MirType::Unknown | MirType::Effect { .. });
+        let dst_is_aot_val = matches!(dst_ty, MirType::Unknown | MirType::Effect { .. });
+        if src_is_aot_val && dst_is_aot_val {
+            return format!("({expr}).clone()");
+        }
+        if dst_is_aot_val {
             return match src_ty {
                 MirType::Unit => format!("{{ let _ = {expr}; lust_aot_rt::AotValue::Nil }}"),
                 MirType::Bool => format!("lust_aot_rt::AotValue::Bool({expr})"),
                 MirType::Int => format!("lust_aot_rt::AotValue::Int({expr})"),
                 MirType::Float => format!("lust_aot_rt::AotValue::Float({expr})"),
                 MirType::String => format!("lust_aot_rt::AotValue::str({expr})"),
-                MirType::Unknown => format!("({expr}).clone()"),
+                MirType::Function {
+                    params,
+                    return_type,
+                } => {
+                    let mut cargs = vec![
+                        "__c_ctx".to_string(),
+                        "&__c_alloc".to_string(),
+                    ];
+                    for (pi, pty) in params.iter().enumerate() {
+                        let raw_a = format!(
+                            "__c_args.get({pi}).cloned().unwrap_or(lust_aot_rt::AotValue::Nil)"
+                        );
+                        cargs.push(self.coerce_expr_to_type(&raw_a, &MirType::Unknown, pty));
+                    }
+                    let ret_aot =
+                        self.coerce_expr_to_type("__fn_res", return_type, &MirType::Unknown);
+                    format!(
+                        "{{ let __fn_ref = ({expr}).clone(); lust_aot_rt::AotValue::closure(move |__c_ctx: &mut lust_aot_rt::AotCtx, __c_args: &[lust_aot_rt::AotValue]| -> Result<lust_aot_rt::AotValue, lust_aot_rt::AotError> {{ let __c_alloc = lust_aot_rt::LustBudgetAlloc::with_limit(__c_ctx.budget_alloc.limit_bytes()); let __fn_res = (__fn_ref)({})?; Ok({ret_aot}) }}) }}",
+                        cargs.join(", ")
+                    )
+                }
+                MirType::Unknown | MirType::Effect { .. } => format!("({expr}).clone()"),
                 _ => format!("lust_aot_rt::AotValue::str(alloc::format!(\"{{:?}}\", {expr}))"),
             };
         }
-        if matches!(src_ty, MirType::Unknown) {
+        if src_is_aot_val {
             return match dst_ty {
                 MirType::Unit => format!("{{ let _ = {expr}; () }}"),
                 MirType::Bool => format!("({expr}).is_truthy()"),
@@ -6813,13 +11504,17 @@ impl<'a, 'm> FnEmitter<'a, 'm> {
                 let var = self.local_var_name(r);
                 let is_move = matches!(op, Operand::Move(_));
                 let storage = self.local_storage(r);
-                if matches!(expected_ty, MirType::Unknown) && !matches!(src_ty, MirType::Unknown) {
+                if matches!(expected_ty, MirType::Unknown | MirType::Effect { .. })
+                    && !matches!(src_ty, MirType::Unknown | MirType::Effect { .. })
+                {
                     let v = self.emit_operand_value(op);
-                    return self.coerce_expr_to_type(&v, &src_ty, &MirType::Unknown);
+                    return self.coerce_expr_to_type(&v, &src_ty, expected_ty);
                 }
-                if matches!(src_ty, MirType::Unknown) && !matches!(expected_ty, MirType::Unknown) {
+                if matches!(src_ty, MirType::Unknown | MirType::Effect { .. })
+                    && !matches!(expected_ty, MirType::Unknown | MirType::Effect { .. })
+                {
                     let v = self.emit_operand_value(op);
-                    return self.coerce_expr_to_type(&v, &MirType::Unknown, expected_ty);
+                    return self.coerce_expr_to_type(&v, &src_ty, expected_ty);
                 }
                 match storage {
                     LocalStorage::RcCell => format!("{var}.get()"),

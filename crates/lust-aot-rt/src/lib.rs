@@ -12,10 +12,18 @@ extern crate alloc as alloc_crate;
 extern crate std;
 
 pub mod alloc;
+pub mod effects;
 pub mod value;
 
 pub use crate::alloc::{
     BudgetAllocError, DEFAULT_CHUNK_SIZE, LustBudgetAlloc, LustChunkArena, StaticSlabAllocator,
+};
+pub use crate::effects::{
+    AotFiberHandle, AotFiberState, AotScope, AotScopePhase, EffectHandlerArm, EffectHandlerFrame,
+    EffectRuntime, EffectYield, OneShotResume, active_scope_depth, default_zst_provider,
+    get_provided_service, handle_non_tail_oneshot, handle_tail_resumptive,
+    handle_tail_resumptive_typed, perform_effect, resume_effect, scope_register_finalizer,
+    scope_spawn_child, scope_spawn_future, with_aot_scope, with_provided_service,
 };
 pub use crate::schema::{AotDecimal128, AotObjectId};
 pub use crate::value::{AotClosure, AotEnum, AotKey, AotMap, AotStruct, AotValue};
@@ -36,6 +44,8 @@ pub enum AotError {
     MissingMapKey,
     SchemaDecodeError(&'static str),
     CapabilityDenied(&'static str),
+    UnhandledEffect(String),
+    EffectAbort { handler_id: u64 },
     UserError(String),
 }
 
@@ -52,6 +62,8 @@ impl AotError {
             Self::MissingMapKey => "MissingMapKey",
             Self::SchemaDecodeError(_) => "SchemaDecodeError",
             Self::CapabilityDenied(_) => "CapabilityDenied",
+            Self::UnhandledEffect(_) => "UnhandledEffect",
+            Self::EffectAbort { .. } => "EffectAbort",
             Self::UserError(_) => "UserError",
         }
     }
@@ -91,6 +103,10 @@ impl fmt::Display for AotError {
             Self::MissingMapKey => write!(f, "Missing map key"),
             Self::SchemaDecodeError(msg) => write!(f, "Schema decode error: {msg}"),
             Self::CapabilityDenied(cap) => write!(f, "Capability denied: {cap}"),
+            Self::UnhandledEffect(name) => write!(f, "Unhandled effect: {name}"),
+            Self::EffectAbort { handler_id } => {
+                write!(f, "Unhandled effect abort (handler {handler_id})")
+            }
             Self::UserError(msg) => write!(f, "{msg}"),
         }
     }
@@ -123,6 +139,7 @@ pub struct AotCtx {
     pub budget_alloc: LustBudgetAlloc,
     pub deny_ffi: bool,
     pub pure_core: bool,
+    pub effects: EffectRuntime,
 }
 
 impl AotCtx {
@@ -135,6 +152,7 @@ impl AotCtx {
             budget_alloc: LustBudgetAlloc::unbounded(),
             deny_ffi: false,
             pure_core: false,
+            effects: EffectRuntime::new(),
         }
     }
 
@@ -161,6 +179,7 @@ impl AotCtx {
             budget_alloc,
             deny_ffi: false,
             pure_core: false,
+            effects: EffectRuntime::new(),
         }
     }
 
@@ -185,6 +204,7 @@ impl AotCtx {
             budget_alloc: LustBudgetAlloc::unbounded(),
             deny_ffi: true,
             pure_core: true,
+            effects: EffectRuntime::new(),
         }
     }
 
@@ -1690,5 +1710,380 @@ mod tests {
 
         let mut c_oid = JsonCursor::new(r#""00112233445566778899aabb""#);
         assert_eq!(c_oid.parse_object_id(), Ok(oid));
+    }
+
+    #[test]
+    fn test_effects_tail_resumptive_abort_nested_dropguard_and_zst_provider() {
+        #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+        struct TestZstProvider;
+
+        assert_eq!(core::mem::size_of::<TestZstProvider>(), 0);
+        let p: TestZstProvider = default_zst_provider();
+        assert_eq!(p, TestZstProvider::default());
+
+        let mut ctx = AotCtx::new();
+        assert_eq!(ctx.effects.active_frame_depth(), 0);
+
+        // 1. Tail-resumptive multiple sequential resumptions + forwarding across nested handlers
+        let nested_res = handle_tail_resumptive(
+            &mut ctx,
+            vec![EffectHandlerArm::from_fn("Outer", |c, args| {
+                let y = args.first().and_then(AotValue::as_int).unwrap_or(0);
+                resume_effect(c, AotValue::Int(y + 1))
+            })],
+            |c| {
+                handle_tail_resumptive(
+                    c,
+                    vec![EffectHandlerArm::from_fn("Inner", |c2, args| {
+                        let x = args.first().and_then(AotValue::as_int).unwrap_or(0);
+                        resume_effect(c2, AotValue::Int(x * 2))
+                    })],
+                    |c2| {
+                        assert_eq!(c2.effects.active_frame_depth(), 2);
+                        let a = perform_effect(c2, "Inner", &[AotValue::Int(5)])?
+                            .as_int()
+                            .unwrap_or(0);
+                        let b = perform_effect(c2, "Outer", &[AotValue::Int(100)])?
+                            .as_int()
+                            .unwrap_or(0);
+                        Ok(AotValue::Int(a + b))
+                    },
+                )
+            },
+        );
+        assert_eq!(nested_res, Ok(AotValue::Int(111)));
+        assert_eq!(ctx.effects.active_frame_depth(), 0);
+
+        // 2. Abortive handler unwinds inner defer DropGuard and pops inner EffectHandlerFrame
+        let defer_ran = RefCell::new(false);
+        let abort_res = handle_tail_resumptive_typed(
+            &mut ctx,
+            vec![EffectHandlerArm::from_fn("AbortOuter", |_c, args| {
+                let code = args.first().and_then(AotValue::as_int).unwrap_or(0);
+                Ok(AotValue::Int(-code))
+            })],
+            |c| {
+                handle_tail_resumptive_typed(
+                    c,
+                    vec![EffectHandlerArm::from_fn("Other", |c2, _args| {
+                        resume_effect(c2, AotValue::Int(0))
+                    })],
+                    |c2| {
+                        let _d = defer(|| *defer_ran.borrow_mut() = true);
+                        let _ = perform_effect(c2, "AbortOuter", &[AotValue::Int(404)])?;
+                        Ok(9999_i64)
+                    },
+                    |v| Ok(v.as_int().unwrap_or(0)),
+                )
+            },
+            |v| Ok(v.as_int().unwrap_or(0)),
+        );
+        assert_eq!(abort_res, Ok(-404));
+        assert!(*defer_ran.borrow(), "defer DropGuard must run on abort unwind");
+        assert_eq!(
+            ctx.effects.active_frame_depth(),
+            0,
+            "inner and outer frames must both be popped by DropGuard on abort"
+        );
+
+        // 3. Unhandled effect, double resume, and resume outside handler arm errors
+        assert_eq!(
+            perform_effect(&mut ctx, "Missing", &[]),
+            Err(AotError::UnhandledEffect(String::from("Missing")))
+        );
+        assert!(matches!(
+            resume_effect(&mut ctx, AotValue::Int(1)),
+            Err(AotError::UserError(ref m)) if m.contains("Cannot resume outside")
+        ));
+        let dbl_res = handle_tail_resumptive(
+            &mut ctx,
+            vec![EffectHandlerArm::from_fn("Ask", |c, _| {
+                resume_effect(c, AotValue::Int(1))?;
+                resume_effect(c, AotValue::Int(2))
+            })],
+            |c| perform_effect(c, "Ask", &[]),
+        );
+        assert!(matches!(
+            dbl_res,
+            Err(AotError::UserError(ref m)) if m.contains("Effect already resumed")
+        ));
+        assert_eq!(ctx.effects.active_frame_depth(), 0);
+        assert!(!ctx.effects.is_in_handler_arm());
+
+        // 4. Scoped service provider restores prior binding on normal & error exit
+        assert_eq!(get_provided_service(&ctx, "AppDb"), None);
+        let svc_res: Result<i64, AotError> =
+            with_provided_service(&mut ctx, "AppDb", AotValue::Int(10), |c| {
+                assert_eq!(get_provided_service(c, "AppDb"), Some(AotValue::Int(10)));
+                let inner_err: Result<i64, AotError> =
+                    with_provided_service(c, "AppDb", AotValue::Int(20), |c2| {
+                        assert_eq!(get_provided_service(c2, "AppDb"), Some(AotValue::Int(20)));
+                        Err(AotError::DivisionByZero)
+                    });
+                assert_eq!(inner_err, Err(AotError::DivisionByZero));
+                assert_eq!(get_provided_service(c, "AppDb"), Some(AotValue::Int(10)));
+                Ok(42)
+            });
+        assert_eq!(svc_res, Ok(42));
+        assert_eq!(get_provided_service(&ctx, "AppDb"), None);
+    }
+
+    #[test]
+    fn test_effect_yield_parameterized_all_types_and_oneshot_resume() {
+        use crate::alloc_crate::rc::Rc;
+        let mut ctx = AotCtx::new();
+
+        // 1. EffectYield<i64, i64, i64> with pre + resume + post
+        let trace = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let t1 = Rc::clone(&trace);
+        let t2 = Rc::clone(&trace);
+        let r_int = handle_non_tail_oneshot::<i64, i64, i64, _, _>(
+            &mut ctx,
+            |_c| {
+                t1.borrow_mut().push("body_pre");
+                Ok(EffectYield::yielded(10_i64, move |_c2, v| {
+                    t1.borrow_mut().push("body_post");
+                    Ok(v * 2)
+                }))
+            },
+            |c, arg, resume_fn| {
+                t2.borrow_mut().push("handler_pre");
+                let r = resume_fn(c, arg + 5)?;
+                t2.borrow_mut().push("handler_post");
+                Ok(r + 100)
+            },
+        );
+        assert_eq!(r_int, Ok(130));
+        assert_eq!(
+            &*trace.borrow(),
+            &["body_pre", "handler_pre", "body_post", "handler_post"]
+        );
+
+        // 2. EffectYield<f64, bool, String> (three distinct non-i64 types)
+        let r_hetero = handle_non_tail_oneshot::<f64, bool, String, _, _>(
+            &mut ctx,
+            |_c| {
+                Ok(EffectYield::yielded(3.5_f64, |_c2, ok| {
+                    Ok(if ok {
+                        String::from("yes")
+                    } else {
+                        String::from("no")
+                    })
+                }))
+            },
+            |c, arg, resume_fn| {
+                let body_s = resume_fn(c, arg > 2.0)?;
+                Ok(crate::alloc_crate::format!("wrapped:{body_s}"))
+            },
+        );
+        assert_eq!(r_hetero, Ok(String::from("wrapped:yes")));
+
+        // 3. EffectYield<String, (), ()> (String + unit)
+        let log = Rc::new(RefCell::new(String::new()));
+        let l1 = Rc::clone(&log);
+        let l2 = Rc::clone(&log);
+        let r_unit = handle_non_tail_oneshot::<String, (), (), _, _>(
+            &mut ctx,
+            |_c| {
+                Ok(EffectYield::yielded(String::from("ping"), move |_c2, ()| {
+                    l1.borrow_mut().push_str(":resumed");
+                    Ok(())
+                }))
+            },
+            |c, arg, resume_fn| {
+                l2.borrow_mut().push_str(&arg);
+                resume_fn(c, ())?;
+                l2.borrow_mut().push_str(":done");
+                Ok(())
+            },
+        );
+        assert_eq!(r_unit, Ok(()));
+        assert_eq!(log.borrow().as_str(), "ping:resumed:done");
+
+        // 4. EffectYield<AotValue, AotValue, AotValue> + Completed fast path
+        let r_completed = handle_non_tail_oneshot::<AotValue, AotValue, AotValue, _, _>(
+            &mut ctx,
+            |_c| Ok(EffectYield::completed(AotValue::Int(77))),
+            |_c, _arg, _resume_fn| Ok(AotValue::Int(-1)),
+        );
+        assert_eq!(r_completed, Ok(AotValue::Int(77)));
+
+        // 5. OneShotResume rejects double resume cleanly without panicking
+        let r_dbl = handle_non_tail_oneshot::<(), i64, i64, _, _>(
+            &mut ctx,
+            |_c| Ok(EffectYield::yielded((), |_c2, v| Ok(v + 1))),
+            |c, (), resume_fn| {
+                let mut k = OneShotResume::new(resume_fn);
+                assert!(!k.is_consumed());
+                let first = k.resume(c, 10)?;
+                assert_eq!(first, 11);
+                assert!(k.is_consumed());
+                k.resume(c, 20)
+            },
+        );
+        assert!(matches!(
+            r_dbl,
+            Err(AotError::UserError(ref m)) if m.contains("Effect already resumed")
+        ));
+    }
+
+    #[test]
+    fn test_aot_scope_three_phase_lifo_and_first_defect_preservation() {
+        use crate::alloc_crate::rc::Rc;
+        use core::cell::Cell;
+        let mut ctx = AotCtx::new();
+        let events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+
+        let mut scope = AotScope::new(1);
+        assert!(scope.is_open());
+        assert_eq!(scope.phase(), AotScopePhase::Open);
+
+        // Spawn two cooperative children that take 2 polls to finish after cancellation
+        let e_c1 = Rc::clone(&events);
+        let e_j1 = Rc::clone(&events);
+        let mut ticks1 = 0u8;
+        let h1 = scope
+            .spawn_child_with_cancel(
+                move |_c| e_c1.borrow_mut().push("cancel:child1"),
+                move |_c, cancelled| {
+                    assert!(cancelled);
+                    ticks1 += 1;
+                    if ticks1 >= 2 {
+                        e_j1.borrow_mut().push("join:child1");
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                },
+            )
+            .expect("spawn child1");
+
+        let e_c2 = Rc::clone(&events);
+        let e_j2 = Rc::clone(&events);
+        let h2 = scope
+            .spawn_child_with_cancel(
+                move |_c| e_c2.borrow_mut().push("cancel:child2"),
+                move |_c, cancelled| {
+                    assert!(cancelled);
+                    e_j2.borrow_mut().push("join:child2");
+                    Ok(true)
+                },
+            )
+            .expect("spawn child2");
+
+        // Register 3 finalizers; middle & last return errors -> first defect must win, all 3 run LIFO
+        let e_f1 = Rc::clone(&events);
+        scope
+            .register_finalizer(move |_c| {
+                e_f1.borrow_mut().push("finalize:1");
+                Err(AotError::UserError(String::from("second_defect")))
+            })
+            .expect("fin1");
+        let e_f2 = Rc::clone(&events);
+        scope
+            .register_finalizer(move |_c| {
+                e_f2.borrow_mut().push("finalize:2");
+                Err(AotError::UserError(String::from("first_defect")))
+            })
+            .expect("fin2");
+        let e_f3 = Rc::clone(&events);
+        scope
+            .register_finalizer(move |_c| {
+                e_f3.borrow_mut().push("finalize:3");
+                Ok(())
+            })
+            .expect("fin3");
+
+        let close_res = scope.close(&mut ctx);
+        assert_eq!(
+            close_res,
+            Err(AotError::UserError(String::from("first_defect")))
+        );
+        assert_eq!(
+            scope.suppressed_errors(),
+            &[AotError::UserError(String::from("second_defect"))]
+        );
+        assert_eq!(
+            scope.phase_transitions(),
+            &[
+                AotScopePhase::Open,
+                AotScopePhase::Cancelling,
+                AotScopePhase::Joining,
+                AotScopePhase::Finalizing,
+                AotScopePhase::Done,
+            ]
+        );
+        assert!(h1.is_cancel_requested());
+        assert!(h2.is_cancel_requested());
+        assert_eq!(h1.state(), AotFiberState::Cancelled);
+        assert_eq!(h2.state(), AotFiberState::Cancelled);
+        assert_eq!(
+            &*events.borrow(),
+            &[
+                "cancel:child1",
+                "cancel:child2",
+                "join:child2",
+                "join:child1",
+                "finalize:3",
+                "finalize:2",
+                "finalize:1",
+            ]
+        );
+
+        // Admission refused after close & close is idempotent
+        assert!(scope.register_finalizer(|_| Ok(())).is_err());
+        assert!(scope.spawn_child(|_, _| Ok(true)).is_err());
+        assert_eq!(scope.close(&mut ctx), Ok(()));
+        assert_eq!(events.borrow().len(), 7);
+
+        // Gate-NEG-02: masked child prevents finalization during try_close until unmasked
+        let mut gated = AotScope::new(2);
+        let child = gated.register_external_child().expect("ext child");
+        child.enter_mask();
+        let fin_ran = Rc::new(Cell::new(false));
+        let fin_ran_c = Rc::clone(&fin_ran);
+        gated
+            .register_finalizer(move |_| {
+                fin_ran_c.set(true);
+                Ok(())
+            })
+            .expect("reg fin");
+
+        assert_eq!(gated.try_close(&mut ctx), Ok(false));
+        assert_eq!(gated.phase(), AotScopePhase::Joining);
+        assert!(child.is_cancel_requested());
+        assert!(!fin_ran.get(), "Gate-NEG-02: finalizer must NOT run while child is masked");
+
+        assert!(child.exit_mask(), "deferred cancel must surface on unmask");
+        child.mark_cancelled();
+        assert_eq!(gated.try_close(&mut ctx), Ok(true));
+        assert_eq!(gated.phase(), AotScopePhase::Done);
+        assert!(fin_ran.get());
+
+        // with_aot_scope + spawn_future: child future RAII DropGuard runs BEFORE parent finalizers
+        let async_events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+        let ae_body = Rc::clone(&async_events);
+        let scope_res = with_aot_scope(&mut ctx, |c| {
+            assert_eq!(active_scope_depth(c), 1);
+            let ae_fin = Rc::clone(&ae_body);
+            scope_register_finalizer(c, move |_| {
+                ae_fin.borrow_mut().push("parent_fin");
+                Ok(())
+            })?;
+            let ae_fut = Rc::clone(&ae_body);
+            let _fh = scope_spawn_future(c, async move {
+                let _g = defer(move || ae_fut.borrow_mut().push("child_future_drop"));
+                core::future::pending::<Result<AotValue, AotError>>().await
+            })?;
+            // Poll once implicitly via scope teardown: future is pending (Wait: first poll starts future!)
+            Ok(99_i64)
+        });
+        assert_eq!(scope_res, Ok(99));
+        assert_eq!(active_scope_depth(&ctx), 0);
+        // Child future RAII DropGuard ran during Joining, strictly BEFORE parent_fin in Finalizing!
+        assert_eq!(
+            &*async_events.borrow(),
+            &["child_future_drop", "parent_fin"]
+        );
     }
 }

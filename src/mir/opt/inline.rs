@@ -814,6 +814,13 @@ fn remap_rvalue(rval: &Rvalue, map: &HashMap<LocalId, LocalId>) -> Rvalue {
         Rvalue::Aggregate(ty, ops) => {
             Rvalue::Aggregate(ty.clone(), ops.iter().map(|o| remap_operand(o, map)).collect())
         }
+        Rvalue::Closure { func_name, captures } => Rvalue::Closure {
+            func_name: func_name.clone(),
+            captures: captures
+                .iter()
+                .map(|(name, op, ty)| (name.clone(), remap_operand(op, map), ty.clone()))
+                .collect(),
+        },
     }
 }
 

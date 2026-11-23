@@ -283,8 +283,10 @@ impl Compiler {
             }
 
             StmtKind::Expr(expr) => {
-                let reg = self.compile_expr(expr)?;
-                self.free_register(reg);
+                if !self.try_compile_array_void_call(expr)? {
+                    let reg = self.compile_expr(expr)?;
+                    self.free_register(reg);
+                }
             }
 
             StmtKind::If {

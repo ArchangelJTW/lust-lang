@@ -870,6 +870,7 @@ fn rvalue_to_c(rval: &Rvalue) -> String {
                 _ => "0".into(),
             }
         }
+        Rvalue::Closure { .. } => "0 /* closure unsupported in C99 emitter */".to_string(),
     }
 }
 

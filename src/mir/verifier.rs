@@ -264,6 +264,11 @@ impl<'a> MirVerifier<'a> {
                     self.check_operand_read(op, inits, block, span);
                 }
             }
+            Rvalue::Closure { captures, .. } => {
+                for (_, op, _) in captures {
+                    self.check_operand_read(op, inits, block, span);
+                }
+            }
         }
     }
 

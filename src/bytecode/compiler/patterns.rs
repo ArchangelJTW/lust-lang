@@ -9,12 +9,25 @@ impl Compiler {
         while let ExprKind::Paren(inner) = &index_expr.kind {
             index_expr = inner;
         }
-        if !self.is_checked_array_index(index_expr.span) {
-            return None;
-        }
         let ExprKind::Index { object, index } = &index_expr.kind else {
             return None;
         };
+        let is_known_array = self.is_checked_array_index(index_expr.span)
+            || matches!(
+                &object.kind,
+                ExprKind::Identifier(name)
+                    if self.resolve_local(name).ok().is_some_and(|reg| {
+                        matches!(
+                            self.functions
+                                .get(self.current_function)
+                                .and_then(|f| f.register_types.get(&reg)),
+                            Some(TypeKind::Array(_))
+                        )
+                    })
+            );
+        if !is_known_array {
+            return None;
+        }
         let crate::ast::Pattern::Enum {
             enum_name,
             variant,

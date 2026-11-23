@@ -2106,6 +2106,7 @@ pub(crate) struct CompiledFnEntry {
     pub struct_metadata_generation: u64,
     pub readonly_params: Vec<bool>,
     pub has_external_or_host_calls: bool,
+    pub is_pure_scalar_abi: bool,
 }
 
 #[derive(Debug, Clone)]

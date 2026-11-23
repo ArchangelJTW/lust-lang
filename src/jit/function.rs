@@ -1188,6 +1188,15 @@ impl<'a> Translator<'a> {
                 self.ops.push(TraceOp::ArrayLen { dest, array });
                 self.write(dest, Some(ValueType::Int));
             }
+            Instruction::ArrayPush(..) => {
+                return None;
+            }
+            Instruction::ArrayGetUnwrap(dest, array, index) => {
+                self.guard(index, ValueType::Int);
+                self.ops.push(TraceOp::GetIndex { dest, array, index });
+                let element = self.env.elements.get(&array).copied();
+                self.write(dest, element);
+            }
             Instruction::SetIndex(array, index, value) => {
                 self.guard(index, ValueType::Int);
                 let mut element_type = self.env.elements.get(&array).copied();

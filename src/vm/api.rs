@@ -728,16 +728,26 @@ impl VM {
             self.budgets.charge_value_vec(1)?;
             return Ok(Value::ok(val));
         }
-        let values = values.try_borrow().map_err(|_| LustError::RuntimeError {
-            message: "Cannot read array while it is mutably borrowed".to_string(),
-        })?;
-        let length = values.len();
-        let value = if index >= 0 {
-            values.get(index as usize).cloned()
+        let (length, value) = if values.is_unboxed() {
+            let length = values.len_fast();
+            let value = if index >= 0 {
+                values.get_value_fast(index as usize)
+            } else {
+                None
+            };
+            (length, value)
         } else {
-            None
+            let values = values.try_borrow().map_err(|_| LustError::RuntimeError {
+                message: "Cannot read array while it is mutably borrowed".to_string(),
+            })?;
+            let length = values.len();
+            let value = if index >= 0 {
+                values.get(index as usize).cloned()
+            } else {
+                None
+            };
+            (length, value)
         };
-        drop(values);
 
         if let Some(value) = value {
             self.budgets.charge_value_vec(1)?;
@@ -1317,8 +1327,54 @@ impl VM {
         self.execute_call_frame(frame)
     }
 
+    /// Read-only alias for `cranelift_entry_count` (`NG-W10-3`).
+    #[inline]
+    pub fn cranelift_native_entry_count(&self) -> u64 {
+        self.cranelift_entry_count
+    }
+
     #[inline]
     pub(crate) fn has_native_entry(&self, func_idx: usize) -> bool {
+        #[cfg(feature = "std")]
+        {
+            if self.backend == VmBackend::Cranelift
+                && (self.slow_path_flags & !crate::vm::SLOW_PATH_GAS_LIMIT) == 0
+                && !crate::vm::MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed)
+                && self.call_stack.is_empty()
+                && self.active_jit_depth == 0
+                && self.active_native_depth == 0
+                && self.budgets.memory.limit_bytes.is_none()
+                && !self.has_active_finalizers
+                && !crate::vm::tracing::has_trace_hook()
+            {
+                #[cfg(feature = "test-deopt")]
+                if self.test_deopt_spike_hook.is_some() {
+                    return false;
+                }
+                let current_struct_gen = self.struct_metadata.generation();
+                if self.cranelift_compiled_generation == self.cranelift_generation
+                    && self.cranelift_compiled_struct_gen == current_struct_gen
+                    && self.mir_context_struct_gen == current_struct_gen
+                {
+                    if let Some(Some(entry)) = self.cranelift_fn_cache.get(func_idx) {
+                        if entry.is_pure_scalar_abi
+                            && !entry.code_ptr.is_null()
+                            && entry.compiled_generation == self.cranelift_compiled_generation
+                            && entry.struct_metadata_generation == current_struct_gen
+                        {
+                            return true;
+                        }
+                    }
+                } else if !self.mir_functions.is_empty()
+                    && self
+                        .functions
+                        .get(func_idx)
+                        .is_some_and(|f| self.mir_functions.contains_key(&f.name))
+                {
+                    return true;
+                }
+            }
+        }
         #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             self.call_stack.is_empty()
@@ -1330,6 +1386,250 @@ impl VM {
         #[cfg(not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))))]
         {
             false
+        }
+    }
+
+    /// Direct scalar C-ABI fast-path into Cranelift JIT without allocating a VM `CallFrame`
+    /// (`NG-W10-3`). Returns `None` whenever preconditions are not met so callers fall back
+    /// cleanly to the standard VM dispatch path.
+    #[inline]
+    pub(crate) fn try_call_cranelift_scalar_direct(
+        &mut self,
+        func_idx: usize,
+        args: &[Value],
+    ) -> Option<Result<Value>> {
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = (func_idx, args);
+            None
+        }
+        #[cfg(feature = "std")]
+        {
+            use crate::mir::cranelift_backend::{
+                MIR_STATUS_ERR_DIV_BY_ZERO, MIR_STATUS_ERR_NEG_EXPONENT, MIR_STATUS_ERR_OOM,
+                MIR_STATUS_ERR_OUT_OF_BOUNDS, MIR_STATUS_ERR_OUT_OF_GAS, MIR_STATUS_OK,
+            };
+            use crate::mir::ir::MirType;
+
+            if self.backend != VmBackend::Cranelift
+                || (self.slow_path_flags & !crate::vm::SLOW_PATH_GAS_LIMIT) != 0
+                || crate::vm::MUTATION_M1_SKIP_GAS.load(core::sync::atomic::Ordering::Relaxed)
+                || !self.call_stack.is_empty()
+                || self.active_jit_depth != 0
+                || self.active_native_depth != 0
+                || self.budgets.memory.limit_bytes.is_some()
+                || self.has_active_finalizers
+                || super::execution::get_effect_finalizer_count() > 0
+                || crate::vm::tracing::has_trace_hook()
+                || args.len() > 4
+            {
+                return None;
+            }
+            #[cfg(feature = "test-deopt")]
+            if self.test_deopt_spike_hook.is_some() {
+                return None;
+            }
+            // If any safepoint slow flag (deopt request, pending interrupt, ordinal hook, mask)
+            // is active, fall back to the full frame path with `NativeInvocationGuard`.
+            if unsafe { (*crate::mir::cranelift_backend::lust_mir_safepoint_state_ptr()).slow_flags }
+                != 0
+            {
+                return None;
+            }
+
+            let current_struct_gen = self.struct_metadata.generation();
+            if self.cranelift_compiled_generation != self.cranelift_generation
+                || self.cranelift_compiled_struct_gen != current_struct_gen
+                || self.mir_context_struct_gen != current_struct_gen
+                || func_idx >= self.cranelift_fn_cache.len()
+            {
+                if self.mir_functions.is_empty() {
+                    return None;
+                }
+                self.compile_cranelift().ok()?;
+            }
+
+            let post_struct_gen = self.struct_metadata.generation();
+            let entry = self.cranelift_fn_cache.get(func_idx)?.as_ref()?;
+            if !entry.is_pure_scalar_abi
+                || entry.code_ptr.is_null()
+                || entry.compiled_generation != self.cranelift_compiled_generation
+                || entry.struct_metadata_generation != post_struct_gen
+                || args.len() != entry.param_types.len()
+            {
+                return None;
+            }
+
+            #[derive(Clone, Copy)]
+            enum ScalarArg {
+                Int(i64),
+                Float(f64),
+                Bool(u8),
+            }
+            #[derive(Clone, Copy)]
+            enum ScalarRet {
+                Int,
+                Float,
+                Bool,
+                Unit,
+            }
+
+            let ret_kind = match entry.ret_type {
+                MirType::Int => ScalarRet::Int,
+                MirType::Float => ScalarRet::Float,
+                MirType::Bool => ScalarRet::Bool,
+                MirType::Unit => ScalarRet::Unit,
+                _ => return None,
+            };
+
+            let arg_len = args.len();
+            let mut unpacked = [ScalarArg::Int(0); 4];
+            for (i, (val, expected_ty)) in args.iter().zip(entry.param_types.iter()).enumerate() {
+                unpacked[i] = match (val, expected_ty) {
+                    (Value::Int(n), MirType::Int) => ScalarArg::Int(*n),
+                    (Value::Float(f), MirType::Float) => ScalarArg::Float(*f),
+                    (Value::Bool(b), MirType::Bool) => ScalarArg::Bool(u8::from(*b)),
+                    _ => return None,
+                };
+            }
+            let code_ptr = entry.code_ptr;
+
+            macro_rules! invoke_scalar_ret {
+                ($ptr:expr, $rk:expr, ($($arg_ty:ty),*), ($($arg_val:expr),*)) => {{
+                    match $rk {
+                        ScalarRet::Int => {
+                            // SAFETY: `entry.is_pure_scalar_abi` verified exact Cranelift C-ABI
+                            // (`I64`/`F64`/`I8` params -> `I64` return) and `self.cranelift_jit`
+                            // keeps `code_ptr` alive for the full duration of `&mut self`.
+                            let func: extern "C" fn($($arg_ty),*) -> i64 =
+                                unsafe { core::mem::transmute($ptr) };
+                            Value::Int(func($($arg_val),*))
+                        }
+                        ScalarRet::Float => {
+                            // SAFETY: verified Cranelift C-ABI signature with `F64` return.
+                            let func: extern "C" fn($($arg_ty),*) -> f64 =
+                                unsafe { core::mem::transmute($ptr) };
+                            Value::Float(func($($arg_val),*))
+                        }
+                        ScalarRet::Bool => {
+                            // SAFETY: verified Cranelift C-ABI signature with `I8` return.
+                            let func: extern "C" fn($($arg_ty),*) -> u8 =
+                                unsafe { core::mem::transmute($ptr) };
+                            Value::Bool(func($($arg_val),*) != 0)
+                        }
+                        ScalarRet::Unit => {
+                            // SAFETY: verified Cranelift C-ABI signature with void (`Unit`) return.
+                            let func: extern "C" fn($($arg_ty),*) =
+                                unsafe { core::mem::transmute($ptr) };
+                            func($($arg_val),*);
+                            Value::Nil
+                        }
+                    }
+                }};
+            }
+
+            macro_rules! dispatch_scalar_args {
+                ($ptr:expr, $rk:expr, ($($acc_ty:ty),*), ($($acc_val:expr),*);) => {
+                    invoke_scalar_ret!($ptr, $rk, ($($acc_ty),*), ($($acc_val),*))
+                };
+                ($ptr:expr, $rk:expr, ($($acc_ty:ty),*), ($($acc_val:expr),*); $head:expr $(, $tail:expr)*) => {
+                    match $head {
+                        ScalarArg::Int(v) => dispatch_scalar_args!(
+                            $ptr, $rk, ($($acc_ty,)* i64), ($($acc_val,)* v); $($tail),*
+                        ),
+                        ScalarArg::Float(v) => dispatch_scalar_args!(
+                            $ptr, $rk, ($($acc_ty,)* f64), ($($acc_val,)* v); $($tail),*
+                        ),
+                        ScalarArg::Bool(v) => dispatch_scalar_args!(
+                            $ptr, $rk, ($($acc_ty,)* u8), ($($acc_val,)* v); $($tail),*
+                        ),
+                    }
+                };
+            }
+
+            let baseline = self.mir_context.capture_baseline();
+            let _mir_guard = self.mir_context.enter();
+
+            let vm_gas_budget = self.gas_remaining();
+            self.mir_context.set_status(MIR_STATUS_OK);
+            self.mir_context.set_memory_used(0);
+            self.mir_context.set_max_memory_limit(i64::MAX);
+            let mut gas_guard = crate::vm::GasScopeGuard::enter(
+                Rc::clone(&self.mir_context),
+                vm_gas_budget,
+                false,
+            );
+
+            self.cranelift_entry_count += 1;
+            let _jit_guard = self.enter_jit_scope();
+
+            // Charge base entry gas (matches `try_run_cranelift_top_frame_scoped`).
+            self.mir_context.charge_gas(1);
+
+            let result_val = if self.mir_context.last_status() == MIR_STATUS_OK {
+                match arg_len {
+                    0 => dispatch_scalar_args!(code_ptr, ret_kind, (), ();),
+                    1 => dispatch_scalar_args!(code_ptr, ret_kind, (), (); unpacked[0]),
+                    2 => dispatch_scalar_args!(code_ptr, ret_kind, (), (); unpacked[0], unpacked[1]),
+                    3 => dispatch_scalar_args!(code_ptr, ret_kind, (), (); unpacked[0], unpacked[1], unpacked[2]),
+                    4 => dispatch_scalar_args!(code_ptr, ret_kind, (), (); unpacked[0], unpacked[1], unpacked[2], unpacked[3]),
+                    _ => unreachable!("args.len() <= 4 already verified"),
+                }
+            } else {
+                Value::Nil
+            };
+
+            let status = self.mir_context.last_status();
+            drop(_jit_guard);
+
+            let gas_charge_res = gas_guard.finish_and_charge(&mut self.budgets);
+
+            if self.mir_context.dirty_allocations() {
+                self.mir_context
+                    .clear_to_baselines(baseline.handles, baseline.buffers);
+            }
+            drop(_mir_guard);
+
+            if status == MIR_STATUS_OK {
+                return Some(gas_charge_res.map(|()| result_val));
+            }
+
+            if let Some(sticky_err) = crate::mir::cranelift_backend::take_current_sticky_error() {
+                crate::mir::cranelift_backend::take_deopt_payload();
+                return Some(Err(LustError::RuntimeError {
+                    message: format!("Native deopt helper error: {}", sticky_err),
+                }));
+            }
+
+            crate::mir::cranelift_backend::take_deopt_payload();
+            match status {
+                MIR_STATUS_ERR_OUT_OF_GAS => Some(Err(match gas_charge_res {
+                    Err(e) => e,
+                    Ok(()) => LustError::RuntimeError {
+                        message: "Out of gas during Cranelift JIT execution".into(),
+                    },
+                })),
+                MIR_STATUS_ERR_OOM => Some(Err(LustError::RuntimeError {
+                    message: "Out of memory during Cranelift JIT execution".into(),
+                })),
+                MIR_STATUS_ERR_DIV_BY_ZERO => Some(Err(LustError::RuntimeError {
+                    message: "Division or modulo by zero during Cranelift JIT execution".into(),
+                })),
+                MIR_STATUS_ERR_NEG_EXPONENT => Some(Err(LustError::RuntimeError {
+                    message: "Negative exponent in integer power during Cranelift JIT execution"
+                        .into(),
+                })),
+                MIR_STATUS_ERR_OUT_OF_BOUNDS => Some(Err(LustError::RuntimeError {
+                    message:
+                        "Array index or pointer out of bounds during Cranelift JIT execution"
+                            .into(),
+                })),
+                _ => {
+                    // Unexpected non-OK or deopt status: reset status and fall back cleanly.
+                    self.mir_context.set_status(MIR_STATUS_OK);
+                    None
+                }
+            }
         }
     }
 

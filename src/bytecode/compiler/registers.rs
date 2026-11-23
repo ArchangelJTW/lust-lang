@@ -328,6 +328,9 @@ impl Compiler {
                     Instruction::LoadNil(_) => Some(Instruction::LoadNil(dest)),
                     Instruction::GetField(_, obj, f) => Some(Instruction::GetField(dest, obj, f)),
                     Instruction::GetIndex(_, obj, idx) => Some(Instruction::GetIndex(dest, obj, idx)),
+                    Instruction::ArrayGetUnwrap(_, obj, idx) => {
+                        Some(Instruction::ArrayGetUnwrap(dest, obj, idx))
+                    }
                     Instruction::ArrayLen(_, obj) => Some(Instruction::ArrayLen(dest, obj)),
                     Instruction::Call(f, args, argc, _) => Some(Instruction::Call(f, args, argc, dest)),
                     Instruction::CallMethod(obj, m, args, argc, _) => {

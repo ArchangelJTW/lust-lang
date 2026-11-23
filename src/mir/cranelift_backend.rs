@@ -1754,6 +1754,7 @@ pub mod jit_engine {
         hdr_to_counter_loop: hashbrown::HashMap<usize, usize>,
         hoist_loops: Vec<HoistLoopSpec>,
         hdr_to_hoist_loop: hashbrown::HashMap<usize, usize>,
+        inline_push_blocks: hashbrown::HashSet<usize>,
     }
 
     struct PromotedLoopCfgRecord {
@@ -2037,8 +2038,55 @@ pub mod jit_engine {
                 _ => true,
             },
             Rvalue::UnaryOp(..) => false,
-            Rvalue::Aggregate(..) => true,
+            Rvalue::Aggregate(..) | Rvalue::Closure { .. } => true,
         }
+    }
+
+    fn is_inline_local_array_push_terminator(
+        term: &Option<Terminator>,
+        b_idx: usize,
+        mir_fn: &MirFunction,
+        struct_layouts: &hashbrown::HashMap<String, MirStructLayout>,
+        locally_allocated_arrays: &hashbrown::HashSet<usize>,
+        def_out: &[hashbrown::HashSet<usize>],
+    ) -> bool {
+        let Some(Terminator::Call {
+            callee,
+            args,
+            destination,
+            ..
+        }) = term
+        else {
+            return false;
+        };
+        if (callee != "array.push" && callee != "table.push") || args.len() != 2 {
+            return false;
+        }
+        if !matches!(destination, Place::Local(_)) {
+            return false;
+        }
+        let (Operand::Copy(Place::Local(arr_loc)) | Operand::Move(Place::Local(arr_loc))) =
+            &args[0]
+        else {
+            return false;
+        };
+        if !locally_allocated_arrays.contains(&arr_loc.0) {
+            return false;
+        }
+        if !def_out.get(b_idx).is_some_and(|s| s.contains(&arr_loc.0)) {
+            return false;
+        }
+        let Ok(MirType::Array(elem_ty)) = try_operand_type(&args[0], &mir_fn.locals, struct_layouts)
+        else {
+            return false;
+        };
+        if mir_array_elem_tag(&elem_ty).is_none() {
+            return false;
+        }
+        let Ok(val_ty) = try_operand_type(&args[1], &mir_fn.locals, struct_layouts) else {
+            return false;
+        };
+        val_ty == *elem_ty
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2051,6 +2099,7 @@ pub mod jit_engine {
         vec_loops: &[crate::mir::opt::simd::VectorizedLoopInfo],
         prov_plan: &ArrayLenProvenancePlan,
         stack_slots: &hashbrown::HashMap<usize, StackSlot>,
+        struct_layouts: &hashbrown::HashMap<String, MirStructLayout>,
         has_sp_ctx: bool,
         has_gas_ctx: bool,
     ) -> LoopPromotionPlan {
@@ -2060,6 +2109,7 @@ pub mod jit_engine {
             hdr_to_counter_loop: hashbrown::HashMap::new(),
             hoist_loops: Vec::new(),
             hdr_to_hoist_loop: hashbrown::HashMap::new(),
+            inline_push_blocks: hashbrown::HashSet::new(),
         };
         let num_blocks = mir_fn.blocks.len();
         if num_blocks == 0 {
@@ -2156,97 +2206,23 @@ pub mod jit_engine {
             }
         }
 
-        // 4. Filter for strict observer-free single-header reducible natural loops
-        let mut eligible: Vec<(usize, hashbrown::HashSet<usize>)> = Vec::new();
-        for (hdr, body) in nat_loops {
-            // (a) Single-header strict dominance & zero side entries (rejects irreducible CFGs)
-            let all_dominated = body.iter().all(|&b| dom[b].contains(&hdr));
-            if !all_dominated {
-                continue;
-            }
-            let single_entry = body
-                .iter()
-                .all(|&b| b == hdr || preds[b].iter().all(|p| body.contains(p)));
-            if !single_entry {
-                continue;
-            }
-            let has_external_entry =
-                hdr == entry_idx || preds[hdr].iter().any(|p| !body.contains(p));
-            if !has_external_entry {
-                continue;
-            }
-            // (b) ZERO Terminator::Call, ZERO Raise, ZERO Unreachable, ZERO None, ZERO vec_pre_map
-            let observer_free = body.iter().all(|&b| {
-                if vec_pre_map.contains_key(&b) {
-                    return false;
-                }
-                matches!(
-                    mir_fn.blocks[b].terminator,
-                    Some(
-                        Terminator::Goto(..)
-                            | Terminator::Cond { .. }
-                            | Terminator::Switch { .. }
-                            | Terminator::Return(..)
-                    )
-                )
-            });
-            if !observer_free {
-                continue;
-            }
-            eligible.push((hdr, body));
-        }
-
-        // Sort outermost-first (largest body first, deterministic tiebreak by hdr)
-        eligible.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
-
-        // 5. Select disjoint counter-promoted loops (outermost-first)
-        let mut counter_loops: Vec<PromotedLoopSpec> = Vec::new();
-        let mut block_to_counter_loop: hashbrown::HashMap<usize, usize> =
-            hashbrown::HashMap::new();
-        let mut hdr_to_counter_loop: hashbrown::HashMap<usize, usize> =
-            hashbrown::HashMap::new();
-
-        for (hdr, body) in &eligible {
-            if body.iter().any(|b| block_to_counter_loop.contains_key(b)) {
-                continue;
-            }
-            let promote_sp = has_sp_ctx && body.iter().any(|b| loop_headers.contains(b));
-            let promote_gas = has_gas_ctx
-                && (body.iter().any(|b| {
-                    mir_fn.blocks[*b]
-                        .statements
-                        .iter()
-                        .any(|s| matches!(s, Statement::ResourceCheck(ResourceKind::Gas, ..)))
-                }) || body.iter().any(|b| {
-                    vec_hdr_map
-                        .get(b)
-                        .is_some_and(|&vl_idx| vec_loops[vl_idx].gas_check.is_some())
-                }));
-            if !promote_sp && !promote_gas {
-                continue;
-            }
-            let cl_idx = counter_loops.len();
-            for &b in body {
-                block_to_counter_loop.insert(b, cl_idx);
-            }
-            hdr_to_counter_loop.insert(*hdr, cl_idx);
-            counter_loops.push(PromotedLoopSpec {
-                hdr: *hdr,
-                loop_blocks: body.clone(),
-                promote_gas,
-                promote_sp,
-            });
-        }
-
-        // 6. Pillar 2: Non-Speculative Guarded-Preheader Array (data_ptr, len) & Struct Base Hoisting
-        // Compute per-block assignments, definite initialization, and locally allocated arrays.
+        // 3b. Compute per-block assignments, locally allocated arrays (strictly excluding params
+        // and OSR live-ins), definite initialization, and inline-push-eligible blocks (NG-W10-5).
         let mut assigned_in_block: Vec<hashbrown::HashSet<usize>> =
             vec![hashbrown::HashSet::new(); num_blocks];
         let mut local_def_only_array_agg: Vec<bool> = vec![true; mir_fn.locals.len()];
         let mut local_has_any_def: Vec<bool> = vec![false; mir_fn.locals.len()];
+        let mut local_copy_sources: Vec<Vec<usize>> = vec![Vec::new(); mir_fn.locals.len()];
         for &p in &mir_fn.params {
             if p.0 < local_def_only_array_agg.len() {
                 local_def_only_array_agg[p.0] = false;
+            }
+        }
+        if let Some((_, live)) = osr_info {
+            for &l in live {
+                if l.0 < local_def_only_array_agg.len() {
+                    local_def_only_array_agg[l.0] = false;
+                }
             }
         }
         for (b_idx, block) in mir_fn.blocks.iter().enumerate() {
@@ -2255,8 +2231,16 @@ pub mod jit_engine {
                     assigned_in_block[b_idx].insert(dst.0);
                     if dst.0 < local_def_only_array_agg.len() {
                         local_has_any_def[dst.0] = true;
-                        if !matches!(rval, Rvalue::Aggregate(MirType::Array(_), _)) {
-                            local_def_only_array_agg[dst.0] = false;
+                        match rval {
+                            Rvalue::Aggregate(MirType::Array(_), _) => {}
+                            Rvalue::Use(
+                                Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)),
+                            ) => {
+                                local_copy_sources[dst.0].push(src.0);
+                            }
+                            _ => {
+                                local_def_only_array_agg[dst.0] = false;
+                            }
                         }
                     }
                 }
@@ -2271,6 +2255,29 @@ pub mod jit_engine {
                     local_has_any_def[dst.0] = true;
                     local_def_only_array_agg[dst.0] = false;
                 }
+            }
+        }
+        loop {
+            let mut changed = false;
+            for i in 0..mir_fn.locals.len() {
+                if !local_def_only_array_agg[i] {
+                    continue;
+                }
+                if !local_has_any_def[i] {
+                    local_def_only_array_agg[i] = false;
+                    changed = true;
+                    continue;
+                }
+                if local_copy_sources[i]
+                    .iter()
+                    .any(|&src| src >= local_def_only_array_agg.len() || !local_def_only_array_agg[src])
+                {
+                    local_def_only_array_agg[i] = false;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
             }
         }
         let locally_allocated_arrays: hashbrown::HashSet<usize> = (0..mir_fn.locals.len())
@@ -2339,6 +2346,105 @@ pub mod jit_engine {
             }
         }
 
+        let mut inline_push_blocks: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
+        for &b in &reachable {
+            if is_inline_local_array_push_terminator(
+                &mir_fn.blocks[b].terminator,
+                b,
+                mir_fn,
+                struct_layouts,
+                &locally_allocated_arrays,
+                &def_out,
+            ) {
+                inline_push_blocks.insert(b);
+            }
+        }
+
+        // 4. Filter for strict observer-free single-header reducible natural loops
+        let mut eligible: Vec<(usize, hashbrown::HashSet<usize>)> = Vec::new();
+        for (hdr, body) in nat_loops {
+            // (a) Single-header strict dominance & zero side entries (rejects irreducible CFGs)
+            let all_dominated = body.iter().all(|&b| dom[b].contains(&hdr));
+            if !all_dominated {
+                continue;
+            }
+            let single_entry = body
+                .iter()
+                .all(|&b| b == hdr || preds[b].iter().all(|p| body.contains(p)));
+            if !single_entry {
+                continue;
+            }
+            let has_external_entry =
+                hdr == entry_idx || preds[hdr].iter().any(|p| !body.contains(p));
+            if !has_external_entry {
+                continue;
+            }
+            // (b) ZERO non-inline Terminator::Call, ZERO Raise, ZERO Unreachable, ZERO None, ZERO vec_pre_map
+            // Inline local `array.push` / `table.push` calls are allowed (cold grow flushes/reloads counters).
+            let observer_free = body.iter().all(|&b| {
+                if vec_pre_map.contains_key(&b) {
+                    return false;
+                }
+                matches!(
+                    mir_fn.blocks[b].terminator,
+                    Some(
+                        Terminator::Goto(..)
+                            | Terminator::Cond { .. }
+                            | Terminator::Switch { .. }
+                            | Terminator::Return(..)
+                    )
+                ) || inline_push_blocks.contains(&b)
+            });
+            if !observer_free {
+                continue;
+            }
+            eligible.push((hdr, body));
+        }
+
+        // Sort outermost-first (largest body first, deterministic tiebreak by hdr)
+        eligible.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+
+        // 5. Select disjoint counter-promoted loops (outermost-first)
+        let mut counter_loops: Vec<PromotedLoopSpec> = Vec::new();
+        let mut block_to_counter_loop: hashbrown::HashMap<usize, usize> =
+            hashbrown::HashMap::new();
+        let mut hdr_to_counter_loop: hashbrown::HashMap<usize, usize> =
+            hashbrown::HashMap::new();
+
+        for (hdr, body) in &eligible {
+            if body.iter().any(|b| block_to_counter_loop.contains_key(b)) {
+                continue;
+            }
+            let promote_sp = has_sp_ctx && body.iter().any(|b| loop_headers.contains(b));
+            let promote_gas = has_gas_ctx
+                && (body.iter().any(|b| {
+                    mir_fn.blocks[*b]
+                        .statements
+                        .iter()
+                        .any(|s| matches!(s, Statement::ResourceCheck(ResourceKind::Gas, ..)))
+                }) || body.iter().any(|b| {
+                    vec_hdr_map
+                        .get(b)
+                        .is_some_and(|&vl_idx| vec_loops[vl_idx].gas_check.is_some())
+                }));
+            if !promote_sp && !promote_gas {
+                continue;
+            }
+            let cl_idx = counter_loops.len();
+            for &b in body {
+                block_to_counter_loop.insert(b, cl_idx);
+            }
+            hdr_to_counter_loop.insert(*hdr, cl_idx);
+            counter_loops.push(PromotedLoopSpec {
+                hdr: *hdr,
+                loop_blocks: body.clone(),
+                promote_gas,
+                promote_sp,
+            });
+        }
+
+        // 6. Pillar 2: Non-Speculative Guarded-Preheader Array (data_ptr, len) & Struct Base Hoisting
+        // (`eligible` is already sorted outermost-first so outer loops hoist before inner loops.)
         let mut hoist_loops: Vec<HoistLoopSpec> = Vec::new();
         let mut hdr_to_hoist_loop: hashbrown::HashMap<usize, usize> = hashbrown::HashMap::new();
 
@@ -2346,6 +2452,9 @@ pub mod jit_engine {
             if vec_hdr_map.contains_key(hdr) {
                 continue;
             }
+            // Loops containing `array.push` / `table.push` may grow/redirect array backing buffers;
+            // never hoist `(len, data_ptr)` across a loop body that can resize an array.
+            let loop_has_array_push = body.iter().any(|b| inline_push_blocks.contains(b));
             // Require single-condition loop header branching to (body_entry inside loop, loop_exit outside loop)
             let Some(Terminator::Cond {
                 then_block,
@@ -2398,6 +2507,11 @@ pub mod jit_engine {
                                     collect_operand_hoist_candidates(op, &mir_fn.locals, &mut used_arrays_anywhere, &mut dummy_s);
                                 }
                             }
+                            Rvalue::Closure { captures, .. } => {
+                                for (_, op, _) in captures {
+                                    collect_operand_hoist_candidates(op, &mir_fn.locals, &mut used_arrays_anywhere, &mut dummy_s);
+                                }
+                            }
                         }
                     }
                 }
@@ -2417,6 +2531,24 @@ pub mod jit_engine {
                         Statement::Assign(lhs, rval, _) => {
                             // RHS executes before LHS
                             match rval {
+                                Rvalue::UnaryOp(MirUnaryOp::Len, op) => {
+                                    collect_operand_hoist_candidates(
+                                        op,
+                                        &mir_fn.locals,
+                                        &mut guaranteed_arrays,
+                                        &mut guaranteed_structs,
+                                    );
+                                    if let Operand::Copy(Place::Local(loc))
+                                        | Operand::Move(Place::Local(loc)) = op
+                                        && matches!(
+                                            mir_fn.locals.get(loc.0).map(|l| &l.ty),
+                                            Some(MirType::Array(_))
+                                        )
+                                        && !guaranteed_arrays.contains(&loc.0)
+                                    {
+                                        guaranteed_arrays.push(loc.0);
+                                    }
+                                }
                                 Rvalue::Use(op) | Rvalue::Cast(op, _) | Rvalue::UnaryOp(_, op) => {
                                     collect_operand_hoist_candidates(
                                         op,
@@ -2441,6 +2573,16 @@ pub mod jit_engine {
                                 }
                                 Rvalue::Aggregate(_, ops) => {
                                     for op in ops {
+                                        collect_operand_hoist_candidates(
+                                            op,
+                                            &mir_fn.locals,
+                                            &mut guaranteed_arrays,
+                                            &mut guaranteed_structs,
+                                        );
+                                    }
+                                }
+                                Rvalue::Closure { captures, .. } => {
+                                    for (_, op, _) in captures {
                                         collect_operand_hoist_candidates(
                                             op,
                                             &mir_fn.locals,
@@ -2489,33 +2631,35 @@ pub mod jit_engine {
             };
 
             let mut hoist_arrays = Vec::new();
-            for loc_idx in candidate_arrays {
-                if !def_in[*hdr].contains(&loc_idx)
-                    || stack_slots.contains_key(&loc_idx)
-                    || body.iter().any(|b| assigned_in_block[*b].contains(&loc_idx))
-                {
-                    continue;
-                }
-                // Skip if already hoisted by an enclosing outer loop
-                if hoist_loops.iter().any(|outer| {
-                    outer.loop_blocks.contains(hdr)
-                        && outer.hoist_arrays.iter().any(|a| a.0 == loc_idx)
-                }) {
-                    continue;
-                }
-                // Shifted-overlap RawWords safety: if any OTHER array is written in this loop,
-                // require both this array and all written arrays to be proven MirAllocationKind::Array.
-                let other_array_written = has_non_local_index_write
-                    || written_index_roots.iter().any(|&w| w != loc_idx);
-                if other_array_written {
-                    let all_proven = !has_non_local_index_write
-                        && is_proven_mir_array(loc_idx)
-                        && written_index_roots.iter().all(|&w| is_proven_mir_array(w));
-                    if !all_proven {
+            if !loop_has_array_push {
+                for loc_idx in candidate_arrays {
+                    if !def_in[*hdr].contains(&loc_idx)
+                        || stack_slots.contains_key(&loc_idx)
+                        || body.iter().any(|b| assigned_in_block[*b].contains(&loc_idx))
+                    {
                         continue;
                     }
+                    // Skip if already hoisted by an enclosing outer loop
+                    if hoist_loops.iter().any(|outer| {
+                        outer.loop_blocks.contains(hdr)
+                            && outer.hoist_arrays.iter().any(|a| a.0 == loc_idx)
+                    }) {
+                        continue;
+                    }
+                    // Shifted-overlap RawWords safety: if any OTHER array is written in this loop,
+                    // require both this array and all written arrays to be proven MirAllocationKind::Array.
+                    let other_array_written = has_non_local_index_write
+                        || written_index_roots.iter().any(|&w| w != loc_idx);
+                    if other_array_written {
+                        let all_proven = !has_non_local_index_write
+                            && is_proven_mir_array(loc_idx)
+                            && written_index_roots.iter().all(|&w| is_proven_mir_array(w));
+                        if !all_proven {
+                            continue;
+                        }
+                    }
+                    hoist_arrays.push(LocalId(loc_idx));
                 }
-                hoist_arrays.push(LocalId(loc_idx));
             }
 
             let mut hoist_structs = Vec::new();
@@ -2556,6 +2700,7 @@ pub mod jit_engine {
             hdr_to_counter_loop,
             hoist_loops,
             hdr_to_hoist_loop,
+            inline_push_blocks,
         }
     }
 
@@ -4873,6 +5018,7 @@ pub mod jit_engine {
                     emergency_exit_bb,
                     hoisted_arrays: &empty_hoisted_arrays,
                     hoisted_structs: &empty_hoisted_structs,
+                    proven_in_bounds: &[],
                 };
 
                 let mut vec_acc_vars: Vec<Option<(Variable, Variable)>> = Vec::with_capacity(vec_loops.len());
@@ -4968,6 +5114,7 @@ pub mod jit_engine {
                     &vec_loops,
                     &prov_plan,
                     &stack_slots,
+                    &self.struct_layouts,
                     safepoint_ctx.is_some(),
                     gas_ctx.is_some(),
                 );
@@ -5345,6 +5492,7 @@ pub mod jit_engine {
                         emergency_exit_bb: active_emergency_bb,
                         hoisted_arrays: &outer_hoisted_arrays,
                         hoisted_structs: &outer_hoisted_structs,
+                        proven_in_bounds: &[],
                     };
                     let active_promoted = cl_opt.map(|ci| cl_states[ci].counters);
 
@@ -5480,7 +5628,17 @@ pub mod jit_engine {
                                     peeled_bc_ctx,
                                 )?;
                                 let val_ty = builder.func.dfg.value_type(val);
-                                let val_to_store = if val_ty == types::I8 {
+                                let val_to_store = if is_bool_array_index_place(
+                                    lhs_place,
+                                    &mir_fn.locals,
+                                    &self.struct_layouts,
+                                ) {
+                                    if val_ty == types::I8 {
+                                        val
+                                    } else {
+                                        builder.ins().icmp_imm_s(IntCC::NotEqual, val, 0)
+                                    }
+                                } else if val_ty == types::I8 {
                                     builder.ins().uextend(types::I64, val)
                                 } else {
                                     val
@@ -5660,12 +5818,11 @@ pub mod jit_engine {
                     let active_emergency_bb = cl_opt
                         .map(|ci| cl_states[ci].emergency_flush_bb)
                         .unwrap_or(emergency_exit_bb);
-                    let active_bc_ctx = BoundsCheckCtx {
-                        status_set_fn,
-                        emergency_exit_bb: active_emergency_bb,
-                        hoisted_arrays: &active_hoisted_arrays,
-                        hoisted_structs: &active_hoisted_structs,
-                    };
+                    let mut cur_proven_in_bounds: Vec<(LocalId, LocalId)> = mir_fn
+                        .proven_in_bounds
+                        .get(&b_idx)
+                        .cloned()
+                        .unwrap_or_default();
                     let active_promoted = cl_opt.map(|ci| cl_states[ci].counters);
 
                     let clif_bb = clif_blocks[b_idx];
@@ -5871,6 +6028,13 @@ pub mod jit_engine {
                     }
 
                     for stmt in &mir_block.statements {
+                        let stmt_bc_ctx = BoundsCheckCtx {
+                            status_set_fn,
+                            emergency_exit_bb: active_emergency_bb,
+                            hoisted_arrays: &active_hoisted_arrays,
+                            hoisted_structs: &active_hoisted_structs,
+                            proven_in_bounds: &cur_proven_in_bounds,
+                        };
                         match stmt {
                             Statement::Assign(Place::Local(dst), rvalue, _) => {
                                 let dst_decl = mir_fn.locals.get(dst.0).ok_or_else(|| {
@@ -5906,11 +6070,13 @@ pub mod jit_engine {
                                     rem_float_fn,
                                     string_helpers,
                                     status_fn,
-                                    active_bc_ctx,
+                                    stmt_bc_ctx,
                                 )?;
                                 let target_ty = mir_to_clif_type(&dst_decl.ty)?;
                                 let val = cast_clif_type(&mut builder, val, target_ty);
                                 store_local_val(*dst, val, &mut builder, &local_vars, &stack_slots)?;
+                                cur_proven_in_bounds
+                                    .retain(|&(arr_l, idx_l)| arr_l != *dst && idx_l != *dst);
                                 match rvalue {
                                     Rvalue::Aggregate(MirType::Array(_), _) => {
                                         cur_validated.insert(dst.0);
@@ -5949,7 +6115,7 @@ pub mod jit_engine {
                                     rem_float_fn,
                                     string_helpers,
                                     status_fn,
-                                    active_bc_ctx,
+                                    stmt_bc_ctx,
                                 )?;
                                 let elem_addr = lower_place_addr(
                                     lhs_place,
@@ -5958,10 +6124,20 @@ pub mod jit_engine {
                                     &stack_slots,
                                     &mir_fn.locals,
                                     &self.struct_layouts,
-                                    active_bc_ctx,
+                                    stmt_bc_ctx,
                                 )?;
                                 let val_ty = builder.func.dfg.value_type(val);
-                                let val_to_store = if val_ty == types::I8 {
+                                let val_to_store = if is_bool_array_index_place(
+                                    lhs_place,
+                                    &mir_fn.locals,
+                                    &self.struct_layouts,
+                                ) {
+                                    if val_ty == types::I8 {
+                                        val
+                                    } else {
+                                        builder.ins().icmp_imm_s(IntCC::NotEqual, val, 0)
+                                    }
+                                } else if val_ty == types::I8 {
                                     builder.ins().uextend(types::I64, val)
                                 } else {
                                     val
@@ -5991,7 +6167,7 @@ pub mod jit_engine {
                                     rem_float_fn,
                                     string_helpers,
                                     status_fn,
-                                    active_bc_ctx,
+                                    stmt_bc_ctx,
                                 )?;
                                 let field_addr = lower_place_addr(
                                     lhs_place,
@@ -6000,7 +6176,7 @@ pub mod jit_engine {
                                     &stack_slots,
                                     &mir_fn.locals,
                                     &self.struct_layouts,
-                                    active_bc_ctx,
+                                    stmt_bc_ctx,
                                 )?;
                                 let val_ty = builder.func.dfg.value_type(val);
                                 let val_to_store = if val_ty == types::I8 {
@@ -6026,6 +6202,14 @@ pub mod jit_engine {
                             _ => {}
                         }
                     }
+
+                    let active_bc_ctx = BoundsCheckCtx {
+                        status_set_fn,
+                        emergency_exit_bb: active_emergency_bb,
+                        hoisted_arrays: &active_hoisted_arrays,
+                        hoisted_structs: &active_hoisted_structs,
+                        proven_in_bounds: &cur_proven_in_bounds,
+                    };
 
                     // If this block is the pre-entry to a vectorized loop, insert runtime scalar-forced
                     // and shifted-alias guards before entering the SIMD loop header
@@ -7190,7 +7374,7 @@ pub mod jit_engine {
                                         &stack_slots,
                                         &mir_fn.locals,
                                         &self.struct_layouts,
-                                        bc_ctx,
+                                        active_bc_ctx,
                                     )?;
                                     let val_raw = lower_operand(
                                         &args[1],
@@ -7199,35 +7383,165 @@ pub mod jit_engine {
                                         &stack_slots,
                                         &mir_fn.locals,
                                         &self.struct_layouts,
-                                        bc_ctx,
+                                        active_bc_ctx,
                                     )?;
                                     let val_clif_ty = builder.func.dfg.value_type(val_raw);
-                                    let val_i64 = if val_clif_ty == types::F64 {
-                                        builder.ins().bitcast(types::I64, MemFlagsData::new(), val_raw)
-                                    } else if val_clif_ty == types::I8 {
-                                        builder.ins().uextend(types::I64, val_raw)
+                                    if promo_plan.inline_push_blocks.contains(&b_idx) {
+                                        // NG-W10-5 inline CLIF fast-path for locally-allocated arrays ONLY
+                                        // (strictly excluded for function params / read_only_borrowed / unvalidated ptrs).
+                                        let len_off = core::mem::offset_of!(MirArrayHeader, len) as i32;
+                                        let cap_off = core::mem::offset_of!(MirArrayHeader, cap) as i32;
+                                        let data_off = core::mem::size_of::<MirArrayHeader>() as i64;
+                                        let len = builder
+                                            .ins()
+                                            .load(types::I64, MemFlagsData::trusted(), arr_val, len_off);
+                                        let cap_raw = builder
+                                            .ins()
+                                            .load(types::I64, MemFlagsData::trusted(), arr_val, cap_off);
+                                        let cap_mask = builder.ins().iconst(types::I64, i64::MAX);
+                                        let actual_cap = builder.ins().band(cap_raw, cap_mask);
+                                        let has_cap = builder
+                                            .ins()
+                                            .icmp(IntCC::UnsignedLessThan, len, actual_cap);
+
+                                        let fast_push_bb = builder.create_block();
+                                        let cold_grow_bb = builder.create_block();
+                                        let cold_ok_bb = builder.create_block();
+                                        builder.set_cold_block(cold_grow_bb);
+                                        builder.set_cold_block(cold_ok_bb);
+                                        builder
+                                            .ins()
+                                            .brif(has_cap, fast_push_bb, &[], cold_grow_bb, &[]);
+
+                                        let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+
+                                        // Hot fast-path: branchless flat/redirected data_ptr + element store + len += 1
+                                        builder.switch_to_block(fast_push_bb);
+                                        let is_redir =
+                                            builder.ins().icmp_imm_s(IntCC::SignedLessThan, cap_raw, 0);
+                                        let flat_ptr = builder.ins().iadd_imm_s(arr_val, data_off);
+                                        // MirAllocationKind::Array always allocates >= 3 words, so word[2] is always readable.
+                                        let word2 = builder.ins().load(
+                                            types::I64,
+                                            MemFlagsData::trusted(),
+                                            arr_val,
+                                            data_off as i32,
+                                        );
+                                        let data_ptr =
+                                            builder.ins().select(is_redir, word2, flat_ptr);
+                                        if *elem_ty == MirType::Bool {
+                                            let elem_addr = builder.ins().iadd(data_ptr, len);
+                                            let val_i8 = if val_clif_ty == types::I8 {
+                                                val_raw
+                                            } else {
+                                                builder.ins().icmp_imm_s(IntCC::NotEqual, val_raw, 0)
+                                            };
+                                            builder.ins().store(
+                                                MemFlagsData::trusted(),
+                                                val_i8,
+                                                elem_addr,
+                                                0,
+                                            );
+                                        } else {
+                                            let byte_off = builder.ins().ishl_imm_s(len, 3);
+                                            let elem_addr = builder.ins().iadd(data_ptr, byte_off);
+                                            builder.ins().store(
+                                                MemFlagsData::trusted(),
+                                                val_raw,
+                                                elem_addr,
+                                                0,
+                                            );
+                                        }
+                                        let next_len = builder.ins().iadd_imm_s(len, 1);
+                                        builder.ins().store(
+                                            MemFlagsData::trusted(),
+                                            next_len,
+                                            arr_val,
+                                            len_off,
+                                        );
+                                        if let Place::Local(loc) = destination {
+                                            let loc_decl = mir_fn.locals.get(loc.0).ok_or_else(|| {
+                                                MirCraneliftBackendError::CodegenError(format!(
+                                                    "Call destination local {loc:?} out of bounds"
+                                                ))
+                                            })?;
+                                            let target_ty = mir_to_clif_type(&loc_decl.ty)?;
+                                            let zero = builder.ins().iconst(types::I64, 0);
+                                            let zero_val = cast_clif_type(&mut builder, zero, target_ty);
+                                            store_local_val(*loc, zero_val, &mut builder, &local_vars, &stack_slots)?;
+                                        }
+                                        builder.ins().jump(succ_bb, &[]);
+
+                                        // Cold grow path: flush promoted counters (if in promoted loop), call lust_mir_array_push
+                                        builder.switch_to_block(cold_grow_bb);
+                                        if let Some(ci) = cl_opt {
+                                            emit_promoted_counters_flush(
+                                                &mut builder,
+                                                cl_states[ci].counters,
+                                            );
+                                            cfg_records[ci].flush_clif_blocks.insert(cold_grow_bb);
+                                        }
+                                        let val_i64 = if val_clif_ty == types::F64 {
+                                            builder.ins().bitcast(types::I64, MemFlagsData::new(), val_raw)
+                                        } else if val_clif_ty == types::I8 {
+                                            builder.ins().uextend(types::I64, val_raw)
+                                        } else {
+                                            val_raw
+                                        };
+                                        let push_call = builder.ins().call(array_push_fn, &[arr_val, val_i64]);
+                                        let push_status = builder.inst_results(push_call)[0];
+                                        let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, push_status, 0);
+                                        builder.ins().brif(is_err, emergency_exit_bb, &[], cold_ok_bb, &[]);
+
+                                        // Cold reload & resume path
+                                        builder.switch_to_block(cold_ok_bb);
+                                        if let Some(ci) = cl_opt {
+                                            emit_promoted_counters_load(
+                                                &mut builder,
+                                                cl_states[ci].counters,
+                                            );
+                                            cfg_records[ci].reload_clif_blocks.insert(cold_ok_bb);
+                                        }
+                                        if let Place::Local(loc) = destination {
+                                            let loc_decl = mir_fn.locals.get(loc.0).ok_or_else(|| {
+                                                MirCraneliftBackendError::CodegenError(format!(
+                                                    "Call destination local {loc:?} out of bounds"
+                                                ))
+                                            })?;
+                                            let target_ty = mir_to_clif_type(&loc_decl.ty)?;
+                                            let zero = builder.ins().iconst(types::I64, 0);
+                                            let zero_val = cast_clif_type(&mut builder, zero, target_ty);
+                                            store_local_val(*loc, zero_val, &mut builder, &local_vars, &stack_slots)?;
+                                        }
+                                        builder.ins().jump(succ_bb, &[]);
                                     } else {
-                                        val_raw
-                                    };
-                                    let push_call = builder.ins().call(array_push_fn, &[arr_val, val_i64]);
-                                    let push_status = builder.inst_results(push_call)[0];
-                                    if let Place::Local(loc) = destination {
-                                        let loc_decl = mir_fn.locals.get(loc.0).ok_or_else(|| {
-                                            MirCraneliftBackendError::CodegenError(format!(
-                                                "Call destination local {loc:?} out of bounds"
-                                            ))
-                                        })?;
-                                        let target_ty = mir_to_clif_type(&loc_decl.ty)?;
-                                        let zero = builder.ins().iconst(types::I64, 0);
-                                        let zero_val = cast_clif_type(&mut builder, zero, target_ty);
-                                        store_local_val(*loc, zero_val, &mut builder, &local_vars, &stack_slots)?;
+                                        let val_i64 = if val_clif_ty == types::F64 {
+                                            builder.ins().bitcast(types::I64, MemFlagsData::new(), val_raw)
+                                        } else if val_clif_ty == types::I8 {
+                                            builder.ins().uextend(types::I64, val_raw)
+                                        } else {
+                                            val_raw
+                                        };
+                                        let push_call = builder.ins().call(array_push_fn, &[arr_val, val_i64]);
+                                        let push_status = builder.inst_results(push_call)[0];
+                                        if let Place::Local(loc) = destination {
+                                            let loc_decl = mir_fn.locals.get(loc.0).ok_or_else(|| {
+                                                MirCraneliftBackendError::CodegenError(format!(
+                                                    "Call destination local {loc:?} out of bounds"
+                                                ))
+                                            })?;
+                                            let target_ty = mir_to_clif_type(&loc_decl.ty)?;
+                                            let zero = builder.ins().iconst(types::I64, 0);
+                                            let zero_val = cast_clif_type(&mut builder, zero, target_ty);
+                                            store_local_val(*loc, zero_val, &mut builder, &local_vars, &stack_slots)?;
+                                        }
+                                        let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, push_status, 0);
+                                        let push_ok_bb = builder.create_block();
+                                        builder.ins().brif(is_err, emergency_exit_bb, &[], push_ok_bb, &[]);
+                                        builder.switch_to_block(push_ok_bb);
+                                        let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
+                                        builder.ins().jump(succ_bb, &[]);
                                     }
-                                    let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, push_status, 0);
-                                    let push_ok_bb = builder.create_block();
-                                    builder.ins().brif(is_err, emergency_exit_bb, &[], push_ok_bb, &[]);
-                                    builder.switch_to_block(push_ok_bb);
-                                    let succ_bb = resolve_target_bb(Some(b_idx), success.0)?;
-                                    builder.ins().jump(succ_bb, &[]);
                                 } else if callee == "string.len" {
                                     if args.len() != 1 {
                                         return Err(MirCraneliftBackendError::CodegenError(format!(
@@ -7421,7 +7735,17 @@ pub mod jit_engine {
                                                     bc_ctx,
                                                 )?;
                                                 let val_ty = builder.func.dfg.value_type(res_val);
-                                                let val_to_store = if val_ty == types::I8 {
+                                                let val_to_store = if is_bool_array_index_place(
+                                                    destination,
+                                                    &mir_fn.locals,
+                                                    &self.struct_layouts,
+                                                ) {
+                                                    if val_ty == types::I8 {
+                                                        res_val
+                                                    } else {
+                                                        builder.ins().icmp_imm_s(IntCC::NotEqual, res_val, 0)
+                                                    }
+                                                } else if val_ty == types::I8 {
                                                     builder.ins().uextend(types::I64, res_val)
                                                 } else {
                                                     res_val
@@ -7718,7 +8042,7 @@ pub mod jit_engine {
                                     return false;
                                 }
                             }
-                            Rvalue::Aggregate(_, _) => return false,
+                            Rvalue::Aggregate(_, _) | Rvalue::Closure { .. } => return false,
                         }
                     }
                     // Fail-closed on Place::Index, Place::Field, Statement::ResourceCheck, etc.
@@ -8478,6 +8802,7 @@ pub mod jit_engine {
                                      }
                                  }
                              }
+                            Rvalue::Closure { .. } => {}
                          }
                      }
                     if let Statement::Assign(place @ (Place::Field(..) | Place::Index(..)), rval, _) = stmt {
@@ -8876,6 +9201,22 @@ pub mod jit_engine {
         emergency_exit_bb: Block,
         hoisted_arrays: &'a hashbrown::HashMap<usize, HoistedArrayVars>,
         hoisted_structs: &'a hashbrown::HashMap<usize, Variable>,
+        proven_in_bounds: &'a [(LocalId, LocalId)],
+    }
+
+    fn is_bool_array_index_place(
+        place: &Place,
+        locals: &[LocalDecl],
+        struct_layouts: &hashbrown::HashMap<String, MirStructLayout>,
+    ) -> bool {
+        matches!(
+            place,
+            Place::Index(base, _)
+                if matches!(
+                    try_place_type(base, locals, struct_layouts),
+                    Ok(MirType::Array(elem_ty)) if *elem_ty == MirType::Bool
+                )
+        )
     }
 
     fn load_local_i64(
@@ -8982,20 +9323,29 @@ pub mod jit_engine {
             Place::Index(base, idx) => {
                 let _ = try_place_type(place, locals, struct_layouts)?;
                 let base_ty = try_place_type(base, locals, struct_layouts)?;
+                let is_bool_array =
+                    matches!(&base_ty, MirType::Array(elem_ty) if **elem_ty == MirType::Bool);
 
-                // PERF-T4-2 fast path: hoisted loop-invariant array (len >= 0, resolved data_ptr)
+                // PERF-T4-2 + NG-W10-5 fast path: hoisted loop-invariant array (len >= 0, resolved data_ptr)
                 if let Place::Local(arr_loc) = base.as_ref()
                     && let Some(&hoisted) = bc_ctx.hoisted_arrays.get(&arr_loc.0)
                 {
                     let idx_val = load_local_i64(*idx, builder, local_vars, stack_slots)?;
-                    let arr_len = builder.use_var(hoisted.len_var);
-                    // guarded_preheader_bb proved arr_len >= 0, so unsigned idx >= arr_len checks both idx < 0 and idx >= len.
-                    let is_oob = builder
-                        .ins()
-                        .icmp(IntCC::UnsignedGreaterThanOrEqual, idx_val, arr_len);
-                    emit_oob_branch_if_bad(is_oob, builder, bc_ctx);
+                    let is_proven_in_bounds = bc_ctx.proven_in_bounds.contains(&(*arr_loc, *idx));
+                    if !is_proven_in_bounds {
+                        let arr_len = builder.use_var(hoisted.len_var);
+                        // guarded_preheader_bb proved arr_len >= 0, so unsigned idx >= arr_len checks both idx < 0 and idx >= len.
+                        let is_oob = builder
+                            .ins()
+                            .icmp(IntCC::UnsignedGreaterThanOrEqual, idx_val, arr_len);
+                        emit_oob_branch_if_bad(is_oob, builder, bc_ctx);
+                    }
                     let data_ptr = builder.use_var(hoisted.data_ptr_var);
-                    let byte_idx = builder.ins().ishl_imm_s(idx_val, 3);
+                    let byte_idx = if is_bool_array {
+                        idx_val
+                    } else {
+                        builder.ins().ishl_imm_s(idx_val, 3)
+                    };
                     return Ok(builder.ins().iadd(data_ptr, byte_idx));
                 }
 
@@ -9054,8 +9404,11 @@ pub mod jit_engine {
                     builder.ins().iadd_imm_s(base_ptr, data_off)
                 };
 
-                let eight = builder.ins().iconst(types::I64, 8);
-                let byte_idx = builder.ins().imul(idx_val, eight);
+                let byte_idx = if is_bool_array {
+                    idx_val
+                } else {
+                    builder.ins().ishl_imm_s(idx_val, 3)
+                };
                 Ok(builder.ins().iadd(data_ptr, byte_idx))
             }
             Place::Field(base, field_idx) => {
@@ -9940,6 +10293,12 @@ pub mod jit_engine {
                                     mark_op_uses(e, &mut aliased);
                                 }
                             }
+                            Rvalue::Closure { captures, .. } => {
+                                aliased.insert(dst.0);
+                                for (_, op, _) in captures {
+                                    mark_op_uses(op, &mut aliased);
+                                }
+                            }
                             Rvalue::BinaryOp(..) | Rvalue::UnaryOp(..) => {}
                         },
                         Place::Field(..) | Place::Index(..) => {
@@ -10465,18 +10824,47 @@ pub mod jit_engine {
                 let call_inst = builder.ins().call(alloc_array_typed_fn, &[len_val, tag_val]);
                 let array_ptr = builder.inst_results(call_inst)[0];
                 emit_status_check(builder, status_fn, emergency_exit_bb);
-                emit_aggregate_word_stores(
-                    array_ptr,
-                    elements,
-                    builder,
-                    local_vars,
-                    stack_slots,
-                    locals,
-                    struct_layouts,
-                    bc_ctx,
-                )?;
+                if *effective_elem_ty == MirType::Bool {
+                    for (i, elem) in elements.iter().enumerate() {
+                        let el_val = lower_operand(
+                            elem,
+                            builder,
+                            local_vars,
+                            stack_slots,
+                            locals,
+                            struct_layouts,
+                            bc_ctx,
+                        )?;
+                        let el_ty = builder.func.dfg.value_type(el_val);
+                        let byte_val = if el_ty == types::I8 {
+                            el_val
+                        } else {
+                            builder.ins().icmp_imm_s(IntCC::NotEqual, el_val, 0)
+                        };
+                        builder.ins().store(
+                            MemFlagsData::trusted(),
+                            byte_val,
+                            array_ptr,
+                            16 + (i as i32),
+                        );
+                    }
+                } else {
+                    emit_aggregate_word_stores(
+                        array_ptr,
+                        elements,
+                        builder,
+                        local_vars,
+                        stack_slots,
+                        locals,
+                        struct_layouts,
+                        bc_ctx,
+                    )?;
+                }
                 Ok(array_ptr)
             }
+            Rvalue::Closure { .. } => Err(MirCraneliftBackendError::UnlowerableValue(
+                "Rvalue::Closure unsupported in Cranelift JIT".into(),
+            )),
             _ => Err(MirCraneliftBackendError::UnsupportedConstant(MirConstant::Unit)),
         }
     }

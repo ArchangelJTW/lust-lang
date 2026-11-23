@@ -82,6 +82,8 @@ pub enum Instruction {
     TryGetIndex(Register, Register, Register),
     ArrayIndexOk(Register, Register, Register, Register),
     ArrayLen(Register, Register),
+    ArrayPush(Register, Register),
+    ArrayGetUnwrap(Register, Register, Register),
     SetIndex(Register, Register, Register),
     Concat(Register, Register, Register),
     CallMethod(Register, ConstIndex, Register, u8, Register),
@@ -180,6 +182,8 @@ pub enum OpCode {
     LoadUpvalue,
     StoreUpvalue,
     Closure,
+    ArrayPush,
+    ArrayGetUnwrap,
 }
 
 impl Instruction {
@@ -262,6 +266,8 @@ impl Instruction {
             Instruction::TryGetIndex(_, _, _) => OpCode::TryGetIndex,
             Instruction::ArrayIndexOk(_, _, _, _) => OpCode::ArrayIndexOk,
             Instruction::ArrayLen(_, _) => OpCode::ArrayLen,
+            Instruction::ArrayPush(_, _) => OpCode::ArrayPush,
+            Instruction::ArrayGetUnwrap(_, _, _) => OpCode::ArrayGetUnwrap,
             Instruction::SetIndex(_, _, _) => OpCode::SetIndex,
             Instruction::Concat(_, _, _) => OpCode::Concat,
             Instruction::CallMethod(_, _, _, _, _) => OpCode::CallMethod,
@@ -345,6 +351,7 @@ impl Instruction {
             | Instruction::GetIndex(dest, _, _)
             | Instruction::TryGetIndex(dest, _, _)
             | Instruction::ArrayLen(dest, _)
+            | Instruction::ArrayGetUnwrap(dest, _, _)
             | Instruction::Concat(dest, _, _)
             | Instruction::CallMethod(_, _, _, _, dest)
             | Instruction::TypeIs(dest, _, _)
@@ -359,6 +366,7 @@ impl Instruction {
             | Instruction::SetField(_, _, _)
             | Instruction::SetIndex(_, _, _)
             | Instruction::ArrayIndexOk(_, _, _, _)
+            | Instruction::ArrayPush(_, _)
             | Instruction::StoreUpvalue(_, _) => None,
         }
     }
@@ -431,6 +439,8 @@ impl Instruction {
             | Instruction::GetIndex(_, lhs, rhs)
             | Instruction::TryGetIndex(_, lhs, rhs)
             | Instruction::ArrayIndexOk(_, _, lhs, rhs)
+            | Instruction::ArrayPush(lhs, rhs)
+            | Instruction::ArrayGetUnwrap(_, lhs, rhs)
             | Instruction::Concat(_, lhs, rhs) => register == lhs || register == rhs,
             Instruction::SetIndex(collection, index, value) => {
                 register == collection || register == index || register == value
@@ -701,6 +711,10 @@ impl fmt::Display for Instruction {
                 write!(f, "ArrayIndexOk R{}, R{}, R{}, R{}", v, c, arr, idx)
             }
             Instruction::ArrayLen(d, arr) => write!(f, "ArrayLen R{}, R{}", d, arr),
+            Instruction::ArrayPush(arr, val) => write!(f, "ArrayPush R{}, R{}", arr, val),
+            Instruction::ArrayGetUnwrap(d, arr, idx) => {
+                write!(f, "ArrayGetUnwrap R{}, R{}, R{}", d, arr, idx)
+            }
             Instruction::SetIndex(arr, idx, val) => {
                 write!(f, "SetIndex R{}, R{}, R{}", arr, idx, val)
             }
@@ -864,6 +878,8 @@ impl OpCode {
             82 => Ok(OpCode::LoadUpvalue),
             83 => Ok(OpCode::StoreUpvalue),
             84 => Ok(OpCode::Closure),
+            85 => Ok(OpCode::ArrayPush),
+            86 => Ok(OpCode::ArrayGetUnwrap),
             other => Err(DecodeError::UnknownOpCode(other)),
         }
     }
@@ -953,6 +969,7 @@ impl Instruction {
             | Instruction::Shr(d, l, r)
             | Instruction::GetIndex(d, l, r)
             | Instruction::TryGetIndex(d, l, r)
+            | Instruction::ArrayGetUnwrap(d, l, r)
             | Instruction::Concat(d, l, r) => {
                 buf[1] = d;
                 buf[2] = l;
@@ -963,7 +980,8 @@ impl Instruction {
             | Instruction::NegFloat(d, s)
             | Instruction::Not(d, s)
             | Instruction::BitNot(d, s)
-            | Instruction::ArrayLen(d, s) => {
+            | Instruction::ArrayLen(d, s)
+            | Instruction::ArrayPush(d, s) => {
                 buf[1] = d;
                 buf[2] = s;
             }
@@ -1240,6 +1258,8 @@ impl Instruction {
                 bytes[1], bytes[2], bytes[3], bytes[4],
             )),
             OpCode::ArrayLen => Ok(Instruction::ArrayLen(bytes[1], bytes[2])),
+            OpCode::ArrayPush => Ok(Instruction::ArrayPush(bytes[1], bytes[2])),
+            OpCode::ArrayGetUnwrap => Ok(Instruction::ArrayGetUnwrap(bytes[1], bytes[2], bytes[3])),
             OpCode::SetIndex => Ok(Instruction::SetIndex(bytes[1], bytes[2], bytes[3])),
             OpCode::Concat => Ok(Instruction::Concat(bytes[1], bytes[2], bytes[3])),
             OpCode::CallMethod => Ok(Instruction::CallMethod(

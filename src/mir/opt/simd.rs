@@ -481,6 +481,11 @@ fn collect_rvalue_reads(rval: &Rvalue, out: &mut HashSet<LocalId>) {
                 collect_operand_reads(e, out);
             }
         }
+        Rvalue::Closure { captures, .. } => {
+            for (_, op, _) in captures {
+                collect_operand_reads(op, out);
+            }
+        }
     }
 }
 

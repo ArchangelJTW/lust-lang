@@ -535,6 +535,7 @@ pub mod zig_engine {
                 }
                 Ok(format!("__alloc_slice(&[_]i64{{{elems}}})"))
             }
+            Rvalue::Closure { .. } => Err(MirZigBackendError::UnsupportedConstant(MirConstant::Unit)),
             _ => Err(MirZigBackendError::UnsupportedConstant(MirConstant::Unit)),
         }
     }

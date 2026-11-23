@@ -2573,7 +2573,8 @@ impl TraceRecorder {
                 Ok(())
             }
 
-            Instruction::GetIndex(dest, array, index) => {
+            Instruction::GetIndex(dest, array, index)
+            | Instruction::ArrayGetUnwrap(dest, array, index) => {
                 if let Some(owner) = self.specialized_owner(array, registers)
                     && let Some((specialized_id, _)) =
                         self.specialized_registers.get(&owner).cloned()
@@ -2735,7 +2736,7 @@ impl TraceRecorder {
                 let value_type = registers
                     .get(value_dest as usize)
                     .and_then(Self::get_value_type)
-                    .or_else(|| arr.borrow().first().and_then(Self::get_value_type));
+                    .or_else(|| arr.get_value_fast(0).as_ref().and_then(Self::get_value_type));
                 self.push_op(TraceOp::ArrayIndexOk {
                     value_dest,
                     condition_dest,
@@ -2775,6 +2776,74 @@ impl TraceRecorder {
                 self.push_op(TraceOp::ArrayLen { dest, array });
                 self.mark_guarded(dest);
                 Ok(())
+            }
+
+            Instruction::ArrayPush(array, value) => {
+                if let Some(owner) = self.specialized_owner(array, registers)
+                    && let Some((specialized_id, ref layout)) =
+                        self.specialized_registers.get(&owner).cloned()
+                {
+                    use crate::jit::specialization::SpecializedLayout;
+                    let expected_type = match layout {
+                        SpecializedLayout::Vec {
+                            element_size: 1, ..
+                        } => {
+                            if !matches!(registers[value as usize], Value::Bool(_)) {
+                                self.stop_recording();
+                                return Err(LustError::RuntimeError {
+                                    message: "Trace aborted: ArrayPush element type mismatch"
+                                        .to_string(),
+                                });
+                            }
+                            ValueType::Bool
+                        }
+                        SpecializedLayout::Vec {
+                            element_layout, ..
+                        } if matches!(
+                            **element_layout,
+                            SpecializedLayout::Scalar { is_float: true, .. }
+                        ) =>
+                        {
+                            if !matches!(registers[value as usize], Value::Float(_)) {
+                                self.stop_recording();
+                                return Err(LustError::RuntimeError {
+                                    message: "Trace aborted: ArrayPush element type mismatch"
+                                        .to_string(),
+                                });
+                            }
+                            ValueType::Float
+                        }
+                        _ => {
+                            if !matches!(registers[value as usize], Value::Int(_)) {
+                                self.stop_recording();
+                                return Err(LustError::RuntimeError {
+                                    message: "Trace aborted: ArrayPush element type mismatch"
+                                        .to_string(),
+                                });
+                            }
+                            ValueType::Int
+                        }
+                    };
+                    if !self.is_guarded(value) {
+                        self.push_op(TraceOp::Guard {
+                            register: value,
+                            expected_type,
+                        });
+                        self.mark_guarded(value);
+                    }
+                    self.push_op(TraceOp::SpecializedOp {
+                        op: SpecializedOpKind::VecPush,
+                        operands: vec![
+                            Operand::Specialized(specialized_id),
+                            Operand::Register(value),
+                        ],
+                    });
+                    return Ok(());
+                }
+                self.stop_recording();
+                Err(LustError::RuntimeError {
+                    message: "Trace aborted: ArrayPush on unspecialized array".to_string(),
+                })
             }
 
             Instruction::CallMethod(obj_reg, method_name_idx, first_arg, arg_count, dest_reg) => {

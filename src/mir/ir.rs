@@ -301,6 +301,10 @@ pub enum Rvalue {
     UnaryOp(MirUnaryOp, Operand),
     Cast(Operand, MirType),
     Aggregate(MirType, Vec<Operand>),
+    Closure {
+        func_name: String,
+        captures: Vec<(String, Operand, MirType)>,
+    },
 }
 
 impl Rvalue {
@@ -315,6 +319,11 @@ impl Rvalue {
             }
             Rvalue::Aggregate(_, ops) => {
                 for op in ops {
+                    op.collect_uses(set);
+                }
+            }
+            Rvalue::Closure { captures, .. } => {
+                for (_, op, _) in captures {
                     op.collect_uses(set);
                 }
             }
@@ -338,6 +347,16 @@ impl fmt::Display for Rvalue {
                     write!(f, "{op}")?;
                 }
                 write!(f, " }}")
+            }
+            Rvalue::Closure { func_name, captures } => {
+                write!(f, "closure {func_name}(")?;
+                for (i, (name, op, ty)) in captures.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{name}: {ty} = {op}")?;
+                }
+                write!(f, ")")
             }
         }
     }
@@ -538,6 +557,18 @@ pub struct FunctionSignature {
     pub effects: Option<crate::ast::ReturnSpec>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirCleanupKind {
+    Defer,
+    ErrDefer,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MirCleanupEntry {
+    pub kind: MirCleanupKind,
+    pub block: BlockId,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirFunction {
     pub signature: FunctionSignature,
@@ -546,6 +577,8 @@ pub struct MirFunction {
     pub locals: Vec<LocalDecl>,
     pub entry: BlockId,
     pub blocks: Vec<BasicBlock>,
+    pub proven_in_bounds: hashbrown::HashMap<usize, Vec<(LocalId, LocalId)>>,
+    pub cleanup_blocks: Vec<MirCleanupEntry>,
 }
 
 impl MirFunction {
@@ -588,6 +621,8 @@ impl MirFunction {
             locals,
             entry,
             blocks,
+            proven_in_bounds: hashbrown::HashMap::new(),
+            cleanup_blocks: Vec::new(),
         }
     }
 
@@ -1103,12 +1138,19 @@ pub enum MirStructOp {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirEnumDef {
+    pub name: String,
+    pub variants: Vec<(String, Vec<MirType>)>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirModule {
     pub name: String,
     pub functions: Vec<MirFunction>,
     pub struct_layouts: Vec<MirStructLayout>,
     pub struct_ops: Vec<MirStructOp>,
+    pub enum_defs: Vec<MirEnumDef>,
 }
 
 impl MirModule {
@@ -1118,11 +1160,24 @@ impl MirModule {
             functions: Vec::new(),
             struct_layouts: Vec::new(),
             struct_ops: Vec::new(),
+            enum_defs: Vec::new(),
         }
     }
 
     pub fn add_function(&mut self, func: MirFunction) {
         self.functions.push(func);
+    }
+
+    pub fn register_enum_def(&mut self, enum_def: MirEnumDef) {
+        if let Some(existing) = self
+            .enum_defs
+            .iter_mut()
+            .find(|e| e.name == enum_def.name)
+        {
+            *existing = enum_def;
+        } else {
+            self.enum_defs.push(enum_def);
+        }
     }
 
     pub fn register_struct_layout(&mut self, layout: MirStructLayout) {

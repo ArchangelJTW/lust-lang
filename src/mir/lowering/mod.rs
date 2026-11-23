@@ -21,12 +21,6 @@ pub enum MirLowerError {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum MirCleanupKind {
-    Defer,
-    ErrDefer,
-}
-
-#[derive(Debug, Clone)]
 pub(super) struct MirCleanup {
     pub(super) kind: MirCleanupKind,
     pub(super) stmt: Box<Stmt>,
@@ -61,10 +55,20 @@ pub struct AstLowering<'a> {
     local_field_names: HashMap<LocalId, Vec<String>>,
     known_typed_locals: HashSet<LocalId>,
     thunk_return_target: Option<(LocalId, BlockId)>,
+    lifted_functions: Option<&'a mut Vec<MirFunction>>,
+    lambda_counter: Option<&'a mut usize>,
 }
 
 impl<'a> AstLowering<'a> {
     pub fn new(func: &'a mut MirFunction) -> Self {
+        Self::new_with_module_sink(func, None, None)
+    }
+
+    fn new_with_module_sink(
+        func: &'a mut MirFunction,
+        lifted_functions: Option<&'a mut Vec<MirFunction>>,
+        lambda_counter: Option<&'a mut usize>,
+    ) -> Self {
         let entry = func.entry;
         let mut scope = HashMap::new();
         let mut known_typed_locals = HashSet::new();
@@ -92,6 +96,8 @@ impl<'a> AstLowering<'a> {
             local_field_names: HashMap::new(),
             known_typed_locals,
             thunk_return_target: None,
+            lifted_functions,
+            lambda_counter,
         }
     }
 
@@ -197,20 +203,79 @@ impl<'a> AstLowering<'a> {
         let mut module = MirModule::new(module_name.into());
         let mut defs = Vec::new();
         for item in items {
-            if let ItemKind::Struct(def) = &item.kind {
-                let layout = struct_def_to_layout(def);
-                module.register_struct_layout(MirStructLayout::from(&layout));
-                defs.push(def);
+            match &item.kind {
+                ItemKind::Struct(def) => {
+                    let layout = struct_def_to_layout(def);
+                    module.register_struct_layout(MirStructLayout::from(&layout));
+                    defs.push(def);
+                }
+                ItemKind::Enum(enum_def) => {
+                    let variants = enum_def
+                        .variants
+                        .iter()
+                        .map(|v| {
+                            let field_tys = v
+                                .fields
+                                .as_ref()
+                                .map(|fs| fs.iter().map(mir_type_from_ast).collect())
+                                .unwrap_or_default();
+                            (v.name.clone(), field_tys)
+                        })
+                        .collect();
+                    module.register_enum_def(MirEnumDef {
+                        name: enum_def.name.clone(),
+                        variants,
+                    });
+                }
+                _ => {}
             }
         }
+        let mut lifted_functions = Vec::new();
+        let mut lambda_counter = 0usize;
         for item in items {
-            if let ItemKind::Function(func_def) = &item.kind {
-                let (mir_fn, ops) = Self::lower_function_with_structs(func_def, &defs)?;
-                module.add_function(mir_fn);
-                for op in ops {
-                    module.record_struct_op(op);
+            match &item.kind {
+                ItemKind::Function(func_def) => {
+                    let (mir_fn, ops) = Self::lower_function_inner(
+                        func_def,
+                        None,
+                        &defs,
+                        Some(&mut lifted_functions),
+                        Some(&mut lambda_counter),
+                    )?;
+                    module.add_function(mir_fn);
+                    for op in ops {
+                        module.record_struct_op(op);
+                    }
                 }
+                ItemKind::Impl(impl_def) => {
+                    let target_name = match &impl_def.target_type.kind {
+                        TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => {
+                            name.clone()
+                        }
+                        _ => format!("{}", impl_def.target_type),
+                    };
+                    for method_fn in &impl_def.methods {
+                        let (mut mir_fn, ops) = Self::lower_function_inner(
+                            method_fn,
+                            Some(&target_name),
+                            &defs,
+                            Some(&mut lifted_functions),
+                            Some(&mut lambda_counter),
+                        )?;
+                        if !mir_fn.signature.name.contains(':') {
+                            mir_fn.signature.name = format!("{}:{}", target_name, method_fn.name);
+                        }
+                        module.add_function(mir_fn);
+                        for op in ops {
+                            module.record_struct_op(op);
+                        }
+                    }
+                }
+                _ => {}
             }
+        }
+        for lifted_fn in lifted_functions {
+            module.add_function(lifted_fn);
         }
         Ok(module)
     }
@@ -226,6 +291,16 @@ impl<'a> AstLowering<'a> {
         func_def: &FunctionDef,
         owner_struct: Option<&str>,
         struct_defs: &[&StructDef],
+    ) -> Result<(MirFunction, Vec<MirStructOp>), MirLowerError> {
+        Self::lower_function_inner(func_def, owner_struct, struct_defs, None, None)
+    }
+
+    fn lower_function_inner(
+        func_def: &FunctionDef,
+        owner_struct: Option<&str>,
+        struct_defs: &[&StructDef],
+        lifted_functions: Option<&mut Vec<MirFunction>>,
+        lambda_counter: Option<&mut usize>,
     ) -> Result<(MirFunction, Vec<MirStructOp>), MirLowerError> {
         let sig = FunctionSignature {
             name: func_def.name.clone(),
@@ -270,7 +345,8 @@ impl<'a> AstLowering<'a> {
         }
 
         let ops = {
-            let mut lowering = AstLowering::new(&mut mir_fn);
+            let mut lowering =
+                AstLowering::new_with_module_sink(&mut mir_fn, lifted_functions, lambda_counter);
             for def in struct_defs {
                 lowering.register_struct_def(def);
             }
@@ -781,7 +857,15 @@ impl<'a> AstLowering<'a> {
                 // Header: evaluate condition
                 self.current_block = header;
                 self.emit_stmt(Statement::ResourceCheck(ResourceKind::Gas, 1, stmt.span));
-                let (cond_op, body_bindings) = self.lower_condition_with_bindings(condition, stmt.span)?;
+                let (cond_op, body_bindings, proven_bounds) =
+                    self.lower_condition_with_bindings(condition, stmt.span)?;
+                if let Some((base_local, idx_local)) = proven_bounds {
+                    self.current_fn
+                        .proven_in_bounds
+                        .entry(body_block.0)
+                        .or_default()
+                        .push((base_local, idx_local));
+                }
                 self.terminate_block(Terminator::Cond {
                     cond: cond_op,
                     then_block: body_block,
@@ -1402,6 +1486,7 @@ impl<'a> AstLowering<'a> {
                         stmt: s.clone(),
                     });
                 }
+                self.lower_cleanup_block(MirCleanupKind::Defer, s)?;
             }
             StmtKind::ErrDefer(s) => {
                 if let Some(cleanups) = self.cleanups.last_mut() {
@@ -1410,6 +1495,7 @@ impl<'a> AstLowering<'a> {
                         stmt: s.clone(),
                     });
                 }
+                self.lower_cleanup_block(MirCleanupKind::ErrDefer, s)?;
             }
             StmtKind::Scoped(stmts) => {
                 self.push_scope();
@@ -1422,11 +1508,55 @@ impl<'a> AstLowering<'a> {
         Ok(())
     }
 
+    fn lower_cleanup_block(
+        &mut self,
+        kind: MirCleanupKind,
+        cleanup_stmt: &Stmt,
+    ) -> Result<(), MirLowerError> {
+        let saved_block = self.current_block;
+        let saved_loop_stack = core::mem::take(&mut self.loop_stack);
+        let cleanup_bb = self.current_fn.new_block();
+        let start_block_idx = cleanup_bb.0;
+        self.current_fn.blocks[cleanup_bb.0].is_cleanup = true;
+        self.current_block = cleanup_bb;
+
+        self.push_scope();
+        let stmt_res = self.lower_statement(cleanup_stmt);
+        let pop_res = self.pop_scope();
+        let end_bb = self.current_block;
+        if self.current_fn.blocks[end_bb.0].terminator.is_none() {
+            self.current_fn.blocks[end_bb.0].terminator =
+                Some(Terminator::Return(None, cleanup_stmt.span));
+        }
+        for block in &mut self.current_fn.blocks[start_block_idx..] {
+            block.is_cleanup = true;
+        }
+
+        self.loop_stack = saved_loop_stack;
+        self.current_block = saved_block;
+
+        stmt_res?;
+        pop_res?;
+
+        self.current_fn.cleanup_blocks.push(MirCleanupEntry {
+            kind,
+            block: cleanup_bb,
+        });
+        Ok(())
+    }
+
     fn lower_condition_with_bindings(
         &mut self,
         condition: &Expr,
         span: crate::ast::Span,
-    ) -> Result<(Operand, Vec<(String, MirType, Place, bool)>), MirLowerError> {
+    ) -> Result<
+        (
+            Operand,
+            Vec<(String, MirType, Place, bool)>,
+            Option<(LocalId, LocalId)>,
+        ),
+        MirLowerError,
+    > {
         match &condition.kind {
             ExprKind::Paren(inner) => self.lower_condition_with_bindings(inner, span),
             ExprKind::IsPattern { expr: scrutinee, pattern } => {
@@ -1434,7 +1564,8 @@ impl<'a> AstLowering<'a> {
                     crate::ast::Pattern::Enum { variant, bindings, .. }
                         if (variant == "Ok" || variant == "Some") =>
                     {
-                        if let ExprKind::Index { object, index } = &scrutinee.kind {
+                        let indexed_parts = Self::extract_index_operands(scrutinee);
+                        if let Some((object, index)) = indexed_parts {
                             let base_place = match self.lower_place(object)? {
                                 Some(p) => p,
                                 None => {
@@ -1522,13 +1653,22 @@ impl<'a> AstLowering<'a> {
                                 span,
                             ));
 
+                            let proven_bounds = match &base_place {
+                                Place::Local(base_local) => Some((*base_local, idx_local)),
+                                _ => None,
+                            };
+
                             let elem_place = Place::Index(Box::new(base_place), idx_local);
                             let mut out_bindings = Vec::new();
                             if let Some(crate::ast::Pattern::Identifier(binding_name)) = bindings.first() {
                                 out_bindings.push((binding_name.clone(), elem_ty, elem_place, false));
                             }
 
-                            return Ok((Operand::Move(Place::Local(in_bounds_temp)), out_bindings));
+                            return Ok((
+                                Operand::Move(Place::Local(in_bounds_temp)),
+                                out_bindings,
+                                proven_bounds,
+                            ));
                         }
 
                         // PERF-T2-5: Lower `if place is Some(binding)` on struct fields or locals of
@@ -1584,7 +1724,7 @@ impl<'a> AstLowering<'a> {
                                             true,
                                         ));
                                     }
-                                    return Ok((Operand::Move(Place::Local(cond_tmp)), out_bindings));
+                                    return Ok((Operand::Move(Place::Local(cond_tmp)), out_bindings, None));
                                 }
                             }
                         }
@@ -1629,7 +1769,7 @@ impl<'a> AstLowering<'a> {
                                 ),
                                 span,
                             ));
-                            return Ok((Operand::Move(Place::Local(cond_tmp)), Vec::new()));
+                            return Ok((Operand::Move(Place::Local(cond_tmp)), Vec::new(), None));
                         }
 
                         Err(MirLowerError::UnlowerableExpression(
@@ -1637,7 +1777,7 @@ impl<'a> AstLowering<'a> {
                         ))
                     }
                     crate::ast::Pattern::Wildcard => {
-                        Ok((Operand::Constant(MirConstant::Bool(true)), Vec::new()))
+                        Ok((Operand::Constant(MirConstant::Bool(true)), Vec::new(), None))
                     }
                     crate::ast::Pattern::Identifier(name) => {
                         let (place, ty) = if let Some(p) = self.lower_place(scrutinee)? {
@@ -1653,7 +1793,11 @@ impl<'a> AstLowering<'a> {
                             self.emit_stmt(Statement::Assign(Place::Local(temp), Rvalue::Use(op), span));
                             (Place::Local(temp), MirType::Int)
                         };
-                        Ok((Operand::Constant(MirConstant::Bool(true)), vec![(name.clone(), ty, place, false)]))
+                        Ok((
+                            Operand::Constant(MirConstant::Bool(true)),
+                            vec![(name.clone(), ty, place, false)],
+                            None,
+                        ))
                     }
                     crate::ast::Pattern::Literal(lit) => {
                         let scrutinee_op = self.lower_expr(scrutinee)?;
@@ -1670,7 +1814,7 @@ impl<'a> AstLowering<'a> {
                             Rvalue::BinaryOp(MirBinaryOp::Eq, scrutinee_op, lit_op),
                             span,
                         ));
-                        Ok((Operand::Move(Place::Local(temp)), Vec::new()))
+                        Ok((Operand::Move(Place::Local(temp)), Vec::new(), None))
                     }
                     _ => Err(MirLowerError::UnlowerableExpression(
                         "unsupported is-pattern in MIR lowering".to_string(),
@@ -1713,14 +1857,14 @@ impl<'a> AstLowering<'a> {
                         ),
                         span,
                     ));
-                    return Ok((Operand::Move(Place::Local(cond_tmp)), Vec::new()));
+                    return Ok((Operand::Move(Place::Local(cond_tmp)), Vec::new(), None));
                 }
                 Err(MirLowerError::UnlowerableExpression(
                     "TypeCheck 'is None' on non-Option<Struct> is not supported in MIR lowering"
                         .to_string(),
                 ))
             }
-            _ => Ok((self.lower_expr(condition)?, Vec::new())),
+            _ => Ok((self.lower_expr(condition)?, Vec::new(), None)),
         }
     }
 
@@ -1732,7 +1876,8 @@ impl<'a> AstLowering<'a> {
         else_block: Option<&[Stmt]>,
         span: crate::ast::Span,
     ) -> Result<(), MirLowerError> {
-        let (cond_op, then_bindings) = self.lower_condition_with_bindings(condition, span)?;
+        let (cond_op, then_bindings, then_proven_bounds) =
+            self.lower_condition_with_bindings(condition, span)?;
         let then_bb = self.current_fn.new_block();
         let merge_bb = self.current_fn.new_block();
 
@@ -1741,6 +1886,14 @@ impl<'a> AstLowering<'a> {
         } else {
             merge_bb
         };
+
+        if let Some((base_local, idx_local)) = then_proven_bounds {
+            self.current_fn
+                .proven_in_bounds
+                .entry(then_bb.0)
+                .or_default()
+                .push((base_local, idx_local));
+        }
 
         self.terminate_block(Terminator::Cond {
             cond: cond_op,
@@ -1785,13 +1938,22 @@ impl<'a> AstLowering<'a> {
                 break;
             }
             self.current_block = cur_else_bb;
-            let (elif_op, elif_bindings) = self.lower_condition_with_bindings(elif_cond, span)?;
+            let (elif_op, elif_bindings, elif_proven_bounds) =
+                self.lower_condition_with_bindings(elif_cond, span)?;
             let elif_then = self.current_fn.new_block();
             let next_elif = if i + 1 < elseif_branches.len() || else_block.is_some() {
                 self.current_fn.new_block()
             } else {
                 merge_bb
             };
+
+            if let Some((base_local, idx_local)) = elif_proven_bounds {
+                self.current_fn
+                    .proven_in_bounds
+                    .entry(elif_then.0)
+                    .or_default()
+                    .push((base_local, idx_local));
+            }
 
             self.terminate_block(Terminator::Cond {
                 cond: elif_op,
@@ -2067,13 +2229,22 @@ impl<'a> AstLowering<'a> {
                 then_branch,
                 else_branch,
             } => {
-                let (cond_op, bindings) = self.lower_condition_with_bindings(condition, expr.span)?;
+                let (cond_op, bindings, proven_bounds) =
+                    self.lower_condition_with_bindings(condition, expr.span)?;
                 let res_local = self.current_fn.add_local(None, MirType::Int, true, expr.span);
                 self.emit_stmt(Statement::StorageLive(res_local, expr.span));
 
                 let then_bb = self.current_fn.new_block();
                 let else_bb = self.current_fn.new_block();
                 let merge_bb = self.current_fn.new_block();
+
+                if let Some((base_local, idx_local)) = proven_bounds {
+                    self.current_fn
+                        .proven_in_bounds
+                        .entry(then_bb.0)
+                        .or_default()
+                        .push((base_local, idx_local));
+                }
 
                 self.terminate_block(Terminator::Cond {
                     cond: cond_op,
@@ -2130,13 +2301,13 @@ impl<'a> AstLowering<'a> {
                 Ok(Operand::Move(Place::Local(res_local)))
             }
             ExprKind::IsPattern { .. } => {
-                let (cond_op, _) = self.lower_condition_with_bindings(expr, expr.span)?;
+                let (cond_op, _, _) = self.lower_condition_with_bindings(expr, expr.span)?;
                 Ok(cond_op)
             }
             ExprKind::TypeCheck { check_type, .. }
                 if matches!(&check_type.kind, TypeKind::Named(n) if n == "None") =>
             {
-                let (cond_op, _) = self.lower_condition_with_bindings(expr, expr.span)?;
+                let (cond_op, _, _) = self.lower_condition_with_bindings(expr, expr.span)?;
                 Ok(cond_op)
             }
             ExprKind::Array(elements) => {
@@ -2242,6 +2413,27 @@ impl<'a> AstLowering<'a> {
                 Ok(Operand::Move(Place::Local(temp)))
             }
             ExprKind::MethodCall { receiver, method, args, .. } if method == "unwrap" && args.is_empty() => {
+                let mut unwrapped_recv = receiver.as_ref();
+                while let ExprKind::Paren(inner) = &unwrapped_recv.kind {
+                    unwrapped_recv = inner;
+                }
+                if let ExprKind::Call { callee, args: call_args, .. } = &unwrapped_recv.kind
+                    && call_args.len() == 2
+                {
+                    match Self::call_callee_name(callee).as_deref() {
+                        Some("array.get" | "table.get") => {
+                            return self.lower_array_index_read(
+                                &call_args[0],
+                                &call_args[1],
+                                expr.span,
+                            );
+                        }
+                        Some("map.get") => {
+                            return self.lower_expr(unwrapped_recv);
+                        }
+                        _ => {}
+                    }
+                }
                 if Self::is_index_expr(receiver) {
                     self.lower_expr(receiver)
                 } else {
@@ -2633,6 +2825,76 @@ impl<'a> AstLowering<'a> {
                         return Ok(Operand::Move(Place::Local(dst)));
                     }
                 }
+                if args.len() == 3 && matches!(callee_name.as_str(), "array.set" | "table.set") {
+                    let arr_op = self.lower_expr(&args[0])?;
+                    let is_map_target = callee_name == "table.set"
+                        && matches!(self.operand_definite_mir_type(&arr_op), MirType::Map(_, _));
+                    if !is_map_target {
+                        let a_loc = match arr_op {
+                            Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
+                                loc
+                            }
+                            other => {
+                                let arr_ty = match self.operand_definite_mir_type(&other) {
+                                    MirType::Unknown => MirType::Array(Box::new(MirType::Unknown)),
+                                    ty => ty,
+                                };
+                                let temp =
+                                    self.current_fn.add_local(None, arr_ty, true, expr.span);
+                                self.emit_stmt(Statement::StorageLive(temp, expr.span));
+                                self.emit_stmt(Statement::Assign(
+                                    Place::Local(temp),
+                                    Rvalue::Use(other),
+                                    expr.span,
+                                ));
+                                temp
+                            }
+                        };
+                        let idx_op = self.lower_expr(&args[1])?;
+                        let i_loc = match idx_op {
+                            Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
+                                loc
+                            }
+                            other => {
+                                let temp = self.current_fn.add_local(
+                                    None,
+                                    MirType::Int,
+                                    true,
+                                    expr.span,
+                                );
+                                self.emit_stmt(Statement::StorageLive(temp, expr.span));
+                                self.emit_stmt(Statement::Assign(
+                                    Place::Local(temp),
+                                    Rvalue::Use(other),
+                                    expr.span,
+                                ));
+                                temp
+                            }
+                        };
+                        let v_op = self.lower_expr(&args[2])?;
+                        self.emit_stmt(Statement::Assign(
+                            Place::Index(Box::new(Place::Local(a_loc)), i_loc),
+                            Rvalue::Use(v_op),
+                            expr.span,
+                        ));
+                        return Ok(Operand::Constant(MirConstant::Unit));
+                    }
+                    let idx_op = self.lower_expr(&args[1])?;
+                    let v_op = self.lower_expr(&args[2])?;
+                    let temp = self.current_fn.add_local(None, MirType::Unit, true, expr.span);
+                    let succ_bb = self.current_fn.new_block();
+                    self.emit_stmt(Statement::StorageLive(temp, expr.span));
+                    self.terminate_block(Terminator::Call {
+                        callee: callee_name,
+                        args: vec![arr_op, idx_op, v_op],
+                        destination: Place::Local(temp),
+                        success: succ_bb,
+                        error: None,
+                        span: expr.span,
+                    });
+                    self.current_block = succ_bb;
+                    return Ok(Operand::Move(Place::Local(temp)));
+                }
                 let mut lowered_args = Vec::with_capacity(args.len());
                 for a in args {
                     lowered_args.push(self.lower_expr(a)?);
@@ -2682,6 +2944,48 @@ impl<'a> AstLowering<'a> {
                 ));
                 Ok(Operand::Move(Place::Local(temp)))
             }
+            ExprKind::Map(entries) => {
+                let map_ty = match expected_ty {
+                    Some(MirType::Map(k, v)) => MirType::Map(k.clone(), v.clone()),
+                    _ => MirType::Map(Box::new(MirType::Unknown), Box::new(MirType::Unknown)),
+                };
+                let map_local = self.current_fn.add_local(None, map_ty, true, expr.span);
+                self.known_typed_locals.insert(map_local);
+                let succ_bb = self.current_fn.new_block();
+                self.emit_stmt(Statement::StorageLive(map_local, expr.span));
+                self.terminate_block(Terminator::Call {
+                    callee: "map.new".into(),
+                    args: Vec::new(),
+                    destination: Place::Local(map_local),
+                    success: succ_bb,
+                    error: None,
+                    span: expr.span,
+                });
+                self.current_block = succ_bb;
+
+                for (k_expr, v_expr) in entries {
+                    let k_op = self.lower_expr(k_expr)?;
+                    let v_op = self.lower_expr(v_expr)?;
+                    let set_tmp = self.current_fn.add_local(None, MirType::Unit, true, expr.span);
+                    let set_succ = self.current_fn.new_block();
+                    self.emit_stmt(Statement::StorageLive(set_tmp, expr.span));
+                    self.terminate_block(Terminator::Call {
+                        callee: "map.set".into(),
+                        args: vec![Operand::Copy(Place::Local(map_local)), k_op, v_op],
+                        destination: Place::Local(set_tmp),
+                        success: set_succ,
+                        error: None,
+                        span: expr.span,
+                    });
+                    self.current_block = set_succ;
+                }
+                Ok(Operand::Move(Place::Local(map_local)))
+            }
+            ExprKind::Lambda {
+                params,
+                return_type,
+                body,
+            } => self.lower_lambda(params, return_type.as_ref(), body, expr.span),
             _ => Err(MirLowerError::UnlowerableExpression(format!("{:?}", expr.kind))),
         }
     }
@@ -2730,12 +3034,272 @@ impl<'a> AstLowering<'a> {
         }
     }
 
+    fn call_callee_name(callee: &Expr) -> Option<String> {
+        match &callee.kind {
+            ExprKind::Identifier(name) => Some(name.clone()),
+            ExprKind::FieldAccess { object, field } => {
+                if let ExprKind::Identifier(obj_name) = &object.kind {
+                    Some(format!("{obj_name}.{field}"))
+                } else {
+                    None
+                }
+            }
+            ExprKind::Paren(inner) => Self::call_callee_name(inner),
+            _ => None,
+        }
+    }
+
+    fn extract_index_operands(expr: &Expr) -> Option<(&Expr, &Expr)> {
+        match &expr.kind {
+            ExprKind::Index { object, index } => Some((object.as_ref(), index.as_ref())),
+            ExprKind::Call { callee, args, .. }
+                if args.len() == 2
+                    && matches!(
+                        Self::call_callee_name(callee).as_deref(),
+                        Some("array.get" | "table.get")
+                    ) =>
+            {
+                Some((&args[0], &args[1]))
+            }
+            ExprKind::Paren(inner) => Self::extract_index_operands(inner),
+            _ => None,
+        }
+    }
+
     fn is_index_expr(expr: &Expr) -> bool {
         match &expr.kind {
             ExprKind::Index { .. } => true,
+            ExprKind::Call { callee, args, .. }
+                if args.len() == 2
+                    && matches!(
+                        Self::call_callee_name(callee).as_deref(),
+                        Some("array.get" | "table.get")
+                    ) =>
+            {
+                true
+            }
             ExprKind::Paren(inner) => Self::is_index_expr(inner),
             _ => false,
         }
+    }
+
+    fn lower_array_index_read(
+        &mut self,
+        arr_expr: &Expr,
+        idx_expr: &Expr,
+        span: crate::ast::Span,
+    ) -> Result<Operand, MirLowerError> {
+        let arr_op = self.lower_expr(arr_expr)?;
+        let a_loc = match arr_op {
+            Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => loc,
+            other => {
+                let arr_ty = match self.operand_definite_mir_type(&other) {
+                    MirType::Unknown => MirType::Array(Box::new(MirType::Unknown)),
+                    ty => ty,
+                };
+                let temp = self.current_fn.add_local(None, arr_ty, true, span);
+                self.emit_stmt(Statement::StorageLive(temp, span));
+                self.emit_stmt(Statement::Assign(
+                    Place::Local(temp),
+                    Rvalue::Use(other),
+                    span,
+                ));
+                temp
+            }
+        };
+        let idx_op = self.lower_expr(idx_expr)?;
+        let i_loc = match idx_op {
+            Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => loc,
+            other => {
+                let temp = self.current_fn.add_local(None, MirType::Int, true, span);
+                self.emit_stmt(Statement::StorageLive(temp, span));
+                self.emit_stmt(Statement::Assign(
+                    Place::Local(temp),
+                    Rvalue::Use(other),
+                    span,
+                ));
+                temp
+            }
+        };
+        let elem_ty = match &self.current_fn.locals[a_loc.0].ty {
+            MirType::Array(inner) => (**inner).clone(),
+            _ => MirType::Int,
+        };
+        let elem_place = Place::Index(Box::new(Place::Local(a_loc)), i_loc);
+        let val_temp = self.current_fn.add_local(None, elem_ty, true, span);
+        self.emit_stmt(Statement::StorageLive(val_temp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(val_temp),
+            Rvalue::Use(Operand::Copy(elem_place)),
+            span,
+        ));
+        Ok(Operand::Move(Place::Local(val_temp)))
+    }
+
+    fn lower_lambda(
+        &mut self,
+        params: &[(String, Option<Type>)],
+        return_type: Option<&Type>,
+        body: &Expr,
+        span: crate::ast::Span,
+    ) -> Result<Operand, MirLowerError> {
+        let (Some(_), Some(_)) = (&self.lifted_functions, &self.lambda_counter) else {
+            return Err(MirLowerError::UnlowerableExpression(
+                "lambda lifting requires module-level MIR lowering".into(),
+            ));
+        };
+
+        let mut locally_bound = HashSet::new();
+        for (p_name, _) in params {
+            locally_bound.insert(p_name.clone());
+        }
+        let mut free_vars = HashSet::new();
+        collect_lambda_free_vars_in_expr(body, &locally_bound, &mut free_vars);
+
+        let mut sorted_free: Vec<String> = free_vars.into_iter().collect();
+        sorted_free.sort();
+
+        let mut captures: Vec<(String, Operand, MirType)> = Vec::new();
+        let mut lifted_param_names: Vec<String> = Vec::new();
+        let mut lifted_param_types: Vec<MirType> = Vec::new();
+        for var_name in sorted_free {
+            if let Some(loc_id) = self.lookup_var(&var_name) {
+                let cap_ty = self.current_fn.locals[loc_id.0].ty.clone();
+                captures.push((
+                    var_name.clone(),
+                    Operand::Copy(Place::Local(loc_id)),
+                    cap_ty.clone(),
+                ));
+                lifted_param_names.push(var_name);
+                lifted_param_types.push(cap_ty);
+            }
+        }
+
+        let mut lambda_param_types: Vec<MirType> = Vec::with_capacity(params.len());
+        for (p_name, p_ty) in params {
+            let mir_ty = p_ty.as_ref().map(mir_type_from_ast).unwrap_or(MirType::Int);
+            lambda_param_types.push(mir_ty.clone());
+            lifted_param_names.push(p_name.clone());
+            lifted_param_types.push(mir_ty);
+        }
+
+        let lambda_ret_ty = return_type
+            .map(mir_type_from_ast)
+            .unwrap_or(MirType::Unknown);
+
+        let lambda_id = {
+            let counter = self.lambda_counter.as_deref_mut().unwrap();
+            let id = *counter;
+            *counter += 1;
+            id
+        };
+        let func_name = format!("__lust_lambda_{lambda_id}");
+
+        let sig = FunctionSignature {
+            name: func_name.clone(),
+            param_types: lifted_param_types,
+            return_type: lambda_ret_ty.clone(),
+            is_public: false,
+            effects: None,
+        };
+        let mut lambda_fn = MirFunction::new(sig, span);
+        for (i, p_name) in lifted_param_names.iter().enumerate() {
+            let p_id = lambda_fn.params[i];
+            lambda_fn.locals[p_id.0].name = Some(p_name.clone());
+        }
+
+        let struct_fields = self.struct_fields.clone();
+        let struct_field_types = self.struct_field_types.clone();
+        let struct_field_substructs = self.struct_field_substructs.clone();
+        let struct_layouts = self.struct_layouts.clone();
+
+        let nested_ops = {
+            let mut nested = AstLowering::new_with_module_sink(
+                &mut lambda_fn,
+                self.lifted_functions.as_deref_mut(),
+                self.lambda_counter.as_deref_mut(),
+            );
+            nested.struct_fields = struct_fields;
+            nested.struct_field_types = struct_field_types;
+            nested.struct_field_substructs = struct_field_substructs;
+            nested.struct_layouts = struct_layouts;
+
+            match &body.kind {
+                ExprKind::Block(stmts) => {
+                    let has_value_ret = !matches!(lambda_ret_ty, MirType::Unit);
+                    let len = stmts.len();
+                    for (idx, stmt) in stmts.iter().enumerate() {
+                        let is_last = idx + 1 == len;
+                        if is_last
+                            && has_value_ret
+                            && let StmtKind::Expr(tail_expr) = &stmt.kind
+                        {
+                            let val_op = nested.lower_expr_with_expected(
+                                tail_expr,
+                                Some(&lambda_ret_ty),
+                            )?;
+                            if nested.current_fn.blocks[nested.current_block.0]
+                                .terminator
+                                .is_none()
+                            {
+                                nested.terminate_block(Terminator::Return(
+                                    Some(val_op),
+                                    tail_expr.span,
+                                ));
+                            }
+                        } else {
+                            nested.lower_statement(stmt)?;
+                        }
+                    }
+                    let cur_block = nested.current_block;
+                    if nested.current_fn.blocks[cur_block.0].terminator.is_none() {
+                        if let Some(root_cleanups) = nested.cleanups.last().cloned() {
+                            for c in root_cleanups.iter().rev() {
+                                if matches!(c.kind, MirCleanupKind::Defer) {
+                                    nested.lower_statement(&c.stmt)?;
+                                }
+                            }
+                        }
+                        let final_block = nested.current_block;
+                        if nested.current_fn.blocks[final_block.0].terminator.is_none() {
+                            nested.current_fn.blocks[final_block.0].terminator =
+                                Some(Terminator::Return(None, span));
+                        }
+                    }
+                }
+                _ => {
+                    let val_op =
+                        nested.lower_expr_with_expected(body, Some(&lambda_ret_ty))?;
+                    let cur_block = nested.current_block;
+                    if nested.current_fn.blocks[cur_block.0].terminator.is_none() {
+                        nested.terminate_block(Terminator::Return(Some(val_op), body.span));
+                    }
+                }
+            }
+            nested.struct_ops
+        };
+
+        self.struct_ops.extend(nested_ops);
+        if let Some(lifted) = self.lifted_functions.as_deref_mut() {
+            lifted.push(lambda_fn);
+        }
+
+        let closure_ty = MirType::Function {
+            params: lambda_param_types,
+            return_type: Box::new(lambda_ret_ty),
+        };
+        let temp = self.current_fn.add_local(None, closure_ty, true, span);
+        self.known_typed_locals.insert(temp);
+        self.emit_stmt(Statement::StorageLive(temp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(temp),
+            Rvalue::Closure {
+                func_name,
+                captures,
+            },
+            span,
+        ));
+        Ok(Operand::Move(Place::Local(temp)))
     }
 
     fn lower_struct_method_call(
@@ -2883,6 +3447,242 @@ impl<'a> AstLowering<'a> {
 
         self.current_block = continuation_bb;
         Ok(Operand::Move(Place::Local(result_local)))
+    }
+}
+
+fn collect_pattern_bindings(pattern: &crate::ast::Pattern, bound: &mut HashSet<String>) {
+    match pattern {
+        crate::ast::Pattern::Identifier(name) => {
+            bound.insert(name.clone());
+        }
+        crate::ast::Pattern::Enum { bindings, .. } => {
+            for b in bindings {
+                collect_pattern_bindings(b, bound);
+            }
+        }
+        crate::ast::Pattern::Struct { fields, .. } => {
+            for (_, p) in fields {
+                collect_pattern_bindings(p, bound);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_lambda_free_vars_in_expr(
+    expr: &Expr,
+    locally_bound: &HashSet<String>,
+    free_vars: &mut HashSet<String>,
+) {
+    match &expr.kind {
+        ExprKind::Literal(_) | ExprKind::RegexLiteral { .. } => {}
+        ExprKind::Identifier(name) => {
+            if !locally_bound.contains(name) {
+                free_vars.insert(name.clone());
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_lambda_free_vars_in_expr(left, locally_bound, free_vars);
+            collect_lambda_free_vars_in_expr(right, locally_bound, free_vars);
+        }
+        ExprKind::Unary { operand, .. } => {
+            collect_lambda_free_vars_in_expr(operand, locally_bound, free_vars);
+        }
+        ExprKind::Call { callee, args, .. } => {
+            collect_lambda_free_vars_in_expr(callee, locally_bound, free_vars);
+            for a in args {
+                collect_lambda_free_vars_in_expr(a, locally_bound, free_vars);
+            }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            collect_lambda_free_vars_in_expr(receiver, locally_bound, free_vars);
+            for a in args {
+                collect_lambda_free_vars_in_expr(a, locally_bound, free_vars);
+            }
+        }
+        ExprKind::FieldAccess { object, .. } => {
+            collect_lambda_free_vars_in_expr(object, locally_bound, free_vars);
+        }
+        ExprKind::Index { object, index } => {
+            collect_lambda_free_vars_in_expr(object, locally_bound, free_vars);
+            collect_lambda_free_vars_in_expr(index, locally_bound, free_vars);
+        }
+        ExprKind::Array(elems) | ExprKind::Tuple(elems) => {
+            for e in elems {
+                collect_lambda_free_vars_in_expr(e, locally_bound, free_vars);
+            }
+        }
+        ExprKind::Map(pairs) => {
+            for (k, v) in pairs {
+                collect_lambda_free_vars_in_expr(k, locally_bound, free_vars);
+                collect_lambda_free_vars_in_expr(v, locally_bound, free_vars);
+            }
+        }
+        ExprKind::StructLiteral { fields, .. } => {
+            for f in fields {
+                collect_lambda_free_vars_in_expr(&f.value, locally_bound, free_vars);
+            }
+        }
+        ExprKind::EnumConstructor { args, .. } => {
+            for a in args {
+                collect_lambda_free_vars_in_expr(a, locally_bound, free_vars);
+            }
+        }
+        ExprKind::Lambda { params, body, .. } => {
+            let mut inner_bound = locally_bound.clone();
+            for (p_name, _) in params {
+                inner_bound.insert(p_name.clone());
+            }
+            collect_lambda_free_vars_in_expr(body, &inner_bound, free_vars);
+        }
+        ExprKind::Paren(inner)
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::TypeCheck { expr: inner, .. }
+        | ExprKind::IsPattern { expr: inner, .. } => {
+            collect_lambda_free_vars_in_expr(inner, locally_bound, free_vars);
+        }
+        ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_lambda_free_vars_in_expr(condition, locally_bound, free_vars);
+            let mut then_bound = locally_bound.clone();
+            if let ExprKind::IsPattern { pattern, .. } = &condition.kind {
+                collect_pattern_bindings(pattern, &mut then_bound);
+            }
+            collect_lambda_free_vars_in_expr(then_branch, &then_bound, free_vars);
+            if let Some(eb) = else_branch {
+                collect_lambda_free_vars_in_expr(eb, locally_bound, free_vars);
+            }
+        }
+        ExprKind::Block(stmts) | ExprKind::EffectBlock(stmts) => {
+            let mut inner_bound = locally_bound.clone();
+            collect_lambda_free_vars_in_stmts(stmts, &mut inner_bound, free_vars);
+        }
+        ExprKind::Return(exprs) => {
+            for e in exprs {
+                collect_lambda_free_vars_in_expr(e, locally_bound, free_vars);
+            }
+        }
+        ExprKind::Range { start, end, .. } => {
+            collect_lambda_free_vars_in_expr(start, locally_bound, free_vars);
+            collect_lambda_free_vars_in_expr(end, locally_bound, free_vars);
+        }
+    }
+}
+
+fn collect_lambda_free_vars_in_stmts(
+    stmts: &[Stmt],
+    locally_bound: &mut HashSet<String>,
+    free_vars: &mut HashSet<String>,
+) {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::Local {
+                bindings,
+                initializer,
+            } => {
+                if let Some(inits) = initializer {
+                    for i in inits {
+                        collect_lambda_free_vars_in_expr(i, locally_bound, free_vars);
+                    }
+                }
+                for b in bindings {
+                    locally_bound.insert(b.name.clone());
+                }
+            }
+            StmtKind::Assign { targets, values } => {
+                for v in values {
+                    collect_lambda_free_vars_in_expr(v, locally_bound, free_vars);
+                }
+                for t in targets {
+                    collect_lambda_free_vars_in_expr(t, locally_bound, free_vars);
+                }
+            }
+            StmtKind::CompoundAssign { target, value, .. } => {
+                collect_lambda_free_vars_in_expr(value, locally_bound, free_vars);
+                collect_lambda_free_vars_in_expr(target, locally_bound, free_vars);
+            }
+            StmtKind::Expr(e) => {
+                collect_lambda_free_vars_in_expr(e, locally_bound, free_vars);
+            }
+            StmtKind::If {
+                condition,
+                then_block,
+                elseif_branches,
+                else_block,
+            } => {
+                collect_lambda_free_vars_in_expr(condition, locally_bound, free_vars);
+                let mut then_bound = locally_bound.clone();
+                if let ExprKind::IsPattern { pattern, .. } = &condition.kind {
+                    collect_pattern_bindings(pattern, &mut then_bound);
+                }
+                collect_lambda_free_vars_in_stmts(then_block, &mut then_bound, free_vars);
+                for (c, body) in elseif_branches {
+                    collect_lambda_free_vars_in_expr(c, locally_bound, free_vars);
+                    let mut elif_bound = locally_bound.clone();
+                    if let ExprKind::IsPattern { pattern, .. } = &c.kind {
+                        collect_pattern_bindings(pattern, &mut elif_bound);
+                    }
+                    collect_lambda_free_vars_in_stmts(body, &mut elif_bound, free_vars);
+                }
+                if let Some(eb) = else_block {
+                    let mut else_bound = locally_bound.clone();
+                    collect_lambda_free_vars_in_stmts(eb, &mut else_bound, free_vars);
+                }
+            }
+            StmtKind::While { condition, body } => {
+                collect_lambda_free_vars_in_expr(condition, locally_bound, free_vars);
+                let mut body_bound = locally_bound.clone();
+                if let ExprKind::IsPattern { pattern, .. } = &condition.kind {
+                    collect_pattern_bindings(pattern, &mut body_bound);
+                }
+                collect_lambda_free_vars_in_stmts(body, &mut body_bound, free_vars);
+            }
+            StmtKind::ForNumeric {
+                variable,
+                start,
+                end,
+                step,
+                body,
+            } => {
+                collect_lambda_free_vars_in_expr(start, locally_bound, free_vars);
+                collect_lambda_free_vars_in_expr(end, locally_bound, free_vars);
+                if let Some(s) = step {
+                    collect_lambda_free_vars_in_expr(s, locally_bound, free_vars);
+                }
+                let mut body_bound = locally_bound.clone();
+                body_bound.insert(variable.clone());
+                collect_lambda_free_vars_in_stmts(body, &mut body_bound, free_vars);
+            }
+            StmtKind::ForIn {
+                variables,
+                iterator,
+                body,
+            } => {
+                collect_lambda_free_vars_in_expr(iterator, locally_bound, free_vars);
+                let mut body_bound = locally_bound.clone();
+                for v in variables {
+                    body_bound.insert(v.clone());
+                }
+                collect_lambda_free_vars_in_stmts(body, &mut body_bound, free_vars);
+            }
+            StmtKind::Return(exprs) => {
+                for e in exprs {
+                    collect_lambda_free_vars_in_expr(e, locally_bound, free_vars);
+                }
+            }
+            StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Block(inner) | StmtKind::Scoped(inner) => {
+                let mut inner_bound = locally_bound.clone();
+                collect_lambda_free_vars_in_stmts(inner, &mut inner_bound, free_vars);
+            }
+            StmtKind::Defer(s) | StmtKind::ErrDefer(s) => {
+                let mut inner_bound = locally_bound.clone();
+                collect_lambda_free_vars_in_stmts(core::slice::from_ref(s.as_ref()), &mut inner_bound, free_vars);
+            }
+        }
     }
 }
 

@@ -291,6 +291,7 @@ pub struct CompiledBytecode {
     pub(crate) entry_module: String,
     pub(crate) entry_script: Option<String>,
     pub(crate) functions: Vec<crate::bytecode::Function>,
+    pub(crate) mir_functions: Vec<crate::mir::ir::MirFunction>,
     pub(crate) signatures: HashMap<String, FunctionSignature>,
     pub(crate) struct_defs: HashMap<String, StructDef>,
     pub(crate) enum_defs: HashMap<String, EnumDef>,
@@ -380,6 +381,9 @@ impl EmbeddedProgram {
         let mut vm = VM::with_config(&bytecode.config);
         vm.load_functions(bytecode.functions.clone());
         vm.register_structs(&bytecode.struct_defs);
+        for mir_fn in &bytecode.mir_functions {
+            vm.register_mir_candidate(mir_fn.clone());
+        }
         bytecode.extern_registry.register_type_stubs(&mut vm);
         for (type_name, trait_name) in &bytecode.trait_impls {
             vm.register_trait_impl(type_name.clone(), trait_name.clone());
@@ -539,8 +543,13 @@ impl EmbeddedProgram {
         self.vm.dump_externs_to_dir(output_root)
     }
 
-    pub(crate) fn vm(&self) -> &VM {
+    pub fn vm(&self) -> &VM {
         &self.vm
+    }
+
+    #[inline]
+    pub fn cranelift_native_entry_count(&self) -> u64 {
+        self.vm.cranelift_native_entry_count()
     }
 
     pub fn global_names(&self) -> Vec<String> {
@@ -1171,27 +1180,59 @@ impl EmbeddedProgram {
         Args: FunctionArgs,
         Ret: FromLustValue,
     {
-        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(feature = "std")]
         if self.vm.has_native_entry(handle.func_idx) {
-            let mut opt_args = Some(args);
-            if let Some(res) = self.vm.call_direct_fast_with(handle.func_idx, |dst| {
-                opt_args.take().unwrap().write_args(dst)
-            }) {
-                return Ret::from_value(res?);
-            }
-            if let Some(args) = opt_args {
-                let mut stack_args = [const { Value::Nil }; 16];
+            if self
+                .vm
+                .functions()
+                .get(handle.func_idx)
+                .is_some_and(|f| f.param_count <= 4 && f.name == handle.expected_name)
+            {
+                let mut stack_args = [const { Value::Nil }; 4];
                 let arg_count = args.write_args(&mut stack_args);
-                let value = self.vm.call_retained_target_slice(
-                    handle.func_idx,
-                    &handle.expected_name,
-                    &stack_args[..arg_count],
-                )?;
-                return Ret::from_value(value);
+                if arg_count <= 4 {
+                    if let Some(res) = self
+                        .vm
+                        .try_call_cranelift_scalar_direct(handle.func_idx, &stack_args[..arg_count])
+                    {
+                        return Ret::from_value(res?);
+                    }
+                    let value = self.vm.call_retained_target_slice(
+                        handle.func_idx,
+                        &handle.expected_name,
+                        &stack_args[..arg_count],
+                    )?;
+                    return Ret::from_value(value);
+                }
+                return Err(LustError::RuntimeError {
+                    message: format!(
+                        "Arity mismatch in call_handle for '{}': expected <= 4 arguments, got {}",
+                        handle.expected_name, arg_count
+                    ),
+                });
             }
-            return Err(LustError::RuntimeError {
-                message: "Internal error in native call".to_string(),
-            });
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            {
+                let mut opt_args = Some(args);
+                if let Some(res) = self.vm.call_direct_fast_with(handle.func_idx, |dst| {
+                    opt_args.take().unwrap().write_args(dst)
+                }) {
+                    return Ret::from_value(res?);
+                }
+                if let Some(args) = opt_args {
+                    let mut stack_args = [const { Value::Nil }; 16];
+                    let arg_count = args.write_args(&mut stack_args);
+                    let value = self.vm.call_retained_target_slice(
+                        handle.func_idx,
+                        &handle.expected_name,
+                        &stack_args[..arg_count],
+                    )?;
+                    return Ret::from_value(value);
+                }
+                return Err(LustError::RuntimeError {
+                    message: "Internal error in native call".to_string(),
+                });
+            }
         }
 
         let mut stack_args = [const { Value::Nil }; 16];
@@ -1248,27 +1289,59 @@ impl EmbeddedProgram {
             idx
         };
 
-        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(feature = "std")]
         if self.vm.has_native_entry(func_idx) {
-            let mut opt_args = Some(args);
-            if let Some(res) = self.vm.call_direct_fast_with(func_idx, |dst| {
-                opt_args.take().unwrap().write_args(dst)
-            }) {
-                return R::from_value(res?);
-            }
-            if let Some(args) = opt_args {
-                let mut stack_args = [const { Value::Nil }; 16];
+            if self
+                .vm
+                .functions()
+                .get(func_idx)
+                .is_some_and(|f| f.param_count <= 4 && f.name == function_name)
+            {
+                let mut stack_args = [const { Value::Nil }; 4];
                 let arg_count = args.write_args(&mut stack_args);
-                let value = self.vm.call_retained_target_slice(
-                    func_idx,
-                    function_name,
-                    &stack_args[..arg_count],
-                )?;
-                return R::from_value(value);
+                if arg_count <= 4 {
+                    if let Some(res) = self
+                        .vm
+                        .try_call_cranelift_scalar_direct(func_idx, &stack_args[..arg_count])
+                    {
+                        return R::from_value(res?);
+                    }
+                    let value = self.vm.call_retained_target_slice(
+                        func_idx,
+                        function_name,
+                        &stack_args[..arg_count],
+                    )?;
+                    return R::from_value(value);
+                }
+                return Err(LustError::RuntimeError {
+                    message: format!(
+                        "Arity mismatch in call_typed for '{}': expected <= 4 arguments, got {}",
+                        function_name, arg_count
+                    ),
+                });
             }
-            return Err(LustError::RuntimeError {
-                message: "Internal error in native call".to_string(),
-            });
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            {
+                let mut opt_args = Some(args);
+                if let Some(res) = self.vm.call_direct_fast_with(func_idx, |dst| {
+                    opt_args.take().unwrap().write_args(dst)
+                }) {
+                    return R::from_value(res?);
+                }
+                if let Some(args) = opt_args {
+                    let mut stack_args = [const { Value::Nil }; 16];
+                    let arg_count = args.write_args(&mut stack_args);
+                    let value = self.vm.call_retained_target_slice(
+                        func_idx,
+                        function_name,
+                        &stack_args[..arg_count],
+                    )?;
+                    return R::from_value(value);
+                }
+                return Err(LustError::RuntimeError {
+                    message: "Internal error in native call".to_string(),
+                });
+            }
         }
 
         let mut stack_args = [const { Value::Nil }; 16];
@@ -2330,6 +2403,10 @@ pub(crate) fn compile_to_bytecode(
         }
     }
 
+    let want_cranelift = config.cranelift_jit()
+        || std::env::var("LUST_JIT_BACKEND").as_deref() == Ok("cranelift")
+        || std::env::var("LUST_BACKEND").as_deref() == Ok("cranelift");
+
     #[cfg(feature = "std")]
     let cache_key = if extern_registry.is_empty() && extern_exports.is_empty() {
         use std::hash::{Hash, Hasher};
@@ -2343,6 +2420,8 @@ pub(crate) fn compile_to_bytecode(
             s.hash(&mut hasher);
         }
         config.jit_enabled().hash(&mut hasher);
+        want_cranelift.hash(&mut hasher);
+        config.use_mir().hash(&mut hasher);
         config.minimal_runtime_types().hash(&mut hasher);
         config.low_memory_mode().hash(&mut hasher);
         config.prelude_mode().hash(&mut hasher);
@@ -2456,8 +2535,11 @@ pub(crate) fn compile_to_bytecode(
     compiler.set_imports_by_module(imports_map);
     compiler.set_entry_module(program_entry_module.clone());
     compiler.set_function_signatures(signatures);
+    compiler.set_struct_defs(struct_defs.clone());
     compiler.set_minimal_runtime_types(config.minimal_runtime_types());
+    compiler.set_collect_mir(want_cranelift || config.use_mir());
     let functions = compiler.compile_module(&wrapped_items)?;
+    let mir_functions = compiler.take_mir_functions();
     let trait_impls = compiler.get_trait_impls().to_vec();
     // Recover signatures from compiler (avoids keeping two copies alive simultaneously)
     let mut signatures = compiler.take_function_signatures();
@@ -2485,6 +2567,7 @@ pub(crate) fn compile_to_bytecode(
         entry_module: program_entry_module,
         entry_script,
         functions,
+        mir_functions,
         signatures,
         struct_defs,
         enum_defs,

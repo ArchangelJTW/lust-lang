@@ -1,6 +1,7 @@
 //! Cranelift JIT dispatch, eligibility checks, and compound value marshaling for the Lust VM.
 
 use crate::ast::types::TypeKind;
+use crate::bytecode::value::UnboxedArrayData;
 use crate::bytecode::{
     FlatArrayBuffer, FlatArrayElemTag, LustArray, LustMap, StructLayout, StructObject, Value,
 };
@@ -202,6 +203,7 @@ pub fn validate_and_decode_array(
     let base_ptr = alloc_rec.base_ptr;
     let len_raw = unsafe { *base_ptr };
     let cap_raw = unsafe { *base_ptr.add(1) };
+    let is_bool = matches!(expected_elem_ty, MirType::Bool);
     let (len, data_ptr) = if cap_raw < 0 {
         let (len, _cap, data_ptr) = mir_ctx
             .resolve_validated_array_data(base_ptr)
@@ -227,14 +229,19 @@ pub fn validate_and_decode_array(
                 message: format!("Malformed array header: len ({len}) > cap ({cap})"),
             });
         }
-        if cap
-            .checked_add(2)
+        let needed_payload_words = if is_bool {
+            cap.checked_add(7).map(|n| n / 8)
+        } else {
+            Some(cap)
+        };
+        if needed_payload_words
+            .and_then(|w| w.checked_add(2))
             .is_none_or(|needed| needed > alloc_rec.word_capacity)
         {
             return Err(LustError::RuntimeError {
                 message: format!(
                     "Malformed array header: extent ({} words) exceeds owned buffer capacity ({} words)",
-                    cap + 2,
+                    needed_payload_words.unwrap_or(cap).saturating_add(2),
                     alloc_rec.word_capacity
                 ),
             });
@@ -242,18 +249,26 @@ pub fn validate_and_decode_array(
         (len, unsafe { base_ptr.add(2) as *const i64 })
     };
 
-    // Element decoding (supports both flat inline and cap < 0 redirected backing buffers)
+    // Element decoding (supports both flat inline and cap < 0 redirected backing buffers;
+    // Bool arrays use 1-byte u8 element stride per NG-W10-5).
     let mut elements = Vec::with_capacity(len);
-    for i in 0..len {
-        let raw = unsafe { *data_ptr.add(i) };
-        let elem = match expected_elem_ty {
-            MirType::Int => Value::Int(raw),
-            MirType::Bool => Value::Bool(raw != 0),
-            MirType::Float => Value::Float(f64::from_bits(raw as u64)),
-            MirType::String => mir_ctx.get_handle(raw).unwrap_or_else(|| Value::string("")),
-            _ => unreachable!("validated primitive array element type"),
-        };
-        elements.push(elem);
+    if is_bool {
+        let byte_ptr = data_ptr as *const u8;
+        for i in 0..len {
+            let raw = unsafe { *byte_ptr.add(i) };
+            elements.push(Value::Bool(raw != 0));
+        }
+    } else {
+        for i in 0..len {
+            let raw = unsafe { *data_ptr.add(i) };
+            let elem = match expected_elem_ty {
+                MirType::Int => Value::Int(raw),
+                MirType::Float => Value::Float(f64::from_bits(raw as u64)),
+                MirType::String => mir_ctx.get_handle(raw).unwrap_or_else(|| Value::string("")),
+                _ => unreachable!("validated primitive array element type"),
+            };
+            elements.push(elem);
+        }
     }
 
     // Match against input arrays to preserve Rc identity
@@ -1040,6 +1055,19 @@ fn compute_readonly_params_with_structs(
                                     }
                                 }
                             }
+                            Rvalue::Closure { captures, .. } => {
+                                for (_, op, _) in captures {
+                                    if let Some(src) =
+                                        operand_alias_source_local(op, &f.locals, struct_meta)
+                                        && src < l_len
+                                    {
+                                        if union_bool_row(&mut mutated[fi], &alias_params[fi][src])
+                                        {
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
                             Rvalue::BinaryOp(..) | Rvalue::UnaryOp(..) => {}
                         },
                         Place::Field(..) | Place::Index(..) => {
@@ -1067,6 +1095,21 @@ fn compute_readonly_params_with_structs(
                                     for elem in elems {
                                         if let Some(src) =
                                             operand_alias_source_local(elem, &f.locals, struct_meta)
+                                            && src < l_len
+                                        {
+                                            if union_bool_row(
+                                                &mut mutated[fi],
+                                                &alias_params[fi][src],
+                                            ) {
+                                                changed = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                Rvalue::Closure { captures, .. } => {
+                                    for (_, op, _) in captures {
+                                        if let Some(src) =
+                                            operand_alias_source_local(op, &f.locals, struct_meta)
                                             && src < l_len
                                         {
                                             if union_bool_row(
@@ -1413,9 +1456,119 @@ pub fn build_or_get_cached_flat_array(
         return Ok(Some((buf, true)));
     }
 
-    // Step 1: Checked byte calculation `(len + 2) * 8`
+    // Fast-path for unboxed typed primitive arrays (NG-W10-1 + NG-W10-5):
+    // Copy directly via single `ptr::copy_nonoverlapping` without materializing `Vec<Value>`.
+    let unboxed_res: Option<Result<Option<Rc<FlatArrayBuffer>>>> = rc.with_unboxed_data(|unb| {
+        let len = match (unb, tag) {
+            (UnboxedArrayData::None, _) => return None,
+            (UnboxedArrayData::Int(v), FlatArrayElemTag::Int) => v.len(),
+            (UnboxedArrayData::Float(v), FlatArrayElemTag::Float) => v.len(),
+            (UnboxedArrayData::Bool(v), FlatArrayElemTag::Bool) => v.len(),
+            (UnboxedArrayData::Int(v), _) if v.is_empty() => 0,
+            (UnboxedArrayData::Float(v), _) if v.is_empty() => 0,
+            (UnboxedArrayData::Bool(v), _) if v.is_empty() => 0,
+            _ => return Some(Ok(None)),
+        };
+
+        let payload_words = if tag == FlatArrayElemTag::Bool {
+            let Some(w) = len.checked_add(7).map(|n| n / 8) else {
+                mir_ctx.set_status(MIR_STATUS_ERR_OOM);
+                return Some(Err(LustError::RuntimeError {
+                    message: "Out of memory: flat bool array cache word length overflow".into(),
+                }));
+            };
+            w
+        } else {
+            len
+        };
+        let Some(word_len) = payload_words.checked_add(2) else {
+            mir_ctx.set_status(MIR_STATUS_ERR_OOM);
+            return Some(Err(LustError::RuntimeError {
+                message: "Out of memory: flat array cache word length overflow".into(),
+            }));
+        };
+        let Some(req_bytes_u) = word_len.checked_mul(core::mem::size_of::<i64>()) else {
+            mir_ctx.set_status(MIR_STATUS_ERR_OOM);
+            return Some(Err(LustError::RuntimeError {
+                message: "Out of memory: flat array cache byte size overflow".into(),
+            }));
+        };
+        let Ok(req_bytes) = i64::try_from(req_bytes_u) else {
+            mir_ctx.set_status(MIR_STATUS_ERR_OOM);
+            return Some(Err(LustError::RuntimeError {
+                message: "Out of memory: flat array cache byte size exceeds i64::MAX".into(),
+            }));
+        };
+
+        let limit = mir_ctx
+            .max_memory_limit
+            .load(core::sync::atomic::Ordering::SeqCst);
+        let prev = mir_ctx
+            .memory_used
+            .fetch_add(req_bytes, core::sync::atomic::Ordering::SeqCst);
+        let mem_rollback = core::mem::DropGuard::new(req_bytes, |bytes| {
+            mir_ctx
+                .memory_used
+                .fetch_sub(bytes, core::sync::atomic::Ordering::SeqCst);
+        });
+        if prev.saturating_add(req_bytes) > limit {
+            mir_ctx.set_status(MIR_STATUS_ERR_OOM);
+            return Some(Err(LustError::RuntimeError {
+                message: "Out of memory allocating cached flat array buffer for Cranelift JIT"
+                    .into(),
+            }));
+        }
+
+        let mut words = Vec::<i64>::new();
+        if words.try_reserve_exact(word_len).is_err() {
+            mir_ctx.set_status(MIR_STATUS_ERR_OOM);
+            return Some(Err(LustError::RuntimeError {
+                message: "Out of memory reserving host buffer for cached flat array".into(),
+            }));
+        }
+        words.resize(word_len, 0);
+        words[0] = len as i64;
+        words[1] = len as i64;
+        if len > 0 {
+            unsafe {
+                let dst = words.as_mut_ptr().add(2);
+                match (unb, tag) {
+                    (UnboxedArrayData::Int(v), FlatArrayElemTag::Int) => {
+                        core::ptr::copy_nonoverlapping(v.as_ptr(), dst, len);
+                    }
+                    (UnboxedArrayData::Float(v), FlatArrayElemTag::Float) => {
+                        core::ptr::copy_nonoverlapping(v.as_ptr() as *const i64, dst, len);
+                    }
+                    (UnboxedArrayData::Bool(v), FlatArrayElemTag::Bool) => {
+                        core::ptr::copy_nonoverlapping(v.as_ptr(), dst as *mut u8, len);
+                    }
+                    _ => unreachable!("unboxed array tag pre-verified"),
+                }
+            }
+        }
+        let buf = Rc::new(FlatArrayBuffer::new(words));
+        rc.set_cached_flat(tag, Rc::clone(&buf));
+        core::mem::DropGuard::dismiss(mem_rollback);
+        Some(Ok(Some(buf)))
+    });
+    if let Some(res) = unboxed_res {
+        return Ok(res?.map(|buf| (buf, false)));
+    }
+
+    // Step 1: Checked byte calculation (`(payload_words + 2) * 8`; 1-byte stride for Bool)
     let len = elements.len();
-    let Some(word_len) = len.checked_add(2) else {
+    let payload_words = if tag == FlatArrayElemTag::Bool {
+        let Some(w) = len.checked_add(7).map(|n| n / 8) else {
+            mir_ctx.set_status(MIR_STATUS_ERR_OOM);
+            return Err(LustError::RuntimeError {
+                message: "Out of memory: flat bool array cache word length overflow".into(),
+            });
+        };
+        w
+    } else {
+        len
+    };
+    let Some(word_len) = payload_words.checked_add(2) else {
         mir_ctx.set_status(MIR_STATUS_ERR_OOM);
         return Err(LustError::RuntimeError {
             message: "Out of memory: flat array cache word length overflow".into(),
@@ -1461,19 +1614,36 @@ pub fn build_or_get_cached_flat_array(
             message: "Out of memory reserving host buffer for cached flat array".into(),
         });
     }
-    words.push(len as i64);
-    words.push(len as i64);
-    for elem in elements {
-        let raw = match (elem, tag) {
-            (Value::Int(n), FlatArrayElemTag::Int) => *n,
-            (Value::Float(f), FlatArrayElemTag::Float) => f.to_bits() as i64,
-            (Value::Bool(b), FlatArrayElemTag::Bool) => i64::from(*b),
-            _ => {
-                // Element type mismatch: `mem_rollback` refunds reserved bytes, leave flat_cache untouched.
-                return Ok(None);
+    if tag == FlatArrayElemTag::Bool {
+        words.resize(word_len, 0);
+        words[0] = len as i64;
+        words[1] = len as i64;
+        let dst_bytes = unsafe { words.as_mut_ptr().add(2) as *mut u8 };
+        for (idx, elem) in elements.iter().enumerate() {
+            match elem {
+                Value::Bool(b) => unsafe {
+                    *dst_bytes.add(idx) = u8::from(*b);
+                },
+                _ => {
+                    // Element type mismatch: `mem_rollback` refunds reserved bytes, leave flat_cache untouched.
+                    return Ok(None);
+                }
             }
-        };
-        words.push(raw);
+        }
+    } else {
+        words.push(len as i64);
+        words.push(len as i64);
+        for elem in elements {
+            let raw = match (elem, tag) {
+                (Value::Int(n), FlatArrayElemTag::Int) => *n,
+                (Value::Float(f), FlatArrayElemTag::Float) => f.to_bits() as i64,
+                _ => {
+                    // Element type mismatch: `mem_rollback` refunds reserved bytes, leave flat_cache untouched.
+                    return Ok(None);
+                }
+            };
+            words.push(raw);
+        }
     }
 
     // Step 4: Publish into `LustArray.flat_cache` ONLY after full population succeeds
@@ -1567,6 +1737,7 @@ impl VM {
                 Self::is_cranelift_eligible_operand(op)
                     && Self::is_cranelift_supported_type(target_ty)
             }
+            Rvalue::Closure { .. } => false,
         }
     }
 
@@ -2005,6 +2176,7 @@ impl VM {
                                     _ => {}
                                 }
                             }
+                            Rvalue::Closure { .. } => return false,
                         }
                     }
                     Statement::StorageLive(_, _)
@@ -3043,6 +3215,17 @@ impl VM {
             .map(|entry| entry.has_external_or_host_calls)
     }
 
+    /// Read-only inspection helper returning the compile-time `is_pure_scalar_abi` flag
+    /// for a compiled Cranelift function (`NG-W10-3`).
+    #[cfg(feature = "std")]
+    pub fn cranelift_is_pure_scalar_abi(&self, func_name: &str) -> Option<bool> {
+        let func_idx = self.functions.iter().position(|f| f.name == func_name)?;
+        self.cranelift_fn_cache
+            .get(func_idx)?
+            .as_ref()
+            .map(|entry| entry.is_pure_scalar_abi)
+    }
+
     /// Read-only inspection helper returning the total Cranelift native entry count.
     #[cfg(feature = "std")]
     pub fn cranelift_entry_count(&self) -> u64 {
@@ -3260,6 +3443,13 @@ impl VM {
                     let has_external_or_host_calls = has_ext_calls_by_name
                         .remove(&name)
                         .unwrap_or(true);
+                    let is_scalar = |t: &MirType| {
+                        matches!(t, MirType::Int | MirType::Float | MirType::Bool)
+                    };
+                    let is_pure_scalar_abi = !has_external_or_host_calls
+                        && param_types.len() <= 4
+                        && param_types.iter().all(is_scalar)
+                        && (is_scalar(&ret_type) || matches!(ret_type, MirType::Unit));
                     self.cranelift_fn_cache[func_idx] = Some(Rc::new(crate::vm::CompiledFnEntry {
                         func_name: alloc::rc::Rc::<str>::from(name.as_str()),
                         code_ptr: ptr,
@@ -3270,6 +3460,7 @@ impl VM {
                         struct_metadata_generation: current_struct_gen,
                         readonly_params,
                         has_external_or_host_calls,
+                        is_pure_scalar_abi,
                     }));
                 }
             }
@@ -3709,11 +3900,15 @@ impl VM {
         let _borrowed_array_guards: Vec<core::cell::Ref<'_, Vec<Value>>> = borrowed_array_rcs
             .iter()
             .map(|rc| {
-                rc.try_borrow().map_err(|_| LustError::RuntimeError {
-                    message:
-                        "Failed to acquire borrow for array parameter packing: mutable borrow active"
-                            .into(),
-                })
+                if rc.is_unboxed() {
+                    Ok(rc.borrow_elements_without_sync())
+                } else {
+                    rc.try_borrow().map_err(|_| LustError::RuntimeError {
+                        message:
+                            "Failed to acquire borrow for array parameter packing: mutable borrow active"
+                                .into(),
+                    })
+                }
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -3839,46 +4034,115 @@ impl VM {
                             }
                         }
 
-                        let elements = rc.try_borrow().map_err(|_| LustError::RuntimeError {
-                            message: "Failed to acquire borrow for array parameter packing: mutable borrow active".into(),
-                        })?;
-                        let all_elems_match = elements.iter().all(|elem| {
-                            matches!(
-                                (elem, &**elem_ty),
-                                (Value::Int(_), MirType::Int)
-                                    | (Value::Bool(_), MirType::Bool)
-                                    | (Value::Float(_), MirType::Float)
-                                    | (Value::String(_), MirType::String)
-                            )
-                        });
-                        if !all_elems_match {
-                            return Ok(CraneliftOutcome::Fallback);
-                        }
-
-                        let len = elements.len();
                         let elem_tag = mir_array_elem_tag(elem_ty).ok_or_else(|| LustError::RuntimeError {
                             message: format!("Unsupported non-primitive array element type {:?}", elem_ty),
                         })?;
-                        let ptr = lust_mir_alloc_array_typed(len as i64, elem_tag);
-                        if ptr.is_null() {
-                            return Err(LustError::RuntimeError {
-                                message: "Out of memory allocating array buffer for Cranelift JIT".into(),
-                            });
-                        }
-                        for (idx, elem) in elements.iter().enumerate() {
-                            let raw_elem = match (elem, &**elem_ty) {
-                                (Value::Int(n), MirType::Int) => *n,
-                                (Value::Bool(b), MirType::Bool) => i64::from(*b),
-                                (Value::Float(f), MirType::Float) => f.to_bits() as i64,
-                                (Value::String(_), MirType::String) => {
-                                    self.mir_context.register_handle(elem.clone())
-                                }
-                                _ => unreachable!("array elements pre-verified"),
+                        let unboxed_ptr_opt: Option<Result<Option<*mut i64>>> =
+                            if rc.is_unboxed() {
+                                rc.with_unboxed_data(|unb| {
+                                    let len = match (unb, &**elem_ty) {
+                                        (UnboxedArrayData::None, _) => return None,
+                                        (UnboxedArrayData::Int(v), MirType::Int) => v.len(),
+                                        (UnboxedArrayData::Float(v), MirType::Float) => v.len(),
+                                        (UnboxedArrayData::Bool(v), MirType::Bool) => v.len(),
+                                        (UnboxedArrayData::Int(v), _) if v.is_empty() => 0,
+                                        (UnboxedArrayData::Float(v), _) if v.is_empty() => 0,
+                                        (UnboxedArrayData::Bool(v), _) if v.is_empty() => 0,
+                                        _ => return Some(Ok(None)),
+                                    };
+                                    let ptr = lust_mir_alloc_array_typed(len as i64, elem_tag);
+                                    if ptr.is_null() {
+                                        return Some(Err(LustError::RuntimeError {
+                                            message: "Out of memory allocating array buffer for Cranelift JIT".into(),
+                                        }));
+                                    }
+                                    if len > 0 {
+                                        unsafe {
+                                            let dst = ptr.add(2);
+                                            match (unb, &**elem_ty) {
+                                                (UnboxedArrayData::Int(v), MirType::Int) => {
+                                                    core::ptr::copy_nonoverlapping(v.as_ptr(), dst, len);
+                                                }
+                                                (UnboxedArrayData::Float(v), MirType::Float) => {
+                                                    core::ptr::copy_nonoverlapping(
+                                                        v.as_ptr() as *const i64,
+                                                        dst,
+                                                        len,
+                                                    );
+                                                }
+                                                (UnboxedArrayData::Bool(v), MirType::Bool) => {
+                                                    core::ptr::copy_nonoverlapping(
+                                                        v.as_ptr(),
+                                                        dst as *mut u8,
+                                                        len,
+                                                    );
+                                                }
+                                                _ => unreachable!("unboxed array element type pre-verified"),
+                                            }
+                                        }
+                                    }
+                                    Some(Ok(Some(ptr)))
+                                })
+                            } else {
+                                None
                             };
-                            unsafe {
-                                *ptr.add(2 + idx) = raw_elem;
+
+                        let ptr = if let Some(unb_res) = unboxed_ptr_opt {
+                            match unb_res? {
+                                Some(ptr) => ptr,
+                                None => return Ok(CraneliftOutcome::Fallback),
                             }
-                        }
+                        } else {
+                            let elements = rc.try_borrow().map_err(|_| LustError::RuntimeError {
+                                message: "Failed to acquire borrow for array parameter packing: mutable borrow active".into(),
+                            })?;
+                            let all_elems_match = elements.iter().all(|elem| {
+                                matches!(
+                                    (elem, &**elem_ty),
+                                    (Value::Int(_), MirType::Int)
+                                        | (Value::Bool(_), MirType::Bool)
+                                        | (Value::Float(_), MirType::Float)
+                                        | (Value::String(_), MirType::String)
+                                )
+                            });
+                            if !all_elems_match {
+                                return Ok(CraneliftOutcome::Fallback);
+                            }
+
+                            let len = elements.len();
+                            let ptr = lust_mir_alloc_array_typed(len as i64, elem_tag);
+                            if ptr.is_null() {
+                                return Err(LustError::RuntimeError {
+                                    message: "Out of memory allocating array buffer for Cranelift JIT".into(),
+                                });
+                            }
+                            if matches!(&**elem_ty, MirType::Bool) {
+                                let dst_bytes = unsafe { ptr.add(2) as *mut u8 };
+                                for (idx, elem) in elements.iter().enumerate() {
+                                    let Value::Bool(b) = elem else {
+                                        unreachable!("bool array elements pre-verified");
+                                    };
+                                    unsafe {
+                                        *dst_bytes.add(idx) = u8::from(*b);
+                                    }
+                                }
+                            } else {
+                                for (idx, elem) in elements.iter().enumerate() {
+                                    let raw_elem = match (elem, &**elem_ty) {
+                                        (Value::Int(n), MirType::Int) => *n,
+                                        (Value::Float(f), MirType::Float) => f.to_bits() as i64,
+                                        (Value::String(_), MirType::String) => {
+                                            self.mir_context.register_handle(elem.clone())
+                                        }
+                                        _ => unreachable!("array elements pre-verified"),
+                                    };
+                                    unsafe {
+                                        *ptr.add(2 + idx) = raw_elem;
+                                    }
+                                }
+                            }
+                            ptr
+                        };
                         let new_idx = marshalled_arrays.len();
                         marshalled_arrays.push(MarshalledArray {
                             rc: rc.clone(),

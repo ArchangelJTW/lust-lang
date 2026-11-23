@@ -16,6 +16,8 @@ use hashbrown::{HashMap, HashSet};
 pub enum MirVmBackendError {
     #[error("Binary operator '{0:?}' is not supported by MIR VM backend")]
     UnsupportedBinaryOp(MirBinaryOp),
+    #[error("Rvalue '{0}' is not supported by MIR VM backend")]
+    UnsupportedRvalue(alloc::string::String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +293,13 @@ impl<'a> MirToBytecodeCompiler<'a> {
                                 }
                             }
                         }
+                        Rvalue::Closure { captures, .. } => {
+                            for (_, op, _) in captures {
+                                if let Operand::Constant(c) = op {
+                                    record_const(c);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -506,6 +515,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 }
                 _ => VmTypeLattice::Known(agg_ty.clone()),
             },
+            Rvalue::Closure { .. } => VmTypeLattice::Top,
         }
     }
 
@@ -993,6 +1003,85 @@ impl<'a> MirToBytecodeCompiler<'a> {
         }
     }
 
+    fn place_reads_local(place: &Place, target: LocalId) -> bool {
+        match place {
+            Place::Local(loc) => *loc == target,
+            Place::Index(base, idx) => *idx == target || Self::place_reads_local(base, target),
+            Place::Field(base, _) => Self::place_reads_local(base, target),
+        }
+    }
+
+    fn operand_reads_local(op: &Operand, target: LocalId) -> bool {
+        match op {
+            Operand::Copy(p) | Operand::Move(p) => Self::place_reads_local(p, target),
+            Operand::Constant(_) => false,
+        }
+    }
+
+    fn rvalue_reads_local(rvalue: &Rvalue, target: LocalId) -> bool {
+        match rvalue {
+            Rvalue::Use(op) | Rvalue::Cast(op, _) | Rvalue::UnaryOp(_, op) => {
+                Self::operand_reads_local(op, target)
+            }
+            Rvalue::BinaryOp(_, lhs, rhs) => {
+                Self::operand_reads_local(lhs, target) || Self::operand_reads_local(rhs, target)
+            }
+            Rvalue::Aggregate(_, elems) => {
+                elems.iter().any(|op| Self::operand_reads_local(op, target))
+            }
+            Rvalue::Closure { captures, .. } => captures
+                .iter()
+                .any(|(_, op, _)| Self::operand_reads_local(op, target)),
+        }
+    }
+
+    fn is_local_read(&self, target: LocalId) -> bool {
+        for block in &self.func.blocks {
+            for stmt in &block.statements {
+                if let Statement::Assign(place, rvalue, _) = stmt {
+                    match place {
+                        Place::Local(_) => {}
+                        Place::Index(base, idx) => {
+                            if *idx == target || Self::place_reads_local(base, target) {
+                                return true;
+                            }
+                        }
+                        Place::Field(base, _) => {
+                            if Self::place_reads_local(base, target) {
+                                return true;
+                            }
+                        }
+                    }
+                    if Self::rvalue_reads_local(rvalue, target) {
+                        return true;
+                    }
+                }
+            }
+            if let Some(term) = &block.terminator {
+                match term {
+                    Terminator::Cond { cond, .. } if Self::operand_reads_local(cond, target) => {
+                        return true;
+                    }
+                    Terminator::Switch { discr, .. }
+                        if Self::operand_reads_local(discr, target) =>
+                    {
+                        return true;
+                    }
+                    Terminator::Return(Some(op), _) if Self::operand_reads_local(op, target) => {
+                        return true;
+                    }
+                    Terminator::Call { args, .. }
+                        if args.iter().any(|a| Self::operand_reads_local(a, target)) =>
+                    {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
     fn operand_is_option(&self, op: &Operand) -> bool {
         match op {
             Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
@@ -1236,6 +1325,11 @@ impl<'a> MirToBytecodeCompiler<'a> {
                     }
                 }
             }
+            Rvalue::Closure { .. } => {
+                return Err(MirVmBackendError::UnsupportedRvalue(
+                    "Rvalue::Closure".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1400,6 +1494,68 @@ impl<'a> MirToBytecodeCompiler<'a> {
             }
             Terminator::Call { callee, args, destination, success, error: _, span } => {
                 let line = span.start_line;
+                let shadowed_by_direct = self
+                    .direct_callee_indices
+                    .is_some_and(|map| map.contains_key(callee.as_str()));
+                if !shadowed_by_direct {
+                    match (callee.as_str(), args.len()) {
+                        ("array.len", 1) => {
+                            let arr_reg = self.operand_to_reg(&args[0], line);
+                            let dest_reg = self.place_to_reg(destination);
+                            self.chunk.emit(Instruction::ArrayLen(dest_reg, arr_reg), line);
+                            if !is_fallthrough(*success) {
+                                let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
+                                self.pending_jumps.push((jump_idx, *success));
+                            }
+                            return;
+                        }
+                        ("array.push", 2) => {
+                            let arr_reg = self.operand_to_reg(&args[0], line);
+                            let val_reg = self.operand_to_reg(&args[1], line);
+                            self.chunk.emit(Instruction::ArrayPush(arr_reg, val_reg), line);
+                            if let Place::Local(dst) = destination
+                                && self.is_local_read(*dst)
+                            {
+                                self.chunk.emit(Instruction::LoadNil(dst.0 as Register), line);
+                            }
+                            if !is_fallthrough(*success) {
+                                let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
+                                self.pending_jumps.push((jump_idx, *success));
+                            }
+                            return;
+                        }
+                        ("array.set", 3) => {
+                            let arr_reg = self.operand_to_reg(&args[0], line);
+                            let idx_reg = self.operand_to_reg(&args[1], line);
+                            let val_reg = self.operand_to_reg(&args[2], line);
+                            self.chunk
+                                .emit(Instruction::SetIndex(arr_reg, idx_reg, val_reg), line);
+                            if let Place::Local(dst) = destination
+                                && self.is_local_read(*dst)
+                            {
+                                self.chunk.emit(Instruction::LoadNil(dst.0 as Register), line);
+                            }
+                            if !is_fallthrough(*success) {
+                                let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
+                                self.pending_jumps.push((jump_idx, *success));
+                            }
+                            return;
+                        }
+                        ("array.get_unwrap", 2) => {
+                            let arr_reg = self.operand_to_reg(&args[0], line);
+                            let idx_reg = self.operand_to_reg(&args[1], line);
+                            let dest_reg = self.place_to_reg(destination);
+                            self.chunk
+                                .emit(Instruction::ArrayGetUnwrap(dest_reg, arr_reg, idx_reg), line);
+                            if !is_fallthrough(*success) {
+                                let jump_idx = self.chunk.emit(Instruction::Jump(0), line);
+                                self.pending_jumps.push((jump_idx, *success));
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 let arg_count = args.len() as u8;
                 let first_arg_reg = if arg_count > 0 {
                     let scratch_base = self.next_scratch();

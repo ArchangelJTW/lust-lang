@@ -764,11 +764,38 @@ pub struct CachedFlatArray {
     pub buf: Rc<FlatArrayBuffer>,
 }
 
-/// Compiler-enforced encapsulated Lust array (`PERF-T4-3`).
+/// Typed unboxed primitive storage for homogeneous `LustArray` instances (`NG-W10-1`).
 ///
-/// Every mutable access (`borrow_mut` / `try_borrow_mut`) unconditionally increments
-/// `generation` and clears `flat_cache` BEFORE returning `RefMut<'_, Vec<Value>>`,
-/// eliminating stale cached flat views even across external Rust mutations outside VM opcodes.
+/// Keeps `bool` arrays at 1 byte per element (`Vec<u8>`) and `int`/`float` arrays
+/// at 8 bytes per element (`Vec<i64>`/`Vec<f64>`) without boxing into 16-byte `Value`s.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnboxedArrayData {
+    None,
+    Int(Vec<i64>),
+    Float(Vec<f64>),
+    Bool(Vec<u8>),
+}
+
+#[inline]
+fn synthetic_borrow_error() -> BorrowError {
+    let tmp = RefCell::new(());
+    let _m = tmp.borrow_mut();
+    tmp.try_borrow().unwrap_err()
+}
+
+#[inline]
+fn synthetic_borrow_mut_error() -> BorrowMutError {
+    let tmp = RefCell::new(());
+    let _r = tmp.borrow();
+    tmp.try_borrow_mut().unwrap_err()
+}
+
+/// Compiler-enforced encapsulated Lust array (`PERF-T4-3`, `NG-W10-1`).
+///
+/// Every mutable access (`borrow_mut` / `try_borrow_mut` / unboxed mutators)
+/// unconditionally increments `generation` and clears `flat_cache` BEFORE
+/// returning (or before completing mutation), eliminating stale cached flat
+/// views even across external Rust mutations outside VM opcodes.
 /// `elements` is placed first under `#[repr(C)]` so `jit::layout::rc_vec_layout` probes
 /// the `RefCell<Vec<Value>>` header deterministically at offset 0 of `LustArray`.
 #[repr(C)]
@@ -776,8 +803,12 @@ pub struct CachedFlatArray {
 pub struct LustArray {
     elements: RefCell<Vec<Value>>,
     generation: Cell<u64>,
+    has_flat_cache: Cell<bool>,
     flat_cache: RefCell<Option<CachedFlatArray>>,
+    unboxed: RefCell<UnboxedArrayData>,
 }
+
+const _: () = assert!(core::mem::offset_of!(LustArray, elements) == 0);
 
 impl LustArray {
     #[inline]
@@ -785,7 +816,9 @@ impl LustArray {
         Self {
             elements: RefCell::new(elements),
             generation: Cell::new(1),
+            has_flat_cache: Cell::new(false),
             flat_cache: RefCell::new(None),
+            unboxed: RefCell::new(UnboxedArrayData::None),
         }
     }
 
@@ -809,21 +842,401 @@ impl LustArray {
     fn invalidate_flat_cache(&self) {
         let next = self.generation.get().wrapping_add(1).max(1);
         self.generation.set(next);
-        self.flat_cache.replace(None);
+        if self.has_flat_cache.replace(false) {
+            self.flat_cache.replace(None);
+        }
+    }
+
+    #[inline]
+    fn materialize_into(elems: &mut Vec<Value>, unb: &mut UnboxedArrayData) {
+        match core::mem::replace(unb, UnboxedArrayData::None) {
+            UnboxedArrayData::None => {}
+            UnboxedArrayData::Int(v) => {
+                debug_assert!(
+                    elems.is_empty(),
+                    "LustArray invariant violated: elements non-empty while unboxed Int active"
+                );
+                elems.reserve(v.len());
+                elems.extend(v.into_iter().map(|x| Value::Int(x as LustInt)));
+            }
+            UnboxedArrayData::Float(v) => {
+                debug_assert!(
+                    elems.is_empty(),
+                    "LustArray invariant violated: elements non-empty while unboxed Float active"
+                );
+                elems.reserve(v.len());
+                elems.extend(v.into_iter().map(|x| Value::Float(x as LustFloat)));
+            }
+            UnboxedArrayData::Bool(v) => {
+                debug_assert!(
+                    elems.is_empty(),
+                    "LustArray invariant violated: elements non-empty while unboxed Bool active"
+                );
+                elems.reserve(v.len());
+                elems.extend(v.into_iter().map(|b| Value::Bool(b != 0)));
+            }
+        }
+    }
+
+    #[inline]
+    pub fn sync_unboxed_to_elements(&self) {
+        let has_unboxed = !matches!(*self.unboxed.borrow(), UnboxedArrayData::None);
+        if has_unboxed {
+            let mut elems = self.elements.borrow_mut();
+            let mut unb = self.unboxed.borrow_mut();
+            Self::materialize_into(&mut elems, &mut unb);
+        }
+    }
+
+    #[inline]
+    pub fn is_unboxed(&self) -> bool {
+        !matches!(*self.unboxed.borrow(), UnboxedArrayData::None)
+    }
+
+    /// Read-only inspection of the backing boxed `elements` vector without
+    /// triggering lazy materialization from `unboxed`.
+    #[inline]
+    pub fn borrow_elements_without_sync(&self) -> Ref<'_, Vec<Value>> {
+        self.elements.borrow()
+    }
+
+    #[inline]
+    pub fn with_unboxed_data<R>(&self, f: impl FnOnce(&UnboxedArrayData) -> R) -> R {
+        let unb = self.unboxed.borrow();
+        f(&unb)
+    }
+
+    #[inline]
+    pub fn len_fast(&self) -> usize {
+        match &*self.unboxed.borrow() {
+            UnboxedArrayData::None => self.elements.borrow().len(),
+            UnboxedArrayData::Int(v) => v.len(),
+            UnboxedArrayData::Float(v) => v.len(),
+            UnboxedArrayData::Bool(v) => v.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty_fast(&self) -> bool {
+        self.len_fast() == 0
+    }
+
+    #[inline]
+    pub fn get_value_fast(&self, idx: usize) -> Option<Value> {
+        match &*self.unboxed.borrow() {
+            UnboxedArrayData::None => self.elements.borrow().get(idx).cloned(),
+            UnboxedArrayData::Int(v) => v.get(idx).map(|&x| Value::Int(x as LustInt)),
+            UnboxedArrayData::Float(v) => v.get(idx).map(|&x| Value::Float(x as LustFloat)),
+            UnboxedArrayData::Bool(v) => v.get(idx).map(|&b| Value::Bool(b != 0)),
+        }
+    }
+
+    #[inline]
+    pub fn push_int(&self, val: i64) {
+        let needs_materialize = {
+            let mut unb = self.unboxed.borrow_mut();
+            match &mut *unb {
+                UnboxedArrayData::Int(v) => {
+                    v.push(val);
+                    false
+                }
+                UnboxedArrayData::None => {
+                    if self.elements.borrow().is_empty() {
+                        *unb = UnboxedArrayData::Int(vec![val]);
+                        false
+                    } else {
+                        true
+                    }
+                }
+                UnboxedArrayData::Float(v) if v.is_empty() => {
+                    *unb = UnboxedArrayData::Int(vec![val]);
+                    false
+                }
+                UnboxedArrayData::Bool(v) if v.is_empty() => {
+                    *unb = UnboxedArrayData::Int(vec![val]);
+                    false
+                }
+                UnboxedArrayData::Float(_) | UnboxedArrayData::Bool(_) => true,
+            }
+        };
+        if needs_materialize {
+            self.sync_unboxed_to_elements();
+            self.elements.borrow_mut().push(Value::Int(val as LustInt));
+        }
+        self.invalidate_flat_cache();
+    }
+
+    #[inline]
+    pub fn push_float(&self, val: f64) {
+        let needs_materialize = {
+            let mut unb = self.unboxed.borrow_mut();
+            match &mut *unb {
+                UnboxedArrayData::Float(v) => {
+                    v.push(val);
+                    false
+                }
+                UnboxedArrayData::None => {
+                    if self.elements.borrow().is_empty() {
+                        *unb = UnboxedArrayData::Float(vec![val]);
+                        false
+                    } else {
+                        true
+                    }
+                }
+                UnboxedArrayData::Int(v) if v.is_empty() => {
+                    *unb = UnboxedArrayData::Float(vec![val]);
+                    false
+                }
+                UnboxedArrayData::Bool(v) if v.is_empty() => {
+                    *unb = UnboxedArrayData::Float(vec![val]);
+                    false
+                }
+                UnboxedArrayData::Int(_) | UnboxedArrayData::Bool(_) => true,
+            }
+        };
+        if needs_materialize {
+            self.sync_unboxed_to_elements();
+            self.elements
+                .borrow_mut()
+                .push(Value::Float(val as LustFloat));
+        }
+        self.invalidate_flat_cache();
+    }
+
+    #[inline]
+    pub fn push_bool(&self, val: bool) {
+        let byte = u8::from(val);
+        let needs_materialize = {
+            let mut unb = self.unboxed.borrow_mut();
+            match &mut *unb {
+                UnboxedArrayData::Bool(v) => {
+                    v.push(byte);
+                    false
+                }
+                UnboxedArrayData::None => {
+                    if self.elements.borrow().is_empty() {
+                        *unb = UnboxedArrayData::Bool(vec![byte]);
+                        false
+                    } else {
+                        true
+                    }
+                }
+                UnboxedArrayData::Int(v) if v.is_empty() => {
+                    *unb = UnboxedArrayData::Bool(vec![byte]);
+                    false
+                }
+                UnboxedArrayData::Float(v) if v.is_empty() => {
+                    *unb = UnboxedArrayData::Bool(vec![byte]);
+                    false
+                }
+                UnboxedArrayData::Int(_) | UnboxedArrayData::Float(_) => true,
+            }
+        };
+        if needs_materialize {
+            self.sync_unboxed_to_elements();
+            self.elements.borrow_mut().push(Value::Bool(val));
+        }
+        self.invalidate_flat_cache();
+    }
+
+    #[inline]
+    pub fn push_value_fast(&self, val: Value) {
+        match val {
+            Value::Int(i) => self.push_int(i as i64),
+            Value::Float(f) => self.push_float(f as f64),
+            Value::Bool(b) => self.push_bool(b),
+            other => {
+                self.sync_unboxed_to_elements();
+                self.elements.borrow_mut().push(other);
+                self.invalidate_flat_cache();
+            }
+        }
+    }
+
+    #[inline]
+    pub fn set_int(&self, idx: usize, val: i64) -> Result<(), usize> {
+        let outcome = {
+            let mut unb = self.unboxed.borrow_mut();
+            match &mut *unb {
+                UnboxedArrayData::Int(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    v[idx] = val;
+                    None
+                }
+                UnboxedArrayData::None => Some(false),
+                UnboxedArrayData::Float(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    Some(true)
+                }
+                UnboxedArrayData::Bool(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    Some(true)
+                }
+            }
+        };
+        if let Some(needs_sync) = outcome {
+            if needs_sync {
+                self.sync_unboxed_to_elements();
+            }
+            let mut elems = self.elements.borrow_mut();
+            if idx >= elems.len() {
+                return Err(elems.len());
+            }
+            elems[idx] = Value::Int(val as LustInt);
+        }
+        self.invalidate_flat_cache();
+        Ok(())
+    }
+
+    #[inline]
+    pub fn set_float(&self, idx: usize, val: f64) -> Result<(), usize> {
+        let outcome = {
+            let mut unb = self.unboxed.borrow_mut();
+            match &mut *unb {
+                UnboxedArrayData::Float(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    v[idx] = val;
+                    None
+                }
+                UnboxedArrayData::None => Some(false),
+                UnboxedArrayData::Int(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    Some(true)
+                }
+                UnboxedArrayData::Bool(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    Some(true)
+                }
+            }
+        };
+        if let Some(needs_sync) = outcome {
+            if needs_sync {
+                self.sync_unboxed_to_elements();
+            }
+            let mut elems = self.elements.borrow_mut();
+            if idx >= elems.len() {
+                return Err(elems.len());
+            }
+            elems[idx] = Value::Float(val as LustFloat);
+        }
+        self.invalidate_flat_cache();
+        Ok(())
+    }
+
+    #[inline]
+    pub fn set_bool(&self, idx: usize, val: bool) -> Result<(), usize> {
+        let outcome = {
+            let mut unb = self.unboxed.borrow_mut();
+            match &mut *unb {
+                UnboxedArrayData::Bool(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    v[idx] = u8::from(val);
+                    None
+                }
+                UnboxedArrayData::None => Some(false),
+                UnboxedArrayData::Int(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    Some(true)
+                }
+                UnboxedArrayData::Float(v) => {
+                    if idx >= v.len() {
+                        return Err(v.len());
+                    }
+                    Some(true)
+                }
+            }
+        };
+        if let Some(needs_sync) = outcome {
+            if needs_sync {
+                self.sync_unboxed_to_elements();
+            }
+            let mut elems = self.elements.borrow_mut();
+            if idx >= elems.len() {
+                return Err(elems.len());
+            }
+            elems[idx] = Value::Bool(val);
+        }
+        self.invalidate_flat_cache();
+        Ok(())
+    }
+
+    #[inline]
+    pub fn set_value_fast(&self, idx: usize, val: Value) -> Result<(), usize> {
+        match val {
+            Value::Int(i) => self.set_int(idx, i as i64),
+            Value::Float(f) => self.set_float(idx, f as f64),
+            Value::Bool(b) => self.set_bool(idx, b),
+            other => {
+                let len = self.len_fast();
+                if idx >= len {
+                    return Err(len);
+                }
+                self.sync_unboxed_to_elements();
+                self.elements.borrow_mut()[idx] = other;
+                self.invalidate_flat_cache();
+                Ok(())
+            }
+        }
+    }
+
+    #[inline]
+    pub fn clear(&self) {
+        {
+            let mut unb = self.unboxed.borrow_mut();
+            *unb = UnboxedArrayData::None;
+        }
+        {
+            let mut elems = self.elements.borrow_mut();
+            elems.clear();
+        }
+        self.invalidate_flat_cache();
     }
 
     #[inline]
     pub fn borrow(&self) -> Ref<'_, Vec<Value>> {
+        self.sync_unboxed_to_elements();
         self.elements.borrow()
     }
 
     #[inline]
     pub fn try_borrow(&self) -> Result<Ref<'_, Vec<Value>>, BorrowError> {
+        let has_unboxed = {
+            let unb = self.unboxed.try_borrow()?;
+            !matches!(*unb, UnboxedArrayData::None)
+        };
+        if has_unboxed {
+            let mut elems = self
+                .elements
+                .try_borrow_mut()
+                .map_err(|_| synthetic_borrow_error())?;
+            let mut unb = self
+                .unboxed
+                .try_borrow_mut()
+                .map_err(|_| synthetic_borrow_error())?;
+            Self::materialize_into(&mut elems, &mut unb);
+        }
         self.elements.try_borrow()
     }
 
     #[inline]
     pub fn borrow_mut(&self) -> RefMut<'_, Vec<Value>> {
+        self.sync_unboxed_to_elements();
         let guard = self.elements.borrow_mut();
         self.invalidate_flat_cache();
         guard
@@ -831,13 +1244,27 @@ impl LustArray {
 
     #[inline]
     pub fn try_borrow_mut(&self) -> Result<RefMut<'_, Vec<Value>>, BorrowMutError> {
-        let guard = self.elements.try_borrow_mut()?;
+        let has_unboxed = {
+            let unb = self
+                .unboxed
+                .try_borrow()
+                .map_err(|_| synthetic_borrow_mut_error())?;
+            !matches!(*unb, UnboxedArrayData::None)
+        };
+        let mut guard = self.elements.try_borrow_mut()?;
+        if has_unboxed {
+            let mut unb = self.unboxed.try_borrow_mut()?;
+            Self::materialize_into(&mut guard, &mut unb);
+        }
         self.invalidate_flat_cache();
         Ok(guard)
     }
 
     #[inline]
     pub fn cached_flat(&self, expected_tag: FlatArrayElemTag) -> Option<Rc<FlatArrayBuffer>> {
+        if !self.has_flat_cache.get() {
+            return None;
+        }
         let cache = self.flat_cache.borrow();
         match cache.as_ref() {
             Some(c) if c.generation == self.generation.get() && c.elem_tag == expected_tag => {
@@ -849,7 +1276,7 @@ impl LustArray {
 
     #[inline]
     pub fn has_cached_flat(&self) -> bool {
-        self.flat_cache.borrow().is_some()
+        self.has_flat_cache.get()
     }
 
     #[inline]
@@ -859,10 +1286,12 @@ impl LustArray {
             elem_tag,
             buf,
         }));
+        self.has_flat_cache.set(true);
     }
 
     #[inline]
     pub fn clear_cached_flat(&self) {
+        self.has_flat_cache.set(false);
         self.flat_cache.replace(None);
     }
 }
@@ -877,6 +1306,89 @@ impl PartialEq for LustArray {
     fn eq(&self, other: &Self) -> bool {
         if core::ptr::eq(self, other) {
             return true;
+        }
+        let len = self.len_fast();
+        if len != other.len_fast() {
+            return false;
+        }
+        let fast = {
+            let a = self.unboxed.borrow();
+            let b = other.unboxed.borrow();
+            match (&*a, &*b) {
+                (UnboxedArrayData::Int(va), UnboxedArrayData::Int(vb)) => Some(va == vb),
+                (UnboxedArrayData::Float(va), UnboxedArrayData::Float(vb)) => Some(va == vb),
+                (UnboxedArrayData::Bool(va), UnboxedArrayData::Bool(vb)) => Some(va == vb),
+                (UnboxedArrayData::None, UnboxedArrayData::None) => None,
+                (
+                    UnboxedArrayData::Int(_)
+                    | UnboxedArrayData::Float(_)
+                    | UnboxedArrayData::Bool(_),
+                    UnboxedArrayData::Int(_)
+                    | UnboxedArrayData::Float(_)
+                    | UnboxedArrayData::Bool(_),
+                ) => Some(len == 0),
+                (UnboxedArrayData::Int(va), UnboxedArrayData::None) => {
+                    let vb = other.elements.borrow();
+                    Some(
+                        va.len() == vb.len()
+                            && va
+                                .iter()
+                                .zip(vb.iter())
+                                .all(|(&x, y)| matches!(y, Value::Int(yi) if (*yi as i64) == x)),
+                    )
+                }
+                (UnboxedArrayData::None, UnboxedArrayData::Int(vb)) => {
+                    let va = self.elements.borrow();
+                    Some(
+                        va.len() == vb.len()
+                            && va
+                                .iter()
+                                .zip(vb.iter())
+                                .all(|(x, &y)| matches!(x, Value::Int(xi) if (*xi as i64) == y)),
+                    )
+                }
+                (UnboxedArrayData::Float(va), UnboxedArrayData::None) => {
+                    let vb = other.elements.borrow();
+                    Some(
+                        va.len() == vb.len()
+                            && va.iter().zip(vb.iter()).all(
+                                |(&x, y)| matches!(y, Value::Float(yf) if (*yf as f64) == x),
+                            ),
+                    )
+                }
+                (UnboxedArrayData::None, UnboxedArrayData::Float(vb)) => {
+                    let va = self.elements.borrow();
+                    Some(
+                        va.len() == vb.len()
+                            && va.iter().zip(vb.iter()).all(
+                                |(x, &y)| matches!(x, Value::Float(xf) if (*xf as f64) == y),
+                            ),
+                    )
+                }
+                (UnboxedArrayData::Bool(va), UnboxedArrayData::None) => {
+                    let vb = other.elements.borrow();
+                    Some(
+                        va.len() == vb.len()
+                            && va
+                                .iter()
+                                .zip(vb.iter())
+                                .all(|(&x, y)| matches!(y, Value::Bool(yb) if *yb == (x != 0))),
+                    )
+                }
+                (UnboxedArrayData::None, UnboxedArrayData::Bool(vb)) => {
+                    let va = self.elements.borrow();
+                    Some(
+                        va.len() == vb.len()
+                            && va
+                                .iter()
+                                .zip(vb.iter())
+                                .all(|(x, &y)| matches!(x, Value::Bool(xb) if *xb == (y != 0))),
+                    )
+                }
+            }
+        };
+        if let Some(eq) = fast {
+            return eq;
         }
         *self.elements.borrow() == *other.elements.borrow()
     }
@@ -1239,7 +1751,19 @@ impl Value {
             Value::Array(arr) => {
                 #[cfg(feature = "std")]
                 sync_specialized_array(arr);
-                Some(arr.borrow().clone())
+                let unboxed_vec = arr.with_unboxed_data(|unb| match unb {
+                    UnboxedArrayData::None => None,
+                    UnboxedArrayData::Int(v) => {
+                        Some(v.iter().map(|&x| Value::Int(x as LustInt)).collect())
+                    }
+                    UnboxedArrayData::Float(v) => {
+                        Some(v.iter().map(|&x| Value::Float(x as LustFloat)).collect())
+                    }
+                    UnboxedArrayData::Bool(v) => {
+                        Some(v.iter().map(|&b| Value::Bool(b != 0)).collect())
+                    }
+                });
+                Some(unboxed_vec.unwrap_or_else(|| arr.borrow().clone()))
             }
             _ => None,
         }
@@ -1249,7 +1773,7 @@ impl Value {
         match self {
             Value::Array(arr) => {
                 sync_specialized_array(arr);
-                Some(arr.borrow().len())
+                Some(arr.len_fast())
             }
             _ => None,
         }
@@ -1259,7 +1783,7 @@ impl Value {
         match self {
             Value::Array(arr) => {
                 sync_specialized_array(arr);
-                arr.borrow().get(index).cloned()
+                arr.get_value_fast(index)
             }
             _ => None,
         }
@@ -1273,7 +1797,7 @@ impl Value {
                     sync_specialized_array(arr);
                     invalidate_specialized_array_cache(arr.as_ptr() as usize);
                 }
-                arr.borrow_mut().push(value);
+                arr.push_value_fast(value);
                 Ok(())
             }
 
@@ -1610,12 +2134,44 @@ impl fmt::Debug for Value {
                 let _guard = debug_cycle_guard(ptr);
 
                 write!(f, "Array([")?;
-                let borrowed = arr.borrow();
-                for (i, val) in borrowed.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
+                let formatted_unboxed = arr.with_unboxed_data(|unb| match unb {
+                    UnboxedArrayData::None => Ok(false),
+                    UnboxedArrayData::Int(v) => {
+                        for (i, &val) in v.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{:?}", Value::Int(val as LustInt))?;
+                        }
+                        Ok(true)
                     }
-                    write!(f, "{:?}", val)?;
+                    UnboxedArrayData::Float(v) => {
+                        for (i, &val) in v.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{:?}", Value::Float(val as LustFloat))?;
+                        }
+                        Ok(true)
+                    }
+                    UnboxedArrayData::Bool(v) => {
+                        for (i, &val) in v.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{:?}", Value::Bool(val != 0))?;
+                        }
+                        Ok(true)
+                    }
+                })?;
+                if !formatted_unboxed {
+                    let borrowed = arr.borrow();
+                    for (i, val) in borrowed.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{:?}", val)?;
+                    }
                 }
                 write!(f, "])")
             }
@@ -1757,13 +2313,45 @@ impl fmt::Display for Value {
                 let _guard = display_cycle_guard(ptr);
 
                 write!(f, "[")?;
-                let borrowed = arr.borrow();
-                for (i, val) in borrowed.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
+                let formatted_unboxed = arr.with_unboxed_data(|unb| match unb {
+                    UnboxedArrayData::None => Ok(false),
+                    UnboxedArrayData::Int(v) => {
+                        for (i, &val) in v.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{}", Value::Int(val as LustInt))?;
+                        }
+                        Ok(true)
                     }
+                    UnboxedArrayData::Float(v) => {
+                        for (i, &val) in v.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{}", Value::Float(val as LustFloat))?;
+                        }
+                        Ok(true)
+                    }
+                    UnboxedArrayData::Bool(v) => {
+                        for (i, &val) in v.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{}", Value::Bool(val != 0))?;
+                        }
+                        Ok(true)
+                    }
+                })?;
+                if !formatted_unboxed {
+                    let borrowed = arr.borrow();
+                    for (i, val) in borrowed.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
 
-                    write!(f, "{}", val)?;
+                        write!(f, "{}", val)?;
+                    }
                 }
 
                 write!(f, "]")
@@ -1897,6 +2485,9 @@ impl PartialEq for Value {
             (Value::Array(a), Value::Array(b)) => {
                 if Rc::ptr_eq(a, b) {
                     return true;
+                }
+                if a.is_unboxed() || b.is_unboxed() {
+                    return **a == **b;
                 }
                 let pair = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
                 #[cfg(feature = "std")]

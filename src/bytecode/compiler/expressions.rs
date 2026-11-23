@@ -1,6 +1,93 @@
 use super::*;
 use crate::ast::StructLiteralField;
 impl Compiler {
+    pub(super) fn is_unshadowed_array_module(&self, name: &str) -> bool {
+        if name != "array" {
+            return false;
+        }
+        if self.resolve_local(name).is_ok() || self.is_module_level_identifier(name) {
+            return false;
+        }
+        if self.function_table.contains_key(name) || self.extern_value_aliases.contains_key(name) {
+            return false;
+        }
+        let module_imports = self
+            .current_module
+            .as_ref()
+            .or(self.entry_module.as_ref())
+            .and_then(|module| self.imports_by_module.get(module));
+        if let Some(imports) = module_imports {
+            if imports.function_aliases.contains_key(name) {
+                return false;
+            }
+            if let Some(target) = imports.module_aliases.get(name) {
+                return target == "array" || target == "std.array";
+            }
+        }
+        self.is_stdlib_symbol("array")
+    }
+
+    pub(super) fn try_compile_array_void_call(&mut self, expr: &Expr) -> Result<bool> {
+        let mut inner = expr;
+        while let ExprKind::Paren(e) = &inner.kind {
+            inner = e;
+        }
+        let ExprKind::Call {
+            callee,
+            args,
+            type_args,
+        } = &inner.kind
+        else {
+            return Ok(false);
+        };
+        if type_args.is_some() {
+            return Ok(false);
+        }
+        let ExprKind::FieldAccess { object, field } = &callee.kind else {
+            return Ok(false);
+        };
+        let ExprKind::Identifier(mod_name) = &object.kind else {
+            return Ok(false);
+        };
+        if !self.is_unshadowed_array_module(mod_name) {
+            return Ok(false);
+        }
+        self.current_line = inner.span.start_line;
+        match (field.as_str(), args.len()) {
+            ("push", 2) => {
+                let arr_reg = self.compile_expr(&args[0])?;
+                let saved_freereg = self.next_register;
+                let val_reg = self.compile_expr(&args[1])?;
+                if self.next_register < saved_freereg {
+                    self.next_register = saved_freereg;
+                }
+                self.emit(Instruction::ArrayPush(arr_reg, val_reg), 0);
+                self.free_register(val_reg);
+                self.free_register(arr_reg);
+                Ok(true)
+            }
+            ("set", 3) => {
+                let arr_reg = self.compile_expr(&args[0])?;
+                let saved_after_arr = self.next_register;
+                let idx_reg = self.compile_expr(&args[1])?;
+                if self.next_register < saved_after_arr {
+                    self.next_register = saved_after_arr;
+                }
+                let saved_after_idx = self.next_register;
+                let val_reg = self.compile_expr(&args[2])?;
+                if self.next_register < saved_after_idx {
+                    self.next_register = saved_after_idx;
+                }
+                self.emit(Instruction::SetIndex(arr_reg, idx_reg, val_reg), 0);
+                self.free_register(val_reg);
+                self.free_register(idx_reg);
+                self.free_register(arr_reg);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub(super) fn compile_expr(&mut self, expr: &Expr) -> Result<Register> {
         self.current_line = expr.span.start_line;
         match &expr.kind {
@@ -255,6 +342,56 @@ impl Compiler {
                         );
                         return self.compile_expr(&method_call);
                     }
+
+                    if type_args.is_none()
+                        && let ExprKind::Identifier(mod_name) = &object.kind
+                        && self.is_unshadowed_array_module(mod_name)
+                    {
+                        match (field.as_str(), args.len()) {
+                            ("len", 1) => {
+                                let arr_reg = self.compile_expr(&args[0])?;
+                                let result_reg = self.allocate_register();
+                                self.emit(Instruction::ArrayLen(result_reg, arr_reg), 0);
+                                self.free_register(arr_reg);
+                                return Ok(result_reg);
+                            }
+                            ("push", 2) => {
+                                let arr_reg = self.compile_expr(&args[0])?;
+                                let saved_freereg = self.next_register;
+                                let val_reg = self.compile_expr(&args[1])?;
+                                if self.next_register < saved_freereg {
+                                    self.next_register = saved_freereg;
+                                }
+                                self.emit(Instruction::ArrayPush(arr_reg, val_reg), 0);
+                                self.free_register(val_reg);
+                                self.free_register(arr_reg);
+                                let result_reg = self.allocate_register();
+                                self.emit(Instruction::LoadNil(result_reg), 0);
+                                return Ok(result_reg);
+                            }
+                            ("set", 3) => {
+                                let arr_reg = self.compile_expr(&args[0])?;
+                                let saved_after_arr = self.next_register;
+                                let idx_reg = self.compile_expr(&args[1])?;
+                                if self.next_register < saved_after_arr {
+                                    self.next_register = saved_after_arr;
+                                }
+                                let saved_after_idx = self.next_register;
+                                let val_reg = self.compile_expr(&args[2])?;
+                                if self.next_register < saved_after_idx {
+                                    self.next_register = saved_after_idx;
+                                }
+                                self.emit(Instruction::SetIndex(arr_reg, idx_reg, val_reg), 0);
+                                self.free_register(val_reg);
+                                self.free_register(idx_reg);
+                                self.free_register(arr_reg);
+                                let result_reg = self.allocate_register();
+                                self.emit(Instruction::LoadNil(result_reg), 0);
+                                return Ok(result_reg);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
 
                 if let ExprKind::FieldAccess { object, field } = &callee.kind
@@ -415,6 +552,30 @@ impl Compiler {
                         self.emit(Instruction::GetIndex(result_reg, obj_reg, idx_reg), 0);
                         self.free_register(obj_reg);
                         self.free_register(idx_reg);
+                        return Ok(result_reg);
+                    }
+                    if let ExprKind::Call {
+                        callee,
+                        args: call_args,
+                        type_args: call_type_args,
+                    } = &index_expr.kind
+                        && call_type_args.is_none()
+                        && call_args.len() == 2
+                        && let ExprKind::FieldAccess { object, field } = &callee.kind
+                        && field == "get"
+                        && let ExprKind::Identifier(mod_name) = &object.kind
+                        && self.is_unshadowed_array_module(mod_name)
+                    {
+                        let arr_reg = self.compile_expr(&call_args[0])?;
+                        let saved_freereg = self.next_register;
+                        let idx_reg = self.compile_expr(&call_args[1])?;
+                        if self.next_register < saved_freereg {
+                            self.next_register = saved_freereg;
+                        }
+                        let result_reg = self.allocate_register();
+                        self.emit(Instruction::ArrayGetUnwrap(result_reg, arr_reg, idx_reg), 0);
+                        self.free_register(idx_reg);
+                        self.free_register(arr_reg);
                         return Ok(result_reg);
                     }
                 }

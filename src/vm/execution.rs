@@ -17,6 +17,85 @@ fn record_frame_hoist_reload() {
     FRAME_HOIST_RELOAD_COUNT.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
+#[inline]
+fn charge_array_push_budget(
+    budgets: &mut budget::BudgetState,
+    arr: &crate::bytecode::LustArray,
+    val: &Value,
+) -> Result<()> {
+    if !budgets.mem_budget_enabled() {
+        return Ok(());
+    }
+    let bytes = arr.with_unboxed_data(|data| match data {
+        crate::bytecode::value::UnboxedArrayData::Int(v) => {
+            if matches!(val, Value::Int(_)) {
+                if v.len() == v.capacity() {
+                    let cap = v.capacity();
+                    let new_cap = if cap == 0 { 4 } else { cap.saturating_mul(2) };
+                    (new_cap - cap).saturating_mul(core::mem::size_of::<i64>())
+                } else {
+                    0
+                }
+            } else {
+                v.len()
+                    .saturating_add(1)
+                    .saturating_mul(core::mem::size_of::<Value>())
+            }
+        }
+        crate::bytecode::value::UnboxedArrayData::Float(v) => {
+            if matches!(val, Value::Float(_)) {
+                if v.len() == v.capacity() {
+                    let cap = v.capacity();
+                    let new_cap = if cap == 0 { 4 } else { cap.saturating_mul(2) };
+                    (new_cap - cap).saturating_mul(core::mem::size_of::<f64>())
+                } else {
+                    0
+                }
+            } else {
+                v.len()
+                    .saturating_add(1)
+                    .saturating_mul(core::mem::size_of::<Value>())
+            }
+        }
+        crate::bytecode::value::UnboxedArrayData::Bool(v) => {
+            if matches!(val, Value::Bool(_)) {
+                if v.len() == v.capacity() {
+                    let cap = v.capacity();
+                    let new_cap = if cap == 0 { 4 } else { cap.saturating_mul(2) };
+                    (new_cap - cap).saturating_mul(core::mem::size_of::<u8>())
+                } else {
+                    0
+                }
+            } else {
+                v.len()
+                    .saturating_add(1)
+                    .saturating_mul(core::mem::size_of::<Value>())
+            }
+        }
+        crate::bytecode::value::UnboxedArrayData::None => {
+            let elems = arr.borrow_elements_without_sync();
+            if elems.is_empty() {
+                match val {
+                    Value::Int(_) => core::mem::size_of::<i64>(),
+                    Value::Float(_) => core::mem::size_of::<f64>(),
+                    Value::Bool(_) => core::mem::size_of::<u8>(),
+                    _ => 4usize.saturating_mul(core::mem::size_of::<Value>()),
+                }
+            } else if elems.len() == elems.capacity() {
+                let cap = elems.capacity();
+                let new_cap = if cap == 0 { 4 } else { cap.saturating_mul(2) };
+                (new_cap - cap).saturating_mul(core::mem::size_of::<Value>())
+            } else {
+                0
+            }
+        }
+    });
+    if bytes > 0 {
+        budgets.charge_mem_bytes(bytes)?;
+    }
+    Ok(())
+}
+
 #[inline(always)]
 fn write_frame_reg_scalar(frame: &mut CallFrame, reg: Register, value: Value) -> bool {
     let slot = &mut frame.registers[reg as usize];
@@ -1303,20 +1382,81 @@ impl VM {
                                     crate::bytecode::value::get_specialized_cached_element(arr, idx)
                                 {
                                     val
+                                } else if idx >= 0
+                                    && let Some(val) = arr.get_value_fast(idx as usize)
+                                {
+                                    val
                                 } else {
-                                    let borrowed = arr.borrow();
-                                    if idx < 0 || idx as usize >= borrowed.len() {
-                                        return Err(LustError::RuntimeError {
-                                            message: format!(
-                                                "Array index {} out of bounds (length: {})",
-                                                idx,
-                                                borrowed.len()
-                                            ),
-                                        });
-                                    }
-                                    borrowed[idx as usize].fast_clone()
+                                    return Err(LustError::RuntimeError {
+                                        message: format!(
+                                            "Array index {} out of bounds (length: {})",
+                                            idx,
+                                            arr.len_fast()
+                                        ),
+                                    });
                                 };
-                                write_frame_reg_fast(frame, cycle_collector, dest, result)
+                                if result.is_plain() {
+                                    write_frame_reg_scalar(frame, dest, result)
+                                } else {
+                                    write_frame_reg_fast(frame, cycle_collector, dest, result)
+                                }
+                            }
+                            Instruction::ArrayGetUnwrap(dest, array_reg, index_reg) => {
+                                let Value::Array(arr) = &frame.registers[array_reg as usize] else {
+                                    let ty = frame.registers[array_reg as usize].type_of();
+                                    return Err(LustError::RuntimeError {
+                                        message: format!("array.get expects an array, got {:?}", ty),
+                                    });
+                                };
+                                let idx = frame.registers[index_reg as usize]
+                                    .as_int()
+                                    .ok_or_else(|| LustError::RuntimeError {
+                                        message: "Array index must be an integer".to_string(),
+                                    })?;
+                                let result = if let Some(val) =
+                                    crate::bytecode::value::get_specialized_cached_element(arr, idx)
+                                {
+                                    val
+                                } else if idx >= 0
+                                    && let Some(val) = arr.get_value_fast(idx as usize)
+                                {
+                                    val
+                                } else {
+                                    return Err(LustError::RuntimeError {
+                                        message: format!(
+                                            "Array index {} out of bounds (length: {})",
+                                            idx,
+                                            arr.len_fast()
+                                        ),
+                                    });
+                                };
+                                if result.is_plain() {
+                                    write_frame_reg_scalar(frame, dest, result)
+                                } else {
+                                    write_frame_reg_fast(frame, cycle_collector, dest, result)
+                                }
+                            }
+                            Instruction::ArrayPush(array_reg, value_reg) => {
+                                let Value::Array(arr) = &frame.registers[array_reg as usize] else {
+                                    let ty = frame.registers[array_reg as usize].type_of();
+                                    return Err(LustError::RuntimeError {
+                                        message: format!(
+                                            "array.push expects an array, got {:?}",
+                                            ty
+                                        ),
+                                    });
+                                };
+                                let value = frame.registers[value_reg as usize].fast_clone();
+                                charge_array_push_budget(budgets, arr, &value)?;
+                                if !crate::vm::cycle::CycleCollector::is_leaf(&value) {
+                                    cycle_collector.record_mutation();
+                                }
+                                crate::bytecode::value::sync_specialized_array(arr);
+                                arr.push_value_fast(value);
+                                crate::bytecode::value::invalidate_specialized_array_cache(
+                                    arr.as_ptr() as usize,
+                                );
+                                false
                             }
                             Instruction::SetIndex(collection_reg, index_reg, value_reg) => {
                                 let Value::Array(arr) = &frame.registers[collection_reg as usize]
@@ -1339,17 +1479,26 @@ impl VM {
                                 {
                                     res.map_err(|message| LustError::RuntimeError { message })?;
                                 } else {
-                                    let mut borrowed = arr.borrow_mut();
-                                    if idx < 0 || idx as usize >= borrowed.len() {
+                                    if idx < 0 {
                                         return Err(LustError::RuntimeError {
                                             message: format!(
                                                 "Array index {} out of bounds (length: {})",
                                                 idx,
-                                                borrowed.len()
+                                                arr.len_fast()
                                             ),
                                         });
                                     }
-                                    borrowed[idx as usize] = value;
+                                    if !crate::vm::cycle::CycleCollector::is_leaf(&value) {
+                                        cycle_collector.record_mutation();
+                                    }
+                                    if let Err(len) = arr.set_value_fast(idx as usize, value) {
+                                        return Err(LustError::RuntimeError {
+                                            message: format!(
+                                                "Array index {} out of bounds (length: {})",
+                                                idx, len
+                                            ),
+                                        });
+                                    }
                                     crate::bytecode::value::invalidate_specialized_array_cache(
                                         arr.as_ptr() as usize,
                                     );
@@ -1376,26 +1525,21 @@ impl VM {
                                     crate::bytecode::value::get_specialized_cached_len(arr)
                                 {
                                     if idx >= 0 && (idx as usize) < len {
-                                        let borrowed = arr.borrow();
-                                        if (idx as usize) < borrowed.len() {
-                                            Some(borrowed[idx as usize].fast_clone())
-                                        } else {
-                                            None
-                                        }
+                                        arr.get_value_fast(idx as usize)
                                     } else {
                                         None
                                     }
+                                } else if idx >= 0 {
+                                    arr.get_value_fast(idx as usize)
                                 } else {
-                                    let borrowed = arr.borrow();
-                                    if idx >= 0 && (idx as usize) < borrowed.len() {
-                                        Some(borrowed[idx as usize].fast_clone())
-                                    } else {
-                                        None
-                                    }
+                                    None
                                 };
                                 if let Some(val) = found {
-                                    let c1 =
-                                        write_frame_reg_fast(frame, cycle_collector, val_dest, val);
+                                    let c1 = if val.is_plain() {
+                                        write_frame_reg_scalar(frame, val_dest, val)
+                                    } else {
+                                        write_frame_reg_fast(frame, cycle_collector, val_dest, val)
+                                    };
                                     let c2 = write_frame_reg_scalar(
                                         frame,
                                         cond_dest,
@@ -1410,7 +1554,7 @@ impl VM {
                                 let len = match &frame.registers[array_reg as usize] {
                                     Value::Array(arr) => {
                                         crate::bytecode::value::get_specialized_cached_len(arr)
-                                            .unwrap_or_else(|| arr.borrow().len())
+                                            .unwrap_or_else(|| arr.len_fast())
                                     }
                                     other => {
                                         return Err(LustError::RuntimeError {
@@ -2547,9 +2691,10 @@ impl VM {
                         }
 
                         Value::NativeFunction(native_fn) => {
-                            let mut args = Vec::new();
+                            let mut args = core::mem::take(&mut self.arg_scratch);
+                            args.clear();
                             for i in 0..arg_count {
-                                args.push(self.get_register(first_arg + i)?.clone());
+                                args.push(self.get_register(first_arg + i)?.fast_clone());
                             }
 
                             let _native_guard = self.enter_native_scope();
@@ -2557,6 +2702,10 @@ impl VM {
                             let outcome = native_fn(&args);
                             drop(_vm_guard);
                             drop(_native_guard);
+                            args.clear();
+                            if args.capacity() > self.arg_scratch.capacity() {
+                                self.arg_scratch = args;
+                            }
                             let outcome =
                                 outcome.map_err(|e| LustError::RuntimeError { message: e })?;
                             self.handle_native_call_outcome(dest_reg, outcome)?;
@@ -2949,21 +3098,24 @@ impl VM {
                                     index.as_int().ok_or_else(|| LustError::RuntimeError {
                                         message: "Array index must be an integer".to_string(),
                                     })?;
-                                if let Some(val) = crate::bytecode::value::get_specialized_cached_element(&arr, idx) {
+                                if let Some(val) =
+                                    crate::bytecode::value::get_specialized_cached_element(
+                                        &arr, idx,
+                                    )
+                                {
+                                    val
+                                } else if idx >= 0
+                                    && let Some(val) = arr.get_value_fast(idx as usize)
+                                {
                                     val
                                 } else {
-                                    let borrowed = arr.borrow();
-                                    if idx < 0 || idx as usize >= borrowed.len() {
-                                        return Err(LustError::RuntimeError {
-                                            message: format!(
-                                                "Array index {} out of bounds (length: {})",
-                                                idx,
-                                                borrowed.len()
-                                            ),
-                                        });
-                                    }
-
-                                    borrowed[idx as usize].clone()
+                                    return Err(LustError::RuntimeError {
+                                        message: format!(
+                                            "Array index {} out of bounds (length: {})",
+                                            idx,
+                                            arr.len_fast()
+                                        ),
+                                    });
                                 }
                             }
 
@@ -2981,6 +3133,70 @@ impl VM {
                         }
                     };
                     self.set_register(dest, result)?;
+                }
+
+                Instruction::ArrayGetUnwrap(dest, array_reg, index_reg) => {
+                    let collection = self.get_register(array_reg)?.fast_clone();
+                    let index = self.get_register(index_reg)?.fast_clone();
+                    match collection {
+                        Value::Array(arr) => {
+                            let idx = index.as_int().ok_or_else(|| LustError::RuntimeError {
+                                message: "Array index must be an integer".to_string(),
+                            })?;
+                            let result = if let Some(val) =
+                                crate::bytecode::value::get_specialized_cached_element(&arr, idx)
+                            {
+                                val
+                            } else if idx >= 0
+                                && let Some(val) = arr.get_value_fast(idx as usize)
+                            {
+                                val
+                            } else {
+                                return Err(LustError::RuntimeError {
+                                    message: format!(
+                                        "Array index {} out of bounds (length: {})",
+                                        idx,
+                                        arr.len_fast()
+                                    ),
+                                });
+                            };
+                            self.set_register(dest, result)?;
+                        }
+                        other => {
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "array.get expects an array, got {:?}",
+                                    other.type_of()
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                Instruction::ArrayPush(array_reg, value_reg) => {
+                    let collection = self.get_register(array_reg)?.fast_clone();
+                    let value = self.get_register(value_reg)?.fast_clone();
+                    match collection {
+                        Value::Array(arr) => {
+                            charge_array_push_budget(&mut self.budgets, &arr, &value)?;
+                            if !crate::vm::cycle::CycleCollector::is_leaf(&value) {
+                                self.cycle_collector.record_mutation();
+                            }
+                            crate::bytecode::value::sync_specialized_array(&arr);
+                            arr.push_value_fast(value);
+                            crate::bytecode::value::invalidate_specialized_array_cache(
+                                arr.as_ptr() as usize,
+                            );
+                        }
+                        other => {
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "array.push expects an array, got {:?}",
+                                    other.type_of()
+                                ),
+                            });
+                        }
+                    }
                 }
 
                 Instruction::TryGetIndex(dest, collection_reg, index_reg) => {
@@ -3022,41 +3238,34 @@ impl VM {
                 }
 
                 Instruction::ArrayIndexOk(val_dest, cond_dest, array_reg, idx_reg) => {
-                    let collection = self.get_register(array_reg)?.clone();
-                    let index = self.get_register(idx_reg)?.clone();
+                    let collection = self.get_register(array_reg)?.fast_clone();
+                    let index = self.get_register(idx_reg)?.fast_clone();
                     if let Value::Array(arr) = &collection {
                         let idx = index.as_int().ok_or_else(|| LustError::RuntimeError {
                             message: "Array index must be an integer".to_string(),
                         })?;
-                        if let Some(val) = crate::bytecode::value::get_specialized_cached_element(arr, idx) {
+                        let found = if let Some(val) =
+                            crate::bytecode::value::get_specialized_cached_element(arr, idx)
+                        {
+                            Some(val)
+                        } else if let Some(len) =
+                            crate::bytecode::value::get_specialized_cached_len(arr)
+                        {
+                            if idx >= 0 && (idx as usize) < len {
+                                arr.get_value_fast(idx as usize)
+                            } else {
+                                None
+                            }
+                        } else if idx >= 0 {
+                            arr.get_value_fast(idx as usize)
+                        } else {
+                            None
+                        };
+                        if let Some(val) = found {
                             self.set_register(val_dest, val)?;
                             self.set_register(cond_dest, Value::Bool(true))?;
-                        } else if let Some(len) = crate::bytecode::value::get_specialized_cached_len(arr) {
-                            if idx >= 0 && (idx as usize) < len {
-                                let borrowed = arr.borrow();
-                                if (idx as usize) < borrowed.len() {
-                                    let val = borrowed[idx as usize].clone();
-                                    drop(borrowed);
-                                    self.set_register(val_dest, val)?;
-                                    self.set_register(cond_dest, Value::Bool(true))?;
-                                } else {
-                                    drop(borrowed);
-                                    self.set_register(cond_dest, Value::Bool(false))?;
-                                }
-                            } else {
-                                self.set_register(cond_dest, Value::Bool(false))?;
-                            }
                         } else {
-                            let borrowed = arr.borrow();
-                            if idx >= 0 && (idx as usize) < borrowed.len() {
-                                let val = borrowed[idx as usize].clone();
-                                drop(borrowed);
-                                self.set_register(val_dest, val)?;
-                                self.set_register(cond_dest, Value::Bool(true))?;
-                            } else {
-                                drop(borrowed);
-                                self.set_register(cond_dest, Value::Bool(false))?;
-                            }
+                            self.set_register(cond_dest, Value::Bool(false))?;
                         }
                     } else {
                         return Err(LustError::RuntimeError {
@@ -3070,7 +3279,7 @@ impl VM {
                     match collection {
                         Value::Array(arr) => {
                             let len = crate::bytecode::value::get_specialized_cached_len(arr)
-                                .unwrap_or_else(|| arr.borrow().len());
+                                .unwrap_or_else(|| arr.len_fast());
                             self.set_register(dest, Value::Int(int_from_usize(len)))?;
                         }
 
@@ -3358,21 +3567,33 @@ impl VM {
                                     index.as_int().ok_or_else(|| LustError::RuntimeError {
                                         message: "Array index must be an integer".to_string(),
                                     })?;
-                                if let Some(res) = crate::bytecode::value::set_specialized_cached_element(&arr, idx, &value) {
+                                if let Some(res) =
+                                    crate::bytecode::value::set_specialized_cached_element(
+                                        &arr, idx, &value,
+                                    )
+                                {
                                     res.map_err(|message| LustError::RuntimeError { message })?;
                                 } else {
-                                    let mut borrowed = arr.borrow_mut();
-                                    if idx < 0 || idx as usize >= borrowed.len() {
+                                    if idx < 0 {
                                         return Err(LustError::RuntimeError {
                                             message: format!(
                                                 "Array index {} out of bounds (length: {})",
                                                 idx,
-                                                borrowed.len()
+                                                arr.len_fast()
                                             ),
                                         });
                                     }
-
-                                    borrowed[idx as usize] = value;
+                                    if !crate::vm::cycle::CycleCollector::is_leaf(&value) {
+                                        self.cycle_collector.record_mutation();
+                                    }
+                                    if let Err(len) = arr.set_value_fast(idx as usize, value) {
+                                        return Err(LustError::RuntimeError {
+                                            message: format!(
+                                                "Array index {} out of bounds (length: {})",
+                                                idx, len
+                                            ),
+                                        });
+                                    }
                                     crate::bytecode::value::invalidate_specialized_array_cache(
                                         arr.as_ptr() as usize,
                                     );
@@ -3654,11 +3875,31 @@ impl VM {
             TypeKind::Named(expected) => self.value_is_type(value, expected),
             TypeKind::GenericInstance { name, .. } => self.value_is_type(value, name),
             TypeKind::Array(element_type) => match value {
-                Value::Array(values) => values.try_borrow().is_ok_and(|items| {
-                    items
-                        .iter()
-                        .all(|value| self.value_matches_type(value, element_type))
-                }),
+                Value::Array(values) => {
+                    if values.is_unboxed() {
+                        values.with_unboxed_data(|data| match data {
+                            crate::bytecode::value::UnboxedArrayData::Int(v) => {
+                                v.is_empty()
+                                    || self.value_matches_type(&Value::Int(0), element_type)
+                            }
+                            crate::bytecode::value::UnboxedArrayData::Float(v) => {
+                                v.is_empty()
+                                    || self.value_matches_type(&Value::Float(0.0), element_type)
+                            }
+                            crate::bytecode::value::UnboxedArrayData::Bool(v) => {
+                                v.is_empty()
+                                    || self.value_matches_type(&Value::Bool(false), element_type)
+                            }
+                            crate::bytecode::value::UnboxedArrayData::None => true,
+                        })
+                    } else {
+                        values.try_borrow().is_ok_and(|items| {
+                            items
+                                .iter()
+                                .all(|value| self.value_matches_type(value, element_type))
+                        })
+                    }
+                }
                 _ => false,
             },
             TypeKind::Map(key_type, value_type) => match value {

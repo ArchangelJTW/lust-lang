@@ -271,6 +271,8 @@ pub struct MirContext {
     dirty_allocations: core::cell::Cell<bool>,
     #[cfg(feature = "std")]
     dirty_allocations_count: core::cell::Cell<u64>,
+    #[cfg(feature = "std")]
+    push_grow_slow_calls: core::cell::Cell<u64>,
     /// Compiler-enforced thread confinement under `std`: makes both `MirContext`
     /// and `Arc<MirContext>` statically `!Send + !Sync` (`PERF-T4-1`, Hazard 7 item 1).
     #[cfg(feature = "std")]
@@ -313,6 +315,7 @@ impl MirContext {
             struct_fields: LocalLock::new(hashbrown::HashMap::new()),
             dirty_allocations: core::cell::Cell::new(false),
             dirty_allocations_count: core::cell::Cell::new(0),
+            push_grow_slow_calls: core::cell::Cell::new(0),
             _not_send_sync: core::marker::PhantomData,
         }
     }
@@ -349,6 +352,26 @@ impl MirContext {
         #[cfg(not(feature = "std"))]
         {
             0
+        }
+    }
+
+    #[inline]
+    pub fn push_grow_slow_calls(&self) -> u64 {
+        #[cfg(feature = "std")]
+        {
+            self.push_grow_slow_calls.get()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            0
+        }
+    }
+
+    #[inline]
+    pub fn reset_push_grow_slow_calls(&self) {
+        #[cfg(feature = "std")]
+        {
+            self.push_grow_slow_calls.set(0);
         }
     }
 
@@ -1246,15 +1269,38 @@ pub fn mir_array_elem_type_from_tag(tag: i64) -> Option<crate::mir::ir::MirType>
     }
 }
 
+#[inline]
+fn is_bool_array_kind(kind: &MirAllocationKind) -> bool {
+    matches!(kind, MirAllocationKind::Array(crate::mir::ir::MirType::Bool))
+}
+
+/// Minimum number of 64-bit (`i64`) payload words required to store `elem_cap` elements.
+/// `Array(Bool)` uses 1-byte (`u8`) element stride rounded up to 8-byte words (`NG-W10-5`).
+#[inline]
+fn array_payload_words_for_cap(elem_cap: usize, is_bool: bool) -> Option<usize> {
+    if is_bool {
+        elem_cap.checked_add(7).map(|n| n / 8)
+    } else {
+        Some(elem_cap)
+    }
+}
+
 fn alloc_mir_buffer_with_kind(len: i64, kind: MirAllocationKind) -> *mut i64 {
     let count = if len < 0 { 0 } else { len as usize };
-    // Arrays always allocate at least 3 words (`max(count, 1) + 2`) so word[2] can hold
+    let is_bool_arr = is_bool_array_kind(&kind);
+    // Arrays always allocate at least 3 words (`max(elem_words, 1) + 2`) so word[2] can hold
     // a redirected backing-buffer pointer when growing via `lust_mir_array_push`.
     let payload_slots = if matches!(
         kind,
         MirAllocationKind::Array(_) | MirAllocationKind::RawWords
     ) {
-        count.max(1)
+        let Some(elem_words) = array_payload_words_for_cap(count, is_bool_arr) else {
+            with_current_mir_context(|ctx| {
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            });
+            return core::ptr::null_mut();
+        };
+        elem_words.max(1)
     } else {
         count
     };
@@ -1289,7 +1335,14 @@ fn alloc_mir_buffer_with_kind(len: i64, kind: MirAllocationKind) -> *mut i64 {
     if oom {
         return core::ptr::null_mut();
     }
-    let mut vec = Vec::<i64>::with_capacity(size);
+    let mut vec = Vec::<i64>::new();
+    if vec.try_reserve_exact(size).is_err() {
+        with_current_mir_context(|ctx| {
+            ctx.memory_used.fetch_sub(bytes_needed, Ordering::SeqCst);
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+        });
+        return core::ptr::null_mut();
+    }
     vec.push(count as i64);
     vec.push(count as i64);
     vec.resize(size, 0);
@@ -1507,9 +1560,15 @@ fn validate_active_array_inner(ctx: &MirContext, ptr: *const i64) -> Option<Vali
             return None;
         }
         let len = len_raw as usize;
+        let is_bool = is_bool_array_kind(&rec.kind);
         if cap_raw >= 0 {
             let cap = cap_raw as usize;
-            if len > cap || cap.checked_add(2).is_none_or(|n| n > rec.word_capacity) {
+            let needed_payload_words = array_payload_words_for_cap(cap, is_bool)?;
+            if len > cap
+                || needed_payload_words
+                    .checked_add(2)
+                    .is_none_or(|n| n > rec.word_capacity)
+            {
                 return None;
             }
             let data_ptr = unsafe { rec.base_ptr.add(2) };
@@ -1531,6 +1590,7 @@ fn validate_active_array_inner(ctx: &MirContext, ptr: *const i64) -> Option<Vali
                 return None;
             }
             let cap = (cap_raw & i64::MAX) as usize;
+            let needed_backing_words = array_payload_words_for_cap(cap, is_bool)?;
             if cap == 0 || len > cap {
                 return None;
             }
@@ -1541,7 +1601,7 @@ fn validate_active_array_inner(ctx: &MirContext, ptr: *const i64) -> Option<Vali
             let backing_rec = ctx.get_active_allocation_record(data_raw as usize)?;
             if backing_rec.kind != MirAllocationKind::ArrayBacking
                 || !backing_rec.is_ctx_owned
-                || backing_rec.word_capacity < cap
+                || backing_rec.word_capacity < needed_backing_words
                 || backing_rec.base_ptr == rec.base_ptr
             {
                 return None;
@@ -1604,6 +1664,10 @@ pub extern "C" fn lust_mir_array_get(ptr: *const i64, idx: i64) -> i64 {
                 .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
             return 0;
         }
+        #[cfg(feature = "std")]
+        if is_bool_array_kind(&v.header_rec.kind) {
+            return unsafe { u64::from(*(v.data_ptr as *const u8).add(idx as usize)) as i64 };
+        }
         unsafe { *v.data_ptr.add(idx as usize) }
     })
 }
@@ -1630,6 +1694,13 @@ pub extern "C" fn lust_mir_array_set(ptr: *mut i64, idx: i64, val: i64) {
                 .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
             return;
         }
+        #[cfg(feature = "std")]
+        if is_bool_array_kind(&v.header_rec.kind) {
+            unsafe {
+                *(v.data_ptr as *mut u8).add(idx as usize) = u8::from(val != 0);
+            }
+            return;
+        }
         unsafe {
             *v.data_ptr.add(idx as usize) = val;
         }
@@ -1641,6 +1712,8 @@ pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
     with_current_mir_context(|ctx| {
         #[cfg(feature = "std")]
         {
+            ctx.push_grow_slow_calls
+                .set(ctx.push_grow_slow_calls.get().saturating_add(1));
             let Some(v) = validate_active_array_ptr(ctx, ptr) else {
                 return MIR_STATUS_ERR_OUT_OF_BOUNDS;
             };
@@ -1659,9 +1732,14 @@ pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
                     .store(MIR_STATUS_ERR_OUT_OF_BOUNDS, Ordering::SeqCst);
                 return MIR_STATUS_ERR_OUT_OF_BOUNDS;
             }
+            let is_bool = is_bool_array_kind(&v.header_rec.kind);
             if v.len < v.cap {
                 unsafe {
-                    *v.data_ptr.add(v.len) = val;
+                    if is_bool {
+                        *(v.data_ptr as *mut u8).add(v.len) = u8::from(val != 0);
+                    } else {
+                        *v.data_ptr.add(v.len) = val;
+                    }
                     *v.base_ptr = (v.len + 1) as i64;
                 }
                 return MIR_STATUS_OK;
@@ -1670,12 +1748,20 @@ pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
                 ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
                 return MIR_STATUS_ERR_OOM;
             };
-            let new_cap = v.cap.saturating_mul(2).max(4).max(new_len);
+            let new_cap = if is_bool {
+                v.cap.saturating_mul(2).max(8).max(new_len)
+            } else {
+                v.cap.saturating_mul(2).max(4).max(new_len)
+            };
             if new_cap > (i64::MAX as usize) {
                 ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
                 return MIR_STATUS_ERR_OOM;
             }
-            let Some(bytes_u) = new_cap.checked_mul(core::mem::size_of::<i64>()) else {
+            let Some(new_word_cap) = array_payload_words_for_cap(new_cap, is_bool) else {
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                return MIR_STATUS_ERR_OOM;
+            };
+            let Some(bytes_u) = new_word_cap.checked_mul(core::mem::size_of::<i64>()) else {
                 ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
                 return MIR_STATUS_ERR_OOM;
             };
@@ -1693,17 +1779,30 @@ pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
             }
 
             let mut new_vec = Vec::<i64>::new();
-            if new_vec.try_reserve_exact(new_cap).is_err() {
+            if new_vec.try_reserve_exact(new_word_cap).is_err() {
                 ctx.memory_used.fetch_sub(bytes_needed, Ordering::SeqCst);
                 ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
                 return MIR_STATUS_ERR_OOM;
             }
-            if v.len > 0 {
-                let src = unsafe { core::slice::from_raw_parts(v.data_ptr, v.len) };
-                new_vec.extend_from_slice(src);
+            if is_bool {
+                new_vec.resize(new_word_cap, 0);
+                let dst_bytes = new_vec.as_mut_ptr() as *mut u8;
+                if v.len > 0 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(v.data_ptr as *const u8, dst_bytes, v.len);
+                    }
+                }
+                unsafe {
+                    *dst_bytes.add(v.len) = u8::from(val != 0);
+                }
+            } else {
+                if v.len > 0 {
+                    let src = unsafe { core::slice::from_raw_parts(v.data_ptr, v.len) };
+                    new_vec.extend_from_slice(src);
+                }
+                new_vec.push(val);
+                new_vec.resize(new_word_cap, 0);
             }
-            new_vec.push(val);
-            new_vec.resize(new_cap, 0);
             let new_slice = new_vec.into_boxed_slice();
             let new_data_ptr = Box::into_raw(new_slice) as *mut i64;
 
@@ -1718,12 +1817,12 @@ pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
                         let old_words = old_backing.word_capacity;
                         records.remove(&(old_backing.base_ptr as usize));
                         if old_idx < bufs.len() && bufs[old_idx].0 == old_backing.base_ptr {
-                            bufs[old_idx] = (new_data_ptr, new_cap);
+                            bufs[old_idx] = (new_data_ptr, new_word_cap);
                             records.insert(
                                 new_data_ptr as usize,
                                 MirAllocationRecord {
                                     base_ptr: new_data_ptr,
-                                    word_capacity: new_cap,
+                                    word_capacity: new_word_cap,
                                     kind: MirAllocationKind::ArrayBacking,
                                     buffer_index: old_idx,
                                     handle_epoch: v.header_rec.handle_epoch,
@@ -1736,12 +1835,12 @@ pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
                             Some((old_backing.base_ptr, old_words))
                         } else {
                             let buffer_index = bufs.len();
-                            bufs.push((new_data_ptr, new_cap));
+                            bufs.push((new_data_ptr, new_word_cap));
                             records.insert(
                                 new_data_ptr as usize,
                                 MirAllocationRecord {
                                     base_ptr: new_data_ptr,
-                                    word_capacity: new_cap,
+                                    word_capacity: new_word_cap,
                                     kind: MirAllocationKind::ArrayBacking,
                                     buffer_index,
                                     handle_epoch: v.header_rec.handle_epoch,
@@ -1755,12 +1854,12 @@ pub extern "C" fn lust_mir_array_push(ptr: *mut i64, val: i64) -> i64 {
                         }
                     } else {
                         let buffer_index = bufs.len();
-                        bufs.push((new_data_ptr, new_cap));
+                        bufs.push((new_data_ptr, new_word_cap));
                         records.insert(
                             new_data_ptr as usize,
                             MirAllocationRecord {
                                 base_ptr: new_data_ptr,
-                                word_capacity: new_cap,
+                                word_capacity: new_word_cap,
                                 kind: MirAllocationKind::ArrayBacking,
                                 buffer_index,
                                 handle_epoch: v.header_rec.handle_epoch,

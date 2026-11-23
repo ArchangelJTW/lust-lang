@@ -637,42 +637,70 @@ pub unsafe extern "C" fn jit_materialize_inline_frames(
         }
     }
     let vm = unsafe { &mut *vm };
+    let old_vm_regs_ptr = vm.vm_registers.as_ptr() as usize;
+    let value_size = core::mem::size_of::<Value>();
+    let old_vm_regs_end = old_vm_regs_ptr + vm.vm_registers.len() * value_size;
+    let root_regs_addr = root_regs as usize;
+    let root_regs_vm_offset = if root_regs_addr >= old_vm_regs_ptr && root_regs_addr < old_vm_regs_end
+    {
+        Some((root_regs_addr - old_vm_regs_ptr) / value_size)
+    } else {
+        None
+    };
     for (r, site, regs) in chain.into_iter().rev() {
         let register_count = vm
             .functions
             .get(site.function_idx)
-            .map(|f| f.register_count)
-            .unwrap_or(site.value_count as u8);
+            .map(|f| if f.register_count > 0 { f.register_count as u16 } else { 256 })
+            .unwrap_or(site.value_count as u16)
+            .max(site.value_count as u16);
+        let caller_regs_addr = r.caller_regs as usize;
+        let caller_vm_offset = if caller_regs_addr >= old_vm_regs_ptr && caller_regs_addr < old_vm_regs_end {
+            Some((caller_regs_addr - old_vm_regs_ptr) / value_size)
+        } else {
+            None
+        };
+        if let Some(caller) = vm.call_stack.last_mut() {
+            caller.ip = site.caller_resume_ip;
+        }
         // The frames were live inside the trace already; the depth limit
         // was checked when they were called.
-        let mut frame = match vm.take_frame(
+        let frame_idx = vm.push_call_frame(
             site.function_idx,
-            Some(site.return_dest as Register),
             register_count,
-        ) {
-            Ok(frame) => frame,
-            Err(_) => CallFrame::new(
-                site.function_idx,
-                Some(site.return_dest as Register),
-                register_count,
-            ),
-        };
+            Some(site.return_dest as Register),
+        );
+        let base_reg = vm.call_stack[frame_idx].base_reg;
         for i in 0..site.value_count {
             let slot = unsafe { regs.add(i) };
-            frame.registers[i] = if i < 64 && site.alias_mask & (1 << i) != 0 {
+            vm.vm_registers[base_reg + i] = if i < 64 && site.alias_mask & (1 << i) != 0 {
                 unsafe { (*slot).clone() }
             } else {
                 unsafe { core::ptr::read(slot) }
             };
+            if !vm.vm_registers[base_reg + i].is_plain() {
+                vm.call_stack[frame_idx].mark_non_plain(i);
+            }
+        }
+        if let Some(vm_off) = caller_vm_offset {
+            if let Value::Closure(closure) = &vm.vm_registers[vm_off + site.callee_reg] {
+                let upvalues = closure.upvalues.iter().map(|uv| uv.get()).collect();
+                let shared_upvalues = closure.upvalues.clone();
+                let frame = &mut vm.call_stack[frame_idx];
+                frame.upvalues = upvalues;
+                frame.shared_upvalues = shared_upvalues;
+            }
+            continue;
         }
         if let Value::Closure(closure) = unsafe { &*r.caller_regs.add(site.callee_reg) } {
+            let frame = &mut vm.call_stack[frame_idx];
             frame.upvalues = closure.upvalues.iter().map(|uv| uv.get()).collect();
             frame.shared_upvalues = closure.upvalues.clone();
         }
-        if let Some(caller) = vm.call_stack.last_mut() {
-            caller.ip = site.caller_resume_ip;
-        }
-        vm.call_stack.push(frame);
     }
-    root_regs
+    if let Some(off) = root_regs_vm_offset {
+        vm.vm_registers[off..].as_mut_ptr()
+    } else {
+        root_regs
+    }
 }

@@ -1,8 +1,514 @@
 use crate::number::NumericType;
+use alloc::vec::Vec;
 use core::fmt;
 pub type Register = u8;
 pub type ConstIndex = u16;
 pub type JumpOffset = i16;
+
+/// Compact 4-byte packed bytecode instruction for L1d-friendly VM dispatch.
+///
+/// Bit layouts:
+/// - `ABC`:  bits `[0..8] = op`, `[8..16] = a`, `[16..24] = b`, `[24..32] = c`
+/// - `ABx`:  bits `[0..8] = op`, `[8..16] = a`, `[16..32] = bx` (`u16`)
+/// - `AsBx`: bits `[0..8] = op`, `[8..16] = a`, `[16..32] = sbx` (`i16` as `u16`)
+/// - `AX`:   `ABx` where `bx` indexes into `Chunk::extra_args: Vec<u32>`
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedInstruction(pub u32);
+
+const _: () = assert!(core::mem::size_of::<PackedInstruction>() == 4);
+const _: () = assert!(core::mem::align_of::<PackedInstruction>() == 4);
+
+impl PackedInstruction {
+    /// Format ABC: bits [0..8] = op, [8..16] = a, [16..24] = b, [24..32] = c
+    #[inline(always)]
+    pub const fn encode_abc(op: OpCode, a: u8, b: u8, c: u8) -> Self {
+        Self((op as u32) | ((a as u32) << 8) | ((b as u32) << 16) | ((c as u32) << 24))
+    }
+
+    /// Format ABx: bits [0..8] = op, [8..16] = a, [16..32] = bx (u16)
+    #[inline(always)]
+    pub const fn encode_abx(op: OpCode, a: u8, bx: u16) -> Self {
+        Self((op as u32) | ((a as u32) << 8) | ((bx as u32) << 16))
+    }
+
+    /// Format AsBx: bits [0..8] = op, [8..16] = a, [16..32] = sbx (i16 as u16)
+    #[inline(always)]
+    pub const fn encode_asbx(op: OpCode, a: u8, sbx: i16) -> Self {
+        Self::encode_abx(op, a, sbx as u16)
+    }
+
+    #[inline(always)]
+    pub const fn opcode_u8(self) -> u8 {
+        (self.0 & 0xFF) as u8
+    }
+
+    #[inline(always)]
+    pub const fn a(self) -> u8 {
+        ((self.0 >> 8) & 0xFF) as u8
+    }
+
+    #[inline(always)]
+    pub const fn b(self) -> u8 {
+        ((self.0 >> 16) & 0xFF) as u8
+    }
+
+    #[inline(always)]
+    pub const fn c(self) -> u8 {
+        (self.0 >> 24) as u8
+    }
+
+    #[inline(always)]
+    pub const fn c_i8(self) -> i8 {
+        ((self.0 >> 24) as u8) as i8
+    }
+
+    #[inline(always)]
+    pub const fn bx(self) -> u16 {
+        (self.0 >> 16) as u16
+    }
+
+    #[inline(always)]
+    pub const fn sbx(self) -> i16 {
+        ((self.0 >> 16) as u16) as i16
+    }
+
+    /// Logical gas weight matching `Instruction::gas_weight()`.
+    #[inline(always)]
+    pub const fn gas_weight(self) -> u16 {
+        let op = self.opcode_u8();
+        if op == OpCode::BranchLtInt as u8 || op == OpCode::BranchLeInt as u8 {
+            2
+        } else if op == OpCode::GetFieldAddSetInt as u8 {
+            3
+        } else {
+            1
+        }
+    }
+
+    #[inline]
+    fn push_extra1(extra_args: &mut Vec<u32>, w0: u32) -> Option<u16> {
+        let idx = extra_args.len();
+        if idx > u16::MAX as usize {
+            return None;
+        }
+        extra_args.push(w0);
+        Some(idx as u16)
+    }
+
+    #[inline]
+    fn push_extra2(extra_args: &mut Vec<u32>, w0: u32, w1: u32) -> Option<u16> {
+        let idx = extra_args.len();
+        if idx > u16::MAX as usize {
+            return None;
+        }
+        extra_args.push(w0);
+        extra_args.push(w1);
+        Some(idx as u16)
+    }
+
+    /// Encodes an `Instruction` into a 4-byte `PackedInstruction`, appending 0, 1, or 2
+    /// extension words to `extra_args` for `AX`-format opcodes.
+    ///
+    /// Returns `None` if `extra_args` cannot be indexed by a `u16` (`extra_args.len() > u16::MAX`).
+    pub fn from_instruction(inst: Instruction, extra_args: &mut Vec<u32>) -> Option<Self> {
+        let packed = match inst {
+            // Direct ABC format (0 extra_args words)
+            Instruction::LoadNil(dest) => Self::encode_abc(OpCode::LoadNil, dest, 0, 0),
+            Instruction::LoadBool(dest, val) => {
+                Self::encode_abc(OpCode::LoadBool, dest, if val { 1 } else { 0 }, 0)
+            }
+            Instruction::Move(dest, src) => Self::encode_abc(OpCode::Move, dest, src, 0),
+            Instruction::Return(reg) => Self::encode_abc(OpCode::Return, reg, 0, 0),
+            Instruction::NewMap(dest) => Self::encode_abc(OpCode::NewMap, dest, 0, 0),
+            Instruction::Neg(d, s) => Self::encode_abc(OpCode::Neg, d, s, 0),
+            Instruction::NegInt(d, s) => Self::encode_abc(OpCode::NegInt, d, s, 0),
+            Instruction::NegFloat(d, s) => Self::encode_abc(OpCode::NegFloat, d, s, 0),
+            Instruction::Not(d, s) => Self::encode_abc(OpCode::Not, d, s, 0),
+            Instruction::BitNot(d, s) => Self::encode_abc(OpCode::BitNot, d, s, 0),
+            Instruction::ArrayLen(d, s) => Self::encode_abc(OpCode::ArrayLen, d, s, 0),
+            Instruction::ArrayPush(d, s) => Self::encode_abc(OpCode::ArrayPush, d, s, 0),
+            Instruction::LoadUpvalue(dest, idx) => {
+                Self::encode_abc(OpCode::LoadUpvalue, dest, idx, 0)
+            }
+            Instruction::StoreUpvalue(idx, src) => {
+                Self::encode_abc(OpCode::StoreUpvalue, idx, src, 0)
+            }
+            Instruction::Add(d, l, r) => Self::encode_abc(OpCode::Add, d, l, r),
+            Instruction::Sub(d, l, r) => Self::encode_abc(OpCode::Sub, d, l, r),
+            Instruction::Mul(d, l, r) => Self::encode_abc(OpCode::Mul, d, l, r),
+            Instruction::Div(d, l, r) => Self::encode_abc(OpCode::Div, d, l, r),
+            Instruction::Mod(d, l, r) => Self::encode_abc(OpCode::Mod, d, l, r),
+            Instruction::Pow(d, l, r) => Self::encode_abc(OpCode::Pow, d, l, r),
+            Instruction::FloorDiv(d, l, r) => Self::encode_abc(OpCode::FloorDiv, d, l, r),
+            Instruction::Eq(d, l, r) => Self::encode_abc(OpCode::Eq, d, l, r),
+            Instruction::Ne(d, l, r) => Self::encode_abc(OpCode::Ne, d, l, r),
+            Instruction::Lt(d, l, r) => Self::encode_abc(OpCode::Lt, d, l, r),
+            Instruction::Le(d, l, r) => Self::encode_abc(OpCode::Le, d, l, r),
+            Instruction::Gt(d, l, r) => Self::encode_abc(OpCode::Gt, d, l, r),
+            Instruction::Ge(d, l, r) => Self::encode_abc(OpCode::Ge, d, l, r),
+            Instruction::AddInt(d, l, r) => Self::encode_abc(OpCode::AddInt, d, l, r),
+            Instruction::SubInt(d, l, r) => Self::encode_abc(OpCode::SubInt, d, l, r),
+            Instruction::MulInt(d, l, r) => Self::encode_abc(OpCode::MulInt, d, l, r),
+            Instruction::DivInt(d, l, r) => Self::encode_abc(OpCode::DivInt, d, l, r),
+            Instruction::ModInt(d, l, r) => Self::encode_abc(OpCode::ModInt, d, l, r),
+            Instruction::PowInt(d, l, r) => Self::encode_abc(OpCode::PowInt, d, l, r),
+            Instruction::FloorDivInt(d, l, r) => Self::encode_abc(OpCode::FloorDivInt, d, l, r),
+            Instruction::EqInt(d, l, r) => Self::encode_abc(OpCode::EqInt, d, l, r),
+            Instruction::NeInt(d, l, r) => Self::encode_abc(OpCode::NeInt, d, l, r),
+            Instruction::LtInt(d, l, r) => Self::encode_abc(OpCode::LtInt, d, l, r),
+            Instruction::LeInt(d, l, r) => Self::encode_abc(OpCode::LeInt, d, l, r),
+            Instruction::GtInt(d, l, r) => Self::encode_abc(OpCode::GtInt, d, l, r),
+            Instruction::GeInt(d, l, r) => Self::encode_abc(OpCode::GeInt, d, l, r),
+            Instruction::AddFloat(d, l, r) => Self::encode_abc(OpCode::AddFloat, d, l, r),
+            Instruction::SubFloat(d, l, r) => Self::encode_abc(OpCode::SubFloat, d, l, r),
+            Instruction::MulFloat(d, l, r) => Self::encode_abc(OpCode::MulFloat, d, l, r),
+            Instruction::DivFloat(d, l, r) => Self::encode_abc(OpCode::DivFloat, d, l, r),
+            Instruction::ModFloat(d, l, r) => Self::encode_abc(OpCode::ModFloat, d, l, r),
+            Instruction::PowFloat(d, l, r) => Self::encode_abc(OpCode::PowFloat, d, l, r),
+            Instruction::FloorDivFloat(d, l, r) => Self::encode_abc(OpCode::FloorDivFloat, d, l, r),
+            Instruction::EqFloat(d, l, r) => Self::encode_abc(OpCode::EqFloat, d, l, r),
+            Instruction::NeFloat(d, l, r) => Self::encode_abc(OpCode::NeFloat, d, l, r),
+            Instruction::LtFloat(d, l, r) => Self::encode_abc(OpCode::LtFloat, d, l, r),
+            Instruction::LeFloat(d, l, r) => Self::encode_abc(OpCode::LeFloat, d, l, r),
+            Instruction::GtFloat(d, l, r) => Self::encode_abc(OpCode::GtFloat, d, l, r),
+            Instruction::GeFloat(d, l, r) => Self::encode_abc(OpCode::GeFloat, d, l, r),
+            Instruction::And(d, l, r) => Self::encode_abc(OpCode::And, d, l, r),
+            Instruction::Or(d, l, r) => Self::encode_abc(OpCode::Or, d, l, r),
+            Instruction::BitAnd(d, l, r) => Self::encode_abc(OpCode::BitAnd, d, l, r),
+            Instruction::BitOr(d, l, r) => Self::encode_abc(OpCode::BitOr, d, l, r),
+            Instruction::BitXor(d, l, r) => Self::encode_abc(OpCode::BitXor, d, l, r),
+            Instruction::Shl(d, l, r) => Self::encode_abc(OpCode::Shl, d, l, r),
+            Instruction::Shr(d, l, r) => Self::encode_abc(OpCode::Shr, d, l, r),
+            Instruction::NewArray(d, first, cnt) => Self::encode_abc(OpCode::NewArray, d, first, cnt),
+            Instruction::TupleNew(d, first, cnt) => Self::encode_abc(OpCode::TupleNew, d, first, cnt),
+            Instruction::TupleGet(d, tuple, idx) => Self::encode_abc(OpCode::TupleGet, d, tuple, idx),
+            Instruction::GetEnumValue(d, enum_reg, idx) => {
+                Self::encode_abc(OpCode::GetEnumValue, d, enum_reg, idx)
+            }
+            Instruction::GetFieldSlot(d, obj, slot) => {
+                Self::encode_abc(OpCode::GetFieldSlot, d, obj, slot)
+            }
+            Instruction::SetFieldSlot(obj, slot, val) => {
+                Self::encode_abc(OpCode::SetFieldSlot, obj, slot, val)
+            }
+            Instruction::GetIndex(d, arr, idx) => Self::encode_abc(OpCode::GetIndex, d, arr, idx),
+            Instruction::TryGetIndex(d, arr, idx) => {
+                Self::encode_abc(OpCode::TryGetIndex, d, arr, idx)
+            }
+            Instruction::ArrayGetUnwrap(d, arr, idx) => {
+                Self::encode_abc(OpCode::ArrayGetUnwrap, d, arr, idx)
+            }
+            Instruction::SetIndex(arr, idx, val) => {
+                Self::encode_abc(OpCode::SetIndex, arr, idx, val)
+            }
+            Instruction::Concat(d, l, r) => Self::encode_abc(OpCode::Concat, d, l, r),
+            Instruction::AddIntImm(d, src, imm) => {
+                Self::encode_abc(OpCode::AddIntImm, d, src, imm as u8)
+            }
+            Instruction::GetFieldAddSetInt(obj, slot, addend) => {
+                Self::encode_abc(OpCode::GetFieldAddSetInt, obj, slot, addend)
+            }
+
+            // Direct ABx / AsBx format (0 extra_args words)
+            Instruction::LoadConst(dest, idx) => Self::encode_abx(OpCode::LoadConst, dest, idx),
+            Instruction::LoadGlobal(dest, idx) => Self::encode_abx(OpCode::LoadGlobal, dest, idx),
+            Instruction::StoreGlobal(idx, src) => Self::encode_abx(OpCode::StoreGlobal, src, idx),
+            Instruction::Jump(offset) => Self::encode_asbx(OpCode::Jump, 0, offset),
+            Instruction::JumpIf(reg, offset) => Self::encode_asbx(OpCode::JumpIf, reg, offset),
+            Instruction::JumpIfNot(reg, offset) => {
+                Self::encode_asbx(OpCode::JumpIfNot, reg, offset)
+            }
+
+            // AX format: 1 word in extra_args
+            Instruction::BranchLtInt(lhs, rhs, off) => {
+                let w0 = u32::from(rhs) | (u32::from(off as u16) << 16);
+                let ex = Self::push_extra1(extra_args, w0)?;
+                Self::encode_abx(OpCode::BranchLtInt, lhs, ex)
+            }
+            Instruction::BranchLeInt(lhs, rhs, off) => {
+                let w0 = u32::from(rhs) | (u32::from(off as u16) << 16);
+                let ex = Self::push_extra1(extra_args, w0)?;
+                Self::encode_abx(OpCode::BranchLeInt, lhs, ex)
+            }
+            Instruction::Call(func, args, cnt, dest) => {
+                let w0 = u32::from(args) | (u32::from(cnt) << 8) | (u32::from(dest) << 16);
+                let ex = Self::push_extra1(extra_args, w0)?;
+                Self::encode_abx(OpCode::Call, func, ex)
+            }
+            Instruction::ArrayIndexOk(val, cond, arr, idx) => {
+                let w0 = u32::from(cond) | (u32::from(arr) << 8) | (u32::from(idx) << 16);
+                let ex = Self::push_extra1(extra_args, w0)?;
+                Self::encode_abx(OpCode::ArrayIndexOk, val, ex)
+            }
+            Instruction::GetField(dest, obj, field_idx) => {
+                let w0 = u32::from(obj) | (u32::from(field_idx) << 16);
+                let ex = Self::push_extra1(extra_args, w0)?;
+                Self::encode_abx(OpCode::GetField, dest, ex)
+            }
+            Instruction::SetField(obj, field_idx, val) => {
+                let w0 = u32::from(val) | (u32::from(field_idx) << 16);
+                let ex = Self::push_extra1(extra_args, w0)?;
+                Self::encode_abx(OpCode::SetField, obj, ex)
+            }
+            Instruction::TypeIs(dest, src, type_idx) => {
+                let w0 = u32::from(src) | (u32::from(type_idx) << 16);
+                let ex = Self::push_extra1(extra_args, w0)?;
+                Self::encode_abx(OpCode::TypeIs, dest, ex)
+            }
+            Instruction::TryCast(dest, src, type_idx) => {
+                let w0 = u32::from(src) | (u32::from(type_idx) << 16);
+                let ex = Self::push_extra1(extra_args, w0)?;
+                Self::encode_abx(OpCode::TryCast, dest, ex)
+            }
+
+            // AX format: 2 consecutive words in extra_args
+            Instruction::NewStruct(dest, name, field_names, fields, cnt) => {
+                let w0 = u32::from(name) | (u32::from(field_names) << 16);
+                let w1 = u32::from(fields) | (u32::from(cnt) << 8);
+                let ex = Self::push_extra2(extra_args, w0, w1)?;
+                Self::encode_abx(OpCode::NewStruct, dest, ex)
+            }
+            Instruction::NewEnumUnit(dest, enum_name, variant) => {
+                let w0 = u32::from(enum_name) | (u32::from(variant) << 16);
+                let ex = Self::push_extra2(extra_args, w0, 0)?;
+                Self::encode_abx(OpCode::NewEnumUnit, dest, ex)
+            }
+            Instruction::NewEnumVariant(dest, enum_name, variant, values, cnt) => {
+                let w0 = u32::from(enum_name) | (u32::from(variant) << 16);
+                let w1 = u32::from(values) | (u32::from(cnt) << 8);
+                let ex = Self::push_extra2(extra_args, w0, w1)?;
+                Self::encode_abx(OpCode::NewEnumVariant, dest, ex)
+            }
+            Instruction::IsEnumVariant(dest, val, enum_name, variant) => {
+                let w0 = u32::from(enum_name) | (u32::from(variant) << 16);
+                let w1 = u32::from(val);
+                let ex = Self::push_extra2(extra_args, w0, w1)?;
+                Self::encode_abx(OpCode::IsEnumVariant, dest, ex)
+            }
+            Instruction::CallMethod(obj, method, args, cnt, dest) => {
+                let w0 = u32::from(method) | (u32::from(args) << 16) | (u32::from(cnt) << 24);
+                let w1 = u32::from(dest);
+                let ex = Self::push_extra2(extra_args, w0, w1)?;
+                Self::encode_abx(OpCode::CallMethod, obj, ex)
+            }
+            Instruction::Closure(dest, func, upvals, cnt) => {
+                let w0 = u32::from(func) | (u32::from(upvals) << 16) | (u32::from(cnt) << 24);
+                let ex = Self::push_extra2(extra_args, w0, 0)?;
+                Self::encode_abx(OpCode::Closure, dest, ex)
+            }
+        };
+        Some(packed)
+    }
+
+    /// Decodes a `PackedInstruction` (paired with `Chunk::extra_args`) back into an `Instruction`.
+    pub fn to_instruction(self, extra_args: &[u32]) -> Result<Instruction, DecodeError> {
+        let opcode = OpCode::from_u8(self.opcode_u8())?;
+        let extra1 = |idx: u16| -> Result<u32, DecodeError> {
+            let i = idx as usize;
+            extra_args.get(i).copied().ok_or(DecodeError::Truncated {
+                expected: i + 1,
+                found: extra_args.len(),
+            })
+        };
+        let extra2 = |idx: u16| -> Result<(u32, u32), DecodeError> {
+            let i = idx as usize;
+            if i + 1 >= extra_args.len() {
+                return Err(DecodeError::Truncated {
+                    expected: i + 2,
+                    found: extra_args.len(),
+                });
+            }
+            Ok((extra_args[i], extra_args[i + 1]))
+        };
+
+        let inst = match opcode {
+            OpCode::LoadNil => Instruction::LoadNil(self.a()),
+            OpCode::LoadBool => {
+                let b = match self.b() {
+                    0 => false,
+                    1 => true,
+                    other => return Err(DecodeError::InvalidBoolean(other)),
+                };
+                Instruction::LoadBool(self.a(), b)
+            }
+            OpCode::LoadConst => Instruction::LoadConst(self.a(), self.bx()),
+            OpCode::LoadGlobal => Instruction::LoadGlobal(self.a(), self.bx()),
+            OpCode::StoreGlobal => Instruction::StoreGlobal(self.bx(), self.a()),
+            OpCode::Move => Instruction::Move(self.a(), self.b()),
+            OpCode::Add => Instruction::Add(self.a(), self.b(), self.c()),
+            OpCode::Sub => Instruction::Sub(self.a(), self.b(), self.c()),
+            OpCode::Mul => Instruction::Mul(self.a(), self.b(), self.c()),
+            OpCode::Div => Instruction::Div(self.a(), self.b(), self.c()),
+            OpCode::Mod => Instruction::Mod(self.a(), self.b(), self.c()),
+            OpCode::Pow => Instruction::Pow(self.a(), self.b(), self.c()),
+            OpCode::FloorDiv => Instruction::FloorDiv(self.a(), self.b(), self.c()),
+            OpCode::Neg => Instruction::Neg(self.a(), self.b()),
+            OpCode::Eq => Instruction::Eq(self.a(), self.b(), self.c()),
+            OpCode::Ne => Instruction::Ne(self.a(), self.b(), self.c()),
+            OpCode::Lt => Instruction::Lt(self.a(), self.b(), self.c()),
+            OpCode::Le => Instruction::Le(self.a(), self.b(), self.c()),
+            OpCode::Gt => Instruction::Gt(self.a(), self.b(), self.c()),
+            OpCode::Ge => Instruction::Ge(self.a(), self.b(), self.c()),
+            OpCode::AddInt => Instruction::AddInt(self.a(), self.b(), self.c()),
+            OpCode::SubInt => Instruction::SubInt(self.a(), self.b(), self.c()),
+            OpCode::MulInt => Instruction::MulInt(self.a(), self.b(), self.c()),
+            OpCode::DivInt => Instruction::DivInt(self.a(), self.b(), self.c()),
+            OpCode::ModInt => Instruction::ModInt(self.a(), self.b(), self.c()),
+            OpCode::PowInt => Instruction::PowInt(self.a(), self.b(), self.c()),
+            OpCode::FloorDivInt => Instruction::FloorDivInt(self.a(), self.b(), self.c()),
+            OpCode::NegInt => Instruction::NegInt(self.a(), self.b()),
+            OpCode::EqInt => Instruction::EqInt(self.a(), self.b(), self.c()),
+            OpCode::NeInt => Instruction::NeInt(self.a(), self.b(), self.c()),
+            OpCode::LtInt => Instruction::LtInt(self.a(), self.b(), self.c()),
+            OpCode::LeInt => Instruction::LeInt(self.a(), self.b(), self.c()),
+            OpCode::GtInt => Instruction::GtInt(self.a(), self.b(), self.c()),
+            OpCode::GeInt => Instruction::GeInt(self.a(), self.b(), self.c()),
+            OpCode::AddFloat => Instruction::AddFloat(self.a(), self.b(), self.c()),
+            OpCode::SubFloat => Instruction::SubFloat(self.a(), self.b(), self.c()),
+            OpCode::MulFloat => Instruction::MulFloat(self.a(), self.b(), self.c()),
+            OpCode::DivFloat => Instruction::DivFloat(self.a(), self.b(), self.c()),
+            OpCode::ModFloat => Instruction::ModFloat(self.a(), self.b(), self.c()),
+            OpCode::PowFloat => Instruction::PowFloat(self.a(), self.b(), self.c()),
+            OpCode::FloorDivFloat => Instruction::FloorDivFloat(self.a(), self.b(), self.c()),
+            OpCode::NegFloat => Instruction::NegFloat(self.a(), self.b()),
+            OpCode::EqFloat => Instruction::EqFloat(self.a(), self.b(), self.c()),
+            OpCode::NeFloat => Instruction::NeFloat(self.a(), self.b(), self.c()),
+            OpCode::LtFloat => Instruction::LtFloat(self.a(), self.b(), self.c()),
+            OpCode::LeFloat => Instruction::LeFloat(self.a(), self.b(), self.c()),
+            OpCode::GtFloat => Instruction::GtFloat(self.a(), self.b(), self.c()),
+            OpCode::GeFloat => Instruction::GeFloat(self.a(), self.b(), self.c()),
+            OpCode::And => Instruction::And(self.a(), self.b(), self.c()),
+            OpCode::Or => Instruction::Or(self.a(), self.b(), self.c()),
+            OpCode::Not => Instruction::Not(self.a(), self.b()),
+            OpCode::BitAnd => Instruction::BitAnd(self.a(), self.b(), self.c()),
+            OpCode::BitOr => Instruction::BitOr(self.a(), self.b(), self.c()),
+            OpCode::BitXor => Instruction::BitXor(self.a(), self.b(), self.c()),
+            OpCode::Shl => Instruction::Shl(self.a(), self.b(), self.c()),
+            OpCode::Shr => Instruction::Shr(self.a(), self.b(), self.c()),
+            OpCode::BitNot => Instruction::BitNot(self.a(), self.b()),
+            OpCode::Jump => Instruction::Jump(self.sbx()),
+            OpCode::JumpIf => Instruction::JumpIf(self.a(), self.sbx()),
+            OpCode::JumpIfNot => Instruction::JumpIfNot(self.a(), self.sbx()),
+            OpCode::Call => {
+                let w0 = extra1(self.bx())?;
+                Instruction::Call(
+                    self.a(),
+                    (w0 & 0xFF) as u8,
+                    ((w0 >> 8) & 0xFF) as u8,
+                    ((w0 >> 16) & 0xFF) as u8,
+                )
+            }
+            OpCode::Return => Instruction::Return(self.a()),
+            OpCode::NewArray => Instruction::NewArray(self.a(), self.b(), self.c()),
+            OpCode::NewMap => Instruction::NewMap(self.a()),
+            OpCode::NewStruct => {
+                let (w0, w1) = extra2(self.bx())?;
+                Instruction::NewStruct(
+                    self.a(),
+                    (w0 & 0xFFFF) as u16,
+                    (w0 >> 16) as u16,
+                    (w1 & 0xFF) as u8,
+                    ((w1 >> 8) & 0xFF) as u8,
+                )
+            }
+            OpCode::NewEnumUnit => {
+                let (w0, _) = extra2(self.bx())?;
+                Instruction::NewEnumUnit(self.a(), (w0 & 0xFFFF) as u16, (w0 >> 16) as u16)
+            }
+            OpCode::NewEnumVariant => {
+                let (w0, w1) = extra2(self.bx())?;
+                Instruction::NewEnumVariant(
+                    self.a(),
+                    (w0 & 0xFFFF) as u16,
+                    (w0 >> 16) as u16,
+                    (w1 & 0xFF) as u8,
+                    ((w1 >> 8) & 0xFF) as u8,
+                )
+            }
+            OpCode::TupleNew => Instruction::TupleNew(self.a(), self.b(), self.c()),
+            OpCode::TupleGet => Instruction::TupleGet(self.a(), self.b(), self.c()),
+            OpCode::IsEnumVariant => {
+                let (w0, w1) = extra2(self.bx())?;
+                Instruction::IsEnumVariant(
+                    self.a(),
+                    (w1 & 0xFF) as u8,
+                    (w0 & 0xFFFF) as u16,
+                    (w0 >> 16) as u16,
+                )
+            }
+            OpCode::GetEnumValue => Instruction::GetEnumValue(self.a(), self.b(), self.c()),
+            OpCode::GetField => {
+                let w0 = extra1(self.bx())?;
+                Instruction::GetField(self.a(), (w0 & 0xFF) as u8, (w0 >> 16) as u16)
+            }
+            OpCode::SetField => {
+                let w0 = extra1(self.bx())?;
+                Instruction::SetField(self.a(), (w0 >> 16) as u16, (w0 & 0xFF) as u8)
+            }
+            OpCode::GetFieldSlot => Instruction::GetFieldSlot(self.a(), self.b(), self.c()),
+            OpCode::SetFieldSlot => Instruction::SetFieldSlot(self.a(), self.b(), self.c()),
+            OpCode::GetIndex => Instruction::GetIndex(self.a(), self.b(), self.c()),
+            OpCode::TryGetIndex => Instruction::TryGetIndex(self.a(), self.b(), self.c()),
+            OpCode::ArrayIndexOk => {
+                let w0 = extra1(self.bx())?;
+                Instruction::ArrayIndexOk(
+                    self.a(),
+                    (w0 & 0xFF) as u8,
+                    ((w0 >> 8) & 0xFF) as u8,
+                    ((w0 >> 16) & 0xFF) as u8,
+                )
+            }
+            OpCode::ArrayLen => Instruction::ArrayLen(self.a(), self.b()),
+            OpCode::ArrayPush => Instruction::ArrayPush(self.a(), self.b()),
+            OpCode::ArrayGetUnwrap => Instruction::ArrayGetUnwrap(self.a(), self.b(), self.c()),
+            OpCode::SetIndex => Instruction::SetIndex(self.a(), self.b(), self.c()),
+            OpCode::Concat => Instruction::Concat(self.a(), self.b(), self.c()),
+            OpCode::CallMethod => {
+                let (w0, w1) = extra2(self.bx())?;
+                Instruction::CallMethod(
+                    self.a(),
+                    (w0 & 0xFFFF) as u16,
+                    ((w0 >> 16) & 0xFF) as u8,
+                    (w0 >> 24) as u8,
+                    (w1 & 0xFF) as u8,
+                )
+            }
+            OpCode::TypeIs => {
+                let w0 = extra1(self.bx())?;
+                Instruction::TypeIs(self.a(), (w0 & 0xFF) as u8, (w0 >> 16) as u16)
+            }
+            OpCode::TryCast => {
+                let w0 = extra1(self.bx())?;
+                Instruction::TryCast(self.a(), (w0 & 0xFF) as u8, (w0 >> 16) as u16)
+            }
+            OpCode::LoadUpvalue => Instruction::LoadUpvalue(self.a(), self.b()),
+            OpCode::StoreUpvalue => Instruction::StoreUpvalue(self.a(), self.b()),
+            OpCode::Closure => {
+                let (w0, _) = extra2(self.bx())?;
+                Instruction::Closure(
+                    self.a(),
+                    (w0 & 0xFFFF) as u16,
+                    ((w0 >> 16) & 0xFF) as u8,
+                    (w0 >> 24) as u8,
+                )
+            }
+            OpCode::AddIntImm => Instruction::AddIntImm(self.a(), self.b(), self.c_i8()),
+            OpCode::BranchLtInt => {
+                let w0 = extra1(self.bx())?;
+                Instruction::BranchLtInt(self.a(), (w0 & 0xFF) as u8, (w0 >> 16) as u16 as i16)
+            }
+            OpCode::BranchLeInt => {
+                let w0 = extra1(self.bx())?;
+                Instruction::BranchLeInt(self.a(), (w0 & 0xFF) as u8, (w0 >> 16) as u16 as i16)
+            }
+            OpCode::GetFieldAddSetInt => {
+                Instruction::GetFieldAddSetInt(self.a(), self.b(), self.c())
+            }
+        };
+        Ok(inst)
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Instruction {
     LoadNil(Register),
@@ -78,6 +584,8 @@ pub enum Instruction {
     GetEnumValue(Register, Register, u8),
     GetField(Register, Register, ConstIndex),
     SetField(Register, ConstIndex, Register),
+    GetFieldSlot(Register, Register, u8),
+    SetFieldSlot(Register, u8, Register),
     GetIndex(Register, Register, Register),
     TryGetIndex(Register, Register, Register),
     ArrayIndexOk(Register, Register, Register, Register),
@@ -92,6 +600,10 @@ pub enum Instruction {
     LoadUpvalue(Register, u8),
     StoreUpvalue(u8, Register),
     Closure(Register, ConstIndex, Register, u8),
+    AddIntImm(Register, Register, i8),
+    BranchLtInt(Register, Register, JumpOffset),
+    BranchLeInt(Register, Register, JumpOffset),
+    GetFieldAddSetInt(Register, u8, Register),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +696,12 @@ pub enum OpCode {
     Closure,
     ArrayPush,
     ArrayGetUnwrap,
+    GetFieldSlot,
+    SetFieldSlot,
+    AddIntImm,
+    BranchLtInt,
+    BranchLeInt,
+    GetFieldAddSetInt,
 }
 
 impl Instruction {
@@ -262,6 +780,8 @@ impl Instruction {
             Instruction::GetEnumValue(_, _, _) => OpCode::GetEnumValue,
             Instruction::GetField(_, _, _) => OpCode::GetField,
             Instruction::SetField(_, _, _) => OpCode::SetField,
+            Instruction::GetFieldSlot(_, _, _) => OpCode::GetFieldSlot,
+            Instruction::SetFieldSlot(_, _, _) => OpCode::SetFieldSlot,
             Instruction::GetIndex(_, _, _) => OpCode::GetIndex,
             Instruction::TryGetIndex(_, _, _) => OpCode::TryGetIndex,
             Instruction::ArrayIndexOk(_, _, _, _) => OpCode::ArrayIndexOk,
@@ -276,6 +796,26 @@ impl Instruction {
             Instruction::LoadUpvalue(_, _) => OpCode::LoadUpvalue,
             Instruction::StoreUpvalue(_, _) => OpCode::StoreUpvalue,
             Instruction::Closure(_, _, _, _) => OpCode::Closure,
+            Instruction::AddIntImm(_, _, _) => OpCode::AddIntImm,
+            Instruction::BranchLtInt(_, _, _) => OpCode::BranchLtInt,
+            Instruction::BranchLeInt(_, _, _) => OpCode::BranchLeInt,
+            Instruction::GetFieldAddSetInt(_, _, _) => OpCode::GetFieldAddSetInt,
+        }
+    }
+
+    /// Logical gas weight of a single bytecode instruction.
+    ///
+    /// Superinstructions charge the exact sum of the constituent instructions
+    /// they fuse so gas accounting remains invariant under fusion:
+    /// - `BranchLtInt` / `BranchLeInt`: 2 (`LtInt`/`LeInt` + `JumpIfNot`)
+    /// - `GetFieldAddSetInt`: 3 (`GetFieldSlot` + `Add`/`AddInt` + `SetFieldSlot`)
+    /// - all other instructions: 1
+    #[inline(always)]
+    pub const fn gas_weight(&self) -> u16 {
+        match self {
+            Instruction::BranchLtInt(..) | Instruction::BranchLeInt(..) => 2,
+            Instruction::GetFieldAddSetInt(..) => 3,
+            _ => 1,
         }
     }
 
@@ -348,6 +888,7 @@ impl Instruction {
             | Instruction::IsEnumVariant(dest, _, _, _)
             | Instruction::GetEnumValue(dest, _, _)
             | Instruction::GetField(dest, _, _)
+            | Instruction::GetFieldSlot(dest, _, _)
             | Instruction::GetIndex(dest, _, _)
             | Instruction::TryGetIndex(dest, _, _)
             | Instruction::ArrayLen(dest, _)
@@ -357,13 +898,18 @@ impl Instruction {
             | Instruction::TypeIs(dest, _, _)
             | Instruction::TryCast(dest, _, _)
             | Instruction::LoadUpvalue(dest, _)
-            | Instruction::Closure(dest, _, _, _) => Some(dest),
+            | Instruction::Closure(dest, _, _, _)
+            | Instruction::AddIntImm(dest, _, _) => Some(dest),
             Instruction::StoreGlobal(_, _)
             | Instruction::Jump(_)
             | Instruction::JumpIf(_, _)
             | Instruction::JumpIfNot(_, _)
+            | Instruction::BranchLtInt(_, _, _)
+            | Instruction::BranchLeInt(_, _, _)
             | Instruction::Return(_)
             | Instruction::SetField(_, _, _)
+            | Instruction::SetFieldSlot(_, _, _)
+            | Instruction::GetFieldAddSetInt(_, _, _)
             | Instruction::SetIndex(_, _, _)
             | Instruction::ArrayIndexOk(_, _, _, _)
             | Instruction::ArrayPush(_, _)
@@ -377,6 +923,7 @@ impl Instruction {
         };
         match *self {
             Instruction::Move(_, src)
+            | Instruction::AddIntImm(_, src, _)
             | Instruction::Neg(_, src)
             | Instruction::NegInt(_, src)
             | Instruction::NegFloat(_, src)
@@ -441,13 +988,20 @@ impl Instruction {
             | Instruction::ArrayIndexOk(_, _, lhs, rhs)
             | Instruction::ArrayPush(lhs, rhs)
             | Instruction::ArrayGetUnwrap(_, lhs, rhs)
-            | Instruction::Concat(_, lhs, rhs) => register == lhs || register == rhs,
+            | Instruction::Concat(_, lhs, rhs)
+            | Instruction::BranchLtInt(lhs, rhs, _)
+            | Instruction::BranchLeInt(lhs, rhs, _) => register == lhs || register == rhs,
             Instruction::SetIndex(collection, index, value) => {
                 register == collection || register == index || register == value
             }
-            Instruction::SetField(object, _, value) => register == object || register == value,
+            Instruction::SetField(object, _, value)
+            | Instruction::SetFieldSlot(object, _, value)
+            | Instruction::GetFieldAddSetInt(object, _, value) => {
+                register == object || register == value
+            }
             Instruction::IsEnumVariant(_, value, _, _)
             | Instruction::GetField(_, value, _)
+            | Instruction::GetFieldSlot(_, value, _)
             | Instruction::TypeIs(_, value, _)
             | Instruction::TryCast(_, value, _) => register == value,
             Instruction::Call(function, first, count, _) => {
@@ -703,6 +1257,14 @@ impl fmt::Display for Instruction {
                 write!(f, "SetField R{}, K{}, R{}", obj, field, val)
             }
 
+            Instruction::GetFieldSlot(d, obj, slot) => {
+                write!(f, "GetFieldSlot R{}, R{}, #{}", d, obj, slot)
+            }
+
+            Instruction::SetFieldSlot(obj, slot, val) => {
+                write!(f, "SetFieldSlot R{}, #{}, R{}", obj, slot, val)
+            }
+
             Instruction::GetIndex(d, arr, idx) => write!(f, "GetIndex R{}, R{}, R{}", d, arr, idx),
             Instruction::TryGetIndex(d, arr, idx) => {
                 write!(f, "TryGetIndex R{}, R{}, R{}", d, arr, idx)
@@ -752,6 +1314,16 @@ impl fmt::Display for Instruction {
                     let end = start + (*cnt as usize) - 1;
                     write!(f, "Closure R{}, F{}, R{}..R{}", d, func, upvals, end)
                 }
+            }
+            Instruction::AddIntImm(d, s, imm) => write!(f, "AddIntImm R{}, R{}, {}", d, s, imm),
+            Instruction::BranchLtInt(lhs, rhs, offset) => {
+                write!(f, "BranchLtInt R{}, R{}, {}", lhs, rhs, offset)
+            }
+            Instruction::BranchLeInt(lhs, rhs, offset) => {
+                write!(f, "BranchLeInt R{}, R{}, {}", lhs, rhs, offset)
+            }
+            Instruction::GetFieldAddSetInt(obj, slot, addend) => {
+                write!(f, "GetFieldAddSetInt R{}, #{}, R{}", obj, slot, addend)
             }
         }
     }
@@ -880,6 +1452,12 @@ impl OpCode {
             84 => Ok(OpCode::Closure),
             85 => Ok(OpCode::ArrayPush),
             86 => Ok(OpCode::ArrayGetUnwrap),
+            87 => Ok(OpCode::GetFieldSlot),
+            88 => Ok(OpCode::SetFieldSlot),
+            89 => Ok(OpCode::AddIntImm),
+            90 => Ok(OpCode::BranchLtInt),
+            91 => Ok(OpCode::BranchLeInt),
+            92 => Ok(OpCode::GetFieldAddSetInt),
             other => Err(DecodeError::UnknownOpCode(other)),
         }
     }
@@ -1089,6 +1667,16 @@ impl Instruction {
                 buf[3] = b[1];
                 buf[4] = val;
             }
+            Instruction::GetFieldSlot(dest, obj, slot) => {
+                buf[1] = dest;
+                buf[2] = obj;
+                buf[3] = slot;
+            }
+            Instruction::SetFieldSlot(obj, slot, val) => {
+                buf[1] = obj;
+                buf[2] = slot;
+                buf[3] = val;
+            }
             Instruction::ArrayIndexOk(v, c, arr, idx) => {
                 buf[1] = v;
                 buf[2] = c;
@@ -1138,6 +1726,24 @@ impl Instruction {
                 buf[3] = b[1];
                 buf[4] = upvals;
                 buf[5] = cnt;
+            }
+            Instruction::AddIntImm(dest, src, imm) => {
+                buf[1] = dest;
+                buf[2] = src;
+                buf[3] = imm as u8;
+            }
+            Instruction::BranchLtInt(lhs, rhs, offset)
+            | Instruction::BranchLeInt(lhs, rhs, offset) => {
+                buf[1] = lhs;
+                buf[2] = rhs;
+                let b = offset.to_le_bytes();
+                buf[3] = b[0];
+                buf[4] = b[1];
+            }
+            Instruction::GetFieldAddSetInt(obj, slot, addend) => {
+                buf[1] = obj;
+                buf[2] = slot;
+                buf[3] = addend;
             }
         }
         buf
@@ -1252,6 +1858,8 @@ impl Instruction {
             OpCode::GetEnumValue => Ok(Instruction::GetEnumValue(bytes[1], bytes[2], bytes[3])),
             OpCode::GetField => Ok(Instruction::GetField(bytes[1], bytes[2], u16_at(3))),
             OpCode::SetField => Ok(Instruction::SetField(bytes[1], u16_at(2), bytes[4])),
+            OpCode::GetFieldSlot => Ok(Instruction::GetFieldSlot(bytes[1], bytes[2], bytes[3])),
+            OpCode::SetFieldSlot => Ok(Instruction::SetFieldSlot(bytes[1], bytes[2], bytes[3])),
             OpCode::GetIndex => Ok(Instruction::GetIndex(bytes[1], bytes[2], bytes[3])),
             OpCode::TryGetIndex => Ok(Instruction::TryGetIndex(bytes[1], bytes[2], bytes[3])),
             OpCode::ArrayIndexOk => Ok(Instruction::ArrayIndexOk(
@@ -1278,6 +1886,24 @@ impl Instruction {
                 u16_at(2),
                 bytes[4],
                 bytes[5],
+            )),
+            OpCode::AddIntImm => Ok(Instruction::AddIntImm(
+                bytes[1],
+                bytes[2],
+                bytes[3] as i8,
+            )),
+            OpCode::BranchLtInt => Ok(Instruction::BranchLtInt(
+                bytes[1],
+                bytes[2],
+                i16_at(3),
+            )),
+            OpCode::BranchLeInt => Ok(Instruction::BranchLeInt(
+                bytes[1],
+                bytes[2],
+                i16_at(3),
+            )),
+            OpCode::GetFieldAddSetInt => Ok(Instruction::GetFieldAddSetInt(
+                bytes[1], bytes[2], bytes[3],
             )),
         }
     }

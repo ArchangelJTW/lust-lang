@@ -185,7 +185,18 @@ impl VM {
         if let Some(dest) = task.yield_dest.take() {
             let value = resume_value_opt.take().or(last_yield_fallback).unwrap_or(Value::Nil);
             if let Some(frame) = task.call_stack.last_mut() {
-                frame.registers[dest as usize] = value;
+                let idx = dest as usize;
+                let is_non_plain = !value.is_plain();
+                let regs = frame
+                    .saved_registers
+                    .get_or_insert_with(|| Box::new(vec![Value::Nil; (frame.reg_count as usize).max(idx + 1)]));
+                if idx >= regs.len() {
+                    regs.resize(idx + 1, Value::Nil);
+                }
+                regs[idx] = value;
+                if is_non_plain {
+                    frame.mark_non_plain(idx);
+                }
             }
         } else if resume_value_opt.is_some() {
             let message = format!(
@@ -198,7 +209,86 @@ impl VM {
 
         task.state = TaskState::Running;
         task.fiber_context.state = crate::effect_abi::FiberExecutionState::Running;
-        mem::swap(&mut self.call_stack, &mut task.call_stack);
+        let saved_parent_call_stack = mem::take(&mut self.call_stack);
+        let parent_reg_top = saved_parent_call_stack
+            .last()
+            .map(|f| f.base_reg + f.reg_count as usize)
+            .unwrap_or(0);
+        let mut cursor = parent_reg_top;
+        let mut pending_frames = mem::take(&mut task.call_stack);
+        let mut loaded_frames: Vec<CallFrame> = Vec::with_capacity(pending_frames.len());
+        let mut load_err: Option<LustError> = None;
+        let mut pending_iter = pending_frames.drain(..);
+        while let Some(mut boxed_frame) = pending_iter.next() {
+            let saved = boxed_frame.saved_registers.take();
+            let saved_len = saved.as_ref().map_or(0, |v| v.len());
+            let reg_count = if boxed_frame.reg_count > 0 {
+                boxed_frame.reg_count.max(saved_len as u16)
+            } else if saved_len > 0 {
+                saved_len as u16
+            } else {
+                self.effective_reg_count(boxed_frame.function_idx)
+            };
+            let end = cursor + reg_count as usize;
+            if self.vm_registers.len() < end {
+                let extra = end - self.vm_registers.len();
+                if self.vm_registers.try_reserve(extra).is_err() {
+                    boxed_frame.saved_registers = saved;
+                    task.call_stack.push(boxed_frame);
+                    load_err = Some(LustError::RuntimeError {
+                        message: "Out of memory restoring fiber register window".to_string(),
+                    });
+                    break;
+                }
+                self.vm_registers.resize(end, Value::Nil);
+            } else {
+                for slot in &mut self.vm_registers[cursor..end] {
+                    *slot = Value::Nil;
+                }
+            }
+            boxed_frame.base_reg = cursor;
+            boxed_frame.reg_count = reg_count;
+            boxed_frame.non_plain_mask = 0;
+            if let Some(saved_vec) = saved {
+                for (i, val) in saved_vec.into_iter().enumerate().take(reg_count as usize) {
+                    if !val.is_plain() {
+                        boxed_frame.mark_non_plain(i);
+                    }
+                    self.vm_registers[cursor + i] = val;
+                }
+            }
+            if let Some(meta) = self.call_meta.get_mut(boxed_frame.function_idx) {
+                meta.active_depth = meta.active_depth.saturating_add(1);
+            }
+            cursor = end;
+            loaded_frames.push(*boxed_frame);
+        }
+        if let Some(err) = load_err {
+            // Roll back already-loaded fiber frames cleanly before returning OOM error.
+            let remaining: Vec<Box<CallFrame>> = pending_iter.collect();
+            let mut restored_stack: Vec<Box<CallFrame>> =
+                Vec::with_capacity(loaded_frames.len() + task.call_stack.len() + remaining.len());
+            for mut frame in loaded_frames {
+                if let Some(meta) = self.call_meta.get_mut(frame.function_idx) {
+                    meta.active_depth = meta.active_depth.saturating_sub(1);
+                }
+                let start = frame.base_reg;
+                let end = (start + frame.reg_count as usize).min(self.vm_registers.len());
+                let saved = self.vm_registers[start..end].to_vec();
+                CallFrame::clear_non_plain_slots(&mut self.vm_registers[start..end], frame.non_plain_mask);
+                frame.saved_registers = Some(Box::new(saved));
+                restored_stack.push(Box::new(frame));
+            }
+            restored_stack.extend(task.call_stack.drain(..));
+            restored_stack.extend(remaining);
+            task.call_stack = restored_stack;
+            task.state = TaskState::Stopped;
+            self.call_stack = saved_parent_call_stack;
+            self.task_manager.attach(task);
+            return Err(err);
+        }
+        drop(pending_iter);
+        self.call_stack = loaded_frames;
         mem::swap(
             &mut self.pending_return_value,
             &mut task.pending_return_value,
@@ -256,9 +346,7 @@ impl VM {
                             task.state = TaskState::Stopped;
                             task.last_result = Some(stop_value);
                             task.last_yield = None;
-                            while let Some(frame) = self.call_stack.pop() {
-                                self.recycle_frame(frame);
-                            }
+                            self.truncate_call_stack(0);
                             self.pending_return_value = None;
                             self.pending_return_dest = None;
                             self.sync_slow_path_flags();
@@ -298,7 +386,26 @@ impl VM {
             }
         }
 
-        mem::swap(&mut self.call_stack, &mut task.call_stack);
+        // Suspend fiber register windows out of `vm_registers` into `task.call_stack`
+        // and restore parent's call stack untouched.
+        task.call_stack.clear();
+        for mut frame in self.call_stack.drain(..) {
+            if let Some(meta) = self.call_meta.get_mut(frame.function_idx) {
+                meta.active_depth = meta.active_depth.saturating_sub(1);
+            }
+            let start = frame.base_reg;
+            let end = (start + frame.reg_count as usize).min(self.vm_registers.len());
+            let saved = if start < end {
+                let slice = self.vm_registers[start..end].to_vec();
+                CallFrame::clear_non_plain_slots(&mut self.vm_registers[start..end], frame.non_plain_mask);
+                slice
+            } else {
+                Vec::new()
+            };
+            frame.saved_registers = Some(Box::new(saved));
+            task.call_stack.push(Box::new(frame));
+        }
+        self.call_stack = saved_parent_call_stack;
         mem::swap(
             &mut self.pending_return_value,
             &mut task.pending_return_value,
@@ -344,13 +451,18 @@ impl VM {
         args: Vec<Value>,
     ) -> Result<Box<CallFrame>> {
         match func {
-            Value::Function(func_idx) => self.make_call_frame(func_idx, None, args, Vec::new()),
+            Value::Function(func_idx) => {
+                self.make_detached_task_frame(func_idx, args, Vec::new(), Vec::new())
+            }
 
             Value::Closure(closure) => {
                 let captured: Vec<Value> = closure.upvalues.iter().map(|uv| uv.get()).collect();
-                let mut frame = self.make_call_frame(closure.function_idx, None, args, captured)?;
-                frame.shared_upvalues = closure.upvalues.clone();
-                Ok(frame)
+                self.make_detached_task_frame(
+                    closure.function_idx,
+                    args,
+                    captured,
+                    closure.upvalues.clone(),
+                )
             }
 
             other => Err(LustError::RuntimeError {
@@ -496,6 +608,8 @@ impl VM {
 
                 let jump_idx = wrapper.chunk.emit(Instruction::Jump(0), 0);
                 wrapper.chunk.patch_jump(jump_idx, loop_start);
+                wrapper.chunk.compute_bb_gas_weights();
+                wrapper.chunk.build_packed_code();
 
                 let new_idx = self.functions.len();
                 self.call_meta.push(super::CallMeta::of(&wrapper));

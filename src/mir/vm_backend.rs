@@ -95,28 +95,33 @@ pub struct MirToBytecodeCompiler<'a> {
     direct_callees: Option<&'a HashSet<String>>,
     direct_callee_indices: Option<&'a HashMap<String, usize>>,
     struct_layouts: Option<&'a HashMap<String, Rc<StructLayout>>>,
+    use_field_slots: bool,
     loop_headers: HashSet<BlockId>,
+    in_loop_blocks: HashSet<BlockId>,
     hoisted_consts_map: HashMap<HoistConstKey, Register>,
     hoisted_consts_order: Vec<(HoistConstKey, Register)>,
+    local_read_counts: Vec<usize>,
+    current_block_start_pc: usize,
+    current_block_in_loop: bool,
 }
 
 impl<'a> MirToBytecodeCompiler<'a> {
     pub fn compile(func: &'a MirFunction) -> Result<Function, MirVmBackendError> {
-        Self::compile_inner(func, None, None, None)
+        Self::compile_inner(func, None, None, None, false)
     }
 
     pub fn compile_with_direct_callees(
         func: &'a MirFunction,
         direct_callees: &'a HashSet<String>,
     ) -> Result<Function, MirVmBackendError> {
-        Self::compile_inner(func, Some(direct_callees), None, None)
+        Self::compile_inner(func, Some(direct_callees), None, None, false)
     }
 
     pub fn compile_with_direct_callee_indices(
         func: &'a MirFunction,
         direct_callee_indices: &'a HashMap<String, usize>,
     ) -> Result<Function, MirVmBackendError> {
-        Self::compile_inner(func, None, Some(direct_callee_indices), None)
+        Self::compile_inner(func, None, Some(direct_callee_indices), None, false)
     }
 
     pub fn compile_with_direct_callees_and_indices(
@@ -124,14 +129,21 @@ impl<'a> MirToBytecodeCompiler<'a> {
         direct_callees: &'a HashSet<String>,
         direct_callee_indices: &'a HashMap<String, usize>,
     ) -> Result<Function, MirVmBackendError> {
-        Self::compile_inner(func, Some(direct_callees), Some(direct_callee_indices), None)
+        Self::compile_inner(func, Some(direct_callees), Some(direct_callee_indices), None, false)
     }
 
     pub fn compile_with_struct_layouts(
         func: &'a MirFunction,
         struct_layouts: &'a HashMap<String, Rc<StructLayout>>,
     ) -> Result<Function, MirVmBackendError> {
-        Self::compile_inner(func, None, None, Some(struct_layouts))
+        Self::compile_inner(func, None, None, Some(struct_layouts), false)
+    }
+
+    pub fn compile_with_field_slots(
+        func: &'a MirFunction,
+        struct_layouts: &'a HashMap<String, Rc<StructLayout>>,
+    ) -> Result<Function, MirVmBackendError> {
+        Self::compile_inner(func, None, None, Some(struct_layouts), true)
     }
 
     pub fn compile_with_options(
@@ -140,7 +152,13 @@ impl<'a> MirToBytecodeCompiler<'a> {
         direct_callee_indices: Option<&'a HashMap<String, usize>>,
         struct_layouts: Option<&'a HashMap<String, Rc<StructLayout>>>,
     ) -> Result<Function, MirVmBackendError> {
-        Self::compile_inner(func, direct_callees, direct_callee_indices, struct_layouts)
+        Self::compile_inner(
+            func,
+            direct_callees,
+            direct_callee_indices,
+            struct_layouts,
+            struct_layouts.is_some(),
+        )
     }
 
     fn compile_inner(
@@ -148,17 +166,21 @@ impl<'a> MirToBytecodeCompiler<'a> {
         direct_callees: Option<&'a HashSet<String>>,
         direct_callee_indices: Option<&'a HashMap<String, usize>>,
         struct_layouts: Option<&'a HashMap<String, Rc<StructLayout>>>,
+        use_field_slots: bool,
     ) -> Result<Function, MirVmBackendError> {
         let param_count = func.params.len() as u8;
         let mut bytecode_fn = Function::new(func.signature.name.clone(), param_count, false);
         let local_types = Self::infer_local_types(func);
 
-        let (loop_headers, hoisted_consts_map, hoisted_consts_order, scratch_start) =
+        let (loop_headers, in_loop_blocks, hoisted_consts_map, hoisted_consts_order, scratch_start) =
             if direct_callees.is_none() {
                 Self::plan_loop_invariant_consts(func)
             } else {
-                (HashSet::new(), HashMap::new(), Vec::new(), func.locals.len())
+                let (_, in_loops) = Self::compute_loop_blocks(func);
+                (HashSet::new(), in_loops, HashMap::new(), Vec::new(), func.locals.len())
             };
+
+        let local_read_counts = Self::compute_local_read_counts(func);
 
         let mut compiler = MirToBytecodeCompiler {
             func,
@@ -173,16 +195,24 @@ impl<'a> MirToBytecodeCompiler<'a> {
             direct_callees,
             direct_callee_indices,
             struct_layouts,
+            use_field_slots,
             loop_headers,
+            in_loop_blocks,
             hoisted_consts_map,
             hoisted_consts_order,
+            local_read_counts,
+            current_block_start_pc: 0,
+            current_block_in_loop: false,
         };
 
         compiler.compile_blocks()?;
         compiler.patch_all_jumps();
+        compiler.chunk.compute_bb_gas_weights();
+        compiler.chunk.build_packed_code();
 
         bytecode_fn.chunk = compiler.chunk;
         bytecode_fn.register_count = (compiler.scratch_start + compiler.max_scratch) as u8;
+        bytecode_fn.trusted_signature = Self::is_mir_signature_trusted(func);
         bytecode_fn.terminator_pcs = compiler.terminator_pcs;
         bytecode_fn.block_entry_pcs = compiler
             .block_pcs
@@ -192,22 +222,53 @@ impl<'a> MirToBytecodeCompiler<'a> {
         Ok(bytecode_fn)
     }
 
-    fn plan_loop_invariant_consts(
-        func: &MirFunction,
-    ) -> (
-        HashSet<BlockId>,
-        HashMap<HoistConstKey, Register>,
-        Vec<(HoistConstKey, Register)>,
-        usize,
-    ) {
-        let mut next_reg = func.locals.len();
-        if func.blocks.is_empty() || next_reg >= 250 {
-            return (HashSet::new(), HashMap::new(), Vec::new(), next_reg);
+    fn is_trusted_mir_type(ty: &MirType) -> bool {
+        match ty {
+            MirType::Unit | MirType::Bool | MirType::Int | MirType::Float | MirType::String => true,
+            MirType::Struct(name) | MirType::Enum(name) => !matches!(
+                name.as_str(),
+                "LuaValue"
+                    | "LuaTable"
+                    | "LuaFunction"
+                    | "LuaUserdata"
+                    | "LuaThread"
+                    | "unknown"
+                    | "Schema"
+                    | "SchemaBuilder"
+            ),
+            MirType::Array(inner) | MirType::Option(inner) => Self::is_trusted_mir_type(inner),
+            MirType::Map(k, v) => Self::is_trusted_mir_type(k) && Self::is_trusted_mir_type(v),
+            MirType::Tuple(elems) => elems.iter().all(Self::is_trusted_mir_type),
+            MirType::Function {
+                params,
+                return_type,
+            } => {
+                params.iter().all(Self::is_trusted_mir_type)
+                    && Self::is_trusted_mir_type(return_type)
+            }
+            MirType::Effect { .. } | MirType::Unknown => false,
         }
+    }
 
+    fn is_mir_signature_trusted(func: &MirFunction) -> bool {
+        if func.signature.effects.is_some() || func.signature.param_types.len() != func.params.len()
+        {
+            return false;
+        }
+        func.signature
+            .param_types
+            .iter()
+            .all(Self::is_trusted_mir_type)
+            && Self::is_trusted_mir_type(&func.signature.return_type)
+    }
+
+    fn compute_loop_blocks(func: &MirFunction) -> (HashSet<BlockId>, HashSet<BlockId>) {
+        if func.blocks.is_empty() {
+            return (HashSet::new(), HashSet::new());
+        }
         let loop_headers = crate::mir::opt::Safepoints::find_loop_headers(&func.blocks);
         if loop_headers.is_empty() {
-            return (loop_headers, HashMap::new(), Vec::new(), next_reg);
+            return (loop_headers, HashSet::new());
         }
 
         let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::with_capacity(func.blocks.len());
@@ -235,6 +296,28 @@ impl<'a> MirToBytecodeCompiler<'a> {
                     }
                 }
             }
+        }
+        (loop_headers, in_loop_blocks)
+    }
+
+    fn plan_loop_invariant_consts(
+        func: &MirFunction,
+    ) -> (
+        HashSet<BlockId>,
+        HashSet<BlockId>,
+        HashMap<HoistConstKey, Register>,
+        Vec<(HoistConstKey, Register)>,
+        usize,
+    ) {
+        let mut next_reg = func.locals.len();
+        if func.blocks.is_empty() || next_reg >= 250 {
+            let (loop_headers, in_loop_blocks) = Self::compute_loop_blocks(func);
+            return (loop_headers, in_loop_blocks, HashMap::new(), Vec::new(), next_reg);
+        }
+
+        let (loop_headers, in_loop_blocks) = Self::compute_loop_blocks(func);
+        if loop_headers.is_empty() {
+            return (loop_headers, in_loop_blocks, HashMap::new(), Vec::new(), next_reg);
         }
 
         let mut hoisted_map: HashMap<HoistConstKey, Register> = HashMap::new();
@@ -335,7 +418,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
             }
         }
 
-        (loop_headers, hoisted_map, hoisted_order, next_reg)
+        (loop_headers, in_loop_blocks, hoisted_map, hoisted_order, next_reg)
     }
 
     fn lookup_hoisted_const(&self, c: &MirConstant) -> Option<Register> {
@@ -860,8 +943,8 @@ impl<'a> MirToBytecodeCompiler<'a> {
         }
     }
 
-    fn lookup_struct_field_name(&self, base: &Place, field_idx: usize) -> Option<Rc<String>> {
-        let struct_name = match self.place_type(base) {
+    fn lookup_struct_name(&self, base: &Place) -> Option<String> {
+        match self.place_type(base) {
             MirType::Struct(name) => Some(name),
             _ => match base {
                 Place::Local(loc) => match self.func.locals.get(loc.0).map(|l| &l.ty) {
@@ -870,13 +953,36 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 },
                 _ => None,
             },
-        }?;
+        }
+    }
+
+    fn lookup_struct_field_name(&self, base: &Place, field_idx: usize) -> Option<Rc<String>> {
+        let struct_name = self.lookup_struct_name(base)?;
         let layout = self.lookup_struct_layout(&struct_name)?;
         layout.field_names().get(field_idx).cloned()
     }
 
+    fn can_emit_struct_field_slot(&self, base: &Place, field_idx: usize) -> bool {
+        if !self.use_field_slots || field_idx > u8::MAX as usize {
+            return false;
+        }
+        let Some(struct_name) = self.lookup_struct_name(base) else {
+            return false;
+        };
+        if struct_name == "LuaTable" {
+            return false;
+        }
+        self.lookup_struct_layout(&struct_name)
+            .is_some_and(|layout| field_idx < layout.field_names().len())
+    }
+
     fn emit_get_field(&mut self, dst: Register, base: &Place, field_idx: usize, line: usize) {
         let base_reg = self.place_to_reg(base);
+        if self.can_emit_struct_field_slot(base, field_idx) {
+            self.chunk
+                .emit(Instruction::GetFieldSlot(dst, base_reg, field_idx as u8), line);
+            return;
+        }
         if let Some(fname) = self.lookup_struct_field_name(base, field_idx) {
             let fname_val = Value::String(fname);
             let exists = self.chunk.constants.iter().any(|v| v == &fname_val);
@@ -895,6 +1001,15 @@ impl<'a> MirToBytecodeCompiler<'a> {
 
     fn emit_set_field(&mut self, base: &Place, field_idx: usize, val_reg: Register, line: usize) {
         let base_reg = self.place_to_reg(base);
+        if self.can_emit_struct_field_slot(base, field_idx) {
+            let slot = field_idx as u8;
+            if self.try_fuse_get_field_add_set_int(base_reg, slot, val_reg, line) {
+                return;
+            }
+            self.chunk
+                .emit(Instruction::SetFieldSlot(base_reg, slot, val_reg), line);
+            return;
+        }
         if let Some(fname) = self.lookup_struct_field_name(base, field_idx) {
             let fname_val = Value::String(fname);
             let exists = self.chunk.constants.iter().any(|v| v == &fname_val);
@@ -911,6 +1026,270 @@ impl<'a> MirToBytecodeCompiler<'a> {
             .emit(Instruction::SetIndex(base_reg, idx_reg, val_reg), line);
     }
 
+    fn count_place_reads(place: &Place, counts: &mut [usize]) {
+        match place {
+            Place::Local(loc) => {
+                if let Some(c) = counts.get_mut(loc.0) {
+                    *c += 1;
+                }
+            }
+            Place::Index(base, idx) => {
+                if let Some(c) = counts.get_mut(idx.0) {
+                    *c += 1;
+                }
+                Self::count_place_reads(base, counts);
+            }
+            Place::Field(base, _) => {
+                Self::count_place_reads(base, counts);
+            }
+        }
+    }
+
+    fn count_operand_reads(op: &Operand, counts: &mut [usize]) {
+        match op {
+            Operand::Copy(p) | Operand::Move(p) => Self::count_place_reads(p, counts),
+            Operand::Constant(_) => {}
+        }
+    }
+
+    fn count_rvalue_reads(rvalue: &Rvalue, counts: &mut [usize]) {
+        match rvalue {
+            Rvalue::Use(op) | Rvalue::Cast(op, _) | Rvalue::UnaryOp(_, op) => {
+                Self::count_operand_reads(op, counts);
+            }
+            Rvalue::BinaryOp(_, lhs, rhs) => {
+                Self::count_operand_reads(lhs, counts);
+                Self::count_operand_reads(rhs, counts);
+            }
+            Rvalue::Aggregate(_, elems) => {
+                for elem in elems {
+                    Self::count_operand_reads(elem, counts);
+                }
+            }
+            Rvalue::Closure { captures, .. } => {
+                for (_, op, _) in captures {
+                    Self::count_operand_reads(op, counts);
+                }
+            }
+        }
+    }
+
+    fn compute_local_read_counts(func: &MirFunction) -> Vec<usize> {
+        let mut counts = alloc::vec![0usize; func.locals.len()];
+        for block in &func.blocks {
+            for stmt in &block.statements {
+                if let Statement::Assign(place, rvalue, _) = stmt {
+                    match place {
+                        Place::Local(_) => {}
+                        Place::Index(base, idx) => {
+                            if let Some(c) = counts.get_mut(idx.0) {
+                                *c += 1;
+                            }
+                            Self::count_place_reads(base, &mut counts);
+                        }
+                        Place::Field(base, _) => {
+                            Self::count_place_reads(base, &mut counts);
+                        }
+                    }
+                    Self::count_rvalue_reads(rvalue, &mut counts);
+                }
+            }
+            if let Some(term) = &block.terminator {
+                match term {
+                    Terminator::Cond { cond, .. } => Self::count_operand_reads(cond, &mut counts),
+                    Terminator::Switch { discr, .. } => {
+                        Self::count_operand_reads(discr, &mut counts);
+                    }
+                    Terminator::Return(Some(op), _) => Self::count_operand_reads(op, &mut counts),
+                    Terminator::Call {
+                        args, destination, ..
+                    } => {
+                        for arg in args {
+                            Self::count_operand_reads(arg, &mut counts);
+                        }
+                        match destination {
+                            Place::Local(_) => {}
+                            Place::Index(base, idx) => {
+                                if let Some(c) = counts.get_mut(idx.0) {
+                                    *c += 1;
+                                }
+                                Self::count_place_reads(base, &mut counts);
+                            }
+                            Place::Field(base, _) => {
+                                Self::count_place_reads(base, &mut counts);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        counts
+    }
+
+    #[inline]
+    fn is_fusible_temp_reg(&self, reg: Register) -> bool {
+        let idx = reg as usize;
+        if idx >= self.scratch_start {
+            return true;
+        }
+        self.func.locals.get(idx).is_some_and(|l| l.name.is_none())
+            && self.local_read_counts.get(idx).copied().unwrap_or(0) == 1
+    }
+
+    #[inline]
+    fn pop_last_instruction(&mut self) -> Option<Instruction> {
+        self.chunk.pop_instruction()
+    }
+
+    /// Intra-block peephole fusion for `GetFieldSlot` + (`LoadConst`) + `Add`/`AddInt` + `SetFieldSlot`
+    /// into `GetFieldAddSetInt`. Strictly restricted to `self.current_block_start_pc..` so
+    /// `block_entry_pcs` / `bb_leaders` are never crossed.
+    fn try_fuse_get_field_add_set_int(
+        &mut self,
+        base_reg: Register,
+        slot: u8,
+        val_reg: Register,
+        line: usize,
+    ) -> bool {
+        let len = self.chunk.instructions.len();
+        if len >= self.current_block_start_pc + 2 {
+            let prev2 = self.chunk.instructions[len - 2];
+            let prev1 = self.chunk.instructions[len - 1];
+            if let (
+                Instruction::GetFieldSlot(t1, obj1, slot1),
+                Instruction::Add(t2, l, r) | Instruction::AddInt(t2, l, r),
+            ) = (prev2, prev1)
+                && obj1 == base_reg
+                && slot1 == slot
+                && l == t1
+                && t2 == val_reg
+                && t1 != base_reg
+                && t1 != r
+                && self.is_fusible_temp_reg(t1)
+                && self.is_fusible_temp_reg(t2)
+            {
+                self.pop_last_instruction();
+                self.pop_last_instruction();
+                self.chunk
+                    .emit(Instruction::GetFieldAddSetInt(base_reg, slot, r), line);
+                return true;
+            }
+        }
+        if len >= self.current_block_start_pc + 3 {
+            let prev3 = self.chunk.instructions[len - 3];
+            let prev2 = self.chunk.instructions[len - 2];
+            let prev1 = self.chunk.instructions[len - 1];
+            if let (
+                Instruction::GetFieldSlot(t1, obj1, slot1),
+                Instruction::LoadConst(c_reg, k),
+                Instruction::Add(t2, l, r) | Instruction::AddInt(t2, l, r),
+            ) = (prev3, prev2, prev1)
+                && obj1 == base_reg
+                && slot1 == slot
+                && l == t1
+                && r == c_reg
+                && t2 == val_reg
+                && (c_reg as usize) >= self.scratch_start
+                && c_reg != t1
+                && c_reg != base_reg
+                && t1 != base_reg
+                && self.is_fusible_temp_reg(t1)
+                && self.is_fusible_temp_reg(t2)
+            {
+                self.pop_last_instruction();
+                self.pop_last_instruction();
+                self.pop_last_instruction();
+                self.chunk.emit(Instruction::LoadConst(c_reg, k), line);
+                self.chunk
+                    .emit(Instruction::GetFieldAddSetInt(base_reg, slot, c_reg), line);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Intra-block peephole fusion for `LtInt`/`LeInt` + `Terminator::Cond` into
+    /// `BranchLtInt` / `BranchLeInt` without crossing `self.current_block_start_pc`.
+    /// Updates `self.terminator_pcs[current_block_id]` on fusion and returns `true`.
+    fn try_compile_fused_cond_terminator(
+        &mut self,
+        term: &Terminator,
+        current_block_id: BlockId,
+        next_block_id: Option<BlockId>,
+    ) -> bool {
+        let Terminator::Cond {
+            cond,
+            then_block,
+            else_block,
+            span,
+        } = term
+        else {
+            return false;
+        };
+        if then_block == else_block {
+            return false;
+        }
+        let (Operand::Copy(Place::Local(cond_loc)) | Operand::Move(Place::Local(cond_loc))) = cond
+        else {
+            return false;
+        };
+        if self.chunk.instructions.len() <= self.current_block_start_pc {
+            return false;
+        }
+        let cond_reg = cond_loc.0 as Register;
+        if !self.is_fusible_temp_reg(cond_reg) {
+            return false;
+        }
+        let Some((is_lt, lhs, rhs)) = (match self.chunk.instructions.last().copied() {
+            Some(Instruction::LtInt(c, lhs, rhs)) if c == cond_reg => Some((true, lhs, rhs)),
+            Some(Instruction::LeInt(c, lhs, rhs)) if c == cond_reg => Some((false, lhs, rhs)),
+            _ => None,
+        }) else {
+            return false;
+        };
+
+        let is_fallthrough =
+            |target: BlockId| next_block_id == Some(target) && target != current_block_id;
+        let line = span.start_line;
+
+        self.pop_last_instruction();
+        let term_pc = self.chunk.instructions.len();
+        self.terminator_pcs.insert(current_block_id.0, term_pc);
+
+        if is_fallthrough(*then_block) {
+            let inst = if is_lt {
+                Instruction::BranchLtInt(lhs, rhs, 0)
+            } else {
+                Instruction::BranchLeInt(lhs, rhs, 0)
+            };
+            let br_pc = self.chunk.emit(inst, line);
+            self.pending_jumps.push((br_pc, *else_block));
+        } else if is_fallthrough(*else_block) {
+            // BranchLeInt(rhs, lhs, then) jumps iff !(rhs <= lhs) <=> lhs < rhs.
+            // BranchLtInt(rhs, lhs, then) jumps iff !(rhs < lhs)  <=> lhs <= rhs.
+            let inst = if is_lt {
+                Instruction::BranchLeInt(rhs, lhs, 0)
+            } else {
+                Instruction::BranchLtInt(rhs, lhs, 0)
+            };
+            let br_pc = self.chunk.emit(inst, line);
+            self.pending_jumps.push((br_pc, *then_block));
+        } else {
+            let inst = if is_lt {
+                Instruction::BranchLtInt(lhs, rhs, 0)
+            } else {
+                Instruction::BranchLeInt(lhs, rhs, 0)
+            };
+            let br_pc = self.chunk.emit(inst, line);
+            self.pending_jumps.push((br_pc, *else_block));
+
+            let jump_then = self.chunk.emit(Instruction::Jump(0), line);
+            self.pending_jumps.push((jump_then, *then_block));
+        }
+        true
+    }
+
     fn compile_blocks(&mut self) -> Result<(), MirVmBackendError> {
         let entry_is_loop_header = self
             .func
@@ -925,6 +1304,8 @@ impl<'a> MirToBytecodeCompiler<'a> {
         for (idx, block) in self.func.blocks.iter().enumerate() {
             let pc = self.chunk.instructions.len();
             self.block_pcs.insert(block.id, pc);
+            self.current_block_start_pc = pc;
+            self.current_block_in_loop = self.in_loop_blocks.contains(&block.id);
 
             if idx == 0 && !entry_is_loop_header && !self.hoisted_consts_order.is_empty() {
                 self.emit_hoisted_consts();
@@ -936,11 +1317,16 @@ impl<'a> MirToBytecodeCompiler<'a> {
             }
 
             self.reset_scratch();
-            let term_pc = self.chunk.instructions.len();
-            self.terminator_pcs.insert(block.id.0, term_pc);
             let next_block_id = self.func.blocks.get(idx + 1).map(|b| b.id);
             if let Some(term) = &block.terminator {
-                self.compile_terminator(term, block.id, next_block_id);
+                if !self.try_compile_fused_cond_terminator(term, block.id, next_block_id) {
+                    let term_pc = self.chunk.instructions.len();
+                    self.terminator_pcs.insert(block.id.0, term_pc);
+                    self.compile_terminator(term, block.id, next_block_id);
+                }
+            } else {
+                let term_pc = self.chunk.instructions.len();
+                self.terminator_pcs.insert(block.id.0, term_pc);
             }
         }
         Ok(())
@@ -1099,8 +1485,22 @@ impl<'a> MirToBytecodeCompiler<'a> {
             Rvalue::Use(op) => {
                 match op {
                     Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)) => {
-                        if dst_reg != src.0 as Register {
-                            self.chunk.emit(Instruction::Move(dst_reg, src.0 as Register), line);
+                        let src_reg = src.0 as Register;
+                        if dst_reg != src_reg {
+                            if self.chunk.instructions.len() > self.current_block_start_pc
+                                && let Some(Instruction::AddIntImm(prev_dst, prev_src, imm)) =
+                                    self.chunk.instructions.last().copied()
+                                && prev_dst == src_reg
+                                && self.is_fusible_temp_reg(src_reg)
+                            {
+                                let last_idx = self.chunk.instructions.len() - 1;
+                                self.chunk.set_instruction(
+                                    last_idx,
+                                    Instruction::AddIntImm(dst_reg, prev_src, imm),
+                                );
+                            } else {
+                                self.chunk.emit(Instruction::Move(dst_reg, src_reg), line);
+                            }
                         }
                     }
                     Operand::Copy(Place::Index(base, idx)) | Operand::Move(Place::Index(base, idx)) => {
@@ -1209,6 +1609,47 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 }
                 let lhs_ty = self.operand_type(lhs);
                 let rhs_ty = self.operand_type(rhs);
+                let allow_add_int_imm = self.current_block_in_loop
+                    || (dst_reg as usize) >= self.scratch_start
+                    || self
+                        .func
+                        .locals
+                        .get(dst_reg as usize)
+                        .is_some_and(|l| l.name.is_none());
+                if allow_add_int_imm && lhs_ty == MirType::Int && rhs_ty == MirType::Int {
+                    match *binop {
+                        MirBinaryOp::Add => {
+                            if let Operand::Constant(MirConstant::Int(v)) = rhs
+                                && let Ok(imm) = i8::try_from(*v)
+                            {
+                                let r_lhs = self.operand_to_reg(lhs, line);
+                                self.chunk
+                                    .emit(Instruction::AddIntImm(dst_reg, r_lhs, imm), line);
+                                return Ok(());
+                            }
+                            if let Operand::Constant(MirConstant::Int(v)) = lhs
+                                && let Ok(imm) = i8::try_from(*v)
+                            {
+                                let r_rhs = self.operand_to_reg(rhs, line);
+                                self.chunk
+                                    .emit(Instruction::AddIntImm(dst_reg, r_rhs, imm), line);
+                                return Ok(());
+                            }
+                        }
+                        MirBinaryOp::Sub => {
+                            if let Operand::Constant(MirConstant::Int(v)) = rhs
+                                && let Some(imm) =
+                                    v.checked_neg().and_then(|neg| i8::try_from(neg).ok())
+                            {
+                                let r_lhs = self.operand_to_reg(lhs, line);
+                                self.chunk
+                                    .emit(Instruction::AddIntImm(dst_reg, r_lhs, imm), line);
+                                return Ok(());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 let is_string = lhs_ty == MirType::String || rhs_ty == MirType::String;
                 let r_lhs = self.operand_to_reg(lhs, line);
                 let r_rhs = self.operand_to_reg(rhs, line);
@@ -1359,6 +1800,23 @@ impl<'a> MirToBytecodeCompiler<'a> {
             }
             Statement::Assign(Place::Field(base, f), rvalue, span) => {
                 let line = span.start_line;
+                if self.can_emit_struct_field_slot(base, *f)
+                    && let Rvalue::BinaryOp(MirBinaryOp::Add, lhs, rhs) = rvalue
+                    && matches!(
+                        lhs,
+                        Operand::Copy(Place::Field(lhs_base, lhs_f))
+                            | Operand::Move(Place::Field(lhs_base, lhs_f))
+                            if *lhs_f == *f && lhs_base == base
+                    )
+                {
+                    let base_reg = self.place_to_reg(base);
+                    let addend_reg = self.operand_to_reg(rhs, line);
+                    self.chunk.emit(
+                        Instruction::GetFieldAddSetInt(base_reg, *f as u8, addend_reg),
+                        line,
+                    );
+                    return Ok(());
+                }
                 let val_reg = match rvalue {
                     Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))) => {
                         src.0 as Register

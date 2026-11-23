@@ -1723,6 +1723,7 @@ pub mod jit_engine {
     struct PromotedLoopCounters {
         gas: Option<(Variable, Variable)>, // (gas_ptr_var, gas_var)
         sp: Option<(Variable, Variable)>,  // (sp_ptr_var, sp_cnt_var)
+        quantum_rem: Option<Variable>,     // NG-W11-2: quantized loop header remaining fast iters (Q=64 -> 63)
     }
 
     #[derive(Clone, Copy)]
@@ -1736,6 +1737,7 @@ pub mod jit_engine {
         loop_blocks: hashbrown::HashSet<usize>,
         promote_gas: bool,
         promote_sp: bool,
+        pub quantized_header_gas_amt: Option<u64>,
     }
 
     struct HoistLoopSpec {
@@ -1789,6 +1791,10 @@ pub mod jit_engine {
                 .ins()
                 .load(types::I64, MemFlagsData::trusted(), sp_ptr, OFF_SAFEPOINTS_CHECKED);
             builder.def_var(sp_cnt_var, s);
+        }
+        if let Some(quantum_rem_var) = counters.quantum_rem {
+            let zero = builder.ins().iconst(types::I64, 0);
+            builder.def_var(quantum_rem_var, zero);
         }
     }
 
@@ -2430,6 +2436,41 @@ pub mod jit_engine {
             if !promote_sp && !promote_gas {
                 continue;
             }
+            // NG-W11-2 (`F-06`, `F-20`): Enable header quantization (Q = 64) ONLY when:
+            //   1. Loop is observer_free (already enforced by `eligible`), has no SIMD vec header,
+            //      and contains no nested loop headers (`hdr` is the unique loop header in `body`).
+            //   2. `body` contains EXACTLY ONE `Statement::ResourceCheck(ResourceKind::Gas, amt, _)`
+            //      across all blocks, with `0 < amt <= 1024`, located at `mir_fn.blocks[hdr].statements[0]`.
+            let total_gas_checks: usize = body
+                .iter()
+                .map(|&b| {
+                    mir_fn.blocks[b]
+                        .statements
+                        .iter()
+                        .filter(|s| matches!(s, Statement::ResourceCheck(ResourceKind::Gas, ..)))
+                        .count()
+                })
+                .sum();
+            let loop_header_count = body.iter().filter(|&&b| loop_headers.contains(&b)).count();
+            let has_vec_hdr = body.iter().any(|b| vec_hdr_map.contains_key(b));
+            let quantized_header_gas_amt = if promote_sp
+                && promote_gas
+                && !has_vec_hdr
+                && loop_headers.contains(hdr)
+                && loop_header_count == 1
+                && total_gas_checks == 1
+            {
+                match mir_fn.blocks[*hdr].statements.first() {
+                    Some(Statement::ResourceCheck(ResourceKind::Gas, amt, _))
+                        if *amt > 0 && *amt <= 1024 =>
+                    {
+                        Some(*amt)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let cl_idx = counter_loops.len();
             for &b in body {
                 block_to_counter_loop.insert(b, cl_idx);
@@ -2440,6 +2481,7 @@ pub mod jit_engine {
                 loop_blocks: body.clone(),
                 promote_gas,
                 promote_sp,
+                quantized_header_gas_amt,
             });
         }
 
@@ -2823,6 +2865,208 @@ pub mod jit_engine {
         builder.switch_to_block(cont_bb);
     }
 
+    /// NG-W11-2 (`F-06`, `F-20`): Atomic quantized loop header check (Q = 64, SEC-01 sound).
+    /// Fuses the synthetic loop header safepoint check and `mir_fn.blocks[hdr].statements[0]`
+    /// (`Statement::ResourceCheck(ResourceKind::Gas, amt, _)`) into a single emission node.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_quantized_loop_header_check(
+        builder: &mut FunctionBuilder,
+        sp_ptr_var: Variable,
+        safepoint_slow_fn: FuncRef,
+        gas_slow_fn: FuncRef,
+        init_deopt_fn: FuncRef,
+        record_deopt_local_fn: FuncRef,
+        target_block_idx: usize,
+        amt: u64,
+        live_locals: &[LocalId],
+        local_vars: &[Variable],
+        stack_slots: &hashbrown::HashMap<usize, StackSlot>,
+        locals: &[LocalDecl],
+        raw_emergency_exit_bb: Block,
+        promoted: PromotedLoopCounters,
+        mut cfg_rec: Option<&mut PromotedLoopCfgRecord>,
+    ) {
+        const OFF_SLOW_FLAGS: i32 = core::mem::offset_of!(SafepointFastState, slow_flags) as i32;
+        const QUANTUM_FAST_ITERS: i64 = 63;
+
+        debug_assert!(amt > 0 && amt <= 1024);
+        let (_, sp_cnt_var) = promoted
+            .sp
+            .expect("quantized loop header check requires promoted sp counter");
+        let (_, gas_var) = promoted
+            .gas
+            .expect("quantized loop header check requires promoted gas counter");
+        let quantum_rem_var = promoted
+            .quantum_rem
+            .expect("quantized loop header check requires quantum_rem_var");
+
+        // Every iteration increments sp_cnt_var in register.
+        let sp0 = builder.use_var(sp_cnt_var);
+        let sp1 = builder.ins().iadd_imm_s(sp0, 1);
+        builder.def_var(sp_cnt_var, sp1);
+
+        let q_rem = builder.use_var(quantum_rem_var);
+        let has_quantum = builder.ins().icmp_imm_s(IntCC::SignedGreaterThan, q_rem, 0);
+
+        let fast_quantum_bb = builder.create_block();
+        let check_reload_bb = builder.create_block();
+        let slow_safepoint_bb = builder.create_block();
+        let sp_reload_bb = builder.create_block();
+        let err_dispatch_bb = builder.create_block();
+        let deopt_capture_bb = builder.create_block();
+        let gas_check_bb = builder.create_block();
+        let allow_arm_param = builder.append_block_param(gas_check_bb, types::I8);
+        let gas_slow_bb = builder.create_block();
+        let gas_reload_bb = builder.create_block();
+        let arm_quantum_bb = builder.create_block();
+        let cont_bb = builder.create_block();
+
+        builder.set_cold_block(slow_safepoint_bb);
+        builder.set_cold_block(sp_reload_bb);
+        builder.set_cold_block(err_dispatch_bb);
+        builder.set_cold_block(deopt_capture_bb);
+        builder.set_cold_block(gas_slow_bb);
+        builder.set_cold_block(gas_reload_bb);
+
+        if let Some(rec) = cfg_rec.as_deref_mut() {
+            rec.flush_clif_blocks.insert(slow_safepoint_bb);
+            rec.post_flush_clif_blocks.insert(err_dispatch_bb);
+            rec.post_flush_clif_blocks.insert(deopt_capture_bb);
+            rec.reload_clif_blocks.insert(sp_reload_bb);
+            rec.flush_clif_blocks.insert(gas_slow_bb);
+            rec.reload_clif_blocks.insert(gas_reload_bb);
+        }
+
+        builder
+            .ins()
+            .brif(has_quantum, fast_quantum_bb, &[], check_reload_bb, &[]);
+
+        // Fast path (63 of 64 iterations): skips slow_flags memory load & gas < 0 branch
+        // because arming q_rem = 63 proved slow_flags == 0 and gas1 >= 63 * amt with no other
+        // ResourceCheck(Gas) in loop_blocks.
+        builder.switch_to_block(fast_quantum_bb);
+        let fast_gas0 = builder.use_var(gas_var);
+        let fast_gas1 = builder.ins().iadd_imm_s(fast_gas0, -(amt as i64));
+        builder.def_var(gas_var, fast_gas1);
+        let q1 = builder.ins().iadd_imm_s(q_rem, -1);
+        builder.def_var(quantum_rem_var, q1);
+        builder.ins().jump(cont_bb, &[]);
+
+        // Check/reload path (1 of 64 iterations, or every iteration when gas < 64*amt or flags != 0).
+        // Evaluates slow_flags BEFORE decrementing gas_var so interrupts and deopt observe exact
+        // pre-ResourceCheck gas_remaining.
+        builder.switch_to_block(check_reload_bb);
+        let sp_ptr = builder.use_var(sp_ptr_var);
+        let flags = builder
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), sp_ptr, OFF_SLOW_FLAGS);
+        let is_slow = builder.ins().icmp_imm_s(IntCC::NotEqual, flags, 0);
+        let allow_arm_yes = builder.ins().iconst(types::I8, 1);
+        builder.ins().brif(
+            is_slow,
+            slow_safepoint_bb,
+            &[],
+            gas_check_bb,
+            &[BlockArg::Value(allow_arm_yes)],
+        );
+
+        builder.switch_to_block(slow_safepoint_bb);
+        let zero_q_sp = builder.ins().iconst(types::I64, 0);
+        builder.def_var(quantum_rem_var, zero_q_sp);
+        emit_promoted_counters_flush(builder, promoted);
+        let sp_call = builder.ins().call(safepoint_slow_fn, &[]);
+        let sp_res = builder.inst_results(sp_call)[0];
+        let is_sp_err = builder.ins().icmp_imm_s(IntCC::NotEqual, sp_res, 0);
+        builder
+            .ins()
+            .brif(is_sp_err, err_dispatch_bb, &[], sp_reload_bb, &[]);
+
+        builder.switch_to_block(sp_reload_bb);
+        emit_promoted_counters_load(builder, promoted);
+        let allow_arm_no = builder.ins().iconst(types::I8, 0);
+        builder
+            .ins()
+            .jump(gas_check_bb, &[BlockArg::Value(allow_arm_no)]);
+
+        builder.switch_to_block(err_dispatch_bb);
+        let is_deopt = builder.ins().icmp_imm_s(IntCC::Equal, sp_res, MIR_STATUS_DEOPT);
+        builder
+            .ins()
+            .brif(is_deopt, deopt_capture_bb, &[], raw_emergency_exit_bb, &[]);
+
+        builder.switch_to_block(deopt_capture_bb);
+        let target_pc_val = builder.ins().iconst(types::I64, target_block_idx as i64);
+        builder.ins().call(init_deopt_fn, &[target_pc_val]);
+        for &loc_id in live_locals {
+            if loc_id.0 < local_vars.len() {
+                let loc_idx_val = builder.ins().iconst(types::I64, loc_id.0 as i64);
+                let cur_val = if let Some(&slot) = stack_slots.get(&loc_id.0) {
+                    let mir_ty = locals
+                        .get(loc_id.0)
+                        .map(|l| l.ty.clone())
+                        .unwrap_or(MirType::Int);
+                    let clif_ty = mir_to_clif_type(&mir_ty).unwrap_or(types::I64);
+                    builder.ins().stack_load(types::I64, clif_ty, slot, 0)
+                } else {
+                    builder.use_var(local_vars[loc_id.0])
+                };
+                let val_ty = builder.func.dfg.value_type(cur_val);
+                let val_i64 = if val_ty == types::I8 {
+                    builder.ins().uextend(types::I64, cur_val)
+                } else if val_ty == types::F64 {
+                    builder.ins().bitcast(types::I64, MemFlagsData::new(), cur_val)
+                } else {
+                    cur_val
+                };
+                builder
+                    .ins()
+                    .call(record_deopt_local_fn, &[target_pc_val, loc_idx_val, val_i64]);
+            }
+        }
+        builder.ins().jump(raw_emergency_exit_bb, &[]);
+
+        // Gas check (2-instruction iadd_imm_s + icmp_imm_s since 0 < amt <= 1024).
+        builder.switch_to_block(gas_check_bb);
+        let gas0 = builder.use_var(gas_var);
+        let gas1 = builder.ins().iadd_imm_s(gas0, -(amt as i64));
+        builder.def_var(gas_var, gas1);
+        let is_neg = builder.ins().icmp_imm_s(IntCC::SignedLessThan, gas1, 0);
+        builder
+            .ins()
+            .brif(is_neg, gas_slow_bb, &[], arm_quantum_bb, &[]);
+
+        builder.switch_to_block(gas_slow_bb);
+        let zero_q_gas = builder.ins().iconst(types::I64, 0);
+        builder.def_var(quantum_rem_var, zero_q_gas);
+        emit_promoted_counters_flush(builder, promoted);
+        let slow_call = builder.ins().call(gas_slow_fn, &[]);
+        let slow_res = builder.inst_results(slow_call)[0];
+        let is_gas_err = builder.ins().icmp_imm_s(IntCC::NotEqual, slow_res, 0);
+        builder
+            .ins()
+            .brif(is_gas_err, raw_emergency_exit_bb, &[], gas_reload_bb, &[]);
+
+        builder.switch_to_block(gas_reload_bb);
+        // Reloads replenished gas_var, sp_cnt_var, and resets quantum_rem_var = 0.
+        emit_promoted_counters_load(builder, promoted);
+        builder.ins().jump(cont_bb, &[]);
+
+        // Arm next 63 fast iterations ONLY when slow_flags == 0 AND gas1 >= 63 * amt.
+        builder.switch_to_block(arm_quantum_bb);
+        let threshold = QUANTUM_FAST_ITERS * (amt as i64);
+        let can_arm_gas = builder
+            .ins()
+            .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, gas1, threshold);
+        let can_arm = builder.ins().band(allow_arm_param, can_arm_gas);
+        let c63 = builder.ins().iconst(types::I64, QUANTUM_FAST_ITERS);
+        let c0 = builder.ins().iconst(types::I64, 0);
+        let next_q = builder.ins().select(can_arm, c63, c0);
+        builder.def_var(quantum_rem_var, next_q);
+        builder.ins().jump(cont_bb, &[]);
+
+        builder.switch_to_block(cont_bb);
+    }
+
     fn function_has_gas_checks(
         mir_fn: &MirFunction,
         vec_loops: &[crate::mir::opt::simd::VectorizedLoopInfo],
@@ -2856,7 +3100,15 @@ pub mod jit_engine {
         if let Some(p) = promoted
             && let Some((_, gas_var)) = p.gas
         {
-            if let Ok(amt_i64) = i64::try_from(amt) {
+            // NG-W11-2 Stage 1: 2-instruction `iadd_imm_s` + `icmp_imm_s` for 0 < amt <= i32::MAX.
+            // Prior check guarantees rem0 >= 0, so rem0 - amt >= -i32::MAX > i64::MIN (never wraps).
+            if amt > 0 && amt <= (i32::MAX as u64) {
+                let rem0 = builder.use_var(gas_var);
+                let rem1 = builder.ins().iadd_imm_s(rem0, -(amt as i64));
+                builder.def_var(gas_var, rem1);
+                let is_neg = builder.ins().icmp_imm_s(IntCC::SignedLessThan, rem1, 0);
+                builder.ins().brif(is_neg, gas_slow_bb, &[], cont_bb, &[]);
+            } else if let Ok(amt_i64) = i64::try_from(amt) {
                 let rem0 = builder.use_var(gas_var);
                 let amt_val = builder.ins().iconst(types::I64, amt_i64);
                 let (rem1, overflowed) = builder.ins().ssub_overflow(rem0, amt_val);
@@ -5152,6 +5404,11 @@ pub mod jit_engine {
                     } else {
                         None
                     };
+                    let quantum_rem = if spec.quantized_header_gas_amt.is_some() {
+                        Some(builder.declare_var(types::I64))
+                    } else {
+                        None
+                    };
                     let preheader_bb = builder.create_block();
                     let emergency_flush_bb = builder.create_block();
                     builder.set_cold_block(emergency_flush_bb);
@@ -5161,6 +5418,7 @@ pub mod jit_engine {
                         counters: PromotedLoopCounters {
                             gas: gas_pair,
                             sp: sp_pair,
+                            quantum_rem,
                         },
                         preheader_bb,
                         emergency_flush_bb,
@@ -5499,6 +5757,7 @@ pub mod jit_engine {
                     builder.switch_to_block(hl_states[hl_idx].peeled_header_bb);
                     let mut cur_validated = prov_plan.validated_in[hspec.hdr].clone();
 
+                    let mut skip_first_header_gas_check = false;
                     if loop_headers.contains(&hspec.hdr) {
                         let proven_entry_storage;
                         let locals_to_record = if let Some((_, live_locals)) = osr_info {
@@ -5519,25 +5778,59 @@ pub mod jit_engine {
                         };
                         let (sp_ptr_var, _, sp_slow_fn) =
                             safepoint_ctx.expect("loop header implies needs_safepoint");
-                        emit_safepoint_check(
-                            &mut builder,
-                            sp_ptr_var,
-                            sp_slow_fn,
-                            init_deopt_fn,
-                            record_deopt_local_fn,
-                            hspec.hdr,
-                            locals_to_record,
-                            &local_vars,
-                            &stack_slots,
-                            &mir_fn.locals,
-                            emergency_exit_bb,
-                            None,
-                            active_promoted,
-                            cl_opt.map(|ci| &mut cfg_records[ci]),
-                        );
+                        let quantized_amt = cl_opt.and_then(|ci| {
+                            let spec = &promo_plan.counter_loops[ci];
+                            if spec.hdr == hspec.hdr {
+                                spec.quantized_header_gas_amt
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(q_amt) = quantized_amt {
+                            let (_, _, gas_slow_fn) =
+                                gas_ctx.expect("quantized loop header implies gas_ctx");
+                            emit_quantized_loop_header_check(
+                                &mut builder,
+                                sp_ptr_var,
+                                sp_slow_fn,
+                                gas_slow_fn,
+                                init_deopt_fn,
+                                record_deopt_local_fn,
+                                hspec.hdr,
+                                q_amt,
+                                locals_to_record,
+                                &local_vars,
+                                &stack_slots,
+                                &mir_fn.locals,
+                                emergency_exit_bb,
+                                active_promoted.expect("quantized loop header implies promoted counters"),
+                                cl_opt.map(|ci| &mut cfg_records[ci]),
+                            );
+                            skip_first_header_gas_check = true;
+                        } else {
+                            emit_safepoint_check(
+                                &mut builder,
+                                sp_ptr_var,
+                                sp_slow_fn,
+                                init_deopt_fn,
+                                record_deopt_local_fn,
+                                hspec.hdr,
+                                locals_to_record,
+                                &local_vars,
+                                &stack_slots,
+                                &mir_fn.locals,
+                                emergency_exit_bb,
+                                None,
+                                active_promoted,
+                                cl_opt.map(|ci| &mut cfg_records[ci]),
+                            );
+                        }
                     }
 
-                    for stmt in &mir_fn.blocks[hspec.hdr].statements {
+                    for (stmt_idx, stmt) in mir_fn.blocks[hspec.hdr].statements.iter().enumerate() {
+                        if stmt_idx == 0 && skip_first_header_gas_check {
+                            continue;
+                        }
                         match stmt {
                             Statement::Assign(Place::Local(dst), rvalue, _) => {
                                 let dst_decl = mir_fn.locals.get(dst.0).ok_or_else(|| {
@@ -5830,6 +6123,7 @@ pub mod jit_engine {
                     let mut cur_validated = prov_plan.validated_in[b_idx].clone();
 
                     let should_safepoint = loop_headers.contains(&b_idx);
+                    let mut skip_first_header_gas_check = false;
 
                     if should_safepoint {
                         let proven_entry_storage;
@@ -5856,22 +6150,57 @@ pub mod jit_engine {
                         });
                         let (sp_ptr_var, _, sp_slow_fn) =
                             safepoint_ctx.expect("loop header implies needs_safepoint");
-                        emit_safepoint_check(
-                            &mut builder,
-                            sp_ptr_var,
-                            sp_slow_fn,
-                            init_deopt_fn,
-                            record_deopt_local_fn,
-                            b_idx,
-                            locals_to_record,
-                            &local_vars,
-                            &stack_slots,
-                            &mir_fn.locals,
-                            emergency_exit_bb,
-                            pending_vec_reduction,
-                            active_promoted,
-                            cl_opt.map(|ci| &mut cfg_records[ci]),
-                        );
+                        let quantized_amt = if vec_hdr_map.get(&b_idx).is_none() {
+                            cl_opt.and_then(|ci| {
+                                let spec = &promo_plan.counter_loops[ci];
+                                if spec.hdr == b_idx {
+                                    spec.quantized_header_gas_amt
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(q_amt) = quantized_amt {
+                            let (_, _, gas_slow_fn) =
+                                gas_ctx.expect("quantized loop header implies gas_ctx");
+                            emit_quantized_loop_header_check(
+                                &mut builder,
+                                sp_ptr_var,
+                                sp_slow_fn,
+                                gas_slow_fn,
+                                init_deopt_fn,
+                                record_deopt_local_fn,
+                                b_idx,
+                                q_amt,
+                                locals_to_record,
+                                &local_vars,
+                                &stack_slots,
+                                &mir_fn.locals,
+                                emergency_exit_bb,
+                                active_promoted.expect("quantized loop header implies promoted counters"),
+                                cl_opt.map(|ci| &mut cfg_records[ci]),
+                            );
+                            skip_first_header_gas_check = true;
+                        } else {
+                            emit_safepoint_check(
+                                &mut builder,
+                                sp_ptr_var,
+                                sp_slow_fn,
+                                init_deopt_fn,
+                                record_deopt_local_fn,
+                                b_idx,
+                                locals_to_record,
+                                &local_vars,
+                                &stack_slots,
+                                &mir_fn.locals,
+                                emergency_exit_bb,
+                                pending_vec_reduction,
+                                active_promoted,
+                                cl_opt.map(|ci| &mut cfg_records[ci]),
+                            );
+                        }
                     }
 
                     // Native Cranelift hardware SIMD lowering for recognized vectorized loop header
@@ -6027,7 +6356,10 @@ pub mod jit_engine {
                         continue;
                     }
 
-                    for stmt in &mir_block.statements {
+                    for (stmt_idx, stmt) in mir_block.statements.iter().enumerate() {
+                        if stmt_idx == 0 && skip_first_header_gas_check {
+                            continue;
+                        }
                         let stmt_bc_ctx = BoundsCheckCtx {
                             status_set_fn,
                             emergency_exit_bb: active_emergency_bb,

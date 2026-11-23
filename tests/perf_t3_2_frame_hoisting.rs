@@ -210,9 +210,11 @@ fn test_perf_t3_2_frame_cache_reloads_across_reallocation() {
     #[cfg(debug_assertions)]
     {
         let rec_delta = rec_reloads_after - rec_reloads_before;
-        assert!(
-            rec_delta >= 160,
-            "depth-80 recursion must reload on every call push and return pop, got {}",
+        // NG-W11-4B: statically typed Call/Return execute directly inside `'frame_fast: loop`
+        // over `vm_registers` with 0 exits to `'dispatch: loop` (1 initial load).
+        assert_eq!(
+            rec_delta, 1,
+            "depth-80 trusted recursion must stay in 'frame_fast: loop with 1 initial load, got {}",
             rec_delta
         );
     }

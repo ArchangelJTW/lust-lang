@@ -794,6 +794,17 @@ pub fn reset_cranelift_writeback_commit_count() {
     CRANELIFT_WRITEBACK_COMMIT_COUNT.with(|c| c.set(0));
 }
 
+#[cfg(feature = "test-deopt")]
+thread_local! {
+    static LAST_DEOPT_SROA_MATERIALIZATIONS: core::cell::RefCell<Vec<(usize, Value)>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(feature = "test-deopt")]
+pub fn take_last_deopt_sroa_materializations() -> Vec<(usize, Value)> {
+    LAST_DEOPT_SROA_MATERIALIZATIONS.with(|slot| core::mem::take(&mut *slot.borrow_mut()))
+}
+
 pub fn commit_staged_writebacks_and_structs(
     staged_arrays: Vec<(Rc<LustArray>, Vec<Value>)>,
     staged_structs: Vec<(Rc<StructObject>, Vec<Value>)>,
@@ -2616,6 +2627,11 @@ impl VM {
                             "Struct '{struct_name}' field index {field_idx} out of bounds in '{func_name}'"
                         )
                     })?;
+                    if struct_name != "LuaTable" && field_idx <= u8::MAX as usize {
+                        continuation_bc.chunk.instructions[pc] =
+                            Instruction::GetFieldSlot(dst, base_reg, field_idx as u8);
+                        continue;
+                    }
                     let fname_val = Value::String(Rc::clone(fname));
                     let fname_exists = continuation_bc
                         .chunk
@@ -2667,6 +2683,11 @@ impl VM {
                             "Struct '{struct_name}' field index {field_idx} out of bounds in '{func_name}'"
                         )
                     })?;
+                    if struct_name != "LuaTable" && field_idx <= u8::MAX as usize {
+                        continuation_bc.chunk.instructions[pc] =
+                            Instruction::SetFieldSlot(base_reg, field_idx as u8, val_reg);
+                        continue;
+                    }
                     let fname_val = Value::String(Rc::clone(fname));
                     let fname_exists = continuation_bc
                         .chunk
@@ -2685,6 +2706,8 @@ impl VM {
                 _ => {}
             }
         }
+        continuation_bc.chunk.compute_bb_gas_weights();
+        continuation_bc.chunk.build_packed_code();
         Ok(())
     }
 
@@ -3001,8 +3024,13 @@ impl VM {
         if let Some(ref target) = hook_target {
             jit_inline_cfg.excluded_functions.insert(target.clone());
         }
+        let sroa_layouts = self.build_sroa_struct_layouts();
         let mut inlined_names =
-            crate::mir::opt::MirOptimizer::optimize_module_for_jit(&mut module, &jit_inline_cfg);
+            crate::mir::opt::MirOptimizer::optimize_module_for_jit_with_layouts(
+                &mut module,
+                &jit_inline_cfg,
+                &sroa_layouts,
+            );
 
         // Fail-closed post-inline eligibility check: revert any inlined function that became ineligible.
         for func in &mut module.functions {
@@ -3215,6 +3243,60 @@ impl VM {
             .map(|entry| entry.has_external_or_host_calls)
     }
 
+    /// Builds scalar-only `MirStructLayout` descriptors from VM `struct_metadata` for MIR SROA
+    /// (`NG-W11-1`) without polluting `MirModule::struct_layouts` (which controls C-flat codegen).
+    #[cfg(feature = "std")]
+    fn build_sroa_struct_layouts(
+        &self,
+    ) -> hashbrown::HashMap<String, crate::mir::ir::MirStructLayout> {
+        use crate::data::layout::{CanonicalTypeTag, LogicalFieldDesc, LogicalLayoutV1};
+
+        let mut layouts = hashbrown::HashMap::new();
+        for (name, info) in self.struct_metadata.iter() {
+            if !self.is_cranelift_supported_struct(name) {
+                continue;
+            }
+            let field_names = info.layout.field_names();
+            if field_names.is_empty() {
+                continue;
+            }
+            let mut fields = Vec::with_capacity(field_names.len());
+            let mut all_scalar = true;
+            for (idx, fname) in field_names.iter().enumerate() {
+                let tag = match &info.layout.field_type(idx).kind {
+                    TypeKind::Int => CanonicalTypeTag::Int64,
+                    TypeKind::Float => CanonicalTypeTag::Float64,
+                    TypeKind::Bool => CanonicalTypeTag::Bool,
+                    TypeKind::String => CanonicalTypeTag::StringSlice,
+                    _ => {
+                        all_scalar = false;
+                        break;
+                    }
+                };
+                fields.push(LogicalFieldDesc::new(idx as u16, fname.as_str(), tag));
+            }
+            if all_scalar {
+                let logical = LogicalLayoutV1::new(0, name.clone(), fields);
+                layouts.insert(name.clone(), crate::mir::ir::MirStructLayout::from(&logical));
+            }
+        }
+        layouts
+    }
+
+    /// Read-only inspection helper returning the SROA struct recipes for a compiled Cranelift
+    /// function (`NG-W11-1`).
+    #[cfg(feature = "std")]
+    pub fn cranelift_sroa_recipes(
+        &self,
+        func_name: &str,
+    ) -> Option<Vec<crate::mir::ir::SroaStructRecipe>> {
+        let func_idx = self.functions.iter().position(|f| f.name == func_name)?;
+        self.cranelift_fn_cache
+            .get(func_idx)?
+            .as_ref()
+            .map(|entry| entry.sroa_recipes.clone())
+    }
+
     /// Read-only inspection helper returning the compile-time `is_pure_scalar_abi` flag
     /// for a compiled Cranelift function (`NG-W10-3`).
     #[cfg(feature = "std")]
@@ -3350,7 +3432,12 @@ impl VM {
         let mut refined_module = crate::mir::ir::MirModule::new(module.name.clone());
         let mut entry_meta_by_name: hashbrown::HashMap<
             String,
-            (Vec<MirType>, MirType, Vec<MirType>),
+            (
+                Vec<MirType>,
+                MirType,
+                Vec<MirType>,
+                Vec<crate::mir::ir::SroaStructRecipe>,
+            ),
         > = hashbrown::HashMap::with_capacity(module.functions.len());
         for f in &module.functions {
             let refined = self.refine_mir_function_in_vm(f);
@@ -3380,7 +3467,12 @@ impl VM {
                 .collect();
             entry_meta_by_name.insert(
                 f.signature.name.clone(),
-                (param_types, f.signature.return_type.clone(), local_types),
+                (
+                    param_types,
+                    f.signature.return_type.clone(),
+                    local_types,
+                    f.sroa_decomposed_structs.clone(),
+                ),
             );
             refined_module.add_function(refined);
         }
@@ -3431,7 +3523,8 @@ impl VM {
                 if func_idx < self.call_meta.len() {
                     self.call_meta[func_idx] = meta;
                 }
-                if let Some((param_types, ret_type, local_types)) = entry_meta_by_name.remove(&name)
+                if let Some((param_types, ret_type, local_types, sroa_recipes)) =
+                    entry_meta_by_name.remove(&name)
                     && param_types.len() == self.functions[func_idx].param_count as usize
                     && !Self::type_contains_unknown(&ret_type)
                     && self.is_cranelift_supported_type_in_vm(&ret_type)
@@ -3461,6 +3554,7 @@ impl VM {
                         readonly_params,
                         has_external_or_host_calls,
                         is_pure_scalar_abi,
+                        sroa_recipes,
                     }));
                 }
             }
@@ -3547,25 +3641,29 @@ impl VM {
             e
         };
 
-        // Step E (Hazard 3): Ensure top_frame register capacity covers installed continuation
-        // bytecode register_count and MIR local_types before native entry / deopt restoration.
+        // Step E (Hazard 3 / Hazard 10): Ensure top_frame register window capacity covers installed
+        // continuation bytecode register_count, param_count, and MIR local_types before native entry.
         let required_regs = self
             .functions
             .get(func_idx)
             .map(|f| f.register_count as usize)
             .unwrap_or(0)
-            .max(entry.local_types.len());
-        {
-            let Some(top_frame) = self.call_stack.last_mut() else {
-                return Ok(None);
-            };
-            if top_frame.registers.len() < param_count || required_regs > top_frame.registers.len() {
-                return Ok(None);
-            }
-            if required_regs > param_count {
-                for slot in &mut top_frame.registers[param_count..required_regs] {
-                    *slot = Value::Nil;
-                }
+            .max(entry.local_types.len())
+            .max(param_count);
+        if required_regs > 256 || self.call_stack.is_empty() {
+            return Ok(None);
+        }
+        let cur_reg_count = self.call_stack.last().unwrap().reg_count as usize;
+        if cur_reg_count < param_count {
+            return Ok(None);
+        }
+        if required_regs > cur_reg_count {
+            self.ensure_top_frame_reg_capacity(required_regs)?;
+        }
+        if required_regs > param_count {
+            let base_reg = self.call_stack.last().unwrap().base_reg;
+            for slot in &mut self.vm_registers[base_reg + param_count..base_reg + required_regs] {
+                *slot = Value::Nil;
             }
         }
 
@@ -3578,6 +3676,7 @@ impl VM {
             &entry.ret_type,
             &entry.local_types,
             &entry.readonly_params,
+            &entry.sroa_recipes,
             entry.has_external_or_host_calls,
             entry.code_ptr,
             &mut native_entered,
@@ -3595,9 +3694,7 @@ impl VM {
                 crate::mir::cranelift_backend::take_current_sticky_error();
                 crate::mir::cranelift_backend::take_deopt_payload();
                 if native_entered {
-                    if let Some(frame) = self.pop_call_frame() {
-                        self.recycle_frame(frame);
-                    }
+                    let _ = self.pop_call_frame();
                 }
                 Err(err)
             }
@@ -3811,16 +3908,17 @@ impl VM {
         let Some(frame) = self.call_stack.last() else {
             return (Vec::new(), hashbrown::HashMap::new());
         };
-        if frame.registers.len() < param_types.len() {
+        if (frame.reg_count as usize) < param_types.len() {
             return (Vec::new(), hashbrown::HashMap::new());
         }
+        let regs = &self.vm_registers[frame.base_reg..frame.base_reg + frame.reg_count as usize];
         let mut state: hashbrown::HashMap<
             *const LustArray,
             (Rc<LustArray>, Option<FlatArrayElemTag>, bool),
         > = hashbrown::HashMap::new();
         let mut order: Vec<*const LustArray> = Vec::new();
         for (i, expected_ty) in param_types.iter().enumerate() {
-            if let Value::Array(rc) = &frame.registers[i] {
+            if let Value::Array(rc) = &regs[i] {
                 let key = Rc::as_ptr(rc);
                 let is_ro = readonly_params.get(i).copied() == Some(true);
                 let tag_opt = match expected_ty {
@@ -3862,6 +3960,7 @@ impl VM {
         ret_type: &MirType,
         local_types: &[MirType],
         readonly_params: &[bool],
+        sroa_recipes: &[crate::mir::ir::SroaStructRecipe],
         has_external_or_host_calls: bool,
         code_ptr: *const u8,
         native_entered: &mut bool,
@@ -3873,8 +3972,9 @@ impl VM {
         if crate::bytecode::value::specialized_cache_active_entries() > 0 {
             let _sync_vm_guard = crate::vm::CurrentVmGuard::from_vm(self);
             if let Some(frame) = self.call_stack.last() {
-                for (i, expected_ty) in param_types.iter().enumerate().take(frame.registers.len()) {
-                    if let (Value::Array(rc), MirType::Array(_)) = (&frame.registers[i], expected_ty) {
+                let regs = &self.vm_registers[frame.base_reg..frame.base_reg + frame.reg_count as usize];
+                for (i, expected_ty) in param_types.iter().enumerate().take(regs.len()) {
+                    if let (Value::Array(rc), MirType::Array(_)) = (&regs[i], expected_ty) {
                         crate::bytecode::value::try_sync_specialized_array(rc)
                             .map_err(|msg| LustError::RuntimeError { message: msg })?;
                     }
@@ -3949,11 +4049,12 @@ impl VM {
 
         {
             let frame = self.call_stack.last().unwrap();
-            if frame.registers.len() < param_count {
+            if (frame.reg_count as usize) < param_count {
                 return Ok(CraneliftOutcome::Fallback);
             }
+            let regs = &self.vm_registers[frame.base_reg..frame.base_reg + frame.reg_count as usize];
             for (i, expected_ty) in param_types.iter().enumerate() {
-                let val = &frame.registers[i];
+                let val = &regs[i];
                 let arg = match (val, expected_ty) {
                     (Value::Int(n), MirType::Int | MirType::Unknown) => RawArg::Int(*n),
                     (Value::Bool(b), MirType::Bool | MirType::Unknown) => RawArg::Int(i64::from(*b)),
@@ -4589,6 +4690,7 @@ impl VM {
                     &marshalled_arrays,
                     &marshalled_structs,
                     readonly_params,
+                    sroa_recipes,
                 );
             }
 
@@ -4827,6 +4929,7 @@ impl VM {
         marshalled_arrays: &[MarshalledArray],
         marshalled_structs: &[MarshalledStruct],
         readonly_params: &[bool],
+        sroa_recipes: &[crate::mir::ir::SroaStructRecipe],
     ) -> Result<CraneliftOutcome> {
         #[cfg(feature = "test-deopt")]
         let (expected_block, payload, source_label) = {
@@ -4947,10 +5050,20 @@ impl VM {
         let top_frame_reg_count = self
             .call_stack
             .last()
-            .map(|frame| frame.registers.len())
+            .map(|frame| frame.reg_count as usize)
             .ok_or_else(|| LustError::RuntimeError {
                 message: "Call stack empty during deopt reconstruction".into(),
             })?;
+        // Hazard 10: MIR inlining / SROA can require more locals than initial AST `reg_count`.
+        // Compute effective capacity required; actual window expansion happens ONLY after all
+        // payload/writeback validations succeed (preserving zero-mutation fail-closed atomicity).
+        let max_sroa_orig = sroa_recipes
+            .iter()
+            .map(|r| r.orig_local.0 + 1)
+            .max()
+            .unwrap_or(0);
+        let required_locals = local_types.len().max(max_sroa_orig);
+        let effective_reg_capacity = top_frame_reg_count.max(required_locals);
 
         let mut seen_indices = hashbrown::HashSet::with_capacity(payload.live_locals.len());
         for &(loc_idx, _) in &payload.live_locals {
@@ -4992,7 +5105,7 @@ impl VM {
             hashbrown::HashMap::new();
         let mut validated_restorations = Vec::with_capacity(payload.live_locals.len());
         for &(loc_idx, raw_val) in &payload.live_locals {
-            if loc_idx >= local_types.len() || loc_idx >= top_frame_reg_count {
+            if loc_idx >= local_types.len() || loc_idx >= effective_reg_capacity {
                 return Err(LustError::RuntimeError {
                     message: format!(
                         "Deopt payload ({source_label}) local index {} out of bounds",
@@ -5144,6 +5257,52 @@ impl VM {
             validated_restorations.push((loc_idx, restored_val));
         }
 
+        // Cold SROA struct materialization (`NG-W11-1`): reconstruct `Rc<StructObject>` from
+        // restored scalar `field_locals` registers for every decomposed struct recipe so `orig_local`
+        // holds a well-typed `Value::Struct` post-deopt.
+        let mut sroa_materializations: Vec<(usize, Value)> = Vec::new();
+        if !sroa_recipes.is_empty() {
+            let mut restored_by_idx: hashbrown::HashMap<usize, Value> =
+                hashbrown::HashMap::with_capacity(validated_restorations.len());
+            for (loc_idx, val) in &validated_restorations {
+                restored_by_idx.insert(*loc_idx, val.clone());
+            }
+            for sroa in sroa_recipes {
+                if sroa.orig_local.0 >= effective_reg_capacity {
+                    continue;
+                }
+                let Some(info) = self.struct_metadata.get(&sroa.struct_name) else {
+                    continue;
+                };
+                let layout = &info.layout;
+                if layout.field_names().len() != sroa.field_locals.len() {
+                    continue;
+                }
+                let mut fields = Vec::with_capacity(sroa.field_locals.len());
+                for (field_idx, field_local) in sroa.field_locals.iter().enumerate() {
+                    let val = if let Some(restored) = restored_by_idx.get(&field_local.0) {
+                        restored.clone()
+                    } else {
+                        match &layout.field_type(field_idx).kind {
+                            TypeKind::Int => Value::Int(0),
+                            TypeKind::Float => Value::Float(0.0),
+                            TypeKind::Bool => Value::Bool(false),
+                            TypeKind::String => Value::string(""),
+                            _ => Value::Nil,
+                        }
+                    };
+                    fields.push(val);
+                }
+                let struct_name = if layout.name().is_empty() {
+                    sroa.struct_name.clone()
+                } else {
+                    layout.name().to_string()
+                };
+                let rc = StructObject::new(struct_name, Rc::clone(layout), fields);
+                sroa_materializations.push((sroa.orig_local.0, Value::Struct(rc)));
+            }
+        }
+
         stage_and_commit_all_writebacks_with_readonly(
             &self.mir_context,
             marshalled_arrays,
@@ -5152,10 +5311,32 @@ impl VM {
             Some(self.struct_metadata.as_map()),
         )?;
 
+        #[cfg(feature = "test-deopt")]
+        {
+            LAST_DEOPT_SROA_MATERIALIZATIONS.with(|slot| {
+                *slot.borrow_mut() = sroa_materializations.clone();
+            });
+        }
+
+        // Hazard 10: Expand top frame register window if `reg_count < required_locals`.
+        if required_locals > top_frame_reg_count {
+            self.ensure_top_frame_reg_capacity(required_locals)?;
+        }
+
         let top_frame = self.call_stack.last_mut().expect("validated non-empty");
         top_frame.ip = recipe.precise_pc;
+        let base_reg = top_frame.base_reg;
         for (loc_idx, val) in validated_restorations {
-            top_frame.registers[loc_idx] = val;
+            if !val.is_plain() {
+                top_frame.mark_non_plain(loc_idx);
+            }
+            self.vm_registers[base_reg + loc_idx] = val;
+        }
+        for (orig_idx, struct_val) in sroa_materializations {
+            if !struct_val.is_plain() {
+                top_frame.mark_non_plain(orig_idx);
+            }
+            self.vm_registers[base_reg + orig_idx] = struct_val;
         }
 
         Ok(CraneliftOutcome::Fallback)
@@ -5614,13 +5795,21 @@ mod eligibility_walker_tests {
             bc.chunk
                 .instructions
                 .iter()
-                .any(|i| matches!(i, crate::bytecode::Instruction::GetField(..)))
+                .any(|i| matches!(
+                    i,
+                    crate::bytecode::Instruction::GetField(..)
+                        | crate::bytecode::Instruction::GetFieldSlot(..)
+                ))
                 && bc
                     .chunk
                     .instructions
                     .iter()
-                    .any(|i| matches!(i, crate::bytecode::Instruction::SetField(..))),
-            "expected GetField and SetField after continuation rewrite"
+                    .any(|i| matches!(
+                        i,
+                        crate::bytecode::Instruction::SetField(..)
+                            | crate::bytecode::Instruction::SetFieldSlot(..)
+                    )),
+            "expected GetField/GetFieldSlot and SetField/SetFieldSlot after continuation rewrite"
         );
 
         let resume_pc = bc.block_entry_pcs[&bb1.0];
@@ -5644,17 +5833,8 @@ mod eligibility_walker_tests {
         );
 
         let local_types: Vec<MirType> = f.locals.iter().map(|l| l.ty.clone()).collect();
-        let mut frame = Box::new(crate::vm::CallFrame {
-            function_idx: func_idx,
-            ip: 0,
-            registers: [const { Value::Nil }; 256],
-            base_register: 0,
-            return_dest: None,
-            upvalues: Vec::new(),
-            shared_upvalues: Vec::new(),
-        });
-        frame.registers[0] = Value::Int(-999);
-        vm.call_stack.push(frame);
+        let frame_idx = vm.push_call_frame(func_idx, 256, None);
+        vm.frame_registers_mut(frame_idx)[0] = Value::Int(-999);
 
         let _ctx_guard = vm.mir_context.enter();
         let fresh_ptr = lust_mir_alloc_struct_named(2, "Point".as_ptr(), "Point".len() as i64);
@@ -5679,7 +5859,7 @@ mod eligibility_walker_tests {
         crate::mir::cranelift_backend::set_current_deopt_payload(payload);
 
         let outcome = vm
-            .restore_deopt_top_frame("alias_resume", 1, 1, &local_types, &[], &[], &[])
+            .restore_deopt_top_frame("alias_resume", 1, 1, &local_types, &[], &[], &[], &[])
             .expect("restore_deopt_top_frame must succeed for aliased fresh structs");
         assert!(matches!(outcome, CraneliftOutcome::Fallback));
 
@@ -5687,7 +5867,8 @@ mod eligibility_walker_tests {
         let (rc_a, rc_b) = {
             let top = vm.call_stack.last().unwrap();
             assert_eq!(top.ip, resume_pc);
-            match (&top.registers[a.0], &top.registers[b.0]) {
+            let regs = vm.top_frame_registers();
+            match (&regs[a.0], &regs[b.0]) {
                 (Value::Struct(ra), Value::Struct(rb)) => (Rc::clone(ra), Rc::clone(rb)),
                 other => panic!("expected (Struct, Struct), got {other:?}"),
             }
@@ -5723,17 +5904,9 @@ mod eligibility_walker_tests {
             },
         );
 
-        let mut frame = Box::new(crate::vm::CallFrame {
-            function_idx: 0,
-            ip: 7,
-            registers: [const { Value::Nil }; 256],
-            base_register: 0,
-            return_dest: None,
-            upvalues: Vec::new(),
-            shared_upvalues: Vec::new(),
-        });
-        frame.registers[0] = Value::Int(12345);
-        vm.call_stack.push(frame);
+        let frame_idx = vm.push_call_frame(0, 256, None);
+        vm.call_stack[frame_idx].ip = 7;
+        vm.frame_registers_mut(frame_idx)[0] = Value::Int(12345);
 
         let caller_struct = StructObject::new(
             "Point".to_string(),
@@ -5776,6 +5949,7 @@ mod eligibility_walker_tests {
                     &[],
                     &marshalled_structs,
                     &[],
+                    &[],
                 )
                 .expect_err("corrupted/unowned struct pointer must fail closed");
             assert!(
@@ -5784,7 +5958,7 @@ mod eligibility_walker_tests {
             );
             // Zero frame mutation AND zero input-struct writeback mutation!
             assert_eq!(vm.call_stack.last().unwrap().ip, 7);
-            assert_eq!(vm.call_stack.last().unwrap().registers[0], Value::Int(12345));
+            assert_eq!(vm.top_frame_registers()[0], Value::Int(12345));
             assert_eq!(*caller_struct.fields.borrow(), vec![Value::Int(10), Value::Int(20)]);
         }
 
@@ -5810,6 +5984,7 @@ mod eligibility_walker_tests {
                 &[],
                 &marshalled_structs,
                 &[],
+                &[],
             )
             .expect_err("struct field count mismatch must fail closed");
         assert!(
@@ -5818,7 +5993,7 @@ mod eligibility_walker_tests {
         );
         // Zero frame mutation AND zero input-struct writeback mutation!
         assert_eq!(vm.call_stack.last().unwrap().ip, 7);
-        assert_eq!(vm.call_stack.last().unwrap().registers[0], Value::Int(12345));
+        assert_eq!(vm.top_frame_registers()[0], Value::Int(12345));
         assert_eq!(*caller_struct.fields.borrow(), vec![Value::Int(10), Value::Int(20)]);
     }
 }

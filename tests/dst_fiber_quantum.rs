@@ -79,9 +79,10 @@ fn test_fuel_based_preemption_and_exact_quantum_accounting() {
     let cont1 = task1.continuation.as_ref().expect("continuation captured");
     assert_eq!(cont1.ip, 3, "IP must point to loop head at instruction 3");
     assert_eq!(cont1.call_stack.len(), 1);
-    assert_eq!(cont1.call_stack[0].registers[0], Value::Int(0)); // accumulator = 0
-    assert_eq!(cont1.call_stack[0].registers[1], Value::Int(1)); // step = 1
-    assert_eq!(cont1.call_stack[0].registers[2], Value::Int(10)); // limit = 10
+    let cont1_regs = cont1.call_stack[0].saved_registers().expect("saved registers captured");
+    assert_eq!(cont1_regs[0], Value::Int(0)); // accumulator = 0
+    assert_eq!(cont1_regs[1], Value::Int(1)); // step = 1
+    assert_eq!(cont1_regs[2], Value::Int(10)); // limit = 10
 
     // Step 2: One full loop iteration (4 instructions: Lt, JumpIfNot, Add, Jump)
     let state2 = vm
@@ -93,7 +94,7 @@ fn test_fuel_based_preemption_and_exact_quantum_accounting() {
     let cont2 = task2.continuation.as_ref().unwrap();
     assert_eq!(cont2.ip, 3, "After 1 iteration, IP returns to loop head");
     assert_eq!(
-        cont2.call_stack[0].registers[0],
+        cont2.call_stack[0].saved_registers().expect("saved registers captured")[0],
         Value::Int(1),
         "Accumulator R0 must be 1"
     );
@@ -128,11 +129,16 @@ fn test_fiber_continuation_preservation_and_explicit_restore() {
     let task = vm.get_task_instance_mut(handle).unwrap();
     let cont = task.take_continuation().expect("continuation present");
     assert_eq!(cont.ip, 3);
-    assert_eq!(cont.call_stack[0].registers[0], Value::Int(3));
+    assert_eq!(
+        cont.call_stack[0].saved_registers().expect("saved registers captured")[0],
+        Value::Int(3)
+    );
 
     // Modify a register in the continuation (e.g. inject intermediate accumulator value 15)
     let mut modified_cont = cont.clone();
-    modified_cont.call_stack[0].registers[0] = Value::Int(15);
+    modified_cont.call_stack[0]
+        .saved_registers_mut()
+        .expect("saved registers present")[0] = Value::Int(15);
 
     // Restore modified continuation and resume
     vm.resume_from_continuation(handle, modified_cont, None)
@@ -188,7 +194,10 @@ fn test_fiber_continuation_preserves_shared_upvalues() {
     let cont = task.continuation.as_ref().unwrap();
     assert_eq!(cont.upvalues.len(), 1);
     assert_eq!(cont.upvalues[0].borrow().get(), Value::Int(50));
-    assert_eq!(cont.call_stack[0].registers[0], Value::Int(51));
+    assert_eq!(
+        cont.call_stack[0].saved_registers().expect("saved registers captured")[0],
+        Value::Int(51)
+    );
 
     // Step remaining 2 instructions (StoreUpvalue, Return)
     let state2 = vm

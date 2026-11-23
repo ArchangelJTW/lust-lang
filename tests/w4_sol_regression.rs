@@ -216,15 +216,7 @@ fn test_w4_helper_deopt_exit_state_applies_raw_mir_block_id_to_frame_ip() {
     let types = vec![(0, MirType::Int)];
     let deopt_exit = DeoptExitState::from_payload(payload, DeoptReason::Safepoint, &types);
 
-    let mut frame = CallFrame {
-        function_idx: 0,
-        ip: 0,
-        registers: [const { Value::Nil }; 256],
-        base_register: 0,
-        return_dest: None,
-        upvalues: Vec::new(),
-        shared_upvalues: Vec::new(),
-    };
+    let mut frame = CallFrame::new_detached(0, 0, 256);
 
     deopt_exit.apply_to_call_frame(&mut frame).expect("apply_to_call_frame succeeds");
 
@@ -361,18 +353,13 @@ fn test_w4_red_mir_block_id_vs_bytecode_pc_real_osr_continuation() {
 
     // Initialize OsrEngine and run OSR entry for loop header
     let mut osr_engine = OsrEngine::new().expect("initializing OsrEngine must succeed");
-    let mut frame = CallFrame {
-        function_idx: 0,
-        ip: actual_block_entry_pc,
-        registers: [const { Value::Nil }; 256],
-        base_register: 0,
-        return_dest: None,
-        upvalues: Vec::new(),
-        shared_upvalues: Vec::new(),
-    };
-    frame.registers[max_iter.0] = Value::Int(10);
-    frame.registers[acc.0] = Value::Int(0);
-    frame.registers[i.0] = Value::Int(1);
+    let mut frame = CallFrame::new_detached(0, actual_block_entry_pc, 256);
+    {
+        let regs = frame.saved_registers_mut().unwrap();
+        regs[max_iter.0] = Value::Int(10);
+        regs[acc.0] = Value::Int(0);
+        regs[i.0] = Value::Int(1);
+    }
 
     let live_locals = vec![max_iter, acc, i];
     safepoint_request_deopt(true);
@@ -393,18 +380,13 @@ fn test_w4_red_mir_block_id_vs_bytecode_pc_real_osr_continuation() {
 
     // Now verify AUTHORITATIVE RESTORATION with real nonidentity mapping:
     safepoint_request_deopt(true);
-    let mut auth_frame = CallFrame {
-        function_idx: 0,
-        ip: actual_block_entry_pc,
-        registers: [const { Value::Nil }; 256],
-        base_register: 0,
-        return_dest: None,
-        upvalues: Vec::new(),
-        shared_upvalues: Vec::new(),
-    };
-    auth_frame.registers[max_iter.0] = Value::Int(10);
-    auth_frame.registers[acc.0] = Value::Int(0);
-    auth_frame.registers[i.0] = Value::Int(1);
+    let mut auth_frame = CallFrame::new_detached(0, actual_block_entry_pc, 256);
+    {
+        let regs = auth_frame.saved_registers_mut().unwrap();
+        regs[max_iter.0] = Value::Int(10);
+        regs[acc.0] = Value::Int(0);
+        regs[i.0] = Value::Int(1);
+    }
 
     let mut mapping = hashbrown::HashMap::new();
     mapping.insert(bb_hdr.0, actual_block_entry_pc);
@@ -451,18 +433,13 @@ fn test_w4_red_mir_block_id_vs_bytecode_pc_real_osr_continuation() {
 
     // Missing / mismatched mapping MUST fail closed with terminal error and leave frame UNCHANGED
     safepoint_request_deopt(true);
-    let mut unchanged_frame = CallFrame {
-        function_idx: 0,
-        ip: 99,
-        registers: [const { Value::Nil }; 256],
-        base_register: 0,
-        return_dest: None,
-        upvalues: Vec::new(),
-        shared_upvalues: Vec::new(),
-    };
-    unchanged_frame.registers[max_iter.0] = Value::Int(10);
-    unchanged_frame.registers[acc.0] = Value::Int(0);
-    unchanged_frame.registers[i.0] = Value::Int(1);
+    let mut unchanged_frame = CallFrame::new_detached(0, 99, 256);
+    {
+        let regs = unchanged_frame.saved_registers_mut().unwrap();
+        regs[max_iter.0] = Value::Int(10);
+        regs[acc.0] = Value::Int(0);
+        regs[i.0] = Value::Int(1);
+    }
     let original_frame = unchanged_frame.clone();
 
     let mismatched_mapping: hashbrown::HashMap<usize, usize> = hashbrown::HashMap::new(); // empty mapping
@@ -483,7 +460,8 @@ fn test_w4_red_mir_block_id_vs_bytecode_pc_real_osr_continuation() {
         "Frame IP must remain completely unchanged (99) after mismatched mapping failure"
     );
     assert_eq!(
-        unchanged_frame.registers[max_iter.0], original_frame.registers[max_iter.0],
+        unchanged_frame.saved_registers().unwrap()[max_iter.0],
+        original_frame.saved_registers().unwrap()[max_iter.0],
         "Frame registers must remain completely unchanged after mismatched mapping failure"
     );
 

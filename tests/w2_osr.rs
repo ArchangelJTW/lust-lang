@@ -55,15 +55,7 @@ fn parse_and_lower_module(source: &str, module_name: &str) -> MirModule {
 }
 
 fn create_dummy_frame(func_idx: usize) -> CallFrame {
-    CallFrame {
-        function_idx: func_idx,
-        ip: 0,
-        registers: [(); 256].map(|_| Value::Nil),
-        base_register: 0,
-        return_dest: None,
-        upvalues: Vec::new(),
-        shared_upvalues: Vec::new(),
-    }
+    CallFrame::new_detached(func_idx, 0, 256)
 }
 
 #[test]
@@ -127,9 +119,12 @@ fn test_osr_entry_counters_and_native_execution() {
 
     // Initial frame state mid-loop: n = 100, sum = 190, i = 20
     let mut frame = create_dummy_frame(0);
-    frame.registers[n_id.0] = Value::Int(100);
-    frame.registers[sum_id.0] = Value::Int(190);
-    frame.registers[i_id.0] = Value::Int(20);
+    {
+        let regs = frame.saved_registers_mut().unwrap();
+        regs[n_id.0] = Value::Int(100);
+        regs[sum_id.0] = Value::Int(190);
+        regs[i_id.0] = Value::Int(20);
+    }
 
     let attempts_before = GLOBAL_OSR_COUNTERS.entry_attempts.load(Ordering::SeqCst);
     let successes_before = GLOBAL_OSR_COUNTERS.entry_successes.load(Ordering::SeqCst);
@@ -200,9 +195,12 @@ fn test_osr_deopt_mid_loop_with_live_locals_reconstruction() {
 
     // Initial frame state: n = 50, sum = 0, i = 0
     let mut frame = create_dummy_frame(0);
-    frame.registers[n_id.0] = Value::Int(50);
-    frame.registers[sum_id.0] = Value::Int(0);
-    frame.registers[i_id.0] = Value::Int(0);
+    {
+        let regs = frame.saved_registers_mut().unwrap();
+        regs[n_id.0] = Value::Int(50);
+        regs[sum_id.0] = Value::Int(0);
+        regs[i_id.0] = Value::Int(0);
+    }
 
     // Request deopt via safepoint trigger
     safepoint_request_deopt(true);
@@ -226,22 +224,25 @@ fn test_osr_deopt_mid_loop_with_live_locals_reconstruction() {
             assert_eq!(exit_state.reason, DeoptReason::Safepoint);
 
             // Verify live locals were reconstructed and applied into CallFrame
-            assert_eq!(frame.registers[n_id.0], Value::Int(50));
-            assert_eq!(frame.registers[sum_id.0], Value::Int(0));
-            assert_eq!(frame.registers[i_id.0], Value::Int(0));
+            {
+                let regs = frame.saved_registers().unwrap();
+                assert_eq!(regs[n_id.0], Value::Int(50));
+                assert_eq!(regs[sum_id.0], Value::Int(0));
+                assert_eq!(regs[i_id.0], Value::Int(0));
+            }
             assert_eq!(frame.ip, target_block.0);
 
             // Now resume in the interpreter from reconstructed frame
             // simulating interpreter loop execution from frame.ip:
-            let mut i = match frame.registers[i_id.0] {
+            let mut i = match frame.saved_registers().unwrap()[i_id.0] {
                 Value::Int(v) => v,
                 _ => unreachable!(),
             };
-            let mut sum = match frame.registers[sum_id.0] {
+            let mut sum = match frame.saved_registers().unwrap()[sum_id.0] {
                 Value::Int(v) => v,
                 _ => unreachable!(),
             };
-            let n = match frame.registers[n_id.0] {
+            let n = match frame.saved_registers().unwrap()[n_id.0] {
                 Value::Int(v) => v,
                 _ => unreachable!(),
             };
@@ -250,10 +251,17 @@ fn test_osr_deopt_mid_loop_with_live_locals_reconstruction() {
                 sum += i;
                 i += 1;
             }
-            frame.registers[sum_id.0] = Value::Int(sum);
-            frame.registers[i_id.0] = Value::Int(i);
+            {
+                let regs = frame.saved_registers_mut().unwrap();
+                regs[sum_id.0] = Value::Int(sum);
+                regs[i_id.0] = Value::Int(i);
+            }
 
-            assert_eq!(frame.registers[sum_id.0], Value::Int(1225), "Sum of 0..49 is 1225");
+            assert_eq!(
+                frame.saved_registers().unwrap()[sum_id.0],
+                Value::Int(1225),
+                "Sum of 0..49 is 1225"
+            );
         }
         other => panic!("Expected OsrExecutionResult::Deoptimized, got {:?}", other),
     }
@@ -285,7 +293,7 @@ fn test_osr_unsupported_state_fallback() {
 
     // Case 1: Active upvalues present in frame
     let mut frame_with_upvalues = create_dummy_frame(0);
-    frame_with_upvalues.registers[0] = Value::Int(10);
+    frame_with_upvalues.saved_registers_mut().unwrap()[0] = Value::Int(10);
     frame_with_upvalues.upvalues.push(Value::Int(99));
 
     let fallback_before = GLOBAL_OSR_COUNTERS.fallback_count.load(Ordering::SeqCst);
@@ -306,10 +314,11 @@ fn test_osr_unsupported_state_fallback() {
 
     // Case 2: Register contains an unsupported closure
     let mut frame_with_closure = create_dummy_frame(0);
-    frame_with_closure.registers[0] = Value::Closure(std::rc::Rc::new(ClosureObject {
-        function_idx: 1,
-        upvalues: Vec::new(),
-    }));
+    frame_with_closure.saved_registers_mut().unwrap()[0] =
+        Value::Closure(std::rc::Rc::new(ClosureObject {
+            function_idx: 1,
+            upvalues: Vec::new(),
+        }));
 
     let fallback_before2 = GLOBAL_OSR_COUNTERS.fallback_count.load(Ordering::SeqCst);
     let res2 = engine
@@ -463,10 +472,13 @@ fn test_osr_with_float_and_nested_loops() {
     let target_block = BlockId(1);
 
     let mut frame = create_dummy_frame(0);
-    frame.registers[m_id.0] = Value::Int(10); // m
-    frame.registers[n_id.0] = Value::Int(20); // n
-    frame.registers[total_id.0] = Value::Int(0);  // total
-    frame.registers[i_id.0] = Value::Int(0);  // i
+    {
+        let regs = frame.saved_registers_mut().unwrap();
+        regs[m_id.0] = Value::Int(10); // m
+        regs[n_id.0] = Value::Int(20); // n
+        regs[total_id.0] = Value::Int(0); // total
+        regs[i_id.0] = Value::Int(0); // i
+    }
 
     let result = engine
         .execute_osr(&mir_fn, target_block, &live_locals, &mut frame)
@@ -534,9 +546,12 @@ fn test_mixed_float_int_osr_execution() {
 
     // Initial frame state mid-loop: limit = 10, sum = 6.5 (after 4 iterations: 0.5 + 4 * 1.5 = 6.5), i = 4
     let mut frame = create_dummy_frame(0);
-    frame.registers[limit_id.0] = Value::Int(10);
-    frame.registers[sum_id.0] = Value::Float(6.5);
-    frame.registers[i_id.0] = Value::Int(4);
+    {
+        let regs = frame.saved_registers_mut().unwrap();
+        regs[limit_id.0] = Value::Int(10);
+        regs[sum_id.0] = Value::Float(6.5);
+        regs[i_id.0] = Value::Int(4);
+    }
 
     let result = engine
         .execute_osr(&mir_fn, target_block, &live_locals, &mut frame)

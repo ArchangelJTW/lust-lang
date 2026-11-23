@@ -343,15 +343,7 @@ fn test_bf1_print_parity_float_bool_arity_and_console() {
             end
         "#;
         let (mut vm_direct_clif, mut vm_direct_bc) = compile_direct_mir_vm(direct_src);
-        let frame = CallFrame {
-            function_idx: 0,
-            ip: 0,
-            registers: [const { Value::Nil }; 256],
-            base_register: 0,
-            return_dest: None,
-            upvalues: Vec::new(),
-            shared_upvalues: Vec::new(),
-        };
+        let frame = CallFrame::new(0, None, 256);
         vm_direct_clif.push_call_frame_for_test(frame);
         let direct_res = vm_direct_clif
             .run_cranelift()

@@ -33,17 +33,9 @@ use lust::vm::{
 static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 fn make_dummy_frame(ip: usize, val0: i64) -> CallFrame {
-    let mut registers = [const { Value::Nil }; 256];
-    registers[0] = Value::Int(val0);
-    CallFrame {
-        function_idx: 0,
-        ip,
-        registers,
-        base_register: 0,
-        return_dest: None,
-        upvalues: Vec::new(),
-        shared_upvalues: Vec::new(),
-    }
+    let mut frame = CallFrame::new_detached(0, ip, 256);
+    frame.saved_registers_mut().unwrap()[0] = Value::Int(val0);
+    frame
 }
 
 // ============================================================================
@@ -79,7 +71,11 @@ fn test_missing_local_type_fails_closed_and_frame_unchanged() {
 
     // 4. Verify frame was NOT mutated
     assert_eq!(frame.ip, original_frame.ip, "Frame IP must remain unchanged");
-    assert_eq!(frame.registers[0], original_frame.registers[0], "Frame register 0 must remain unchanged");
+    assert_eq!(
+        frame.saved_registers().unwrap()[0],
+        original_frame.saved_registers().unwrap()[0],
+        "Frame register 0 must remain unchanged"
+    );
 }
 
 #[test]
@@ -242,9 +238,9 @@ fn test_apply_out_of_range_register_fails_closed_and_frame_unchanged() {
 
     let mut frame = make_dummy_frame(42, 111);
     let initial_ip = frame.ip;
-    let initial_reg0 = frame.registers[0].clone();
+    let initial_reg0 = frame.saved_registers().unwrap()[0].clone();
 
-    // Register 300 exceeds frame.registers.len() (256)
+    // Register 300 exceeds frame register window length (256)
     let payload = DeoptPayload::new(5, vec![(0, 222), (300, 999)]);
     let types = vec![(0, MirType::Int), (300, MirType::Int)];
 
@@ -264,7 +260,7 @@ fn test_apply_out_of_range_register_fails_closed_and_frame_unchanged() {
         "frame.ip must remain unchanged (42) after out-of-range register rejection"
     );
     assert_eq!(
-        frame.registers[0], initial_reg0,
+        frame.saved_registers().unwrap()[0], initial_reg0,
         "frame.registers[0] must remain unchanged (111) after out-of-range register rejection"
     );
 }
@@ -319,7 +315,7 @@ fn test_unproven_mapping_fails_closed_and_authoritative_resume_pc() {
         frame.ip, authoritative_pc,
         "frame.ip must be set to authoritative bytecode PC (25), NOT raw MIR block ID (7)"
     );
-    assert_eq!(frame.registers[0], Value::Int(42));
+    assert_eq!(frame.saved_registers().unwrap()[0], Value::Int(42));
 }
 
 // ============================================================================
@@ -448,9 +444,12 @@ fn test_real_native_path_osr_deopt_safepoint() {
 
     let mut engine = OsrEngine::new().expect("OsrEngine initialization");
     let mut frame = make_dummy_frame(0, 0);
-    frame.registers[arg.0] = Value::Int(10);
-    frame.registers[sum.0] = Value::Int(0);
-    frame.registers[i.0] = Value::Int(0);
+    {
+        let regs = frame.saved_registers_mut().unwrap();
+        regs[arg.0] = Value::Int(10);
+        regs[sum.0] = Value::Int(0);
+        regs[i.0] = Value::Int(0);
+    }
 
     let live_locals = vec![arg, sum, i];
 
@@ -463,9 +462,10 @@ fn test_real_native_path_osr_deopt_safepoint() {
             assert_eq!(exit_state.site_id, bb_hdr.0, "exit_state.site_id must match loop header block ID");
             assert_eq!(exit_state.reason, DeoptReason::Safepoint);
             // Verify frame registers were safely restored
-            assert_eq!(frame.registers[arg.0], Value::Int(10));
-            assert_eq!(frame.registers[sum.0], Value::Int(0));
-            assert_eq!(frame.registers[i.0], Value::Int(0));
+            let regs = frame.saved_registers().unwrap();
+            assert_eq!(regs[arg.0], Value::Int(10));
+            assert_eq!(regs[sum.0], Value::Int(0));
+            assert_eq!(regs[i.0], Value::Int(0));
         }
         other => panic!("Expected Deoptimized result from safepoint, got: {:?}", other),
     }
@@ -558,9 +558,12 @@ fn test_execute_osr_authoritative_proven_mapping_and_mismatched_fails_closed() {
     proven_mapping.insert(bb_hdr.0, authoritative_pc);
 
     let mut frame = make_dummy_frame(0, 0);
-    frame.registers[arg.0] = Value::Int(10);
-    frame.registers[sum.0] = Value::Int(0);
-    frame.registers[i.0] = Value::Int(0);
+    {
+        let regs = frame.saved_registers_mut().unwrap();
+        regs[arg.0] = Value::Int(10);
+        regs[sum.0] = Value::Int(0);
+        regs[i.0] = Value::Int(0);
+    }
 
     safepoint_request_deopt(true);
     let auth_res = engine.execute_osr_authoritative(
@@ -579,7 +582,7 @@ fn test_execute_osr_authoritative_proven_mapping_and_mismatched_fails_closed() {
                 frame.ip, authoritative_pc,
                 "frame.ip must be restored to authoritative bytecode PC (42), not raw site (1)"
             );
-            assert_eq!(frame.registers[arg.0], Value::Int(10));
+            assert_eq!(frame.saved_registers().unwrap()[arg.0], Value::Int(10));
         }
         other => panic!("Expected Deoptimized result, got: {:?}", other),
     }
@@ -609,7 +612,8 @@ fn test_execute_osr_authoritative_proven_mapping_and_mismatched_fails_closed() {
         "Frame IP must remain 123 (unmutated) on missing mapping"
     );
     assert_eq!(
-        unmutated_frame.registers[0], original_frame.registers[0],
+        unmutated_frame.saved_registers().unwrap()[0],
+        original_frame.saved_registers().unwrap()[0],
         "Frame registers must remain unmutated on missing mapping"
     );
 

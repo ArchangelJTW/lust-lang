@@ -4767,10 +4767,11 @@ pub unsafe extern "C" fn jit_call_native_safe(
                 }
 
                 let dest_reg = vm.call_stack.last().and_then(|frame| {
-                    let base = frame.registers.as_ptr() as usize;
+                    let regs = &vm.vm_registers[frame.base_reg..frame.base_reg + frame.reg_count as usize];
+                    let base = regs.as_ptr() as usize;
                     let out_ptr = out as usize;
                     let value_size = core::mem::size_of::<Value>();
-                    let end = base + value_size * frame.registers.len();
+                    let end = base + value_size * regs.len();
                     if out_ptr < base || out_ptr >= end {
                         return None;
                     }
@@ -4805,10 +4806,11 @@ pub unsafe extern "C" fn jit_call_native_safe(
                 let vm = &mut *vm_ptr;
                 if vm.clock.is_simulated() && vm.current_task.is_some() {
                     let dest_reg = vm.call_stack.last().and_then(|frame| {
-                        let base = frame.registers.as_ptr() as usize;
+                        let regs = &vm.vm_registers[frame.base_reg..frame.base_reg + frame.reg_count as usize];
+                        let base = regs.as_ptr() as usize;
                         let out_ptr = out as usize;
                         let value_size = core::mem::size_of::<Value>();
-                        let end = base + value_size * frame.registers.len();
+                        let end = base + value_size * regs.len();
                         if out_ptr < base || out_ptr >= end {
                             return None;
                         }
@@ -4932,8 +4934,13 @@ pub unsafe extern "C" fn jit_call_function_safe(
                 // Get current registers pointer AFTER the call (it may have reallocated)
                 let vm = &mut *vm_ptr;
                 if let Some(frame) = vm.call_stack.last_mut() {
-                    if (dest_reg as usize) < frame.registers.len() {
-                        frame.registers[dest_reg as usize] = value;
+                    let reg = dest_reg as usize;
+                    if reg < frame.reg_count as usize {
+                        if !value.is_plain() {
+                            frame.mark_non_plain(reg);
+                        }
+                        let slot = frame.base_reg + reg;
+                        vm.vm_registers[slot] = value;
                         1
                     } else {
                         jit::log(|| {
@@ -4968,8 +4975,12 @@ pub unsafe extern "C" fn jit_current_registers(vm_ptr: *mut VM) -> *mut Value {
 
         let vm = &mut *vm_ptr;
         vm.call_stack
-            .last_mut()
-            .map(|frame| frame.registers.as_mut_ptr())
+            .last()
+            .map(|frame| {
+                let start = frame.base_reg;
+                let end = start + frame.reg_count as usize;
+                vm.vm_registers[start..end].as_mut_ptr()
+            })
             .unwrap_or(core::ptr::null_mut())
     }
 }
@@ -5292,8 +5303,13 @@ pub unsafe extern "C" fn jit_call_method_safe(
                 }
                 let vm = &mut *vm_ptr;
                 if let Some(frame) = vm.call_stack.last_mut() {
-                    if (dest_reg as usize) < frame.registers.len() {
-                        frame.registers[dest_reg as usize] = val;
+                    let reg = dest_reg as usize;
+                    if reg < frame.reg_count as usize {
+                        if !val.is_plain() {
+                            frame.mark_non_plain(reg);
+                        }
+                        let slot = frame.base_reg + reg;
+                        vm.vm_registers[slot] = val;
                         1
                     } else {
                         jit::log(|| {

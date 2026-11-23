@@ -302,6 +302,8 @@ impl Compiler {
                 Instruction::Jump(_)
                     | Instruction::JumpIf(..)
                     | Instruction::JumpIfNot(..)
+                    | Instruction::BranchLtInt(..)
+                    | Instruction::BranchLeInt(..)
                     | Instruction::Return(_)
             )
         });
@@ -327,6 +329,9 @@ impl Compiler {
                     Instruction::LoadBool(_, b) => Some(Instruction::LoadBool(dest, b)),
                     Instruction::LoadNil(_) => Some(Instruction::LoadNil(dest)),
                     Instruction::GetField(_, obj, f) => Some(Instruction::GetField(dest, obj, f)),
+                    Instruction::GetFieldSlot(_, obj, slot) => {
+                        Some(Instruction::GetFieldSlot(dest, obj, slot))
+                    }
                     Instruction::GetIndex(_, obj, idx) => Some(Instruction::GetIndex(dest, obj, idx)),
                     Instruction::ArrayGetUnwrap(_, obj, idx) => {
                         Some(Instruction::ArrayGetUnwrap(dest, obj, idx))
@@ -345,11 +350,16 @@ impl Compiler {
                     Instruction::PowInt(_, l, r) => Some(Instruction::PowInt(dest, l, r)),
                     Instruction::PowFloat(_, l, r) => Some(Instruction::PowFloat(dest, l, r)),
                     Instruction::Concat(_, l, r) => Some(Instruction::Concat(dest, l, r)),
+                    Instruction::AddIntImm(_, src, imm) => {
+                        Some(Instruction::AddIntImm(dest, src, imm))
+                    }
                     _ => None,
                 }
             };
             if let Some(replacement) = replacement {
-                *self.current_chunk_mut().instructions.last_mut().unwrap() = replacement;
+                let chunk = self.current_chunk_mut();
+                let last_idx = chunk.instructions.len() - 1;
+                chunk.set_instruction(last_idx, replacement);
                 return;
             }
         }

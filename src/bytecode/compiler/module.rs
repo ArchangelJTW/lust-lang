@@ -363,6 +363,11 @@ impl Compiler {
                     Ok(mut bytecode_fn) => {
                         bytecode_fn.is_method = self.functions[f_idx].is_method;
                         bytecode_fn.signature = self.functions[f_idx].signature.clone();
+                        bytecode_fn.trusted_signature = if bytecode_fn.signature.is_some() {
+                            bytecode_fn.compute_trusted_signature()
+                        } else {
+                            self.functions[f_idx].trusted_signature
+                        };
                         self.functions[f_idx] = bytecode_fn;
                         self.mir_functions.push(mir_fn);
                     }
@@ -380,6 +385,11 @@ impl Compiler {
             for (_, mir_fn) in pending_mir {
                 self.mir_functions.push(mir_fn);
             }
+        }
+
+        for function in &mut self.functions {
+            function.chunk.compute_bb_gas_weights();
+            function.chunk.build_packed_code();
         }
 
         Ok(self.functions.clone())

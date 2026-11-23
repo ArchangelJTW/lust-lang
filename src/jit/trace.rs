@@ -717,7 +717,10 @@ pub fn register_dead_after(
                 };
                 pending.push(target);
             }
-            Instruction::JumpIf(_, offset) | Instruction::JumpIfNot(_, offset) => {
+            Instruction::JumpIf(_, offset)
+            | Instruction::JumpIfNot(_, offset)
+            | Instruction::BranchLtInt(_, _, offset)
+            | Instruction::BranchLeInt(_, _, offset) => {
                 let Some(target) = (ip as i64 + 1 + i64::from(offset)).try_into().ok() else {
                     return false;
                 };
@@ -2037,7 +2040,11 @@ impl TraceRecorder {
         if callee_fn.chunk.instructions.iter().any(|inst| {
             matches!(
                 inst,
-                Instruction::Jump(_) | Instruction::JumpIf(..) | Instruction::JumpIfNot(..)
+                Instruction::Jump(_)
+                    | Instruction::JumpIf(..)
+                    | Instruction::JumpIfNot(..)
+                    | Instruction::BranchLtInt(..)
+                    | Instruction::BranchLeInt(..)
             )
         }) {
             return false;
@@ -3124,6 +3131,106 @@ impl TraceRecorder {
                     field_name,
                     value: value_reg,
                     field_index,
+                    value_type,
+                    is_weak: is_weak_field,
+                });
+                Ok(())
+            }
+
+            Instruction::GetFieldSlot(dest, obj_reg, slot_idx) => {
+                let idx = slot_idx as usize;
+                let (field_name, is_weak_field) = match &registers[obj_reg as usize] {
+                    Value::Struct(object) if object.name != "LuaTable" => {
+                        let StructObject { layout, .. } = object.as_ref();
+                        let Some(name) = layout.field_names().get(idx) else {
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "GetFieldSlot index {} out of bounds during trace recording",
+                                    idx
+                                ),
+                            });
+                        };
+                        ((**name).clone(), layout.is_weak(idx))
+                    }
+                    _ => {
+                        return Err(LustError::RuntimeError {
+                            message: "GetFieldSlot on non-struct during trace recording"
+                                .to_string(),
+                        });
+                    }
+                };
+                if let Some(ty) = Self::get_value_type(&registers[obj_reg as usize])
+                    && !self.is_guarded(obj_reg)
+                {
+                    self.push_op(TraceOp::Guard {
+                        register: obj_reg,
+                        expected_type: ty,
+                    });
+                    self.mark_guarded(obj_reg);
+                }
+
+                let value_type = Self::get_value_type(&registers[dest as usize]);
+                self.push_op(TraceOp::GetField {
+                    dest,
+                    object: obj_reg,
+                    field_name,
+                    field_index: Some(idx),
+                    value_type,
+                    is_weak: is_weak_field,
+                });
+                Ok(())
+            }
+
+            Instruction::SetFieldSlot(obj_reg, slot_idx, value_reg) => {
+                let idx = slot_idx as usize;
+                let (field_name, is_weak_field) = match &registers[obj_reg as usize] {
+                    Value::Struct(object) if object.name != "LuaTable" => {
+                        let StructObject { layout, .. } = object.as_ref();
+                        let Some(name) = layout.field_names().get(idx) else {
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "SetFieldSlot index {} out of bounds during trace recording",
+                                    idx
+                                ),
+                            });
+                        };
+                        ((**name).clone(), layout.is_weak(idx))
+                    }
+                    _ => {
+                        return Err(LustError::RuntimeError {
+                            message: "SetFieldSlot on non-struct during trace recording"
+                                .to_string(),
+                        });
+                    }
+                };
+                if let Some(ty) = Self::get_value_type(&registers[obj_reg as usize])
+                    && !self.is_guarded(obj_reg)
+                {
+                    self.push_op(TraceOp::Guard {
+                        register: obj_reg,
+                        expected_type: ty,
+                    });
+                    self.mark_guarded(obj_reg);
+                }
+
+                let value_type = Self::get_value_type(&registers[value_reg as usize]);
+                if let Some(ty) = value_type
+                    && !self.is_guarded(value_reg)
+                {
+                    self.push_op(TraceOp::Guard {
+                        register: value_reg,
+                        expected_type: ty,
+                    });
+                    self.mark_guarded(value_reg);
+                }
+
+                self.rebox_specialized_register(value_reg, "SetFieldSlot");
+
+                self.push_op(TraceOp::SetField {
+                    object: obj_reg,
+                    field_name,
+                    value: value_reg,
+                    field_index: Some(idx),
                     value_type,
                     is_weak: is_weak_field,
                 });

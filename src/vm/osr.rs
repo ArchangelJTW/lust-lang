@@ -145,13 +145,28 @@ pub struct OsrFrameState {
 }
 
 impl OsrFrameState {
-    /// Captures live register state from a `CallFrame` at `target_pc`.
+    /// Captures live register state from a detached `CallFrame` at `target_pc`.
     pub fn from_call_frame(frame: &CallFrame, target_pc: usize, live_indices: &[usize]) -> Self {
+        let regs = frame
+            .saved_registers
+            .as_deref()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        Self::from_call_frame_with_regs(frame, regs, target_pc, live_indices)
+    }
+
+    /// Captures live register state from a `CallFrame` and its backing register slice at `target_pc`.
+    pub fn from_call_frame_with_regs(
+        frame: &CallFrame,
+        regs: &[Value],
+        target_pc: usize,
+        live_indices: &[usize],
+    ) -> Self {
         let has_upvalues = !frame.upvalues.is_empty() || !frame.shared_upvalues.is_empty();
         let mut registers = Vec::with_capacity(live_indices.len());
         for &idx in live_indices {
-            if idx < frame.registers.len() {
-                registers.push((idx, frame.registers[idx].clone()));
+            if idx < regs.len() {
+                registers.push((idx, regs[idx].clone()));
             }
         }
         Self {
@@ -295,39 +310,95 @@ impl DeoptExitState {
         })
     }
 
-    /// Validates all restored register indices against `frame` bounds and checks for duplicates.
-    /// Does NOT mutate the frame.
-    pub fn validate_registers(&self, frame: &CallFrame) -> Result<(), String> {
+    /// Validates all restored register indices against a register window of length `regs_len` and checks for duplicates.
+    /// Does NOT mutate any frame or register state.
+    pub fn validate_registers_len(&self, regs_len: usize) -> Result<(), String> {
         let mut seen = hashbrown::HashSet::new();
         for (idx, _) in &self.restored_locals {
             if !seen.insert(*idx) {
                 return Err(format!("Duplicate local index {} in deopt restored locals", idx));
             }
-            if *idx >= frame.registers.len() {
+            if *idx >= regs_len {
                 return Err(format!(
                     "Deopt restored local index {} out of bounds for frame with {} registers",
-                    idx,
-                    frame.registers.len()
+                    idx, regs_len
                 ));
             }
         }
         Ok(())
     }
 
-    /// Applies the reconstructed registers and instruction pointer back to the `CallFrame`
+    /// Validates all restored register indices against a detached `CallFrame`'s `saved_registers` bounds.
+    /// Does NOT mutate the frame.
+    pub fn validate_registers(&self, frame: &CallFrame) -> Result<(), String> {
+        let regs_len = frame
+            .saved_registers
+            .as_deref()
+            .map_or(0, Vec::len);
+        self.validate_registers_len(regs_len)
+    }
+
+    /// Applies the reconstructed registers and instruction pointer back to a `CallFrame` and backing slice
+    /// with exact complete validation before ANY frame/IP mutation.
+    pub fn apply_to_call_frame_with_regs(
+        &self,
+        frame: &mut CallFrame,
+        regs: &mut [Value],
+    ) -> Result<(), String> {
+        self.validate_registers_len(regs.len())?;
+        frame.ip = self.resume_pc.unwrap_or(self.target_pc);
+        for (idx, val) in &self.restored_locals {
+            if !val.is_plain() {
+                frame.mark_non_plain(*idx);
+            }
+            regs[*idx] = val.clone();
+        }
+        Ok(())
+    }
+
+    /// Applies the reconstructed registers and instruction pointer back to a detached `CallFrame`
     /// with exact complete validation before ANY frame/IP mutation.
     ///
     /// If validation fails, returns `Err` and leaves `frame` completely unmodified.
     pub fn apply_to_call_frame(&self, frame: &mut CallFrame) -> Result<(), String> {
         self.validate_registers(frame)?;
         frame.ip = self.resume_pc.unwrap_or(self.target_pc);
-        for (idx, val) in &self.restored_locals {
-            frame.registers[*idx] = val.clone();
+        if let Some(regs) = frame.saved_registers.as_deref_mut() {
+            for (idx, val) in &self.restored_locals {
+                if !val.is_plain() {
+                    frame.non_plain_mask |= 1u64 << (*idx).min(63);
+                }
+                regs[*idx] = val.clone();
+            }
         }
         Ok(())
     }
 
-    /// Applies reconstructed state to `frame` requiring a proven authoritative bytecode resume PC.
+    /// Applies reconstructed state to `frame` + backing `regs` slice requiring a proven authoritative bytecode resume PC.
+    /// Fails closed (returns Err without mutating `frame` or `regs`) if `self.resume_pc` is None.
+    pub fn try_apply_authoritative_with_regs(
+        &self,
+        frame: &mut CallFrame,
+        regs: &mut [Value],
+    ) -> Result<(), String> {
+        self.validate_registers_len(regs.len())?;
+        let resume_pc = self.resume_pc.ok_or_else(|| {
+            format!(
+                "No proven bytecode resume PC mapping for deopt site ID {} ({:?}, raw target_pc {})",
+                self.site_id, self.site_kind, self.target_pc
+            )
+        })?;
+        frame.ip = resume_pc;
+        for (idx, val) in &self.restored_locals {
+            if !val.is_plain() {
+                frame.mark_non_plain(*idx);
+            }
+            regs[*idx] = val.clone();
+        }
+        Ok(())
+    }
+
+    /// Applies reconstructed state to a detached `frame` requiring a proven authoritative bytecode resume PC.
     /// Fails closed (returns Err without mutating `frame`) if `self.resume_pc` is None.
     pub fn try_apply_authoritative(&self, frame: &mut CallFrame) -> Result<(), String> {
         self.validate_registers(frame)?;
@@ -338,8 +409,13 @@ impl DeoptExitState {
             )
         })?;
         frame.ip = resume_pc;
-        for (idx, val) in &self.restored_locals {
-            frame.registers[*idx] = val.clone();
+        if let Some(regs) = frame.saved_registers.as_deref_mut() {
+            for (idx, val) in &self.restored_locals {
+                if !val.is_plain() {
+                    frame.non_plain_mask |= 1u64 << (*idx).min(63);
+                }
+                regs[*idx] = val.clone();
+            }
         }
         Ok(())
     }
@@ -715,6 +791,7 @@ impl OsrEngine {
     pub fn validate_and_pack_frame_args(
         entry: &OsrCompiledEntry,
         frame: &CallFrame,
+        regs: &[Value],
     ) -> Result<Vec<i64>, OsrFallbackReason> {
         if !frame.upvalues.is_empty() || !frame.shared_upvalues.is_empty() {
             return Err(OsrFallbackReason::ActiveUpvalues);
@@ -722,8 +799,7 @@ impl OsrEngine {
 
         let mut raw_args = Vec::with_capacity(entry.live_local_types.len());
         for (reg_idx, expected_ty) in &entry.live_local_types {
-            let val = frame
-                .registers
+            let val = regs
                 .get(*reg_idx)
                 .ok_or(OsrFallbackReason::MissingRegister(*reg_idx))?;
             let raw = match (val, expected_ty) {

@@ -4,6 +4,7 @@ pub mod escape_analysis;
 pub mod inline;
 pub mod safepoints;
 pub mod simd;
+pub mod sroa;
 
 pub use constant_folding::ConstantFolding;
 pub use dce::DeadCodeElimination;
@@ -11,6 +12,7 @@ pub use escape_analysis::{EscapeAnalysis, EscapeStatus};
 pub use inline::{InlinerConfig, JitInlineConfig, MirInliner};
 pub use safepoints::{SafepointConfig, SafepointStats, Safepoints};
 pub use simd::{SimdConfig, SimdOptimizer, SimdStats, SIMD_LANE_WIDTH};
+pub use sroa::ScalarReplacementOfAggregates;
 
 use crate::mir::ir::{
     BlockId, LocalId, MirFunction, MirModule, Operand, Place, Rvalue, Statement, Terminator,
@@ -104,28 +106,72 @@ impl MirOptimizer {
         module: &mut MirModule,
         config: &JitInlineConfig,
     ) -> hashbrown::HashSet<alloc::string::String> {
+        let empty = hashbrown::HashMap::new();
+        Self::optimize_module_for_jit_with_layouts(module, config, &empty)
+    }
+
+    /// JIT-safe module optimization with explicit struct layout metadata for MIR SROA (`NG-W11-1`):
+    /// 1. Runs `MirInliner::inline_module_for_jit` enforcing all JIT guards.
+    /// 2. Runs `MirOptimizer::optimize_function` on functions that received inlined code.
+    /// 3. Runs `ScalarReplacementOfAggregates::run_on_function` on every non-excluded function
+    ///    using `module.struct_layouts` merged with `extra_struct_layouts`, re-running
+    ///    `MirOptimizer::optimize_function` when SROA fires, with fail-closed `MirVerifier::verify_fn`
+    ///    reversion on any verification failure.
+    ///
+    /// Returns the set of function names whose MIR was modified (by inlining and/or SROA).
+    pub fn optimize_module_for_jit_with_layouts(
+        module: &mut MirModule,
+        config: &JitInlineConfig,
+        extra_struct_layouts: &hashbrown::HashMap<
+            alloc::string::String,
+            crate::mir::ir::MirStructLayout,
+        >,
+    ) -> hashbrown::HashSet<alloc::string::String> {
         let pre_inline_snapshots: hashbrown::HashMap<alloc::string::String, MirFunction> = module
             .functions
             .iter()
             .map(|f| (f.signature.name.clone(), f.clone()))
             .collect();
 
-        let mut inlined = MirInliner::inline_module_for_jit(module, config);
+        let mut combined_layouts: hashbrown::HashMap<
+            alloc::string::String,
+            crate::mir::ir::MirStructLayout,
+        > = extra_struct_layouts.clone();
+        for layout in &module.struct_layouts {
+            combined_layouts
+                .entry(layout.type_name.clone())
+                .or_insert_with(|| layout.clone());
+        }
+
+        let mut modified = MirInliner::inline_module_for_jit(module, config);
 
         for func in &mut module.functions {
-            if !inlined.contains(&func.signature.name) {
+            if config.excluded_functions.contains(&func.signature.name) {
                 continue;
             }
-            Self::optimize_function(func);
-            if crate::mir::verifier::MirVerifier::verify_fn(func).is_err() {
-                if let Some(orig) = pre_inline_snapshots.get(&func.signature.name) {
-                    *func = orig.clone();
+            if modified.contains(&func.signature.name) {
+                Self::optimize_function(func);
+                if crate::mir::verifier::MirVerifier::verify_fn(func).is_err() {
+                    if let Some(orig) = pre_inline_snapshots.get(&func.signature.name) {
+                        *func = orig.clone();
+                    }
+                    modified.remove(&func.signature.name);
                 }
-                inlined.remove(&func.signature.name);
+            }
+            if !combined_layouts.is_empty() {
+                let pre_sroa = func.clone();
+                if ScalarReplacementOfAggregates::run_on_function(func, &combined_layouts) {
+                    Self::optimize_function(func);
+                    if crate::mir::verifier::MirVerifier::verify_fn(func).is_err() {
+                        *func = pre_sroa;
+                    } else {
+                        modified.insert(func.signature.name.clone());
+                    }
+                }
             }
         }
 
-        inlined
+        modified
     }
 
     /// Performs escape analysis on a MIR function local variables.

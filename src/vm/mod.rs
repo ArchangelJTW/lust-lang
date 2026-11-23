@@ -507,17 +507,25 @@ pub struct VM {
     pub(super) ast_bytecode_backup: HashMap<usize, Function>,
     pub(super) natives: HashMap<String, Value>,
     pub(super) globals: HashMap<String, Value>,
+    /// Flat vector backing O(1) indexed `LoadGlobal` inside `'frame_fast: loop` (`NG-W11-3`).
+    pub(crate) globals_vec: Vec<Value>,
+    /// Maps global symbol name -> slot index in `globals_vec` (`NG-W11-3`).
+    pub(crate) global_name_to_slot: HashMap<String, u32>,
+    /// Generation counter for `LoadGlobal` IC invalidation (invariant: always >= 1).
+    pub(crate) globals_generation: u64,
     /// Bumped on every change to `globals` or `natives`. Traces snapshot
     /// the globals they read and guard on this counter (see
     /// `TraceOp::GuardGlobals`).
     pub(crate) globals_version: u64,
     pub(super) map_hasher: DefaultHashBuilder,
-    /// Frames are boxed: a `CallFrame` carries 12 KB of inline registers,
-    /// and moving that into and out of the stack on every call dominated
-    /// call cost. Returned frames go to `frame_pool` for reuse.
-    pub(super) call_stack: Vec<Box<CallFrame>>,
-    /// Recycled frames with their registers already reset to Nil.
-    pub(super) frame_pool: Vec<Box<CallFrame>>,
+    /// Budgeted allocator handle backing `vm_registers` (`NG-W9-2`, `NG-W11-4A`).
+    pub(crate) vm_alloc: crate::alloc_budget::VmAllocHandle,
+    /// Flat register stack backing all active `CallFrame` windows (`NG-W11-4A`).
+    pub(crate) vm_registers: Vec<Value, crate::alloc_budget::VmAllocHandle>,
+    /// Compact call-frame window descriptors stored by value (<= 96 bytes each, no `Box`).
+    pub(super) call_stack: Vec<CallFrame>,
+    /// Number of non-plain register slots cleared during the most recent frame pop (0 on pure-scalar frames).
+    pub(crate) last_frame_pop_cleanup_iters: usize,
     /// Resolved user-defined struct methods per call site:
     /// (struct layout, calling function, method-name constant) -> function.
     /// Resolution otherwise formats a mangled name and scans every function
@@ -550,7 +558,6 @@ pub struct VM {
     #[cfg(feature = "std")]
     pub(super) exported_type_stubs: Vec<ModuleStub>,
     pub(super) last_dispatched_target: Option<(usize, String)>,
-    pub(super) root_frame: Option<Box<CallFrame>>,
     pub(super) active_native_depth: usize,
     pub(super) active_jit_depth: usize,
     pub host_ledger: TrustedHostResourceLedger,
@@ -719,29 +726,259 @@ impl VM {
     }
 
     #[inline]
-    pub(super) fn push_call_frame(&mut self, frame: Box<CallFrame>) {
-        let func_idx = frame.function_idx;
-        if let Some(meta) = self.call_meta.get_mut(func_idx) {
-            meta.active_depth = meta.active_depth.saturating_add(1);
-        }
-        self.call_stack.push(frame);
+    pub fn globals_generation(&self) -> u64 {
+        self.globals_generation
     }
 
     #[inline]
-    pub(super) fn pop_call_frame(&mut self) -> Option<Box<CallFrame>> {
+    pub(crate) fn sync_global_insert(&mut self, name: String, value: Value) {
+        if let Some(&slot) = self.global_name_to_slot.get(name.as_str()) {
+            self.globals_vec[slot as usize] = value.clone();
+        } else {
+            let slot = self.globals_vec.len() as u32;
+            self.globals_vec.push(value.clone());
+            self.global_name_to_slot.insert(name.clone(), slot);
+        }
+        self.globals.insert(name, value);
+        self.globals_version = self.globals_version.wrapping_add(1);
+        self.globals_generation = self.globals_generation.wrapping_add(1).max(1);
+    }
+
+    #[inline]
+    pub(crate) fn sync_globals_clear(&mut self) {
+        self.globals.clear();
+        self.globals_vec.clear();
+        self.global_name_to_slot.clear();
+        self.globals_version = self.globals_version.wrapping_add(1);
+        self.globals_generation = self.globals_generation.wrapping_add(1).max(1);
+    }
+
+    /// Returns the budgeted allocator handle backing `vm_registers`.
+    #[inline]
+    pub fn vm_alloc(&self) -> &crate::alloc_budget::VmAllocHandle {
+        &self.vm_alloc
+    }
+
+    /// Returns the current initialized length of the flat register stack `vm_registers`.
+    #[inline]
+    pub fn vm_registers_len(&self) -> usize {
+        self.vm_registers.len()
+    }
+
+    /// Returns the allocated capacity of the flat register stack `vm_registers`.
+    #[inline]
+    pub fn vm_registers_capacity(&self) -> usize {
+        self.vm_registers.capacity()
+    }
+
+    /// Returns the number of register cleanup iterations performed during the most recent frame pop.
+    /// Pure-scalar frames (`non_plain_mask == 0`) always report `0`.
+    #[inline]
+    pub fn last_frame_pop_cleanup_iters(&self) -> usize {
+        self.last_frame_pop_cleanup_iters
+    }
+
+    #[inline]
+    pub(crate) fn effective_reg_count(&self, func_idx: usize) -> u16 {
+        match self.functions.get(func_idx) {
+            Some(f) if f.register_count > 0 => (f.register_count as u16).max(f.param_count as u16),
+            _ => 256,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn next_frame_base_reg(&self) -> usize {
+        self.call_stack
+            .last()
+            .map(|f| f.base_reg + f.reg_count as usize)
+            .unwrap_or(0)
+    }
+
+    /// Returns an immutable slice over the register window of `call_stack[frame_idx]`.
+    #[inline]
+    pub fn frame_registers(&self, frame_idx: usize) -> &[Value] {
+        let frame = &self.call_stack[frame_idx];
+        let start = frame.base_reg;
+        let end = start + frame.reg_count as usize;
+        &self.vm_registers[start..end]
+    }
+
+    /// Returns a mutable slice over the register window of `call_stack[frame_idx]`.
+    #[inline]
+    pub fn frame_registers_mut(&mut self, frame_idx: usize) -> &mut [Value] {
+        let frame = &self.call_stack[frame_idx];
+        let start = frame.base_reg;
+        let end = start + frame.reg_count as usize;
+        &mut self.vm_registers[start..end]
+    }
+
+    /// Returns an immutable slice over the top call frame's register window.
+    #[inline]
+    pub fn top_frame_registers(&self) -> &[Value] {
+        let frame = self.call_stack.last().expect("top_frame_registers called on empty call stack");
+        let start = frame.base_reg;
+        let end = start + frame.reg_count as usize;
+        &self.vm_registers[start..end]
+    }
+
+    /// Returns a mutable slice over the top call frame's register window.
+    #[inline]
+    pub fn top_frame_registers_mut(&mut self) -> &mut [Value] {
+        let frame = self.call_stack.last().expect("top_frame_registers_mut called on empty call stack");
+        let start = frame.base_reg;
+        let end = start + frame.reg_count as usize;
+        &mut self.vm_registers[start..end]
+    }
+
+    /// Writes `value` into slot `reg` of `call_stack[frame_idx]`, maintaining `non_plain_mask`.
+    #[inline]
+    pub fn write_frame_register(&mut self, frame_idx: usize, reg: usize, value: Value) {
+        let frame = &mut self.call_stack[frame_idx];
+        debug_assert!(reg < frame.reg_count as usize);
+        if !value.is_plain() {
+            frame.mark_non_plain(reg);
+        }
+        let slot = frame.base_reg + reg;
+        self.vm_registers[slot] = value;
+    }
+
+    /// Ensures the top call frame has at least `required_regs` register slots in `vm_registers`
+    /// (Hazard 10: handles MIR inlining / SROA expanding locals beyond initial AST `register_count`).
+    pub(crate) fn ensure_top_frame_reg_capacity(&mut self, required_regs: usize) -> Result<usize> {
+        if required_regs > u16::MAX as usize {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Frame register capacity {} exceeds u16::MAX",
+                    required_regs
+                ),
+            });
+        }
+        let Some(top) = self.call_stack.last() else {
+            return Err(LustError::RuntimeError {
+                message: "Empty call stack".to_string(),
+            });
+        };
+        let base_reg = top.base_reg;
+        let cur_count = top.reg_count as usize;
+        if required_regs > cur_count {
+            let new_end = base_reg + required_regs;
+            if self.vm_registers.len() < new_end {
+                let extra = new_end - self.vm_registers.len();
+                self.vm_registers
+                    .try_reserve(extra)
+                    .map_err(|_| LustError::RuntimeError {
+                        message: "Out of memory expanding VM register window".to_string(),
+                    })?;
+                self.vm_registers.resize(new_end, Value::Nil);
+            } else {
+                for slot in &mut self.vm_registers[base_reg + cur_count..new_end] {
+                    *slot = Value::Nil;
+                }
+            }
+            if let Some(top_mut) = self.call_stack.last_mut() {
+                top_mut.reg_count = required_regs as u16;
+            }
+            return Ok(required_regs);
+        }
+        Ok(cur_count)
+    }
+
+    /// Allocates a new register window on `vm_registers`, pushes a `CallFrame`, and returns its frame index.
+    #[inline]
+    pub fn push_call_frame(
+        &mut self,
+        function_idx: usize,
+        reg_count: u16,
+        return_dest: Option<Register>,
+    ) -> usize {
+        let base_reg = self.next_frame_base_reg();
+        let needed = base_reg + reg_count as usize;
+        if self.vm_registers.len() < needed {
+            self.vm_registers.resize(needed, Value::Nil);
+        }
+        if let Some(meta) = self.call_meta.get_mut(function_idx) {
+            meta.active_depth = meta.active_depth.saturating_add(1);
+        }
+        let frame = CallFrame {
+            function_idx,
+            ip: 0,
+            base_reg,
+            reg_count,
+            return_dest,
+            non_plain_mask: 0,
+            upvalues: Vec::new(),
+            shared_upvalues: Vec::new(),
+            saved_registers: None,
+        };
+        self.call_stack.push(frame);
+        self.call_stack.len() - 1
+    }
+
+    /// Fallible frame window push enforcing `max_stack_depth` and `VmAllocHandle` OOM budgets.
+    #[inline]
+    pub(super) fn try_push_call_frame(
+        &mut self,
+        function_idx: usize,
+        reg_count: u16,
+        return_dest: Option<Register>,
+        upvalues: Vec<Value>,
+        shared_upvalues: Vec<Upvalue>,
+    ) -> Result<usize> {
+        if self.call_stack.len() >= self.max_stack_depth {
+            return Err(LustError::RuntimeError {
+                message: "Stack overflow".to_string(),
+            });
+        }
+        let base_reg = self.next_frame_base_reg();
+        let needed = base_reg + reg_count as usize;
+        if self.vm_registers.len() < needed {
+            let extra = needed - self.vm_registers.len();
+            self.vm_registers
+                .try_reserve(extra)
+                .map_err(|_| LustError::RuntimeError {
+                    message: "Out of memory allocating VM register window".to_string(),
+                })?;
+            self.vm_registers.resize(needed, Value::Nil);
+        }
+        if let Some(meta) = self.call_meta.get_mut(function_idx) {
+            meta.active_depth = meta.active_depth.saturating_add(1);
+        }
+        let frame = CallFrame {
+            function_idx,
+            ip: 0,
+            base_reg,
+            reg_count,
+            return_dest,
+            non_plain_mask: 0,
+            upvalues,
+            shared_upvalues,
+            saved_registers: None,
+        };
+        self.call_stack.push(frame);
+        Ok(self.call_stack.len() - 1)
+    }
+
+    #[inline]
+    pub(super) fn pop_call_frame(&mut self) -> Option<CallFrame> {
         let frame = self.call_stack.pop()?;
         if let Some(meta) = self.call_meta.get_mut(frame.function_idx) {
             meta.active_depth = meta.active_depth.saturating_sub(1);
         }
+        let start = frame.base_reg;
+        let end = (start + frame.reg_count as usize).min(self.vm_registers.len());
+        let cleared = if start < end {
+            CallFrame::clear_non_plain_slots(&mut self.vm_registers[start..end], frame.non_plain_mask)
+        } else {
+            0
+        };
+        self.last_frame_pop_cleanup_iters = cleared;
         Some(frame)
     }
 
     #[inline]
     pub(super) fn truncate_call_stack(&mut self, new_len: usize) {
         while self.call_stack.len() > new_len {
-            if let Some(frame) = self.pop_call_frame() {
-                self.recycle_frame(frame);
-            }
+            let _ = self.pop_call_frame();
         }
     }
 
@@ -750,10 +987,47 @@ impl VM {
         self.call_stack.len()
     }
 
+    /// Pops the top call frame and clears only its `non_plain_mask` register slots.
+    pub fn pop_call_frame_public(&mut self) -> Option<CallFrame> {
+        self.pop_call_frame()
+    }
+
     #[doc(hidden)]
     #[cfg(feature = "test-deopt")]
-    pub fn push_call_frame_for_test(&mut self, frame: CallFrame) {
-        self.push_call_frame(Box::new(frame));
+    pub fn push_call_frame_for_test(&mut self, mut frame: CallFrame) {
+        let saved = frame.saved_registers.take();
+        let saved_len = saved.as_ref().map_or(0, |v| v.len());
+        let reg_count = if frame.reg_count > 0 {
+            frame.reg_count.max(saved_len as u16)
+        } else if saved_len > 0 {
+            saved_len as u16
+        } else {
+            256
+        };
+        let base_reg = self.next_frame_base_reg();
+        let end = base_reg + reg_count as usize;
+        if self.vm_registers.len() < end {
+            self.vm_registers.resize(end, Value::Nil);
+        } else {
+            for slot in &mut self.vm_registers[base_reg..end] {
+                *slot = Value::Nil;
+            }
+        }
+        frame.non_plain_mask = 0;
+        if let Some(saved_vec) = saved {
+            for (i, val) in saved_vec.into_iter().enumerate().take(reg_count as usize) {
+                if !val.is_plain() {
+                    frame.mark_non_plain(i);
+                }
+                self.vm_registers[base_reg + i] = val;
+            }
+        }
+        frame.base_reg = base_reg;
+        frame.reg_count = reg_count;
+        if let Some(meta) = self.call_meta.get_mut(frame.function_idx) {
+            meta.active_depth = meta.active_depth.saturating_add(1);
+        }
+        self.call_stack.push(frame);
     }
 
     #[inline]
@@ -1287,8 +1561,11 @@ impl VM {
     }
 
     pub(super) fn restore_all_ast_bytecode_backups(&mut self) {
-        for (func_idx, orig_fn) in self.ast_bytecode_backup.drain() {
+        for (func_idx, mut orig_fn) in self.ast_bytecode_backup.drain() {
             if func_idx < self.functions.len() {
+                if orig_fn.signature.is_some() {
+                    orig_fn.trusted_signature = orig_fn.compute_trusted_signature();
+                }
                 let meta = CallMeta::of(&orig_fn);
                 self.functions[func_idx] = orig_fn;
                 if func_idx < self.call_meta.len() {
@@ -1350,16 +1627,18 @@ impl VM {
         direct_callees: &hashbrown::HashSet<String>,
     ) -> Result<()> {
         let name = mir_fn.signature.name.clone();
-        let bytecode_fn = crate::mir::vm_backend::MirToBytecodeCompiler::compile_with_direct_callees(
+        let mut bytecode_fn = crate::mir::vm_backend::MirToBytecodeCompiler::compile_with_direct_callees(
             &mir_fn,
             direct_callees,
         )
         .map_err(|e| LustError::RuntimeError {
             message: format!("Failed to lower MIR function '{}' to bytecode: {:?}", name, e),
         })?;
+        if bytecode_fn.signature.is_some() {
+            bytecode_fn.trusted_signature = bytecode_fn.compute_trusted_signature();
+        }
         let meta = CallMeta::of(&bytecode_fn);
         let func_idx = if let Some(pos) = self.functions.iter().position(|f| f.name == name) {
-            let mut bytecode_fn = bytecode_fn;
             bytecode_fn.is_method = self.functions[pos].is_method;
             self.functions[pos] = bytecode_fn;
             if pos < self.call_meta.len() {
@@ -1375,8 +1654,7 @@ impl VM {
             idx
         };
         self.ast_bytecode_backup.remove(&func_idx);
-        self.globals.insert(name.clone(), Value::Function(func_idx));
-        self.globals_version = self.globals_version.wrapping_add(1);
+        self.sync_global_insert(name.clone(), Value::Function(func_idx));
         self.jit.reset_function_tables(self.functions.len());
         self.jit_cells.entry_table = self.jit.function_entry_table();
         self.mir_functions.insert(name, mir_fn);
@@ -1554,7 +1832,8 @@ impl VM {
 
         let raw_args = {
             let frame = self.call_stack.last().unwrap();
-            match crate::vm::osr::OsrEngine::validate_and_pack_frame_args(&entry, frame) {
+            let regs = &self.vm_registers[frame.base_reg..frame.base_reg + frame.reg_count as usize];
+            match crate::vm::osr::OsrEngine::validate_and_pack_frame_args(&entry, frame, regs) {
                 Ok(args) => args,
                 Err(_) => {
                     crate::vm::osr::GLOBAL_OSR_COUNTERS
@@ -1594,9 +1873,7 @@ impl VM {
                 crate::mir::cranelift_backend::take_current_sticky_error();
                 crate::mir::cranelift_backend::take_deopt_payload();
                 if native_entered {
-                    if let Some(frame) = self.pop_call_frame() {
-                        self.recycle_frame(frame);
-                    }
+                    let _ = self.pop_call_frame();
                 }
                 Err(err)
             }
@@ -1729,13 +2006,17 @@ impl VM {
                     message: format!("OSR deopt payload conversion error: {e}"),
                 })?;
 
-                let top_frame = self.call_stack.last_mut().ok_or_else(|| {
-                    LustError::RuntimeError {
+                let (base_reg, reg_count) = self
+                    .call_stack
+                    .last()
+                    .map(|f| (f.base_reg, f.reg_count as usize))
+                    .ok_or_else(|| LustError::RuntimeError {
                         message: "Call stack empty during OSR deopt reconstruction".into(),
-                    }
-                })?;
+                    })?;
+                let top_frame = self.call_stack.last_mut().unwrap();
+                let regs = &mut self.vm_registers[base_reg..base_reg + reg_count];
                 deopt_exit
-                    .try_apply_authoritative(top_frame)
+                    .try_apply_authoritative_with_regs(top_frame, regs)
                     .map_err(|e| LustError::RuntimeError {
                         message: format!("OSR deopt authoritative frame application error: {e}"),
                     })?;
@@ -1815,18 +2096,18 @@ impl VM {
 pub struct CallFrame {
     pub function_idx: usize,
     pub ip: usize,
-    /// In std mode this is a fixed [Value; 256] stored inline in the frame (no extra
-    /// indirection, JIT-compatible raw pointer layout). In no_std mode (no JIT) it is a
-    /// Vec sized to the function's actual register_count, saving the unused slots.
-    #[cfg(feature = "std")]
-    pub registers: [Value; 256],
-    #[cfg(not(feature = "std"))]
-    pub registers: Vec<Value>,
-    #[allow(dead_code)]
-    pub base_register: usize,
+    /// Starting index of this frame's register window inside `VM::vm_registers`.
+    pub base_reg: usize,
+    /// Number of register slots allocated to this frame window (up to 256).
+    pub reg_count: u16,
     pub return_dest: Option<Register>,
+    /// Bitmask of slots `0..63` (bit 63 = overflow for any slot `>= 63`) that hold non-plain (`!is_plain()`) values.
+    pub non_plain_mask: u64,
     pub upvalues: Vec<Value>,
     pub shared_upvalues: Vec<Upvalue>,
+    /// Detached register snapshot populated only for suspended fiber continuations and standalone OSR frames.
+    /// Active frames on `VM::call_stack` keep this as `None` (zero heap allocations).
+    pub saved_registers: Option<Box<Vec<Value>>>,
 }
 
 /// What a bytecode-to-bytecode call checks about its callee, computed
@@ -1837,6 +2118,10 @@ pub(super) struct CallMeta {
     /// Lua-compat function (`LuaValue` params or multi-return): arguments
     /// are padded/truncated rather than counted. Takes the general path.
     pub(super) lua_function: bool,
+    /// True when the function signature is fully statically typed without dynamic
+    /// contracts (`Schema` / `LuaValue` / `Unknown` / `Infer` / generics / effects),
+    /// permitting internal bytecode calls to skip redundant shallow-type rechecks.
+    pub(super) trusted_signature: bool,
     /// Shallow kind check per parameter, when the signature is known and
     /// matches the parameter count.
     pub(super) params: Vec<ShallowKind>,
@@ -1921,6 +2206,7 @@ impl CallMeta {
         use crate::ast::TypeKind;
         let Some(signature) = &function.signature else {
             return Self {
+                trusted_signature: function.trusted_signature,
                 params: alloc::vec![ShallowKind::Any; function.param_count as usize],
                 ..Self::default()
             };
@@ -1935,6 +2221,7 @@ impl CallMeta {
                 if matches!(&inner.kind, TypeKind::Named(name) if name == "LuaValue")
         );
         let lua_function = lua_params && (!signature.params.is_empty() || lua_multi_return);
+        let trusted_signature = !lua_function && function.compute_trusted_signature();
         let params = if signature.params.len() == function.param_count as usize {
             signature.params.iter().map(ShallowKind::of).collect()
         } else {
@@ -1942,6 +2229,7 @@ impl CallMeta {
         };
         Self {
             lua_function,
+            trusted_signature,
             params,
             return_kind: ShallowKind::of(&signature.return_type),
             lua_multi_return,
@@ -1950,52 +2238,87 @@ impl CallMeta {
     }
 }
 
-/// Upper bound on recycled frames kept around (each holds 12 KB).
-pub(super) const FRAME_POOL_LIMIT: usize = 64;
-
 impl CallFrame {
-    #[allow(unused_variables)]
-    pub(super) fn new(
+    /// Creates a compact window descriptor for a frame with `reg_count` slots.
+    #[inline]
+    pub fn new(
         function_idx: usize,
         return_dest: Option<Register>,
-        register_count: u8,
-    ) -> Box<Self> {
-        Box::new(Self {
+        reg_count: u16,
+    ) -> Self {
+        Self {
             function_idx,
             ip: 0,
-            #[cfg(feature = "std")]
-            registers: [const { Value::Nil }; 256],
-            #[cfg(not(feature = "std"))]
-            registers: alloc::vec![Value::Nil; register_count as usize],
-            base_register: 0,
+            base_reg: 0,
+            reg_count,
             return_dest,
+            non_plain_mask: 0,
             upvalues: Vec::new(),
             shared_upvalues: Vec::new(),
-        })
+            saved_registers: None,
+        }
     }
 
-    /// Reset a frame that ran `function_idx` (which used the first
-    /// `register_count` registers) so it can be handed out again.
-    pub(super) fn reset(
-        &mut self,
-        function_idx: usize,
-        return_dest: Option<Register>,
-        register_count: u8,
-    ) {
-        for value in &mut self.registers[..register_count as usize] {
-            if value.is_plain() {
-                // SAFETY: nothing to drop.
-                unsafe { core::ptr::write(value, Value::Nil) };
-            } else {
-                *value = Value::Nil;
+    /// Creates a detached `CallFrame` with its own `saved_registers` buffer (used by standalone OSR/fiber tests).
+    #[inline]
+    pub fn new_detached(function_idx: usize, ip: usize, reg_count: u16) -> Self {
+        Self {
+            function_idx,
+            ip,
+            base_reg: 0,
+            reg_count,
+            return_dest: None,
+            non_plain_mask: 0,
+            upvalues: Vec::new(),
+            shared_upvalues: Vec::new(),
+            saved_registers: Some(Box::new(alloc::vec![Value::Nil; reg_count as usize])),
+        }
+    }
+
+    /// Marks slot `reg` as holding a non-plain (`!is_plain()`) value requiring cleanup on frame pop.
+    #[inline(always)]
+    pub fn mark_non_plain(&mut self, reg: usize) {
+        self.non_plain_mask |= 1u64 << reg.min(63);
+    }
+
+    /// Returns a slice of detached saved registers, if this frame holds a suspended/standalone snapshot.
+    #[inline]
+    pub fn saved_registers(&self) -> Option<&[Value]> {
+        self.saved_registers.as_deref().map(Vec::as_slice)
+    }
+
+    /// Returns a mutable slice of detached saved registers, if this frame holds a suspended/standalone snapshot.
+    #[inline]
+    pub fn saved_registers_mut(&mut self) -> Option<&mut [Value]> {
+        self.saved_registers.as_deref_mut().map(Vec::as_mut_slice)
+    }
+
+    /// Clears only register slots marked in `non_plain_mask` back to `Value::Nil`.
+    /// Returns the number of slots inspected/cleared (`0` on pure-scalar frames).
+    #[inline]
+    pub fn clear_non_plain_slots(regs: &mut [Value], non_plain_mask: u64) -> usize {
+        if non_plain_mask == 0 {
+            return 0;
+        }
+        let mut cleared = 0usize;
+        let mut low = non_plain_mask & !(1u64 << 63);
+        while low != 0 {
+            let bit = low.trailing_zeros() as usize;
+            low &= low - 1;
+            if bit < regs.len() {
+                regs[bit] = Value::Nil;
+                cleared += 1;
             }
         }
-        self.function_idx = function_idx;
-        self.ip = 0;
-        self.base_register = 0;
-        self.return_dest = return_dest;
-        self.upvalues.clear();
-        self.shared_upvalues.clear();
+        if (non_plain_mask & (1u64 << 63)) != 0 {
+            for slot in regs.iter_mut().skip(63) {
+                if !slot.is_plain() {
+                    *slot = Value::Nil;
+                }
+                cleared += 1;
+            }
+        }
+        cleared
     }
 }
 
@@ -2107,6 +2430,7 @@ pub(crate) struct CompiledFnEntry {
     pub readonly_params: Vec<bool>,
     pub has_external_or_host_calls: bool,
     pub is_pure_scalar_abi: bool,
+    pub sroa_recipes: Vec<crate::mir::ir::SroaStructRecipe>,
 }
 
 #[derive(Debug, Clone)]
@@ -2141,9 +2465,9 @@ impl Drop for VM {
         self.jit.traces.clear();
         self.functions.clear();
         self.natives.clear();
-        self.globals.clear();
-        self.globals_version = self.globals_version.wrapping_add(1);
+        self.sync_globals_clear();
         self.call_stack.clear();
+        self.vm_registers.clear();
         self.pending_return_value = None;
         self.pending_task_signal = None;
         self.last_task_signal = None;

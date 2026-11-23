@@ -569,6 +569,14 @@ pub struct MirCleanupEntry {
     pub block: BlockId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SroaStructRecipe {
+    pub orig_local: LocalId,
+    pub struct_name: String,
+    pub field_names: Vec<String>,
+    pub field_locals: Vec<LocalId>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirFunction {
     pub signature: FunctionSignature,
@@ -579,6 +587,7 @@ pub struct MirFunction {
     pub blocks: Vec<BasicBlock>,
     pub proven_in_bounds: hashbrown::HashMap<usize, Vec<(LocalId, LocalId)>>,
     pub cleanup_blocks: Vec<MirCleanupEntry>,
+    pub sroa_decomposed_structs: Vec<SroaStructRecipe>,
 }
 
 impl MirFunction {
@@ -623,6 +632,7 @@ impl MirFunction {
             blocks,
             proven_in_bounds: hashbrown::HashMap::new(),
             cleanup_blocks: Vec::new(),
+            sroa_decomposed_structs: Vec::new(),
         }
     }
 

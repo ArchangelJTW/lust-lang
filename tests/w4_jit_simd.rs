@@ -5377,15 +5377,7 @@ fn test_w4_4a_metered_simd_reachability_edges_and_proof() {
 // =========================================================================
 
 fn create_dummy_frame(func_idx: usize) -> CallFrame {
-    CallFrame {
-        function_idx: func_idx,
-        ip: 0,
-        registers: [(); 256].map(|_| Value::Nil),
-        base_register: 0,
-        return_dest: None,
-        upvalues: Vec::new(),
-        shared_upvalues: Vec::new(),
-    }
+    CallFrame::new_detached(func_idx, 0, 256)
 }
 
 /// Builds an executable MIR loop with multiple entry paths into the loop header:
@@ -6383,9 +6375,12 @@ fn test_w4_4a_osr_vector_header_target_execution_parity_and_proof() {
         let mut engine = OsrEngine::new().expect("Init OsrEngine");
         let mut frame = create_dummy_frame(0);
         // Mid-loop state: n = 100, sum = 190 (sum 0..19), i = 20
-        frame.registers[n_loc.0] = Value::Int(100);
-        frame.registers[sum_loc.0] = Value::Int(190);
-        frame.registers[i_loc.0] = Value::Int(20);
+        {
+            let regs = frame.saved_registers_mut().unwrap();
+            regs[n_loc.0] = Value::Int(100);
+            regs[sum_loc.0] = Value::Int(190);
+            regs[i_loc.0] = Value::Int(20);
+        }
 
         let res = engine.execute_osr(&accum_fn, BlockId(1), &[n_loc, sum_loc, i_loc], &mut frame)
             .expect("execute_osr on scalar loop must succeed");
@@ -6398,11 +6393,14 @@ fn test_w4_4a_osr_vector_header_target_execution_parity_and_proof() {
         // OsrExecutionResult::Fallback. This is an explicit, verified architectural boundary.
         let mut array_frame = create_dummy_frame(0);
         let (_, arr_val) = make_vm_int_array(&[1, 2, 3]);
-        array_frame.registers[a_id.0] = arr_val;
-        array_frame.registers[b_id.0] = Value::Int(0);
-        array_frame.registers[out_id.0] = Value::Int(0);
-        array_frame.registers[len_id.0] = Value::Int(3);
-        array_frame.registers[i_id.0] = Value::Int(0);
+        {
+            let regs = array_frame.saved_registers_mut().unwrap();
+            regs[a_id.0] = arr_val;
+            regs[b_id.0] = Value::Int(0);
+            regs[out_id.0] = Value::Int(0);
+            regs[len_id.0] = Value::Int(3);
+            regs[i_id.0] = Value::Int(0);
+        }
 
         let fallback_count_before = GLOBAL_OSR_COUNTERS.fallback_count.load(Ordering::SeqCst);
         let array_osr_res = engine.execute_osr(&vec_fn, bb_scalar_hdr, &[a_id, b_id, out_id, len_id, i_id], &mut array_frame)

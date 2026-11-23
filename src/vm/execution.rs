@@ -1,7 +1,108 @@
 use super::*;
+use crate::bytecode::chunk::ChunkIcSlot;
+use crate::bytecode::OpCode;
 use crate::bytecode::ValueKey;
-use crate::bytecode::value::{ClosureObject, EnumObject, StructObject};
+use crate::bytecode::value::{ClosureObject, EnumObject, Name, StructObject};
 use core::ptr;
+
+const OP_LOAD_NIL: u8 = OpCode::LoadNil as u8;
+const OP_LOAD_BOOL: u8 = OpCode::LoadBool as u8;
+const OP_LOAD_CONST: u8 = OpCode::LoadConst as u8;
+const OP_LOAD_GLOBAL: u8 = OpCode::LoadGlobal as u8;
+const OP_MOVE: u8 = OpCode::Move as u8;
+const OP_ADD_INT: u8 = OpCode::AddInt as u8;
+const OP_ADD_INT_IMM: u8 = OpCode::AddIntImm as u8;
+const OP_SUB_INT: u8 = OpCode::SubInt as u8;
+const OP_MUL_INT: u8 = OpCode::MulInt as u8;
+const OP_DIV_INT: u8 = OpCode::DivInt as u8;
+const OP_MOD_INT: u8 = OpCode::ModInt as u8;
+const OP_POW_INT: u8 = OpCode::PowInt as u8;
+const OP_FLOOR_DIV_INT: u8 = OpCode::FloorDivInt as u8;
+const OP_NEG_INT: u8 = OpCode::NegInt as u8;
+const OP_EQ_INT: u8 = OpCode::EqInt as u8;
+const OP_NE_INT: u8 = OpCode::NeInt as u8;
+const OP_LT_INT: u8 = OpCode::LtInt as u8;
+const OP_LE_INT: u8 = OpCode::LeInt as u8;
+const OP_GT_INT: u8 = OpCode::GtInt as u8;
+const OP_GE_INT: u8 = OpCode::GeInt as u8;
+const OP_ADD_FLOAT: u8 = OpCode::AddFloat as u8;
+const OP_SUB_FLOAT: u8 = OpCode::SubFloat as u8;
+const OP_MUL_FLOAT: u8 = OpCode::MulFloat as u8;
+const OP_DIV_FLOAT: u8 = OpCode::DivFloat as u8;
+const OP_MOD_FLOAT: u8 = OpCode::ModFloat as u8;
+const OP_POW_FLOAT: u8 = OpCode::PowFloat as u8;
+const OP_FLOOR_DIV_FLOAT: u8 = OpCode::FloorDivFloat as u8;
+const OP_NEG_FLOAT: u8 = OpCode::NegFloat as u8;
+const OP_EQ_FLOAT: u8 = OpCode::EqFloat as u8;
+const OP_NE_FLOAT: u8 = OpCode::NeFloat as u8;
+const OP_LT_FLOAT: u8 = OpCode::LtFloat as u8;
+const OP_LE_FLOAT: u8 = OpCode::LeFloat as u8;
+const OP_GT_FLOAT: u8 = OpCode::GtFloat as u8;
+const OP_GE_FLOAT: u8 = OpCode::GeFloat as u8;
+const OP_ADD: u8 = OpCode::Add as u8;
+const OP_SUB: u8 = OpCode::Sub as u8;
+const OP_MUL: u8 = OpCode::Mul as u8;
+const OP_DIV: u8 = OpCode::Div as u8;
+const OP_MOD: u8 = OpCode::Mod as u8;
+const OP_POW: u8 = OpCode::Pow as u8;
+const OP_FLOOR_DIV: u8 = OpCode::FloorDiv as u8;
+const OP_NEG: u8 = OpCode::Neg as u8;
+const OP_EQ: u8 = OpCode::Eq as u8;
+const OP_NE: u8 = OpCode::Ne as u8;
+const OP_LT: u8 = OpCode::Lt as u8;
+const OP_LE: u8 = OpCode::Le as u8;
+const OP_GT: u8 = OpCode::Gt as u8;
+const OP_GE: u8 = OpCode::Ge as u8;
+const OP_AND: u8 = OpCode::And as u8;
+const OP_OR: u8 = OpCode::Or as u8;
+const OP_NOT: u8 = OpCode::Not as u8;
+const OP_BIT_AND: u8 = OpCode::BitAnd as u8;
+const OP_BIT_OR: u8 = OpCode::BitOr as u8;
+const OP_BIT_XOR: u8 = OpCode::BitXor as u8;
+const OP_SHL: u8 = OpCode::Shl as u8;
+const OP_SHR: u8 = OpCode::Shr as u8;
+const OP_BIT_NOT: u8 = OpCode::BitNot as u8;
+const OP_JUMP: u8 = OpCode::Jump as u8;
+const OP_JUMP_IF: u8 = OpCode::JumpIf as u8;
+const OP_JUMP_IF_NOT: u8 = OpCode::JumpIfNot as u8;
+const OP_BRANCH_LT_INT: u8 = OpCode::BranchLtInt as u8;
+const OP_BRANCH_LE_INT: u8 = OpCode::BranchLeInt as u8;
+const OP_NEW_ARRAY: u8 = OpCode::NewArray as u8;
+const OP_TUPLE_NEW: u8 = OpCode::TupleNew as u8;
+const OP_TUPLE_GET: u8 = OpCode::TupleGet as u8;
+const OP_IS_ENUM_VARIANT: u8 = OpCode::IsEnumVariant as u8;
+const OP_GET_ENUM_VALUE: u8 = OpCode::GetEnumValue as u8;
+const OP_NEW_STRUCT: u8 = OpCode::NewStruct as u8;
+const OP_NEW_ENUM_UNIT: u8 = OpCode::NewEnumUnit as u8;
+const OP_NEW_ENUM_VARIANT: u8 = OpCode::NewEnumVariant as u8;
+const OP_GET_FIELD_SLOT: u8 = OpCode::GetFieldSlot as u8;
+const OP_SET_FIELD_SLOT: u8 = OpCode::SetFieldSlot as u8;
+const OP_GET_FIELD_ADD_SET_INT: u8 = OpCode::GetFieldAddSetInt as u8;
+const OP_GET_FIELD: u8 = OpCode::GetField as u8;
+const OP_SET_FIELD: u8 = OpCode::SetField as u8;
+const OP_CONCAT: u8 = OpCode::Concat as u8;
+const OP_GET_INDEX: u8 = OpCode::GetIndex as u8;
+const OP_ARRAY_GET_UNWRAP: u8 = OpCode::ArrayGetUnwrap as u8;
+const OP_ARRAY_PUSH: u8 = OpCode::ArrayPush as u8;
+const OP_SET_INDEX: u8 = OpCode::SetIndex as u8;
+const OP_ARRAY_INDEX_OK: u8 = OpCode::ArrayIndexOk as u8;
+const OP_ARRAY_LEN: u8 = OpCode::ArrayLen as u8;
+const OP_LOAD_UPVALUE: u8 = OpCode::LoadUpvalue as u8;
+const OP_STORE_UPVALUE: u8 = OpCode::StoreUpvalue as u8;
+const OP_CALL: u8 = OpCode::Call as u8;
+const OP_CALL_METHOD: u8 = OpCode::CallMethod as u8;
+const OP_RETURN: u8 = OpCode::Return as u8;
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    static OPTION_NONE_SINGLETON: Rc<EnumObject> = EnumObject::new("Option", "None", None);
+}
+
+#[cfg(feature = "std")]
+#[inline(always)]
+fn option_none_singleton() -> Rc<EnumObject> {
+    OPTION_NONE_SINGLETON.with(Rc::clone)
+}
 
 pub static MUTATION_M1_SKIP_GAS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 pub static MUTATION_M1_EXECUTION_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -97,40 +198,33 @@ fn charge_array_push_budget(
 }
 
 #[inline(always)]
-fn write_frame_reg_scalar(frame: &mut CallFrame, reg: Register, value: Value) -> bool {
-    let slot = &mut frame.registers[reg as usize];
-    if slot.is_plain() {
-        // SAFETY: the old value owns nothing, so it needs no drop.
-        unsafe { core::ptr::write(slot, value) };
-    } else {
-        *slot = value;
-    }
+fn write_frame_reg_scalar(regs: &mut [Value], reg: Register, value: Value) -> bool {
+    regs[reg as usize] = value;
     false
 }
 
 #[inline(always)]
 fn write_frame_reg_fast(
     frame: &mut CallFrame,
+    regs: &mut [Value],
     cycle_collector: &mut cycle::CycleCollector,
     reg: Register,
     value: Value,
 ) -> bool {
-    if cycle_collector.is_enabled() {
-        cycle_collector.register_value(&value);
+    let idx = reg as usize;
+    if !value.is_plain() {
+        frame.mark_non_plain(idx);
+        if cycle_collector.is_enabled() {
+            cycle_collector.register_value(&value);
+        }
     }
-    let slot = &mut frame.registers[reg as usize];
-    if slot.is_plain() {
-        // SAFETY: the old value owns nothing, so it needs no drop.
-        unsafe { core::ptr::write(slot, value) };
-    } else {
-        *slot = value;
-    }
+    regs[idx] = value;
     cycle_collector.is_enabled() && cycle_collector.should_collect()
 }
 
 #[inline(always)]
 fn frame_int_binary_op<F>(
-    frame: &mut CallFrame,
+    regs: &mut [Value],
     dest: Register,
     lhs: Register,
     rhs: Register,
@@ -139,8 +233,8 @@ fn frame_int_binary_op<F>(
 where
     F: FnOnce(LustInt, LustInt) -> Result<Value>,
 {
-    let left = &frame.registers[lhs as usize];
-    let right = &frame.registers[rhs as usize];
+    let left = &regs[lhs as usize];
+    let right = &regs[rhs as usize];
     let (Value::Int(a), Value::Int(b)) = (left, right) else {
         return Err(LustError::RuntimeError {
             message: format!(
@@ -150,12 +244,12 @@ where
         });
     };
     let result = op(*a, *b)?;
-    Ok(write_frame_reg_scalar(frame, dest, result))
+    Ok(write_frame_reg_scalar(regs, dest, result))
 }
 
 #[inline(always)]
 fn frame_float_binary_op<F>(
-    frame: &mut CallFrame,
+    regs: &mut [Value],
     dest: Register,
     lhs: Register,
     rhs: Register,
@@ -164,8 +258,8 @@ fn frame_float_binary_op<F>(
 where
     F: FnOnce(LustFloat, LustFloat) -> Result<Value>,
 {
-    let left = &frame.registers[lhs as usize];
-    let right = &frame.registers[rhs as usize];
+    let left = &regs[lhs as usize];
+    let right = &regs[rhs as usize];
     let (Value::Float(a), Value::Float(b)) = (left, right) else {
         return Err(LustError::RuntimeError {
             message: format!(
@@ -175,12 +269,13 @@ where
         });
     };
     let result = op(*a, *b)?;
-    Ok(write_frame_reg_scalar(frame, dest, result))
+    Ok(write_frame_reg_scalar(regs, dest, result))
 }
 
 #[inline(always)]
 fn frame_binary_op<F>(
     frame: &mut CallFrame,
+    regs: &mut [Value],
     cycle_collector: &mut cycle::CycleCollector,
     dest: Register,
     lhs: Register,
@@ -190,15 +285,15 @@ fn frame_binary_op<F>(
 where
     F: FnOnce(&Value, &Value) -> Result<Value>,
 {
-    let left = &frame.registers[lhs as usize];
-    let right = &frame.registers[rhs as usize];
+    let left = &regs[lhs as usize];
+    let right = &regs[rhs as usize];
     let result = op(left, right)?;
-    Ok(write_frame_reg_fast(frame, cycle_collector, dest, result))
+    Ok(write_frame_reg_fast(frame, regs, cycle_collector, dest, result))
 }
 
 #[inline(always)]
 fn frame_comparison_op<I, F>(
-    frame: &mut CallFrame,
+    regs: &mut [Value],
     dest: Register,
     lhs: Register,
     rhs: Register,
@@ -209,8 +304,8 @@ where
     I: FnOnce(LustInt, LustInt) -> bool,
     F: FnOnce(LustFloat, LustFloat) -> bool,
 {
-    let left = &frame.registers[lhs as usize];
-    let right = &frame.registers[rhs as usize];
+    let left = &regs[lhs as usize];
+    let right = &regs[rhs as usize];
     let result = match (left, right) {
         (Value::Int(a), Value::Int(b)) => int_op(*a, *b),
         (Value::Float(a), Value::Float(b)) => op(*a, *b),
@@ -222,16 +317,39 @@ where
             });
         }
     };
-    Ok(write_frame_reg_scalar(frame, dest, Value::Bool(result)))
+    Ok(write_frame_reg_scalar(regs, dest, Value::Bool(result)))
 }
 
 enum FrameExit {
     EndOfChunk,
     CollectCycles,
     OutOfGas(u64),
+    FallbackToOuter,
     #[cfg(feature = "std")]
     TryOsr(usize),
     Slow(Instruction, usize),
+}
+
+enum FastStep {
+    InLoopCall {
+        target_func_idx: usize,
+        first_arg: Register,
+        arg_count: u8,
+        dest: Register,
+        ip_before_execution: usize,
+    },
+    InLoopCallMethod {
+        target_func_idx: usize,
+        obj_reg: Register,
+        first_arg: Register,
+        arg_count: u8,
+        dest: Register,
+        ip_before_execution: usize,
+    },
+    InLoopReturn {
+        ret_reg: Register,
+        ip_before_execution: usize,
+    },
 }
 
 pub struct MutationM1Guard;
@@ -491,9 +609,11 @@ impl VM {
     pub(super) fn run_inner<const JIT_ENABLED: bool>(&mut self) -> Result<Value> {
         self.sync_slow_path_flags();
         let mut frame_dirty = true;
+        let mut exact_gas_mode = false;
         let mut cur_frame_idx: usize = 0;
         let mut cur_func_idx: usize = 0;
         let mut cur_chunk_len: usize = 0;
+        let mut cur_has_packed: bool = false;
         #[cfg(feature = "std")]
         let mut cur_has_osr_entries: bool = false;
 
@@ -520,6 +640,7 @@ impl VM {
                 cur_func_idx = self.call_stack[cur_frame_idx].function_idx;
                 let func = &self.functions[cur_func_idx];
                 cur_chunk_len = func.chunk.instructions.len();
+                cur_has_packed = func.chunk.packed_code.len() == cur_chunk_len;
                 #[cfg(feature = "std")]
                 {
                     cur_has_osr_entries = !func.block_entry_pcs.is_empty();
@@ -541,16 +662,15 @@ impl VM {
                 !self.functions[cur_func_idx].block_entry_pcs.is_empty()
             );
 
-            let executing_frame_index = cur_frame_idx;
-            let func_idx = cur_func_idx;
-
             #[cfg(feature = "std")]
             let can_enter_fast = !JIT_ENABLED
+                && cur_has_packed
                 && (self.slow_path_flags & SLOW_PATH_PREAMBLE_MASK) == 0
                 && !crate::vm::tracing::has_trace_hook();
             #[cfg(not(feature = "std"))]
-            let can_enter_fast =
-                !JIT_ENABLED && (self.slow_path_flags & SLOW_PATH_PREAMBLE_MASK) == 0;
+            let can_enter_fast = !JIT_ENABLED
+                && cur_has_packed
+                && (self.slow_path_flags & SLOW_PATH_PREAMBLE_MASK) == 0;
 
             let (instruction, ip_before_execution) = if can_enter_fast {
                 let has_gas_limit = (self.slow_path_flags & SLOW_PATH_GAS_LIMIT) != 0;
@@ -558,33 +678,140 @@ impl VM {
                 #[cfg(feature = "std")]
                 let can_osr =
                     self.backend == crate::vm::VmBackend::Cranelift && cur_has_osr_entries;
-                // Safe disjoint-field borrows scoped strictly to pure intra-frame opcodes.
-                // Rust's borrow checker statically forbids any call_stack/functions-mutating
-                // `&mut self` call while `frame`, `instructions`, and `constants` are live.
+                let allow_inloop_calls = self.backend != crate::vm::VmBackend::Cranelift;
+                let has_active_finalizers = self.has_active_finalizers;
+                let max_stack_depth = self.max_stack_depth;
+                let min_inloop_return_depth = self.call_until_depth.unwrap_or(0).saturating_add(1);
+                // Safe disjoint-field borrows scoped to intra-frame ops plus in-loop
+                // Call / CallMethod / Return over `VM::vm_registers` (NG-W11-4B).
+                // Zero `unsafe`: `frame`/`regs` are dropped before pushing/popping
+                // `call_stack` or growing `vm_registers`, and `ic_slots` is dropped
+                // only when switching to a different `function_idx`.
                 let exit = {
-                    let frame: &mut CallFrame = &mut self.call_stack[cur_frame_idx];
-                    let func = &self.functions[cur_func_idx];
-                    let instructions = &func.chunk.instructions;
-                    let constants = &func.chunk.constants;
+                    let functions = &self.functions;
+                    let call_meta = &mut self.call_meta;
+                    let call_stack = &mut self.call_stack;
+                    let vm_registers = &mut self.vm_registers;
+                    let last_frame_pop_cleanup_iters = &mut self.last_frame_pop_cleanup_iters;
+                    let method_cache = &mut self.method_cache;
                     let budgets = &mut self.budgets;
                     let cycle_collector = &mut self.cycle_collector;
                     let struct_tostring_cache = &mut self.struct_tostring_cache;
+                    let struct_metadata = &self.struct_metadata;
+                    let unit_enums = &mut self.unit_enums;
+                    let globals_vec = &self.globals_vec;
+                    let global_name_to_slot = &self.global_name_to_slot;
+                    let globals_generation = self.globals_generation;
 
                     'frame_fast: loop {
+                        let func = &functions[cur_func_idx];
+                        let instructions = &func.chunk.instructions;
+                        let packed_code = &func.chunk.packed_code;
+                        let extra_args = &func.chunk.extra_args;
+                        if packed_code.len() != instructions.len() {
+                            break 'frame_fast FrameExit::FallbackToOuter;
+                        }
+                        let constants = &func.chunk.constants;
+                        let bb_gas_weights = &func.chunk.bb_gas_weights;
+                        let has_bb_gas = bb_gas_weights.len() == packed_code.len();
+                        cur_chunk_len = packed_code.len();
+                        let mut ic_slots = func.chunk.ic_slots.borrow_mut();
+                        if ic_slots.len() < packed_code.len() {
+                            ic_slots.resize(packed_code.len(), ChunkIcSlot::Empty);
+                        }
+
+                        'same_func: loop {
+                            let base_reg = call_stack[cur_frame_idx].base_reg;
+                            let reg_end = base_reg + call_stack[cur_frame_idx].reg_count as usize;
+
+                            let step: FastStep = {
+                                let frame: &mut CallFrame = &mut call_stack[cur_frame_idx];
+                                let regs: &mut [Value] = &mut vm_registers[base_reg..reg_end];
+
+                                'intra: loop {
                         debug_assert_eq!(cur_func_idx, frame.function_idx);
-                        debug_assert_eq!(cur_chunk_len, instructions.len());
+                        debug_assert_eq!(cur_chunk_len, packed_code.len());
 
                         let ip = frame.ip;
-                        let Some(&instruction) = instructions.get(ip) else {
+                        let Some(&packed) = packed_code.get(ip) else {
                             break 'frame_fast FrameExit::EndOfChunk;
                         };
+                        debug_assert_eq!(
+                            packed.to_instruction(extra_args),
+                            Ok(instructions[ip]),
+                            "packed_code[{}] drifted out of sync with instructions[{}]",
+                            ip,
+                            ip
+                        );
                         let ip_before_execution = ip + 1;
                         frame.ip = ip_before_execution;
 
                         if skip_gas {
                             Self::record_mutation_m1_skip_gas();
+                        } else if has_bb_gas && !exact_gas_mode {
+                            let w = bb_gas_weights[ip];
+                            if w > 0 {
+                                let w_u64 = u64::from(w);
+                                if has_gas_limit
+                                    && let Some(limit) = budgets.gas.limit
+                                {
+                                    let remaining = limit.saturating_sub(budgets.gas.used);
+                                    if remaining < w_u64 {
+                                        exact_gas_mode = true;
+                                        budgets.gas.used = budgets
+                                            .gas
+                                            .used
+                                            .saturating_add(u64::from(packed.gas_weight()));
+                                        if budgets.gas.used > limit {
+                                            break 'frame_fast FrameExit::OutOfGas(limit);
+                                        }
+                                    } else {
+                                        budgets.gas.used = budgets.gas.used.saturating_add(w_u64);
+                                    }
+                                } else {
+                                    budgets.gas.used = budgets.gas.used.saturating_add(w_u64);
+                                }
+                            }
+                        } else if has_bb_gas {
+                            let w = bb_gas_weights[ip];
+                            if w > 0 {
+                                let w_u64 = u64::from(w);
+                                let can_batch = !has_gas_limit
+                                    || budgets.gas.limit.is_none_or(|limit| {
+                                        limit.saturating_sub(budgets.gas.used) >= w_u64
+                                    });
+                                if can_batch {
+                                    exact_gas_mode = false;
+                                    budgets.gas.used = budgets.gas.used.saturating_add(w_u64);
+                                } else {
+                                    budgets.gas.used = budgets
+                                        .gas
+                                        .used
+                                        .saturating_add(u64::from(packed.gas_weight()));
+                                    if has_gas_limit
+                                        && let Some(limit) = budgets.gas.limit
+                                        && budgets.gas.used > limit
+                                    {
+                                        break 'frame_fast FrameExit::OutOfGas(limit);
+                                    }
+                                }
+                            } else {
+                                budgets.gas.used = budgets
+                                    .gas
+                                    .used
+                                    .saturating_add(u64::from(packed.gas_weight()));
+                                if has_gas_limit
+                                    && let Some(limit) = budgets.gas.limit
+                                    && budgets.gas.used > limit
+                                {
+                                    break 'frame_fast FrameExit::OutOfGas(limit);
+                                }
+                            }
                         } else {
-                            budgets.gas.used = budgets.gas.used.saturating_add(1);
+                            budgets.gas.used = budgets
+                                .gas
+                                .used
+                                .saturating_add(u64::from(packed.gas_weight()));
                             if has_gas_limit
                                 && let Some(limit) = budgets.gas.limit
                                 && budgets.gas.used > limit
@@ -593,39 +820,94 @@ impl VM {
                             }
                         }
 
-                        let needs_collect = match instruction {
-                            Instruction::LoadNil(dest) => {
-                                write_frame_reg_scalar(frame, dest, Value::Nil)
+                        let needs_collect = match packed.opcode_u8() {
+                            OP_LOAD_NIL => {
+                                write_frame_reg_scalar(regs, packed.a(), Value::Nil)
                             }
-                            Instruction::LoadBool(dest, value) => {
-                                write_frame_reg_scalar(frame, dest, Value::Bool(value))
+                            OP_LOAD_BOOL => {
+                                write_frame_reg_scalar(regs, packed.a(), Value::Bool(packed.b() != 0))
                             }
-                            Instruction::LoadConst(dest, const_idx) => {
-                                let constant = constants[const_idx as usize].fast_clone();
-                                write_frame_reg_fast(frame, cycle_collector, dest, constant)
+                            OP_LOAD_CONST => {
+                                let constant = constants[packed.bx() as usize].fast_clone();
+                                write_frame_reg_fast(frame, regs, cycle_collector, packed.a(), constant)
                             }
-                            Instruction::Move(dest, src) => {
-                                let value = frame.registers[src as usize].fast_clone();
-                                write_frame_reg_fast(frame, cycle_collector, dest, value)
+                            OP_LOAD_GLOBAL => {
+                                let dest = packed.a();
+                                let name_idx = packed.bx();
+                                let val = match &ic_slots[ip] {
+                                    ChunkIcSlot::GlobalSlot {
+                                        generation,
+                                        slot_idx,
+                                    } if *generation == globals_generation => {
+                                        globals_vec[*slot_idx as usize].fast_clone()
+                                    }
+                                    _ => {
+                                        let name = constants[name_idx as usize]
+                                            .as_string()
+                                            .ok_or_else(|| LustError::RuntimeError {
+                                                message: "Global name must be a string".to_string(),
+                                            })?;
+                                        if let Some(&slot_idx) = global_name_to_slot.get(name) {
+                                            ic_slots[ip] = ChunkIcSlot::GlobalSlot {
+                                                generation: globals_generation,
+                                                slot_idx,
+                                            };
+                                            globals_vec[slot_idx as usize].fast_clone()
+                                        } else {
+                                            break 'frame_fast FrameExit::Slow(
+                                                instructions[ip],
+                                                ip_before_execution,
+                                            );
+                                        }
+                                    }
+                                };
+                                if val.is_plain() {
+                                    write_frame_reg_scalar(regs, dest, val)
+                                } else {
+                                    write_frame_reg_fast(frame, regs, cycle_collector, dest, val)
+                                }
+                            }
+                            OP_MOVE => {
+                                let value = regs[packed.b() as usize].fast_clone();
+                                write_frame_reg_fast(frame, regs, cycle_collector, packed.a(), value)
                             }
 
-                            Instruction::AddInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_ADD_INT => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Int(a.wrapping_add(b)))
                                 })?
                             }
-                            Instruction::SubInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_ADD_INT_IMM => {
+                                let dest = packed.a();
+                                let src = packed.b();
+                                let imm = packed.c_i8();
+                                let src_val = &regs[src as usize];
+                                let Value::Int(a) = src_val else {
+                                    return Err(LustError::RuntimeError {
+                                        message: format!(
+                                            "Typed numeric instruction expected int operand, got {:?}",
+                                            src_val
+                                        ),
+                                    });
+                                };
+                                write_frame_reg_scalar(
+                                    regs,
+                                    dest,
+                                    Value::Int(a.wrapping_add(LustInt::from(imm))),
+                                )
+                            }
+                            OP_SUB_INT => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Int(a.wrapping_sub(b)))
                                 })?
                             }
-                            Instruction::MulInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_MUL_INT => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Int(a.wrapping_mul(b)))
                                 })?
                             }
-                            Instruction::DivInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_DIV_INT => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     if b == 0 {
                                         Err(LustError::RuntimeError {
                                             message: "Division by zero".to_string(),
@@ -635,8 +917,8 @@ impl VM {
                                     }
                                 })?
                             }
-                            Instruction::ModInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_MOD_INT => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     if b == 0 {
                                         Err(LustError::RuntimeError {
                                             message: "Modulo by zero".to_string(),
@@ -646,74 +928,75 @@ impl VM {
                                     }
                                 })?
                             }
-                            Instruction::PowInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_POW_INT => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     int_pow(a, b)
                                 })?
                             }
-                            Instruction::FloorDivInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_FLOOR_DIV_INT => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     floor_div_i64(a, b).map(Value::Int)
                                 })?
                             }
-                            Instruction::NegInt(dest, src) => {
-                                frame_int_binary_op(frame, dest, src, src, |a, _| {
+                            OP_NEG_INT => {
+                                let src = packed.b();
+                                frame_int_binary_op(regs, packed.a(), src, src, |a, _| {
                                     Ok(Value::Int(a.wrapping_neg()))
                                 })?
                             }
-                            Instruction::EqInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_EQ_INT => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Bool(a == b))
                                 })?
                             }
-                            Instruction::NeInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_NE_INT => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Bool(a != b))
                                 })?
                             }
-                            Instruction::LtInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_LT_INT => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Bool(a < b))
                                 })?
                             }
-                            Instruction::LeInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_LE_INT => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Bool(a <= b))
                                 })?
                             }
-                            Instruction::GtInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_GT_INT => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Bool(a > b))
                                 })?
                             }
-                            Instruction::GeInt(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_GE_INT => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Bool(a >= b))
                                 })?
                             }
 
-                            Instruction::AddFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_ADD_FLOAT => {
+                                frame_float_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Float(a + b))
                                 })?
                             }
-                            Instruction::SubFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_SUB_FLOAT => {
+                                frame_float_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Float(a - b))
                                 })?
                             }
-                            Instruction::MulFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_MUL_FLOAT => {
+                                frame_float_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Float(a * b))
                                 })?
                             }
-                            Instruction::DivFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_DIV_FLOAT => {
+                                frame_float_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Float(a / b))
                                 })?
                             }
-                            Instruction::ModFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_MOD_FLOAT => {
+                                frame_float_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     if b == 0.0 {
                                         Err(LustError::RuntimeError {
                                             message: "Modulo by zero".to_string(),
@@ -723,13 +1006,13 @@ impl VM {
                                     }
                                 })?
                             }
-                            Instruction::PowFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_POW_FLOAT => {
+                                frame_float_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Float(a.powf(b)))
                                 })?
                             }
-                            Instruction::FloorDivFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_FLOOR_DIV_FLOAT => {
+                                frame_float_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     if b == 0.0 {
                                         Err(LustError::RuntimeError {
                                             message: "Division by zero".to_string(),
@@ -739,44 +1022,45 @@ impl VM {
                                     }
                                 })?
                             }
-                            Instruction::NegFloat(dest, src) => {
-                                frame_float_binary_op(frame, dest, src, src, |a, _| {
+                            OP_NEG_FLOAT => {
+                                let src = packed.b();
+                                frame_float_binary_op(regs, packed.a(), src, src, |a, _| {
                                     Ok(Value::Float(-a))
                                 })?
                             }
-                            Instruction::EqFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_EQ_FLOAT => {
+                                frame_float_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Bool(a == b))
                                 })?
                             }
-                            Instruction::NeFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_NE_FLOAT => {
+                                frame_float_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Bool(a != b))
                                 })?
                             }
-                            Instruction::LtFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_LT_FLOAT => {
+                                frame_float_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Bool(a < b))
                                 })?
                             }
-                            Instruction::LeFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_LE_FLOAT => {
+                                frame_float_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Bool(a <= b))
                                 })?
                             }
-                            Instruction::GtFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_GT_FLOAT => {
+                                frame_float_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Bool(a > b))
                                 })?
                             }
-                            Instruction::GeFloat(dest, lhs, rhs) => {
-                                frame_float_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_GE_FLOAT => {
+                                frame_float_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Bool(a >= b))
                                 })?
                             }
 
-                            Instruction::Add(dest, lhs, rhs) => {
-                                frame_binary_op(frame, cycle_collector, dest, lhs, rhs, |l, r| {
+                            OP_ADD => {
+                                frame_binary_op(frame, regs, cycle_collector, packed.a(), packed.b(), packed.c(), |l, r| {
                                     match (l, r) {
                                         (Value::Int(a), Value::Int(b)) => {
                                             Ok(Value::Int(a.wrapping_add(*b)))
@@ -799,8 +1083,8 @@ impl VM {
                                     }
                                 })?
                             }
-                            Instruction::Sub(dest, lhs, rhs) => {
-                                frame_binary_op(frame, cycle_collector, dest, lhs, rhs, |l, r| {
+                            OP_SUB => {
+                                frame_binary_op(frame, regs, cycle_collector, packed.a(), packed.b(), packed.c(), |l, r| {
                                     match (l, r) {
                                         (Value::Int(a), Value::Int(b)) => {
                                             Ok(Value::Int(a.wrapping_sub(*b)))
@@ -820,8 +1104,8 @@ impl VM {
                                     }
                                 })?
                             }
-                            Instruction::Mul(dest, lhs, rhs) => {
-                                frame_binary_op(frame, cycle_collector, dest, lhs, rhs, |l, r| {
+                            OP_MUL => {
+                                frame_binary_op(frame, regs, cycle_collector, packed.a(), packed.b(), packed.c(), |l, r| {
                                     match (l, r) {
                                         (Value::Int(a), Value::Int(b)) => {
                                             Ok(Value::Int(a.wrapping_mul(*b)))
@@ -841,8 +1125,8 @@ impl VM {
                                     }
                                 })?
                             }
-                            Instruction::Div(dest, lhs, rhs) => {
-                                frame_binary_op(frame, cycle_collector, dest, lhs, rhs, |l, r| {
+                            OP_DIV => {
+                                frame_binary_op(frame, regs, cycle_collector, packed.a(), packed.b(), packed.c(), |l, r| {
                                     match (l, r) {
                                         (Value::Int(a), Value::Int(b)) => {
                                             if *b == 0 {
@@ -868,8 +1152,8 @@ impl VM {
                                     }
                                 })?
                             }
-                            Instruction::Mod(dest, lhs, rhs) => {
-                                frame_binary_op(frame, cycle_collector, dest, lhs, rhs, |l, r| {
+                            OP_MOD => {
+                                frame_binary_op(frame, regs, cycle_collector, packed.a(), packed.b(), packed.c(), |l, r| {
                                     match (l, r) {
                                         (Value::Int(a), Value::Int(b)) => {
                                             if *b == 0 {
@@ -913,8 +1197,8 @@ impl VM {
                                     }
                                 })?
                             }
-                            Instruction::Pow(dest, lhs, rhs) => {
-                                frame_binary_op(frame, cycle_collector, dest, lhs, rhs, |l, r| {
+                            OP_POW => {
+                                frame_binary_op(frame, regs, cycle_collector, packed.a(), packed.b(), packed.c(), |l, r| {
                                     match (l, r) {
                                         (Value::Int(a), Value::Int(b)) => int_pow(*a, *b),
                                         (Value::Float(a), Value::Float(b)) => {
@@ -935,8 +1219,8 @@ impl VM {
                                     }
                                 })?
                             }
-                            Instruction::FloorDiv(dest, lhs, rhs) => {
-                                frame_binary_op(frame, cycle_collector, dest, lhs, rhs, |l, r| {
+                            OP_FLOOR_DIV => {
+                                frame_binary_op(frame, regs, cycle_collector, packed.a(), packed.b(), packed.c(), |l, r| {
                                     match (l, r) {
                                         (Value::Int(a), Value::Int(b)) => {
                                             floor_div_i64(*a, *b).map(Value::Int)
@@ -977,8 +1261,8 @@ impl VM {
                                     }
                                 })?
                             }
-                            Instruction::Neg(dest, src) => {
-                                let result = match &frame.registers[src as usize] {
+                            OP_NEG => {
+                                let result = match &regs[packed.b() as usize] {
                                     Value::Int(i) => Value::Int(i.wrapping_neg()),
                                     Value::Float(f) => Value::Float(-f),
                                     other => {
@@ -987,97 +1271,97 @@ impl VM {
                                         });
                                     }
                                 };
-                                write_frame_reg_scalar(frame, dest, result)
+                                write_frame_reg_scalar(regs, packed.a(), result)
                             }
-                            Instruction::Eq(dest, lhs, rhs) => {
-                                let eq = frame.registers[lhs as usize] == frame.registers[rhs as usize];
-                                write_frame_reg_scalar(frame, dest, Value::Bool(eq))
+                            OP_EQ => {
+                                let eq = regs[packed.b() as usize] == regs[packed.c() as usize];
+                                write_frame_reg_scalar(regs, packed.a(), Value::Bool(eq))
                             }
-                            Instruction::Ne(dest, lhs, rhs) => {
-                                let ne = frame.registers[lhs as usize] != frame.registers[rhs as usize];
-                                write_frame_reg_scalar(frame, dest, Value::Bool(ne))
+                            OP_NE => {
+                                let ne = regs[packed.b() as usize] != regs[packed.c() as usize];
+                                write_frame_reg_scalar(regs, packed.a(), Value::Bool(ne))
                             }
-                            Instruction::Lt(dest, lhs, rhs) => {
+                            OP_LT => {
                                 frame_comparison_op(
-                                    frame,
-                                    dest,
-                                    lhs,
-                                    rhs,
+                                    regs,
+                                    packed.a(),
+                                    packed.b(),
+                                    packed.c(),
                                     |l, r| l < r,
                                     |l, r| l < r,
                                 )?
                             }
-                            Instruction::Le(dest, lhs, rhs) => {
+                            OP_LE => {
                                 frame_comparison_op(
-                                    frame,
-                                    dest,
-                                    lhs,
-                                    rhs,
+                                    regs,
+                                    packed.a(),
+                                    packed.b(),
+                                    packed.c(),
                                     |l, r| l <= r,
                                     |l, r| l <= r,
                                 )?
                             }
-                            Instruction::Gt(dest, lhs, rhs) => {
+                            OP_GT => {
                                 frame_comparison_op(
-                                    frame,
-                                    dest,
-                                    lhs,
-                                    rhs,
+                                    regs,
+                                    packed.a(),
+                                    packed.b(),
+                                    packed.c(),
                                     |l, r| l > r,
                                     |l, r| l > r,
                                 )?
                             }
-                            Instruction::Ge(dest, lhs, rhs) => {
+                            OP_GE => {
                                 frame_comparison_op(
-                                    frame,
-                                    dest,
-                                    lhs,
-                                    rhs,
+                                    regs,
+                                    packed.a(),
+                                    packed.b(),
+                                    packed.c(),
                                     |l, r| l >= r,
                                     |l, r| l >= r,
                                 )?
                             }
-                            Instruction::And(dest, lhs, rhs) => {
-                                let res = frame.registers[lhs as usize].is_truthy()
-                                    && frame.registers[rhs as usize].is_truthy();
-                                write_frame_reg_scalar(frame, dest, Value::Bool(res))
+                            OP_AND => {
+                                let res = regs[packed.b() as usize].is_truthy()
+                                    && regs[packed.c() as usize].is_truthy();
+                                write_frame_reg_scalar(regs, packed.a(), Value::Bool(res))
                             }
-                            Instruction::Or(dest, lhs, rhs) => {
-                                let res = frame.registers[lhs as usize].is_truthy()
-                                    || frame.registers[rhs as usize].is_truthy();
-                                write_frame_reg_scalar(frame, dest, Value::Bool(res))
+                            OP_OR => {
+                                let res = regs[packed.b() as usize].is_truthy()
+                                    || regs[packed.c() as usize].is_truthy();
+                                write_frame_reg_scalar(regs, packed.a(), Value::Bool(res))
                             }
-                            Instruction::Not(dest, src) => {
-                                let res = !frame.registers[src as usize].is_truthy();
-                                write_frame_reg_scalar(frame, dest, Value::Bool(res))
+                            OP_NOT => {
+                                let res = !regs[packed.b() as usize].is_truthy();
+                                write_frame_reg_scalar(regs, packed.a(), Value::Bool(res))
                             }
-                            Instruction::BitAnd(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_BIT_AND => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Int(a & b))
                                 })?
                             }
-                            Instruction::BitOr(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_BIT_OR => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Int(a | b))
                                 })?
                             }
-                            Instruction::BitXor(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_BIT_XOR => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Int(a ^ b))
                                 })?
                             }
-                            Instruction::Shl(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_SHL => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Int(a.wrapping_shl((b & 63) as u32)))
                                 })?
                             }
-                            Instruction::Shr(dest, lhs, rhs) => {
-                                frame_int_binary_op(frame, dest, lhs, rhs, |a, b| {
+                            OP_SHR => {
+                                frame_int_binary_op(regs, packed.a(), packed.b(), packed.c(), |a, b| {
                                     Ok(Value::Int(a.wrapping_shr((b & 63) as u32)))
                                 })?
                             }
-                            Instruction::BitNot(dest, src) => {
-                                let res = match &frame.registers[src as usize] {
+                            OP_BIT_NOT => {
+                                let res = match &regs[packed.b() as usize] {
                                     Value::Int(a) => Value::Int(!a),
                                     other => {
                                         return Err(LustError::RuntimeError {
@@ -1088,10 +1372,11 @@ impl VM {
                                         });
                                     }
                                 };
-                                write_frame_reg_scalar(frame, dest, res)
+                                write_frame_reg_scalar(regs, packed.a(), res)
                             }
 
-                            Instruction::Jump(offset) => {
+                            OP_JUMP => {
+                                let offset = packed.sbx();
                                 let target_ip = (frame.ip as isize + offset as isize) as usize;
                                 frame.ip = target_ip;
                                 #[cfg(feature = "std")]
@@ -1100,8 +1385,10 @@ impl VM {
                                 }
                                 false
                             }
-                            Instruction::JumpIf(cond, offset) => {
-                                let truthy = match &frame.registers[cond as usize] {
+                            OP_JUMP_IF => {
+                                let cond = packed.a();
+                                let offset = packed.sbx();
+                                let truthy = match &regs[cond as usize] {
                                     Value::Bool(b) => *b,
                                     other => other.is_truthy(),
                                 };
@@ -1110,8 +1397,10 @@ impl VM {
                                 }
                                 false
                             }
-                            Instruction::JumpIfNot(cond, offset) => {
-                                let truthy = match &frame.registers[cond as usize] {
+                            OP_JUMP_IF_NOT => {
+                                let cond = packed.a();
+                                let offset = packed.sbx();
+                                let truthy = match &regs[cond as usize] {
                                     Value::Bool(b) => *b,
                                     other => other.is_truthy(),
                                 };
@@ -1120,29 +1409,86 @@ impl VM {
                                 }
                                 false
                             }
+                            OP_BRANCH_LT_INT => {
+                                let lhs = packed.a();
+                                let w0 = extra_args[packed.bx() as usize];
+                                let rhs = (w0 & 0xFF) as u8;
+                                let offset = (w0 >> 16) as u16 as i16;
+                                let left = &regs[lhs as usize];
+                                let right = &regs[rhs as usize];
+                                let (Value::Int(a), Value::Int(b)) = (left, right) else {
+                                    return Err(LustError::RuntimeError {
+                                        message: format!(
+                                            "Typed numeric instruction expected int operands, got {:?} and {:?}",
+                                            left, right
+                                        ),
+                                    });
+                                };
+                                if !(*a < *b) {
+                                    let target_ip = (frame.ip as isize + offset as isize) as usize;
+                                    frame.ip = target_ip;
+                                    #[cfg(feature = "std")]
+                                    if offset < 0 && can_osr {
+                                        break 'frame_fast FrameExit::TryOsr(target_ip);
+                                    }
+                                }
+                                false
+                            }
+                            OP_BRANCH_LE_INT => {
+                                let lhs = packed.a();
+                                let w0 = extra_args[packed.bx() as usize];
+                                let rhs = (w0 & 0xFF) as u8;
+                                let offset = (w0 >> 16) as u16 as i16;
+                                let left = &regs[lhs as usize];
+                                let right = &regs[rhs as usize];
+                                let (Value::Int(a), Value::Int(b)) = (left, right) else {
+                                    return Err(LustError::RuntimeError {
+                                        message: format!(
+                                            "Typed numeric instruction expected int operands, got {:?} and {:?}",
+                                            left, right
+                                        ),
+                                    });
+                                };
+                                if !(*a <= *b) {
+                                    let target_ip = (frame.ip as isize + offset as isize) as usize;
+                                    frame.ip = target_ip;
+                                    #[cfg(feature = "std")]
+                                    if offset < 0 && can_osr {
+                                        break 'frame_fast FrameExit::TryOsr(target_ip);
+                                    }
+                                }
+                                false
+                            }
 
-                            Instruction::NewArray(dest, first_elem, count) => {
+                            OP_NEW_ARRAY => {
+                                let dest = packed.a();
+                                let first_elem = packed.b();
+                                let count = packed.c();
                                 let element_count = count as usize;
                                 budgets.charge_value_vec(element_count)?;
                                 let mut elements = Vec::with_capacity(element_count);
                                 for i in 0..count {
                                     elements.push(
-                                        frame.registers[(first_elem + i) as usize].fast_clone(),
+                                        regs[(first_elem + i) as usize].fast_clone(),
                                     );
                                 }
                                 write_frame_reg_fast(
                                     frame,
+                                    regs,
                                     cycle_collector,
                                     dest,
                                     Value::array(elements),
                                 )
                             }
-                            Instruction::TupleNew(dest, first_elem, count) => {
+                            OP_TUPLE_NEW => {
+                                let dest = packed.a();
+                                let first_elem = packed.b();
+                                let count = packed.c();
                                 let mut parts = Vec::with_capacity(count as usize);
                                 let mut total_elements: usize = 0;
                                 for offset in 0..(count as usize) {
                                     let value =
-                                        frame.registers[(first_elem + offset as u8) as usize]
+                                        regs[(first_elem + offset as u8) as usize]
                                             .clone();
                                     total_elements = total_elements.saturating_add(match &value {
                                         Value::Tuple(existing) => existing.len(),
@@ -1161,13 +1507,17 @@ impl VM {
                                 }
                                 write_frame_reg_fast(
                                     frame,
+                                    regs,
                                     cycle_collector,
                                     dest,
                                     Value::tuple(elements),
                                 )
                             }
-                            Instruction::TupleGet(dest, tuple_reg, index) => {
-                                let value = match &frame.registers[tuple_reg as usize] {
+                            OP_TUPLE_GET => {
+                                let dest = packed.a();
+                                let tuple_reg = packed.b();
+                                let index = packed.c();
+                                let value = match &regs[tuple_reg as usize] {
                                     Value::Tuple(values) => {
                                         let idx = index as usize;
                                         if idx >= values.len() {
@@ -1188,14 +1538,16 @@ impl VM {
                                         });
                                     }
                                 };
-                                write_frame_reg_fast(frame, cycle_collector, dest, value)
+                                write_frame_reg_fast(frame, regs, cycle_collector, dest, value)
                             }
-                            Instruction::IsEnumVariant(
-                                dest,
-                                value_reg,
-                                enum_name_idx,
-                                variant_idx,
-                            ) => {
+                            OP_IS_ENUM_VARIANT => {
+                                let dest = packed.a();
+                                let ex = packed.bx() as usize;
+                                let w0 = extra_args[ex];
+                                let w1 = extra_args[ex + 1];
+                                let value_reg = (w1 & 0xFF) as u8;
+                                let enum_name_idx = (w0 & 0xFFFF) as u16;
+                                let variant_idx = (w0 >> 16) as u16;
                                 let enum_name = constants[enum_name_idx as usize]
                                     .as_string()
                                     .ok_or_else(|| LustError::RuntimeError {
@@ -1206,13 +1558,16 @@ impl VM {
                                     .ok_or_else(|| LustError::RuntimeError {
                                         message: "Variant name must be a string".to_string(),
                                     })?;
-                                let is_variant = frame.registers[value_reg as usize]
+                                let is_variant = regs[value_reg as usize]
                                     .is_enum_variant(enum_name, variant_name);
-                                write_frame_reg_scalar(frame, dest, Value::Bool(is_variant))
+                                write_frame_reg_scalar(regs, dest, Value::Bool(is_variant))
                             }
-                            Instruction::GetEnumValue(dest, enum_reg, index) => {
+                            OP_GET_ENUM_VALUE => {
+                                let dest = packed.a();
+                                let enum_reg = packed.b();
+                                let index = packed.c();
                                 let value = if let Some((_, _, Some(values))) =
-                                    frame.registers[enum_reg as usize].as_enum()
+                                    regs[enum_reg as usize].as_enum()
                                 {
                                     if (index as usize) < values.len() {
                                         values[index as usize].fast_clone()
@@ -1232,19 +1587,472 @@ impl VM {
                                                 .to_string(),
                                     });
                                 };
-                                write_frame_reg_fast(frame, cycle_collector, dest, value)
+                                write_frame_reg_fast(frame, regs, cycle_collector, dest, value)
                             }
-                            Instruction::GetField(dest, obj, field_idx) => {
-                                let val = match &frame.registers[obj as usize] {
-                                    Value::Struct(s) if s.name != "LuaTable" => {
-                                        let field_name = constants[field_idx as usize]
+                            OP_NEW_STRUCT => {
+                                let dest = packed.a();
+                                let ex = packed.bx() as usize;
+                                let w0 = extra_args[ex];
+                                let w1 = extra_args[ex + 1];
+                                let name_idx = (w0 & 0xFFFF) as u16;
+                                let first_field_name_idx = (w0 >> 16) as u16;
+                                let first_field = (w1 & 0xFF) as u8;
+                                let field_count = ((w1 >> 8) & 0xFF) as u8;
+                                let fcount = field_count as usize;
+                                budgets.charge_value_vec(fcount)?;
+                                let meta_gen = struct_metadata.generation();
+                                let ic_hit = matches!(
+                                    &ic_slots[ip],
+                                    ChunkIcSlot::NewStructTemplate { struct_meta_gen, .. }
+                                        if *struct_meta_gen == meta_gen
+                                );
+                                let struct_value = if !ic_hit {
+                                    let struct_name = constants[name_idx as usize]
+                                        .as_string()
+                                        .ok_or_else(|| LustError::RuntimeError {
+                                            message: "Struct name must be a string".to_string(),
+                                        })?;
+                                    let info = struct_metadata.get(struct_name).ok_or_else(|| {
+                                        LustError::RuntimeError {
+                                            message: format!("Unknown struct '{}'", struct_name),
+                                        }
+                                    })?;
+                                    let layout = Rc::clone(&info.layout);
+                                    let layout_len = layout.field_names().len();
+                                    let mut slot_map = Vec::with_capacity(fcount);
+                                    let mut filled = vec![false; layout_len];
+                                    let mut is_identity = fcount == layout_len;
+                                    for i in 0..field_count {
+                                        let field_name = constants
+                                            [(first_field_name_idx + i as u16) as usize]
                                             .as_string_rc()
                                             .ok_or_else(|| LustError::RuntimeError {
                                                 message: "Field name must be a string".to_string(),
                                             })?;
-                                        frame.registers[obj as usize]
-                                            .struct_get_field_rc(&field_name)
-                                            .unwrap_or(Value::Nil)
+                                        let slot_idx = layout
+                                            .index_of_rc(&field_name)
+                                            .or_else(|| layout.index_of_str(field_name.as_str()))
+                                            .ok_or_else(|| LustError::RuntimeError {
+                                                message: format!(
+                                                    "Struct '{}' has no field '{}'",
+                                                    struct_name, field_name
+                                                ),
+                                            })?;
+                                        if slot_idx != i as usize {
+                                            is_identity = false;
+                                        }
+                                        filled[slot_idx] = true;
+                                        slot_map.push(slot_idx);
+                                    }
+                                    if filled.iter().any(|slot| !*slot) {
+                                        let missing: Vec<String> = layout
+                                            .field_names()
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|&(idx, _)| !filled[idx])
+                                            .map(|(_, name)| (**name).clone())
+                                            .collect();
+                                        return Err(LustError::RuntimeError {
+                                            message: format!(
+                                                "Struct '{}' is missing required field(s): {}",
+                                                struct_name,
+                                                missing.join(", ")
+                                            ),
+                                        });
+                                    }
+                                    let interned_name = Name::from(struct_name);
+                                    let ordered = if is_identity && !layout.has_weak_fields() {
+                                        let mut ordered = Vec::with_capacity(fcount);
+                                        for i in 0..field_count {
+                                            ordered.push(
+                                                regs
+                                                    [(first_field as usize) + (i as usize)]
+                                                    .fast_clone(),
+                                            );
+                                        }
+                                        ordered
+                                    } else {
+                                        let mut ordered = vec![Value::Nil; layout_len];
+                                        for (i, &slot_idx) in slot_map.iter().enumerate() {
+                                            let val = regs
+                                                [(first_field as usize) + i]
+                                                .fast_clone();
+                                            let canonical = if layout.has_weak_fields() {
+                                                layout
+                                                    .canonicalize_field_value(slot_idx, val)
+                                                    .map_err(|message| LustError::RuntimeError {
+                                                        message,
+                                                    })?
+                                            } else {
+                                                val
+                                            };
+                                            ordered[slot_idx] = canonical;
+                                        }
+                                        ordered
+                                    };
+                                    if struct_name != "LuaTable" {
+                                        ic_slots[ip] = ChunkIcSlot::NewStructTemplate {
+                                            struct_meta_gen: meta_gen,
+                                            struct_name: interned_name.clone(),
+                                            layout: Rc::clone(&layout),
+                                            slot_map: slot_map.into_boxed_slice(),
+                                            is_identity,
+                                        };
+                                    }
+                                    Value::Struct(StructObject::new(interned_name, layout, ordered))
+                                } else {
+                                    let ChunkIcSlot::NewStructTemplate {
+                                        struct_name,
+                                        layout,
+                                        slot_map,
+                                        is_identity,
+                                        ..
+                                    } = &ic_slots[ip]
+                                    else {
+                                        unreachable!()
+                                    };
+                                    let ordered = if *is_identity && !layout.has_weak_fields() {
+                                        let mut ordered = Vec::with_capacity(fcount);
+                                        for i in 0..field_count {
+                                            ordered.push(
+                                                regs
+                                                    [(first_field as usize) + (i as usize)]
+                                                    .fast_clone(),
+                                            );
+                                        }
+                                        ordered
+                                    } else {
+                                        let layout_len = layout.field_names().len();
+                                        let mut ordered = vec![Value::Nil; layout_len];
+                                        for (i, &slot_idx) in slot_map.iter().enumerate() {
+                                            let val = regs
+                                                [(first_field as usize) + i]
+                                                .fast_clone();
+                                            let canonical = if layout.has_weak_fields() {
+                                                layout
+                                                    .canonicalize_field_value(slot_idx, val)
+                                                    .map_err(|message| LustError::RuntimeError {
+                                                        message,
+                                                    })?
+                                            } else {
+                                                val
+                                            };
+                                            ordered[slot_idx] = canonical;
+                                        }
+                                        ordered
+                                    };
+                                    Value::Struct(StructObject::new(
+                                        struct_name.clone(),
+                                        Rc::clone(layout),
+                                        ordered,
+                                    ))
+                                };
+                                write_frame_reg_fast(frame, regs, cycle_collector, dest, struct_value)
+                            }
+                            OP_NEW_ENUM_UNIT => {
+                                let dest = packed.a();
+                                let w0 = extra_args[packed.bx() as usize];
+                                let enum_name_idx = (w0 & 0xFFFF) as u16;
+                                let variant_idx = (w0 >> 16) as u16;
+                                let obj = match &ic_slots[ip] {
+                                    ChunkIcSlot::EnumUnit { object } => Rc::clone(object),
+                                    _ => {
+                                        let enum_str = constants[enum_name_idx as usize]
+                                            .as_string()
+                                            .ok_or_else(|| LustError::RuntimeError {
+                                                message: "Enum name must be a string".to_string(),
+                                            })?;
+                                        let variant_str = constants[variant_idx as usize]
+                                            .as_string()
+                                            .ok_or_else(|| LustError::RuntimeError {
+                                                message: "Variant name must be a string"
+                                                    .to_string(),
+                                            })?;
+                                        #[cfg(feature = "std")]
+                                        let obj = if enum_str == "Option" && variant_str == "None"
+                                        {
+                                            option_none_singleton()
+                                        } else {
+                                            let e_name = Name::from(enum_str);
+                                            let v_name = Name::from(variant_str);
+                                            let key = (
+                                                e_name.inner_ptr() as usize,
+                                                v_name.inner_ptr() as usize,
+                                            );
+                                            Rc::clone(unit_enums.entry(key).or_insert_with(|| {
+                                                EnumObject::new(e_name, v_name, None)
+                                            }))
+                                        };
+                                        #[cfg(not(feature = "std"))]
+                                        let obj = {
+                                            let e_name = Name::from(enum_str);
+                                            let v_name = Name::from(variant_str);
+                                            let key = (
+                                                e_name.inner_ptr() as usize,
+                                                v_name.inner_ptr() as usize,
+                                            );
+                                            Rc::clone(unit_enums.entry(key).or_insert_with(|| {
+                                                EnumObject::new(e_name, v_name, None)
+                                            }))
+                                        };
+                                        ic_slots[ip] = ChunkIcSlot::EnumUnit {
+                                            object: Rc::clone(&obj),
+                                        };
+                                        obj
+                                    }
+                                };
+                                write_frame_reg_fast(frame, regs, cycle_collector, dest, Value::Enum(obj))
+                            }
+                            OP_NEW_ENUM_VARIANT => {
+                                let dest = packed.a();
+                                let ex = packed.bx() as usize;
+                                let w0 = extra_args[ex];
+                                let w1 = extra_args[ex + 1];
+                                let enum_name_idx = (w0 & 0xFFFF) as u16;
+                                let variant_idx = (w0 >> 16) as u16;
+                                let first_value = (w1 & 0xFF) as u8;
+                                let value_count = ((w1 >> 8) & 0xFF) as u8;
+                                budgets.charge_value_vec(value_count as usize)?;
+                                let (enum_name, variant_name) = match &ic_slots[ip] {
+                                    ChunkIcSlot::EnumVariantNames {
+                                        enum_name,
+                                        variant_name,
+                                    } => (enum_name.clone(), variant_name.clone()),
+                                    _ => {
+                                        let enum_str = constants[enum_name_idx as usize]
+                                            .as_string()
+                                            .ok_or_else(|| LustError::RuntimeError {
+                                                message: "Enum name must be a string".to_string(),
+                                            })?;
+                                        let variant_str = constants[variant_idx as usize]
+                                            .as_string()
+                                            .ok_or_else(|| LustError::RuntimeError {
+                                                message: "Variant name must be a string"
+                                                    .to_string(),
+                                            })?;
+                                        let enum_name = Name::from(enum_str);
+                                        let variant_name = Name::from(variant_str);
+                                        ic_slots[ip] = ChunkIcSlot::EnumVariantNames {
+                                            enum_name: enum_name.clone(),
+                                            variant_name: variant_name.clone(),
+                                        };
+                                        (enum_name, variant_name)
+                                    }
+                                };
+                                let mut values = Vec::with_capacity(value_count as usize);
+                                for i in 0..value_count {
+                                    values.push(
+                                        regs[(first_value as usize) + (i as usize)]
+                                            .fast_clone(),
+                                    );
+                                }
+                                let val = Value::Enum(EnumObject::new(
+                                    enum_name,
+                                    variant_name,
+                                    Some(values),
+                                ));
+                                write_frame_reg_fast(frame, regs, cycle_collector, dest, val)
+                            }
+                            OP_GET_FIELD_SLOT => {
+                                let dest = packed.a();
+                                let obj = packed.b();
+                                let slot_idx = packed.c();
+                                let val = match &regs[obj as usize] {
+                                    Value::Struct(s) if s.name != "LuaTable" => {
+                                        let idx = slot_idx as usize;
+                                        let borrowed = s.fields.borrow();
+                                        match borrowed.get(idx) {
+                                            Some(v) => {
+                                                let cloned = v.fast_clone();
+                                                drop(borrowed);
+                                                if s.layout.has_weak_fields() {
+                                                    s.layout.materialize_field_value(idx, cloned)
+                                                } else {
+                                                    cloned
+                                                }
+                                            }
+                                            None => Value::Nil,
+                                        }
+                                    }
+                                    _ => {
+                                        break 'frame_fast FrameExit::Slow(
+                                            instructions[ip],
+                                            ip_before_execution,
+                                        );
+                                    }
+                                };
+                                if val.is_plain() {
+                                    write_frame_reg_scalar(regs, dest, val)
+                                } else {
+                                    write_frame_reg_fast(frame, regs, cycle_collector, dest, val)
+                                }
+                            }
+                            OP_SET_FIELD_SLOT => {
+                                let obj_reg = packed.a();
+                                let slot_idx = packed.b();
+                                let value_reg = packed.c();
+                                let is_fast_struct = matches!(
+                                    &regs[obj_reg as usize],
+                                    Value::Struct(s) if s.name != "LuaTable"
+                                );
+                                if !is_fast_struct {
+                                    break 'frame_fast FrameExit::Slow(
+                                        instructions[ip],
+                                        ip_before_execution,
+                                    );
+                                }
+                                let value = regs[value_reg as usize].fast_clone();
+                                if !crate::vm::cycle::CycleCollector::is_leaf(&value) {
+                                    cycle_collector.record_mutation();
+                                }
+                                let Value::Struct(s) = &regs[obj_reg as usize] else {
+                                    unreachable!()
+                                };
+                                let idx = slot_idx as usize;
+                                {
+                                    let mut borrowed = s.fields.borrow_mut();
+                                    if idx < borrowed.len() {
+                                        let canonical = if s.layout.has_weak_fields() {
+                                            s.layout
+                                                .canonicalize_field_value(idx, value)
+                                                .map_err(|message| LustError::RuntimeError {
+                                                    message,
+                                                })?
+                                        } else {
+                                            value
+                                        };
+                                        borrowed[idx] = canonical;
+                                    } else {
+                                        return Err(LustError::RuntimeError {
+                                            message: format!(
+                                                "Struct '{}' field index {} out of bounds (len {})",
+                                                s.name,
+                                                idx,
+                                                borrowed.len()
+                                            ),
+                                        });
+                                    }
+                                }
+                                if !struct_tostring_cache.is_empty() {
+                                    let key = Rc::as_ptr(s) as usize;
+                                    struct_tostring_cache.remove(&key);
+                                }
+                                false
+                            }
+                            OP_GET_FIELD_ADD_SET_INT => {
+                                let obj_reg = packed.a();
+                                let slot_idx = packed.b();
+                                let addend_reg = packed.c();
+                                let (Value::Struct(s), Value::Int(delta)) =
+                                    (&regs[obj_reg as usize], &regs[addend_reg as usize])
+                                else {
+                                    break 'frame_fast FrameExit::Slow(
+                                        instructions[ip],
+                                        ip_before_execution,
+                                    );
+                                };
+                                if s.name == "LuaTable" || s.layout.has_weak_fields() {
+                                    break 'frame_fast FrameExit::Slow(
+                                        instructions[ip],
+                                        ip_before_execution,
+                                    );
+                                }
+                                let idx = slot_idx as usize;
+                                let updated = {
+                                    let mut borrowed = s.fields.borrow_mut();
+                                    let Some(slot_val) = borrowed.get_mut(idx) else {
+                                        return Err(LustError::RuntimeError {
+                                            message: format!(
+                                                "Struct '{}' field index {} out of bounds (len {})",
+                                                s.name,
+                                                idx,
+                                                borrowed.len()
+                                            ),
+                                        });
+                                    };
+                                    if let Value::Int(cur) = *slot_val {
+                                        *slot_val = Value::Int(cur.wrapping_add(*delta));
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                };
+                                if !updated {
+                                    break 'frame_fast FrameExit::Slow(
+                                        instructions[ip],
+                                        ip_before_execution,
+                                    );
+                                }
+                                if !struct_tostring_cache.is_empty() {
+                                    let key = Rc::as_ptr(s) as usize;
+                                    struct_tostring_cache.remove(&key);
+                                }
+                                false
+                            }
+                            OP_GET_FIELD => {
+                                let dest = packed.a();
+                                let w0 = extra_args[packed.bx() as usize];
+                                let obj = (w0 & 0xFF) as u8;
+                                let field_idx = (w0 >> 16) as u16;
+                                let val = match &regs[obj as usize] {
+                                    Value::Struct(s) if s.name != "LuaTable" => {
+                                        let cur_layout_ptr = Rc::as_ptr(&s.layout) as usize;
+                                        let resolved_slot = match &ic_slots[ip] {
+                                            ChunkIcSlot::FieldSlot {
+                                                layout_ptr,
+                                                slot_idx,
+                                                ..
+                                            } if *layout_ptr == cur_layout_ptr => Some(*slot_idx),
+                                            _ => {
+                                                let field_name = constants[field_idx as usize]
+                                                    .as_string_rc()
+                                                    .ok_or_else(|| LustError::RuntimeError {
+                                                        message: "Field name must be a string"
+                                                            .to_string(),
+                                                    })?;
+                                                let idx_opt = s
+                                                    .layout
+                                                    .index_of_rc(&field_name)
+                                                    .or_else(|| {
+                                                        s.layout.index_of_str(field_name.as_str())
+                                                    })
+                                                    .or_else(|| {
+                                                        s.layout
+                                                            .field_names()
+                                                            .iter()
+                                                            .position(|n| {
+                                                                n.as_str() == field_name.as_str()
+                                                            })
+                                                    });
+                                                if let Some(slot_idx) = idx_opt {
+                                                    ic_slots[ip] = ChunkIcSlot::FieldSlot {
+                                                        layout_ptr: cur_layout_ptr,
+                                                        layout: Rc::clone(&s.layout),
+                                                        slot_idx,
+                                                    };
+                                                }
+                                                idx_opt
+                                            }
+                                        };
+                                        match resolved_slot {
+                                            Some(idx) => {
+                                                let borrowed = s.fields.borrow();
+                                                match borrowed.get(idx) {
+                                                    Some(v) => {
+                                                        let cloned = v.fast_clone();
+                                                        drop(borrowed);
+                                                        if s.layout.has_weak_fields() {
+                                                            s.layout
+                                                                .materialize_field_value(idx, cloned)
+                                                        } else {
+                                                            cloned
+                                                        }
+                                                    }
+                                                    None => Value::Nil,
+                                                }
+                                            }
+                                            None => Value::Nil,
+                                        }
                                     }
                                     Value::Map(map) => {
                                         let field_name = constants[field_idx as usize]
@@ -1257,43 +2065,109 @@ impl VM {
                                     }
                                     _ => {
                                         break 'frame_fast FrameExit::Slow(
-                                            instruction,
+                                            instructions[ip],
                                             ip_before_execution,
                                         );
                                     }
                                 };
-                                write_frame_reg_fast(frame, cycle_collector, dest, val)
+                                if val.is_plain() {
+                                    write_frame_reg_scalar(regs, dest, val)
+                                } else {
+                                    write_frame_reg_fast(frame, regs, cycle_collector, dest, val)
+                                }
                             }
-                            Instruction::SetField(obj_reg, field_idx, value_reg) => {
-                                let is_fast_target = match &frame.registers[obj_reg as usize] {
+                            OP_SET_FIELD => {
+                                let obj_reg = packed.a();
+                                let w0 = extra_args[packed.bx() as usize];
+                                let value_reg = (w0 & 0xFF) as u8;
+                                let field_idx = (w0 >> 16) as u16;
+                                let is_fast_target = match &regs[obj_reg as usize] {
                                     Value::Struct(s) => s.name != "LuaTable",
                                     Value::Map(_) => true,
                                     _ => false,
                                 };
                                 if !is_fast_target {
                                     break 'frame_fast FrameExit::Slow(
-                                        instruction,
+                                        instructions[ip],
                                         ip_before_execution,
                                     );
                                 }
-                                let field_name = constants[field_idx as usize]
-                                    .as_string_rc()
-                                    .ok_or_else(|| LustError::RuntimeError {
-                                        message: "Field name must be a string".to_string(),
-                                    })?;
-                                let value = frame.registers[value_reg as usize].fast_clone();
-                                match &frame.registers[obj_reg as usize] {
-                                    Value::Struct(_) => {
-                                        let invalidate_key =
-                                            Self::struct_cache_key(&frame.registers[obj_reg as usize]);
-                                        frame.registers[obj_reg as usize]
-                                            .struct_set_field_rc(&field_name, value)
-                                            .map_err(|message| LustError::RuntimeError { message })?;
-                                        if let Some(key) = invalidate_key {
+                                let value = regs[value_reg as usize].fast_clone();
+                                match &regs[obj_reg as usize] {
+                                    Value::Struct(s) => {
+                                        let cur_layout_ptr = Rc::as_ptr(&s.layout) as usize;
+                                        let idx = match &ic_slots[ip] {
+                                            ChunkIcSlot::FieldSlot {
+                                                layout_ptr,
+                                                slot_idx,
+                                                ..
+                                            } if *layout_ptr == cur_layout_ptr => *slot_idx,
+                                            _ => {
+                                                let field_name = constants[field_idx as usize]
+                                                    .as_string_rc()
+                                                    .ok_or_else(|| LustError::RuntimeError {
+                                                        message: "Field name must be a string"
+                                                            .to_string(),
+                                                    })?;
+                                                let slot_idx = s
+                                                    .layout
+                                                    .index_of_rc(&field_name)
+                                                    .or_else(|| {
+                                                        s.layout.index_of_str(field_name.as_str())
+                                                    })
+                                                    .ok_or_else(|| LustError::RuntimeError {
+                                                        message: format!(
+                                                            "Struct '{}' has no field '{}'",
+                                                            s.layout.name(),
+                                                            field_name.as_str()
+                                                        ),
+                                                    })?;
+                                                ic_slots[ip] = ChunkIcSlot::FieldSlot {
+                                                    layout_ptr: cur_layout_ptr,
+                                                    layout: Rc::clone(&s.layout),
+                                                    slot_idx,
+                                                };
+                                                slot_idx
+                                            }
+                                        };
+                                        if !crate::vm::cycle::CycleCollector::is_leaf(&value) {
+                                            cycle_collector.record_mutation();
+                                        }
+                                        {
+                                            let mut borrowed = s.fields.borrow_mut();
+                                            if idx < borrowed.len() {
+                                                let canonical = if s.layout.has_weak_fields() {
+                                                    s.layout
+                                                        .canonicalize_field_value(idx, value)
+                                                        .map_err(|message| {
+                                                            LustError::RuntimeError { message }
+                                                        })?
+                                                } else {
+                                                    value
+                                                };
+                                                borrowed[idx] = canonical;
+                                            } else {
+                                                return Err(LustError::RuntimeError {
+                                                    message: format!(
+                                                        "Struct '{}' field index {} out of bounds (len {})",
+                                                        s.name,
+                                                        idx,
+                                                        borrowed.len()
+                                                    ),
+                                                });
+                                            }
+                                        }
+                                        if !struct_tostring_cache.is_empty() {
+                                            let key = Rc::as_ptr(s) as usize;
                                             struct_tostring_cache.remove(&key);
                                         }
                                     }
                                     Value::Map(map) => {
+                                        let field_name = constants[field_idx as usize]
+                                            .as_string_rc()
+                                            .ok_or_else(|| LustError::RuntimeError {
+                                                message: "Field name must be a string".to_string(),
+                                            })?;
                                         let key = ValueKey::from(field_name);
                                         if budgets.mem_budget_enabled()
                                             && !map.borrow().contains_key(&key)
@@ -1306,29 +2180,32 @@ impl VM {
                                 }
                                 false
                             }
-                            Instruction::Concat(dest, lhs, rhs) => {
+                            OP_CONCAT => {
+                                let dest = packed.a();
+                                let lhs = packed.b();
+                                let rhs = packed.c();
                                 let both_strings = matches!(
                                     (
-                                        &frame.registers[lhs as usize],
-                                        &frame.registers[rhs as usize]
+                                        &regs[lhs as usize],
+                                        &regs[rhs as usize]
                                     ),
                                     (Value::String(_), Value::String(_))
                                 );
                                 if !both_strings {
                                     break 'frame_fast FrameExit::Slow(
-                                        instruction,
+                                        instructions[ip],
                                         ip_before_execution,
                                     );
                                 }
                                 let mut in_place_done = false;
                                 if dest == lhs {
-                                    let right_rc = match &frame.registers[rhs as usize] {
+                                    let right_rc = match &regs[rhs as usize] {
                                         Value::String(s) => Rc::clone(s),
                                         _ => unreachable!(),
                                     };
                                     let right_len = right_rc.len();
                                     if let Value::String(ref mut rc) =
-                                        frame.registers[dest as usize]
+                                        regs[dest as usize]
                                     {
                                         if let Some(s_mut) = Rc::get_mut(rc) {
                                             budgets.charge_mem_bytes(right_len)?;
@@ -1339,8 +2216,8 @@ impl VM {
                                 }
                                 if !in_place_done {
                                     let (left_rc, right_rc) = match (
-                                        &frame.registers[lhs as usize],
-                                        &frame.registers[rhs as usize],
+                                        &regs[lhs as usize],
+                                        &regs[rhs as usize],
                                     ) {
                                         (Value::String(l), Value::String(r)) => {
                                             (Rc::clone(l), Rc::clone(r))
@@ -1358,6 +2235,7 @@ impl VM {
                                     combined.push_str(right_rc.as_str());
                                     write_frame_reg_fast(
                                         frame,
+                                        regs,
                                         cycle_collector,
                                         dest,
                                         Value::string(combined),
@@ -1366,14 +2244,17 @@ impl VM {
                                     false
                                 }
                             }
-                            Instruction::GetIndex(dest, array_reg, index_reg) => {
-                                let Value::Array(arr) = &frame.registers[array_reg as usize] else {
+                            OP_GET_INDEX => {
+                                let dest = packed.a();
+                                let array_reg = packed.b();
+                                let index_reg = packed.c();
+                                let Value::Array(arr) = &regs[array_reg as usize] else {
                                     break 'frame_fast FrameExit::Slow(
-                                        instruction,
+                                        instructions[ip],
                                         ip_before_execution,
                                     );
                                 };
-                                let idx = frame.registers[index_reg as usize]
+                                let idx = regs[index_reg as usize]
                                     .as_int()
                                     .ok_or_else(|| LustError::RuntimeError {
                                         message: "Array index must be an integer".to_string(),
@@ -1396,19 +2277,22 @@ impl VM {
                                     });
                                 };
                                 if result.is_plain() {
-                                    write_frame_reg_scalar(frame, dest, result)
+                                    write_frame_reg_scalar(regs, dest, result)
                                 } else {
-                                    write_frame_reg_fast(frame, cycle_collector, dest, result)
+                                    write_frame_reg_fast(frame, regs, cycle_collector, dest, result)
                                 }
                             }
-                            Instruction::ArrayGetUnwrap(dest, array_reg, index_reg) => {
-                                let Value::Array(arr) = &frame.registers[array_reg as usize] else {
-                                    let ty = frame.registers[array_reg as usize].type_of();
+                            OP_ARRAY_GET_UNWRAP => {
+                                let dest = packed.a();
+                                let array_reg = packed.b();
+                                let index_reg = packed.c();
+                                let Value::Array(arr) = &regs[array_reg as usize] else {
+                                    let ty = regs[array_reg as usize].type_of();
                                     return Err(LustError::RuntimeError {
                                         message: format!("array.get expects an array, got {:?}", ty),
                                     });
                                 };
-                                let idx = frame.registers[index_reg as usize]
+                                let idx = regs[index_reg as usize]
                                     .as_int()
                                     .ok_or_else(|| LustError::RuntimeError {
                                         message: "Array index must be an integer".to_string(),
@@ -1431,14 +2315,16 @@ impl VM {
                                     });
                                 };
                                 if result.is_plain() {
-                                    write_frame_reg_scalar(frame, dest, result)
+                                    write_frame_reg_scalar(regs, dest, result)
                                 } else {
-                                    write_frame_reg_fast(frame, cycle_collector, dest, result)
+                                    write_frame_reg_fast(frame, regs, cycle_collector, dest, result)
                                 }
                             }
-                            Instruction::ArrayPush(array_reg, value_reg) => {
-                                let Value::Array(arr) = &frame.registers[array_reg as usize] else {
-                                    let ty = frame.registers[array_reg as usize].type_of();
+                            OP_ARRAY_PUSH => {
+                                let array_reg = packed.a();
+                                let value_reg = packed.b();
+                                let Value::Array(arr) = &regs[array_reg as usize] else {
+                                    let ty = regs[array_reg as usize].type_of();
                                     return Err(LustError::RuntimeError {
                                         message: format!(
                                             "array.push expects an array, got {:?}",
@@ -1446,7 +2332,7 @@ impl VM {
                                         ),
                                     });
                                 };
-                                let value = frame.registers[value_reg as usize].fast_clone();
+                                let value = regs[value_reg as usize].fast_clone();
                                 charge_array_push_budget(budgets, arr, &value)?;
                                 if !crate::vm::cycle::CycleCollector::is_leaf(&value) {
                                     cycle_collector.record_mutation();
@@ -1458,20 +2344,23 @@ impl VM {
                                 );
                                 false
                             }
-                            Instruction::SetIndex(collection_reg, index_reg, value_reg) => {
-                                let Value::Array(arr) = &frame.registers[collection_reg as usize]
+                            OP_SET_INDEX => {
+                                let collection_reg = packed.a();
+                                let index_reg = packed.b();
+                                let value_reg = packed.c();
+                                let Value::Array(arr) = &regs[collection_reg as usize]
                                 else {
                                     break 'frame_fast FrameExit::Slow(
-                                        instruction,
+                                        instructions[ip],
                                         ip_before_execution,
                                     );
                                 };
-                                let idx = frame.registers[index_reg as usize]
+                                let idx = regs[index_reg as usize]
                                     .as_int()
                                     .ok_or_else(|| LustError::RuntimeError {
                                         message: "Array index must be an integer".to_string(),
                                     })?;
-                                let value = frame.registers[value_reg as usize].fast_clone();
+                                let value = regs[value_reg as usize].fast_clone();
                                 if let Some(res) =
                                     crate::bytecode::value::set_specialized_cached_element(
                                         arr, idx, &value,
@@ -1505,14 +2394,19 @@ impl VM {
                                 }
                                 false
                             }
-                            Instruction::ArrayIndexOk(val_dest, cond_dest, array_reg, idx_reg) => {
-                                let Value::Array(arr) = &frame.registers[array_reg as usize] else {
-                                    let ty = frame.registers[array_reg as usize].type_of();
+                            OP_ARRAY_INDEX_OK => {
+                                let val_dest = packed.a();
+                                let w0 = extra_args[packed.bx() as usize];
+                                let cond_dest = (w0 & 0xFF) as u8;
+                                let array_reg = ((w0 >> 8) & 0xFF) as u8;
+                                let idx_reg = ((w0 >> 16) & 0xFF) as u8;
+                                let Value::Array(arr) = &regs[array_reg as usize] else {
+                                    let ty = regs[array_reg as usize].type_of();
                                     return Err(LustError::RuntimeError {
                                         message: format!("Cannot index {:?}", ty),
                                     });
                                 };
-                                let idx = frame.registers[idx_reg as usize]
+                                let idx = regs[idx_reg as usize]
                                     .as_int()
                                     .ok_or_else(|| LustError::RuntimeError {
                                         message: "Array index must be an integer".to_string(),
@@ -1536,22 +2430,24 @@ impl VM {
                                 };
                                 if let Some(val) = found {
                                     let c1 = if val.is_plain() {
-                                        write_frame_reg_scalar(frame, val_dest, val)
+                                        write_frame_reg_scalar(regs, val_dest, val)
                                     } else {
-                                        write_frame_reg_fast(frame, cycle_collector, val_dest, val)
+                                        write_frame_reg_fast(frame, regs, cycle_collector, val_dest, val)
                                     };
                                     let c2 = write_frame_reg_scalar(
-                                        frame,
+                                        regs,
                                         cond_dest,
                                         Value::Bool(true),
                                     );
                                     c1 || c2
                                 } else {
-                                    write_frame_reg_scalar(frame, cond_dest, Value::Bool(false))
+                                    write_frame_reg_scalar(regs, cond_dest, Value::Bool(false))
                                 }
                             }
-                            Instruction::ArrayLen(dest, array_reg) => {
-                                let len = match &frame.registers[array_reg as usize] {
+                            OP_ARRAY_LEN => {
+                                let dest = packed.a();
+                                let array_reg = packed.b();
+                                let len = match &regs[array_reg as usize] {
                                     Value::Array(arr) => {
                                         crate::bytecode::value::get_specialized_cached_len(arr)
                                             .unwrap_or_else(|| arr.len_fast())
@@ -1566,15 +2462,17 @@ impl VM {
                                     }
                                 };
                                 write_frame_reg_scalar(
-                                    frame,
+                                    regs,
                                     dest,
                                     Value::Int(int_from_usize(len)),
                                 )
                             }
-                            Instruction::LoadUpvalue(dest, upvalue_idx) => {
+                            OP_LOAD_UPVALUE => {
+                                let dest = packed.a();
+                                let upvalue_idx = packed.b();
                                 if (upvalue_idx as usize) < frame.upvalues.len() {
                                     let value = frame.upvalues[upvalue_idx as usize].clone();
-                                    write_frame_reg_fast(frame, cycle_collector, dest, value)
+                                    write_frame_reg_fast(frame, regs, cycle_collector, dest, value)
                                 } else {
                                     return Err(LustError::RuntimeError {
                                         message: format!(
@@ -1585,8 +2483,10 @@ impl VM {
                                     });
                                 }
                             }
-                            Instruction::StoreUpvalue(upvalue_idx, src) => {
-                                let value = frame.registers[src as usize].clone();
+                            OP_STORE_UPVALUE => {
+                                let upvalue_idx = packed.a();
+                                let src = packed.b();
+                                let value = regs[src as usize].clone();
                                 let idx = upvalue_idx as usize;
                                 if idx < frame.upvalues.len() {
                                     frame.upvalues[idx] = value.clone();
@@ -1605,22 +2505,392 @@ impl VM {
                                 }
                             }
 
+                            OP_CALL => {
+                                let callee_reg = packed.a();
+                                if allow_inloop_calls
+                                    && let Value::Function(target_func_idx) =
+                                        regs[callee_reg as usize]
+                                {
+                                    let w0 = extra_args[packed.bx() as usize];
+                                    break 'intra FastStep::InLoopCall {
+                                        target_func_idx,
+                                        first_arg: (w0 & 0xFF) as u8,
+                                        arg_count: ((w0 >> 8) & 0xFF) as u8,
+                                        dest: ((w0 >> 16) & 0xFF) as u8,
+                                        ip_before_execution,
+                                    };
+                                }
+                                break 'frame_fast FrameExit::Slow(
+                                    instructions[ip],
+                                    ip_before_execution,
+                                );
+                            }
+                            OP_CALL_METHOD => {
+                                let obj_reg = packed.a();
+                                if allow_inloop_calls
+                                    && let Value::Struct(receiver) = &regs[obj_reg as usize]
+                                    && receiver.name != "LuaTable"
+                                {
+                                    let ex = packed.bx() as usize;
+                                    let w0 = extra_args[ex];
+                                    let w1 = extra_args[ex + 1];
+                                    let method_const = (w0 & 0xFFFF) as u16;
+                                    let first_arg = ((w0 >> 16) & 0xFF) as u8;
+                                    let arg_count = (w0 >> 24) as u8;
+                                    let dest = (w1 & 0xFF) as u8;
+                                    let recv_layout_ptr = Rc::as_ptr(&receiver.layout) as usize;
+                                    let target_opt = match &ic_slots[ip] {
+                                        ChunkIcSlot::MethodCall {
+                                            layout_ptr,
+                                            target_func_idx,
+                                            ..
+                                        } if *layout_ptr == recv_layout_ptr => {
+                                            Some(*target_func_idx)
+                                        }
+                                        _ => {
+                                            let key =
+                                                (recv_layout_ptr, cur_func_idx, method_const);
+                                            let found = method_cache.get(&key).copied().or_else(
+                                                || {
+                                                    let method_name =
+                                                        constants[method_const as usize]
+                                                            .as_string()?;
+                                                    if method_name == "try_unwrap" {
+                                                        return None;
+                                                    }
+                                                    let mangled_name = format!(
+                                                        "{}:{}",
+                                                        receiver.name.as_str(),
+                                                        method_name
+                                                    );
+                                                    let idx = functions
+                                                        .iter()
+                                                        .position(|f| f.name == mangled_name)?;
+                                                    method_cache.insert(key, idx);
+                                                    Some(idx)
+                                                },
+                                            );
+                                            if let Some(target_func_idx) = found {
+                                                ic_slots[ip] = ChunkIcSlot::MethodCall {
+                                                    layout_ptr: recv_layout_ptr,
+                                                    layout: Rc::clone(&receiver.layout),
+                                                    target_func_idx,
+                                                };
+                                            }
+                                            found
+                                        }
+                                    };
+                                    if let Some(target_func_idx) = target_opt {
+                                        break 'intra FastStep::InLoopCallMethod {
+                                            target_func_idx,
+                                            obj_reg,
+                                            first_arg,
+                                            arg_count,
+                                            dest,
+                                            ip_before_execution,
+                                        };
+                                    }
+                                }
+                                break 'frame_fast FrameExit::Slow(
+                                    instructions[ip],
+                                    ip_before_execution,
+                                );
+                            }
+                            OP_RETURN => {
+                                let ret_reg = packed.a();
+                                if allow_inloop_calls && !has_active_finalizers {
+                                    break 'intra FastStep::InLoopReturn {
+                                        ret_reg,
+                                        ip_before_execution,
+                                    };
+                                }
+                                break 'frame_fast FrameExit::Slow(
+                                    instructions[ip],
+                                    ip_before_execution,
+                                );
+                            }
+
                             _ => {
-                                break 'frame_fast FrameExit::Slow(instruction, ip_before_execution);
+                                break 'frame_fast FrameExit::Slow(
+                                    instructions[ip],
+                                    ip_before_execution,
+                                );
                             }
                         };
 
                         if needs_collect {
                             break 'frame_fast FrameExit::CollectCycles;
                         }
+                                }
+                            };
+
+                            match step {
+                                FastStep::InLoopCall {
+                                    target_func_idx,
+                                    first_arg,
+                                    arg_count,
+                                    dest,
+                                    ip_before_execution,
+                                } => {
+                                    let Some(target_fn) = functions.get(target_func_idx) else {
+                                        break 'frame_fast FrameExit::Slow(
+                                            instructions[ip_before_execution - 1],
+                                            ip_before_execution,
+                                        );
+                                    };
+                                    let is_trusted = call_meta
+                                        .get(target_func_idx)
+                                        .is_some_and(|m| m.trusted_signature && !m.lua_function);
+                                    if !is_trusted
+                                        || !target_fn.upvalues.is_empty()
+                                        || arg_count != target_fn.param_count
+                                    {
+                                        break 'frame_fast FrameExit::Slow(
+                                            instructions[ip_before_execution - 1],
+                                            ip_before_execution,
+                                        );
+                                    }
+                                    let caller_frame = &call_stack[cur_frame_idx];
+                                    let caller_base = caller_frame.base_reg;
+                                    let caller_reg_count = caller_frame.reg_count as usize;
+                                    if arg_count > 0
+                                        && (first_arg as usize) + (arg_count as usize)
+                                            > caller_reg_count
+                                    {
+                                        break 'frame_fast FrameExit::Slow(
+                                            instructions[ip_before_execution - 1],
+                                            ip_before_execution,
+                                        );
+                                    }
+                                    if call_stack.len() >= max_stack_depth {
+                                        return Err(LustError::RuntimeError {
+                                            message: "Stack overflow".to_string(),
+                                        });
+                                    }
+                                    let new_base = caller_base + caller_reg_count;
+                                    let target_reg_count: u16 = if target_fn.register_count > 0 {
+                                        (target_fn.register_count as u16)
+                                            .max(target_fn.param_count as u16)
+                                    } else {
+                                        256
+                                    };
+                                    let needed = new_base + target_reg_count as usize;
+                                    if vm_registers.len() < needed {
+                                        let extra = needed - vm_registers.len();
+                                        vm_registers.try_reserve(extra).map_err(|_| {
+                                            LustError::RuntimeError {
+                                                message:
+                                                    "Out of memory allocating VM register window"
+                                                        .to_string(),
+                                            }
+                                        })?;
+                                        vm_registers.resize(needed, Value::Nil);
+                                    }
+                                    let mut callee_non_plain_mask: u64 = 0;
+                                    for i in 0..arg_count as usize {
+                                        let src_idx =
+                                            caller_base + first_arg.wrapping_add(i as u8) as usize;
+                                        let val = vm_registers[src_idx].fast_clone();
+                                        if !val.is_plain() {
+                                            callee_non_plain_mask |= 1u64 << i.min(63);
+                                        }
+                                        vm_registers[new_base + i] = val;
+                                    }
+                                    if let Some(meta) = call_meta.get_mut(target_func_idx) {
+                                        meta.active_depth = meta.active_depth.saturating_add(1);
+                                    }
+                                    call_stack.push(CallFrame {
+                                        function_idx: target_func_idx,
+                                        ip: 0,
+                                        base_reg: new_base,
+                                        reg_count: target_reg_count,
+                                        return_dest: Some(dest),
+                                        non_plain_mask: callee_non_plain_mask,
+                                        upvalues: Vec::new(),
+                                        shared_upvalues: Vec::new(),
+                                        saved_registers: None,
+                                    });
+                                    cur_frame_idx = call_stack.len() - 1;
+                                    if target_func_idx == cur_func_idx {
+                                        continue 'same_func;
+                                    }
+                                    cur_func_idx = target_func_idx;
+                                    continue 'frame_fast;
+                                }
+                                FastStep::InLoopCallMethod {
+                                    target_func_idx,
+                                    obj_reg,
+                                    first_arg,
+                                    arg_count,
+                                    dest,
+                                    ip_before_execution,
+                                } => {
+                                    let Some(target_fn) = functions.get(target_func_idx) else {
+                                        break 'frame_fast FrameExit::Slow(
+                                            instructions[ip_before_execution - 1],
+                                            ip_before_execution,
+                                        );
+                                    };
+                                    let is_trusted = call_meta
+                                        .get(target_func_idx)
+                                        .is_some_and(|m| m.trusted_signature && !m.lua_function);
+                                    if !is_trusted
+                                        || !target_fn.upvalues.is_empty()
+                                        || (1usize + arg_count as usize)
+                                            != target_fn.param_count as usize
+                                    {
+                                        break 'frame_fast FrameExit::Slow(
+                                            instructions[ip_before_execution - 1],
+                                            ip_before_execution,
+                                        );
+                                    }
+                                    let caller_frame = &call_stack[cur_frame_idx];
+                                    let caller_base = caller_frame.base_reg;
+                                    let caller_reg_count = caller_frame.reg_count as usize;
+                                    if (obj_reg as usize) >= caller_reg_count
+                                        || (arg_count > 0
+                                            && (first_arg as usize) + (arg_count as usize)
+                                                > caller_reg_count)
+                                    {
+                                        break 'frame_fast FrameExit::Slow(
+                                            instructions[ip_before_execution - 1],
+                                            ip_before_execution,
+                                        );
+                                    }
+                                    if call_stack.len() >= max_stack_depth {
+                                        return Err(LustError::RuntimeError {
+                                            message: "Stack overflow".to_string(),
+                                        });
+                                    }
+                                    let new_base = caller_base + caller_reg_count;
+                                    let target_reg_count: u16 = if target_fn.register_count > 0 {
+                                        (target_fn.register_count as u16)
+                                            .max(target_fn.param_count as u16)
+                                    } else {
+                                        256
+                                    };
+                                    let needed = new_base + target_reg_count as usize;
+                                    if vm_registers.len() < needed {
+                                        let extra = needed - vm_registers.len();
+                                        vm_registers.try_reserve(extra).map_err(|_| {
+                                            LustError::RuntimeError {
+                                                message:
+                                                    "Out of memory allocating VM register window"
+                                                        .to_string(),
+                                            }
+                                        })?;
+                                        vm_registers.resize(needed, Value::Nil);
+                                    }
+                                    let mut callee_non_plain_mask: u64 = 0;
+                                    let recv_val =
+                                        vm_registers[caller_base + obj_reg as usize].fast_clone();
+                                    if !recv_val.is_plain() {
+                                        callee_non_plain_mask |= 1u64;
+                                    }
+                                    vm_registers[new_base] = recv_val;
+                                    for i in 0..arg_count as usize {
+                                        let src_idx =
+                                            caller_base + first_arg.wrapping_add(i as u8) as usize;
+                                        let val = vm_registers[src_idx].fast_clone();
+                                        if !val.is_plain() {
+                                            callee_non_plain_mask |= 1u64 << (i + 1).min(63);
+                                        }
+                                        vm_registers[new_base + 1 + i] = val;
+                                    }
+                                    if let Some(meta) = call_meta.get_mut(target_func_idx) {
+                                        meta.active_depth = meta.active_depth.saturating_add(1);
+                                    }
+                                    call_stack.push(CallFrame {
+                                        function_idx: target_func_idx,
+                                        ip: 0,
+                                        base_reg: new_base,
+                                        reg_count: target_reg_count,
+                                        return_dest: Some(dest),
+                                        non_plain_mask: callee_non_plain_mask,
+                                        upvalues: Vec::new(),
+                                        shared_upvalues: Vec::new(),
+                                        saved_registers: None,
+                                    });
+                                    cur_frame_idx = call_stack.len() - 1;
+                                    if target_func_idx == cur_func_idx {
+                                        continue 'same_func;
+                                    }
+                                    cur_func_idx = target_func_idx;
+                                    continue 'frame_fast;
+                                }
+                                FastStep::InLoopReturn {
+                                    ret_reg,
+                                    ip_before_execution,
+                                } => {
+                                    let is_trusted_ret = call_meta
+                                        .get(cur_func_idx)
+                                        .is_some_and(|m| m.trusted_signature);
+                                    if call_stack.len() <= min_inloop_return_depth
+                                        || !is_trusted_ret
+                                    {
+                                        break 'frame_fast FrameExit::Slow(
+                                            instructions[ip_before_execution - 1],
+                                            ip_before_execution,
+                                        );
+                                    }
+                                    let callee_frame = call_stack.pop().unwrap();
+                                    let callee_base = callee_frame.base_reg;
+                                    let ret_val = if ret_reg == 255 {
+                                        Value::Nil
+                                    } else {
+                                        vm_registers[callee_base + ret_reg as usize].fast_clone()
+                                    };
+                                    if let Some(meta) =
+                                        call_meta.get_mut(callee_frame.function_idx)
+                                    {
+                                        meta.active_depth = meta.active_depth.saturating_sub(1);
+                                    }
+                                    let start = callee_frame.base_reg;
+                                    let end = (start + callee_frame.reg_count as usize)
+                                        .min(vm_registers.len());
+                                    let cleared = if start < end {
+                                        CallFrame::clear_non_plain_slots(
+                                            &mut vm_registers[start..end],
+                                            callee_frame.non_plain_mask,
+                                        )
+                                    } else {
+                                        0
+                                    };
+                                    *last_frame_pop_cleanup_iters = cleared;
+
+                                    cur_frame_idx = call_stack.len() - 1;
+                                    let caller_func_idx = call_stack[cur_frame_idx].function_idx;
+                                    let mut needs_collect = false;
+                                    if let Some(dest) = callee_frame.return_dest {
+                                        let caller_frame = &mut call_stack[cur_frame_idx];
+                                        let dest_idx = dest as usize;
+                                        if !ret_val.is_plain() {
+                                            caller_frame.mark_non_plain(dest_idx);
+                                            if cycle_collector.is_enabled() {
+                                                cycle_collector.register_value(&ret_val);
+                                                needs_collect = cycle_collector.should_collect();
+                                            }
+                                        }
+                                        vm_registers[caller_frame.base_reg + dest_idx] = ret_val;
+                                    }
+                                    if needs_collect {
+                                        cur_func_idx = caller_func_idx;
+                                        break 'frame_fast FrameExit::CollectCycles;
+                                    }
+                                    if caller_func_idx == cur_func_idx {
+                                        continue 'same_func;
+                                    }
+                                    cur_func_idx = caller_func_idx;
+                                    continue 'frame_fast;
+                                }
+                            }
+                        }
                     }
                 };
 
                 match exit {
                     FrameExit::EndOfChunk => {
-                        if let Some(frame) = self.pop_call_frame() {
-                            self.recycle_frame(frame);
-                        }
+                        let _ = self.pop_call_frame();
                         if self.call_stack.is_empty() {
                             return Ok(Value::Nil);
                         }
@@ -1634,6 +2904,10 @@ impl VM {
                     }
                     FrameExit::OutOfGas(limit) => {
                         return Err(self.handle_out_of_gas_slow(limit));
+                    }
+                    FrameExit::FallbackToOuter => {
+                        frame_dirty = true;
+                        continue 'dispatch;
                     }
                     #[cfg(feature = "std")]
                     FrameExit::TryOsr(target_ip) => {
@@ -1659,13 +2933,12 @@ impl VM {
                     }
                 }
             } else {
+                let func_idx = cur_func_idx;
                 let (instruction, ip_before_execution) = {
                     let frame = &mut self.call_stack[cur_frame_idx];
                     let ip = frame.ip;
                     if ip >= cur_chunk_len {
-                        if let Some(frame) = self.pop_call_frame() {
-                            self.recycle_frame(frame);
-                        }
+                        let _ = self.pop_call_frame();
                         if self.call_stack.is_empty() {
                             return Ok(Value::Nil);
                         }
@@ -1717,8 +2990,11 @@ impl VM {
                             None
                         };
                         if let Some(trace_id) = root_trace_id {
-                            let frame = self.call_stack.last_mut().unwrap();
-                            let registers_ptr = frame.registers.as_mut_ptr();
+                            let (base_reg, reg_count) = {
+                                let frame = self.call_stack.last().unwrap();
+                                (frame.base_reg, frame.reg_count as usize)
+                            };
+                            let registers_ptr = self.vm_registers[base_reg..base_reg + reg_count].as_mut_ptr();
                             if let Some(trace) = self.jit.trace_handle(trace_id) {
                                 frame_dirty = true;
                                 self.jit.record_native_entry();
@@ -1752,6 +3028,9 @@ impl VM {
                                 let result = trace.execute(registers_ptr, vm_ptr, ptr::null());
                                 drop(_jit_guard);
                                 drop(trace);
+                                if let Some(frame) = self.call_stack.last_mut() {
+                                    frame.non_plain_mask = u64::MAX;
+                                }
                                 self.sync_gas_from_cells();
 
                                 #[cfg(target_arch = "x86_64")]
@@ -1985,8 +3264,9 @@ impl VM {
                                         .contains(&(func_idx, loop_start_ip))
                                     {
                                         let frame = self.call_stack.last().unwrap();
+                                        let regs = &self.vm_registers[frame.base_reg..frame.base_reg + frame.reg_count as usize];
                                         let func = &self.functions[func_idx];
-                                        recorder.specialize_trace_inputs(&frame.registers, func);
+                                        recorder.specialize_trace_inputs(regs, func);
                                     }
                                     self.trace_recorder = Some(recorder);
                                     self.jit.recording_started();
@@ -2006,7 +3286,11 @@ impl VM {
                 if (self.slow_path_flags & SLOW_PATH_SKIP_GAS) != 0 {
                     Self::record_mutation_m1_skip_gas();
                 } else {
-                    self.budgets.gas.used = self.budgets.gas.used.saturating_add(1);
+                    self.budgets.gas.used = self
+                        .budgets
+                        .gas
+                        .used
+                        .saturating_add(u64::from(instruction.gas_weight()));
                     if self.slow_path_flags & SLOW_PATH_GAS_LIMIT != 0
                         && let Some(limit) = self.budgets.gas.limit
                         && self.budgets.gas.used > limit
@@ -2020,6 +3304,8 @@ impl VM {
                 frame_dirty = true;
                 (instruction, ip_before_execution)
             };
+            let executing_frame_index = cur_frame_idx;
+            let func_idx = cur_func_idx;
             match instruction {
                 Instruction::LoadNil(dest) => {
                     self.set_register(dest, Value::Nil)?;
@@ -2078,15 +3364,17 @@ impl VM {
                 }
 
                 Instruction::StoreGlobal(name_idx, src) => {
-                    let func = &self.functions[func_idx];
-                    let name = func.chunk.constants[name_idx as usize]
-                        .as_string()
-                        .ok_or_else(|| LustError::RuntimeError {
-                            message: "Global name must be a string".to_string(),
-                        })?;
+                    let name = {
+                        let func = &self.functions[func_idx];
+                        func.chunk.constants[name_idx as usize]
+                            .as_string()
+                            .ok_or_else(|| LustError::RuntimeError {
+                                message: "Global name must be a string".to_string(),
+                            })?
+                            .to_string()
+                    };
                     let value = self.get_register(src)?.clone();
-                    self.globals.insert(name.to_string(), value);
-                    self.globals_version = self.globals_version.wrapping_add(1);
+                    self.sync_global_insert(name, value);
                 }
 
                 Instruction::Move(dest, src) => {
@@ -2096,6 +3384,19 @@ impl VM {
 
                 Instruction::AddInt(dest, lhs, rhs) => {
                     self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Int(a.wrapping_add(b))))?;
+                }
+                Instruction::AddIntImm(dest, src, imm) => {
+                    let src_val = self.get_register(src)?;
+                    let Value::Int(a) = src_val else {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Typed numeric instruction expected int operand, got {:?}",
+                                src_val
+                            ),
+                        });
+                    };
+                    let result = Value::Int(a.wrapping_add(LustInt::from(imm)));
+                    self.set_register(dest, result)?;
                 }
                 Instruction::SubInt(dest, lhs, rhs) => {
                     self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Int(a.wrapping_sub(b))))?;
@@ -2531,14 +3832,46 @@ impl VM {
                     }
                 }
 
+                Instruction::BranchLtInt(lhs, rhs, offset) => {
+                    let left = self.get_register(lhs)?;
+                    let right = self.get_register(rhs)?;
+                    let (Value::Int(a), Value::Int(b)) = (left, right) else {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Typed numeric instruction expected int operands, got {:?} and {:?}",
+                                left, right
+                            ),
+                        });
+                    };
+                    if !(*a < *b) {
+                        let frame = self.call_stack.last_mut().unwrap();
+                        frame.ip = (frame.ip as isize + offset as isize) as usize;
+                    }
+                }
+
+                Instruction::BranchLeInt(lhs, rhs, offset) => {
+                    let left = self.get_register(lhs)?;
+                    let right = self.get_register(rhs)?;
+                    let (Value::Int(a), Value::Int(b)) = (left, right) else {
+                        return Err(LustError::RuntimeError {
+                            message: format!(
+                                "Typed numeric instruction expected int operands, got {:?} and {:?}",
+                                left, right
+                            ),
+                        });
+                    };
+                    if !(*a <= *b) {
+                        let frame = self.call_stack.last_mut().unwrap();
+                        frame.ip = (frame.ip as isize + offset as isize) as usize;
+                    }
+                }
+
                 Instruction::Call(func_reg, first_arg, arg_count, dest_reg)
                     if self.plain_function_callee(func_reg) =>
                 {
                     frame_dirty = true;
-                    let frame =
-                        self.bytecode_call_frame(func_reg, first_arg, arg_count, dest_reg)?;
-                    let callee_idx = frame.function_idx;
-                    self.push_call_frame(frame);
+                    let callee_idx =
+                        self.push_bytecode_call_frame(func_reg, first_arg, arg_count, dest_reg)?;
                     #[cfg(feature = "std")]
                     if crate::vm::tracing::has_trace_hook() {
                         let callee = &self.functions[callee_idx];
@@ -2660,13 +3993,13 @@ impl VM {
                                 args.push(self.get_register(first_arg + i)?.clone());
                             }
 
-                            let frame = self.make_checked_call_frame(
+                            self.push_checked_call_frame(
                                 func_idx,
                                 Some(dest_reg),
                                 args,
                                 Vec::new(),
+                                Vec::new(),
                             )?;
-                            self.push_call_frame(frame);
                         }
 
                         Value::Closure(closure) => {
@@ -2680,14 +4013,13 @@ impl VM {
 
                             let upvalue_values: Vec<Value> =
                                 upvalues.iter().map(|uv| uv.get()).collect();
-                            let mut frame = self.make_checked_call_frame(
+                            self.push_checked_call_frame(
                                 func_idx,
                                 Some(dest_reg),
                                 args,
                                 upvalue_values,
+                                upvalues.clone(),
                             )?;
-                            frame.shared_upvalues = upvalues.clone();
-                            self.push_call_frame(frame);
                         }
 
                         Value::NativeFunction(native_fn) => {
@@ -2840,6 +4172,15 @@ impl VM {
                         .ok_or_else(|| LustError::RuntimeError {
                             message: "Variant name must be a string".to_string(),
                         })?;
+                    #[cfg(feature = "std")]
+                    let value = if enum_name.as_str() == "Option"
+                        && variant_name.as_str() == "None"
+                    {
+                        Value::Enum(option_none_singleton())
+                    } else {
+                        self.unit_enum(&enum_name, &variant_name)
+                    };
+                    #[cfg(not(feature = "std"))]
                     let value = self.unit_enum(&enum_name, &variant_name);
                     self.set_register(dest, value)?;
                 }
@@ -3016,7 +4357,234 @@ impl VM {
                         }
                     }
 
-                    if let Some(key) = invalidate_key {
+                    if !self.struct_tostring_cache.is_empty()
+                        && let Some(key) = invalidate_key
+                    {
+                        self.struct_tostring_cache.remove(&key);
+                    }
+                }
+
+                Instruction::GetFieldSlot(dest, obj, slot_idx) => {
+                    let object = self.get_register(obj)?;
+                    let value = match object {
+                        Value::Struct(s) if s.name != "LuaTable" => object
+                            .struct_get_field_indexed(slot_idx as usize)
+                            .unwrap_or(Value::Nil),
+                        Value::Struct(s) => {
+                            let field_name = s
+                                .layout
+                                .field_names()
+                                .get(slot_idx as usize)
+                                .cloned()
+                                .ok_or_else(|| LustError::RuntimeError {
+                                    message: format!(
+                                        "Struct '{}' field index {} out of bounds",
+                                        s.name, slot_idx
+                                    ),
+                                })?;
+                            if let Some(Value::Map(map)) = Self::lua_table_map(object) {
+                                frame_dirty = true;
+                                let raw_key_value = Value::String(field_name);
+                                let key = self
+                                    .make_hash_key(&Self::lua_table_key_value(&raw_key_value))?;
+                                let borrowed = map.borrow();
+                                borrowed.get(&key).cloned().unwrap_or(Value::Nil)
+                            } else {
+                                object
+                                    .struct_get_field_indexed(slot_idx as usize)
+                                    .unwrap_or(Value::Nil)
+                            }
+                        }
+                        _ => {
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "Cannot get field slot {} from {:?}",
+                                    slot_idx, object
+                                ),
+                            });
+                        }
+                    };
+                    self.set_register(dest, value)?;
+                }
+
+                Instruction::SetFieldSlot(obj_reg, slot_idx, value_reg) => {
+                    let object = self.get_register(obj_reg)?.clone();
+                    let value = self.get_register(value_reg)?.clone();
+                    let mut invalidate_key: Option<usize> = None;
+                    match &object {
+                        Value::Struct(s) if s.name != "LuaTable" => {
+                            invalidate_key = Self::struct_cache_key(&object);
+                            if !crate::vm::cycle::CycleCollector::is_leaf(&value) {
+                                self.cycle_collector.record_mutation();
+                            }
+                            object
+                                .struct_set_field_indexed(slot_idx as usize, value)
+                                .map_err(|message| LustError::RuntimeError { message })?;
+                        }
+                        Value::Struct(s) => {
+                            let field_name = s
+                                .layout
+                                .field_names()
+                                .get(slot_idx as usize)
+                                .cloned()
+                                .ok_or_else(|| LustError::RuntimeError {
+                                    message: format!(
+                                        "Struct '{}' field index {} out of bounds",
+                                        s.name, slot_idx
+                                    ),
+                                })?;
+                            if let Some(Value::Map(map)) = Self::lua_table_map(&object) {
+                                frame_dirty = true;
+                                let raw_key_value = Value::String(field_name);
+                                let key = self
+                                    .make_hash_key(&Self::lua_table_key_value(&raw_key_value))?;
+                                if self.budgets.mem_budget_enabled()
+                                    && !map.borrow().contains_key(&key)
+                                {
+                                    self.budgets.charge_map_entry_estimate()?;
+                                }
+                                map.borrow_mut().insert(key, value);
+                            } else {
+                                invalidate_key = Self::struct_cache_key(&object);
+                                object
+                                    .struct_set_field_indexed(slot_idx as usize, value)
+                                    .map_err(|message| LustError::RuntimeError { message })?;
+                            }
+                        }
+                        _ => {
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "Cannot set field slot {} on {:?}",
+                                    slot_idx, object
+                                ),
+                            });
+                        }
+                    }
+                    if !self.struct_tostring_cache.is_empty()
+                        && let Some(key) = invalidate_key
+                    {
+                        self.struct_tostring_cache.remove(&key);
+                    }
+                }
+
+                Instruction::GetFieldAddSetInt(obj_reg, slot_idx, addend_reg) => {
+                    let object = self.get_register(obj_reg)?.clone();
+                    let addend = self.get_register(addend_reg)?.clone();
+                    let idx = slot_idx as usize;
+                    let mut invalidate_key: Option<usize> = None;
+
+                    let current = match &object {
+                        Value::Struct(s) if s.name != "LuaTable" => {
+                            let len = s.fields.borrow().len();
+                            if idx >= len {
+                                return Err(LustError::RuntimeError {
+                                    message: format!(
+                                        "Struct '{}' field index {} out of bounds (len {})",
+                                        s.name, idx, len
+                                    ),
+                                });
+                            }
+                            object
+                                .struct_get_field_indexed(idx)
+                                .unwrap_or(Value::Nil)
+                        }
+                        Value::Struct(s) => {
+                            let field_name = s
+                                .layout
+                                .field_names()
+                                .get(idx)
+                                .cloned()
+                                .ok_or_else(|| LustError::RuntimeError {
+                                    message: format!(
+                                        "Struct '{}' field index {} out of bounds",
+                                        s.name, slot_idx
+                                    ),
+                                })?;
+                            if let Some(Value::Map(map)) = Self::lua_table_map(&object) {
+                                frame_dirty = true;
+                                let raw_key_value = Value::String(field_name);
+                                let key = self
+                                    .make_hash_key(&Self::lua_table_key_value(&raw_key_value))?;
+                                let borrowed = map.borrow();
+                                borrowed.get(&key).cloned().unwrap_or(Value::Nil)
+                            } else {
+                                object
+                                    .struct_get_field_indexed(idx)
+                                    .unwrap_or(Value::Nil)
+                            }
+                        }
+                        _ => {
+                            return Err(LustError::RuntimeError {
+                                message: format!(
+                                    "Cannot get field slot {} from {:?}",
+                                    slot_idx, object
+                                ),
+                            });
+                        }
+                    };
+
+                    let sum = match (&current, &addend) {
+                        (Value::Int(a), Value::Int(b)) => Value::Int(a.wrapping_add(*b)),
+                        (Value::Float(a), Value::Float(b)) => Value::Float(a + b),
+                        (Value::Int(a), Value::Float(b)) => Value::Float(float_from_int(*a) + *b),
+                        (Value::Float(a), Value::Int(b)) => Value::Float(*a + float_from_int(*b)),
+                        (Value::String(a), Value::String(b)) => {
+                            let cap = a.len().saturating_add(b.len());
+                            self.budgets.charge_mem_bytes(cap)?;
+                            Value::string(format!("{}{}", a, b))
+                        }
+                        _ => {
+                            return Err(LustError::RuntimeError {
+                                message: format!("Cannot add {:?} and {:?}", current, addend),
+                            });
+                        }
+                    };
+
+                    match &object {
+                        Value::Struct(s) if s.name != "LuaTable" => {
+                            invalidate_key = Self::struct_cache_key(&object);
+                            if !crate::vm::cycle::CycleCollector::is_leaf(&sum) {
+                                self.cycle_collector.record_mutation();
+                            }
+                            object
+                                .struct_set_field_indexed(idx, sum)
+                                .map_err(|message| LustError::RuntimeError { message })?;
+                        }
+                        Value::Struct(s) => {
+                            let field_name = s
+                                .layout
+                                .field_names()
+                                .get(idx)
+                                .cloned()
+                                .ok_or_else(|| LustError::RuntimeError {
+                                    message: format!(
+                                        "Struct '{}' field index {} out of bounds",
+                                        s.name, slot_idx
+                                    ),
+                                })?;
+                            if let Some(Value::Map(map)) = Self::lua_table_map(&object) {
+                                frame_dirty = true;
+                                let raw_key_value = Value::String(field_name);
+                                let key = self
+                                    .make_hash_key(&Self::lua_table_key_value(&raw_key_value))?;
+                                if self.budgets.mem_budget_enabled()
+                                    && !map.borrow().contains_key(&key)
+                                {
+                                    self.budgets.charge_map_entry_estimate()?;
+                                }
+                                map.borrow_mut().insert(key, sum);
+                            } else {
+                                invalidate_key = Self::struct_cache_key(&object);
+                                object
+                                    .struct_set_field_indexed(idx, sum)
+                                    .map_err(|message| LustError::RuntimeError { message })?;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                    if !self.struct_tostring_cache.is_empty()
+                        && let Some(key) = invalidate_key
+                    {
                         self.struct_tostring_cache.remove(&key);
                     }
                 }
@@ -3024,22 +4592,21 @@ impl VM {
                 Instruction::Concat(dest, lhs, rhs) => {
                     let mut in_place_done = false;
                     if dest == lhs {
-                        let right = {
-                            let frame = self.call_stack.last().ok_or_else(|| LustError::RuntimeError {
-                                message: "Empty call stack".to_string(),
-                            })?;
-                            frame.registers[rhs as usize].clone()
-                        };
+                        let right = self.get_register(rhs)?.clone();
                         if matches!(right, Value::Struct(_) | Value::Enum(_)) {
                             frame_dirty = true;
                         }
                         let right_str = self.value_to_string_for_concat(&right)?;
                         let right_len = right_str.len();
 
-                        let frame = self.call_stack.last_mut().ok_or_else(|| LustError::RuntimeError {
-                            message: "Empty call stack".to_string(),
-                        })?;
-                        if let Value::String(ref mut rc) = frame.registers[dest as usize] {
+                        let base_reg = self
+                            .call_stack
+                            .last()
+                            .ok_or_else(|| LustError::RuntimeError {
+                                message: "Empty call stack".to_string(),
+                            })?
+                            .base_reg;
+                        if let Value::String(ref mut rc) = self.vm_registers[base_reg + dest as usize] {
                             if let Some(s_mut) = Rc::get_mut(rc) {
                                 self.budgets.charge_mem_bytes(right_len)?;
                                 s_mut.push_str(right_str.as_ref());
@@ -3049,17 +4616,8 @@ impl VM {
                     }
 
                     if !in_place_done {
-                        let (left, right) = {
-                            let frame =
-                                self.call_stack
-                                    .last_mut()
-                                    .ok_or_else(|| LustError::RuntimeError {
-                                        message: "Empty call stack".to_string(),
-                                    })?;
-                            let left = frame.registers[lhs as usize].clone();
-                            let right = frame.registers[rhs as usize].clone();
-                            (left, right)
-                        };
+                        let left = self.get_register(lhs)?.clone();
+                        let right = self.get_register(rhs)?.clone();
                         if matches!(left, Value::Struct(_) | Value::Enum(_))
                             || matches!(right, Value::Struct(_) | Value::Enum(_))
                         {
@@ -3302,31 +4860,58 @@ impl VM {
                     dest_reg,
                 ) => 'method: {
                     frame_dirty = true;
-                    let object = self.get_register(obj_reg)?.clone();
-                    // Fast path: a user-defined struct method already resolved
-                    // at this call site.
-                    if let Value::Struct(receiver) = &object {
-                        let key = (
-                            Rc::as_ptr(&receiver.layout) as usize,
-                            func_idx,
-                            method_name_idx,
-                        );
-                        if let Some(&target) = self.method_cache.get(&key) {
+                    let call_ip = ip_before_execution.saturating_sub(1);
+                    let object = self.get_register(obj_reg)?.fast_clone();
+                    // Fast path: monomorphic per-site IC in Chunk::ic_slots[call_ip],
+                    // with fallback to VM::method_cache. Never cache LuaTable.
+                    if let Value::Struct(receiver) = &object
+                        && receiver.name != "LuaTable"
+                    {
+                        let recv_layout_ptr = Rc::as_ptr(&receiver.layout) as usize;
+                        let cached_target = {
+                            let slots = self.functions[func_idx].chunk.ic_slots.borrow();
+                            match slots.get(call_ip) {
+                                Some(ChunkIcSlot::MethodCall {
+                                    layout_ptr,
+                                    target_func_idx,
+                                    ..
+                                }) if *layout_ptr == recv_layout_ptr => Some(*target_func_idx),
+                                _ => None,
+                            }
+                        }
+                        .or_else(|| {
+                            let key = (recv_layout_ptr, func_idx, method_name_idx);
+                            let target = self.method_cache.get(&key).copied()?;
+                            let needed = self.functions[func_idx].chunk.instructions.len();
+                            let mut slots = self.functions[func_idx].chunk.ic_slots.borrow_mut();
+                            if slots.len() < needed {
+                                slots.resize(needed, ChunkIcSlot::Empty);
+                            }
+                            if call_ip < slots.len() {
+                                slots[call_ip] = ChunkIcSlot::MethodCall {
+                                    layout_ptr: recv_layout_ptr,
+                                    layout: Rc::clone(&receiver.layout),
+                                    target_func_idx: target,
+                                };
+                            }
+                            Some(target)
+                        });
+                        if let Some(target) = cached_target {
                             let mut args = core::mem::take(&mut self.arg_scratch);
                             args.clear();
                             args.push(object.clone());
                             for i in 0..arg_count {
-                                args.push(self.get_register(first_arg + i)?.clone());
+                                args.push(self.get_register(first_arg + i)?.fast_clone());
                             }
-                            let frame = self.make_checked_call_frame(
+                            // Fall through to the trace recorder below: it
+                            // inlines user-defined struct methods like calls.
+                            self.push_checked_call_frame(
                                 target,
                                 Some(dest_reg),
                                 args,
                                 Vec::new(),
+                                Vec::new(),
                             )?;
-                            // Fall through to the trace recorder below: it
-                            // inlines user-defined struct methods like calls.
-                            self.push_call_frame(frame);
                             #[cfg(feature = "std")]
                             if self.backend == crate::vm::VmBackend::Cranelift
                                 && self.trace_recorder.is_none()
@@ -3395,25 +4980,45 @@ impl VM {
                     };
                     if let Some(struct_name) = object_type_name {
                         let mangled_name = format!("{}:{}", struct_name, method_name);
-                        if let Some(func_idx) =
+                        if let Some(target_func_idx) =
                             self.functions.iter().position(|f| f.name == mangled_name)
                         {
-                            if let Value::Struct(object) = &object {
+                            if let Value::Struct(object) = &object
+                                && object.name != "LuaTable"
+                            {
                                 let StructObject { layout, .. } = object.as_ref();
+                                let layout_ptr = Rc::as_ptr(layout) as usize;
                                 let caller = self.call_stack.last().unwrap().function_idx;
                                 self.method_cache.insert(
-                                    (Rc::as_ptr(layout) as usize, caller, method_name_idx),
-                                    func_idx,
+                                    (layout_ptr, caller, method_name_idx),
+                                    target_func_idx,
                                 );
+                                let needed = self.functions[caller].chunk.instructions.len();
+                                let mut slots =
+                                    self.functions[caller].chunk.ic_slots.borrow_mut();
+                                if slots.len() < needed {
+                                    slots.resize(needed, ChunkIcSlot::Empty);
+                                }
+                                if call_ip < slots.len() {
+                                    slots[call_ip] = ChunkIcSlot::MethodCall {
+                                        layout_ptr,
+                                        layout: Rc::clone(layout),
+                                        target_func_idx,
+                                    };
+                                }
                             }
                             let mut args = Vec::with_capacity(1 + arg_count as usize);
                             args.push(object.clone());
                             for i in 0..arg_count {
                                 args.push(self.get_register(first_arg + i)?.clone());
                             }
-                            let frame =
-                                self.make_call_frame(func_idx, Some(dest_reg), args, Vec::new())?;
-                            self.push_call_frame(frame);
+                            self.push_deep_call_frame(
+                                target_func_idx,
+                                Some(dest_reg),
+                                args,
+                                Vec::new(),
+                                Vec::new(),
+                            )?;
                             #[cfg(feature = "std")]
                             if self.backend == crate::vm::VmBackend::Cranelift
                                 && self.trace_recorder.is_none()
@@ -3662,11 +5267,13 @@ impl VM {
                     let function = &self.functions[func_idx];
                     let registers_opt =
                         if let Some(frame) = self.call_stack.get(executing_frame_index) {
-                            Some(&frame.registers)
+                            Some(&self.vm_registers[frame.base_reg..frame.base_reg + frame.reg_count as usize])
                         } else if executing_frame_index > 0 {
                             self.call_stack
                                 .get(executing_frame_index - 1)
-                                .map(|frame| &frame.registers)
+                                .map(|frame| {
+                                    &self.vm_registers[frame.base_reg..frame.base_reg + frame.reg_count as usize]
+                                })
                         } else {
                             None
                         };
@@ -3997,7 +5604,16 @@ impl VM {
     pub(super) fn finish_return(&mut self, return_value: Value) -> Result<Option<Value>> {
         let frame = self.call_stack.last().unwrap();
         let return_dest = frame.return_dest;
-        self.validate_function_return(frame.function_idx, &return_value)?;
+        let is_outer_return = self.call_stack.len() <= 1
+            || self.call_until_depth == Some(self.call_stack.len() - 1);
+        let skip_return_check = !is_outer_return
+            && self
+                .call_meta
+                .get(frame.function_idx)
+                .is_some_and(|meta| meta.trusted_signature);
+        if !skip_return_check {
+            self.validate_function_return(frame.function_idx, &return_value)?;
+        }
         #[cfg(feature = "std")]
         if crate::vm::tracing::has_trace_hook() {
             let func = &self.functions[frame.function_idx];
@@ -4005,9 +5621,7 @@ impl VM {
             let line = func.chunk.lines.get(ip_index).copied().unwrap_or(0);
             self.dispatch_return_hook(&func.name, line, self.call_stack.len());
         }
-        if let Some(frame) = self.pop_call_frame() {
-            self.recycle_frame(frame);
-        }
+        let _ = self.pop_call_frame();
         if self.call_stack.is_empty() {
             return Ok(Some(return_value));
         }
@@ -4074,11 +5688,18 @@ impl VM {
         self.jit.record_native_entry();
         self.pending_jit_error = None;
         self.jit_cells.exit_info = usize::MAX;
-        let registers_ptr = self.call_stack.last_mut().unwrap().registers.as_mut_ptr();
+        let (base_reg, reg_count) = {
+            let f = self.call_stack.last().unwrap();
+            (f.base_reg, f.reg_count as usize)
+        };
+        let registers_ptr = self.vm_registers[base_reg..base_reg + reg_count].as_mut_ptr();
         let vm_ptr = self as *mut VM;
         let _jit_guard = self.enter_jit_scope();
         let result = code.execute(registers_ptr, vm_ptr, ptr::null());
         drop(_jit_guard);
+        if let Some(frame) = self.call_stack.last_mut() {
+            frame.non_plain_mask = u64::MAX;
+        }
         self.jit_cells.stack_limit = outer_limit;
         self.sync_gas_from_cells();
         crate::jit::log(|| format!("🎯 JIT: function {} native result {}", func_idx, result));
@@ -4089,7 +5710,8 @@ impl VM {
             let return_value = if reg == 255 {
                 Value::Nil
             } else {
-                self.call_stack.last().unwrap().registers[reg].fast_clone()
+                let top = self.call_stack.last().unwrap();
+                self.vm_registers[top.base_reg + reg].fast_clone()
             };
             return self.finish_return(return_value);
         }
@@ -4251,7 +5873,8 @@ impl VM {
         let Some(frame) = self.call_stack.last() else {
             return false;
         };
-        match frame.registers[func_reg as usize] {
+        let slot = frame.base_reg + func_reg as usize;
+        match self.vm_registers[slot] {
             Value::Function(idx) => self
                 .call_meta
                 .get(idx)
@@ -4261,19 +5884,20 @@ impl VM {
     }
 
     /// The fast path of `Instruction::Call` for a plain bytecode callee:
-    /// same checks as `make_call_frame_with` with `ArgCheck::Shallow`, but
-    /// the arguments are copied straight from the caller's registers into
-    /// the new frame, with no intermediate buffer and no per-call signature
-    /// walk. `plain_function_callee` must have said yes.
-    fn bytecode_call_frame(
+    /// same checks as `push_call_frame_with` with `ArgCheck::Shallow`, but
+    /// the arguments are copied straight from the caller's register window into
+    /// the new frame window in `vm_registers`, with no intermediate buffer and no
+    /// per-call signature walk. `plain_function_callee` must have said yes.
+    fn push_bytecode_call_frame(
         &mut self,
         func_reg: Register,
         first_arg: Register,
         arg_count: u8,
         dest_reg: Register,
-    ) -> Result<Box<CallFrame>> {
+    ) -> Result<usize> {
         let caller = self.call_stack.len() - 1;
-        let Value::Function(function_idx) = self.call_stack[caller].registers[func_reg as usize]
+        let caller_base = self.call_stack[caller].base_reg;
+        let Value::Function(function_idx) = self.vm_registers[caller_base + func_reg as usize]
         else {
             unreachable!("plain_function_callee checked the callee");
         };
@@ -4286,71 +5910,104 @@ impl VM {
                 ),
             });
         }
-        let register_count = function.register_count;
-        let mut frame = self.take_frame(function_idx, Some(dest_reg), register_count)?;
-        for index in 0..arg_count as usize {
-            let value =
-                &self.call_stack[caller].registers[first_arg.wrapping_add(index as u8) as usize];
-            let expected = self.call_meta[function_idx].params[index];
-            if !expected.matches(value) {
-                let function = &self.functions[function_idx];
-                let ty = function
-                    .signature
-                    .as_ref()
-                    .map(|signature| signature.params[index].to_string())
-                    .unwrap_or_default();
-                let message = format!(
-                    "Function {} argument {} expects {}, got {:?}",
-                    function.name,
-                    index + 1,
-                    ty,
-                    value.type_of()
-                );
-                self.recycle_frame(frame);
-                return Err(LustError::RuntimeError { message });
+        // Validate all argument types before pushing the new window (fail-closed, zero mutation).
+        // Skip redundant shallow re-checks for statically verified `trusted_signature` callees.
+        if !self.call_meta[function_idx].trusted_signature {
+            for index in 0..arg_count as usize {
+                let value =
+                    &self.vm_registers[caller_base + first_arg.wrapping_add(index as u8) as usize];
+                let expected = self.call_meta[function_idx].params[index];
+                if !expected.matches(value) {
+                    let function = &self.functions[function_idx];
+                    let ty = function
+                        .signature
+                        .as_ref()
+                        .map(|signature| signature.params[index].to_string())
+                        .unwrap_or_default();
+                    let message = format!(
+                        "Function {} argument {} expects {}, got {:?}",
+                        function.name,
+                        index + 1,
+                        ty,
+                        value.type_of()
+                    );
+                    return Err(LustError::RuntimeError { message });
+                }
             }
-            frame.registers[index] = value.fast_clone();
+        }
+        let reg_count = self.effective_reg_count(function_idx);
+        let callee_frame_idx = self.try_push_call_frame(
+            function_idx,
+            reg_count,
+            Some(dest_reg),
+            Vec::new(),
+            Vec::new(),
+        )?;
+        let callee_base = self.call_stack[callee_frame_idx].base_reg;
+        for index in 0..arg_count as usize {
+            let src_idx = caller_base + first_arg.wrapping_add(index as u8) as usize;
+            let value = self.vm_registers[src_idx].fast_clone();
+            if !value.is_plain() {
+                self.call_stack[callee_frame_idx].mark_non_plain(index);
+            }
+            self.vm_registers[callee_base + index] = value;
         }
         if self.jit.enabled {
             let recursive = self
                 .call_meta
                 .get(function_idx)
-                .is_some_and(|meta| meta.active_depth > 0);
+                .is_some_and(|meta| meta.active_depth > 1);
             self.jit.record_function_call(recursive);
         }
-        Ok(frame)
+        Ok(function_idx)
     }
 
-    pub(super) fn make_checked_call_frame(
+    pub(super) fn push_checked_call_frame(
         &mut self,
         function_idx: usize,
         return_dest: Option<Register>,
         args: Vec<Value>,
         upvalues: Vec<Value>,
-    ) -> Result<Box<CallFrame>> {
-        self.make_call_frame_with(function_idx, return_dest, args, upvalues, ArgCheck::Shallow)
+        shared_upvalues: Vec<Upvalue>,
+    ) -> Result<()> {
+        self.push_call_frame_with(
+            function_idx,
+            return_dest,
+            args,
+            upvalues,
+            shared_upvalues,
+            ArgCheck::Shallow,
+        )
     }
 
-    /// Build a frame for a call from the host or a dynamic value: every
+    /// Push a frame window for a call from the host or a dynamic value: every
     /// argument is validated in full against the signature, including the
     /// elements of containers.
-    pub(super) fn make_call_frame(
+    pub(super) fn push_deep_call_frame(
         &mut self,
         function_idx: usize,
         return_dest: Option<Register>,
         args: Vec<Value>,
         upvalues: Vec<Value>,
-    ) -> Result<Box<CallFrame>> {
-        self.make_call_frame_with(function_idx, return_dest, args, upvalues, ArgCheck::Deep)
+        shared_upvalues: Vec<Upvalue>,
+    ) -> Result<()> {
+        self.push_call_frame_with(
+            function_idx,
+            return_dest,
+            args,
+            upvalues,
+            shared_upvalues,
+            ArgCheck::Deep,
+        )
     }
 
-    pub(super) fn make_call_frame_slice(
+    pub(super) fn push_call_frame_slice(
         &mut self,
         function_idx: usize,
         return_dest: Option<Register>,
         args: &[Value],
         check: ArgCheck,
-    ) -> Result<Box<CallFrame>> {
+    ) -> Result<()> {
         let function = self
             .functions
             .get(function_idx)
@@ -4367,7 +6024,13 @@ impl VM {
                 ),
             });
         }
-        if let Some(signature) = &function.signature
+        let skip_shallow = matches!(check, ArgCheck::Shallow)
+            && self
+                .call_meta
+                .get(function_idx)
+                .is_some_and(|meta| meta.trusted_signature);
+        if !skip_shallow
+            && let Some(signature) = &function.signature
             && signature.params.len() == args.len()
         {
             for (index, (value, ty)) in args.iter().zip(&signature.params).enumerate() {
@@ -4398,32 +6061,39 @@ impl VM {
             }
         }
 
-        let register_count = function.register_count;
-        let mut frame = self.take_frame(function_idx, return_dest, register_count)?;
+        let reg_count = self.effective_reg_count(function_idx);
+        let frame_idx = self.try_push_call_frame(
+            function_idx,
+            reg_count,
+            return_dest,
+            Vec::new(),
+            Vec::new(),
+        )?;
         if self.jit.enabled {
             let recursive = self
                 .call_meta
                 .get(function_idx)
-                .is_some_and(|meta| meta.active_depth > 0);
+                .is_some_and(|meta| meta.active_depth > 1);
             self.jit.record_function_call(recursive);
         }
-        frame.upvalues.clear();
-        frame.shared_upvalues.clear();
+        let base_reg = self.call_stack[frame_idx].base_reg;
         for (index, arg) in args.iter().enumerate() {
             self.observe_value(arg);
-            frame.registers[index] = arg.fast_clone();
+            let cloned = arg.fast_clone();
+            if !cloned.is_plain() {
+                self.call_stack[frame_idx].mark_non_plain(index);
+            }
+            self.vm_registers[base_reg + index] = cloned;
         }
-        Ok(frame)
+        Ok(())
     }
 
-    fn make_call_frame_with(
-        &mut self,
+    fn validate_call_args_vec(
+        &self,
         function_idx: usize,
-        return_dest: Option<Register>,
-        mut args: Vec<Value>,
-        upvalues: Vec<Value>,
+        args: &mut Vec<Value>,
         check: ArgCheck,
-    ) -> Result<Box<CallFrame>> {
+    ) -> Result<()> {
         let function = self
             .functions
             .get(function_idx)
@@ -4456,7 +6126,13 @@ impl VM {
                 ),
             });
         }
-        if let Some(signature) = &function.signature
+        let skip_shallow = matches!(check, ArgCheck::Shallow)
+            && self
+                .call_meta
+                .get(function_idx)
+                .is_some_and(|meta| meta.trusted_signature);
+        if !skip_shallow
+            && let Some(signature) = &function.signature
             && signature.params.len() == args.len()
         {
             for (index, (value, ty)) in args.iter().zip(&signature.params).enumerate() {
@@ -4486,57 +6162,77 @@ impl VM {
                 }
             }
         }
+        Ok(())
+    }
 
-        let register_count = function.register_count;
-        let mut frame = self.take_frame(function_idx, return_dest, register_count)?;
+    fn push_call_frame_with(
+        &mut self,
+        function_idx: usize,
+        return_dest: Option<Register>,
+        mut args: Vec<Value>,
+        upvalues: Vec<Value>,
+        shared_upvalues: Vec<Upvalue>,
+        check: ArgCheck,
+    ) -> Result<()> {
+        self.validate_call_args_vec(function_idx, &mut args, check)?;
+        let reg_count = self.effective_reg_count(function_idx);
+        let frame_idx = self.try_push_call_frame(
+            function_idx,
+            reg_count,
+            return_dest,
+            upvalues,
+            shared_upvalues,
+        )?;
         if self.jit.enabled {
             let recursive = self
                 .call_meta
                 .get(function_idx)
-                .is_some_and(|meta| meta.active_depth > 0);
+                .is_some_and(|meta| meta.active_depth > 1);
             self.jit.record_function_call(recursive);
         }
-        frame.upvalues = upvalues;
-        frame.shared_upvalues.clear();
+        let base_reg = self.call_stack[frame_idx].base_reg;
         for (index, arg) in args.drain(..).enumerate() {
             self.observe_value(&arg);
-            frame.registers[index] = arg;
+            if !arg.is_plain() {
+                self.call_stack[frame_idx].mark_non_plain(index);
+            }
+            self.vm_registers[base_reg + index] = arg;
         }
         // Keep the (now empty) argument buffer so the next call allocates
         // nothing.
         if args.capacity() > self.arg_scratch.capacity() {
             self.arg_scratch = args;
         }
-        Ok(frame)
+        Ok(())
     }
 
-    /// A frame for `function_idx`, from the pool when one is available.
-    /// Fails when pushing it would exceed the stack depth limit (checked
-    /// here, where the stack grows, rather than on every instruction).
-    pub(super) fn take_frame(
+    /// Creates a detached `Box<CallFrame>` carrying its initial arguments in `saved_registers`
+    /// for a newly created fiber task (does not mutate the active VM call stack or `vm_registers`).
+    pub(super) fn make_detached_task_frame(
         &mut self,
         function_idx: usize,
-        return_dest: Option<Register>,
-        register_count: u8,
+        mut args: Vec<Value>,
+        upvalues: Vec<Value>,
+        shared_upvalues: Vec<Upvalue>,
     ) -> Result<Box<CallFrame>> {
-        if self.call_stack.len() >= self.max_stack_depth {
-            return Err(LustError::RuntimeError {
-                message: "Stack overflow".to_string(),
-            });
-        }
-        Ok(match self.frame_pool.pop() {
-            Some(mut frame) => {
-                // Pooled frames come back with every register they used
-                // reset to Nil (see `recycle_frame`); only the bookkeeping
-                // needs setting.
-                frame.function_idx = function_idx;
-                frame.ip = 0;
-                frame.base_register = 0;
-                frame.return_dest = return_dest;
-                frame
+        self.validate_call_args_vec(function_idx, &mut args, ArgCheck::Deep)?;
+        let reg_count = self.effective_reg_count(function_idx);
+        let mut regs = alloc::vec![Value::Nil; reg_count as usize];
+        let mut frame = CallFrame::new(function_idx, None, reg_count);
+        frame.upvalues = upvalues;
+        frame.shared_upvalues = shared_upvalues;
+        for (index, arg) in args.drain(..).enumerate() {
+            self.observe_value(&arg);
+            if !arg.is_plain() {
+                frame.mark_non_plain(index);
             }
-            None => CallFrame::new(function_idx, return_dest, register_count),
-        })
+            regs[index] = arg;
+        }
+        frame.saved_registers = Some(Box::new(regs));
+        if args.capacity() > self.arg_scratch.capacity() {
+            self.arg_scratch = args;
+        }
+        Ok(Box::new(frame))
     }
 
     /// An O(1) argument check for calls the typechecker already validated:
@@ -4556,21 +6252,6 @@ impl VM {
             TypeKind::Tuple(_) => matches!(value, Value::Tuple(_)),
             _ => true,
         }
-    }
-
-    /// Keep a popped frame for reuse, with the registers it used reset to
-    /// Nil (dropping their values now, as dropping the frame would have).
-    pub(super) fn recycle_frame(&mut self, mut frame: Box<CallFrame>) {
-        if self.frame_pool.len() >= super::FRAME_POOL_LIMIT {
-            return;
-        }
-        let register_count = self
-            .functions
-            .get(frame.function_idx)
-            .map(|f| f.register_count)
-            .unwrap_or(u8::MAX);
-        frame.reset(frame.function_idx, None, register_count);
-        self.frame_pool.push(frame);
     }
 
     fn validate_function_return(&self, function_idx: usize, value: &Value) -> Result<()> {
@@ -4713,14 +6394,24 @@ impl VM {
             .ok_or_else(|| LustError::RuntimeError {
                 message: "Empty call stack".to_string(),
             })?;
-        Ok(&frame.registers[reg as usize])
+        let idx = reg as usize;
+        if idx >= frame.reg_count as usize {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Register {} out of bounds (window len {})",
+                    idx, frame.reg_count
+                ),
+            });
+        }
+        Ok(&self.vm_registers[frame.base_reg + idx])
     }
 
     // Inlining lets scalar instructions write their tag/payload directly,
     // without materializing a temporary Value for an out-of-line call.
     #[inline(always)]
     pub(super) fn set_register(&mut self, reg: Register, value: Value) -> Result<()> {
-        if self.cycle_collector.is_enabled() {
+        let is_non_plain = !value.is_plain();
+        if is_non_plain && self.cycle_collector.is_enabled() {
             self.cycle_collector.register_value(&value);
         }
         let frame = self
@@ -4729,13 +6420,20 @@ impl VM {
             .ok_or_else(|| LustError::RuntimeError {
                 message: "Empty call stack".to_string(),
             })?;
-        let slot = &mut frame.registers[reg as usize];
-        if slot.is_plain() {
-            // SAFETY: the old value owns nothing, so it needs no drop.
-            unsafe { core::ptr::write(slot, value) };
-        } else {
-            *slot = value;
+        let idx = reg as usize;
+        if idx >= frame.reg_count as usize {
+            return Err(LustError::RuntimeError {
+                message: format!(
+                    "Register {} out of bounds (window len {})",
+                    idx, frame.reg_count
+                ),
+            });
         }
+        if is_non_plain {
+            frame.mark_non_plain(idx);
+        }
+        let slot = frame.base_reg + idx;
+        self.vm_registers[slot] = value;
         if self.cycle_collector.is_enabled() {
             self.maybe_collect_cycles();
         }
@@ -4930,10 +6628,8 @@ impl VM {
                 let saved_pending_task_signal = self.pending_task_signal.clone();
                 let saved_last_task_signal = self.last_task_signal.clone();
 
-                let frame = self.make_checked_call_frame(*func_idx, None, args, Vec::new())?;
-
                 let stack_depth_before = self.call_stack.len();
-                self.push_call_frame(frame);
+                self.push_deep_call_frame(*func_idx, None, args, Vec::new(), Vec::new())?;
                 let previous_target = self.call_until_depth;
                 self.call_until_depth = Some(stack_depth_before);
                 // Compiled code for the function runs it now; `run` then
@@ -4972,11 +6668,14 @@ impl VM {
                 let saved_last_task_signal = self.last_task_signal.clone();
 
                 let upvalue_values: Vec<Value> = upvalues.iter().map(|uv| uv.get()).collect();
-                let mut frame = self.make_checked_call_frame(*func_idx, None, args, upvalue_values)?;
-                frame.shared_upvalues = upvalues.clone();
-
                 let stack_depth_before = self.call_stack.len();
-                self.push_call_frame(frame);
+                self.push_deep_call_frame(
+                    *func_idx,
+                    None,
+                    args,
+                    upvalue_values,
+                    upvalues.clone(),
+                )?;
                 let previous_target = self.call_until_depth;
                 self.call_until_depth = Some(stack_depth_before);
                 let run_result = self.run();
@@ -5603,12 +7302,12 @@ impl VM {
                     message: format!("Duplicate local index {} in deopt payload", loc_idx),
                 });
             }
-            if loc_idx >= top_frame.registers.len() {
+            if loc_idx >= top_frame.reg_count as usize {
                 return Err(LustError::RuntimeError {
                     message: format!(
                         "Deopt payload local index {} exceeds frame register count {}",
                         loc_idx,
-                        top_frame.registers.len()
+                        top_frame.reg_count
                     ),
                 });
             }
@@ -5658,8 +7357,12 @@ impl VM {
         // 4. All validations passed; apply restored state to top call frame
         let top_frame = self.call_stack.last_mut().expect("call stack validated non-empty");
         top_frame.ip = resume_pc;
+        let base_reg = top_frame.base_reg;
         for (loc_idx, val) in validated_restorations {
-            top_frame.registers[loc_idx] = val;
+            if !val.is_plain() {
+                top_frame.mark_non_plain(loc_idx);
+            }
+            self.vm_registers[base_reg + loc_idx] = val;
         }
 
         self.run()

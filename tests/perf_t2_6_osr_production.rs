@@ -485,20 +485,14 @@ fn test_perf_t2_6_adv_try_apply_authoritative_error_leaves_frame_unchanged_and_m
     safepoint_reset();
 
     // 1. Direct atomicity check on DeoptExitState::try_apply_authoritative:
-    //    (a) Missing resume_pc -> Err and ZERO mutation to frame.ip or frame.registers.
-    let mut registers = [const { Value::Nil }; 256];
-    registers[0] = Value::Int(111);
-    registers[1] = Value::Int(222);
-    let mut frame = CallFrame {
-        function_idx: 0,
-        ip: 42,
-        registers,
-        base_register: 0,
-        return_dest: None,
-        upvalues: Vec::new(),
-        shared_upvalues: Vec::new(),
-    };
-    let snapshot_regs = frame.registers.clone();
+    //    (a) Missing resume_pc -> Err and ZERO mutation to frame.ip or frame registers.
+    let mut frame = CallFrame::new_detached(0, 42, 256);
+    {
+        let regs = frame.saved_registers_mut().unwrap();
+        regs[0] = Value::Int(111);
+        regs[1] = Value::Int(222);
+    }
+    let snapshot_regs = frame.saved_registers().unwrap().to_vec();
 
     let missing_pc_state = DeoptExitState {
         site_id: 7,
@@ -513,7 +507,11 @@ fn test_perf_t2_6_adv_try_apply_authoritative_error_leaves_frame_unchanged_and_m
         .expect_err("Missing resume_pc must fail closed");
     assert!(err.contains("No proven bytecode resume PC mapping"), "unexpected err: {err}");
     assert_eq!(frame.ip, 42, "frame.ip must remain untouched on error");
-    assert_eq!(frame.registers, snapshot_regs, "frame.registers must remain untouched on error");
+    assert_eq!(
+        frame.saved_registers().unwrap(),
+        snapshot_regs.as_slice(),
+        "frame.registers must remain untouched on error"
+    );
 
     //    (b) Out-of-bounds register index after a valid index -> Err and ZERO partial mutation.
     let oob_state = DeoptExitState {
@@ -530,7 +528,8 @@ fn test_perf_t2_6_adv_try_apply_authoritative_error_leaves_frame_unchanged_and_m
     assert!(err2.contains("out of bounds"), "unexpected err2: {err2}");
     assert_eq!(frame.ip, 42, "frame.ip must remain untouched on OOB error");
     assert_eq!(
-        frame.registers, snapshot_regs,
+        frame.saved_registers().unwrap(),
+        snapshot_regs.as_slice(),
         "Earlier register 0 must not be partially mutated when register 9999 is OOB"
     );
 

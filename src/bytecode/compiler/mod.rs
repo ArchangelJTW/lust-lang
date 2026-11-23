@@ -310,7 +310,9 @@ impl Compiler {
 
     fn assign_signature_by_name(&mut self, func_idx: usize, name: &str) {
         if let Some(signature) = self.function_signatures.get(name).cloned() {
-            self.functions[func_idx].set_signature(signature);
+            let func = &mut self.functions[func_idx];
+            func.set_signature(signature);
+            func.trusted_signature = func.compute_trusted_signature();
         }
     }
 
@@ -321,7 +323,9 @@ impl Compiler {
         return_type: &Option<Type>,
     ) {
         if let Some(signature) = Self::lambda_signature(params, return_type) {
-            self.functions[func_idx].set_signature(signature);
+            let func = &mut self.functions[func_idx];
+            func.set_signature(signature);
+            func.trusted_signature = func.compute_trusted_signature();
         }
     }
 

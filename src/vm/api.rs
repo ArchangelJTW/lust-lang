@@ -188,6 +188,8 @@ struct VmBuiltinsCache {
     struct_metadata: HashMap<String, super::RuntimeStructInfo>,
     natives: HashMap<String, Value>,
     globals: HashMap<String, Value>,
+    globals_vec: Vec<Value>,
+    global_name_to_slot: HashMap<String, u32>,
     intrinsics: HashMap<usize, crate::jit::Intrinsic>,
 }
 
@@ -203,6 +205,8 @@ impl VM {
     }
 
     pub fn with_config(config: &LustConfig) -> Self {
+        let vm_alloc = crate::alloc_budget::VmAllocHandle::unbounded();
+        let vm_registers = Vec::with_capacity_in(4096, vm_alloc.clone());
         let mut vm = Self {
             current_vm_lookup: super::current_vm_ptr,
             backend: {
@@ -260,12 +264,17 @@ impl VM {
             ast_bytecode_backup: HashMap::new(),
             natives: HashMap::new(),
             globals: HashMap::new(),
+            globals_vec: Vec::new(),
+            global_name_to_slot: HashMap::new(),
+            globals_generation: 1,
             globals_version: 0,
             jit_cells: crate::jit::JitCells::default(),
             unit_enums: HashMap::new(),
             map_hasher: DefaultHashBuilder::default(),
+            vm_alloc,
+            vm_registers,
             call_stack: Vec::new(),
-            frame_pool: Vec::new(),
+            last_frame_pop_cleanup_iters: 0,
             method_cache: hashbrown::HashMap::new(),
             arg_scratch: Vec::new(),
             max_stack_depth: 1000,
@@ -290,7 +299,6 @@ impl VM {
             #[cfg(feature = "std")]
             exported_type_stubs: Vec::new(),
             last_dispatched_target: None,
-            root_frame: Some(CallFrame::new(0, None, 255)),
             active_native_depth: 0,
             active_jit_depth: 0,
             host_ledger: TrustedHostResourceLedger::new(),
@@ -343,6 +351,9 @@ impl VM {
             vm.struct_metadata.replace_all(cached.struct_metadata);
             vm.natives = cached.natives;
             vm.globals = cached.globals;
+            vm.globals_vec = cached.globals_vec;
+            vm.global_name_to_slot = cached.global_name_to_slot;
+            vm.globals_generation = 1;
             vm.jit.intrinsics = cached.intrinsics;
             return vm;
         }
@@ -377,6 +388,8 @@ impl VM {
                     struct_metadata: vm.struct_metadata.clone_map(),
                     natives: vm.natives.clone(),
                     globals: vm.globals.clone(),
+                    globals_vec: vm.globals_vec.clone(),
+                    global_name_to_slot: vm.global_name_to_slot.clone(),
                     intrinsics: vm.jit.intrinsics.clone(),
                 },
             );
@@ -603,8 +616,10 @@ impl VM {
         }
     }
 
-    pub fn load_functions(&mut self, functions: Vec<Function>) {
-        for function in &functions {
+    pub fn load_functions(&mut self, mut functions: Vec<Function>) {
+        for function in &mut functions {
+            function.chunk.compute_bb_gas_weights();
+            function.chunk.build_packed_code();
             for value in &function.chunk.constants {
                 self.observe_value_graph(value);
             }
@@ -614,6 +629,7 @@ impl VM {
         self.jit_cells.entry_table = self.jit.function_entry_table();
         self.call_meta = functions.iter().map(CallMeta::of).collect();
         self.functions = functions;
+        self.method_cache.clear();
         self.ast_bytecode_backup.clear();
         #[cfg(feature = "std")]
         {
@@ -844,14 +860,13 @@ impl VM {
                 };
                 let cloned = value.clone();
                 self.natives.insert(name.clone(), value);
-                self.globals.insert(name, cloned);
+                self.sync_global_insert(name, cloned);
             }
 
             other => {
-                self.globals.insert(name, other);
+                self.sync_global_insert(name, other);
             }
         }
-        self.globals_version = self.globals_version.wrapping_add(1);
     }
 
     #[allow(dead_code)]
@@ -1098,6 +1113,7 @@ impl VM {
     pub fn clear_native_functions(&mut self) {
         self.natives.clear();
         self.globals_version = self.globals_version.wrapping_add(1);
+        self.globals_generation = self.globals_generation.wrapping_add(1).max(1);
         #[cfg(feature = "std")]
         self.exported_type_stubs.clear();
     }
@@ -1145,14 +1161,12 @@ impl VM {
     pub fn set_global(&mut self, name: impl Into<String>, value: Value) {
         let name = name.into();
         self.observe_value(&value);
-        self.globals.insert(name.clone(), value);
         self.natives.remove(&name);
-        self.globals_version = self.globals_version.wrapping_add(1);
+        self.sync_global_insert(name, value);
         self.maybe_collect_cycles();
     }
 
-    fn execute_call_frame(&mut self, frame: Box<CallFrame>) -> Result<Value> {
-        let stack_depth_before = self.call_stack.len();
+    fn execute_top_call_frame(&mut self, stack_depth_before: usize) -> Result<Value> {
         let saved_pending_return_value = self.pending_return_value.clone();
         let saved_pending_return_dest = self.pending_return_dest;
         let saved_pending_task_signal = self.pending_task_signal.clone();
@@ -1162,8 +1176,7 @@ impl VM {
         let saved_call_until_depth = self.call_until_depth;
         self.skip_next_trace_record = false;
         self.call_until_depth = Some(stack_depth_before);
-        let func_idx = frame.function_idx;
-        self.push_call_frame(frame);
+        let func_idx = self.call_stack.last().expect("frame pushed before execute_top_call_frame").function_idx;
         #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
         let result = if self.jit.enabled && saved_trace_recorder.is_none() {
             match self.run_compiled_function(func_idx) {
@@ -1209,8 +1222,9 @@ impl VM {
     }
 
     fn call_function_index(&mut self, func_idx: usize, args: Vec<Value>) -> Result<Value> {
-        let frame = self.make_call_frame(func_idx, None, args, Vec::new())?;
-        self.execute_call_frame(frame)
+        let stack_depth_before = self.call_stack.len();
+        self.push_deep_call_frame(func_idx, None, args, Vec::new(), Vec::new())?;
+        self.execute_top_call_frame(stack_depth_before)
     }
 
     pub fn call(&mut self, function_name: &str, args: Vec<Value>) -> Result<Value> {
@@ -1275,10 +1289,13 @@ impl VM {
                     self.functions[func_idx].register_count,
                 );
                 if args.len() == param_count {
-                    if let Some(mut root_frame) = self.root_frame.take() {
-                        root_frame.registers[..param_count].clone_from_slice(args);
-                        let registers_ptr = root_frame.registers.as_mut_ptr();
-                        let vm_ptr = self as *mut VM;
+                    let window_len = (register_count as usize).max(param_count).max(256);
+                    if self.vm_registers.len() < window_len {
+                        self.vm_registers.resize(window_len, Value::Nil);
+                    }
+                    self.vm_registers[..param_count].clone_from_slice(args);
+                    let registers_ptr = self.vm_registers.as_mut_ptr();
+                    let vm_ptr = self as *mut VM;
 
                         let marker = 0u8;
                         let sp = &marker as *const u8 as usize;
@@ -1312,19 +1329,23 @@ impl VM {
                             .contains(&result)
                         {
                             let reg = (result - crate::jit::FUNCTION_RETURN_BASE) as usize;
-                            let return_value = root_frame.registers[reg].fast_clone();
-                            root_frame.reset(0, None, register_count);
-                            self.root_frame = Some(root_frame);
+                            let return_value = self.vm_registers[reg].fast_clone();
+                            let clear_len = (register_count as usize).max(param_count).min(self.vm_registers.len());
+                            for slot in &mut self.vm_registers[..clear_len] {
+                                *slot = Value::Nil;
+                            }
                             return Ok(return_value);
                         }
-                        root_frame.reset(0, None, register_count);
-                        self.root_frame = Some(root_frame);
-                    }
+                        let clear_len = (register_count as usize).max(param_count).min(self.vm_registers.len());
+                        for slot in &mut self.vm_registers[..clear_len] {
+                            *slot = Value::Nil;
+                        }
                 }
             }
         }
-        let frame = self.make_call_frame_slice(func_idx, None, args, ArgCheck::Shallow)?;
-        self.execute_call_frame(frame)
+        let stack_depth_before = self.call_stack.len();
+        self.push_call_frame_slice(func_idx, None, args, ArgCheck::Shallow)?;
+        self.execute_top_call_frame(stack_depth_before)
     }
 
     /// Read-only alias for `cranelift_entry_count` (`NG-W10-3`).
@@ -1380,7 +1401,6 @@ impl VM {
             self.call_stack.is_empty()
                 && self.jit.enabled
                 && self.trace_recorder.is_none()
-                && self.root_frame.is_some()
                 && self.jit.function_entry(func_idx) != 0
         }
         #[cfg(not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))))]
@@ -1646,11 +1666,14 @@ impl VM {
                     self.functions[func_idx].param_count as usize,
                     self.functions[func_idx].register_count,
                 );
-                if let Some(mut root_frame) = self.root_frame.take() {
-                    let arg_count = write_args(&mut root_frame.registers);
-                    if arg_count == param_count {
-                        let registers_ptr = root_frame.registers.as_mut_ptr();
-                        let vm_ptr = self as *mut VM;
+                let window_len = (register_count as usize).max(param_count).max(256);
+                if self.vm_registers.len() < window_len {
+                    self.vm_registers.resize(window_len, Value::Nil);
+                }
+                let arg_count = write_args(&mut self.vm_registers[..window_len]);
+                if arg_count == param_count {
+                    let registers_ptr = self.vm_registers.as_mut_ptr();
+                    let vm_ptr = self as *mut VM;
 
                         let marker = 0u8;
                         let sp = &marker as *const u8 as usize;
@@ -1684,25 +1707,34 @@ impl VM {
                             .contains(&result)
                         {
                             let reg = (result - crate::jit::FUNCTION_RETURN_BASE) as usize;
-                            let return_value = root_frame.registers[reg].fast_clone();
-                            root_frame.reset(0, None, register_count);
-                            self.root_frame = Some(root_frame);
+                            let return_value = self.vm_registers[reg].fast_clone();
+                            let clear_len = (register_count as usize).max(param_count).min(self.vm_registers.len());
+                            for slot in &mut self.vm_registers[..clear_len] {
+                                *slot = Value::Nil;
+                            }
                             return Some(Ok(return_value));
                         }
 
+                        let fallback_args: Vec<Value> =
+                            self.vm_registers[..param_count].to_vec();
+                        let clear_len = (register_count as usize).max(param_count).min(self.vm_registers.len());
+                        for slot in &mut self.vm_registers[..clear_len] {
+                            *slot = Value::Nil;
+                        }
+                        let stack_depth_before = self.call_stack.len();
                         let fallback_res = self
-                            .make_call_frame_slice(
+                            .push_call_frame_slice(
                                 func_idx,
                                 None,
-                                &root_frame.registers[..param_count],
+                                &fallback_args,
                                 ArgCheck::Shallow,
                             )
-                            .and_then(|frame| self.execute_call_frame(frame));
-                        root_frame.reset(0, None, register_count);
-                        self.root_frame = Some(root_frame);
+                            .and_then(|()| self.execute_top_call_frame(stack_depth_before));
                         return Some(fallback_res);
-                    } else {
-                        self.root_frame = Some(root_frame);
+                } else {
+                    let clear_len = arg_count.min(self.vm_registers.len());
+                    for slot in &mut self.vm_registers[..clear_len] {
+                        *slot = Value::Nil;
                     }
                 }
             }

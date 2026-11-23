@@ -146,6 +146,20 @@ impl<'a> MirToBytecodeCompiler<'a> {
         Self::compile_inner(func, None, None, Some(struct_layouts), true)
     }
 
+    pub fn compile_with_field_slots_and_callee_indices(
+        func: &'a MirFunction,
+        direct_callee_indices: &'a HashMap<String, usize>,
+        struct_layouts: &'a HashMap<String, Rc<StructLayout>>,
+    ) -> Result<Function, MirVmBackendError> {
+        Self::compile_inner(
+            func,
+            None,
+            Some(direct_callee_indices),
+            Some(struct_layouts),
+            true,
+        )
+    }
+
     pub fn compile_with_options(
         func: &'a MirFunction,
         direct_callees: Option<&'a HashSet<String>>,
@@ -969,7 +983,7 @@ impl<'a> MirToBytecodeCompiler<'a> {
         let Some(struct_name) = self.lookup_struct_name(base) else {
             return false;
         };
-        if struct_name == "LuaTable" {
+        if struct_name == "LuaTable" || struct_name.ends_with(".LuaTable") {
             return false;
         }
         self.lookup_struct_layout(&struct_name)

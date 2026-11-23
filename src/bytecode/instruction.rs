@@ -86,6 +86,18 @@ impl PackedInstruction {
         }
     }
 
+    /// Returns the register operand and the field-name constant index.
+    #[inline(always)]
+    pub(crate) fn field_operands(self, extra_args: &[u32]) -> (Register, ConstIndex) {
+        let op = self.opcode_u8();
+        if op == OpCode::GetFieldCompact as u8 || op == OpCode::SetFieldCompact as u8 {
+            (self.b(), u16::from(self.c()))
+        } else {
+            let word = extra_args[self.bx() as usize];
+            (word as u8, (word >> 16) as u16)
+        }
+    }
+
     #[inline]
     fn push_extra1(extra_args: &mut Vec<u32>, w0: u32) -> Option<u16> {
         let idx = extra_args.len();
@@ -240,6 +252,12 @@ impl PackedInstruction {
                 let w0 = u32::from(cond) | (u32::from(arr) << 8) | (u32::from(idx) << 16);
                 let ex = Self::push_extra1(extra_args, w0)?;
                 Self::encode_abx(OpCode::ArrayIndexOk, val, ex)
+            }
+            Instruction::GetField(dest, obj, field_idx) if field_idx <= u16::from(u8::MAX) => {
+                Self::encode_abc(OpCode::GetFieldCompact, dest, obj, field_idx as u8)
+            }
+            Instruction::SetField(obj, field_idx, val) if field_idx <= u16::from(u8::MAX) => {
+                Self::encode_abc(OpCode::SetFieldCompact, obj, val, field_idx as u8)
             }
             Instruction::GetField(dest, obj, field_idx) => {
                 let w0 = u32::from(obj) | (u32::from(field_idx) << 16);
@@ -445,6 +463,12 @@ impl PackedInstruction {
             OpCode::SetField => {
                 let w0 = extra1(self.bx())?;
                 Instruction::SetField(self.a(), (w0 >> 16) as u16, (w0 & 0xFF) as u8)
+            }
+            OpCode::GetFieldCompact => {
+                Instruction::GetField(self.a(), self.b(), u16::from(self.c()))
+            }
+            OpCode::SetFieldCompact => {
+                Instruction::SetField(self.a(), u16::from(self.c()), self.b())
             }
             OpCode::GetFieldSlot => Instruction::GetFieldSlot(self.a(), self.b(), self.c()),
             OpCode::SetFieldSlot => Instruction::SetFieldSlot(self.a(), self.b(), self.c()),
@@ -702,6 +726,9 @@ pub enum OpCode {
     BranchLtInt,
     BranchLeInt,
     GetFieldAddSetInt,
+    // Packed-only forms. The legacy encoding keeps the original field opcodes.
+    GetFieldCompact,
+    SetFieldCompact,
 }
 
 impl Instruction {
@@ -1458,6 +1485,8 @@ impl OpCode {
             90 => Ok(OpCode::BranchLtInt),
             91 => Ok(OpCode::BranchLeInt),
             92 => Ok(OpCode::GetFieldAddSetInt),
+            93 => Ok(OpCode::GetFieldCompact),
+            94 => Ok(OpCode::SetFieldCompact),
             other => Err(DecodeError::UnknownOpCode(other)),
         }
     }
@@ -1856,6 +1885,9 @@ impl Instruction {
                 u16_at(5),
             )),
             OpCode::GetEnumValue => Ok(Instruction::GetEnumValue(bytes[1], bytes[2], bytes[3])),
+            OpCode::GetFieldCompact | OpCode::SetFieldCompact => {
+                Err(DecodeError::UnknownOpCode(bytes[0]))
+            }
             OpCode::GetField => Ok(Instruction::GetField(bytes[1], bytes[2], u16_at(3))),
             OpCode::SetField => Ok(Instruction::SetField(bytes[1], u16_at(2), bytes[4])),
             OpCode::GetFieldSlot => Ok(Instruction::GetFieldSlot(bytes[1], bytes[2], bytes[3])),

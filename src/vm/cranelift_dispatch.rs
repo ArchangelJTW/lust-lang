@@ -10,10 +10,13 @@ use crate::error::{LustError, Result};
 use crate::mir::cranelift_backend::{
     DeoptSiteKind, MIR_STATUS_DEOPT, MIR_STATUS_ERR_DIV_BY_ZERO, MIR_STATUS_ERR_NEG_EXPONENT,
     MIR_STATUS_ERR_OOM, MIR_STATUS_ERR_OUT_OF_BOUNDS, MIR_STATUS_ERR_OUT_OF_GAS, MIR_STATUS_OK,
-    apply_module_callee_return_types, find_loop_headers, get_registered_struct_layout_by_name,
+    apply_module_callee_return_types, compute_default_module_roots,
+    compute_reachable_native_functions, find_loop_headers, get_registered_struct_layout_by_name,
     is_effect_or_handler_callee, is_vm_effect_intrinsic_callee, lust_mir_alloc_array_typed,
-    lust_mir_alloc_struct_named, lust_mir_alloc_tuple_typed, mir_array_elem_tag,
+    lust_mir_alloc_tuple_typed, mir_array_elem_tag,
 };
+#[cfg(all(feature = "std", test))]
+use crate::mir::cranelift_backend::lust_mir_alloc_struct_named;
 #[cfg(feature = "test-deopt")]
 use crate::vm::DeoptPayloadSource;
 #[cfg(feature = "std")]
@@ -53,6 +56,18 @@ pub struct MarshalledStruct {
 enum CraneliftOutcome {
     Fallback,
     Return(Value),
+}
+
+#[cfg(feature = "std")]
+struct PreparedCraneliftModule {
+    module: crate::mir::ir::MirModule,
+    eligible: hashbrown::HashSet<String>,
+    func_idx_by_name: hashbrown::HashMap<String, usize>,
+    eager_continuations: hashbrown::HashMap<String, crate::bytecode::Function>,
+    deferred_continuations: hashbrown::HashSet<String>,
+    deferred_dead_helpers: hashbrown::HashSet<String>,
+    effective_roots: hashbrown::HashSet<String>,
+    skipped_dead_helper_count: usize,
 }
 
 #[derive(Debug)]
@@ -353,20 +368,20 @@ pub fn validate_and_decode_tuple(
 
 pub const MAX_STRUCT_DECODE_DEPTH: usize = 256;
 
-fn resolve_option_struct_target_name(
+fn resolve_option_struct_target_name<'a>(
     owner_struct_name: &str,
-    inner_name: &str,
+    inner_name: &'a str,
     struct_meta: Option<&hashbrown::HashMap<String, crate::vm::RuntimeStructInfo>>,
-) -> String {
+) -> alloc::borrow::Cow<'a, str> {
     if !inner_name.contains('.')
         && let Some((mod_prefix, _)) = owner_struct_name.rsplit_once('.')
     {
         let qualified = format!("{mod_prefix}.{inner_name}");
         if struct_meta.is_some_and(|m| m.contains_key(&qualified)) {
-            return qualified;
+            return alloc::borrow::Cow::Owned(qualified);
         }
     }
-    inner_name.to_string()
+    alloc::borrow::Cow::Borrowed(inner_name)
 }
 
 fn validate_and_decode_struct_inner(
@@ -391,6 +406,7 @@ fn validate_and_decode_struct_inner(
     let (base_ptr, len) = validate_owned_header(mir_ctx, raw_ptr_val, "struct", |kind| {
         match kind {
             crate::mir::runtime_helpers::MirAllocationKind::Struct(existing_name) => {
+                let existing_name: &str = existing_name.as_ref();
                 let layout_matches = layout_opt.is_some_and(|l| existing_name == l.name());
                 let simple_expected = expected_name
                     .rsplit_once('.')
@@ -399,20 +415,20 @@ fn validate_and_decode_struct_inner(
                 let simple_existing = existing_name
                     .rsplit_once('.')
                     .map(|(_, s)| s)
-                    .unwrap_or(existing_name.as_str());
+                    .unwrap_or(existing_name);
                 let qualified_same = layout_matches
                     || (existing_name != expected_name
                         && existing_name == simple_expected
                         && struct_meta.is_some_and(|m| {
                             m.get(expected_name)
-                                .zip(m.get(existing_name.as_str()))
+                                .zip(m.get(existing_name))
                                 .is_some_and(|(a, b)| Rc::ptr_eq(&a.layout, &b.layout))
                         }))
                     || (existing_name != expected_name
                         && expected_name == simple_existing
                         && struct_meta.is_some_and(|m| {
                             m.get(expected_name)
-                                .zip(m.get(existing_name.as_str()))
+                                .zip(m.get(existing_name))
                                 .is_some_and(|(a, b)| Rc::ptr_eq(&a.layout, &b.layout))
                         }));
                 if existing_name != expected_name && !qualified_same {
@@ -493,8 +509,13 @@ fn validate_and_decode_struct_inner(
                                         struct_meta,
                                     );
                                     let sub_layout: Option<&Rc<StructLayout>> =
-                                        if let Some(meta) = struct_meta {
-                                            meta.get(&sub_name).map(|info| &info.layout)
+                                        if depth > 0
+                                            && sub_name.as_ref() == expected_name
+                                            && layout_opt.is_some()
+                                        {
+                                            layout_opt
+                                        } else if let Some(meta) = struct_meta {
+                                            meta.get(sub_name.as_ref()).map(|info| &info.layout)
                                         } else if layout.name() == sub.as_str()
                                             || expected_name == sub.as_str()
                                         {
@@ -506,7 +527,7 @@ fn validate_and_decode_struct_inner(
                                         mir_ctx,
                                         marshalled_structs,
                                         raw,
-                                        &sub_name,
+                                        sub_name.as_ref(),
                                         sub_layout,
                                         struct_meta,
                                         visited_ptrs,
@@ -666,6 +687,7 @@ fn stage_struct_writebacks_with_readonly_and_meta(
         let (base_ptr, len) = validate_owned_header(mir_ctx, m.ptr as i64, "struct", |kind| {
             match kind {
                 crate::mir::runtime_helpers::MirAllocationKind::Struct(alloc_name) => {
+                    let alloc_name: &str = alloc_name.as_ref();
                     let simple_name = m
                         .rc
                         .name
@@ -723,7 +745,7 @@ fn stage_struct_writebacks_with_readonly_and_meta(
                         struct_meta,
                     );
                     let sub_layout: Option<&Rc<StructLayout>> = if let Some(meta) = struct_meta {
-                        meta.get(&sub_name).map(|info| &info.layout)
+                        meta.get(sub_name.as_ref()).map(|info| &info.layout)
                     } else if m.rc.layout.name() == sub || m.rc.name.as_str() == sub {
                         Some(&m.rc.layout)
                     } else {
@@ -735,7 +757,7 @@ fn stage_struct_writebacks_with_readonly_and_meta(
                         mir_ctx,
                         marshalled_structs,
                         raw,
-                        &sub_name,
+                        sub_name.as_ref(),
                         sub_layout,
                         struct_meta,
                         &mut visited_ptrs,
@@ -1766,7 +1788,8 @@ impl VM {
                 owner_struct_name,
                 inner_name,
                 Some(struct_meta),
-            );
+            )
+            .into_owned();
         }
         ty
     }
@@ -1807,8 +1830,8 @@ impl VM {
                         sub,
                         Some(self.struct_metadata.as_map()),
                     );
-                    if self.struct_metadata.contains_key(&resolved) {
-                        self.is_cranelift_supported_struct_inner(&resolved, visiting)
+                    if self.struct_metadata.contains_key(resolved.as_ref()) {
+                        self.is_cranelift_supported_struct_inner(resolved.as_ref(), visiting)
                     } else {
                         false
                     }
@@ -2845,6 +2868,10 @@ impl VM {
             sf.clear();
             let meta_map = self.struct_metadata.as_map();
             for (name, info) in self.struct_metadata.iter() {
+                self.mir_context.intern_struct_type_name(name);
+                if !info.layout.name().is_empty() && info.layout.name() != name.as_str() {
+                    self.mir_context.intern_struct_type_name(info.layout.name());
+                }
                 let field_types: Vec<MirType> = (0..info.layout.field_names().len())
                     .map(|i| {
                         Self::resolve_struct_field_mir_type_in_map(
@@ -2874,30 +2901,276 @@ impl VM {
         self.cranelift_generation = self.cranelift_generation.wrapping_add(1).max(1);
     }
 
-    /// Builds the candidate post-inline Cranelift MIR module, continuation bytecodes, and
-    /// authoritative deopt recipes following Hazard 3 Steps A-C:
-    /// - Pre-filter eligible functions and run initial call-graph eligibility fixpoint.
-    /// - Step A (`PERF-T1-4`): Clone refined eligible functions into a candidate `MirModule` and
-    ///   run `MirOptimizer::optimize_module_for_jit` (with `test_deopt_spike_hook.target_function`
-    ///   excluded under `test-deopt`, no loop-bearing / effect / recursive callees, and
-    ///   `MirVerifier::verify_fn` fail-closed revert).
-    /// - Step B: Compile continuation bytecode (`MirToBytecodeCompiler::compile_with_direct_callees`)
-    ///   from the exact post-inline `MirFunction`.
-    /// - Step C: Build deopt recipes (`build_function_deopt_recipes`) from the identical post-inline
-    ///   `MirFunction` and `continuation_bc`. If a post-inline function fails Step B/C, revert it
-    ///   to its pre-inline MIR snapshot and retry before dropping; then re-run the call-graph
-    ///   eligibility fixpoint on the final module.
+    /// Collects all VM function names referenced by non-Cranelift bytecode functions (indirect calls,
+    /// closures, globals, `CallMethod`), runtime global closures, or MIR `Rvalue::Closure` nodes so
+    /// dead-helper DCE never prunes an indirectly-callable or closure-captured helper.
     #[cfg(feature = "std")]
-    #[allow(clippy::type_complexity)]
+    fn collect_bytecode_referenced_functions(
+        &self,
+        eligible_names: &hashbrown::HashSet<String>,
+    ) -> hashbrown::HashSet<String> {
+        use crate::bytecode::Instruction;
+
+        let mut referenced = hashbrown::HashSet::new();
+
+        for func in &self.functions {
+            if eligible_names.contains(&func.name) {
+                continue;
+            }
+            for constant in &func.chunk.constants {
+                match constant {
+                    Value::Function(idx) => {
+                        if let Some(target) = self.functions.get(*idx) {
+                            referenced.insert(target.name.clone());
+                        }
+                    }
+                    Value::Closure(cl) => {
+                        if let Some(target) = self.functions.get(cl.function_idx) {
+                            referenced.insert(target.name.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for insn in &func.chunk.instructions {
+                match *insn {
+                    Instruction::Closure(_, fn_idx, _, _) => {
+                        if let Some(target) = self.functions.get(fn_idx as usize) {
+                            referenced.insert(target.name.clone());
+                        }
+                    }
+                    Instruction::LoadGlobal(_, const_idx) => {
+                        if let Some(Value::String(gname)) =
+                            func.chunk.constants.get(const_idx as usize)
+                        {
+                            let gname_str = gname.as_str();
+                            if let Some(val) = self.globals.get(gname_str) {
+                                match val {
+                                    Value::Function(idx) => {
+                                        if let Some(target) = self.functions.get(*idx) {
+                                            referenced.insert(target.name.clone());
+                                        }
+                                    }
+                                    Value::Closure(cl) => {
+                                        if let Some(target) = self.functions.get(cl.function_idx) {
+                                            referenced.insert(target.name.clone());
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            let dot_suffix = format!(".{gname_str}");
+                            let colon_suffix = format!("::{gname_str}");
+                            for target in &self.functions {
+                                if target.name == gname_str
+                                    || target.name.ends_with(&dot_suffix)
+                                    || target.name.ends_with(&colon_suffix)
+                                {
+                                    referenced.insert(target.name.clone());
+                                }
+                            }
+                        }
+                    }
+                    Instruction::CallMethod(_, method_const_idx, _, _, _) => {
+                        if let Some(Value::String(mname)) =
+                            func.chunk.constants.get(method_const_idx as usize)
+                        {
+                            let method_suffix = format!(":{}", mname.as_str());
+                            for target in &self.functions {
+                                if target.is_method
+                                    && (target.name == mname.as_str()
+                                        || target.name.ends_with(&method_suffix))
+                                {
+                                    referenced.insert(target.name.clone());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Preserve any function captured in a live global closure value.
+        for val in self.globals.values() {
+            if let Value::Closure(cl) = val
+                && let Some(target) = self.functions.get(cl.function_idx)
+            {
+                referenced.insert(target.name.clone());
+            }
+        }
+
+        // Preserve any function targeted by an Rvalue::Closure in any registered MIR function
+        // (including ineligible MIR functions).
+        for mir_fn in self.mir_functions.values() {
+            for block in &mir_fn.blocks {
+                for stmt in &block.statements {
+                    if let Statement::Assign(_, Rvalue::Closure { func_name, .. }, _) = stmt {
+                        referenced.insert(func_name.clone());
+                    }
+                }
+            }
+        }
+
+        referenced
+    }
+
+    #[cfg(feature = "std")]
+    fn refine_mir_function_with_callee_rets(
+        mir_fn: &MirFunction,
+        callee_rets: &hashbrown::HashMap<String, MirType>,
+    ) -> MirFunction {
+        let mut f = mir_fn.clone();
+        apply_module_callee_return_types(&mut f, callee_rets);
+        crate::mir::cranelift_backend::jit_engine::refine_mir_function(&f)
+    }
+
+    /// Lightweight compile-time fail-closed deopt eligibility validation without compiling
+    /// continuation bytecode or allocating `CompiledDeoptRecipe` entries (`NG-W14-7`).
+    /// Returns `Ok((has_effect_site, has_loop_header))`.
+    #[cfg(feature = "std")]
+    fn validate_function_deopt_eligibility(
+        &self,
+        func_name: &str,
+        refined: &MirFunction,
+        hook_authorized_for_fn: bool,
+    ) -> core::result::Result<(bool, bool), String> {
+        if refined.locals.len() > u8::MAX as usize {
+            return Err(format!(
+                "MIR local count {} exceeds 255-register VM limit in '{}'",
+                refined.locals.len(),
+                func_name
+            ));
+        }
+
+        let mut has_effect_site = false;
+        for (b_idx, block) in refined.blocks.iter().enumerate() {
+            if let Some(Terminator::Call { callee, .. }) = &block.terminator
+                && is_effect_or_handler_callee(callee)
+            {
+                if !is_vm_effect_intrinsic_callee(callee) && !hook_authorized_for_fn {
+                    return Err(format!(
+                        "Callee '{}' in '{}' requires test-deopt hook authorization",
+                        callee, func_name
+                    ));
+                }
+                has_effect_site = true;
+                let proven_indices = refined.derive_proven_site_metadata(b_idx).map_err(|err| {
+                    format!(
+                        "Cannot derive authoritative deopt metadata for site {}: {}",
+                        b_idx, err
+                    )
+                })?;
+                for idx in proven_indices {
+                    let ty = refined.locals.get(idx).map(|l| &l.ty).ok_or_else(|| {
+                        format!("Local index {} out of bounds in '{}'", idx, func_name)
+                    })?;
+                    if Self::type_contains_unknown(ty) || !self.is_supported_deopt_recipe_type(ty) {
+                        return Err(format!(
+                            "Unsupported deopt local {} type {:?} at site {} in '{}'",
+                            idx, ty, b_idx, func_name
+                        ));
+                    }
+                }
+            }
+        }
+
+        let loop_headers = find_loop_headers(&refined.blocks);
+        let has_loop_header = !loop_headers.is_empty();
+        for b_idx in loop_headers {
+            let proven_indices = refined
+                .derive_proven_site_metadata_at_entry(b_idx)
+                .map_err(|err| {
+                    format!(
+                        "Cannot derive authoritative deopt metadata for loop header safepoint {}: {}",
+                        b_idx, err
+                    )
+                })?;
+            for idx in proven_indices {
+                let ty = refined.locals.get(idx).map(|l| &l.ty).ok_or_else(|| {
+                    format!("Local index {} out of bounds in '{}'", idx, func_name)
+                })?;
+                if Self::type_contains_unknown(ty) || !self.is_supported_deopt_recipe_type(ty) {
+                    return Err(format!(
+                        "Unsupported deopt local {} type {:?} at loop header {} in '{}'",
+                        idx, ty, b_idx, func_name
+                    ));
+                }
+            }
+        }
+
+        if has_effect_site || has_loop_header {
+            for local in &refined.locals {
+                if let MirType::Struct(struct_name) = &local.ty
+                    && self.struct_metadata.get(struct_name).is_none()
+                {
+                    return Err(format!(
+                        "Missing struct layout metadata for '{struct_name}' in deopt-capable function '{func_name}'"
+                    ));
+                }
+            }
+        }
+
+        Ok((has_effect_site, has_loop_header))
+    }
+
+    #[cfg(feature = "std")]
+    fn compile_continuation_bytecode_for_mir(
+        &self,
+        name: &str,
+        func_idx: usize,
+        candidate: &MirFunction,
+        direct_callees: &hashbrown::HashSet<String>,
+        direct_callee_indices: &hashbrown::HashMap<String, usize>,
+    ) -> core::result::Result<crate::bytecode::Function, String> {
+        if candidate.locals.len() > u8::MAX as usize {
+            return Err(format!(
+                "MIR local count {} exceeds 255-register VM limit in '{}'",
+                candidate.locals.len(),
+                name
+            ));
+        }
+        let mut continuation_bc =
+            crate::mir::vm_backend::MirToBytecodeCompiler::compile_with_direct_callees_and_indices(
+                candidate,
+                direct_callees,
+                direct_callee_indices,
+            )
+            .map_err(|err| {
+                format!(
+                    "Failed to compile MIR continuation bytecode for '{}': {:?}",
+                    name, err
+                )
+            })?;
+        if (continuation_bc.register_count as usize) < candidate.locals.len() {
+            return Err(format!(
+                "MIR continuation register_count overflow for '{}' (locals={}, register_count={})",
+                name,
+                candidate.locals.len(),
+                continuation_bc.register_count
+            ));
+        }
+        if let Some(orig_fn) = self.functions.get(func_idx) {
+            continuation_bc.is_method = orig_fn.is_method;
+            continuation_bc.signature = orig_fn.signature.clone();
+        }
+        self.rewrite_continuation_struct_ops(candidate, &mut continuation_bc)?;
+        Ok(continuation_bc)
+    }
+
+    /// Builds the candidate post-inline Cranelift MIR module with:
+    /// - Step A (`PERF-T1-4`): JIT-safe MIR inlining + SROA + tier1 optimizations.
+    /// - Dead-Helper DCE (`NG-W14-7`): computes reachable native functions from active roots +
+    ///   exported/indirectly-referenced functions after inlining and prunes 100%-inlined helpers
+    ///   with 0 remaining callers before Cranelift codegen.
+    /// - Lazy Deopt Preparation (`NG-W14-7`): validates fail-closed deopt eligibility while
+    ///   deferring `CompiledDeoptRecipe` materialization (and script/non-entry continuation
+    ///   bytecode compilation) until first actual deopt event.
+    #[cfg(feature = "std")]
     fn prepare_cranelift_module(
         &self,
-        next_gen: u64,
-    ) -> Result<(
-        crate::mir::ir::MirModule,
-        hashbrown::HashSet<String>,
-        hashbrown::HashMap<String, Vec<CompiledDeoptRecipe>>,
-        hashbrown::HashMap<String, (usize, crate::bytecode::Function)>,
-    )> {
+        requested_roots: Option<&hashbrown::HashSet<String>>,
+    ) -> Result<PreparedCraneliftModule> {
         let mut eligible: hashbrown::HashSet<String> = self
             .mir_functions
             .iter()
@@ -2997,16 +3270,20 @@ impl VM {
         }
 
         if eligible.is_empty() {
-            return Ok((
-                crate::mir::ir::MirModule::new("vm_cranelift_module".into()),
+            return Ok(PreparedCraneliftModule {
+                module: crate::mir::ir::MirModule::new("vm_cranelift_module".into()),
                 eligible,
-                hashbrown::HashMap::new(),
-                hashbrown::HashMap::new(),
-            ));
+                func_idx_by_name,
+                eager_continuations: hashbrown::HashMap::new(),
+                deferred_continuations: hashbrown::HashSet::new(),
+                deferred_dead_helpers: hashbrown::HashSet::new(),
+                effective_roots: hashbrown::HashSet::new(),
+                skipped_dead_helper_count: 0,
+            });
         }
 
         // Step A (Hazard 3 / PERF-T1-4): Clone raw eligible functions into candidate module
-        // and run JIT-safe MIR inlining + post-inline optimization BEFORE Steps B, C, and D.
+        // and run JIT-safe MIR inlining + post-inline optimization BEFORE reachability & Steps B/C.
         let mut sorted_names: Vec<String> = eligible.iter().cloned().collect();
         sorted_names.sort();
 
@@ -3044,108 +3321,173 @@ impl VM {
             }
         }
 
-        // Step B & Step C (Hazard 3): Derive continuation bytecode and deopt recipes strictly
-        // from the identical post-inline `MirFunction` in `module`.
-        let mut recipes_by_fn: hashbrown::HashMap<String, Vec<CompiledDeoptRecipe>> =
-            hashbrown::HashMap::new();
-        let mut continuations_by_fn: hashbrown::HashMap<String, (usize, crate::bytecode::Function)> =
-            hashbrown::HashMap::new();
-        let mut may_deopt_effect: hashbrown::HashSet<String> = hashbrown::HashSet::new();
-        let direct_callees = self.collect_direct_callees();
-        let direct_callee_indices: hashbrown::HashMap<String, usize> = self
-            .functions
+        // Compute effective reachability roots AFTER MIR inlining (`NG-W14-7` Dead-Helper DCE).
+        let bytecode_referenced = self.collect_bytecode_referenced_functions(&eligible);
+        let mut effective_roots: hashbrown::HashSet<String> = match requested_roots {
+            Some(req) => req.clone(),
+            None => compute_default_module_roots(&module),
+        };
+        for name in bytecode_referenced {
+            if eligible.contains(&name) {
+                effective_roots.insert(name);
+            }
+        }
+        if let Some(ref target) = hook_target
+            && eligible.contains(target)
+        {
+            effective_roots.insert(target.clone());
+        }
+
+        // Build callee return type map once for refinement reuse.
+        let callee_rets: hashbrown::HashMap<String, MirType> = self
+            .mir_functions
             .iter()
-            .enumerate()
-            .map(|(idx, f)| (f.name.clone(), idx))
+            .map(|(k, v)| (k.clone(), v.signature.return_type.clone()))
             .collect();
 
-        for func in &mut module.functions {
-            let name = func.signature.name.clone();
-            let hook_auth = hook_target.as_deref() == Some(name.as_str());
-            let Some(&func_idx) = func_idx_by_name.get(&name) else {
-                eligible.remove(&name);
-                continue;
-            };
+        // Step B & Step C (`NG-W14-7` Lazy Deopt Preparation + Dead-Helper DCE):
+        // Validate deopt eligibility on reachable functions, reverting to pre-inline MIR on failure
+        // (and re-computing reachability if a revert re-exposes previously-inlined callees).
+        let mut reachable = compute_reachable_native_functions(&module, &effective_roots);
+        let mut validated: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        let mut may_deopt_effect: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        let mut eager_continuations: hashbrown::HashMap<String, crate::bytecode::Function> =
+            hashbrown::HashMap::new();
+        let mut deferred_continuations: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        let mut direct_callees_cache: Option<hashbrown::HashSet<String>> = None;
+        let mut direct_callee_indices_cache: Option<hashbrown::HashMap<String, usize>> = None;
 
-            let compile_bc_and_recipes = |candidate: &MirFunction| -> core::result::Result<
-                (crate::bytecode::Function, Vec<CompiledDeoptRecipe>, bool),
-                String,
-            > {
-                if candidate.locals.len() > u8::MAX as usize {
-                    return Err(format!(
-                        "MIR local count {} exceeds 255-register VM limit in '{}'",
-                        candidate.locals.len(),
-                        name
-                    ));
-                }
-                let mut continuation_bc =
-                    crate::mir::vm_backend::MirToBytecodeCompiler::compile_with_direct_callees_and_indices(
-                        candidate,
-                        &direct_callees,
-                        &direct_callee_indices,
-                    )
-                    .map_err(|err| {
-                        format!(
-                            "Failed to compile MIR continuation bytecode for '{}': {:?}",
-                            name, err
-                        )
-                    })?;
-                if (continuation_bc.register_count as usize) < candidate.locals.len() {
-                    return Err(format!(
-                        "MIR continuation register_count overflow for '{}' (locals={}, register_count={})",
-                        name,
-                        candidate.locals.len(),
-                        continuation_bc.register_count
-                    ));
-                }
-                continuation_bc.is_method = self.functions[func_idx].is_method;
-                continuation_bc.signature = self.functions[func_idx].signature.clone();
-                self.rewrite_continuation_struct_ops(candidate, &mut continuation_bc)?;
+        loop {
+            let mut reverted_any = false;
+            let mut progress = false;
 
-                let (recipes, has_effect) = self.build_function_deopt_recipes(
-                    &name,
-                    candidate,
-                    &continuation_bc,
-                    next_gen,
-                    hook_auth,
-                )?;
-                Ok((continuation_bc, recipes, has_effect))
-            };
-
-            let attempt = match compile_bc_and_recipes(func) {
-                Ok(ok) => Ok(ok),
-                Err(_) if inlined_names.contains(&name) => {
-                    // Post-inline Step B/C failed: revert cleanly to pre-inline MIR and retry.
-                    if let Some(orig) = pre_inline_fns.get(&name) {
-                        *func = orig.clone();
-                    }
-                    inlined_names.remove(&name);
-                    compile_bc_and_recipes(func)
+            for func in &mut module.functions {
+                let name = func.signature.name.clone();
+                if !reachable.contains(&name) || !eligible.contains(&name) || validated.contains(&name)
+                {
+                    continue;
                 }
-                Err(err) => Err(err),
-            };
-
-            match attempt {
-                Ok((continuation_bc, recipes, has_effect)) => {
-                    if has_effect {
-                        may_deopt_effect.insert(name.clone());
-                    }
-                    recipes_by_fn.insert(name.clone(), recipes);
-                    continuations_by_fn.insert(name, (func_idx, continuation_bc));
-                }
-                Err(err_msg) => {
-                    if hook_auth {
-                        return Err(LustError::RuntimeError { message: err_msg });
-                    }
+                progress = true;
+                let hook_auth = hook_target.as_deref() == Some(name.as_str());
+                let Some(&func_idx) = func_idx_by_name.get(&name) else {
                     eligible.remove(&name);
+                    continue;
+                };
+
+                let is_script_entry = name == "__script" || name.starts_with("__init@");
+                let is_nested_only_callee = requested_roots
+                    .is_some_and(|req| !req.contains(&name))
+                    && !hook_auth;
+
+                let validate_or_compile = |candidate: &MirFunction,
+                                           direct_callees_cache: &mut Option<
+                    hashbrown::HashSet<String>,
+                >,
+                                           direct_callee_indices_cache: &mut Option<
+                    hashbrown::HashMap<String, usize>,
+                >|
+                 -> core::result::Result<
+                    (bool, bool, Option<crate::bytecode::Function>),
+                    String,
+                > {
+                    let refined = Self::refine_mir_function_with_callee_rets(candidate, &callee_rets);
+                    let (has_effect, has_loop) =
+                        self.validate_function_deopt_eligibility(&name, &refined, hook_auth)?;
+                    if !has_effect && !has_loop {
+                        // Zero deopt sites: never needs continuation bytecode or recipes.
+                        return Ok((false, false, None));
+                    }
+                    let defer_bc =
+                        (is_script_entry || is_nested_only_callee) && candidate.locals.len() <= 220;
+                    if defer_bc {
+                        return Ok((has_effect, true, None));
+                    }
+                    let direct_callees = direct_callees_cache
+                        .get_or_insert_with(|| self.collect_direct_callees());
+                    let direct_callee_indices = direct_callee_indices_cache.get_or_insert_with(|| {
+                        self.functions
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, f)| (f.name.clone(), idx))
+                            .collect()
+                    });
+                    let continuation_bc = self.compile_continuation_bytecode_for_mir(
+                        &name,
+                        func_idx,
+                        candidate,
+                        direct_callees,
+                        direct_callee_indices,
+                    )?;
+                    Ok((has_effect, false, Some(continuation_bc)))
+                };
+
+                let attempt = match validate_or_compile(
+                    func,
+                    &mut direct_callees_cache,
+                    &mut direct_callee_indices_cache,
+                ) {
+                    Ok(ok) => Ok(ok),
+                    Err(_) if inlined_names.contains(&name) => {
+                        if let Some(orig) = pre_inline_fns.get(&name) {
+                            *func = orig.clone();
+                        }
+                        inlined_names.remove(&name);
+                        reverted_any = true;
+                        validate_or_compile(
+                            func,
+                            &mut direct_callees_cache,
+                            &mut direct_callee_indices_cache,
+                        )
+                    }
+                    Err(err) => Err(err),
+                };
+
+                match attempt {
+                    Ok((has_effect, is_deferred, opt_bc)) => {
+                        if has_effect {
+                            may_deopt_effect.insert(name.clone());
+                        }
+                        if is_deferred {
+                            deferred_continuations.insert(name.clone());
+                        } else if let Some(bc) = opt_bc {
+                            eager_continuations.insert(name.clone(), bc);
+                        }
+                        validated.insert(name);
+                    }
+                    Err(err_msg) => {
+                        if hook_auth {
+                            return Err(LustError::RuntimeError { message: err_msg });
+                        }
+                        eligible.remove(&name);
+                    }
                 }
+            }
+
+            if reverted_any {
+                reachable = compute_reachable_native_functions(&module, &effective_roots);
+                continue;
+            }
+            if !progress {
+                break;
             }
         }
 
-        // Post-Step C call-graph eligibility fixpoint on the FINAL post-inline module functions.
+        // Partition post-inline eligible functions into live reachable vs dead-inlined helpers.
+        let mut deferred_dead_helpers: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        for f in &module.functions {
+            if eligible.contains(&f.signature.name) && !reachable.contains(&f.signature.name) {
+                deferred_dead_helpers.insert(f.signature.name.clone());
+            }
+        }
+        let skipped_dead_helper_count = deferred_dead_helpers.len();
+
+        // Retain only live reachable & eligible functions for call-graph fixpoint & codegen.
+        eligible.retain(|name| reachable.contains(name));
         module
             .functions
             .retain(|f| eligible.contains(&f.signature.name));
+
+        // Post-Step C call-graph eligibility fixpoint on the FINAL live post-inline module.
         loop {
             let param_counts: hashbrown::HashMap<&str, usize> = module
                 .functions
@@ -3181,15 +3523,47 @@ impl VM {
             drop(param_counts);
             for name in to_remove {
                 eligible.remove(&name);
-                recipes_by_fn.remove(&name);
-                continuations_by_fn.remove(&name);
+                eager_continuations.remove(&name);
+                deferred_continuations.remove(&name);
             }
             module
                 .functions
                 .retain(|f| eligible.contains(&f.signature.name));
         }
 
-        Ok((module, eligible, recipes_by_fn, continuations_by_fn))
+        // Prune any newly-orphaned helpers after fixpoint removal.
+        if !module.functions.is_empty() {
+            let post_fixpoint_reachable =
+                compute_reachable_native_functions(&module, &effective_roots);
+            let mut extra_skipped = 0usize;
+            for f in &module.functions {
+                if !post_fixpoint_reachable.contains(&f.signature.name) {
+                    deferred_dead_helpers.insert(f.signature.name.clone());
+                    extra_skipped += 1;
+                }
+            }
+            if extra_skipped > 0 {
+                eligible.retain(|name| post_fixpoint_reachable.contains(name));
+                eager_continuations.retain(|name, _| eligible.contains(name));
+                deferred_continuations.retain(|name| eligible.contains(name));
+                module
+                    .functions
+                    .retain(|f| eligible.contains(&f.signature.name));
+            }
+        }
+
+        let skipped_dead_helper_count = deferred_dead_helpers.len().max(skipped_dead_helper_count);
+
+        Ok(PreparedCraneliftModule {
+            module,
+            eligible,
+            func_idx_by_name,
+            eager_continuations,
+            deferred_continuations,
+            deferred_dead_helpers,
+            effective_roots,
+            skipped_dead_helper_count,
+        })
     }
 
     /// Read-only inspection helper returning the exact post-inline compiled `MirFunction`
@@ -3199,13 +3573,62 @@ impl VM {
         if !self.cranelift_compiled.contains_key(func_name) {
             return None;
         }
-        let (module, _, _, _) = self
-            .prepare_cranelift_module(self.cranelift_compiled_generation)
-            .ok()?;
-        module
+        if let Some(mir) = self
+            .cranelift_jit
+            .as_ref()
+            .and_then(|jit| jit.post_inline_mir(func_name))
+        {
+            return Some(mir.clone());
+        }
+        let prepared = self.prepare_cranelift_module(None).ok()?;
+        prepared
+            .module
             .functions
             .into_iter()
             .find(|f| f.signature.name == func_name)
+    }
+
+    /// Read-only inspection helper returning the number of dead inlined helpers skipped from
+    /// Cranelift codegen during the most recent compilation (`NG-W14-7`).
+    #[cfg(feature = "std")]
+    pub fn cranelift_skipped_dead_helper_count(&self) -> usize {
+        self.cranelift_jit
+            .as_ref()
+            .map_or(0, |jit| jit.skipped_dead_helper_count())
+    }
+
+    /// Read-only inspection helper returning the number of on-demand lazy deopt materializations
+    /// performed for the current Cranelift compilation (`NG-W14-7`).
+    #[cfg(feature = "std")]
+    pub fn cranelift_lazy_deopt_materialization_count(&self) -> u64 {
+        self.cranelift_jit
+            .as_ref()
+            .map_or(0, |jit| jit.lazy_deopt_materialization_count())
+    }
+
+    /// Read-only inspection helper returning the number of currently materialized deopt recipes
+    /// in `self.cranelift_recipes` (`NG-W14-7`).
+    #[cfg(feature = "std")]
+    pub fn cranelift_materialized_recipe_count(&self) -> usize {
+        self.cranelift_recipes.len()
+    }
+
+    /// Read-only inspection helper returning whether `func_name` currently has deferred
+    /// continuation bytecode awaiting first actual deopt (`NG-W14-7`).
+    #[cfg(feature = "std")]
+    pub fn cranelift_has_deferred_continuation(&self, func_name: &str) -> bool {
+        self.cranelift_jit
+            .as_ref()
+            .is_some_and(|jit| jit.is_deferred_continuation(func_name))
+    }
+
+    /// Read-only inspection helper returning whether `func_name` was pruned as a dead inlined helper
+    /// for the active compilation root set (`NG-W14-7`).
+    #[cfg(feature = "std")]
+    pub fn cranelift_is_deferred_dead_helper(&self, func_name: &str) -> bool {
+        self.cranelift_jit
+            .as_ref()
+            .is_some_and(|jit| jit.is_deferred_dead_helper(func_name))
     }
 
     /// Read-only inspection helper returning the current compiled Cranelift generation.
@@ -3339,6 +3762,8 @@ impl VM {
 
     /// Read-only inspection helper returning the compiled deopt recipe sites
     /// `(block_id, site_kind, precise_pc)` for `func_name`.
+    /// When recipes are lazily deferred (`NG-W14-7`), derives the sites read-only from the stored
+    /// post-inline MIR snapshot without mutating VM state.
     #[cfg(feature = "std")]
     pub fn cranelift_deopt_recipe_sites(&self, func_name: &str) -> Vec<(usize, DeoptSiteKind, usize)> {
         let mut sites: Vec<(usize, DeoptSiteKind, usize)> = self
@@ -3347,13 +3772,72 @@ impl VM {
             .filter(|r| r.func_name == func_name)
             .map(|r| (r.block_id, r.site_kind, r.precise_pc))
             .collect();
+        if sites.is_empty()
+            && let Some(jit) = self.cranelift_jit.as_ref()
+            && let Some(mir_snapshot) = jit.post_inline_mir(func_name)
+            && let Some(func_idx) = self.functions.iter().position(|f| f.name == func_name)
+        {
+            #[cfg(feature = "test-deopt")]
+            let hook_auth = self
+                .test_deopt_spike_hook
+                .as_ref()
+                .is_some_and(|h| h.target_function == func_name);
+            #[cfg(not(feature = "test-deopt"))]
+            let hook_auth = false;
+
+            let use_installed = !jit.is_deferred_continuation(func_name)
+                && !self.functions[func_idx].block_entry_pcs.is_empty();
+            let temp_bc;
+            let bc_ref = if use_installed {
+                &self.functions[func_idx]
+            } else {
+                let direct_callees = self.collect_direct_callees();
+                let direct_callee_indices: hashbrown::HashMap<String, usize> = self
+                    .functions
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, f)| (f.name.clone(), idx))
+                    .collect();
+                match self.compile_continuation_bytecode_for_mir(
+                    func_name,
+                    func_idx,
+                    mir_snapshot,
+                    &direct_callees,
+                    &direct_callee_indices,
+                ) {
+                    Ok(bc) => {
+                        temp_bc = bc;
+                        &temp_bc
+                    }
+                    Err(_) => return sites,
+                }
+            };
+            if let Ok((recipes, _)) = self.build_function_deopt_recipes(
+                func_name,
+                mir_snapshot,
+                bc_ref,
+                self.cranelift_compiled_generation,
+                hook_auth,
+            ) {
+                sites.extend(
+                    recipes
+                        .into_iter()
+                        .map(|r| (r.block_id, r.site_kind, r.precise_pc)),
+                );
+            }
+        }
         sites.sort_by_key(|&(block_id, _, precise_pc)| (block_id, precise_pc));
         sites
     }
 
-    /// Compiles all uncompiled eligible registered MIR functions using CraneliftJitCompiler.
+    /// Compiles all uncompiled reachable eligible registered MIR functions using CraneliftJitCompiler.
     #[cfg(feature = "std")]
     pub fn compile_cranelift(&mut self) -> Result<()> {
+        self.compile_cranelift_internal(None)
+    }
+
+    #[cfg(feature = "std")]
+    fn compile_cranelift_internal(&mut self, requested_root: Option<&str>) -> Result<()> {
         let _guard = self.mir_context.enter();
         let current_struct_gen = self.struct_metadata.generation();
         if self.cranelift_compiled_struct_gen != current_struct_gen
@@ -3371,41 +3855,45 @@ impl VM {
             self.cranelift_generation.max(1)
         };
 
-        let (module, eligible, mut recipes_by_fn, mut continuations_by_fn) =
-            self.prepare_cranelift_module(next_gen)?;
+        let requested_roots: Option<hashbrown::HashSet<String>> = requested_root.map(|root| {
+            let mut roots = hashbrown::HashSet::new();
+            roots.insert(root.to_string());
+            if self.cranelift_compiled_generation == self.cranelift_generation
+                && self.cranelift_compiled_struct_gen == current_struct_gen
+                && let Some(jit) = self.cranelift_jit.as_ref()
+            {
+                for prev_root in jit.compiled_roots() {
+                    roots.insert(prev_root.clone());
+                }
+            }
+            roots
+        });
 
-        if eligible.is_empty() {
-            self.restore_all_ast_bytecode_backups();
-            self.cranelift_compiled.clear();
-            self.cranelift_recipes.clear();
-            self.cranelift_fn_cache.clear();
-            self.cranelift_fn_cache.resize(self.functions.len(), None);
-            self.cranelift_compiled_generation = self.cranelift_generation;
-            self.cranelift_compiled_struct_gen = current_struct_gen;
+        let mut prepared = self.prepare_cranelift_module(requested_roots.as_ref())?;
+
+        if prepared.eligible.is_empty() {
+            if requested_root.is_none() || prepared.deferred_dead_helpers.is_empty() {
+                self.restore_all_ast_bytecode_backups();
+                self.cranelift_compiled.clear();
+                self.cranelift_recipes.clear();
+                self.cranelift_fn_cache.clear();
+                self.cranelift_fn_cache.resize(self.functions.len(), None);
+                self.cranelift_compiled_generation = self.cranelift_generation;
+                self.cranelift_compiled_struct_gen = current_struct_gen;
+            }
             return Ok(());
         }
 
         let all_compiled = self.cranelift_jit.is_some()
             && self.cranelift_compiled_generation == self.cranelift_generation
             && self.cranelift_compiled_struct_gen == current_struct_gen
-            && eligible.len() == self.cranelift_compiled.len()
-            && eligible
+            && prepared.eligible.len() == self.cranelift_compiled.len()
+            && prepared
+                .eligible
                 .iter()
                 .all(|name| self.cranelift_compiled.contains_key(name));
         if all_compiled {
             return Ok(());
-        }
-
-        let mut pending_recipes = hashbrown::HashMap::new();
-        for f in &module.functions {
-            if let Some(fn_recipes) = recipes_by_fn.remove(&f.signature.name) {
-                for recipe in fn_recipes {
-                    pending_recipes.insert(
-                        (recipe.func_name.clone(), recipe.block_id, recipe.site_kind),
-                        recipe,
-                    );
-                }
-            }
         }
 
         let mut compiler = if self.cranelift_jit.is_some() && self.cranelift_compiled.is_empty() {
@@ -3418,18 +3906,31 @@ impl VM {
             })?
         };
 
-        let compiled_map = match compiler.compile_module(&module) {
-            Ok(map) => map,
-            Err(e) => {
-                return Err(LustError::RuntimeError {
-                    message: format!("Cranelift JIT module compilation failed: {:?}", e),
-                });
-            }
-        };
+        let compiled_map =
+            match compiler.compile_module_with_roots(&prepared.module, &prepared.effective_roots) {
+                Ok(map) => map,
+                Err(e) => {
+                    return Err(LustError::RuntimeError {
+                        message: format!("Cranelift JIT module compilation failed: {:?}", e),
+                    });
+                }
+            };
+
+        let backend_skipped = compiler.skipped_dead_helper_count();
+        let total_skipped_dead_helpers = prepared
+            .skipped_dead_helper_count
+            .saturating_add(backend_skipped);
 
         // Precompute per-function refined metadata and read-only parameter masks strictly from
-        // the FINAL post-inline compiled module functions before mutating VM state.
-        let mut refined_module = crate::mir::ir::MirModule::new(module.name.clone());
+        // the FINAL live post-inline compiled module functions before mutating VM state.
+        let callee_rets: hashbrown::HashMap<String, MirType> = self
+            .mir_functions
+            .iter()
+            .map(|(k, v)| (k.clone(), v.signature.return_type.clone()))
+            .collect();
+        let mut refined_module = crate::mir::ir::MirModule::new(prepared.module.name.clone());
+        let mut post_inline_mirs: hashbrown::HashMap<String, MirFunction> =
+            hashbrown::HashMap::with_capacity(prepared.module.functions.len());
         let mut entry_meta_by_name: hashbrown::HashMap<
             String,
             (
@@ -3438,9 +3939,12 @@ impl VM {
                 Vec<MirType>,
                 Vec<crate::mir::ir::SroaStructRecipe>,
             ),
-        > = hashbrown::HashMap::with_capacity(module.functions.len());
-        for f in &module.functions {
-            let refined = self.refine_mir_function_in_vm(f);
+        > = hashbrown::HashMap::with_capacity(prepared.module.functions.len());
+        for f in &prepared.module.functions {
+            if !compiled_map.contains_key(&f.signature.name) {
+                continue;
+            }
+            let refined = Self::refine_mir_function_with_callee_rets(f, &callee_rets);
             let param_types: Vec<MirType> = f
                 .params
                 .iter()
@@ -3474,6 +3978,7 @@ impl VM {
                     f.sroa_decomposed_structs.clone(),
                 ),
             );
+            post_inline_mirs.insert(f.signature.name.clone(), f.clone());
             refined_module.add_function(refined);
         }
         let mut readonly_params_by_name = compute_readonly_params_with_structs(
@@ -3482,19 +3987,29 @@ impl VM {
         );
         let mut has_ext_calls_by_name = compute_has_external_or_host_calls(&refined_module);
 
-        // Transactional publish ONLY after compile_module returns Ok
-        let mut compiled_func_indices: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
+        compiler.set_post_inline_snapshot(
+            post_inline_mirs,
+            prepared.deferred_continuations,
+            prepared.deferred_dead_helpers,
+            prepared.effective_roots,
+            total_skipped_dead_helpers,
+        );
+
+        // Transactional publish ONLY after compile_module_with_roots returns Ok.
+        let mut installed_cont_indices: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
         for name in compiled_map.keys() {
-            if let Some((func_idx, _)) = continuations_by_fn.get(name) {
-                compiled_func_indices.insert(*func_idx);
+            if prepared.eager_continuations.contains_key(name)
+                && let Some(&func_idx) = prepared.func_idx_by_name.get(name)
+            {
+                installed_cont_indices.insert(func_idx);
             }
         }
-        // Restore any previously-compiled function that was dropped in this recompilation.
+        // Restore any previously-compiled function that was dropped or deferred in this recompilation.
         let dropped_indices: Vec<usize> = self
             .ast_bytecode_backup
             .keys()
             .copied()
-            .filter(|idx| !compiled_func_indices.contains(idx))
+            .filter(|idx| !installed_cont_indices.contains(idx))
             .collect();
         for func_idx in dropped_indices {
             if let Some(orig_fn) = self.ast_bytecode_backup.remove(&func_idx)
@@ -3514,14 +4029,16 @@ impl VM {
         self.cranelift_fn_cache.clear();
         self.cranelift_fn_cache.resize(self.functions.len(), None);
         for (name, ptr) in compiled_map {
-            if let Some((func_idx, continuation_bc)) = continuations_by_fn.remove(&name)
+            if let Some(&func_idx) = prepared.func_idx_by_name.get(&name)
                 && func_idx < self.functions.len()
             {
-                let meta = crate::vm::CallMeta::of(&continuation_bc);
-                let prev_fn = core::mem::replace(&mut self.functions[func_idx], continuation_bc);
-                self.ast_bytecode_backup.entry(func_idx).or_insert(prev_fn);
-                if func_idx < self.call_meta.len() {
-                    self.call_meta[func_idx] = meta;
+                if let Some(continuation_bc) = prepared.eager_continuations.remove(&name) {
+                    let meta = crate::vm::CallMeta::of(&continuation_bc);
+                    let prev_fn = core::mem::replace(&mut self.functions[func_idx], continuation_bc);
+                    self.ast_bytecode_backup.entry(func_idx).or_insert(prev_fn);
+                    if func_idx < self.call_meta.len() {
+                        self.call_meta[func_idx] = meta;
+                    }
                 }
                 if let Some((param_types, ret_type, local_types, sroa_recipes)) =
                     entry_meta_by_name.remove(&name)
@@ -3560,9 +4077,6 @@ impl VM {
             }
             self.cranelift_compiled.insert(name, ptr);
             self.cranelift_compilation_count += 1;
-        }
-        for (key, recipe) in pending_recipes {
-            self.cranelift_recipes.insert(key, recipe);
         }
         self.cranelift_generation = next_gen;
         self.cranelift_compiled_generation = next_gen;
@@ -3621,13 +4135,18 @@ impl VM {
                 {
                     Rc::clone(cached)
                 }
-                None if !has_spike_hook => {
+                None if !has_spike_hook
+                    && !self.cranelift_jit.as_ref().is_some_and(|jit| {
+                        jit.is_deferred_dead_helper(&self.functions[func_idx].name)
+                    }) =>
+                {
                     // Already compiled for current (cranelift_generation, struct_metadata_generation)
-                    // and this func_idx was ineligible.
+                    // and this func_idx was ineligible (not a DCE-deferred helper).
                     return Ok(None);
                 }
                 _ => {
-                    // Fallback to slow path if hook active or metadata mismatch.
+                    // Fallback to slow path if hook active, DCE-deferred helper invoked directly,
+                    // or metadata mismatch.
                     let Some(e) = self.resolve_cranelift_fn_entry_slow(func_idx, param_count)? else {
                         return Ok(None);
                     };
@@ -3736,12 +4255,13 @@ impl VM {
             return Ok(None);
         }
 
-        // Compile before entering MirContext invocation scope and packing arguments
+        // Compile reachable closure from `func_name` before entering MirContext invocation scope
+        // and packing arguments (`NG-W14-7` demand-driven dead-helper DCE).
         if !self.cranelift_compiled.contains_key(&func_name)
             || self.cranelift_compiled_generation != self.cranelift_generation
             || self.cranelift_compiled_struct_gen != self.struct_metadata.generation()
         {
-            self.compile_cranelift()?;
+            self.compile_cranelift_internal(Some(&func_name))?;
         }
 
         let post_struct_gen = self.struct_metadata.generation();
@@ -3768,6 +4288,7 @@ impl VM {
         &self,
         rc: &Rc<StructObject>,
         expected_name: &str,
+        expected_info_hint: Option<&crate::vm::RuntimeStructInfo>,
         param_idx: usize,
         marshalled_structs: &mut Vec<MarshalledStruct>,
         marshalled_struct_by_ptr: &mut hashbrown::HashMap<*const StructObject, usize>,
@@ -3798,11 +4319,18 @@ impl VM {
             return Ok(Some(existing.ptr));
         }
 
-        if !self.is_cranelift_supported_struct(expected_name) {
+        // `is_cranelift_supported_struct` validates the full transitive closure of
+        // `Option<Named(sub)>` targets at `depth == 0`, so recursive steps do not need
+        // to re-run the global-lock + HashSet traversal on every node.
+        if depth == 0 && !self.is_cranelift_supported_struct(expected_name) {
             return Ok(None);
         }
-        let Some(expected_info) = self.struct_metadata.get(expected_name) else {
-            return Ok(None);
+        let expected_info = match expected_info_hint {
+            Some(info) => info,
+            None => match self.struct_metadata.get(expected_name) {
+                Some(info) => info,
+                None => return Ok(None),
+            },
         };
         if rc.name.as_str() != expected_name
             && rc.name.as_str() != expected_info.layout.name()
@@ -3819,9 +4347,27 @@ impl VM {
             return Ok(None);
         }
 
+        enum RawFieldBuf {
+            Inline([i64; 8], usize),
+            Heap(Vec<i64>),
+        }
+        impl RawFieldBuf {
+            #[inline]
+            fn as_slice(&self) -> &[i64] {
+                match self {
+                    Self::Inline(arr, len) => &arr[..*len],
+                    Self::Heap(v) => v.as_slice(),
+                }
+            }
+        }
+
         visiting.insert(rc_key);
-        let marshal_fields_res: Result<Option<Vec<i64>>> = (|| {
-            let mut raw_fields = Vec::with_capacity(fields.len());
+        let marshal_fields_res: Result<Option<RawFieldBuf>> = (|| {
+            let mut raw_fields = if fields.len() <= 8 {
+                RawFieldBuf::Inline([0; 8], 0)
+            } else {
+                RawFieldBuf::Heap(Vec::with_capacity(fields.len()))
+            };
             for (idx, fld) in fields.iter().enumerate() {
                 let raw_fld = match (fld, &expected_info.layout.field_type(idx).kind) {
                     (Value::Int(n), TypeKind::Int) => *n,
@@ -3843,9 +4389,15 @@ impl VM {
                                 Some(("Option", "None", None))
                                 | Some(("Option", "None", Some([]))) => 0i64,
                                 Some(("Option", "Some", Some([Value::Struct(sub_rc)]))) => {
+                                    let sub_hint = if sub_name.as_ref() == expected_name {
+                                        Some(expected_info)
+                                    } else {
+                                        None
+                                    };
                                     match self.marshal_struct_recursive(
                                         sub_rc,
-                                        &sub_name,
+                                        sub_name.as_ref(),
+                                        sub_hint,
                                         param_idx,
                                         marshalled_structs,
                                         marshalled_struct_by_ptr,
@@ -3863,7 +4415,13 @@ impl VM {
                     },
                     _ => return Ok(None),
                 };
-                raw_fields.push(raw_fld);
+                match &mut raw_fields {
+                    RawFieldBuf::Inline(arr, len) => {
+                        arr[*len] = raw_fld;
+                        *len += 1;
+                    }
+                    RawFieldBuf::Heap(v) => v.push(raw_fld),
+                }
             }
             Ok(Some(raw_fields))
         })();
@@ -3872,21 +4430,15 @@ impl VM {
             return Ok(None);
         };
 
-        let len = raw_fields.len();
-        let ptr = lust_mir_alloc_struct_named(
-            len as i64,
-            expected_name.as_ptr(),
-            expected_name.len() as i64,
-        );
+        let raw_slice = raw_fields.as_slice();
+        let len = raw_slice.len();
+        let ptr = self
+            .mir_context
+            .alloc_struct_with_fields(expected_name, raw_slice);
         if ptr.is_null() {
             return Err(LustError::RuntimeError {
                 message: "Out of memory allocating struct buffer for Cranelift JIT".into(),
             });
-        }
-        for (idx, raw_fld) in raw_fields.into_iter().enumerate() {
-            unsafe {
-                *ptr.add(2 + idx) = raw_fld;
-            }
         }
         let new_idx = marshalled_structs.len();
         marshalled_structs.push(MarshalledStruct {
@@ -4306,6 +4858,7 @@ impl VM {
                         match self.marshal_struct_recursive(
                             rc,
                             expected_name,
+                            None,
                             i,
                             &mut marshalled_structs,
                             &mut marshalled_struct_by_ptr,
@@ -4325,6 +4878,7 @@ impl VM {
                                 match self.marshal_struct_recursive(
                                     rc,
                                     expected_name,
+                                    None,
                                     i,
                                     &mut marshalled_structs,
                                     &mut marshalled_struct_by_ptr,
@@ -5028,16 +5582,100 @@ impl VM {
             }
         }
 
-        let recipe = self
+        // Lazy deopt preparation (`NG-W14-7`): materialize continuation bytecode (if deferred)
+        // and `CompiledDeoptRecipe`s on demand from the stored post-inline MIR snapshot.
+        // Keep new bytecode/recipes staged until all payload & writeback validations succeed
+        // (preserving zero-mutation fail-closed atomicity).
+        let mut staged_continuation_bc: Option<(usize, crate::bytecode::Function)> = None;
+        let mut staged_recipes: Vec<CompiledDeoptRecipe> = Vec::new();
+        let recipe = if let Some(cached) = self
             .cranelift_recipes
             .get(&(func_name.to_string(), target_block_id, payload.site_kind))
             .cloned()
-            .ok_or_else(|| LustError::RuntimeError {
-                message: format!(
-                    "Missing compiled deopt recipe for ({}, block {}, {:?}) ({source_label})",
-                    func_name, target_block_id, payload.site_kind
-                ),
-            })?;
+        {
+            cached
+        } else {
+            let mir_snapshot = self
+                .cranelift_jit
+                .as_ref()
+                .and_then(|jit| jit.post_inline_mir(func_name).cloned());
+            let is_deferred_bc = self
+                .cranelift_jit
+                .as_ref()
+                .is_some_and(|jit| jit.is_deferred_continuation(func_name));
+            if let Some(mir_snapshot) = mir_snapshot
+                && let Some(func_idx) = self.functions.iter().position(|f| f.name == func_name)
+            {
+                #[cfg(feature = "test-deopt")]
+                let hook_auth = self
+                    .test_deopt_spike_hook
+                    .as_ref()
+                    .is_some_and(|h| h.target_function == func_name);
+                #[cfg(not(feature = "test-deopt"))]
+                let hook_auth = false;
+
+                let need_bc = is_deferred_bc || self.functions[func_idx].block_entry_pcs.is_empty();
+                let recipes = if need_bc {
+                    let direct_callees = self.collect_direct_callees();
+                    let direct_callee_indices: hashbrown::HashMap<String, usize> = self
+                        .functions
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, f)| (f.name.clone(), idx))
+                        .collect();
+                    let continuation_bc = self
+                        .compile_continuation_bytecode_for_mir(
+                            func_name,
+                            func_idx,
+                            &mir_snapshot,
+                            &direct_callees,
+                            &direct_callee_indices,
+                        )
+                        .map_err(|message| LustError::RuntimeError { message })?;
+                    let (recipes, _) = self
+                        .build_function_deopt_recipes(
+                            func_name,
+                            &mir_snapshot,
+                            &continuation_bc,
+                            compiled_gen,
+                            hook_auth,
+                        )
+                        .map_err(|message| LustError::RuntimeError { message })?;
+                    staged_continuation_bc = Some((func_idx, continuation_bc));
+                    recipes
+                } else {
+                    let (recipes, _) = self
+                        .build_function_deopt_recipes(
+                            func_name,
+                            &mir_snapshot,
+                            &self.functions[func_idx],
+                            compiled_gen,
+                            hook_auth,
+                        )
+                        .map_err(|message| LustError::RuntimeError { message })?;
+                    recipes
+                };
+                let matched = recipes
+                    .iter()
+                    .find(|r| r.block_id == target_block_id && r.site_kind == payload.site_kind)
+                    .cloned()
+                    .ok_or_else(|| LustError::RuntimeError {
+                        message: format!(
+                            "Missing compiled deopt recipe for ({}, block {}, {:?}) ({source_label})",
+                            func_name, target_block_id, payload.site_kind
+                        ),
+                    })?;
+                staged_recipes = recipes;
+                matched
+            } else {
+                return Err(LustError::RuntimeError {
+                    message: format!(
+                        "Missing compiled deopt recipe for ({}, block {}, {:?}) ({source_label})",
+                        func_name, target_block_id, payload.site_kind
+                    ),
+                });
+            }
+        };
         if recipe.compilation_generation != compiled_gen {
             return Err(LustError::RuntimeError {
                 message: format!(
@@ -5054,15 +5692,28 @@ impl VM {
             .ok_or_else(|| LustError::RuntimeError {
                 message: "Call stack empty during deopt reconstruction".into(),
             })?;
-        // Hazard 10: MIR inlining / SROA can require more locals than initial AST `reg_count`.
-        // Compute effective capacity required; actual window expansion happens ONLY after all
-        // payload/writeback validations succeed (preserving zero-mutation fail-closed atomicity).
+        // Hazard 10: MIR inlining / SROA / lazily-materialized continuation bytecode can require
+        // more locals/scratch registers than initial AST `reg_count`. Compute effective capacity
+        // required; actual window expansion happens ONLY after all payload/writeback validations
+        // succeed (preserving zero-mutation fail-closed atomicity).
+        let continuation_reg_count = if let Some((_, ref bc)) = staged_continuation_bc {
+            bc.register_count as usize
+        } else {
+            self.call_stack
+                .last()
+                .and_then(|frame| self.functions.get(frame.function_idx))
+                .map(|f| f.register_count as usize)
+                .unwrap_or(0)
+        };
         let max_sroa_orig = sroa_recipes
             .iter()
             .map(|r| r.orig_local.0 + 1)
             .max()
             .unwrap_or(0);
-        let required_locals = local_types.len().max(max_sroa_orig);
+        let required_locals = local_types
+            .len()
+            .max(max_sroa_orig)
+            .max(continuation_reg_count);
         let effective_reg_capacity = top_frame_reg_count.max(required_locals);
 
         let mut seen_indices = hashbrown::HashSet::with_capacity(payload.live_locals.len());
@@ -5321,6 +5972,31 @@ impl VM {
         // Hazard 10: Expand top frame register window if `reg_count < required_locals`.
         if required_locals > top_frame_reg_count {
             self.ensure_top_frame_reg_capacity(required_locals)?;
+        }
+
+        // Commit lazily-materialized continuation bytecode & deopt recipes atomically
+        // ONLY after all payload, writeback, and register-window checks have succeeded (`NG-W14-7`).
+        if let Some((func_idx, continuation_bc)) = staged_continuation_bc
+            && func_idx < self.functions.len()
+        {
+            let meta = crate::vm::CallMeta::of(&continuation_bc);
+            let prev_fn = core::mem::replace(&mut self.functions[func_idx], continuation_bc);
+            self.ast_bytecode_backup.entry(func_idx).or_insert(prev_fn);
+            if func_idx < self.call_meta.len() {
+                self.call_meta[func_idx] = meta;
+            }
+            if let Some(jit) = self.cranelift_jit.as_mut() {
+                jit.mark_continuation_materialized(func_name);
+            }
+        }
+        if !staged_recipes.is_empty() {
+            for r in staged_recipes {
+                self.cranelift_recipes
+                    .insert((r.func_name.clone(), r.block_id, r.site_kind), r);
+            }
+            if let Some(jit) = self.cranelift_jit.as_mut() {
+                jit.record_lazy_deopt_materialization();
+            }
         }
 
         let top_frame = self.call_stack.last_mut().expect("validated non-empty");

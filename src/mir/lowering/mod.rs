@@ -1545,6 +1545,62 @@ impl<'a> AstLowering<'a> {
         Ok(())
     }
 
+    /// Emits the canonical array bounds-check sequence for `0 <= idx_local < len(base_place)`
+    /// using single-use `Move` temporaries so Cranelift (`NG-W14-8`) lowers it to a single
+    /// unsigned comparison `(idx as u64) < (len as u64)` (`IntCC::UnsignedLessThan`), while
+    /// preserving full MIR/VM/AOT structural compatibility.
+    fn emit_array_in_bounds_check(
+        &mut self,
+        base_place: &Place,
+        idx_local: LocalId,
+        span: crate::ast::Span,
+    ) -> LocalId {
+        let len_temp = self.current_fn.add_local(None, MirType::Int, true, span);
+        self.emit_stmt(Statement::StorageLive(len_temp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(len_temp),
+            Rvalue::UnaryOp(MirUnaryOp::Len, Operand::Copy(base_place.clone())),
+            span,
+        ));
+
+        let ge_zero_temp = self.current_fn.add_local(None, MirType::Bool, true, span);
+        self.emit_stmt(Statement::StorageLive(ge_zero_temp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(ge_zero_temp),
+            Rvalue::BinaryOp(
+                MirBinaryOp::GtEq,
+                Operand::Copy(Place::Local(idx_local)),
+                Operand::Constant(MirConstant::Int(0)),
+            ),
+            span,
+        ));
+
+        let lt_len_temp = self.current_fn.add_local(None, MirType::Bool, true, span);
+        self.emit_stmt(Statement::StorageLive(lt_len_temp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(lt_len_temp),
+            Rvalue::BinaryOp(
+                MirBinaryOp::Lt,
+                Operand::Copy(Place::Local(idx_local)),
+                Operand::Move(Place::Local(len_temp)),
+            ),
+            span,
+        ));
+
+        let in_bounds_temp = self.current_fn.add_local(None, MirType::Bool, true, span);
+        self.emit_stmt(Statement::StorageLive(in_bounds_temp, span));
+        self.emit_stmt(Statement::Assign(
+            Place::Local(in_bounds_temp),
+            Rvalue::BinaryOp(
+                MirBinaryOp::And,
+                Operand::Move(Place::Local(ge_zero_temp)),
+                Operand::Move(Place::Local(lt_len_temp)),
+            ),
+            span,
+        ));
+        in_bounds_temp
+    }
+
     fn lower_condition_with_bindings(
         &mut self,
         condition: &Expr,
@@ -1609,49 +1665,8 @@ impl<'a> AstLowering<'a> {
                                 }
                             };
 
-                            let len_temp = self.current_fn.add_local(None, MirType::Int, true, span);
-                            self.emit_stmt(Statement::StorageLive(len_temp, span));
-                            self.emit_stmt(Statement::Assign(
-                                Place::Local(len_temp),
-                                Rvalue::UnaryOp(MirUnaryOp::Len, Operand::Copy(base_place.clone())),
-                                span,
-                            ));
-
-                            let ge_zero_temp = self.current_fn.add_local(None, MirType::Bool, true, span);
-                            self.emit_stmt(Statement::StorageLive(ge_zero_temp, span));
-                            self.emit_stmt(Statement::Assign(
-                                Place::Local(ge_zero_temp),
-                                Rvalue::BinaryOp(
-                                    MirBinaryOp::GtEq,
-                                    Operand::Copy(Place::Local(idx_local)),
-                                    Operand::Constant(MirConstant::Int(0)),
-                                ),
-                                span,
-                            ));
-
-                            let lt_len_temp = self.current_fn.add_local(None, MirType::Bool, true, span);
-                            self.emit_stmt(Statement::StorageLive(lt_len_temp, span));
-                            self.emit_stmt(Statement::Assign(
-                                Place::Local(lt_len_temp),
-                                Rvalue::BinaryOp(
-                                    MirBinaryOp::Lt,
-                                    Operand::Copy(Place::Local(idx_local)),
-                                    Operand::Copy(Place::Local(len_temp)),
-                                ),
-                                span,
-                            ));
-
-                            let in_bounds_temp = self.current_fn.add_local(None, MirType::Bool, true, span);
-                            self.emit_stmt(Statement::StorageLive(in_bounds_temp, span));
-                            self.emit_stmt(Statement::Assign(
-                                Place::Local(in_bounds_temp),
-                                Rvalue::BinaryOp(
-                                    MirBinaryOp::And,
-                                    Operand::Copy(Place::Local(ge_zero_temp)),
-                                    Operand::Copy(Place::Local(lt_len_temp)),
-                                ),
-                                span,
-                            ));
+                            let in_bounds_temp =
+                                self.emit_array_in_bounds_check(&base_place, idx_local, span);
 
                             let proven_bounds = match &base_place {
                                 Place::Local(base_local) => Some((*base_local, idx_local)),
@@ -2709,52 +2724,19 @@ impl<'a> AstLowering<'a> {
                         }
                     };
 
-                    let len_temp = self.current_fn.add_local(None, MirType::Int, true, expr.span);
-                    self.emit_stmt(Statement::StorageLive(len_temp, expr.span));
-                    self.emit_stmt(Statement::Assign(
-                        Place::Local(len_temp),
-                        Rvalue::UnaryOp(MirUnaryOp::Len, Operand::Copy(base_place.clone())),
-                        expr.span,
-                    ));
-
-                    let ge_zero_temp = self.current_fn.add_local(None, MirType::Bool, true, expr.span);
-                    self.emit_stmt(Statement::StorageLive(ge_zero_temp, expr.span));
-                    self.emit_stmt(Statement::Assign(
-                        Place::Local(ge_zero_temp),
-                        Rvalue::BinaryOp(
-                            MirBinaryOp::GtEq,
-                            Operand::Copy(Place::Local(idx_local)),
-                            Operand::Constant(MirConstant::Int(0)),
-                        ),
-                        expr.span,
-                    ));
-
-                    let lt_len_temp = self.current_fn.add_local(None, MirType::Bool, true, expr.span);
-                    self.emit_stmt(Statement::StorageLive(lt_len_temp, expr.span));
-                    self.emit_stmt(Statement::Assign(
-                        Place::Local(lt_len_temp),
-                        Rvalue::BinaryOp(
-                            MirBinaryOp::Lt,
-                            Operand::Copy(Place::Local(idx_local)),
-                            Operand::Copy(Place::Local(len_temp)),
-                        ),
-                        expr.span,
-                    ));
-
-                    let in_bounds_temp = self.current_fn.add_local(None, MirType::Bool, true, expr.span);
-                    self.emit_stmt(Statement::StorageLive(in_bounds_temp, expr.span));
-                    self.emit_stmt(Statement::Assign(
-                        Place::Local(in_bounds_temp),
-                        Rvalue::BinaryOp(
-                            MirBinaryOp::And,
-                            Operand::Copy(Place::Local(ge_zero_temp)),
-                            Operand::Copy(Place::Local(lt_len_temp)),
-                        ),
-                        expr.span,
-                    ));
+                    let in_bounds_temp =
+                        self.emit_array_in_bounds_check(&base_place, idx_local, expr.span);
 
                     let ok_bb = self.current_fn.new_block();
                     let err_bb = self.current_fn.new_block();
+
+                    if let Place::Local(base_local) = &base_place {
+                        self.current_fn
+                            .proven_in_bounds
+                            .entry(ok_bb.0)
+                            .or_default()
+                            .push((*base_local, idx_local));
+                    }
 
                     self.terminate_block(Terminator::Cond {
                         cond: Operand::Move(Place::Local(in_bounds_temp)),

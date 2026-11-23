@@ -195,10 +195,13 @@ pub enum MirAllocationKind {
     Array(crate::mir::ir::MirType),
     ArrayBacking,
     Tuple(Vec<crate::mir::ir::MirType>),
-    Struct(alloc::string::String),
+    Struct(alloc::rc::Rc<str>),
     CFlatStruct(alloc::string::String),
     RawWords,
 }
+
+#[cfg(feature = "std")]
+const MAX_INTERNED_STRUCT_TYPE_NAMES: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct MirAllocationRecord {
@@ -268,6 +271,12 @@ pub struct MirContext {
     #[cfg(feature = "std")]
     pub struct_fields: LocalLock<hashbrown::HashMap<alloc::string::String, Vec<crate::mir::ir::MirType>>>,
     #[cfg(feature = "std")]
+    struct_type_names: LocalLock<hashbrown::HashSet<alloc::rc::Rc<str>>>,
+    #[cfg(feature = "std")]
+    last_struct_type_name: core::cell::RefCell<Option<alloc::rc::Rc<str>>>,
+    #[cfg(feature = "std")]
+    empty_struct_type_name: alloc::rc::Rc<str>,
+    #[cfg(feature = "std")]
     dirty_allocations: core::cell::Cell<bool>,
     #[cfg(feature = "std")]
     dirty_allocations_count: core::cell::Cell<u64>,
@@ -313,6 +322,9 @@ impl MirContext {
             interned_list: LocalLock::new(Vec::new()),
             small_digit_handles: core::array::from_fn(|_| LocalCell::new(0)),
             struct_fields: LocalLock::new(hashbrown::HashMap::new()),
+            struct_type_names: LocalLock::new(hashbrown::HashSet::new()),
+            last_struct_type_name: core::cell::RefCell::new(None),
+            empty_struct_type_name: alloc::rc::Rc::from(""),
             dirty_allocations: core::cell::Cell::new(false),
             dirty_allocations_count: core::cell::Cell::new(0),
             push_grow_slow_calls: core::cell::Cell::new(0),
@@ -617,12 +629,179 @@ impl MirContext {
     pub fn register_struct_field_types(&self, name: &str, field_types: Vec<crate::mir::ir::MirType>) {
         #[cfg(feature = "std")]
         {
+            self.intern_struct_type_name(name);
             let mut sf = self.struct_fields.borrow_mut();
             sf.insert(alloc::string::ToString::to_string(name), field_types);
         }
         #[cfg(not(feature = "std"))]
         {
             let _ = (name, field_types);
+        }
+    }
+
+    /// Interns a struct type name into a shared `Rc<str>` within this thread-confined `MirContext`.
+    /// Uses a content-verified 1-entry MRU cache backed by a bounded `HashSet<Rc<str>>` so hot
+    /// struct allocation loops avoid per-allocation heap `String` allocations and hashing.
+    #[inline]
+    pub fn intern_struct_type_name(&self, name: &str) -> alloc::rc::Rc<str> {
+        #[cfg(feature = "std")]
+        {
+            if name.is_empty() {
+                return alloc::rc::Rc::clone(&self.empty_struct_type_name);
+            }
+            {
+                let last = self.last_struct_type_name.borrow();
+                if let Some(cached) = last.as_ref()
+                    && cached.as_ref() == name
+                {
+                    return alloc::rc::Rc::clone(cached);
+                }
+            }
+            let rc = {
+                let mut set = self.struct_type_names.borrow_mut();
+                if let Some(existing) = set.get(name) {
+                    alloc::rc::Rc::clone(existing)
+                } else {
+                    let fresh: alloc::rc::Rc<str> = alloc::rc::Rc::from(name);
+                    if set.len() < MAX_INTERNED_STRUCT_TYPE_NAMES {
+                        set.insert(alloc::rc::Rc::clone(&fresh));
+                    }
+                    fresh
+                }
+            };
+            *self.last_struct_type_name.borrow_mut() = Some(alloc::rc::Rc::clone(&rc));
+            rc
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            alloc::rc::Rc::from(name)
+        }
+    }
+
+    /// Fast byte-slice interner for `lust_mir_alloc_struct_named`.
+    /// Because the MRU cached `Rc<str>` is guaranteed valid UTF-8, a byte-slice equality match
+    /// proves validity and returns a shared `Rc<str>` without UTF-8 rescanning or hashing.
+    #[inline]
+    fn intern_struct_type_name_bytes(&self, bytes: &[u8]) -> Option<alloc::rc::Rc<str>> {
+        #[cfg(feature = "std")]
+        {
+            {
+                let last = self.last_struct_type_name.borrow();
+                if let Some(cached) = last.as_ref()
+                    && cached.as_bytes() == bytes
+                {
+                    return Some(alloc::rc::Rc::clone(cached));
+                }
+            }
+            let name_str = core::str::from_utf8(bytes).ok()?;
+            Some(self.intern_struct_type_name(name_str))
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let name_str = core::str::from_utf8(bytes).ok()?;
+            Some(alloc::rc::Rc::from(name_str))
+        }
+    }
+
+    /// Allocates an owned struct buffer populated directly with `fields`, interning `name`
+    /// and enforcing the exact `SEC-02` memory budget, `try_reserve_exact` + `DropGuard`
+    /// OOM rollback, and `allocation_records` provenance contract.
+    #[inline]
+    pub fn alloc_struct_with_fields(&self, name: &str, fields: &[i64]) -> *mut i64 {
+        if name.is_empty() {
+            self.last_status.store(
+                crate::effect_abi::LUST_STATUS_ERR_GENERIC as i64,
+                Ordering::SeqCst,
+            );
+            return core::ptr::null_mut();
+        }
+        let count = fields.len();
+        let Some(size) = count.checked_add(2) else {
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            return core::ptr::null_mut();
+        };
+        let Some(bytes_u) = size.checked_mul(core::mem::size_of::<i64>()) else {
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            return core::ptr::null_mut();
+        };
+        let Ok(bytes_needed) = i64::try_from(bytes_u) else {
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            return core::ptr::null_mut();
+        };
+        let limit = self.max_memory_limit.load(Ordering::SeqCst);
+        let prev = self.memory_used.fetch_add(bytes_needed, Ordering::SeqCst);
+        if prev.saturating_add(bytes_needed) > limit {
+            self.memory_used.fetch_sub(bytes_needed, Ordering::SeqCst);
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            return core::ptr::null_mut();
+        }
+        let mem_rollback = core::mem::DropGuard::new(bytes_needed, |bytes| {
+            self.memory_used.fetch_sub(bytes, Ordering::SeqCst);
+        });
+        let mut vec = Vec::<i64>::new();
+        if vec.try_reserve_exact(size).is_err() {
+            self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+            return core::ptr::null_mut();
+        }
+        vec.push(count as i64);
+        vec.push(count as i64);
+        vec.extend_from_slice(fields);
+        let slice = vec.into_boxed_slice();
+        let kind = MirAllocationKind::Struct(self.intern_struct_type_name(name));
+        let ptr = {
+            #[cfg(feature = "std")]
+            {
+                let handle_epoch = self.handle_count();
+                let scope_depth = self.scope_alloc_floors.borrow().len();
+                let mut bufs = self.allocated_buffers.borrow_mut();
+                let mut records = self.allocation_records.borrow_mut();
+                if bufs.try_reserve(1).is_err() || records.try_reserve(1).is_err() {
+                    self.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                    return core::ptr::null_mut();
+                }
+                let seq = self.next_alloc_seq.fetch_add(1, Ordering::SeqCst);
+                let ptr = Box::into_raw(slice) as *mut i64;
+                let buffer_index = bufs.len();
+                bufs.push((ptr, size));
+                records.insert(
+                    ptr as usize,
+                    MirAllocationRecord {
+                        base_ptr: ptr,
+                        word_capacity: size,
+                        kind,
+                        buffer_index,
+                        handle_epoch,
+                        alloc_seq: seq,
+                        is_ctx_owned: true,
+                        read_only_borrowed: false,
+                        registered_scope_depth: scope_depth,
+                    },
+                );
+                drop(records);
+                drop(bufs);
+                self.mark_dirty_allocation();
+                ptr
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                let _ = kind;
+                Box::into_raw(slice) as *mut i64
+            }
+        };
+        core::mem::DropGuard::dismiss(mem_rollback);
+        ptr
+    }
+
+    /// Read-only inspection helper returning the count of interned struct type names in this context.
+    #[inline]
+    pub fn interned_struct_type_name_count(&self) -> usize {
+        #[cfg(feature = "std")]
+        {
+            self.struct_type_names.borrow().len()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            0
         }
     }
 
@@ -956,17 +1135,18 @@ impl MirContext {
                 let mut bufs = self.allocated_buffers.borrow_mut();
                 let mut records = self.allocation_records.borrow_mut();
                 let start = effective_buffers.min(bufs.len());
-                let items: Vec<(*mut i64, usize)> = bufs.drain(start..).collect();
-                for &(ptr, _) in &items {
-                    if !ptr.is_null() {
-                        records.remove(&(ptr as usize));
-                    }
-                }
                 if effective_handles == 0 && start == 0 && scope_depth == 0 {
                     records.clear();
                     self.borrowed_readonly_stack.borrow_mut().clear();
                     self.dirty_allocations.set(false);
+                    core::mem::take(&mut *bufs)
                 } else {
+                    let items: Vec<(*mut i64, usize)> = bufs.drain(start..).collect();
+                    for &(ptr, _) in &items {
+                        if !ptr.is_null() {
+                            records.remove(&(ptr as usize));
+                        }
+                    }
                     if scope_depth > 0
                         && baseline_handles <= handle_floor
                         && baseline_buffers <= buf_floor
@@ -985,8 +1165,8 @@ impl MirContext {
                     {
                         self.dirty_allocations.set(false);
                     }
+                    items
                 }
-                items
             };
             for (ptr, cap) in drained {
                 if !ptr.is_null() {
@@ -1285,7 +1465,8 @@ fn array_payload_words_for_cap(elem_cap: usize, is_bool: bool) -> Option<usize> 
     }
 }
 
-fn alloc_mir_buffer_with_kind(len: i64, kind: MirAllocationKind) -> *mut i64 {
+#[inline]
+fn alloc_mir_buffer_in_ctx(ctx: &MirContext, len: i64, kind: MirAllocationKind) -> *mut i64 {
     let count = if len < 0 { 0 } else { len as usize };
     let is_bool_arr = is_bool_array_kind(&kind);
     // Arrays always allocate at least 3 words (`max(elem_words, 1) + 2`) so word[2] can hold
@@ -1295,9 +1476,7 @@ fn alloc_mir_buffer_with_kind(len: i64, kind: MirAllocationKind) -> *mut i64 {
         MirAllocationKind::Array(_) | MirAllocationKind::RawWords
     ) {
         let Some(elem_words) = array_payload_words_for_cap(count, is_bool_arr) else {
-            with_current_mir_context(|ctx| {
-                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
-            });
+            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
             return core::ptr::null_mut();
         };
         elem_words.max(1)
@@ -1305,83 +1484,82 @@ fn alloc_mir_buffer_with_kind(len: i64, kind: MirAllocationKind) -> *mut i64 {
         count
     };
     let Some(size) = payload_slots.checked_add(2) else {
-        with_current_mir_context(|ctx| {
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
-        });
+        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
         return core::ptr::null_mut();
     };
     let Some(bytes_u) = size.checked_mul(core::mem::size_of::<i64>()) else {
-        with_current_mir_context(|ctx| {
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
-        });
+        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
         return core::ptr::null_mut();
     };
     let Ok(bytes_needed) = i64::try_from(bytes_u) else {
-        with_current_mir_context(|ctx| {
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
-        });
+        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
         return core::ptr::null_mut();
     };
-    let oom = with_current_mir_context(|ctx| {
-        let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
-        let prev = ctx.memory_used.fetch_add(bytes_needed, Ordering::SeqCst);
-        if prev.saturating_add(bytes_needed) > limit {
-            ctx.memory_used.fetch_sub(bytes_needed, Ordering::SeqCst);
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
-            return true;
-        }
-        false
-    });
-    if oom {
+    let limit = ctx.max_memory_limit.load(Ordering::SeqCst);
+    let prev = ctx.memory_used.fetch_add(bytes_needed, Ordering::SeqCst);
+    if prev.saturating_add(bytes_needed) > limit {
+        ctx.memory_used.fetch_sub(bytes_needed, Ordering::SeqCst);
+        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
         return core::ptr::null_mut();
     }
+    let mem_rollback = core::mem::DropGuard::new(bytes_needed, |bytes| {
+        ctx.memory_used.fetch_sub(bytes, Ordering::SeqCst);
+    });
     let mut vec = Vec::<i64>::new();
     if vec.try_reserve_exact(size).is_err() {
-        with_current_mir_context(|ctx| {
-            ctx.memory_used.fetch_sub(bytes_needed, Ordering::SeqCst);
-            ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
-        });
+        ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
         return core::ptr::null_mut();
     }
-    vec.push(count as i64);
-    vec.push(count as i64);
     vec.resize(size, 0);
+    vec[0] = count as i64;
+    vec[1] = count as i64;
     let slice = vec.into_boxed_slice();
-    let ptr = Box::into_raw(slice) as *mut i64;
-    with_current_mir_context(|ctx| {
+    let ptr = {
         #[cfg(feature = "std")]
         {
             let handle_epoch = ctx.handle_count();
-            let seq = ctx.next_alloc_seq.fetch_add(1, Ordering::SeqCst);
             let scope_depth = ctx.scope_alloc_floors.borrow().len();
-            {
-                let mut bufs = ctx.allocated_buffers.borrow_mut();
-                let mut records = ctx.allocation_records.borrow_mut();
-                let buffer_index = bufs.len();
-                bufs.push((ptr, size));
-                records.insert(
-                    ptr as usize,
-                    MirAllocationRecord {
-                        base_ptr: ptr,
-                        word_capacity: size,
-                        kind,
-                        buffer_index,
-                        handle_epoch,
-                        alloc_seq: seq,
-                        is_ctx_owned: true,
-                        read_only_borrowed: false,
-                        registered_scope_depth: scope_depth,
-                    },
-                );
+            let mut bufs = ctx.allocated_buffers.borrow_mut();
+            let mut records = ctx.allocation_records.borrow_mut();
+            if bufs.try_reserve(1).is_err() || records.try_reserve(1).is_err() {
+                ctx.last_status.store(MIR_STATUS_ERR_OOM, Ordering::SeqCst);
+                return core::ptr::null_mut();
             }
+            let seq = ctx.next_alloc_seq.fetch_add(1, Ordering::SeqCst);
+            let ptr = Box::into_raw(slice) as *mut i64;
+            let buffer_index = bufs.len();
+            bufs.push((ptr, size));
+            records.insert(
+                ptr as usize,
+                MirAllocationRecord {
+                    base_ptr: ptr,
+                    word_capacity: size,
+                    kind,
+                    buffer_index,
+                    handle_epoch,
+                    alloc_seq: seq,
+                    is_ctx_owned: true,
+                    read_only_borrowed: false,
+                    registered_scope_depth: scope_depth,
+                },
+            );
+            drop(records);
+            drop(bufs);
             ctx.mark_dirty_allocation();
+            ptr
         }
         #[cfg(not(feature = "std"))]
         {
-            let _ = (ctx, kind);
+            let _ = kind;
+            Box::into_raw(slice) as *mut i64
         }
-    });
+    };
+    core::mem::DropGuard::dismiss(mem_rollback);
     ptr
+}
+
+fn alloc_mir_buffer_with_kind(len: i64, kind: MirAllocationKind) -> *mut i64 {
+    with_current_mir_context(|ctx| alloc_mir_buffer_in_ctx(ctx, len, kind))
 }
 
 #[unsafe(no_mangle)]
@@ -1432,7 +1610,10 @@ pub extern "C" fn lust_mir_alloc_tuple_typed(len: i64, tags_ptr: *const i64) -> 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_alloc_struct(len: i64) -> *mut i64 {
-    alloc_mir_buffer_with_kind(len, MirAllocationKind::Struct(alloc::string::String::new()))
+    with_current_mir_context(|ctx| {
+        let name = ctx.intern_struct_type_name("");
+        alloc_mir_buffer_in_ctx(ctx, len, MirAllocationKind::Struct(name))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1449,17 +1630,14 @@ pub extern "C" fn lust_mir_alloc_struct_named(
         return core::ptr::null_mut();
     }
     let slice = unsafe { core::slice::from_raw_parts(name_ptr, name_len as usize) };
-    let Ok(name_str) = core::str::from_utf8(slice) else {
-        with_current_mir_context(|ctx| {
+    with_current_mir_context(|ctx| {
+        let Some(interned) = ctx.intern_struct_type_name_bytes(slice) else {
             ctx.last_status
                 .store(crate::effect_abi::LUST_STATUS_ERR_GENERIC as i64, Ordering::SeqCst);
-        });
-        return core::ptr::null_mut();
-    };
-    alloc_mir_buffer_with_kind(
-        len,
-        MirAllocationKind::Struct(alloc::string::ToString::to_string(name_str)),
-    )
+            return core::ptr::null_mut();
+        };
+        alloc_mir_buffer_in_ctx(ctx, len, MirAllocationKind::Struct(interned))
+    })
 }
 
 #[unsafe(no_mangle)]

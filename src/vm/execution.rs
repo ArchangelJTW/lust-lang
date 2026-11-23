@@ -80,6 +80,47 @@ const OP_SET_FIELD_SLOT: u8 = OpCode::SetFieldSlot as u8;
 const OP_GET_FIELD_ADD_SET_INT: u8 = OpCode::GetFieldAddSetInt as u8;
 const OP_GET_FIELD: u8 = OpCode::GetField as u8;
 const OP_SET_FIELD: u8 = OpCode::SetField as u8;
+const OP_GET_FIELD_COMPACT: u8 = OpCode::GetFieldCompact as u8;
+const OP_SET_FIELD_COMPACT: u8 = OpCode::SetFieldCompact as u8;
+
+const BYTECODE_REGISTER_WINDOW: usize = 256;
+
+fn register_window_oom() -> LustError {
+    LustError::RuntimeError {
+        message: "Out of memory allocating VM register window".to_string(),
+    }
+}
+
+#[inline]
+fn register_window_end(base: usize, count: u16) -> Result<usize> {
+    base.checked_add(usize::from(count).max(BYTECODE_REGISTER_WINDOW))
+        .ok_or_else(register_window_oom)
+}
+
+#[inline]
+fn reserve_register_window(
+    registers: &mut Vec<Value, crate::alloc_budget::VmAllocHandle>,
+    budgets: &mut budget::BudgetState,
+    end: usize,
+) -> Result<()> {
+    if end > registers.len() {
+        if end > registers.capacity() {
+            let bytes = (end - registers.capacity())
+                .checked_mul(core::mem::size_of::<Value>())
+                .ok_or_else(register_window_oom)?;
+            let old_usage = budgets.memory.used_bytes;
+            if !budgets.try_charge_mem_bytes(bytes) {
+                return Err(register_window_oom());
+            }
+            if registers.try_reserve_exact(end - registers.len()).is_err() {
+                budgets.memory.used_bytes = old_usage;
+                return Err(register_window_oom());
+            }
+        }
+        registers.resize(end, Value::Nil);
+    }
+    Ok(())
+}
 const OP_CONCAT: u8 = OpCode::Concat as u8;
 const OP_GET_INDEX: u8 = OpCode::GetIndex as u8;
 const OP_ARRAY_GET_UNWRAP: u8 = OpCode::ArrayGetUnwrap as u8;
@@ -198,7 +239,11 @@ fn charge_array_push_budget(
 }
 
 #[inline(always)]
-fn write_frame_reg_scalar(regs: &mut [Value], reg: Register, value: Value) -> bool {
+fn write_frame_reg_scalar(
+    regs: &mut [Value; BYTECODE_REGISTER_WINDOW],
+    reg: Register,
+    value: Value,
+) -> bool {
     regs[reg as usize] = value;
     false
 }
@@ -206,7 +251,7 @@ fn write_frame_reg_scalar(regs: &mut [Value], reg: Register, value: Value) -> bo
 #[inline(always)]
 fn write_frame_reg_fast(
     frame: &mut CallFrame,
-    regs: &mut [Value],
+    regs: &mut [Value; BYTECODE_REGISTER_WINDOW],
     cycle_collector: &mut cycle::CycleCollector,
     reg: Register,
     value: Value,
@@ -224,7 +269,7 @@ fn write_frame_reg_fast(
 
 #[inline(always)]
 fn frame_int_binary_op<F>(
-    regs: &mut [Value],
+    regs: &mut [Value; BYTECODE_REGISTER_WINDOW],
     dest: Register,
     lhs: Register,
     rhs: Register,
@@ -249,7 +294,7 @@ where
 
 #[inline(always)]
 fn frame_float_binary_op<F>(
-    regs: &mut [Value],
+    regs: &mut [Value; BYTECODE_REGISTER_WINDOW],
     dest: Register,
     lhs: Register,
     rhs: Register,
@@ -275,7 +320,7 @@ where
 #[inline(always)]
 fn frame_binary_op<F>(
     frame: &mut CallFrame,
-    regs: &mut [Value],
+    regs: &mut [Value; BYTECODE_REGISTER_WINDOW],
     cycle_collector: &mut cycle::CycleCollector,
     dest: Register,
     lhs: Register,
@@ -293,7 +338,7 @@ where
 
 #[inline(always)]
 fn frame_comparison_op<I, F>(
-    regs: &mut [Value],
+    regs: &mut [Value; BYTECODE_REGISTER_WINDOW],
     dest: Register,
     lhs: Register,
     rhs: Register,
@@ -606,10 +651,44 @@ impl VM {
         e
     }
 
+    // Fiber restore and native frame materialization can hand off densely
+    // packed logical registers. Move the live slots back to padded windows
+    // before dispatch. Reserving first makes allocation failure atomic.
+    fn prepare_dispatch_register_windows(&mut self) -> Result<()> {
+        let Some(first) = self.call_stack.first() else {
+            return Ok(());
+        };
+        let mut end = first.base_reg;
+        let mut needs_rebase = false;
+        for frame in &self.call_stack {
+            needs_rebase |= frame.base_reg != end;
+            end = register_window_end(end, frame.reg_count)?;
+        }
+        reserve_register_window(&mut self.vm_registers, &mut self.budgets, end)?;
+        if needs_rebase {
+            // Restored frames are dense or already padded, so all moves
+            // are to the right. Move high slots first to handle overlap.
+            for frame in self.call_stack.iter_mut().rev() {
+                end -= usize::from(frame.reg_count).max(BYTECODE_REGISTER_WINDOW);
+                if end != frame.base_reg {
+                    for slot in (0..usize::from(frame.reg_count)).rev() {
+                        let value = core::mem::replace(
+                            &mut self.vm_registers[frame.base_reg + slot],
+                            Value::Nil,
+                        );
+                        self.vm_registers[end + slot] = value;
+                    }
+                    frame.base_reg = end;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn run_inner<const JIT_ENABLED: bool>(&mut self) -> Result<Value> {
         self.sync_slow_path_flags();
         let mut frame_dirty = true;
-        let mut exact_gas_mode = false;
+        self.prepare_dispatch_register_windows()?;
         let mut cur_frame_idx: usize = 0;
         let mut cur_func_idx: usize = 0;
         let mut cur_chunk_len: usize = 0;
@@ -687,7 +766,10 @@ impl VM {
                 // Zero `unsafe`: `frame`/`regs` are dropped before pushing/popping
                 // `call_stack` or growing `vm_registers`, and `ic_slots` is dropped
                 // only when switching to a different `function_idx`.
-                let exit = {
+                // Restore the unexecuted suffix if this dispatch leaves a
+                // prepaid block early (slow opcode, GC, or runtime error).
+                let mut prepaid = None;
+                let exit = (|| -> Result<FrameExit> {
                     let functions = &self.functions;
                     let call_meta = &mut self.call_meta;
                     let call_stack = &mut self.call_stack;
@@ -703,7 +785,7 @@ impl VM {
                     let global_name_to_slot = &self.global_name_to_slot;
                     let globals_generation = self.globals_generation;
 
-                    'frame_fast: loop {
+                    Ok('frame_fast: loop {
                         let func = &functions[cur_func_idx];
                         let instructions = &func.chunk.instructions;
                         let packed_code = &func.chunk.packed_code;
@@ -713,7 +795,9 @@ impl VM {
                         }
                         let constants = &func.chunk.constants;
                         let bb_gas_weights = &func.chunk.bb_gas_weights;
-                        let has_bb_gas = bb_gas_weights.len() == packed_code.len();
+                        let bb_gas_ends = &func.chunk.bb_gas_ends;
+                        let has_bb_gas = bb_gas_weights.len() == packed_code.len()
+                            && bb_gas_ends.len() == packed_code.len();
                         cur_chunk_len = packed_code.len();
                         let mut ic_slots = func.chunk.ic_slots.borrow_mut();
                         if ic_slots.len() < packed_code.len() {
@@ -722,11 +806,20 @@ impl VM {
 
                         'same_func: loop {
                             let base_reg = call_stack[cur_frame_idx].base_reg;
-                            let reg_end = base_reg + call_stack[cur_frame_idx].reg_count as usize;
+                            let reg_end = register_window_end(
+                                base_reg,
+                                call_stack[cur_frame_idx].reg_count,
+                            )?;
+                            reserve_register_window(vm_registers, budgets, reg_end)?;
 
                             let step: FastStep = {
                                 let frame: &mut CallFrame = &mut call_stack[cur_frame_idx];
-                                let regs: &mut [Value] = &mut vm_registers[base_reg..reg_end];
+                                let regs: &mut [Value; BYTECODE_REGISTER_WINDOW] =
+                                    (&mut vm_registers[base_reg..base_reg + BYTECODE_REGISTER_WINDOW])
+                                        .try_into()
+                                        .expect("fixed-width register slice");
+                                let mut gas_edge = frame.ip;
+                                let mut exact_gas_mode = true;
 
                                 'intra: loop {
                         debug_assert_eq!(cur_func_idx, frame.function_idx);
@@ -748,57 +841,28 @@ impl VM {
 
                         if skip_gas {
                             Self::record_mutation_m1_skip_gas();
-                        } else if has_bb_gas && !exact_gas_mode {
-                            let w = bb_gas_weights[ip];
-                            if w > 0 {
-                                let w_u64 = u64::from(w);
-                                if has_gas_limit
-                                    && let Some(limit) = budgets.gas.limit
-                                {
-                                    let remaining = limit.saturating_sub(budgets.gas.used);
-                                    if remaining < w_u64 {
-                                        exact_gas_mode = true;
-                                        budgets.gas.used = budgets
-                                            .gas
-                                            .used
-                                            .saturating_add(u64::from(packed.gas_weight()));
-                                        if budgets.gas.used > limit {
-                                            break 'frame_fast FrameExit::OutOfGas(limit);
-                                        }
-                                    } else {
-                                        budgets.gas.used = budgets.gas.used.saturating_add(w_u64);
+                        } else {
+                            if has_bb_gas && ip == gas_edge {
+                                // On an interior resume, charge instructions
+                                // individually until the next block entry.
+                                let end = bb_gas_ends[ip];
+                                gas_edge = end;
+                                exact_gas_mode = true;
+                                prepaid = None;
+                                if ip == 0 || bb_gas_ends[ip - 1] == ip {
+                                    let weight = u64::from(bb_gas_weights[ip]);
+                                    let used = budgets.gas.used;
+                                    if !has_gas_limit || budgets.gas.limit.is_none_or(|limit| {
+                                        limit.saturating_sub(used) >= weight
+                                    }) {
+                                        exact_gas_mode = false;
+                                        budgets.gas.used = used.saturating_add(weight);
+                                        prepaid = Some((cur_frame_idx, cur_func_idx, ip, end, used));
                                     }
-                                } else {
-                                    budgets.gas.used = budgets.gas.used.saturating_add(w_u64);
                                 }
                             }
-                        } else if has_bb_gas {
-                            let w = bb_gas_weights[ip];
-                            if w > 0 {
-                                let w_u64 = u64::from(w);
-                                let can_batch = !has_gas_limit
-                                    || budgets.gas.limit.is_none_or(|limit| {
-                                        limit.saturating_sub(budgets.gas.used) >= w_u64
-                                    });
-                                if can_batch {
-                                    exact_gas_mode = false;
-                                    budgets.gas.used = budgets.gas.used.saturating_add(w_u64);
-                                } else {
-                                    budgets.gas.used = budgets
-                                        .gas
-                                        .used
-                                        .saturating_add(u64::from(packed.gas_weight()));
-                                    if has_gas_limit
-                                        && let Some(limit) = budgets.gas.limit
-                                        && budgets.gas.used > limit
-                                    {
-                                        break 'frame_fast FrameExit::OutOfGas(limit);
-                                    }
-                                }
-                            } else {
-                                budgets.gas.used = budgets
-                                    .gas
-                                    .used
+                            if exact_gas_mode {
+                                budgets.gas.used = budgets.gas.used
                                     .saturating_add(u64::from(packed.gas_weight()));
                                 if has_gas_limit
                                     && let Some(limit) = budgets.gas.limit
@@ -806,17 +870,6 @@ impl VM {
                                 {
                                     break 'frame_fast FrameExit::OutOfGas(limit);
                                 }
-                            }
-                        } else {
-                            budgets.gas.used = budgets
-                                .gas
-                                .used
-                                .saturating_add(u64::from(packed.gas_weight()));
-                            if has_gas_limit
-                                && let Some(limit) = budgets.gas.limit
-                                && budgets.gas.used > limit
-                            {
-                                break 'frame_fast FrameExit::OutOfGas(limit);
                             }
                         }
 
@@ -828,8 +881,21 @@ impl VM {
                                 write_frame_reg_scalar(regs, packed.a(), Value::Bool(packed.b() != 0))
                             }
                             OP_LOAD_CONST => {
-                                let constant = constants[packed.bx() as usize].fast_clone();
-                                write_frame_reg_fast(frame, regs, cycle_collector, packed.a(), constant)
+                                let dest = packed.a();
+                                let constant = &constants[packed.bx() as usize];
+                                let scalar = match constant {
+                                    Value::Int(value) => Some(Value::Int(*value)),
+                                    Value::Float(value) => Some(Value::Float(*value)),
+                                    Value::Bool(value) => Some(Value::Bool(*value)),
+                                    _ => None,
+                                };
+                                if let Some(value) = scalar
+                                    && regs[dest as usize].is_plain()
+                                {
+                                    write_frame_reg_scalar(regs, dest, value)
+                                } else {
+                                    write_frame_reg_fast(frame, regs, cycle_collector, dest, constant.fast_clone())
+                                }
                             }
                             OP_LOAD_GLOBAL => {
                                 let dest = packed.a();
@@ -1379,6 +1445,8 @@ impl VM {
                                 let offset = packed.sbx();
                                 let target_ip = (frame.ip as isize + offset as isize) as usize;
                                 frame.ip = target_ip;
+                                gas_edge = frame.ip;
+                                prepaid = None;
                                 #[cfg(feature = "std")]
                                 if offset < 0 && can_osr {
                                     break 'frame_fast FrameExit::TryOsr(target_ip);
@@ -1394,6 +1462,8 @@ impl VM {
                                 };
                                 if truthy {
                                     frame.ip = (frame.ip as isize + offset as isize) as usize;
+                                    gas_edge = frame.ip;
+                                    prepaid = None;
                                 }
                                 false
                             }
@@ -1406,6 +1476,8 @@ impl VM {
                                 };
                                 if !truthy {
                                     frame.ip = (frame.ip as isize + offset as isize) as usize;
+                                    gas_edge = frame.ip;
+                                    prepaid = None;
                                 }
                                 false
                             }
@@ -1427,6 +1499,8 @@ impl VM {
                                 if !(*a < *b) {
                                     let target_ip = (frame.ip as isize + offset as isize) as usize;
                                     frame.ip = target_ip;
+                                    gas_edge = frame.ip;
+                                    prepaid = None;
                                     #[cfg(feature = "std")]
                                     if offset < 0 && can_osr {
                                         break 'frame_fast FrameExit::TryOsr(target_ip);
@@ -1452,6 +1526,8 @@ impl VM {
                                 if !(*a <= *b) {
                                     let target_ip = (frame.ip as isize + offset as isize) as usize;
                                     frame.ip = target_ip;
+                                    gas_edge = frame.ip;
+                                    prepaid = None;
                                     #[cfg(feature = "std")]
                                     if offset < 0 && can_osr {
                                         break 'frame_fast FrameExit::TryOsr(target_ip);
@@ -1989,11 +2065,9 @@ impl VM {
                                 }
                                 false
                             }
-                            OP_GET_FIELD => {
+                            OP_GET_FIELD | OP_GET_FIELD_COMPACT => {
                                 let dest = packed.a();
-                                let w0 = extra_args[packed.bx() as usize];
-                                let obj = (w0 & 0xFF) as u8;
-                                let field_idx = (w0 >> 16) as u16;
+                                let (obj, field_idx) = packed.field_operands(extra_args);
                                 let val = match &regs[obj as usize] {
                                     Value::Struct(s) if s.name != "LuaTable" => {
                                         let cur_layout_ptr = Rc::as_ptr(&s.layout) as usize;
@@ -2076,25 +2150,12 @@ impl VM {
                                     write_frame_reg_fast(frame, regs, cycle_collector, dest, val)
                                 }
                             }
-                            OP_SET_FIELD => {
+                            OP_SET_FIELD | OP_SET_FIELD_COMPACT => {
                                 let obj_reg = packed.a();
-                                let w0 = extra_args[packed.bx() as usize];
-                                let value_reg = (w0 & 0xFF) as u8;
-                                let field_idx = (w0 >> 16) as u16;
-                                let is_fast_target = match &regs[obj_reg as usize] {
-                                    Value::Struct(s) => s.name != "LuaTable",
-                                    Value::Map(_) => true,
-                                    _ => false,
-                                };
-                                if !is_fast_target {
-                                    break 'frame_fast FrameExit::Slow(
-                                        instructions[ip],
-                                        ip_before_execution,
-                                    );
-                                }
-                                let value = regs[value_reg as usize].fast_clone();
+                                let (value_reg, field_idx) = packed.field_operands(extra_args);
+                                let value = &regs[value_reg as usize];
                                 match &regs[obj_reg as usize] {
-                                    Value::Struct(s) => {
+                                    Value::Struct(s) if s.name != "LuaTable" => {
                                         let cur_layout_ptr = Rc::as_ptr(&s.layout) as usize;
                                         let idx = match &ic_slots[ip] {
                                             ChunkIcSlot::FieldSlot {
@@ -2130,7 +2191,7 @@ impl VM {
                                                 slot_idx
                                             }
                                         };
-                                        if !crate::vm::cycle::CycleCollector::is_leaf(&value) {
+                                        if !crate::vm::cycle::CycleCollector::is_leaf(value) {
                                             cycle_collector.record_mutation();
                                         }
                                         {
@@ -2138,12 +2199,12 @@ impl VM {
                                             if idx < borrowed.len() {
                                                 let canonical = if s.layout.has_weak_fields() {
                                                     s.layout
-                                                        .canonicalize_field_value(idx, value)
+                                                        .canonicalize_field_value(idx, value.fast_clone())
                                                         .map_err(|message| {
                                                             LustError::RuntimeError { message }
                                                         })?
                                                 } else {
-                                                    value
+                                                    value.fast_clone()
                                                 };
                                                 borrowed[idx] = canonical;
                                             } else {
@@ -2174,9 +2235,14 @@ impl VM {
                                         {
                                             budgets.charge_map_entry_estimate()?;
                                         }
-                                        map.borrow_mut().insert(key, value);
+                                        map.borrow_mut().insert(key, value.fast_clone());
                                     }
-                                    _ => unreachable!(),
+                                    _ => {
+                                        break 'frame_fast FrameExit::Slow(
+                                            instructions[ip],
+                                            ip_before_execution,
+                                        );
+                                    }
                                 }
                                 false
                             }
@@ -2624,6 +2690,8 @@ impl VM {
                                 }
                             };
 
+                            // An in-loop call or return ends the current gas block.
+                            prepaid = None;
                             match step {
                                 FastStep::InLoopCall {
                                     target_func_idx,
@@ -2667,25 +2735,16 @@ impl VM {
                                             message: "Stack overflow".to_string(),
                                         });
                                     }
-                                    let new_base = caller_base + caller_reg_count;
+                                    let new_base =
+                                        register_window_end(caller_base, caller_frame.reg_count)?;
                                     let target_reg_count: u16 = if target_fn.register_count > 0 {
                                         (target_fn.register_count as u16)
                                             .max(target_fn.param_count as u16)
                                     } else {
                                         256
                                     };
-                                    let needed = new_base + target_reg_count as usize;
-                                    if vm_registers.len() < needed {
-                                        let extra = needed - vm_registers.len();
-                                        vm_registers.try_reserve(extra).map_err(|_| {
-                                            LustError::RuntimeError {
-                                                message:
-                                                    "Out of memory allocating VM register window"
-                                                        .to_string(),
-                                            }
-                                        })?;
-                                        vm_registers.resize(needed, Value::Nil);
-                                    }
+                                    let needed = register_window_end(new_base, target_reg_count)?;
+                                    reserve_register_window(vm_registers, budgets, needed)?;
                                     let mut callee_non_plain_mask: u64 = 0;
                                     for i in 0..arg_count as usize {
                                         let src_idx =
@@ -2762,25 +2821,16 @@ impl VM {
                                             message: "Stack overflow".to_string(),
                                         });
                                     }
-                                    let new_base = caller_base + caller_reg_count;
+                                    let new_base =
+                                        register_window_end(caller_base, caller_frame.reg_count)?;
                                     let target_reg_count: u16 = if target_fn.register_count > 0 {
                                         (target_fn.register_count as u16)
                                             .max(target_fn.param_count as u16)
                                     } else {
                                         256
                                     };
-                                    let needed = new_base + target_reg_count as usize;
-                                    if vm_registers.len() < needed {
-                                        let extra = needed - vm_registers.len();
-                                        vm_registers.try_reserve(extra).map_err(|_| {
-                                            LustError::RuntimeError {
-                                                message:
-                                                    "Out of memory allocating VM register window"
-                                                        .to_string(),
-                                            }
-                                        })?;
-                                        vm_registers.resize(needed, Value::Nil);
-                                    }
+                                    let needed = register_window_end(new_base, target_reg_count)?;
+                                    reserve_register_window(vm_registers, budgets, needed)?;
                                     let mut callee_non_plain_mask: u64 = 0;
                                     let recv_val =
                                         vm_registers[caller_base + obj_reg as usize].fast_clone();
@@ -2885,10 +2935,21 @@ impl VM {
                                 }
                             }
                         }
-                    }
-                };
+                    })
+                })();
 
-                match exit {
+                if let Some((frame_idx, func_idx, start, end, used)) = prepaid {
+                    let pc = self.call_stack[frame_idx].ip;
+                    if pc < end {
+                        let executed = self.functions[func_idx].chunk.packed_code[start..pc]
+                            .iter()
+                            .map(|inst| u64::from(inst.gas_weight()))
+                            .sum::<u64>();
+                        self.budgets.gas.used = used.saturating_add(executed);
+                    }
+                }
+
+                match exit? {
                     FrameExit::EndOfChunk => {
                         let _ = self.pop_call_frame();
                         if self.call_stack.is_empty() {
@@ -5888,6 +5949,33 @@ impl VM {
     /// the arguments are copied straight from the caller's register window into
     /// the new frame window in `vm_registers`, with no intermediate buffer and no
     /// per-call signature walk. `plain_function_callee` must have said yes.
+    fn try_push_dispatch_frame(
+        &mut self,
+        function_idx: usize,
+        reg_count: u16,
+        return_dest: Option<Register>,
+        upvalues: Vec<Value>,
+        shared_upvalues: Vec<Upvalue>,
+    ) -> Result<usize> {
+        if self.call_stack.len() >= self.max_stack_depth {
+            return Err(LustError::RuntimeError {
+                message: "Stack overflow".to_string(),
+            });
+        }
+        let base = match self.call_stack.last() {
+            Some(parent) => register_window_end(parent.base_reg, parent.reg_count)?,
+            None => 0,
+        };
+        let end = register_window_end(base, reg_count)?;
+        reserve_register_window(&mut self.vm_registers, &mut self.budgets, end)?;
+        // The shared push updates call metadata and has enough storage
+        // already. Set the padded base before initializing any live slots.
+        let idx =
+            self.try_push_call_frame(function_idx, reg_count, return_dest, upvalues, shared_upvalues)?;
+        self.call_stack[idx].base_reg = base;
+        Ok(idx)
+    }
+
     fn push_bytecode_call_frame(
         &mut self,
         func_reg: Register,
@@ -5936,7 +6024,7 @@ impl VM {
             }
         }
         let reg_count = self.effective_reg_count(function_idx);
-        let callee_frame_idx = self.try_push_call_frame(
+        let callee_frame_idx = self.try_push_dispatch_frame(
             function_idx,
             reg_count,
             Some(dest_reg),
@@ -6062,7 +6150,7 @@ impl VM {
         }
 
         let reg_count = self.effective_reg_count(function_idx);
-        let frame_idx = self.try_push_call_frame(
+        let frame_idx = self.try_push_dispatch_frame(
             function_idx,
             reg_count,
             return_dest,
@@ -6176,7 +6264,7 @@ impl VM {
     ) -> Result<()> {
         self.validate_call_args_vec(function_idx, &mut args, check)?;
         let reg_count = self.effective_reg_count(function_idx);
-        let frame_idx = self.try_push_call_frame(
+        let frame_idx = self.try_push_dispatch_frame(
             function_idx,
             reg_count,
             return_dest,

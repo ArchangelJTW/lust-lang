@@ -1,6 +1,7 @@
 #[cfg(feature = "std")]
 pub use jit_engine::{
-    analyze_module_call_effects, clear_registered_struct_layouts, find_loop_backedges, find_loop_headers,
+    analyze_module_call_effects, clear_registered_struct_layouts, compute_default_module_roots,
+    compute_reachable_native_functions, find_loop_backedges, find_loop_headers,
     get_registered_struct_layout, get_registered_struct_layout_by_name, ic_dispatch,
     ic_invalidate, ic_invalidate_all, ic_probe, ic_register_site, ic_reset, ic_site_stats,
     ic_update, is_loop_backedge, lust_mir_abs_int, lust_mir_alloc_array,
@@ -1723,7 +1724,7 @@ pub mod jit_engine {
     struct PromotedLoopCounters {
         gas: Option<(Variable, Variable)>, // (gas_ptr_var, gas_var)
         sp: Option<(Variable, Variable)>,  // (sp_ptr_var, sp_cnt_var)
-        quantum_rem: Option<Variable>,     // NG-W11-2: quantized loop header remaining fast iters (Q=64 -> 63)
+        quantum: Option<(Variable, u64)>,  // NG-W14-1: (quantum_rem_var, header_gas_amt) for Q=64 batch reconciliation
     }
 
     #[derive(Clone, Copy)]
@@ -1740,6 +1741,15 @@ pub mod jit_engine {
         pub quantized_header_gas_amt: Option<u64>,
     }
 
+    /// NG-W14-1: Strictly nested innermost natural loop quantized (`Q=64`) inside
+    /// an enclosing non-quantized counter-promoted loop (`parent_cl_idx`).
+    struct InnerQuantizedLoopSpec {
+        hdr: usize,
+        loop_blocks: hashbrown::HashSet<usize>,
+        parent_cl_idx: usize,
+        header_gas_amt: u64,
+    }
+
     struct HoistLoopSpec {
         hdr: usize,
         body_entry: usize,
@@ -1754,6 +1764,8 @@ pub mod jit_engine {
         counter_loops: Vec<PromotedLoopSpec>,
         block_to_counter_loop: hashbrown::HashMap<usize, usize>,
         hdr_to_counter_loop: hashbrown::HashMap<usize, usize>,
+        inner_quantized_loops: Vec<InnerQuantizedLoopSpec>,
+        block_to_inner_quantized: hashbrown::HashMap<usize, usize>,
         hoist_loops: Vec<HoistLoopSpec>,
         hdr_to_hoist_loop: hashbrown::HashMap<usize, usize>,
         inline_push_blocks: hashbrown::HashSet<usize>,
@@ -1766,6 +1778,14 @@ pub mod jit_engine {
         preheader_bb: Block,
         loop_clif_blocks: hashbrown::HashSet<Block>,
         flush_clif_blocks: hashbrown::HashSet<Block>,
+        post_flush_clif_blocks: hashbrown::HashSet<Block>,
+        reload_clif_blocks: hashbrown::HashSet<Block>,
+    }
+
+    struct InnerQuantizedCfgRecord {
+        hdr: usize,
+        loop_clif_blocks: hashbrown::HashSet<Block>,
+        reconcile_clif_blocks: hashbrown::HashSet<Block>,
         post_flush_clif_blocks: hashbrown::HashSet<Block>,
         reload_clif_blocks: hashbrown::HashSet<Block>,
     }
@@ -1792,13 +1812,46 @@ pub mod jit_engine {
                 .load(types::I64, MemFlagsData::trusted(), sp_ptr, OFF_SAFEPOINTS_CHECKED);
             builder.def_var(sp_cnt_var, s);
         }
-        if let Some(quantum_rem_var) = counters.quantum_rem {
+        if let Some((quantum_rem_var, _)) = counters.quantum {
             let zero = builder.ins().iconst(types::I64, 0);
             builder.def_var(quantum_rem_var, zero);
         }
     }
 
-    fn emit_promoted_counters_flush(
+    /// NG-W14-1: Reconciles any unused pre-reserved `Q=64` quantum steps back into
+    /// register-promoted `(gas_var, sp_cnt_var)` with zero memory stores and resets `quantum_rem = 0`.
+    /// Invariant inside quantized loop:
+    ///   `gas_var == actual_gas_remaining - quantum_rem * amt`
+    ///   `sp_cnt_var == actual_safepoints_checked + quantum_rem`
+    fn emit_quantum_reconcile_to_regs(
+        builder: &mut FunctionBuilder,
+        counters: PromotedLoopCounters,
+    ) {
+        if let Some((quantum_rem_var, amt)) = counters.quantum {
+            let q = builder.use_var(quantum_rem_var);
+            if let Some((_, gas_var)) = counters.gas {
+                let g = builder.use_var(gas_var);
+                let refund = if amt == 1 {
+                    q
+                } else {
+                    let amt_val = builder.ins().iconst(types::I64, amt as i64);
+                    builder.ins().imul(q, amt_val)
+                };
+                let g_rec = builder.ins().iadd(g, refund);
+                builder.def_var(gas_var, g_rec);
+            }
+            if let Some((_, sp_cnt_var)) = counters.sp {
+                let s = builder.use_var(sp_cnt_var);
+                let s_rec = builder.ins().isub(s, q);
+                builder.def_var(sp_cnt_var, s_rec);
+            }
+            let zero = builder.ins().iconst(types::I64, 0);
+            builder.def_var(quantum_rem_var, zero);
+        }
+    }
+
+    /// Flushes `(gas_var, sp_cnt_var)` directly to memory when `quantum_rem == 0` is statically guaranteed.
+    fn emit_promoted_counters_flush_exact(
         builder: &mut FunctionBuilder,
         counters: PromotedLoopCounters,
     ) {
@@ -1822,15 +1875,26 @@ pub mod jit_engine {
         }
     }
 
-    /// Barrier 5 (`PERF-T4-2`): Mechanically verifies on the emitted Cranelift IR CFG that:
+    fn emit_promoted_counters_flush(
+        builder: &mut FunctionBuilder,
+        counters: PromotedLoopCounters,
+    ) {
+        emit_quantum_reconcile_to_regs(builder, counters);
+        emit_promoted_counters_flush_exact(builder, counters);
+    }
+
+    /// Barrier 5 (`PERF-T4-2` + `NG-W14-1`): Mechanically verifies on the emitted Cranelift IR CFG that:
     /// 1. Every CFG edge leaving a promoted loop's interior block set routes strictly through
     ///    an authorized flush block (and no interior block executes `return`).
     /// 2. Every authorized flush block stores all promoted counters BEFORE any call or exit.
     /// 3. Every reload block loads all promoted counters BEFORE re-entering the loop.
     /// 4. Every preheader block loads all promoted counters.
+    /// 5. Every CFG edge leaving an inner quantized loop's interior block set routes strictly
+    ///    through an authorized reconcile/flush block (and no interior block executes `return`).
     fn verify_promoted_loop_exit_completeness(
         func: &cranelift_codegen::ir::Function,
         records: &[PromotedLoopCfgRecord],
+        iq_records: &[InnerQuantizedCfgRecord],
     ) -> Result<(), MirCraneliftBackendError> {
         use cranelift_codegen::ir::InstructionData;
 
@@ -1946,6 +2010,35 @@ pub mod jit_engine {
             PROMOTED_LOOP_CFG_VERIFICATIONS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         }
 
+        for iq_rec in iq_records {
+            for &bb in &iq_rec.loop_clif_blocks {
+                if !func.layout.is_block_inserted(bb) {
+                    continue;
+                }
+                for inst in func.layout.block_insts(bb) {
+                    let data = &func.dfg.insts[inst];
+                    if data.opcode().is_return() {
+                        return Err(MirCraneliftBackendError::CodegenError(format!(
+                            "NG-W14-1 CFG verifier: interior block {:?} of inner quantized loop hdr {} executes return without reconcile/flush block",
+                            bb, iq_rec.hdr
+                        )));
+                    }
+                    for bcall in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+                        let dst = bcall.block(&func.dfg.value_lists);
+                        if !iq_rec.loop_clif_blocks.contains(&dst)
+                            && !iq_rec.reconcile_clif_blocks.contains(&dst)
+                        {
+                            return Err(MirCraneliftBackendError::CodegenError(format!(
+                                "NG-W14-1 CFG verifier: leaked exit edge {:?} -> {:?} from inner quantized loop hdr {} bypassing reconcile/flush blocks",
+                                bb, dst, iq_rec.hdr
+                            )));
+                        }
+                    }
+                }
+            }
+            PROMOTED_LOOP_CFG_VERIFICATIONS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        }
+
         Ok(())
     }
 
@@ -1995,10 +2088,158 @@ pub mod jit_engine {
         }
     }
 
+    /// NG-W14-5: Identifies function-wide single-definition constant `MirType::Int` locals
+    /// whose defining block strictly dominates every read in the function (fail-closed).
+    fn compute_const_int_locals(
+        mir_fn: &MirFunction,
+        osr_info: Option<(BlockId, &[LocalId])>,
+        stack_slots: &hashbrown::HashMap<usize, StackSlot>,
+    ) -> hashbrown::HashMap<usize, i64> {
+        let n = mir_fn.locals.len();
+        if n == 0 || mir_fn.blocks.is_empty() {
+            return hashbrown::HashMap::new();
+        }
+        let mut def_state = vec![0u8; n]; // 0 = unseen, 1 = single const int def, 2 = ineligible
+        let mut def_val = vec![0i64; n];
+        let mut def_loc = vec![(0usize, 0usize); n]; // (block_idx, stmt_idx)
+
+        for (idx, decl) in mir_fn.locals.iter().enumerate() {
+            if decl.ty != MirType::Int || stack_slots.contains_key(&idx) {
+                def_state[idx] = 2;
+            }
+        }
+        for param in &mir_fn.params {
+            if param.0 < n {
+                def_state[param.0] = 2;
+            }
+        }
+        if let Some((_, live_locals)) = osr_info {
+            for loc in live_locals {
+                if loc.0 < n {
+                    def_state[loc.0] = 2;
+                }
+            }
+        }
+
+        for (b_idx, block) in mir_fn.blocks.iter().enumerate() {
+            for (s_idx, stmt) in block.statements.iter().enumerate() {
+                if let Statement::Assign(place, rval, _) = stmt {
+                    match (place, rval) {
+                        (
+                            Place::Local(dst),
+                            Rvalue::Use(Operand::Constant(MirConstant::Int(c))),
+                        ) => {
+                            if dst.0 < n {
+                                if def_state[dst.0] == 0 {
+                                    def_state[dst.0] = 1;
+                                    def_val[dst.0] = *c;
+                                    def_loc[dst.0] = (b_idx, s_idx);
+                                } else {
+                                    def_state[dst.0] = 2;
+                                }
+                            }
+                        }
+                        _ => {
+                            let root = place.root_local().0;
+                            if root < n {
+                                def_state[root] = 2;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(Terminator::Call { destination, .. }) = &block.terminator {
+                let root = destination.root_local().0;
+                if root < n {
+                    def_state[root] = 2;
+                }
+            }
+        }
+
+        let entry_idx = osr_info
+            .map(|(tb, _)| tb.0)
+            .unwrap_or(mir_fn.entry.0)
+            .min(mir_fn.blocks.len() - 1);
+
+        let mut out = hashbrown::HashMap::new();
+        for idx in 0..n {
+            if def_state[idx] != 1 {
+                continue;
+            }
+            let (def_bb, def_stmt_idx) = def_loc[idx];
+
+            // 1. Fail closed if `idx` is read before its definition inside `def_bb`.
+            let mut read_before_def = false;
+            for stmt in &mir_fn.blocks[def_bb].statements[..def_stmt_idx] {
+                let mut uses = hashbrown::HashSet::new();
+                stmt.collect_uses(&mut uses);
+                if uses.contains(&idx) {
+                    read_before_def = true;
+                    break;
+                }
+            }
+            if read_before_def {
+                continue;
+            }
+
+            // 2. If not defined in `entry_idx`, verify `def_bb` dominates every block that reads `idx`
+            //    by checking whether any block reading `idx` is reachable from `entry_idx` without
+            //    passing through `def_bb`.
+            if def_bb != entry_idx {
+                let mut visited = hashbrown::HashSet::new();
+                let mut queue = std::collections::VecDeque::new();
+                visited.insert(entry_idx);
+                queue.push_back(entry_idx);
+                let mut bypassed = false;
+                while let Some(b) = queue.pop_front() {
+                    let mut uses = hashbrown::HashSet::new();
+                    for stmt in &mir_fn.blocks[b].statements {
+                        stmt.collect_uses(&mut uses);
+                    }
+                    if let Some(term) = &mir_fn.blocks[b].terminator {
+                        term.collect_uses(&mut uses);
+                    }
+                    if uses.contains(&idx) {
+                        bypassed = true;
+                        break;
+                    }
+                    if let Some(term) = &mir_fn.blocks[b].terminator {
+                        for succ in term.successors() {
+                            if succ < mir_fn.blocks.len() && succ != def_bb && visited.insert(succ) {
+                                queue.push_back(succ);
+                            }
+                        }
+                    }
+                }
+                if bypassed {
+                    continue;
+                }
+            }
+
+            out.insert(idx, def_val[idx]);
+        }
+        out
+    }
+
+    #[inline]
+    fn resolve_const_int_operand(
+        op: &Operand,
+        const_int_locals: &hashbrown::HashMap<usize, i64>,
+    ) -> Option<i64> {
+        match op {
+            Operand::Constant(MirConstant::Int(c)) => Some(*c),
+            Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
+                const_int_locals.get(&loc.0).copied()
+            }
+            _ => None,
+        }
+    }
+
     fn rvalue_may_fail_non_oob(
         rval: &Rvalue,
         locals: &[LocalDecl],
         validated_at_hdr: &hashbrown::HashSet<usize>,
+        const_int_locals: &hashbrown::HashMap<usize, i64>,
     ) -> bool {
         match rval {
             Rvalue::Use(_) | Rvalue::Cast(..) => false,
@@ -2023,7 +2264,7 @@ pub mod jit_engine {
                     if is_float {
                         matches!(op, MirBinaryOp::Mod)
                     } else {
-                        !matches!(rhs, Operand::Constant(MirConstant::Int(c)) if *c != 0)
+                        !matches!(resolve_const_int_operand(rhs, const_int_locals), Some(c) if c != 0)
                     }
                 }
                 MirBinaryOp::Add => {
@@ -2105,6 +2346,7 @@ pub mod jit_engine {
         vec_loops: &[crate::mir::opt::simd::VectorizedLoopInfo],
         prov_plan: &ArrayLenProvenancePlan,
         stack_slots: &hashbrown::HashMap<usize, StackSlot>,
+        const_int_locals: &hashbrown::HashMap<usize, i64>,
         struct_layouts: &hashbrown::HashMap<String, MirStructLayout>,
         has_sp_ctx: bool,
         has_gas_ctx: bool,
@@ -2113,6 +2355,8 @@ pub mod jit_engine {
             counter_loops: Vec::new(),
             block_to_counter_loop: hashbrown::HashMap::new(),
             hdr_to_counter_loop: hashbrown::HashMap::new(),
+            inner_quantized_loops: Vec::new(),
+            block_to_inner_quantized: hashbrown::HashMap::new(),
             hoist_loops: Vec::new(),
             hdr_to_hoist_loop: hashbrown::HashMap::new(),
             inline_push_blocks: hashbrown::HashSet::new(),
@@ -2485,6 +2729,74 @@ pub mod jit_engine {
             });
         }
 
+        // 5b. NG-W14-1: Prioritize innermost natural loops (smallest block set first)
+        // for Q=64 quantization inside enclosing non-quantized counter-promoted loops.
+        // Outer loops stay on standard non-quantized counter promotion (zero ssub_overflow),
+        // while innermost leaf loops get Q=64 single-counter batch strip-mining.
+        let mut eligible_innermost = eligible.clone();
+        eligible_innermost.sort_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| a.0.cmp(&b.0)));
+
+        let mut inner_quantized_loops: Vec<InnerQuantizedLoopSpec> = Vec::new();
+        let mut block_to_inner_quantized: hashbrown::HashMap<usize, usize> =
+            hashbrown::HashMap::new();
+
+        for (hdr, body) in &eligible_innermost {
+            let Some(&parent_cl_idx) = block_to_counter_loop.get(hdr) else {
+                continue;
+            };
+            let parent_spec = &counter_loops[parent_cl_idx];
+            if parent_spec.hdr == *hdr
+                || parent_spec.quantized_header_gas_amt.is_some()
+                || !parent_spec.promote_gas
+                || !parent_spec.promote_sp
+            {
+                continue;
+            }
+            if !body.iter().all(|b| {
+                block_to_counter_loop.get(b) == Some(&parent_cl_idx)
+                    && !block_to_inner_quantized.contains_key(b)
+            }) {
+                continue;
+            }
+            let total_gas_checks: usize = body
+                .iter()
+                .map(|&b| {
+                    mir_fn.blocks[b]
+                        .statements
+                        .iter()
+                        .filter(|s| matches!(s, Statement::ResourceCheck(ResourceKind::Gas, ..)))
+                        .count()
+                })
+                .sum();
+            let loop_header_count = body.iter().filter(|&&b| loop_headers.contains(&b)).count();
+            let has_vec_hdr = body.iter().any(|b| vec_hdr_map.contains_key(b));
+            if has_vec_hdr
+                || !loop_headers.contains(hdr)
+                || loop_header_count != 1
+                || total_gas_checks != 1
+            {
+                continue;
+            }
+            let header_gas_amt = match mir_fn.blocks[*hdr].statements.first() {
+                Some(Statement::ResourceCheck(ResourceKind::Gas, amt, _))
+                    if *amt > 0 && *amt <= 1024 =>
+                {
+                    *amt
+                }
+                _ => continue,
+            };
+            let iq_idx = inner_quantized_loops.len();
+            for &b in body {
+                block_to_inner_quantized.insert(b, iq_idx);
+            }
+            inner_quantized_loops.push(InnerQuantizedLoopSpec {
+                hdr: *hdr,
+                loop_blocks: body.clone(),
+                parent_cl_idx,
+                header_gas_amt,
+            });
+        }
+
         // 6. Pillar 2: Non-Speculative Guarded-Preheader Array (data_ptr, len) & Struct Base Hoisting
         // (`eligible` is already sorted outermost-first so outer loops hoist before inner loops.)
         let mut hoist_loops: Vec<HoistLoopSpec> = Vec::new();
@@ -2634,7 +2946,12 @@ pub mod jit_engine {
                                     }
                                 }
                             }
-                            if rvalue_may_fail_non_oob(rval, &mir_fn.locals, validated_at_hdr) {
+                            if rvalue_may_fail_non_oob(
+                                rval,
+                                &mir_fn.locals,
+                                validated_at_hdr,
+                                const_int_locals,
+                            ) {
                                 break 'walk;
                             }
                             collect_place_hoist_candidates(
@@ -2740,6 +3057,8 @@ pub mod jit_engine {
             counter_loops,
             block_to_counter_loop,
             hdr_to_counter_loop,
+            inner_quantized_loops,
+            block_to_inner_quantized,
             hoist_loops,
             hdr_to_hoist_loop,
             inline_push_blocks,
@@ -2865,9 +3184,19 @@ pub mod jit_engine {
         builder.switch_to_block(cont_bb);
     }
 
-    /// NG-W11-2 (`F-06`, `F-20`): Atomic quantized loop header check (Q = 64, SEC-01 sound).
-    /// Fuses the synthetic loop header safepoint check and `mir_fn.blocks[hdr].statements[0]`
-    /// (`Statement::ResourceCheck(ResourceKind::Gas, amt, _)`) into a single emission node.
+    /// NG-W11-2 + NG-W14-1: Atomic quantized loop header check (Q = 64, SEC-01 sound)
+    /// with true single-counter batch gas & safepoint reconciliation.
+    ///
+    /// Invariant maintained throughout the quantized loop:
+    ///   - `gas_var == actual_gas_remaining - quantum_rem * amt`
+    ///   - `sp_cnt_var == actual_safepoints_checked + quantum_rem`
+    ///   - `0 <= quantum_rem <= 63` (and `quantum_rem > 0 => slow_flags == 0 && gas_var >= 0`)
+    ///
+    /// Fast path (63 of 64 iterations): updates ONLY `quantum_rem -= 1` and falls through
+    /// directly into `cont_bb` (zero `sp_cnt` update, zero `gas_var` update, zero `slow_flags`
+    /// memory load, zero 4-block diamond). Exact `(gas_remaining, safepoints_checked)` are
+    /// reconciled on refill, every normal loop exit edge, early break/return, OOG/OOB trap,
+    /// and forced deopt exit.
     #[allow(clippy::too_many_arguments)]
     fn emit_quantized_loop_header_check(
         builder: &mut FunctionBuilder,
@@ -2885,6 +3214,7 @@ pub mod jit_engine {
         raw_emergency_exit_bb: Block,
         promoted: PromotedLoopCounters,
         mut cfg_rec: Option<&mut PromotedLoopCfgRecord>,
+        mut iq_cfg_rec: Option<&mut InnerQuantizedCfgRecord>,
     ) {
         const OFF_SLOW_FLAGS: i32 = core::mem::offset_of!(SafepointFastState, slow_flags) as i32;
         const QUANTUM_FAST_ITERS: i64 = 63;
@@ -2896,19 +3226,20 @@ pub mod jit_engine {
         let (_, gas_var) = promoted
             .gas
             .expect("quantized loop header check requires promoted gas counter");
-        let quantum_rem_var = promoted
-            .quantum_rem
+        let (quantum_rem_var, q_amt) = promoted
+            .quantum
             .expect("quantized loop header check requires quantum_rem_var");
+        debug_assert_eq!(q_amt, amt);
 
-        // Every iteration increments sp_cnt_var in register.
-        let sp0 = builder.use_var(sp_cnt_var);
-        let sp1 = builder.ins().iadd_imm_s(sp0, 1);
-        builder.def_var(sp_cnt_var, sp1);
+        // Fast path (63 of 64 iterations): single register decrement + branch straight to cont_bb.
+        // Decrementing `quantum_rem` by 1 preserves:
+        //   actual_gas_remaining = gas_var + quantum_rem * amt  (decreased by amt)
+        //   actual_safepoints    = sp_cnt_var - quantum_rem     (increased by 1)
+        let q0 = builder.use_var(quantum_rem_var);
+        let q1 = builder.ins().iadd_imm_s(q0, -1);
+        let needs_refill = builder.ins().icmp_imm_s(IntCC::SignedLessThan, q1, 0);
+        builder.def_var(quantum_rem_var, q1);
 
-        let q_rem = builder.use_var(quantum_rem_var);
-        let has_quantum = builder.ins().icmp_imm_s(IntCC::SignedGreaterThan, q_rem, 0);
-
-        let fast_quantum_bb = builder.create_block();
         let check_reload_bb = builder.create_block();
         let slow_safepoint_bb = builder.create_block();
         let sp_reload_bb = builder.create_block();
@@ -2921,12 +3252,17 @@ pub mod jit_engine {
         let arm_quantum_bb = builder.create_block();
         let cont_bb = builder.create_block();
 
+        // Refill / check / arm blocks run at most 1/64 iterations — mark cold so hot loop
+        // body lays out straight-line with zero taken jumps on the 63/64 fast path.
+        builder.set_cold_block(check_reload_bb);
         builder.set_cold_block(slow_safepoint_bb);
         builder.set_cold_block(sp_reload_bb);
         builder.set_cold_block(err_dispatch_bb);
         builder.set_cold_block(deopt_capture_bb);
+        builder.set_cold_block(gas_check_bb);
         builder.set_cold_block(gas_slow_bb);
         builder.set_cold_block(gas_reload_bb);
+        builder.set_cold_block(arm_quantum_bb);
 
         if let Some(rec) = cfg_rec.as_deref_mut() {
             rec.flush_clif_blocks.insert(slow_safepoint_bb);
@@ -2936,26 +3272,29 @@ pub mod jit_engine {
             rec.flush_clif_blocks.insert(gas_slow_bb);
             rec.reload_clif_blocks.insert(gas_reload_bb);
         }
+        if let Some(iq_rec) = iq_cfg_rec.as_deref_mut() {
+            iq_rec.reconcile_clif_blocks.insert(slow_safepoint_bb);
+            iq_rec.post_flush_clif_blocks.insert(err_dispatch_bb);
+            iq_rec.post_flush_clif_blocks.insert(deopt_capture_bb);
+            iq_rec.reload_clif_blocks.insert(sp_reload_bb);
+            iq_rec.reconcile_clif_blocks.insert(gas_slow_bb);
+            iq_rec.reload_clif_blocks.insert(gas_reload_bb);
+        }
 
         builder
             .ins()
-            .brif(has_quantum, fast_quantum_bb, &[], check_reload_bb, &[]);
+            .brif(needs_refill, check_reload_bb, &[], cont_bb, &[]);
 
-        // Fast path (63 of 64 iterations): skips slow_flags memory load & gas < 0 branch
-        // because arming q_rem = 63 proved slow_flags == 0 and gas1 >= 63 * amt with no other
-        // ResourceCheck(Gas) in loop_blocks.
-        builder.switch_to_block(fast_quantum_bb);
-        let fast_gas0 = builder.use_var(gas_var);
-        let fast_gas1 = builder.ins().iadd_imm_s(fast_gas0, -(amt as i64));
-        builder.def_var(gas_var, fast_gas1);
-        let q1 = builder.ins().iadd_imm_s(q_rem, -1);
-        builder.def_var(quantum_rem_var, q1);
-        builder.ins().jump(cont_bb, &[]);
-
-        // Check/reload path (1 of 64 iterations, or every iteration when gas < 64*amt or flags != 0).
+        // Refill path (1 of 64 iterations, or every iteration when gas < 64*amt or flags != 0).
+        // Entered ONLY when q0 == 0, so gas_var and sp_cnt_var are already exact pre-iteration values.
         // Evaluates slow_flags BEFORE decrementing gas_var so interrupts and deopt observe exact
         // pre-ResourceCheck gas_remaining.
         builder.switch_to_block(check_reload_bb);
+        let zero_q = builder.ins().iconst(types::I64, 0);
+        builder.def_var(quantum_rem_var, zero_q);
+        let sp0 = builder.use_var(sp_cnt_var);
+        let sp1 = builder.ins().iadd_imm_s(sp0, 1);
+        builder.def_var(sp_cnt_var, sp1);
         let sp_ptr = builder.use_var(sp_ptr_var);
         let flags = builder
             .ins()
@@ -2971,9 +3310,8 @@ pub mod jit_engine {
         );
 
         builder.switch_to_block(slow_safepoint_bb);
-        let zero_q_sp = builder.ins().iconst(types::I64, 0);
-        builder.def_var(quantum_rem_var, zero_q_sp);
-        emit_promoted_counters_flush(builder, promoted);
+        // quantum_rem_var == 0 here, so gas_var (pre-ResourceCheck) & sp_cnt_var (+1) are exact.
+        emit_promoted_counters_flush_exact(builder, promoted);
         let sp_call = builder.ins().call(safepoint_slow_fn, &[]);
         let sp_res = builder.inst_results(sp_call)[0];
         let is_sp_err = builder.ins().icmp_imm_s(IntCC::NotEqual, sp_res, 0);
@@ -3036,9 +3374,8 @@ pub mod jit_engine {
             .brif(is_neg, gas_slow_bb, &[], arm_quantum_bb, &[]);
 
         builder.switch_to_block(gas_slow_bb);
-        let zero_q_gas = builder.ins().iconst(types::I64, 0);
-        builder.def_var(quantum_rem_var, zero_q_gas);
-        emit_promoted_counters_flush(builder, promoted);
+        // quantum_rem_var == 0 here, so gas_var (gas1 < 0) & sp_cnt_var are exact.
+        emit_promoted_counters_flush_exact(builder, promoted);
         let slow_call = builder.ins().call(gas_slow_fn, &[]);
         let slow_res = builder.inst_results(slow_call)[0];
         let is_gas_err = builder.ins().icmp_imm_s(IntCC::NotEqual, slow_res, 0);
@@ -3052,6 +3389,8 @@ pub mod jit_engine {
         builder.ins().jump(cont_bb, &[]);
 
         // Arm next 63 fast iterations ONLY when slow_flags == 0 AND gas1 >= 63 * amt.
+        // Pre-reserve 63 * amt from gas_var and +63 into sp_cnt_var so the fast path
+        // updates ONLY quantum_rem_var!
         builder.switch_to_block(arm_quantum_bb);
         let threshold = QUANTUM_FAST_ITERS * (amt as i64);
         let can_arm_gas = builder
@@ -3061,7 +3400,14 @@ pub mod jit_engine {
         let c63 = builder.ins().iconst(types::I64, QUANTUM_FAST_ITERS);
         let c0 = builder.ins().iconst(types::I64, 0);
         let next_q = builder.ins().select(can_arm, c63, c0);
+        let gas_reserved = builder.ins().iadd_imm_s(gas1, -threshold);
+        let next_gas = builder.ins().select(can_arm, gas_reserved, gas1);
+        let sp_cur = builder.use_var(sp_cnt_var);
+        let sp_reserved = builder.ins().iadd_imm_s(sp_cur, QUANTUM_FAST_ITERS);
+        let next_sp = builder.ins().select(can_arm, sp_reserved, sp_cur);
         builder.def_var(quantum_rem_var, next_q);
+        builder.def_var(gas_var, next_gas);
+        builder.def_var(sp_cnt_var, next_sp);
         builder.ins().jump(cont_bb, &[]);
 
         builder.switch_to_block(cont_bb);
@@ -3179,6 +3525,90 @@ pub mod jit_engine {
         builder.switch_to_block(cont_bb);
     }
 
+    /// Computes the default reachable root set for a `MirModule`:
+    /// - Module entrypoints (`__script`, `__init@*`),
+    /// - Exported / public functions (`signature.is_public == true`),
+    /// - Any function referenced by an `Rvalue::Closure` in the module.
+    ///
+    /// If a synthetic module has no public/entry/closure roots at all, falls back conservatively
+    /// to treating all functions in `module` as roots.
+    pub fn compute_default_module_roots(module: &MirModule) -> hashbrown::HashSet<String> {
+        let mut roots = hashbrown::HashSet::new();
+        for f in &module.functions {
+            if f.signature.is_public
+                || f.signature.name == "__script"
+                || f.signature.name.starts_with("__init@")
+            {
+                roots.insert(f.signature.name.clone());
+            }
+            for block in &f.blocks {
+                for stmt in &block.statements {
+                    if let Statement::Assign(_, Rvalue::Closure { func_name, .. }, _) = stmt {
+                        roots.insert(func_name.clone());
+                    }
+                }
+            }
+        }
+        if roots.is_empty() {
+            for f in &module.functions {
+                roots.insert(f.signature.name.clone());
+            }
+        }
+        roots
+    }
+
+    /// Computes the transitive set of module-local functions reachable from `explicit_roots`
+    /// via direct calls (`Terminator::Call`) and closure captures (`Rvalue::Closure`).
+    ///
+    /// Helper functions that were 100% inlined with 0 remaining callers and are not in
+    /// `explicit_roots` are excluded from the returned set so Cranelift skips their codegen.
+    pub fn compute_reachable_native_functions(
+        module: &MirModule,
+        explicit_roots: &hashbrown::HashSet<String>,
+    ) -> hashbrown::HashSet<String> {
+        let fn_by_name: hashbrown::HashMap<&str, &MirFunction> = module
+            .functions
+            .iter()
+            .map(|f| (f.signature.name.as_str(), f))
+            .collect();
+
+        let mut reachable: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        let mut worklist: Vec<&str> = Vec::new();
+
+        for root in explicit_roots {
+            if let Some(&f) = fn_by_name.get(root.as_str()) {
+                if reachable.insert(f.signature.name.clone()) {
+                    worklist.push(f.signature.name.as_str());
+                }
+            }
+        }
+
+        while let Some(cur_name) = worklist.pop() {
+            let Some(&cur_fn) = fn_by_name.get(cur_name) else {
+                continue;
+            };
+            for block in &cur_fn.blocks {
+                for stmt in &block.statements {
+                    if let Statement::Assign(_, Rvalue::Closure { func_name, .. }, _) = stmt
+                        && let Some(&target_fn) = fn_by_name.get(func_name.as_str())
+                        && reachable.insert(target_fn.signature.name.clone())
+                    {
+                        worklist.push(target_fn.signature.name.as_str());
+                    }
+                }
+                if let Some(Terminator::Call { callee, .. }) = &block.terminator
+                    && !is_builtin_or_special_callee(callee)
+                    && let Some(&target_fn) = fn_by_name.get(callee.as_str())
+                    && reachable.insert(target_fn.signature.name.clone())
+                {
+                    worklist.push(target_fn.signature.name.as_str());
+                }
+            }
+        }
+
+        reachable
+    }
+
     pub struct CraneliftJitCompiler {
         builder_ctx: FunctionBuilderContext,
         ctx: Context,
@@ -3190,8 +3620,15 @@ pub mod jit_engine {
         osr_request_counter: u64,
         capture_ir: bool,
         captured_ir: hashbrown::HashMap<String, String>,
+        captured_opt_ir: hashbrown::HashMap<String, String>,
         host_callbacks: hashbrown::HashMap<String, (Vec<MirType>, MirType)>,
         gas_budget_active: bool,
+        post_inline_mirs: hashbrown::HashMap<String, MirFunction>,
+        deferred_continuation_fns: hashbrown::HashSet<String>,
+        deferred_dead_helpers: hashbrown::HashSet<String>,
+        compiled_roots: hashbrown::HashSet<String>,
+        skipped_dead_helper_count: usize,
+        lazy_deopt_materialization_count: u64,
         #[cfg(feature = "test-deopt")]
         refine_max_iterations_override: Option<usize>,
     }
@@ -3335,8 +3772,15 @@ pub mod jit_engine {
                 osr_request_counter: 0,
                 capture_ir: false,
                 captured_ir: hashbrown::HashMap::new(),
+                captured_opt_ir: hashbrown::HashMap::new(),
                 host_callbacks,
                 gas_budget_active: false,
+                post_inline_mirs: hashbrown::HashMap::new(),
+                deferred_continuation_fns: hashbrown::HashSet::new(),
+                deferred_dead_helpers: hashbrown::HashSet::new(),
+                compiled_roots: hashbrown::HashSet::new(),
+                skipped_dead_helper_count: 0,
+                lazy_deopt_materialization_count: 0,
                 #[cfg(feature = "test-deopt")]
                 refine_max_iterations_override: None,
             })
@@ -3344,6 +3788,56 @@ pub mod jit_engine {
 
         pub fn set_gas_budget_active(&mut self, active: bool) {
             self.gas_budget_active = active;
+        }
+
+        /// Stores the lightweight post-inline MIR snapshot, deferred continuation/dead-helper
+        /// indices, and active root set for lazy deopt materialization and on-demand DCE expansion.
+        pub fn set_post_inline_snapshot(
+            &mut self,
+            post_inline_mirs: hashbrown::HashMap<String, MirFunction>,
+            deferred_continuation_fns: hashbrown::HashSet<String>,
+            deferred_dead_helpers: hashbrown::HashSet<String>,
+            compiled_roots: hashbrown::HashSet<String>,
+            skipped_dead_helper_count: usize,
+        ) {
+            self.post_inline_mirs = post_inline_mirs;
+            self.deferred_continuation_fns = deferred_continuation_fns;
+            self.deferred_dead_helpers = deferred_dead_helpers;
+            self.compiled_roots = compiled_roots;
+            self.skipped_dead_helper_count = skipped_dead_helper_count;
+            self.lazy_deopt_materialization_count = 0;
+        }
+
+        pub fn post_inline_mir(&self, name: &str) -> Option<&MirFunction> {
+            self.post_inline_mirs.get(name)
+        }
+
+        pub fn is_deferred_continuation(&self, name: &str) -> bool {
+            self.deferred_continuation_fns.contains(name)
+        }
+
+        pub fn mark_continuation_materialized(&mut self, name: &str) {
+            self.deferred_continuation_fns.remove(name);
+        }
+
+        pub fn is_deferred_dead_helper(&self, name: &str) -> bool {
+            self.deferred_dead_helpers.contains(name)
+        }
+
+        pub fn compiled_roots(&self) -> &hashbrown::HashSet<String> {
+            &self.compiled_roots
+        }
+
+        pub fn skipped_dead_helper_count(&self) -> usize {
+            self.skipped_dead_helper_count
+        }
+
+        pub fn lazy_deopt_materialization_count(&self) -> u64 {
+            self.lazy_deopt_materialization_count
+        }
+
+        pub fn record_lazy_deopt_materialization(&mut self) {
+            self.lazy_deopt_materialization_count += 1;
         }
 
         /// Configures an explicit type refinement maximum iteration override for testing convergence boundaries.
@@ -3396,6 +3890,28 @@ pub mod jit_engine {
                 .ok_or_else(|| {
                     MirCraneliftBackendError::CodegenError(format!(
                         "No IR captured for function '{}'",
+                        mir_fn.signature.name
+                    ))
+                })
+        }
+
+        pub fn dump_optimized_function_ir(
+            &mut self,
+            mir_fn: &MirFunction,
+        ) -> Result<String, MirCraneliftBackendError> {
+            let prev = self.capture_ir;
+            self.capture_ir = true;
+            let compile_res = self.compile_function(mir_fn);
+            self.capture_ir = prev;
+            compile_res?;
+            let fast_key = format!("{}$fast", mir_fn.signature.name);
+            self.captured_opt_ir
+                .get(&fast_key)
+                .or_else(|| self.captured_opt_ir.get(&mir_fn.signature.name))
+                .cloned()
+                .ok_or_else(|| {
+                    MirCraneliftBackendError::CodegenError(format!(
+                        "No optimized IR captured for function '{}'",
                         mir_fn.signature.name
                     ))
                 })
@@ -3534,17 +4050,39 @@ pub mod jit_engine {
             &mut self,
             module: &MirModule,
         ) -> Result<hashbrown::HashMap<String, *const u8>, MirCraneliftBackendError> {
+            let roots = compute_default_module_roots(module);
+            self.compile_module_with_roots(module, &roots)
+        }
+
+        pub fn compile_module_with_roots(
+            &mut self,
+            module: &MirModule,
+            roots: &hashbrown::HashSet<String>,
+        ) -> Result<hashbrown::HashMap<String, *const u8>, MirCraneliftBackendError> {
             self.register_struct_layouts(&module.struct_layouts);
 
-            let mut fast_funcs = hashbrown::HashMap::new();
-            let callee_rets: hashbrown::HashMap<String, MirType> = module
+            let reachable = compute_reachable_native_functions(module, roots);
+            let skipped = module
                 .functions
+                .iter()
+                .filter(|f| !reachable.contains(&f.signature.name))
+                .count();
+            self.skipped_dead_helper_count = skipped;
+
+            let live_functions: Vec<&MirFunction> = module
+                .functions
+                .iter()
+                .filter(|f| reachable.contains(&f.signature.name))
+                .collect();
+
+            let mut fast_funcs = hashbrown::HashMap::new();
+            let callee_rets: hashbrown::HashMap<String, MirType> = live_functions
                 .iter()
                 .map(|f| (f.signature.name.clone(), f.signature.return_type.clone()))
                 .collect();
-            let mut refined_functions = Vec::with_capacity(module.functions.len());
-            for f in &module.functions {
-                let mut f_with_calls = f.clone();
+            let mut refined_functions = Vec::with_capacity(live_functions.len());
+            for f in &live_functions {
+                let mut f_with_calls = (*f).clone();
                 apply_module_callee_return_types(&mut f_with_calls, &callee_rets);
                 refined_functions.push(self.refine_function_for_compiler(&f_with_calls));
             }
@@ -5265,13 +5803,8 @@ pub mod jit_engine {
                     hashbrown::HashMap::new();
                 let empty_hoisted_structs: hashbrown::HashMap<usize, Variable> =
                     hashbrown::HashMap::new();
-                let bc_ctx = BoundsCheckCtx {
-                    status_set_fn,
-                    emergency_exit_bb,
-                    hoisted_arrays: &empty_hoisted_arrays,
-                    hoisted_structs: &empty_hoisted_structs,
-                    proven_in_bounds: &[],
-                };
+                let empty_pow2_mod_defs: hashbrown::HashMap<usize, (ClifValue, i64)> =
+                    hashbrown::HashMap::new();
 
                 let mut vec_acc_vars: Vec<Option<(Variable, Variable)>> = Vec::with_capacity(vec_loops.len());
                 for vl in &vec_loops {
@@ -5316,6 +5849,18 @@ pub mod jit_engine {
                         stack_slots.insert(local.id.0, slot);
                     }
                 }
+
+                // NG-W14-5: Function-wide single-definition constant integer local map.
+                let const_int_locals = compute_const_int_locals(mir_fn, osr_info, &stack_slots);
+                let bc_ctx = BoundsCheckCtx {
+                    status_set_fn,
+                    emergency_exit_bb,
+                    hoisted_arrays: &empty_hoisted_arrays,
+                    hoisted_structs: &empty_hoisted_structs,
+                    proven_in_bounds: &[],
+                    const_int_locals: &const_int_locals,
+                    pow2_mod_defs: &empty_pow2_mod_defs,
+                };
 
                 let loop_headers = find_loop_headers(&mir_fn.blocks);
                 let prov_plan = compute_array_len_provenance_plan(mir_fn, &loop_headers, osr_info);
@@ -5366,14 +5911,38 @@ pub mod jit_engine {
                     &vec_loops,
                     &prov_plan,
                     &stack_slots,
+                    &const_int_locals,
                     &self.struct_layouts,
                     safepoint_ctx.is_some(),
                     gas_ctx.is_some(),
                 );
 
+                // NG-W14-8: Unsigned range-check fusion (`(j as u64) < (len as u64)`) and
+                // conservative loop-induction bounds proof feeding `proven_in_bounds`.
+                let local_read_counts = mir_fn.compute_local_read_counts();
+                let mut bounds_excluded_locals: hashbrown::HashSet<usize> =
+                    stack_slots.keys().copied().collect();
+                if let Some((_, live_locals)) = osr_info {
+                    for &loc in live_locals {
+                        bounds_excluded_locals.insert(loc.0);
+                    }
+                }
+                let bounds_entry_idx = osr_info
+                    .map(|(tb, _)| tb.0)
+                    .unwrap_or(mir_fn.entry.0);
+                let loop_bounds_analysis = mir_fn.compute_loop_induction_bounds_analysis(
+                    bounds_entry_idx,
+                    &bounds_excluded_locals,
+                    osr_info.is_none(),
+                );
+
                 struct CounterLoopLoweringState {
                     counters: PromotedLoopCounters,
                     preheader_bb: Block,
+                    emergency_flush_bb: Block,
+                }
+                struct InnerQuantizedLoopLoweringState {
+                    counters: PromotedLoopCounters,
                     emergency_flush_bb: Block,
                 }
                 struct HoistLoopLoweringState {
@@ -5404,11 +5973,9 @@ pub mod jit_engine {
                     } else {
                         None
                     };
-                    let quantum_rem = if spec.quantized_header_gas_amt.is_some() {
-                        Some(builder.declare_var(types::I64))
-                    } else {
-                        None
-                    };
+                    let quantum = spec
+                        .quantized_header_gas_amt
+                        .map(|amt| (builder.declare_var(types::I64), amt));
                     let preheader_bb = builder.create_block();
                     let emergency_flush_bb = builder.create_block();
                     builder.set_cold_block(emergency_flush_bb);
@@ -5418,7 +5985,7 @@ pub mod jit_engine {
                         counters: PromotedLoopCounters {
                             gas: gas_pair,
                             sp: sp_pair,
-                            quantum_rem,
+                            quantum,
                         },
                         preheader_bb,
                         emergency_flush_bb,
@@ -5430,6 +5997,37 @@ pub mod jit_engine {
                         preheader_bb,
                         loop_clif_blocks: hashbrown::HashSet::new(),
                         flush_clif_blocks,
+                        post_flush_clif_blocks: hashbrown::HashSet::new(),
+                        reload_clif_blocks: hashbrown::HashSet::new(),
+                    });
+                }
+
+                let mut iq_states: Vec<InnerQuantizedLoopLoweringState> =
+                    Vec::with_capacity(promo_plan.inner_quantized_loops.len());
+                let mut iq_cfg_records: Vec<InnerQuantizedCfgRecord> =
+                    Vec::with_capacity(promo_plan.inner_quantized_loops.len());
+                for iq_spec in &promo_plan.inner_quantized_loops {
+                    let parent_counters = cl_states[iq_spec.parent_cl_idx].counters;
+                    let q_var = builder.declare_var(types::I64);
+                    let emergency_flush_bb = builder.create_block();
+                    builder.set_cold_block(emergency_flush_bb);
+                    cfg_records[iq_spec.parent_cl_idx]
+                        .flush_clif_blocks
+                        .insert(emergency_flush_bb);
+                    let mut reconcile_clif_blocks = hashbrown::HashSet::new();
+                    reconcile_clif_blocks.insert(emergency_flush_bb);
+                    iq_states.push(InnerQuantizedLoopLoweringState {
+                        counters: PromotedLoopCounters {
+                            gas: parent_counters.gas,
+                            sp: parent_counters.sp,
+                            quantum: Some((q_var, iq_spec.header_gas_amt)),
+                        },
+                        emergency_flush_bb,
+                    });
+                    iq_cfg_records.push(InnerQuantizedCfgRecord {
+                        hdr: iq_spec.hdr,
+                        loop_clif_blocks: hashbrown::HashSet::new(),
+                        reconcile_clif_blocks,
                         post_flush_clif_blocks: hashbrown::HashSet::new(),
                         reload_clif_blocks: hashbrown::HashSet::new(),
                     });
@@ -5542,13 +6140,70 @@ pub mod jit_engine {
                     }
                 }
 
+                // Pre-create dedicated critical-edge exit-reconcile / exit-flush blocks for every
+                // normal exit edge leaving a nested inner quantized loop (NG-W14-1).
+                let mut iq_exit_by_edge: hashbrown::HashMap<(usize, usize), Block> =
+                    hashbrown::HashMap::new();
+                let mut iq_exit_blocks_per_loop: Vec<Vec<(Block, Block, bool)>> =
+                    vec![Vec::new(); promo_plan.inner_quantized_loops.len()];
+                for (iq_idx, iq_spec) in promo_plan.inner_quantized_loops.iter().enumerate() {
+                    let parent_cl_idx = iq_spec.parent_cl_idx;
+                    let parent_loop_blocks = &promo_plan.counter_loops[parent_cl_idx].loop_blocks;
+                    let mut exit_targets: Vec<usize> = Vec::new();
+                    let mut sorted_blocks: Vec<usize> = iq_spec.loop_blocks.iter().copied().collect();
+                    sorted_blocks.sort_unstable();
+                    for b_idx in sorted_blocks {
+                        if let Some(term) = &mir_fn.blocks[b_idx].terminator {
+                            for succ in term.successors() {
+                                if !iq_spec.loop_blocks.contains(&succ)
+                                    && !exit_targets.contains(&succ)
+                                {
+                                    exit_targets.push(succ);
+                                }
+                            }
+                        }
+                    }
+                    exit_targets.sort_unstable();
+                    let mut by_dest_key: hashbrown::HashMap<(Block, bool), Block> =
+                        hashbrown::HashMap::new();
+                    for target in exit_targets {
+                        let exits_outer_cl = !parent_loop_blocks.contains(&target);
+                        let dest_bb = resolve_dest_entry_bb(Some(iq_spec.hdr), target)?;
+                        let exit_bb = if let Some(&existing) =
+                            by_dest_key.get(&(dest_bb, exits_outer_cl))
+                        {
+                            existing
+                        } else {
+                            let ebb = builder.create_block();
+                            by_dest_key.insert((dest_bb, exits_outer_cl), ebb);
+                            iq_exit_blocks_per_loop[iq_idx].push((dest_bb, ebb, exits_outer_cl));
+                            iq_cfg_records[iq_idx].reconcile_clif_blocks.insert(ebb);
+                            if exits_outer_cl {
+                                cfg_records[parent_cl_idx].flush_clif_blocks.insert(ebb);
+                            } else {
+                                cfg_records[parent_cl_idx].loop_clif_blocks.insert(ebb);
+                            }
+                            ebb
+                        };
+                        iq_exit_by_edge.insert((iq_idx, target), exit_bb);
+                    }
+                }
+
                 let resolve_target_bb = |from_block: Option<usize>, target: usize| -> Result<Block, MirCraneliftBackendError> {
-                    if let Some(fb) = from_block
-                        && let Some(&cl_idx) = promo_plan.block_to_counter_loop.get(&fb)
-                        && !promo_plan.counter_loops[cl_idx].loop_blocks.contains(&target)
-                    {
-                        if let Some(&flush_bb) = exit_flush_by_edge.get(&(cl_idx, target)) {
-                            return Ok(flush_bb);
+                    if let Some(fb) = from_block {
+                        if let Some(&iq_idx) = promo_plan.block_to_inner_quantized.get(&fb)
+                            && !promo_plan.inner_quantized_loops[iq_idx].loop_blocks.contains(&target)
+                        {
+                            if let Some(&iq_exit_bb) = iq_exit_by_edge.get(&(iq_idx, target)) {
+                                return Ok(iq_exit_bb);
+                            }
+                        }
+                        if let Some(&cl_idx) = promo_plan.block_to_counter_loop.get(&fb)
+                            && !promo_plan.counter_loops[cl_idx].loop_blocks.contains(&target)
+                        {
+                            if let Some(&flush_bb) = exit_flush_by_edge.get(&(cl_idx, target)) {
+                                return Ok(flush_bb);
+                            }
                         }
                     }
                     resolve_dest_entry_bb(from_block, target)
@@ -5714,6 +6369,16 @@ pub mod jit_engine {
                 for (cl_idx, spec) in promo_plan.counter_loops.iter().enumerate() {
                     builder.switch_to_block(cl_states[cl_idx].preheader_bb);
                     emit_promoted_counters_load(&mut builder, cl_states[cl_idx].counters);
+                    // NG-W14-1: Initialize quantum_rem = 0 for every nested inner quantized loop
+                    // inside this counter-promoted loop so it dominates all inner loop entries.
+                    for (iq_idx, iq_spec) in promo_plan.inner_quantized_loops.iter().enumerate() {
+                        if iq_spec.parent_cl_idx == cl_idx {
+                            if let Some((q_var, _)) = iq_states[iq_idx].counters.quantum {
+                                let zero = builder.ins().iconst(types::I64, 0);
+                                builder.def_var(q_var, zero);
+                            }
+                        }
+                    }
                     let entry_hdr_bb = if let Some(&hl_idx) = promo_plan.hdr_to_hoist_loop.get(&spec.hdr) {
                         hl_states[hl_idx].peeled_header_bb
                     } else {
@@ -5725,7 +6390,8 @@ pub mod jit_engine {
                 // Emit PERF-T4-2 non-speculative peeled-entry headers & guarded preheaders
                 for (hl_idx, hspec) in promo_plan.hoist_loops.iter().enumerate() {
                     let cl_opt = promo_plan.block_to_counter_loop.get(&hspec.hdr).copied();
-                    let blocks_before: hashbrown::HashSet<Block> = if cl_opt.is_some() {
+                    let iq_opt = promo_plan.block_to_inner_quantized.get(&hspec.hdr).copied();
+                    let blocks_before: hashbrown::HashSet<Block> = if cl_opt.is_some() || iq_opt.is_some() {
                         builder.func.layout.blocks().collect()
                     } else {
                         hashbrown::HashSet::new()
@@ -5742,17 +6408,27 @@ pub mod jit_engine {
                             outer_hoisted_structs.extend(hl_states[other_idx].hoisted_structs.iter().map(|(&k, &v)| (k, v)));
                         }
                     }
-                    let active_emergency_bb = cl_opt
-                        .map(|ci| cl_states[ci].emergency_flush_bb)
-                        .unwrap_or(emergency_exit_bb);
+                    let active_emergency_bb = if let Some(iqi) = iq_opt {
+                        iq_states[iqi].emergency_flush_bb
+                    } else if let Some(ci) = cl_opt {
+                        cl_states[ci].emergency_flush_bb
+                    } else {
+                        emergency_exit_bb
+                    };
                     let peeled_bc_ctx = BoundsCheckCtx {
                         status_set_fn,
                         emergency_exit_bb: active_emergency_bb,
                         hoisted_arrays: &outer_hoisted_arrays,
                         hoisted_structs: &outer_hoisted_structs,
                         proven_in_bounds: &[],
+                        const_int_locals: &const_int_locals,
+                        pow2_mod_defs: &empty_pow2_mod_defs,
                     };
-                    let active_promoted = cl_opt.map(|ci| cl_states[ci].counters);
+                    let active_promoted = if let Some(iqi) = iq_opt {
+                        Some(iq_states[iqi].counters)
+                    } else {
+                        cl_opt.map(|ci| cl_states[ci].counters)
+                    };
 
                     builder.switch_to_block(hl_states[hl_idx].peeled_header_bb);
                     let mut cur_validated = prov_plan.validated_in[hspec.hdr].clone();
@@ -5778,14 +6454,25 @@ pub mod jit_engine {
                         };
                         let (sp_ptr_var, _, sp_slow_fn) =
                             safepoint_ctx.expect("loop header implies needs_safepoint");
-                        let quantized_amt = cl_opt.and_then(|ci| {
-                            let spec = &promo_plan.counter_loops[ci];
-                            if spec.hdr == hspec.hdr {
-                                spec.quantized_header_gas_amt
-                            } else {
-                                None
-                            }
-                        });
+                        let quantized_amt = iq_opt
+                            .and_then(|iqi| {
+                                let iq_spec = &promo_plan.inner_quantized_loops[iqi];
+                                if iq_spec.hdr == hspec.hdr {
+                                    Some(iq_spec.header_gas_amt)
+                                } else {
+                                    None
+                                }
+                            })
+                            .or_else(|| {
+                                cl_opt.and_then(|ci| {
+                                    let spec = &promo_plan.counter_loops[ci];
+                                    if spec.hdr == hspec.hdr {
+                                        spec.quantized_header_gas_amt
+                                    } else {
+                                        None
+                                    }
+                                })
+                            });
                         if let Some(q_amt) = quantized_amt {
                             let (_, _, gas_slow_fn) =
                                 gas_ctx.expect("quantized loop header implies gas_ctx");
@@ -5805,6 +6492,7 @@ pub mod jit_engine {
                                 emergency_exit_bb,
                                 active_promoted.expect("quantized loop header implies promoted counters"),
                                 cl_opt.map(|ci| &mut cfg_records[ci]),
+                                iq_opt.map(|iqi| &mut iq_cfg_records[iqi]),
                             );
                             skip_first_header_gas_check = true;
                         } else {
@@ -5827,8 +6515,63 @@ pub mod jit_engine {
                         }
                     }
 
+                    let mut peeled_pow2_mod_defs: hashbrown::HashMap<usize, (ClifValue, i64)> =
+                        hashbrown::HashMap::new();
+                    let peeled_range_fusion = mir_fn.detect_unsigned_range_checks_in_block(
+                        hspec.hdr,
+                        &local_read_counts,
+                        &bounds_excluded_locals,
+                        &loop_bounds_analysis.non_neg_locals_in[hspec.hdr],
+                    );
                     for (stmt_idx, stmt) in mir_fn.blocks[hspec.hdr].statements.iter().enumerate() {
                         if stmt_idx == 0 && skip_first_header_gas_check {
+                            continue;
+                        }
+                        if peeled_range_fusion.skip_stmts.contains(&stmt_idx) {
+                            continue;
+                        }
+                        let peeled_stmt_bc_ctx = BoundsCheckCtx {
+                            status_set_fn,
+                            emergency_exit_bb: active_emergency_bb,
+                            hoisted_arrays: &outer_hoisted_arrays,
+                            hoisted_structs: &outer_hoisted_structs,
+                            proven_in_bounds: &[],
+                            const_int_locals: &const_int_locals,
+                            pow2_mod_defs: &peeled_pow2_mod_defs,
+                        };
+                        if let Some(rc) = peeled_range_fusion.fused_checks.get(&stmt_idx) {
+                            let dst_decl = mir_fn.locals.get(rc.dst.0).ok_or_else(|| {
+                                MirCraneliftBackendError::CodegenError(format!(
+                                    "Destination local {:?} out of bounds",
+                                    rc.dst
+                                ))
+                            })?;
+                            let idx_val = load_local_i64(
+                                rc.idx_local,
+                                &mut builder,
+                                &local_vars,
+                                &stack_slots,
+                            )?;
+                            let mut len_val = lower_operand(
+                                &rc.len_op,
+                                &mut builder,
+                                &local_vars,
+                                &stack_slots,
+                                &mir_fn.locals,
+                                &self.struct_layouts,
+                                peeled_stmt_bc_ctx,
+                            )?;
+                            if builder.func.dfg.value_type(len_val) != types::I64 {
+                                len_val = cast_clif_type(&mut builder, len_val, types::I64);
+                            }
+                            let in_bounds = builder
+                                .ins()
+                                .icmp(IntCC::UnsignedLessThan, idx_val, len_val);
+                            let target_ty = mir_to_clif_type(&dst_decl.ty)?;
+                            let val = cast_clif_type(&mut builder, in_bounds, target_ty);
+                            store_local_val(rc.dst, val, &mut builder, &local_vars, &stack_slots)?;
+                            peeled_pow2_mod_defs.remove(&rc.dst.0);
+                            cur_validated.remove(&rc.dst.0);
                             continue;
                         }
                         match stmt {
@@ -5844,6 +6587,7 @@ pub mod jit_engine {
                                     } else {
                                         None
                                     };
+                                let mut pow2_mod_record: Option<(ClifValue, i64)> = None;
                                 let val = lower_rvalue(
                                     rvalue,
                                     Some(&dst_decl.ty),
@@ -5866,11 +6610,19 @@ pub mod jit_engine {
                                     rem_float_fn,
                                     string_helpers,
                                     status_fn,
-                                    peeled_bc_ctx,
+                                    peeled_stmt_bc_ctx,
+                                    Some(&mut pow2_mod_record),
                                 )?;
                                 let target_ty = mir_to_clif_type(&dst_decl.ty)?;
                                 let val = cast_clif_type(&mut builder, val, target_ty);
                                 store_local_val(*dst, val, &mut builder, &local_vars, &stack_slots)?;
+                                if let Some(entry) = pow2_mod_record
+                                    && !stack_slots.contains_key(&dst.0)
+                                {
+                                    peeled_pow2_mod_defs.insert(dst.0, entry);
+                                } else {
+                                    peeled_pow2_mod_defs.remove(&dst.0);
+                                }
                                 match rvalue {
                                     Rvalue::Aggregate(MirType::Array(_), _) => {
                                         cur_validated.insert(dst.0);
@@ -5909,7 +6661,8 @@ pub mod jit_engine {
                                     rem_float_fn,
                                     string_helpers,
                                     status_fn,
-                                    peeled_bc_ctx,
+                                    peeled_stmt_bc_ctx,
+                                    None,
                                 )?;
                                 let elem_addr = lower_place_addr(
                                     lhs_place,
@@ -5918,7 +6671,7 @@ pub mod jit_engine {
                                     &stack_slots,
                                     &mir_fn.locals,
                                     &self.struct_layouts,
-                                    peeled_bc_ctx,
+                                    peeled_stmt_bc_ctx,
                                 )?;
                                 let val_ty = builder.func.dfg.value_type(val);
                                 let val_to_store = if is_bool_array_index_place(
@@ -5961,7 +6714,8 @@ pub mod jit_engine {
                                     rem_float_fn,
                                     string_helpers,
                                     status_fn,
-                                    peeled_bc_ctx,
+                                    peeled_stmt_bc_ctx,
+                                    None,
                                 )?;
                                 let field_addr = lower_place_addr(
                                     lhs_place,
@@ -6087,12 +6841,25 @@ pub mod jit_engine {
                             }
                         }
                     }
+                    if let Some(iqi) = iq_opt {
+                        let iq_rec = &mut iq_cfg_records[iqi];
+                        for bb in builder.func.layout.blocks() {
+                            if !blocks_before.contains(&bb)
+                                && !iq_rec.reconcile_clif_blocks.contains(&bb)
+                                && !iq_rec.post_flush_clif_blocks.contains(&bb)
+                                && !iq_rec.reload_clif_blocks.contains(&bb)
+                            {
+                                iq_rec.loop_clif_blocks.insert(bb);
+                            }
+                        }
+                    }
                 }
 
                 // Lower each basic block
                 for (b_idx, mir_block) in mir_fn.blocks.iter().enumerate() {
                     let cl_opt = promo_plan.block_to_counter_loop.get(&b_idx).copied();
-                    let blocks_before: hashbrown::HashSet<Block> = if cl_opt.is_some() {
+                    let iq_opt = promo_plan.block_to_inner_quantized.get(&b_idx).copied();
+                    let blocks_before: hashbrown::HashSet<Block> = if cl_opt.is_some() || iq_opt.is_some() {
                         builder.func.layout.blocks().collect()
                     } else {
                         hashbrown::HashSet::new()
@@ -6108,15 +6875,30 @@ pub mod jit_engine {
                             active_hoisted_structs.extend(hl_states[hl_idx].hoisted_structs.iter().map(|(&k, &v)| (k, v)));
                         }
                     }
-                    let active_emergency_bb = cl_opt
-                        .map(|ci| cl_states[ci].emergency_flush_bb)
-                        .unwrap_or(emergency_exit_bb);
+                    let active_emergency_bb = if let Some(iqi) = iq_opt {
+                        iq_states[iqi].emergency_flush_bb
+                    } else if let Some(ci) = cl_opt {
+                        cl_states[ci].emergency_flush_bb
+                    } else {
+                        emergency_exit_bb
+                    };
                     let mut cur_proven_in_bounds: Vec<(LocalId, LocalId)> = mir_fn
                         .proven_in_bounds
                         .get(&b_idx)
                         .cloned()
                         .unwrap_or_default();
-                    let active_promoted = cl_opt.map(|ci| cl_states[ci].counters);
+                    if let Some(ind_pairs) = loop_bounds_analysis.proven_in_bounds.get(&b_idx) {
+                        for &pair in ind_pairs {
+                            if !cur_proven_in_bounds.contains(&pair) {
+                                cur_proven_in_bounds.push(pair);
+                            }
+                        }
+                    }
+                    let active_promoted = if let Some(iqi) = iq_opt {
+                        Some(iq_states[iqi].counters)
+                    } else {
+                        cl_opt.map(|ci| cl_states[ci].counters)
+                    };
 
                     let clif_bb = clif_blocks[b_idx];
                     builder.switch_to_block(clif_bb);
@@ -6151,14 +6933,25 @@ pub mod jit_engine {
                         let (sp_ptr_var, _, sp_slow_fn) =
                             safepoint_ctx.expect("loop header implies needs_safepoint");
                         let quantized_amt = if vec_hdr_map.get(&b_idx).is_none() {
-                            cl_opt.and_then(|ci| {
-                                let spec = &promo_plan.counter_loops[ci];
-                                if spec.hdr == b_idx {
-                                    spec.quantized_header_gas_amt
-                                } else {
-                                    None
-                                }
-                            })
+                            iq_opt
+                                .and_then(|iqi| {
+                                    let iq_spec = &promo_plan.inner_quantized_loops[iqi];
+                                    if iq_spec.hdr == b_idx {
+                                        Some(iq_spec.header_gas_amt)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .or_else(|| {
+                                    cl_opt.and_then(|ci| {
+                                        let spec = &promo_plan.counter_loops[ci];
+                                        if spec.hdr == b_idx {
+                                            spec.quantized_header_gas_amt
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
                         } else {
                             None
                         };
@@ -6181,6 +6974,7 @@ pub mod jit_engine {
                                 emergency_exit_bb,
                                 active_promoted.expect("quantized loop header implies promoted counters"),
                                 cl_opt.map(|ci| &mut cfg_records[ci]),
+                                iq_opt.map(|iqi| &mut iq_cfg_records[iqi]),
                             );
                             skip_first_header_gas_check = true;
                         } else {
@@ -6356,8 +7150,19 @@ pub mod jit_engine {
                         continue;
                     }
 
+                    let mut cur_pow2_mod_defs: hashbrown::HashMap<usize, (ClifValue, i64)> =
+                        hashbrown::HashMap::new();
+                    let block_range_fusion = mir_fn.detect_unsigned_range_checks_in_block(
+                        b_idx,
+                        &local_read_counts,
+                        &bounds_excluded_locals,
+                        &loop_bounds_analysis.non_neg_locals_in[b_idx],
+                    );
                     for (stmt_idx, stmt) in mir_block.statements.iter().enumerate() {
                         if stmt_idx == 0 && skip_first_header_gas_check {
+                            continue;
+                        }
+                        if block_range_fusion.skip_stmts.contains(&stmt_idx) {
                             continue;
                         }
                         let stmt_bc_ctx = BoundsCheckCtx {
@@ -6366,7 +7171,46 @@ pub mod jit_engine {
                             hoisted_arrays: &active_hoisted_arrays,
                             hoisted_structs: &active_hoisted_structs,
                             proven_in_bounds: &cur_proven_in_bounds,
+                            const_int_locals: &const_int_locals,
+                            pow2_mod_defs: &cur_pow2_mod_defs,
                         };
+                        if let Some(rc) = block_range_fusion.fused_checks.get(&stmt_idx) {
+                            let dst_decl = mir_fn.locals.get(rc.dst.0).ok_or_else(|| {
+                                MirCraneliftBackendError::CodegenError(format!(
+                                    "Destination local {:?} out of bounds",
+                                    rc.dst
+                                ))
+                            })?;
+                            let idx_val = load_local_i64(
+                                rc.idx_local,
+                                &mut builder,
+                                &local_vars,
+                                &stack_slots,
+                            )?;
+                            let mut len_val = lower_operand(
+                                &rc.len_op,
+                                &mut builder,
+                                &local_vars,
+                                &stack_slots,
+                                &mir_fn.locals,
+                                &self.struct_layouts,
+                                stmt_bc_ctx,
+                            )?;
+                            if builder.func.dfg.value_type(len_val) != types::I64 {
+                                len_val = cast_clif_type(&mut builder, len_val, types::I64);
+                            }
+                            let in_bounds = builder
+                                .ins()
+                                .icmp(IntCC::UnsignedLessThan, idx_val, len_val);
+                            let target_ty = mir_to_clif_type(&dst_decl.ty)?;
+                            let val = cast_clif_type(&mut builder, in_bounds, target_ty);
+                            store_local_val(rc.dst, val, &mut builder, &local_vars, &stack_slots)?;
+                            cur_pow2_mod_defs.remove(&rc.dst.0);
+                            cur_proven_in_bounds
+                                .retain(|&(arr_l, idx_l)| arr_l != rc.dst && idx_l != rc.dst);
+                            cur_validated.remove(&rc.dst.0);
+                            continue;
+                        }
                         match stmt {
                             Statement::Assign(Place::Local(dst), rvalue, _) => {
                                 let dst_decl = mir_fn.locals.get(dst.0).ok_or_else(|| {
@@ -6380,6 +7224,7 @@ pub mod jit_engine {
                                     } else {
                                         None
                                     };
+                                let mut pow2_mod_record: Option<(ClifValue, i64)> = None;
                                 let val = lower_rvalue(
                                     rvalue,
                                     Some(&dst_decl.ty),
@@ -6403,10 +7248,18 @@ pub mod jit_engine {
                                     string_helpers,
                                     status_fn,
                                     stmt_bc_ctx,
+                                    Some(&mut pow2_mod_record),
                                 )?;
                                 let target_ty = mir_to_clif_type(&dst_decl.ty)?;
                                 let val = cast_clif_type(&mut builder, val, target_ty);
                                 store_local_val(*dst, val, &mut builder, &local_vars, &stack_slots)?;
+                                if let Some(entry) = pow2_mod_record
+                                    && !stack_slots.contains_key(&dst.0)
+                                {
+                                    cur_pow2_mod_defs.insert(dst.0, entry);
+                                } else {
+                                    cur_pow2_mod_defs.remove(&dst.0);
+                                }
                                 cur_proven_in_bounds
                                     .retain(|&(arr_l, idx_l)| arr_l != *dst && idx_l != *dst);
                                 match rvalue {
@@ -6448,6 +7301,7 @@ pub mod jit_engine {
                                     string_helpers,
                                     status_fn,
                                     stmt_bc_ctx,
+                                    None,
                                 )?;
                                 let elem_addr = lower_place_addr(
                                     lhs_place,
@@ -6500,6 +7354,7 @@ pub mod jit_engine {
                                     string_helpers,
                                     status_fn,
                                     stmt_bc_ctx,
+                                    None,
                                 )?;
                                 let field_addr = lower_place_addr(
                                     lhs_place,
@@ -6541,6 +7396,8 @@ pub mod jit_engine {
                         hoisted_arrays: &active_hoisted_arrays,
                         hoisted_structs: &active_hoisted_structs,
                         proven_in_bounds: &cur_proven_in_bounds,
+                        const_int_locals: &const_int_locals,
+                        pow2_mod_defs: &empty_pow2_mod_defs,
                     };
 
                     // If this block is the pre-entry to a vectorized loop, insert runtime scalar-forced
@@ -7806,12 +8663,14 @@ pub mod jit_engine {
 
                                         // Cold grow path: flush promoted counters (if in promoted loop), call lust_mir_array_push
                                         builder.switch_to_block(cold_grow_bb);
+                                        if let Some(p_counters) = active_promoted {
+                                            emit_promoted_counters_flush(&mut builder, p_counters);
+                                        }
                                         if let Some(ci) = cl_opt {
-                                            emit_promoted_counters_flush(
-                                                &mut builder,
-                                                cl_states[ci].counters,
-                                            );
                                             cfg_records[ci].flush_clif_blocks.insert(cold_grow_bb);
+                                        }
+                                        if let Some(iqi) = iq_opt {
+                                            iq_cfg_records[iqi].reconcile_clif_blocks.insert(cold_grow_bb);
                                         }
                                         let val_i64 = if val_clif_ty == types::F64 {
                                             builder.ins().bitcast(types::I64, MemFlagsData::new(), val_raw)
@@ -7827,12 +8686,14 @@ pub mod jit_engine {
 
                                         // Cold reload & resume path
                                         builder.switch_to_block(cold_ok_bb);
+                                        if let Some(p_counters) = active_promoted {
+                                            emit_promoted_counters_load(&mut builder, p_counters);
+                                        }
                                         if let Some(ci) = cl_opt {
-                                            emit_promoted_counters_load(
-                                                &mut builder,
-                                                cl_states[ci].counters,
-                                            );
                                             cfg_records[ci].reload_clif_blocks.insert(cold_ok_bb);
+                                        }
+                                        if let Some(iqi) = iq_opt {
+                                            iq_cfg_records[iqi].reload_clif_blocks.insert(cold_ok_bb);
                                         }
                                         if let Place::Local(loc) = destination {
                                             let loc_decl = mir_fn.locals.get(loc.0).ok_or_else(|| {
@@ -8126,21 +8987,31 @@ pub mod jit_engine {
                                     } else {
                                         builder.ins().iconst(ret_clif_ty, 0)
                                     };
-                                    if let Some(ci) = cl_opt {
+                                    if let Some(p_counters) = active_promoted {
                                         let ret_flush_bb = builder.create_block();
-                                        cfg_records[ci].flush_clif_blocks.insert(ret_flush_bb);
+                                        if let Some(ci) = cl_opt {
+                                            cfg_records[ci].flush_clif_blocks.insert(ret_flush_bb);
+                                        }
+                                        if let Some(iqi) = iq_opt {
+                                            iq_cfg_records[iqi].reconcile_clif_blocks.insert(ret_flush_bb);
+                                        }
                                         builder.ins().jump(ret_flush_bb, &[]);
                                         builder.switch_to_block(ret_flush_bb);
-                                        emit_promoted_counters_flush(&mut builder, cl_states[ci].counters);
+                                        emit_promoted_counters_flush(&mut builder, p_counters);
                                     }
                                     builder.ins().return_(&[ret_val]);
                                 } else {
-                                    if let Some(ci) = cl_opt {
+                                    if let Some(p_counters) = active_promoted {
                                         let ret_flush_bb = builder.create_block();
-                                        cfg_records[ci].flush_clif_blocks.insert(ret_flush_bb);
+                                        if let Some(ci) = cl_opt {
+                                            cfg_records[ci].flush_clif_blocks.insert(ret_flush_bb);
+                                        }
+                                        if let Some(iqi) = iq_opt {
+                                            iq_cfg_records[iqi].reconcile_clif_blocks.insert(ret_flush_bb);
+                                        }
                                         builder.ins().jump(ret_flush_bb, &[]);
                                         builder.switch_to_block(ret_flush_bb);
-                                        emit_promoted_counters_flush(&mut builder, cl_states[ci].counters);
+                                        emit_promoted_counters_flush(&mut builder, p_counters);
                                     }
                                     builder.ins().return_(&[]);
                                 }
@@ -8175,6 +9046,18 @@ pub mod jit_engine {
                             }
                         }
                     }
+                    if let Some(iqi) = iq_opt {
+                        let iq_rec = &mut iq_cfg_records[iqi];
+                        for bb in builder.func.layout.blocks() {
+                            if !blocks_before.contains(&bb)
+                                && !iq_rec.reconcile_clif_blocks.contains(&bb)
+                                && !iq_rec.post_flush_clif_blocks.contains(&bb)
+                                && !iq_rec.reload_clif_blocks.contains(&bb)
+                            {
+                                iq_rec.loop_clif_blocks.insert(bb);
+                            }
+                        }
+                    }
                 }
 
                 // Emit PERF-T4-2 Barrier 3 (`loop_emergency_flush_bb`) and Barrier 4 (`exit_flush_bb`) blocks
@@ -8186,6 +9069,23 @@ pub mod jit_engine {
                     for &(dest_bb, exit_flush_bb) in &exit_flush_blocks_per_loop[cl_idx] {
                         builder.switch_to_block(exit_flush_bb);
                         emit_promoted_counters_flush(&mut builder, state.counters);
+                        builder.ins().jump(dest_bb, &[]);
+                    }
+                }
+
+                // Emit NG-W14-1 inner quantized loop emergency flush & exit reconcile/flush blocks
+                for (iq_idx, iq_state) in iq_states.iter().enumerate() {
+                    builder.switch_to_block(iq_state.emergency_flush_bb);
+                    emit_promoted_counters_flush(&mut builder, iq_state.counters);
+                    builder.ins().jump(emergency_exit_bb, &[]);
+
+                    for &(dest_bb, exit_bb, exits_outer_cl) in &iq_exit_blocks_per_loop[iq_idx] {
+                        builder.switch_to_block(exit_bb);
+                        if exits_outer_cl {
+                            emit_promoted_counters_flush(&mut builder, iq_state.counters);
+                        } else {
+                            emit_quantum_reconcile_to_regs(&mut builder, iq_state.counters);
+                        }
                         builder.ins().jump(dest_bb, &[]);
                     }
                 }
@@ -8206,8 +9106,8 @@ pub mod jit_engine {
                 }
 
                 builder.seal_all_blocks();
-                // PERF-T4-2 Barrier 5: compile-time CFG exit-completeness verification
-                verify_promoted_loop_exit_completeness(&builder.func, &cfg_records)?;
+                // PERF-T4-2 Barrier 5 + NG-W14-1: compile-time CFG exit-completeness verification
+                verify_promoted_loop_exit_completeness(&builder.func, &cfg_records, &iq_cfg_records)?;
                 builder.finalize(self.module.target_config());
             }
 
@@ -8223,6 +9123,11 @@ pub mod jit_engine {
                     eprintln!("Verifier error in define_function: {:?}", e);
                     MirCraneliftBackendError::CodegenError(format!("{e:?}"))
                 })?;
+            if self.capture_ir {
+                let opt_ir_text = self.format_captured_ir();
+                let key = ir_capture_key.unwrap_or(&mir_fn.signature.name).to_string();
+                self.captured_opt_ir.insert(key, opt_ir_text);
+            }
             let code_size = self
                 .ctx
                 .compiled_code()
@@ -9534,6 +10439,8 @@ pub mod jit_engine {
         hoisted_arrays: &'a hashbrown::HashMap<usize, HoistedArrayVars>,
         hoisted_structs: &'a hashbrown::HashMap<usize, Variable>,
         proven_in_bounds: &'a [(LocalId, LocalId)],
+        const_int_locals: &'a hashbrown::HashMap<usize, i64>,
+        pow2_mod_defs: &'a hashbrown::HashMap<usize, (ClifValue, i64)>,
     }
 
     fn is_bool_array_index_place(
@@ -9696,12 +10603,19 @@ pub mod jit_engine {
                 let data_ptr = if matches!(base_ty, MirType::Array(_) | MirType::Tuple(_)) {
                     let is_null = builder.ins().icmp_imm_s(IntCC::Equal, base_ptr, 0);
                     emit_oob_branch_if_bad(is_null, builder, bc_ctx);
-                    let len_off = core::mem::offset_of!(MirArrayHeader, len) as i32;
-                    let arr_len = builder.ins().load(types::I64, MemFlagsData::trusted(), base_ptr, len_off);
-                    let idx_neg = builder.ins().icmp_imm_s(IntCC::SignedLessThan, idx_val, 0);
-                    let idx_ge = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx_val, arr_len);
-                    let is_oob = builder.ins().bor(idx_neg, idx_ge);
-                    emit_oob_branch_if_bad(is_oob, builder, bc_ctx);
+                    let is_proven_in_bounds = matches!(
+                        base.as_ref(),
+                        Place::Local(arr_loc)
+                            if bc_ctx.proven_in_bounds.contains(&(*arr_loc, *idx))
+                    );
+                    if !is_proven_in_bounds {
+                        let len_off = core::mem::offset_of!(MirArrayHeader, len) as i32;
+                        let arr_len = builder.ins().load(types::I64, MemFlagsData::trusted(), base_ptr, len_off);
+                        let idx_neg = builder.ins().icmp_imm_s(IntCC::SignedLessThan, idx_val, 0);
+                        let idx_ge = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx_val, arr_len);
+                        let is_oob = builder.ins().bor(idx_neg, idx_ge);
+                        emit_oob_branch_if_bad(is_oob, builder, bc_ctx);
+                    }
 
                     if matches!(base_ty, MirType::Array(_)) {
                         let cap_off = core::mem::offset_of!(MirArrayHeader, cap) as i32;
@@ -9935,10 +10849,11 @@ pub mod jit_engine {
         rhs_operand: &Operand,
         builder: &mut FunctionBuilder,
         bc_ctx: BoundsCheckCtx<'_>,
+        pow2_mod_out: Option<&mut Option<(ClifValue, i64)>>,
     ) -> ClifValue {
         let emergency_exit_bb = bc_ctx.emergency_exit_bb;
-        if let Operand::Constant(MirConstant::Int(c)) = rhs_operand {
-            if *c == 0 {
+        if let Some(c) = resolve_const_int_operand(rhs_operand, bc_ctx.const_int_locals) {
+            if c == 0 {
                 let code = builder.ins().iconst(types::I64, MIR_STATUS_ERR_DIV_BY_ZERO);
                 builder.ins().call(bc_ctx.status_set_fn, &[code]);
                 builder.ins().jump(emergency_exit_bb, &[]);
@@ -9947,17 +10862,77 @@ pub mod jit_engine {
                 builder.seal_block(dead_bb);
                 return builder.ins().iconst(types::I64, 0);
             }
-            if *c == -1 {
+            if c == 1 {
+                return if is_div {
+                    l
+                } else {
+                    builder.ins().iconst(types::I64, 0)
+                };
+            }
+            if c == -1 {
                 return if is_div {
                     builder.ins().ineg(l)
                 } else {
                     builder.ins().iconst(types::I64, 0)
                 };
             }
+            if c == i64::MIN {
+                // Truncated-toward-zero semantics for divisor i64::MIN (-2^63):
+                //   l / i64::MIN == 1 iff l == i64::MIN else 0
+                //   l % i64::MIN == 0 iff l == i64::MIN else l
+                //   l % i64::MIN == 0 iff (l & i64::MAX) == 0
+                let is_min = builder.ins().icmp_imm_s(IntCC::Equal, l, i64::MIN);
+                if is_div {
+                    return builder.ins().uextend(types::I64, is_min);
+                } else {
+                    if let Some(slot) = pow2_mod_out {
+                        *slot = Some((l, i64::MAX));
+                    }
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    return builder.ins().select(is_min, zero, l);
+                }
+            }
+
+            let abs_c = c.unsigned_abs();
+            if abs_c.is_power_of_two() {
+                // NG-W14-5: Exact branchless signed power-of-two truncated-toward-zero
+                // division / remainder for c = ±2^k (1 <= k <= 62).
+                let k = abs_c.trailing_zeros() as i64;
+                let bias = if k == 1 {
+                    // For ±2: bias = 1 if l < 0 else 0 (single logical right shift).
+                    builder.ins().ushr_imm_s(l, 63)
+                } else {
+                    // For ±2^k (2 <= k <= 62): bias = (2^k - 1) if l < 0 else 0.
+                    let sign = builder.ins().sshr_imm_s(l, k - 1);
+                    builder.ins().ushr_imm_s(sign, 64 - k)
+                };
+                let biased = builder.ins().iadd(l, bias);
+                if is_div {
+                    let q = builder.ins().sshr_imm_s(biased, k);
+                    return if c < 0 { builder.ins().ineg(q) } else { q };
+                } else {
+                    if let Some(slot) = pow2_mod_out {
+                        *slot = Some((l, (abs_c - 1) as i64));
+                    }
+                    // Truncated quotient * 2^k = biased & -(2^k); remainder = l - (q * 2^k).
+                    // Identical for +2^k and -2^k because l % (-d) == l % d.
+                    let mask = builder.ins().iconst(types::I64, abs_c.wrapping_neg() as i64);
+                    let trunc_mul = builder.ins().band(biased, mask);
+                    return builder.ins().isub(l, trunc_mul);
+                }
+            }
+
+            // General non-zero, non-power-of-two constant `c` (e.g. 3, -3, 7, -7):
+            // Both `rhs == 0` and `(lhs == i64::MIN && rhs == -1)` runtime trap guards are
+            // completely elided. Materialize `iconst c` directly so Cranelift's egraph
+            // (`simplify_skeleton` -> `apply_div_const_magic_s64`) unconditionally lowers
+            // `sdiv`/`srem` to Hacker's Delight magic-multiplier `smulhi` + shifts even
+            // when `rhs_operand` originated from a cross-block constant local.
+            let c_val = builder.ins().iconst(types::I64, c);
             return if is_div {
-                builder.ins().sdiv(l, r)
+                builder.ins().sdiv(l, c_val)
             } else {
-                builder.ins().srem(l, r)
+                builder.ins().srem(l, c_val)
             };
         }
 
@@ -10777,6 +11752,7 @@ pub mod jit_engine {
         string_helpers: StringHelperFns,
         status_fn: FuncRef,
         bc_ctx: BoundsCheckCtx<'_>,
+        pow2_mod_out: Option<&mut Option<(ClifValue, i64)>>,
     ) -> Result<ClifValue, MirCraneliftBackendError> {
         let emergency_exit_bb = bc_ctx.emergency_exit_bb;
         match rval {
@@ -10922,10 +11898,10 @@ pub mod jit_engine {
                     MirBinaryOp::Sub => builder.ins().isub(l, r),
                     MirBinaryOp::Mul => builder.ins().imul(l, r),
                     MirBinaryOp::Div => {
-                        emit_inline_int_div_or_rem(true, l, r, rhs, builder, bc_ctx)
+                        emit_inline_int_div_or_rem(true, l, r, rhs, builder, bc_ctx, None)
                     }
                     MirBinaryOp::Mod => {
-                        emit_inline_int_div_or_rem(false, l, r, rhs, builder, bc_ctx)
+                        emit_inline_int_div_or_rem(false, l, r, rhs, builder, bc_ctx, pow2_mod_out)
                     }
                     MirBinaryOp::FloorDiv => {
                         let call = builder.ins().call(floordiv_fn, &[l, r]);
@@ -10952,8 +11928,39 @@ pub mod jit_engine {
                         let sh = builder.ins().band(r, mask);
                         builder.ins().sshr(l, sh)
                     }
-                    MirBinaryOp::Eq => builder.ins().icmp(IntCC::Equal, l, r),
-                    MirBinaryOp::NotEq => builder.ins().icmp(IntCC::NotEqual, l, r),
+                    MirBinaryOp::Eq | MirBinaryOp::NotEq => {
+                        let cc = if matches!(binop, MirBinaryOp::Eq) {
+                            IntCC::Equal
+                        } else {
+                            IntCC::NotEqual
+                        };
+                        // NG-W14-5 peephole: `(v % ±2^k) == 0` / `!= 0` (and `v % i64::MIN == 0`)
+                        // holds iff `(v & mask) == 0` / `!= 0` across all signed 64-bit integers.
+                        let pow2_zero_check = if resolve_const_int_operand(rhs, bc_ctx.const_int_locals) == Some(0) {
+                            match lhs {
+                                Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
+                                    bc_ctx.pow2_mod_defs.get(&loc.0).copied()
+                                }
+                                _ => None,
+                            }
+                        } else if resolve_const_int_operand(lhs, bc_ctx.const_int_locals) == Some(0) {
+                            match rhs {
+                                Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
+                                    bc_ctx.pow2_mod_defs.get(&loc.0).copied()
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some((orig_lhs_val, mask)) = pow2_zero_check {
+                            let mask_val = builder.ins().iconst(types::I64, mask);
+                            let masked = builder.ins().band(orig_lhs_val, mask_val);
+                            builder.ins().icmp_imm_s(cc, masked, 0)
+                        } else {
+                            builder.ins().icmp(cc, l, r)
+                        }
+                    }
                     MirBinaryOp::Lt => builder.ins().icmp(IntCC::SignedLessThan, l, r),
                     MirBinaryOp::LtEq => builder.ins().icmp(IntCC::SignedLessThanOrEqual, l, r),
                     MirBinaryOp::Gt => builder.ins().icmp(IntCC::SignedGreaterThan, l, r),

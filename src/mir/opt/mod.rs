@@ -45,6 +45,10 @@ fn fold_return_constants(func: &mut MirFunction) -> bool {
 }
 
 impl MirOptimizer {
+    pub fn merge_linear_blocks(func: &mut MirFunction) -> bool {
+        MirInliner::merge_linear_blocks(func)
+    }
+
     pub fn optimize_function(func: &mut MirFunction) {
         let max_passes = 10;
         for _ in 0..max_passes {
@@ -52,6 +56,7 @@ impl MirOptimizer {
             changed |= ConstantFolding::run_on_function(func);
             changed |= DeadCodeElimination::run_on_function(func);
             changed |= SimdOptimizer::run_on_function(func);
+            changed |= MirInliner::merge_linear_blocks(func);
             for (i, block) in func.blocks.iter_mut().enumerate() {
                 block.id = BlockId(i);
             }
@@ -150,6 +155,7 @@ impl MirOptimizer {
                 continue;
             }
             if modified.contains(&func.signature.name) {
+                MirInliner::merge_linear_blocks(func);
                 Self::optimize_function(func);
                 if crate::mir::verifier::MirVerifier::verify_fn(func).is_err() {
                     if let Some(orig) = pre_inline_snapshots.get(&func.signature.name) {

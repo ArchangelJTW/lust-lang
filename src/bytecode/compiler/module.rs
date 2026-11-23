@@ -352,13 +352,15 @@ impl Compiler {
                 }
             }
 
+            let mir_struct_layouts = self.build_struct_layouts_for_mir();
             for (f_idx, mir_fn) in pending_mir {
                 if !valid_mir_names.contains(&mir_fn.signature.name) {
                     continue;
                 }
-                match crate::mir::MirToBytecodeCompiler::compile_with_direct_callee_indices(
+                match crate::mir::MirToBytecodeCompiler::compile_with_field_slots_and_callee_indices(
                     &mir_fn,
                     &self.function_table,
+                    &mir_struct_layouts,
                 ) {
                     Ok(mut bytecode_fn) => {
                         bytecode_fn.is_method = self.functions[f_idx].is_method;
@@ -473,6 +475,43 @@ impl Compiler {
                 name
             )))
         }
+    }
+
+    fn build_struct_layouts_for_mir(
+        &self,
+    ) -> HashMap<String, alloc::rc::Rc<crate::bytecode::StructLayout>> {
+        let mut layouts = HashMap::with_capacity(self.struct_defs.len());
+        for (name, def) in &self.struct_defs {
+            let field_names: Vec<alloc::rc::Rc<String>> = def
+                .fields
+                .iter()
+                .map(|field| alloc::rc::Rc::new(field.name.clone()))
+                .collect();
+            let field_storage: Vec<crate::bytecode::FieldStorage> = def
+                .fields
+                .iter()
+                .map(|field| match field.ownership {
+                    crate::ast::FieldOwnership::Weak => crate::bytecode::FieldStorage::Weak,
+                    crate::ast::FieldOwnership::Strong => crate::bytecode::FieldStorage::Strong,
+                })
+                .collect();
+            let field_types: Vec<crate::ast::Type> =
+                def.fields.iter().map(|field| field.ty.clone()).collect();
+            let weak_targets: Vec<Option<crate::ast::Type>> = def
+                .fields
+                .iter()
+                .map(|field| field.weak_target.clone())
+                .collect();
+            let layout = alloc::rc::Rc::new(crate::bytecode::StructLayout::new(
+                def.name.clone(),
+                field_names,
+                field_storage,
+                field_types,
+                weak_targets,
+            ));
+            layouts.insert(name.clone(), layout);
+        }
+        layouts
     }
 
     fn collect_struct_defs_for_mir(&self) -> Vec<crate::ast::StructDef> {

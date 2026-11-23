@@ -88,34 +88,121 @@ impl Compiler {
         }
     }
 
+    pub(super) fn const_int_literal(expr: &Expr) -> Option<LustInt> {
+        match &expr.kind {
+            ExprKind::Literal(Literal::Integer(value)) => Some(*value),
+            ExprKind::Paren(inner) => Self::const_int_literal(inner),
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => Self::const_int_literal(operand).and_then(|value| value.checked_neg()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn try_int_add_imm<'a>(
+        op: BinaryOp,
+        left: &'a Expr,
+        right: &'a Expr,
+    ) -> Option<(&'a Expr, i8)> {
+        match op {
+            BinaryOp::Add => {
+                if let Some(v) = Self::const_int_literal(right)
+                    && let Ok(imm) = i8::try_from(v)
+                {
+                    return Some((left, imm));
+                }
+                if let Some(v) = Self::const_int_literal(left)
+                    && let Ok(imm) = i8::try_from(v)
+                {
+                    return Some((right, imm));
+                }
+                None
+            }
+            BinaryOp::Sub => Self::const_int_literal(right)
+                .and_then(|v| v.checked_neg())
+                .and_then(|neg| i8::try_from(neg).ok())
+                .map(|imm| (left, imm)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn has_hoisted_consts_in_scope(&self) -> bool {
+        for scope in self.scopes.iter().rev() {
+            if scope.locals.contains_key("(hoist_active)") {
+                return true;
+            }
+            if scope.is_thunk_boundary {
+                break;
+            }
+        }
+        false
+    }
+
+    pub(super) fn hoisted_int_key(value: LustInt) -> String {
+        format!("(hoist_i:{value})")
+    }
+
+    pub(super) fn hoisted_float_key(bits: crate::number::FloatBits) -> String {
+        format!("(hoist_f:{bits:x})")
+    }
+
+    pub(super) fn lookup_hoisted_int_const(&self, value: LustInt) -> Option<Register> {
+        if !self.has_hoisted_consts_in_scope() {
+            return None;
+        }
+        let key = Self::hoisted_int_key(value);
+        self.resolve_local(&key).ok()
+    }
+
+    pub(super) fn lookup_hoisted_float_const(
+        &self,
+        value: crate::number::LustFloat,
+    ) -> Option<Register> {
+        if !self.has_hoisted_consts_in_scope() {
+            return None;
+        }
+        let key = Self::hoisted_float_key(value.to_bits());
+        self.resolve_local(&key).ok()
+    }
+
     pub(super) fn compile_expr(&mut self, expr: &Expr) -> Result<Register> {
         self.current_line = expr.span.start_line;
         match &expr.kind {
-            ExprKind::Literal(lit) => {
-                let reg = self.allocate_register();
-                match lit {
-                    Literal::Integer(i) => {
-                        let const_idx = self.add_int_const(*i);
-                        self.emit(Instruction::LoadConst(reg, const_idx), 0);
+            ExprKind::Literal(lit) => match lit {
+                Literal::Integer(i) => {
+                    if let Some(hoisted_reg) = self.lookup_hoisted_int_const(*i) {
+                        return Ok(hoisted_reg);
                     }
-
-                    Literal::Float(f) => {
-                        let const_idx = self.add_constant(Value::Float(*f));
-                        self.emit(Instruction::LoadConst(reg, const_idx), 0);
-                    }
-
-                    Literal::String(s) => {
-                        let const_idx = self.add_constant(Value::string(s.clone()));
-                        self.emit(Instruction::LoadConst(reg, const_idx), 0);
-                    }
-
-                    Literal::Bool(b) => {
-                        self.emit(Instruction::LoadBool(reg, *b), 0);
-                    }
+                    let reg = self.allocate_register();
+                    let const_idx = self.add_int_const(*i);
+                    self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                    Ok(reg)
                 }
 
-                Ok(reg)
-            }
+                Literal::Float(f) => {
+                    if let Some(hoisted_reg) = self.lookup_hoisted_float_const(*f) {
+                        return Ok(hoisted_reg);
+                    }
+                    let reg = self.allocate_register();
+                    let const_idx = self.add_constant(Value::Float(*f));
+                    self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                    Ok(reg)
+                }
+
+                Literal::String(s) => {
+                    let reg = self.allocate_register();
+                    let const_idx = self.add_constant(Value::string(s.clone()));
+                    self.emit(Instruction::LoadConst(reg, const_idx), 0);
+                    Ok(reg)
+                }
+
+                Literal::Bool(b) => {
+                    let reg = self.allocate_register();
+                    self.emit(Instruction::LoadBool(reg, *b), 0);
+                    Ok(reg)
+                }
+            },
 
             ExprKind::RegexLiteral { pattern, .. } => {
                 let reg = self.allocate_register();
@@ -216,6 +303,18 @@ impl Compiler {
                 BinaryOp::And => self.compile_and_expr(expr.span, left, right),
                 BinaryOp::Or => self.compile_or_expr(left, right),
                 _ => {
+                    if !self.loop_contexts.is_empty()
+                        && self.numeric_type(left.span) == Some(NumericType::Int)
+                        && self.numeric_type(right.span) == Some(NumericType::Int)
+                        && let Some((operand_expr, imm)) = Self::try_int_add_imm(*op, left, right)
+                    {
+                        let operand_reg = self.compile_expr(operand_expr)?;
+                        let result_reg = self.allocate_register();
+                        self.emit(Instruction::AddIntImm(result_reg, operand_reg, imm), 0);
+                        self.free_register(operand_reg);
+                        return Ok(result_reg);
+                    }
+
                     let left_reg = self.compile_expr(left)?;
                     let saved_freereg = self.next_register;
                     let right_reg = self.compile_expr(right)?;
@@ -1020,7 +1119,7 @@ impl Compiler {
         // the exact value that was tested. Recompiling it here used to evaluate
         // side-effecting expressions such as `next() is Some(x)` twice.
         let mut left_scrutinee = None;
-        let left_reg = if !left_bindings.is_empty() {
+        let mut left_reg = if !left_bindings.is_empty() {
             if let Some((expr, pattern)) = Self::direct_is_pattern(left) {
                 let scrutinee_reg = self.compile_expr(expr)?;
                 let result_reg = self.compile_is_pattern(scrutinee_reg, pattern)?;
@@ -1032,6 +1131,11 @@ impl Compiler {
         } else {
             self.compile_expr(left)?
         };
+        if i32::from(left_reg) <= self.max_local_register_index() {
+            let tmp = self.allocate_register();
+            self.emit(Instruction::Move(tmp, left_reg), 0);
+            left_reg = tmp;
+        }
         let skip_right = self.emit(Instruction::JumpIfNot(left_reg, 0), 0);
         let wrap_option = self.should_wrap_option(span);
         let option_indices = if wrap_option {
@@ -1125,7 +1229,12 @@ impl Compiler {
     }
 
     fn compile_or_expr(&mut self, left: &Expr, right: &Expr) -> Result<Register> {
-        let left_reg = self.compile_expr(left)?;
+        let mut left_reg = self.compile_expr(left)?;
+        if i32::from(left_reg) <= self.max_local_register_index() {
+            let tmp = self.allocate_register();
+            self.emit(Instruction::Move(tmp, left_reg), 0);
+            left_reg = tmp;
+        }
         let skip_right = self.emit(Instruction::JumpIf(left_reg, 0), 0);
 
         let saved_next = self.next_register;

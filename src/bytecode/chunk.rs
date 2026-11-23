@@ -56,6 +56,8 @@ pub struct Chunk {
     /// Each basic-block leader holds the sum of `inst.gas_weight()` across the
     /// block; interior instructions hold `0`.
     pub bb_gas_weights: Vec<u16>,
+    /// Exclusive end of the gas block containing each PC.
+    pub(crate) bb_gas_ends: Vec<usize>,
 }
 
 impl Chunk {
@@ -69,10 +71,13 @@ impl Chunk {
             lines: Vec::new(),
             ic_slots: RefCell::new(Vec::new()),
             bb_gas_weights: Vec::new(),
+            bb_gas_ends: Vec::new(),
         }
     }
 
     pub fn emit(&mut self, instruction: Instruction, line: usize) -> usize {
+        self.bb_gas_weights.clear();
+        self.bb_gas_ends.clear();
         let idx = self.instructions.len();
         self.instructions.push(instruction);
         if self.packed_code.len() == idx {
@@ -94,6 +99,8 @@ impl Chunk {
 
     /// Replaces the instruction at `idx` and synchronously updates `packed_code[idx]`.
     pub fn set_instruction(&mut self, idx: usize, instruction: Instruction) {
+        self.bb_gas_weights.clear();
+        self.bb_gas_ends.clear();
         self.instructions[idx] = instruction;
         if self.packed_code.len() == self.instructions.len() {
             if let Some(packed) =
@@ -109,6 +116,8 @@ impl Chunk {
 
     /// Pops the last instruction (and matching line / packed entry when synchronized).
     pub fn pop_instruction(&mut self) -> Option<Instruction> {
+        self.bb_gas_weights.clear();
+        self.bb_gas_ends.clear();
         let was_synced = self.packed_code.len() == self.instructions.len();
         let popped = self.instructions.pop()?;
         if was_synced {
@@ -134,6 +143,8 @@ impl Chunk {
     }
 
     pub fn patch_jump(&mut self, jump_idx: usize, target_idx: usize) {
+        self.bb_gas_weights.clear();
+        self.bb_gas_ends.clear();
         let offset = (target_idx as isize - jump_idx as isize - 1) as i16;
         match &mut self.instructions[jump_idx] {
             Instruction::Jump(off) => {
@@ -228,6 +239,7 @@ impl Chunk {
         let n = self.instructions.len();
         if n == 0 {
             self.bb_gas_weights.clear();
+            self.bb_gas_ends.clear();
             return;
         }
 
@@ -260,24 +272,22 @@ impl Chunk {
 
         self.bb_gas_weights.clear();
         self.bb_gas_weights.resize(n, 0);
+        self.bb_gas_ends.resize(n, 0);
 
-        let mut leader_pc = 0usize;
-        let mut acc: u32 = 0;
-        for pc in 0..n {
-            let w = u32::from(self.instructions[pc].gas_weight());
-            if pc > 0 && is_leader[pc] {
+        let mut leader_pc = 0;
+        let mut acc = 0u32;
+        for (pc, (inst, leader)) in self.instructions.iter().zip(is_leader).enumerate() {
+            let w = u32::from(inst.gas_weight());
+            if pc > 0 && (leader || acc + w > u32::from(u16::MAX)) {
                 self.bb_gas_weights[leader_pc] = acc as u16;
+                self.bb_gas_ends[leader_pc..pc].fill(pc);
                 leader_pc = pc;
-                acc = w;
-            } else if acc + w > u32::from(u16::MAX) {
-                self.bb_gas_weights[leader_pc] = acc as u16;
-                leader_pc = pc;
-                acc = w;
-            } else {
-                acc += w;
+                acc = 0;
             }
+            acc += w;
         }
         self.bb_gas_weights[leader_pc] = acc as u16;
+        self.bb_gas_ends[leader_pc..].fill(n);
     }
 
     pub fn disassemble(&self, name: &str) -> String {

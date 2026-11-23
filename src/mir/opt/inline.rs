@@ -399,9 +399,52 @@ impl MirInliner {
         changed
     }
 
-    /// Performs the splicing of `callee` into `caller` at `call_block_idx`.
+    /// Evaluates if `callee` has a straight-line control flow (no branches, loops, or cleanups).
+    pub fn is_straight_line(callee: &MirFunction) -> bool {
+        if callee.blocks.is_empty() || callee.entry.0 >= callee.blocks.len() {
+            return false;
+        }
+        if !crate::mir::opt::Safepoints::find_loop_headers(&callee.blocks).is_empty() {
+            return false;
+        }
+        if !callee.cleanup_blocks.is_empty() || callee.blocks.iter().any(|b| b.is_cleanup) {
+            return false;
+        }
+        let mut in_degrees = alloc::vec![0usize; callee.blocks.len()];
+        in_degrees[callee.entry.0] = 1;
+
+        let mut return_count = 0;
+        for (idx, block) in callee.blocks.iter().enumerate() {
+            match &block.terminator {
+                Some(Terminator::Goto(target, _)) => {
+                    if target.0 >= callee.blocks.len() || target.0 == idx {
+                        return false;
+                    }
+                    in_degrees[target.0] += 1;
+                }
+                Some(Terminator::Return(..)) => {
+                    return_count += 1;
+                }
+                _ => return false,
+            }
+        }
+
+        if return_count != 1 {
+            return false;
+        }
+
+        for &in_deg in &in_degrees {
+            if in_deg != 1 {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Performs the splicing of `callee` into `caller` at `call_block_idx` without merging basic blocks.
     /// Returns the number of newly added basic blocks.
-    fn perform_inline(
+    pub fn inline_call_site_unmerged(
         &self,
         caller: &mut MirFunction,
         call_block_idx: usize,
@@ -424,68 +467,6 @@ impl MirInliner {
             local_map.insert(decl.id, new_local_id);
         }
 
-        // Special case: Single-block callee can be inlined directly into the call block
-        if callee.blocks.len() == 1 {
-            let c_block = &callee.blocks[0];
-
-            // Assign parameters directly in call block
-            for (i, p_id) in callee.params.iter().enumerate() {
-                let mapped_param = local_map[p_id];
-                let arg_op = call_args[i].clone();
-
-                caller.blocks[call_block_idx]
-                    .statements
-                    .push(Statement::StorageLive(mapped_param, call_span));
-                caller.blocks[call_block_idx]
-                    .statements
-                    .push(Statement::Assign(
-                        Place::Local(mapped_param),
-                        Rvalue::Use(arg_op),
-                        call_span,
-                    ));
-            }
-
-            // Append callee statements directly to call block
-            for stmt in &c_block.statements {
-                caller.blocks[call_block_idx]
-                    .statements
-                    .push(remap_statement(stmt, &local_map));
-            }
-
-            // Handle terminator directly
-            match &c_block.terminator {
-                Some(Terminator::Return(opt_ret, s)) => {
-                    if let Some(ret_op) = opt_ret {
-                        caller.blocks[call_block_idx].statements.push(Statement::Assign(
-                            destination,
-                            Rvalue::Use(remap_operand(ret_op, &local_map)),
-                            *s,
-                        ));
-                    }
-                    caller.blocks[call_block_idx].terminator = Some(Terminator::Goto(succ_bb, *s));
-                }
-                Some(Terminator::Raise(err_op, s)) => {
-                    if let Some(err_target) = err_bb {
-                        caller.blocks[call_block_idx].terminator =
-                            Some(Terminator::Goto(err_target, *s));
-                    } else {
-                        caller.blocks[call_block_idx].terminator =
-                            Some(Terminator::Raise(remap_operand(err_op, &local_map), *s));
-                    }
-                }
-                Some(Terminator::Unreachable(s)) => {
-                    caller.blocks[call_block_idx].terminator = Some(Terminator::Unreachable(*s));
-                }
-                _ => {
-                    caller.blocks[call_block_idx].terminator =
-                        Some(Terminator::Goto(succ_bb, call_span));
-                }
-            }
-
-            return 0;
-        }
-
-        // General multi-block inlining
         // 2. Prepend parameter assignments to caller's call block before the jump
         for (i, p_id) in callee.params.iter().enumerate() {
             let mapped_param = local_map[p_id];
@@ -597,54 +578,296 @@ impl MirInliner {
             caller.blocks[target_bb_id.0].terminator = term;
         }
 
+        // Remap callee proven_in_bounds if present
+        for (c_bb, pairs) in &callee.proven_in_bounds {
+            if let Some(mapped_bb) = block_map.get(&BlockId(*c_bb)) {
+                let mapped_pairs: Vec<(LocalId, LocalId)> = pairs
+                    .iter()
+                    .map(|(a, b)| (*local_map.get(a).unwrap_or(a), *local_map.get(b).unwrap_or(b)))
+                    .collect();
+                caller
+                    .proven_in_bounds
+                    .entry(mapped_bb.0)
+                    .or_default()
+                    .extend(mapped_pairs);
+            }
+        }
+
         callee.blocks.len()
+    }
+
+    /// Performs inlining of `callee` into `caller` at `call_block_idx`.
+    /// When `callee` is a single-block or straight-line callee, merges trivial unconditional
+    /// `Goto` chains (`pre_call_bb -> cloned_entry_bb -> continuation_bb`) when predecessor
+    /// and successor counts are 1, strictly preserving `proven_in_bounds` and deopt/cleanup metadata.
+    pub fn inline_call_site(
+        &self,
+        caller: &mut MirFunction,
+        call_block_idx: usize,
+        callee: &MirFunction,
+        call_args: &[Operand],
+        destination: Place,
+        succ_bb: BlockId,
+        err_bb: Option<BlockId>,
+        call_span: Span,
+    ) -> usize {
+        let is_straight = Self::is_straight_line(callee);
+        let added = self.inline_call_site_unmerged(
+            caller,
+            call_block_idx,
+            callee,
+            call_args,
+            destination,
+            succ_bb,
+            err_bb,
+            call_span,
+        );
+
+        if is_straight {
+            Self::merge_linear_blocks(caller);
+        }
+
+        added
+    }
+
+    /// Backwards-compatible alias for `inline_call_site`.
+    pub fn perform_inline(
+        &self,
+        caller: &mut MirFunction,
+        call_block_idx: usize,
+        callee: &MirFunction,
+        call_args: &[Operand],
+        destination: Place,
+        succ_bb: BlockId,
+        err_bb: Option<BlockId>,
+        call_span: Span,
+    ) -> usize {
+        self.inline_call_site(
+            caller,
+            call_block_idx,
+            callee,
+            call_args,
+            destination,
+            succ_bb,
+            err_bb,
+            call_span,
+        )
+    }
+
+    /// Simplifies the CFG by merging trivial unconditional `Goto` chains (`A -> B`)
+    /// when `A` unconditionally jumps to `B` and `B` has in-degree 1.
+    ///
+    /// Guardrails:
+    /// - Never merges across exception / error handler boundaries.
+    /// - Never merges across cleanup boundaries (`from.is_cleanup != to.is_cleanup` or `to` in `cleanup_blocks`).
+    /// - Never merges across deopt-point headers or loop headers (`find_loop_headers` or `to == entry`).
+    /// - Preserves and remaps `func.proven_in_bounds` and `func.cleanup_blocks`.
+    pub fn merge_linear_blocks(func: &mut MirFunction) -> bool {
+        let mut overall_changed = false;
+        loop {
+            let mut in_degrees = alloc::vec![0usize; func.blocks.len()];
+            if func.entry.0 < in_degrees.len() {
+                in_degrees[func.entry.0] = 1;
+            }
+            for block in &func.blocks {
+                if let Some(term) = &block.terminator {
+                    for succ in terminator_successors(term) {
+                        if succ.0 < in_degrees.len() {
+                            in_degrees[succ.0] += 1;
+                        }
+                    }
+                }
+            }
+
+            let loop_headers: hashbrown::HashSet<BlockId> =
+                crate::mir::opt::Safepoints::find_loop_headers(&func.blocks)
+                    .into_iter()
+                    .collect();
+
+            let mut error_targets: hashbrown::HashSet<BlockId> = hashbrown::HashSet::new();
+            for block in &func.blocks {
+                if let Some(Terminator::Call { error: Some(err_bb), .. }) = &block.terminator {
+                    error_targets.insert(*err_bb);
+                }
+            }
+
+            let mut cleanup_entry_blocks: hashbrown::HashSet<BlockId> = hashbrown::HashSet::new();
+            for entry in &func.cleanup_blocks {
+                cleanup_entry_blocks.insert(entry.block);
+            }
+
+            let mut changed = false;
+            for i in 0..func.blocks.len() {
+                if let Some(Terminator::Goto(target_id, _)) = func.blocks[i].terminator {
+                    if target_id.0 != i
+                        && target_id.0 < func.blocks.len()
+                        && in_degrees[target_id.0] == 1
+                        && target_id != func.entry
+                        && !loop_headers.contains(&target_id)
+                        && !error_targets.contains(&target_id)
+                        && !cleanup_entry_blocks.contains(&target_id)
+                        && func.blocks[i].is_cleanup == func.blocks[target_id.0].is_cleanup
+                        && func.blocks[target_id.0].terminator.is_some()
+                    {
+                        let target_stmts = core::mem::take(&mut func.blocks[target_id.0].statements);
+                        let target_term = func.blocks[target_id.0].terminator.take();
+
+                        func.blocks[i].statements.extend(target_stmts);
+                        func.blocks[i].terminator = target_term;
+
+                        func.blocks[target_id.0].terminator =
+                            Some(Terminator::Unreachable(Span::dummy()));
+
+                        // Preserve proven_in_bounds:
+                        if let Some(target_pairs) = func.proven_in_bounds.remove(&target_id.0) {
+                            let i_pairs = func.proven_in_bounds.entry(i).or_default();
+                            for pair in target_pairs {
+                                if !i_pairs.contains(&pair) {
+                                    i_pairs.push(pair);
+                                }
+                            }
+                        }
+
+                        changed = true;
+                    }
+                }
+            }
+
+            if changed {
+                overall_changed = true;
+                compact_and_renumber_blocks(func);
+            } else {
+                break;
+            }
+        }
+
+        overall_changed
     }
 
     /// Simplifies the CFG by fusing linear Goto chains where the target has in-degree 1.
     pub fn simplify_cfg(func: &mut MirFunction) -> bool {
-        let mut in_degrees = vec![0usize; func.blocks.len()];
-        in_degrees[func.entry.0] = 1;
-        for block in &func.blocks {
+        Self::merge_linear_blocks(func)
+    }
+}
+
+fn compact_and_renumber_blocks(func: &mut MirFunction) {
+    let mut reachable = hashbrown::HashSet::new();
+    let mut worklist = alloc::vec::Vec::new();
+
+    reachable.insert(func.entry);
+    worklist.push(func.entry);
+
+    for entry in &func.cleanup_blocks {
+        if entry.block.0 < func.blocks.len() && reachable.insert(entry.block) {
+            worklist.push(entry.block);
+        }
+    }
+    for (idx, b) in func.blocks.iter().enumerate() {
+        if b.is_cleanup && reachable.insert(BlockId(idx)) {
+            worklist.push(BlockId(idx));
+        }
+    }
+
+    while let Some(bb) = worklist.pop() {
+        if let Some(block) = func.blocks.get(bb.0) {
             if let Some(term) = &block.terminator {
                 for succ in terminator_successors(term) {
-                    if succ.0 < in_degrees.len() {
-                        in_degrees[succ.0] += 1;
+                    if succ.0 < func.blocks.len() && reachable.insert(succ) {
+                        worklist.push(succ);
                     }
                 }
             }
         }
+    }
 
-        let mut changed = false;
-        for i in 0..func.blocks.len() {
-            if let Some(Terminator::Goto(target, _)) = func.blocks[i].terminator {
-                if target.0 != i
-                    && target.0 < func.blocks.len()
-                    && in_degrees[target.0] == 1
-                    && target != func.entry
-                {
-                    let target_stmts = func.blocks[target.0].statements.clone();
-                    let target_term = func.blocks[target.0].terminator.clone();
+    if reachable.len() == func.blocks.len() {
+        for (i, b) in func.blocks.iter_mut().enumerate() {
+            b.id = BlockId(i);
+        }
+        return;
+    }
 
-                    func.blocks[i].statements.extend(target_stmts);
-                    func.blocks[i].terminator = target_term;
+    let mut remap = hashbrown::HashMap::new();
+    let mut new_blocks = alloc::vec::Vec::with_capacity(reachable.len());
 
-                    func.blocks[target.0].statements.clear();
-                    func.blocks[target.0].terminator =
-                        Some(Terminator::Unreachable(Span::dummy()));
+    for (old_idx, block) in func.blocks.iter().enumerate() {
+        let old_id = BlockId(old_idx);
+        if reachable.contains(&old_id) {
+            let new_id = BlockId(new_blocks.len());
+            remap.insert(old_id, new_id);
+            let mut new_block = block.clone();
+            new_block.id = new_id;
+            new_blocks.push(new_block);
+        }
+    }
 
-                    changed = true;
+    for block in &mut new_blocks {
+        if let Some(term) = &mut block.terminator {
+            patch_terminator_targets(term, &remap);
+        }
+    }
+
+    if let Some(&new_entry) = remap.get(&func.entry) {
+        func.entry = new_entry;
+    }
+
+    for entry in &mut func.cleanup_blocks {
+        if let Some(&new_id) = remap.get(&entry.block) {
+            entry.block = new_id;
+        }
+    }
+
+    let mut new_proven = hashbrown::HashMap::new();
+    for (old_b_idx, pairs) in &func.proven_in_bounds {
+        if let Some(&new_id) = remap.get(&BlockId(*old_b_idx)) {
+            new_proven.insert(new_id.0, pairs.clone());
+        }
+    }
+    func.proven_in_bounds = new_proven;
+
+    func.blocks = new_blocks;
+}
+
+fn patch_terminator_targets(term: &mut Terminator, remap: &hashbrown::HashMap<BlockId, BlockId>) {
+    match term {
+        Terminator::Goto(target, _) => {
+            if let Some(&new_id) = remap.get(target) {
+                *target = new_id;
+            }
+        }
+        Terminator::Cond {
+            then_block,
+            else_block,
+            ..
+        } => {
+            if let Some(&new_id) = remap.get(then_block) {
+                *then_block = new_id;
+            }
+            if let Some(&new_id) = remap.get(else_block) {
+                *else_block = new_id;
+            }
+        }
+        Terminator::Switch { cases, default, .. } => {
+            for (_, target) in cases {
+                if let Some(&new_id) = remap.get(target) {
+                    *target = new_id;
+                }
+            }
+            if let Some(&new_id) = remap.get(default) {
+                *default = new_id;
+            }
+        }
+        Terminator::Call { success, error, .. } => {
+            if let Some(&new_id) = remap.get(success) {
+                *success = new_id;
+            }
+            if let Some(err_bb) = error {
+                if let Some(&new_id) = remap.get(err_bb) {
+                    *err_bb = new_id;
                 }
             }
         }
-
-        if changed {
-            crate::mir::opt::DeadCodeElimination::run_on_function(func);
-        }
-        for (i, block) in func.blocks.iter_mut().enumerate() {
-            block.id = BlockId(i);
-        }
-
-        changed
+        Terminator::Return(_, _) | Terminator::Raise(_, _) | Terminator::Unreachable(_) => {}
     }
 }
 
